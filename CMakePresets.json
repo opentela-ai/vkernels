@@ -1,0 +1,87 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 18, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "_base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "host",
+      "displayName": "Host (no CUDA, optimised)",
+      "inherits": "_base",
+      "cacheVariables": {
+        "VKERNELS_BUILD_CUDA": "OFF",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Host debug",
+      "inherits": "_base",
+      "cacheVariables": {
+        "VKERNELS_BUILD_CUDA": "OFF",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "coverage",
+      "displayName": "Host + gcov coverage",
+      "inherits": "_base",
+      "cacheVariables": {
+        "VKERNELS_BUILD_CUDA": "OFF",
+        "VKERNELS_ENABLE_COVERAGE": "ON",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "Host + AddressSanitizer/UBSan",
+      "inherits": "_base",
+      "cacheVariables": {
+        "VKERNELS_BUILD_CUDA": "OFF",
+        "VKERNELS_ENABLE_ASAN": "ON",
+        "VKERNELS_ENABLE_UBSAN": "ON",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "cuda",
+      "displayName": "CUDA (native arch)",
+      "inherits": "_base",
+      "cacheVariables": {
+        "VKERNELS_BUILD_CUDA": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "cuda-debug",
+      "displayName": "CUDA debug + coverage",
+      "inherits": "cuda",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "VKERNELS_ENABLE_COVERAGE": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "host", "configurePreset": "host" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "coverage", "configurePreset": "coverage" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "cuda", "configurePreset": "cuda" },
+    { "name": "cuda-debug", "configurePreset": "cuda-debug" }
+  ],
+  "testPresets": [
+    { "name": "host", "configurePreset": "host", "output": { "outputOnFailure": true } },
+    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
+    { "name": "coverage", "configurePreset": "coverage", "output": { "outputOnFailure": true } },
+    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
+    { "name": "cuda", "configurePreset": "cuda", "output": { "outputOnFailure": true } },
+    { "name": "cuda-debug", "configurePreset": "cuda-debug", "output": { "outputOnFailure": true } }
+  ]
+}
