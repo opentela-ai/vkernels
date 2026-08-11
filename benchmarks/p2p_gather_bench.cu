@@ -303,6 +303,10 @@ double bench_plan_prepare(std::size_t count, std::size_t run_bytes,
   return std::chrono::duration<double, std::milli>(p1 - p0).count();
 }
 
+// Forward declaration; defined after print_header.
+static void print_row(std::size_t runs, std::size_t row_bytes,
+                      const Timings& t);
+
 // KVAAS layer-relative 2-D plan: prepare ONCE with per-page base pointers,
 // then time `repeats` execute() calls with distinct layer offsets. Reports
 // the one-time prepare cost and the median per-execute device/host time.
@@ -611,47 +615,53 @@ int main(int argc, char** argv) {
   // geometry (issue #8 acceptance). Plans were prepared above before the
   // filler; here we time their executes against the one-shot baseline.
   // -----------------------------------------------------------------------
-  print_header("2-D KVAAS: 256-KiB rows, layer-relative plan vs one-shot");
-  std::printf("%-6s %-12s %-12s %-12s %-12s %-8s %-12s %-12s %s\n",
-              "runs", "copy_us", "oneshot_us", "plan_us",
-              "plan_adap", "plan_kern", "plan_host_us", "prep_ms",
-              "branch");
-  std::printf("%s\n", "------------------------------------------------------------"
-                    "------------------------------------------------------------");
+  std::printf("\n2-D KVAAS: 256-KiB rows, layer-relative plan vs one-shot\n");
+  std::printf("%-6s %-12s %-12s %-12s %-12s %-8s %-12s %-12s\n",
+              "runs", "copy_us", "oneshot_us", "plan_us", "plan_adap",
+              "plan_kern", "plan_host_us", "prep_ms");
+  std::printf("%s\n", "------------------------------------------------------"
+                    "---------------------------------------------");
   for (std::size_t ci = 0; ci < kNumKvaasCounts; ++ci) {
     const std::size_t count = kKvaasCounts[ci];
     // Baseline: one cudaMemcpy2DAsync per page.
+    float copy_us = 0.0f, h0 = 0.0f;
+    time_median(stream, iters, [&] {
+      for (std::size_t i = 0; i < count; ++i)
+        cudaMemcpy2DAsync(kvaas_dst + i * kLayerRow, kLayerRow,
+                          kvaas_src + i * kKvaasStrideBench,
+                          kKvaasStrideBench, kLayerRow, 1,
+                          cudaMemcpyDefault, stream);
+    }, &copy_us, &h0);
+
+    // One-shot: build runs and time the adaptive path.
     std::vector<Gather2DRun> runs(count);
     for (std::size_t p = 0; p < count; ++p)
       runs[p] = {kvaas_src + p * kKvaasStrideBench, kKvaasStrideBench,
                  p * kLayerRow, kLayerRow, kLayerRow, 1u};
-    float copy_us = 0.0f, h0 = 0.0f;
+    float oneshot_us = 0.0f, h1 = 0.0f;
+    bool oneshot_kernel = false;
     time_median(stream, iters, [&] {
-      for (std::size_t i = 0; i < count; ++i)
-        cudaMemcpy2DAsync(kvaas_dst + runs[i].dst_offset, kLayerRow,
-                          runs[i].src, kKvaasStrideBench, kLayerRow, 1,
-                          cudaMemcpyDefault, stream);
-    }, &copy_us, &h0);
-
-    // One-shot adaptive.
-    Timings t = bench_2d(stream, count, kLayerRow, 1u, kKvaasStrideBench,
-                         kLayerRow, iters, kvaas_dst, kvaas_src);
-
-    // Layer-relative plan: prepared once above, timed here.
-    float kv_dev = 0.0f, kv_host = 0.0f;
-    time_median(stream, iters,
-                [&] { kvaas_plans[ci]->execute(std::size_t(0), stream); },
-                &kv_dev, &kv_host);
-
-    bool kv_uses_kernel =
+      p2p_gather_runs_2d(kvaas_dst, count * kLayerRow, runs.data(), count,
+                          stream);
+    }, &oneshot_us, &h1);
+    oneshot_kernel =
         vkernels::comm::prefer_gather_kernel(count, count * kLayerRow,
                                              /*strided=*/true);
-    std::printf("%-6zu %-12.2f %-12.2f %-12.2f %-12.2f %-8s %-12.2f %-12.3f %s\n",
-                count, copy_us * 1e3, t.adaptive_ms * 1e3, kv_dev * 1e3,
-                t.adaptive_ms * 1e3,
-                t.adaptive_took_kernel ? "kernel" : "copy",
-                kv_host * 1e3, kvaas_prep_ms[ci],
-                kv_uses_kernel ? "kernel" : "copy");
+
+    // Layer-relative plan: prepared once above, timed here.
+    float plan_us = 0.0f, plan_host = 0.0f;
+    time_median(stream, iters,
+                [&] { kvaas_plans[ci]->execute(std::size_t(0), stream); },
+                &plan_us, &plan_host);
+
+    bool plan_kernel =
+        vkernels::comm::prefer_gather_kernel(count, count * kLayerRow,
+                                             /*strided=*/true);
+    std::printf("%-6zu %-12.2f %-12.2f %-12.2f %-12.2f %-8s %-12.2f %-12.3f\n",
+                count, copy_us * 1e3, oneshot_us * 1e3, plan_us * 1e3,
+                oneshot_us * 1e3,
+                oneshot_kernel ? "kernel" : "copy",
+                plan_host * 1e3, kvaas_prep_ms[ci]);
   }
   wall("KVAAS 2D done");
 
@@ -660,6 +670,15 @@ int main(int argc, char** argv) {
   for (std::size_t ci = 0; ci < kNumKvaasCounts; ++ci) delete kvaas_plans[ci];
   cudaFree(kvaas_src);
   cudaFree(kvaas_dst);
+
+  // -----------------------------------------------------------------------
+  // Uneven-height 2-D: sweep max_height to show launched vs useful blocks
+  // -----------------------------------------------------------------------
+  for (std::size_t max_h : {2u, 4u, 8u, 16u, 32u}) {
+    bench_2d_uneven(stream, 32u, 512u, max_h, 1024u, 1024u, iters, dst_buf,
+                    src_buf);
+  }
+  wall("uneven-height done");
 
   if (concurrent) {
     // Release the persistent filler. The memset must go on a stream that is
