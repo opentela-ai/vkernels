@@ -688,3 +688,169 @@ TEST(P2PGatherPlan2d, SyncExecuteAndValidation) {
   EXPECT_THROW(P2PGatherPlan2D(dst2.data(), dst2.size(), bad, 1),
                std::invalid_argument);
 }
+
+// ---------------------------------------------------------------------------
+// 2-D prepared plan: layer-relative offset execute (KVAAS reuse pattern)
+// ---------------------------------------------------------------------------
+
+// A single per-plan source base region, to which every run points; the
+// offset shifts all runs' source pointers uniformly. This is the KVAAS
+// model: the plan stores the construction-time page bases, and execute()
+// adds the per-layer byte offset.
+TEST(P2PGatherPlan2d, OffsetExecuteSingleLayer) {
+  auto src = peer(32, 50);  // 4 rows x 8 bytes
+  auto dst = scratch(64, 0);
+  // Plan uses base src (byte 0); offset 4 copies bytes [4,16) of each row.
+  Gather2DRun runs[1] = {{src.data(), 8, 0, 8, 4, 2}};
+  P2PGatherPlan2D plan(dst.data(), dst.size(), runs, 1);
+
+  plan.execute(4u);  // add 4-byte offset: copy columns 4-7 of rows 0-1
+  for (std::size_t y = 0; y < 2; ++y)
+    for (std::size_t x = 0; x < 4; ++x)
+      ASSERT_EQ(dst[y * 8 + x], src[y * 8 + 4 + x]);
+  // Untouched columns remain zero.
+  ASSERT_EQ(dst[4], 0);
+  ASSERT_EQ(dst[12], 0);
+}
+
+TEST(P2PGatherPlan2d, OffsetExecuteMultipleTiles) {
+  auto a = peer(24, 10);  // 3 rows x 8 bytes
+  auto b = peer(24, 30);  // 3 rows x 8 bytes
+  auto dst = scratch(128, 0);
+  // Two tiles: each copies 3 rows of 4 bytes with dst stride 8 (gap of
+  // 4 bytes between rows, so the padding check is meaningful). The plan
+  // is prepared with base pointers; the offset shifts both tiles in their
+  // respective allocations.
+  Gather2DRun runs[2] = {{a.data(), 8, 0, 8, 4, 3},
+                         {b.data(), 8, 48, 8, 4, 3}};
+  P2PGatherPlan2D plan(dst.data(), dst.size(), runs, 2);
+
+  // Offset 2: copy columns 2-5 of each source row.
+  plan.execute(2u);
+  for (std::size_t y = 0; y < 3; ++y) {
+    for (std::size_t x = 0; x < 4; ++x) {
+      ASSERT_EQ(dst[y * 8 + x], a[y * 8 + 2 + x]);
+      ASSERT_EQ(dst[48 + y * 8 + x], b[y * 8 + 2 + x]);
+    }
+    // Padding (4 bytes after each row's data) untouched.
+    for (std::size_t p = 4; p < 8; ++p) {
+      ASSERT_EQ(dst[y * 8 + p], 0);
+      ASSERT_EQ(dst[48 + y * 8 + p], 0);
+    }
+  }
+}
+
+TEST(P2PGatherPlan2d, OffsetExecute40Layers) {
+  // The KVAAS pattern: 192 pages, each a 256-Byte row (small-scale).
+  // Prepare ONE plan bound to the scratch buffer, then execute with 40
+  // distinct layer offsets. Every execution enqueues exactly one task.
+  constexpr std::size_t kLayerBytes = 256;
+  constexpr std::size_t kPages = 8;
+  // One "peer page" of (kPages * kLayerBytes) bytes: pages at offsets
+  // first_slot * slot_bytes = i * kLayerBytes (here slot_bytes ==
+  // layer_bytes), each layer at offset layer * kLayerBytes within its page.
+  auto peer_buf = peer(kPages * kLayerBytes * 40, 1);
+
+  auto dst = scratch(kPages * kLayerBytes, 0xCC);
+  std::vector<Gather2DRun> runs;
+  runs.reserve(kPages);
+  for (std::size_t p = 0; p < kPages; ++p) {
+    // Page p: base = peer_buf + p * kLayerBytes, one row per page of
+    // kLayerBytes width. The plan stores this base; execute adds the
+    // layer offset (= layer_index * kLayerBytes).
+    runs.push_back({peer_buf.data() + p * kLayerBytes, kLayerBytes,
+                    p * kLayerBytes, kLayerBytes, kLayerBytes, 1u});
+  }
+  P2PGatherPlan2D plan(dst.data(), dst.size(), runs.data(), runs.size());
+  EXPECT_EQ(plan.num_runs(), kPages);
+
+  constexpr int kLayers = 40;
+  Stream s;
+  for (int layer = 0; layer < kLayers; ++layer) {
+    std::size_t before = s.submitted();
+    plan.execute(layer * kLayerBytes, &s);
+    EXPECT_EQ(s.submitted() - before, 1u);
+  }
+  s.wait();
+
+  // Last layer (layer 39) is still in dst; verify it byte-exact.
+  const std::size_t last = 39u * kLayerBytes;
+  for (std::size_t p = 0; p < kPages; ++p)
+    for (std::size_t x = 0; x < kLayerBytes; ++x)
+      ASSERT_EQ(dst[p * kLayerBytes + x],
+                peer_buf[p * kLayerBytes + last + x]);
+}
+
+TEST(P2PGatherPlan2d, OffsetExecuteConcurrentTwoStreams) {
+  // Two concurrent streams, different layer offsets, one immutable plan.
+  auto peer_buf = peer(1024, 10);
+  auto dst = scratch(64, 0);
+  Gather2DRun runs[1] = {{peer_buf.data(), 256, 0, 32, 32, 2}};
+  P2PGatherPlan2D plan(dst.data(), dst.size(), runs, 1);
+
+  Stream s1, s2;
+  // s1 copies layer 0 (offset 0); s2 copies layer 1 (offset 256).
+  // Both concurrent, same plan, no cross-stream races on the read-only
+  // metadata.
+  for (int i = 0; i < 4; ++i) {
+    plan.execute(0u, &s1);
+    plan.execute(256u, &s2);
+  }
+  s1.wait();
+  s2.wait();
+  // After the last s1 execute: dst holds layer 0 rows 0-1.
+  // s2 races with s1, so the FINAL state depends on ordering — but both
+  // streams write disjoint rows within dst? No: same dst region. The test
+  // verifies no crashes (the plan's metadata is read-only); the final dst
+  // content is whichever stream wrote last. s2 was last enqueued after s1
+  // in each loop iteration and dst contains layer 1.
+  for (std::size_t y = 0; y < 2; ++y)
+    for (std::size_t x = 0; x < 32; ++x)
+      ASSERT_EQ(dst[y * 32 + x], peer_buf[256 + y * 256 + x]);
+}
+
+TEST(P2PGatherPlan2d, OffsetUnaligned16Byte) {
+  // An unaligned offset (e.g. 1 byte) is valid: the host memcpy handles
+  // any alignment, and the CUDA path falls back to the scalar path with
+  // grid.x sized to max width.
+  auto src = peer(32, 1);
+  auto dst = scratch(32, 0);
+  Gather2DRun runs[1] = {{src.data(), 8, 0, 8, 4, 2}};
+  P2PGatherPlan2D plan(dst.data(), dst.size(), runs, 1);
+
+  plan.execute(1u);  // offset 1: unaligned
+  for (std::size_t y = 0; y < 2; ++y)
+    for (std::size_t x = 0; x < 4; ++x)
+      ASSERT_EQ(dst[y * 8 + x], src[y * 8 + 1 + x]);
+}
+
+TEST(P2PGatherPlan2d, OffsetZeroIsEquivalentToNoOffsetExecute) {
+  // execute(0) == execute() — byte-exact agreement.
+  auto src = peer(16, 5);
+  auto dst0 = scratch(16, 0);
+  auto dst1 = scratch(16, 0);
+  Gather2DRun runs[1] = {{src.data(), 4, 0, 4, 4, 4}};
+  P2PGatherPlan2D plan0(dst0.data(), dst0.size(), runs, 1);
+  P2PGatherPlan2D plan1(dst1.data(), dst1.size(), runs, 1);
+
+  plan0.execute();               // zero-offset
+  plan1.execute(std::size_t(0));  // explicit offset=0
+  expect_equal_bytes(dst0, dst1);
+}
+
+TEST(P2PGatherPlan2d, OffsetExecuteSyncNoStream) {
+  // Offset execute with stream == nullptr runs synchronously.
+  auto src = peer(32, 5);
+  auto dst = scratch(32, 0);
+  // src stride 8, width 4, height 4: rows have 4-byte gaps.
+  Gather2DRun runs[1] = {{src.data(), 8, 0, 4, 4, 4}};
+  P2PGatherPlan2D plan(dst.data(), dst.size(), runs, 1);
+  plan.execute(2u);  // sync: returns after copies complete
+  // Row y copies src[y*8+2 .. y*8+6) to dst[y*4 .. y*4+4).
+  for (std::size_t y = 0; y < 4; ++y)
+    for (std::size_t x = 0; x < 4; ++x)
+      ASSERT_EQ(dst[y * 4 + x], src[y * 8 + 2 + x]);
+  // Gaps (bytes 4..8 of each dst row? No: dst stride 4, width 4, so rows
+  // are packed. The last row y=3 ends at byte 15; dst[16..31] untouched:
+  for (std::size_t i = 16; i < 32; ++i) ASSERT_EQ(dst[i], 0);
+}

@@ -154,17 +154,26 @@ __global__ void gather_1d_kernel(const RunDev1D* __restrict__ runs, int num_runs
 // tall tiles. Each block compares its row against the run's own `height`
 // (read from the descriptor), so no separate max-height parameter is needed
 // and there is no narrowing int cast.
-__global__ void gather_2d_kernel(const RunDev2D* __restrict__ runs, int num_runs) {
+//
+// `src_offset` is added to every run's source pointer. It is 0 for the
+// one-shot path and the zero-offset plan execute; set to the layer-relative
+// byte offset for the KVAAS reuse pattern. When src_offset is a multiple of
+// 16 the vectorized path is enabled (run.vec must also be true); otherwise
+// all runs fall back to the scalar path regardless of the prepare-time vec
+// flag. The caller sizes grid.x to cover the worst case for the chosen path.
+__global__ void gather_2d_kernel(const RunDev2D* __restrict__ runs, int num_runs,
+                                 unsigned long long src_offset) {
   int r = blockIdx.z;
   unsigned long long row = static_cast<unsigned long long>(blockIdx.y);
   if (r >= num_runs) return;
   RunDev2D run = runs[r];
   if (row >= run.height) return;  // run shorter than the grid's row extent
   unsigned char* drow = run.dst + row * run.dst_stride;
-  const unsigned char* srow = run.src + row * run.src_stride;
+  const unsigned char* srow = run.src + src_offset + row * run.src_stride;
   unsigned long long i =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (run.vec) {
+  const bool vec = run.vec && ((src_offset & 15u) == 0);
+  if (vec) {
     const unsigned long long chunks = run.width >> 4u;
     if (i < chunks) {
       const unsigned long long off = i << 4u;
@@ -243,13 +252,17 @@ void launch_gather_1d(const RunDev1D* d_runs, std::size_t num_runs,
 }
 
 // Launch the 2-D gather kernel for an already-staged descriptor list.
+// `src_offset` (default 0) is the layer-relative byte offset added to
+// every run's source pointer.
 void launch_gather_2d(const RunDev2D* d_runs, std::size_t num_runs,
                       std::size_t max_units, std::size_t max_height,
-                      cudaStream_t stream) {
+                      cudaStream_t stream,
+                      unsigned long long src_offset = 0) {
   dim3 block(256);
   dim3 grid(tiles(max_units), static_cast<unsigned>(max_height),
             static_cast<unsigned>(num_runs));
-  gather_2d_kernel<<<grid, block, 0, stream>>>(d_runs, static_cast<int>(num_runs));
+  gather_2d_kernel<<<grid, block, 0, stream>>>(d_runs, static_cast<int>(num_runs),
+                                                src_offset);
   cudaError_t err = cudaGetLastError();
   VK_ENSURES(err == cudaSuccess, "cuda gather_2d launch failed");
 }
@@ -328,10 +341,11 @@ void copy_engine_1d(const std::vector<StagedRun1D>& staged, std::uint8_t* dst,
 }
 
 void copy_engine_2d(const std::vector<StagedRun2D>& staged, std::uint8_t* dst,
-                    cudaStream_t stream) {
+                    cudaStream_t stream, std::size_t src_offset = 0) {
   for (const auto& r : staged) {
     cudaError_t err =
-        cudaMemcpy2DAsync(dst + r.dst_offset, r.dst_stride, r.src, r.src_stride,
+        cudaMemcpy2DAsync(dst + r.dst_offset, r.dst_stride,
+                          r.src + src_offset, r.src_stride,
                           r.width, r.height, cudaMemcpyDefault, stream);
     VK_ENSURES(err == cudaSuccess, "cudaMemcpy2DAsync (copy-engine path) failed");
   }
@@ -403,7 +417,8 @@ struct P2PGatherPlan2D::Impl {
   std::size_t dst_capacity = 0;
   std::vector<StagedRun2D> host_runs;
   std::vector<RunDev2D> dev;
-  std::size_t max_units = 0;
+  std::size_t max_units = 0;         // max vectorized units (width >> 4)
+  std::size_t max_scalar_units = 0;  // max width (scalar fallback)
   std::size_t max_height = 0;
   std::size_t total = 0;
   RunDev2D* d_runs = nullptr;
@@ -490,6 +505,7 @@ P2PGatherPlan2D::P2PGatherPlan2D(std::uint8_t* dst, std::size_t dst_capacity,
                           static_cast<unsigned long long>(r.height), vec});
     const std::size_t u = units_2d(r, vec);
     if (impl_->max_units < u) impl_->max_units = u;
+    if (impl_->max_scalar_units < r.width) impl_->max_scalar_units = r.width;
     if (impl_->max_height < r.height) impl_->max_height = r.height;
     impl_->total += r.width * r.height;
   }
@@ -522,6 +538,25 @@ void P2PGatherPlan2D::execute(cudaStream_t stream) const {
                      impl_->max_height, stream);
   } else {
     copy_engine_2d(impl_->host_runs, impl_->dst, stream);
+  }
+}
+
+void P2PGatherPlan2D::execute(std::size_t src_byte_offset,
+                              cudaStream_t stream) const {
+  if (impl_->host_runs.empty()) return;  // valid no-op plan
+  // When the offset is a multiple of 16 the vectorized path stays enabled
+  // (the prepare-time vec flag on the aligned base sources remains valid).
+  // An unaligned offset falls back to the scalar path for every run, and
+  // grid.x is sized to max_scalar_units (max width) to cover it.
+  const bool vec_ok = (src_byte_offset & 15u) == 0;
+  const std::size_t max_units = vec_ok ? impl_->max_units : impl_->max_scalar_units;
+  if (prefer_gather_kernel(impl_->host_runs.size(), impl_->total,
+                           /*strided=*/true)) {
+    launch_gather_2d(impl_->d_runs, impl_->host_runs.size(), max_units,
+                     impl_->max_height, stream,
+                     static_cast<unsigned long long>(src_byte_offset));
+  } else {
+    copy_engine_2d(impl_->host_runs, impl_->dst, stream, src_byte_offset);
   }
 }
 

@@ -79,7 +79,16 @@ class P2PGatherPlan2D {
   std::size_t num_runs() const;
   std::size_t total_bytes() const;
 
+  // Zero-offset execute (existing behaviour).
   void execute(cudaStream_t_p2p stream) const;
+
+  // Layer-relative execute: adds `src_byte_offset` to every run's source
+  // pointer. The kernel reads `srow = run.src + offset + row*src_stride`;
+  // the copy-engine branch passes `r.src + offset` to cudaMemcpy2DAsync.
+  // The plan stores the construction-time source base pointers; both
+  // branches apply the scalar offset with no per-layer H2D descriptor
+  // upload.
+  void execute(std::size_t src_byte_offset, cudaStream_t_p2p stream) const;
 
  private:
   struct Impl;

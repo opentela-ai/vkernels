@@ -303,6 +303,83 @@ double bench_plan_prepare(std::size_t count, std::size_t run_bytes,
   return std::chrono::duration<double, std::milli>(p1 - p0).count();
 }
 
+// KVAAS layer-relative 2-D plan: prepare ONCE with per-page base pointers,
+// then time `repeats` execute() calls with distinct layer offsets. Reports
+// the one-time prepare cost and the median per-execute device/host time.
+// This is the "192 pages, 40 layers" pattern from issue #8.
+double bench_plan2d_kvaas(std::size_t pages, std::size_t layer_bytes,
+                          std::size_t page_stride, std::uint8_t* dst,
+                          std::uint8_t* src, P2PGatherPlan2D** out) {
+  std::vector<Gather2DRun> runs(pages);
+  for (std::size_t p = 0; p < pages; ++p)
+    runs[p] = {src + p * page_stride, page_stride, p * layer_bytes, layer_bytes,
+               layer_bytes, 1u};
+  auto p0 = std::chrono::steady_clock::now();
+  *out = new P2PGatherPlan2D(dst, pages * layer_bytes, runs.data(), pages);
+  auto p1 = std::chrono::steady_clock::now();
+  return std::chrono::duration<double, std::milli>(p1 - p0).count();
+}
+
+// Uneven-height benchmark: builds runs with a range of heights and reports
+// total launched blocks versus useful (non-return) blocks. Heights are
+// assigned to consecutive runs: [1, 1, ..., 2, 2, ..., max_h, max_h].
+void bench_2d_uneven(cudaStream_t stream, std::size_t count,
+                     std::size_t width, std::size_t max_height,
+                     std::size_t src_stride, std::size_t dst_stride,
+                     int iters, std::uint8_t* dst, std::uint8_t* src) {
+  std::vector<Gather2DRun> runs(count);
+  std::size_t total_height = 0;
+  for (std::size_t i = 0; i < count; ++i) {
+    // Height increases from 1 to max_height, recycling for large counts.
+    const std::size_t h = 1 + (i % max_height);
+    runs[i] = {src + i * max_height * src_stride, src_stride,
+               i * max_height * dst_stride, dst_stride, width, h};
+    total_height += h;
+  }
+
+  // Useful rows = sum of heights; useless rows = count * max_height - total_height.
+  // Launched blocks (kernel): tiles(ceil(width/16)) * max_height * count
+  // (vectorized path); useful row-blocks = sum over runs of tiles(ceil(width/16)) * height(r).
+  const std::size_t max_units = (width + 15u) / 16u;  // vectorized units per row
+  const std::size_t blocks_x = max_units > 0 ? (max_units + 255u) / 256u : 1u;
+  const std::size_t launched = blocks_x * max_height * count;
+  const std::size_t useful = blocks_x * total_height;
+
+  std::printf("\nUneven-height 2-D: %zu runs, width=%zu, max_h=%zu\n",
+              count, width, max_height);
+  std::printf("  total rows=%zu  max_rows=%zu  useless=%zu (%.1f%%)\n",
+              total_height, max_height * count,
+              max_height * count - total_height,
+              100.0 * (1.0 - static_cast<double>(total_height) /
+                               static_cast<double>(max_height * count)));
+  std::printf("  launched blocks=%zu  useful blocks=%zu  waste=%.1f%%\n",
+              launched, useful,
+              100.0 * (1.0 - static_cast<double>(useful) /
+                               static_cast<double>(launched)));
+
+  // Time via the one-shot 2-D API (same as the adaptive path).
+  Timings t;
+  // dst capacity must cover all runs: each occupies at most
+  // max_height * dst_stride bytes.
+  const std::size_t total = count * max_height * dst_stride;
+  set_gather_dispatch(GatherDispatchMode::kForceKernel, 1);
+  float h = 0.0f;
+  time_median(stream, iters, [&] {
+    p2p_gather_runs_2d(dst, total, runs.data(), count, stream);
+  }, &t.kernel_ms, &t.kernel_host_ms);
+
+  set_gather_dispatch(GatherDispatchMode::kAdaptive, 4);
+  t.adaptive_took_kernel =
+      vkernels::comm::prefer_gather_kernel(count, total,
+                                           /*strided=*/true);
+  time_median(stream, iters, [&] {
+    p2p_gather_runs_2d(dst, total, runs.data(), count, stream);
+  }, &t.adaptive_ms, &t.adaptive_host_ms);
+  set_gather_dispatch();
+
+  print_row(count, width, t);
+}
+
 void print_header(const char* title) {
   std::printf("\n%s\n", title);
   std::printf("%-6s %-9s %-11s %-11s %-11s %-10s %-11s %-11s %s\n",
@@ -407,18 +484,41 @@ int main(int argc, char** argv) {
   // Issue #6 acceptance sweep: fixed 48 MiB payload across the run counts
   // that bracket the measured 16-32 crossover (1, 2, 4, 8, 16 below it;
   // 32, 64, 192 at/above it).
-  // The prepared plan is created BEFORE the filler: its prepare does a
-  // synchronous cudaMalloc and its destructor a synchronous cudaFree — both
-  // wait for device quiescence, which would block for the filler's whole
-  // lifetime. The plan borrows the shared scratch buffers (it must outlive
-  // the streams it executes on; main frees the buffers after the filler is
-  // released and the plan is destroyed).
+  // All prepared plans are created BEFORE the filler: synchronous
+  // cudaMalloc/cudaFree wait for device quiescence, which with the
+  // persistent filler running would block for the filler's lifetime.
+  // Plans borrow the shared scratch buffers and must outlive the filler.
   print_header("Prepared plan: prepare once, 40 layer executes (48 MiB total)");
   constexpr std::size_t kPlanRuns = 8;
   P2PGatherPlan1D* plan = nullptr;
   const double plan_prepare_ms =
       bench_plan_prepare(kPlanRuns, k48MiB / kPlanRuns, dst_buf, src_buf,
                          &plan);
+
+  // KVAAS 2-D layer-relative plans: prepare one per sweep count BEFORE the
+  // filler, for the same reason. Stored alongside their per-layer row size.
+  constexpr std::size_t kLayerRow = 256u * 1024u;  // 256 KiB
+  constexpr std::size_t kKvaasStride = 10u * 1024u * 1024u;  // 10 MiB
+  const std::size_t kKvaasStrideBench =
+      g_src_dev == 0 ? kLayerRow : kKvaasStride;
+  constexpr std::size_t kKvaasMaxPages = 192u;
+  const std::size_t kvaas_src_bytes = kKvaasMaxPages * kKvaasStrideBench;
+  std::uint8_t* kvaas_src = nullptr;
+  std::uint8_t* kvaas_dst = nullptr;
+  if (g_src_dev != 0) cudaSetDevice(g_src_dev);
+  cudaMalloc(&kvaas_src, kvaas_src_bytes);
+  if (g_src_dev != 0) cudaSetDevice(0);
+  cudaMalloc(&kvaas_dst, kKvaasMaxPages * kLayerRow);
+
+  constexpr std::size_t kKvaasCounts[] = {1u, 2u, 4u, 8u, 16u, 32u, 64u, 192u};
+  constexpr std::size_t kNumKvaasCounts = sizeof(kKvaasCounts) / sizeof(kKvaasCounts[0]);
+  P2PGatherPlan2D* kvaas_plans[kNumKvaasCounts] = {};
+  double kvaas_prep_ms[kNumKvaasCounts] = {};
+  for (std::size_t ci = 0; ci < kNumKvaasCounts; ++ci) {
+    kvaas_prep_ms[ci] =
+        bench_plan2d_kvaas(kKvaasCounts[ci], kLayerRow, kKvaasStrideBench,
+                           kvaas_dst, kvaas_src, &kvaas_plans[ci]);
+  }
 
   if (concurrent) {
     // Warm up the one-time default-pool tuning and the gather-kernel JIT
@@ -504,6 +604,62 @@ int main(int argc, char** argv) {
               kPlanRuns, k48MiB / kPlanRuns, plan_prepare_ms,
               plan_dev * 1e3f, plan_host * 1e3f);
   wall("plan done");
+
+  // -----------------------------------------------------------------------
+  // -----------------------------------------------------------------------
+  // KVAAS layer-relative 2-D plan: 192-page, 256-KiB-row, 10-MiB-stride
+  // geometry (issue #8 acceptance). Plans were prepared above before the
+  // filler; here we time their executes against the one-shot baseline.
+  // -----------------------------------------------------------------------
+  print_header("2-D KVAAS: 256-KiB rows, layer-relative plan vs one-shot");
+  std::printf("%-6s %-12s %-12s %-12s %-12s %-8s %-12s %-12s %s\n",
+              "runs", "copy_us", "oneshot_us", "plan_us",
+              "plan_adap", "plan_kern", "plan_host_us", "prep_ms",
+              "branch");
+  std::printf("%s\n", "------------------------------------------------------------"
+                    "------------------------------------------------------------");
+  for (std::size_t ci = 0; ci < kNumKvaasCounts; ++ci) {
+    const std::size_t count = kKvaasCounts[ci];
+    // Baseline: one cudaMemcpy2DAsync per page.
+    std::vector<Gather2DRun> runs(count);
+    for (std::size_t p = 0; p < count; ++p)
+      runs[p] = {kvaas_src + p * kKvaasStrideBench, kKvaasStrideBench,
+                 p * kLayerRow, kLayerRow, kLayerRow, 1u};
+    float copy_us = 0.0f, h0 = 0.0f;
+    time_median(stream, iters, [&] {
+      for (std::size_t i = 0; i < count; ++i)
+        cudaMemcpy2DAsync(kvaas_dst + runs[i].dst_offset, kLayerRow,
+                          runs[i].src, kKvaasStrideBench, kLayerRow, 1,
+                          cudaMemcpyDefault, stream);
+    }, &copy_us, &h0);
+
+    // One-shot adaptive.
+    Timings t = bench_2d(stream, count, kLayerRow, 1u, kKvaasStrideBench,
+                         kLayerRow, iters, kvaas_dst, kvaas_src);
+
+    // Layer-relative plan: prepared once above, timed here.
+    float kv_dev = 0.0f, kv_host = 0.0f;
+    time_median(stream, iters,
+                [&] { kvaas_plans[ci]->execute(std::size_t(0), stream); },
+                &kv_dev, &kv_host);
+
+    bool kv_uses_kernel =
+        vkernels::comm::prefer_gather_kernel(count, count * kLayerRow,
+                                             /*strided=*/true);
+    std::printf("%-6zu %-12.2f %-12.2f %-12.2f %-12.2f %-8s %-12.2f %-12.3f %s\n",
+                count, copy_us * 1e3, t.adaptive_ms * 1e3, kv_dev * 1e3,
+                t.adaptive_ms * 1e3,
+                t.adaptive_took_kernel ? "kernel" : "copy",
+                kv_host * 1e3, kvaas_prep_ms[ci],
+                kv_uses_kernel ? "kernel" : "copy");
+  }
+  wall("KVAAS 2D done");
+
+  // Clean up KVAAS plans and buffers (must happen before filler release —
+  // destructors do synchronous cudaFree).
+  for (std::size_t ci = 0; ci < kNumKvaasCounts; ++ci) delete kvaas_plans[ci];
+  cudaFree(kvaas_src);
+  cudaFree(kvaas_dst);
 
   if (concurrent) {
     // Release the persistent filler. The memset must go on a stream that is

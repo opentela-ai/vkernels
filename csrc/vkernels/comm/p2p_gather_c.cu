@@ -132,5 +132,16 @@ extern "C" vkernels_status_t vkernels_p2p_plan_2d_execute(
   return VKERNELS_OK;
 }
 
+extern "C" vkernels_status_t vkernels_p2p_plan_2d_execute_offset(
+    vkernels_p2p_plan_2d_t* plan, size_t src_byte_offset, cudaStream_t stream) {
+  try {
+    reinterpret_cast<vkernels::comm::cuda::P2PGatherPlan2D*>(plan)->execute(
+        src_byte_offset, stream);
+  } catch (const std::exception& e) {
+    return to_status(e);
+  }
+  return VKERNELS_OK;
+}
+
 #  endif  // __CUDA_ARCH__
 #endif  // defined(VKERNELS_C_HAS_CUDA)

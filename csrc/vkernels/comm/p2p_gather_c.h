@@ -114,6 +114,11 @@ void vkernels_p2p_plan_2d_destroy(vkernels_p2p_plan_2d_t* plan);
 
 vkernels_status_t vkernels_p2p_plan_2d_execute(vkernels_p2p_plan_2d_t* plan,
                                                cudaStream_t stream);
+
+// Layer-relative execute (KVAAS reuse pattern): adds `src_byte_offset` to
+// every run's source pointer. All other semantics match _execute.
+vkernels_status_t vkernels_p2p_plan_2d_execute_offset(
+    vkernels_p2p_plan_2d_t* plan, size_t src_byte_offset, cudaStream_t stream);
 #endif  // VKERNELS_C_HAS_CUDA
 
 #ifdef __cplusplus

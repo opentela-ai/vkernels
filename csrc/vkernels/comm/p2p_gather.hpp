@@ -245,6 +245,11 @@ class P2PGatherPlan1D {
 };
 
 // A prepared 2-D strided run list, bound to one destination allocation.
+// The plan stores the source base pointers from the input runs — the
+// caller's construction-time pointers. After construction the plan can be
+// executed with a layer-relative `src_byte_offset` so KVAAS reuses one
+// run topology across all 40 layers without re-creating the plan or
+// performing per-layer metadata work.
 class P2PGatherPlan2D {
  public:
   P2PGatherPlan2D(std::uint8_t* dst, std::size_t dst_capacity,
@@ -261,6 +266,13 @@ class P2PGatherPlan2D {
   // Same contract as P2PGatherPlan1D::execute: one stream task, no per-call
   // metadata work, plan must outlive the stream.
   void execute(Stream* stream = nullptr) const;
+
+  // Layer-relative execute: adds `src_byte_offset` to every run's source
+  // pointer before copying. This is the KVAAS pattern — one run topology
+  // (page bases, strides, widths, heights) reused across layers, with only
+  // the per-layer byte offset changing. Every other aspect of execute() —
+  // single stream task, no validation, no allocation — is preserved.
+  void execute(std::size_t src_byte_offset, Stream* stream = nullptr) const;
 
  private:
   std::uint8_t* dst_;
