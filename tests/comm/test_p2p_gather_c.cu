@@ -93,18 +93,21 @@ TEST(P2pGatherCAdaptive, ManyRunsUseKernelByteExact) {
 TEST(P2pGatherCAdaptive, ForcedKernelVectorizedTailAndUnaligned) {
   // Force the kernel and mix vectorized and scalar runs in ONE launch:
   //   run0: src aligned, dst off 0,      len 48  -> vec, 3 chunks, tail 0
-  //   run1: src unaligned (+3), dst off 32, len 50 -> scalar path
-  //   run2: src aligned (+16), dst off 100, len 17 -> vec, 1 chunk + 1 tail
+  //   run1: src unaligned (+3), dst off 64, len 50 -> scalar path
+  //   run2: src aligned (+16), dst off 128, len 17 -> vec, 1 chunk + 1 tail
+  // (Offsets leave disjoint dst spans [0,48) / [64,114) / [128,145): the
+  // staging validators reject overlapping outputs.)
   vkernels::comm::set_gather_dispatch(vkernels::comm::GatherDispatchMode::kForceKernel, 1);
 
   std::vector<uint8_t> hsrc = patterned(256);
   uint8_t* dsrc = nullptr, *ddst = nullptr;
   ASSERT_TRUE(cudaMalloc(&dsrc, 256) == cudaSuccess);
   ASSERT_TRUE(cudaMalloc(&ddst, kCap) == cudaSuccess);
+  ASSERT_TRUE(cudaMemset(ddst, 0, kCap) == cudaSuccess);  // gap checks need a known fill
   ASSERT_TRUE(cudaMemcpy(dsrc, hsrc.data(), 256, cudaMemcpyHostToDevice) == cudaSuccess);
 
   const void* ptrs[3] = {dsrc, dsrc + 3, dsrc + 16};
-  size_t offs[3] = {0, 32, 100};
+  size_t offs[3] = {0, 64, 128};
   size_t lens[3] = {48, 50, 17};
   vkernels_status_t st = vkernels_p2p_gather_runs(ddst, kCap, ptrs, offs, lens, 3, 0);
   ASSERT_EQ(st, VKERNELS_OK);
@@ -112,11 +115,11 @@ TEST(P2pGatherCAdaptive, ForcedKernelVectorizedTailAndUnaligned) {
   std::vector<uint8_t> hdst(kCap, 0);
   ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kCap, cudaMemcpyDeviceToHost) == cudaSuccess);
   for (size_t i = 0; i < 48; ++i) ASSERT_EQ(hdst[i], hsrc[i]);
-  for (size_t i = 0; i < 50; ++i) ASSERT_EQ(hdst[32 + i], hsrc[3 + i]);
-  for (size_t i = 0; i < 17; ++i) ASSERT_EQ(hdst[100 + i], hsrc[16 + i]);
+  for (size_t i = 0; i < 50; ++i) ASSERT_EQ(hdst[64 + i], hsrc[3 + i]);
+  for (size_t i = 0; i < 17; ++i) ASSERT_EQ(hdst[128 + i], hsrc[16 + i]);
   ASSERT_EQ(hdst[48], 0);   // gaps stay untouched
-  ASSERT_EQ(hdst[82], 0);
-  ASSERT_EQ(hdst[117], 0);
+  ASSERT_EQ(hdst[114], 0);
+  ASSERT_EQ(hdst[145], 0);
 
   cudaFree(dsrc); cudaFree(ddst);
   vkernels::comm::set_gather_dispatch();  // restore adaptive defaults
@@ -183,7 +186,7 @@ TEST(P2pGatherPlan1dC, ReuseAcrossManyLaunchesAndStreams) {
   // 40 sequential layer launches on one stream.
   cudaStream_t s;
   ASSERT_TRUE(cudaStreamCreate(&s) == cudaSuccess);
-  for (int layer = 0; layer < kLayers; ++layer) {
+  for (size_t layer = 0; layer < kLayers; ++layer) {
     ASSERT_EQ(vkernels_p2p_plan_1d_execute(plan, s), VKERNELS_OK);
   }
   ASSERT_TRUE(cudaStreamSynchronize(s) == cudaSuccess);
@@ -289,6 +292,9 @@ TEST(P2pGatherC, OneRunCopiesByteExact) {
   uint8_t* ddst = nullptr;
   ASSERT_TRUE(cudaMalloc(&dsrc, 256)  == cudaSuccess);
   ASSERT_TRUE(cudaMalloc(&ddst, kCap)  == cudaSuccess);
+  // cudaMalloc memory is not guaranteed zeroed; the untouched-tail check
+  // below needs a known fill outside the copied range.
+  ASSERT_TRUE(cudaMemset(ddst, 0, kCap) == cudaSuccess);
   ASSERT_TRUE(cudaMemcpy(dsrc, hsrc.data(), 256, cudaMemcpyHostToDevice)  == cudaSuccess);
 
   const void* ptrs[1] = {dsrc};
@@ -314,6 +320,9 @@ TEST(P2pGatherC, MultipleRunsNonOverlapping) {
   ASSERT_TRUE(cudaMalloc(&d0, 128)  == cudaSuccess);
   ASSERT_TRUE(cudaMalloc(&d1, 64)  == cudaSuccess);
   ASSERT_TRUE(cudaMalloc(&ddst, kCap)  == cudaSuccess);
+  // Known fill outside the runs so the gap check is meaningful (fresh
+  // cudaMalloc memory is not guaranteed zeroed).
+  ASSERT_TRUE(cudaMemset(ddst, 0, kCap) == cudaSuccess);
   ASSERT_TRUE(cudaMemcpy(d0, h0.data(), 128, cudaMemcpyHostToDevice)  == cudaSuccess);
   ASSERT_TRUE(cudaMemcpy(d1, h1.data(), 64, cudaMemcpyHostToDevice)  == cudaSuccess);
 

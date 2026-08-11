@@ -413,24 +413,27 @@ namespace {
 constexpr std::size_t k48MiB = 48u * 1024u * 1024u;
 }
 
-TEST(GatherDispatch, DefaultsAreAdaptiveWithFloor24) {
+TEST(GatherDispatch, DefaultsAreAdaptiveWithFloor4) {
   auto [mode, min_runs] = gather_dispatch_config();
   EXPECT_EQ(static_cast<int>(mode), static_cast<int>(GatherDispatchMode::kAdaptive));
-  EXPECT_EQ(min_runs, 24u);
+  EXPECT_EQ(min_runs, 4u);
 }
 
-TEST(GatherDispatch, CostModelMatchesIssue6Measurements) {
-  // Copy engine: ~195.5 us @ 1 run / 48 MiB, +~3.08 us per extra run
-  // (the issue #6 table's slope from 1 to 192 runs is (784.29-195.49)/191).
-  EXPECT_NEAR(est_copy_engine_us(1, k48MiB), 195.4, 1.0);
-  EXPECT_NEAR(est_copy_engine_us(192, k48MiB), 783.7, 1.0);
-  EXPECT_NEAR(est_copy_engine_us(16, k48MiB), 241.6, 1.0);
+TEST(GatherDispatch, CostModelMatchesH100NVLMeasurements) {
+  // Copy engine: 201.7 us @ 1 run / 48 MiB + ~7.37 us per extra run, with
+  // a ~20 us per-call floor (measured on sgs-gpu07, real NVLink peer).
+  EXPECT_NEAR(est_copy_engine_us(1, k48MiB), 201.6, 1.0);
+  EXPECT_NEAR(est_copy_engine_us(192, k48MiB), 1609.3, 1.0);
+  EXPECT_NEAR(est_copy_engine_us(16, k48MiB), 312.2, 1.0);
+  EXPECT_NEAR(est_copy_engine_us(1, 4096), 20.0, 0.5);  // fixed floor
   EXPECT_EQ(est_copy_engine_us(0, 0), 0.0);
-  EXPECT_EQ(est_copy_engine_us(1, 0), 0.0);  // one run, zero bytes: no per-run term
+  EXPECT_EQ(est_copy_engine_us(1, 0), 0.0);  // one run, zero bytes: no cost
 
-  // Gather kernel: ~253 us flat at 48 MiB, independent of run count.
-  EXPECT_NEAR(est_gather_kernel_us(1, k48MiB), 253.0, 1.0);
-  EXPECT_NEAR(est_gather_kernel_us(192, k48MiB), 253.0, 1.0);
+  // Gather kernel: ~210 us flat at 48 MiB, independent of run count; the
+  // fixed launch floor covers tiny transfers (8.58 us measured at 4 KiB).
+  EXPECT_NEAR(est_gather_kernel_us(1, k48MiB), 210.2, 1.0);
+  EXPECT_NEAR(est_gather_kernel_us(192, k48MiB), 210.2, 1.0);
+  EXPECT_NEAR(est_gather_kernel_us(1, 4096), 8.6, 0.5);
   EXPECT_EQ(est_gather_kernel_us(1, 0), 0.0);
 
   // Monotonicity: the loop grows with run count, the kernel does not.
@@ -438,26 +441,31 @@ TEST(GatherDispatch, CostModelMatchesIssue6Measurements) {
   EXPECT_EQ(est_gather_kernel_us(1, k48MiB), est_gather_kernel_us(2, k48MiB));
 }
 
-TEST(GatherDispatch, AdaptiveChoosesKernelOnlyAboveCrossover) {
-  set_gather_dispatch(GatherDispatchMode::kAdaptive, 24);
-  // 1-16 runs: copy engine (the 0.77x-0.98x low-run region of the table).
-  for (std::size_t n : {1u, 2u, 4u, 8u, 16u}) {
+TEST(GatherDispatch, AdaptiveChoosesKernelAboveMeasuredCrossover) {
+  set_gather_dispatch(GatherDispatchMode::kAdaptive, 4);
+  // 1-3 runs at 48 MiB: copy engine — the floor guards the ~1% margins
+  // measured below the ~3-run crossover.
+  for (std::size_t n : {1u, 2u, 3u}) {
     EXPECT_FALSE(prefer_gather_kernel(n, k48MiB));
   }
-  // At/above the min-runs floor the model wins: 32/64/192 runs were 1.15x/
-  // 1.49x/2.91x for the kernel in the issue #6 table.
-  for (std::size_t n : {24u, 32u, 64u, 192u}) {
+  // From 4 runs the model wins: kernel was 1.07x/1.23x/1.49x/2.17x/3.59x/
+  // 8.40x over the copy loop at 4/8/16/32/64/192 runs (measured).
+  for (std::size_t n : {4u, 8u, 16u, 32u, 64u, 192u}) {
     EXPECT_TRUE(prefer_gather_kernel(n, k48MiB));
   }
 }
 
-TEST(GatherDispatch, FloorHoldsBelowMinRuns) {
-  set_gather_dispatch(GatherDispatchMode::kAdaptive, 24);
-  // Even though the fitted model says the kernel wins from ~21 runs, the
-  // 24-run floor keeps a margin below the measured 16-32 crossover.
-  EXPECT_FALSE(prefer_gather_kernel(20, k48MiB));
-  EXPECT_FALSE(prefer_gather_kernel(23, k48MiB));
-  EXPECT_TRUE(prefer_gather_kernel(24, k48MiB));
+TEST(GatherDispatch, FloorHoldsBelowMinRunsForLargePayloads) {
+  set_gather_dispatch(GatherDispatchMode::kAdaptive, 4);
+  // 48 MiB (>= the 1 MiB floor threshold): below 4 runs the floor forces
+  // the copy engine even where the model's margin is small.
+  EXPECT_FALSE(prefer_gather_kernel(2, k48MiB));
+  EXPECT_FALSE(prefer_gather_kernel(3, k48MiB));
+  EXPECT_TRUE(prefer_gather_kernel(4, k48MiB));
+  // Below the threshold the copy engine never wins: the model decides from
+  // one run (2.3x kernel advantage measured at 4 KiB).
+  EXPECT_TRUE(prefer_gather_kernel(1, 4096));
+  EXPECT_TRUE(prefer_gather_kernel(2, 4096));
 }
 
 TEST(GatherDispatch, ZeroBytesNeverTakesTheKernel) {
@@ -482,7 +490,7 @@ TEST(GatherDispatch, ForcedModesOverrideTheModel) {
   set_gather_dispatch();  // restore the defaults for later tests
   auto [mode2, min_runs2] = gather_dispatch_config();
   EXPECT_EQ(static_cast<int>(mode2), static_cast<int>(GatherDispatchMode::kAdaptive));
-  EXPECT_EQ(min_runs2, 24u);
+  EXPECT_EQ(min_runs2, 4u);
 }
 
 // Host mirror of the CUDA kernel's grid-sizing contract (p2p_gather.cu): the

@@ -175,7 +175,7 @@ Timings bench_1d(cudaStream_t stream, std::size_t count, std::size_t run_bytes,
 
   // Adaptive: the production path — copy engine below the crossover, kernel
   // at/above it (which branch was taken is reported for verification).
-  set_gather_dispatch(GatherDispatchMode::kAdaptive, 24);
+  set_gather_dispatch(GatherDispatchMode::kAdaptive, 4);
   t.adaptive_took_kernel = vkernels::comm::prefer_gather_kernel(count, total);
   time_median(stream, iters, [&] {
     p2p_gather_runs(dst, total, src_ptrs.data(), dst_offsets.data(),
@@ -223,7 +223,7 @@ Timings bench_2d(cudaStream_t stream, std::size_t count, std::size_t width,
     p2p_gather_runs_2d(dst, dst_bytes, runs.data(), count, stream);
   }, &t.kernel_ms, &t.kernel_host_ms);
 
-  set_gather_dispatch(GatherDispatchMode::kAdaptive, 24);
+  set_gather_dispatch(GatherDispatchMode::kAdaptive, 4);
   t.adaptive_took_kernel = vkernels::comm::prefer_gather_kernel(count, count * width * height);
   time_median(stream, iters, [&] {
     p2p_gather_runs_2d(dst, dst_bytes, runs.data(), count, stream);

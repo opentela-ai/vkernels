@@ -144,25 +144,30 @@ void memcpy_peer_batch_async(Span<std::uint8_t> dst, const void* const* src_ptrs
 enum class GatherDispatchMode { kAdaptive = 0, kForceKernel = 1, kForceCopyEngine = 2 };
 
 // Set the dispatch mode and the minimum run count at which the gather
-// kernel is eligible. Defaults: kAdaptive with min_runs = 24 (the issue #6
-// measurement shows the crossover at ~19 runs for 48 MiB; the floor keeps a
-// margin so the 1-16 run range stays within 5% of the copy-engine
-// baseline). Thread-safe (atomics); typically set once before launching.
+// kernel is eligible. Defaults: kAdaptive with min_runs = 4 (measured on
+// H100 NVL: crossover ~3 runs at 48 MiB; 1-2-run margins are ~1%, so the
+// floor keeps the low-run large-payload region on the copy engine, and the
+// acceptance range 1-16 runs stays within 5% of the copy-engine baseline
+// while 8/16-run wins are preserved). Below a 1 MiB payload the floor does
+// not apply — the copy engine never wins there — so the model decides from
+// one run. Thread-safe (atomics); typically set once before launching.
 void set_gather_dispatch(GatherDispatchMode mode = GatherDispatchMode::kAdaptive,
-                         std::size_t min_runs_for_kernel = 24);
+                         std::size_t min_runs_for_kernel = 4);
 std::pair<GatherDispatchMode, std::size_t> gather_dispatch_config();
 
 // Estimated device time (microseconds) of the per-run copy-engine loop for
 // `total_bytes` split across `num_runs` cudaMemcpy*Async calls. Constants
-// are fitted to the issue #6 H100 NVL table (48 MiB, CUDA 13 / sm90,
-// peer-enabled H100 NVL): ~195.5 us for one run (~4.07 us/MiB of copy
-// bandwidth) plus ~3.08 us of per-run driver/launch overhead. `num_runs`
-// counts only non-empty runs (empty runs are dropped before dispatch).
+// fitted to H100 NVL measurements (sgs-gpu07, CUDA 13 / driver 580.82.07,
+// real NVLink peer reads): ~201.7 us for 48 MiB in one run (~4.20 us/MiB)
+// plus ~7.37 us per extra run, with a ~20 us per-call floor that dominates
+// transfers below a few MiB. `num_runs` counts only non-empty runs (empty
+// runs are dropped before dispatch); zero bytes estimates 0.
 double est_copy_engine_us(std::size_t num_runs, std::size_t total_bytes);
 
 // Estimated device time (microseconds) of the single-launch gather kernel:
-// ~253 us for 48 MiB (~5.27 us/MiB of SM-driven peer reads), essentially
-// flat in run count (grid.y growth is negligible below the 65535-run cap).
+// ~210 us for 48 MiB (~4.38 us/MiB of SM-driven peer reads, faster than
+// the copy engine's 4.20 us/MiB but with no per-run cost), plus a ~8.6 us
+// launch floor; flat in run count below the 65535-run cap.
 double est_gather_kernel_us(std::size_t num_runs, std::size_t total_bytes);
 
 // Pure dispatch decision: true -> single-launch SM gather kernel, false ->

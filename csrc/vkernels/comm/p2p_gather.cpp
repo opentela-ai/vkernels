@@ -200,19 +200,32 @@ namespace {
 // (p2p_gather.cu) and written by set_gather_dispatch; a pair of atomics is
 // enough because the two values are independent (mode and min-runs floor).
 std::atomic<unsigned> g_dispatch_mode(static_cast<unsigned>(GatherDispatchMode::kAdaptive));
-std::atomic<std::size_t> g_dispatch_min_runs(24);
+std::atomic<std::size_t> g_dispatch_min_runs(4);
 
-// Cost-model constants fitted to the issue #6 H100 NVL table (48 MiB
-// payload, CUDA 13 / sm90, peer-enabled H100 NVL):
-//   * copy-engine loop: 195.5 us @ 1 run, +3.08 us per extra run. The
-//     per-MiB term absorbs the single-copy bandwidth (48 MiB / 195.5 us
-//     ~= 4.07 us/MiB); the per-run term is the driver/launch overhead the
-//     loop pays for fragmentation.
-//   * gather kernel: ~253 us flat at 48 MiB (~5.27 us/MiB of SM-driven
-//     peer reads), flat in run count (grid.y growth is negligible).
-constexpr double kCopyPerMiBUs = 4.07;
-constexpr double kCopyPerRunUs = 3.08;
-constexpr double kKernelPerMiBUs = 5.27;
+// Cost-model constants fitted to measurements on sgs-gpu07 (4x H100 NVL,
+// CUDA 13.0 / driver 580.82.07, real NVLink peer reads GPU1->GPU0, 50-iter
+// medians, idle):
+//   * copy-engine loop: 201.7 us @ 1 run / 48 MiB, +~7.37 us per extra
+//     run, with a ~20 us per-call floor that dominates small transfers
+//     (20.1 us for a single 4 KiB copy). The per-MiB term is the
+//     bandwidth (48 MiB / 201.7 us ~= 4.20 us/MiB); the per-run term is
+//     the driver/engine overhead the loop pays for fragmentation.
+//   * gather kernel: ~210.2 us flat at 48 MiB (~4.38 us/MiB of SM-driven
+//     peer reads) with a ~8.6 us launch/grid floor; flat in run count
+//     (grid.y growth is negligible).
+constexpr double kCopyFixedUs = 20.0;    // per-call floor, dominates < 5 MiB
+constexpr double kCopyPerMiBUs = 4.20;   // ~4.07 us/MiB from issue #6, 4.20 measured
+constexpr double kCopyPerRunUs = 7.37;   // 3.08 us from issue #6, 7.37 measured
+constexpr double kKernelFixedUs = 8.6;   // launch + tiny-grid floor
+constexpr double kKernelPerMiBUs = 4.38; // 5.27 us/MiB from issue #6, 4.38 measured
+
+// The min-runs floor guards the large-payload, low-run region where the
+// copy engine's bandwidth advantage lives (measured crossover ~3 runs at
+// 48 MiB; the 1-2-run margins are ~1%, inside noise). Below this payload
+// the copy engine never wins — its fixed floor dominates and the kernel
+// takes even a single run (2.3x at 4 KiB) — so the model decides from 1
+// run there.
+constexpr std::size_t kFloorMinBytes = 1024u * 1024u;  // 1 MiB
 
 }  // namespace
 
@@ -227,14 +240,18 @@ std::pair<GatherDispatchMode, std::size_t> gather_dispatch_config() {
 }
 
 double est_copy_engine_us(std::size_t num_runs, std::size_t total_bytes) {
+  if (total_bytes == 0) return 0.0;  // nothing to copy
   const double mib = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
   const double runs = static_cast<double>(num_runs);
-  return kCopyPerMiBUs * mib + kCopyPerRunUs * (runs > 1.0 ? runs - 1.0 : 0.0);
+  const double one_call = std::max(kCopyFixedUs, kCopyPerMiBUs * mib);
+  return one_call + kCopyPerRunUs * (runs > 1.0 ? runs - 1.0 : 0.0);
 }
 
 double est_gather_kernel_us(std::size_t num_runs, std::size_t total_bytes) {
+  if (total_bytes == 0) return 0.0;  // nothing to copy
   (void)num_runs;  // flat in run count below the 65535-run grid cap
-  return kKernelPerMiBUs * (static_cast<double>(total_bytes) / (1024.0 * 1024.0));
+  return std::max(kKernelFixedUs,
+                  kKernelPerMiBUs * (static_cast<double>(total_bytes) / (1024.0 * 1024.0)));
 }
 
 bool prefer_gather_kernel(std::size_t num_runs, std::size_t total_bytes) {
@@ -244,7 +261,8 @@ bool prefer_gather_kernel(std::size_t num_runs, std::size_t total_bytes) {
     case GatherDispatchMode::kForceCopyEngine: return false;
     case GatherDispatchMode::kAdaptive: break;
   }
-  if (num_runs < g_dispatch_min_runs.load()) return false;  // floor: keep 1-16 near baseline
+  if (total_bytes >= kFloorMinBytes && num_runs < g_dispatch_min_runs.load())
+    return false;  // floor: keep the low-run large-payload region on the engine
   return est_gather_kernel_us(num_runs, total_bytes) <
          est_copy_engine_us(num_runs, total_bytes);
 }
