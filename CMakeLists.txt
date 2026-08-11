@@ -13,6 +13,7 @@ option(VKERNELS_BUILD_TESTS "Build unit tests" ON)
 option(VKERNELS_BUILD_BENCHMARKS "Build micro-benchmarks" OFF)
 option(VKERNELS_BUILD_CUDA "Compile CUDA kernel sources when a toolkit is found" ON)
 option(VKERNELS_BUILD_PYTHON "Build Python bindings (opt-in)" OFF)
+option(VKERNELS_BUILD_RUST "Register the Rust binding test suite (opt-in, needs cargo)" OFF)
 option(VKERNELS_ENABLE_COVERAGE "Enable gcov line-coverage instrumentation" OFF)
 option(VKERNELS_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(VKERNELS_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
@@ -56,6 +57,32 @@ if(VKERNELS_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
+if(VKERNELS_BUILD_BENCHMARKS)
+  add_subdirectory(benchmarks)
+endif()
+
+if(VKERNELS_BUILD_PYTHON)
+  add_subdirectory(src)
+endif()
+
+if(VKERNELS_BUILD_RUST)
+  # Rust bindings under rust/ (safe `vkernels` crate over the `vkernels-sys`
+  # FFI layer). `cargo test` builds the C++ library itself via the cmake
+  # build script, so this only registers the test; the crate builds on any
+  # machine (host path by default, VKERNELS_RUST_CUDA=ON for CUDA).
+  find_program(VKERNELS_CARGO_EXECUTABLE NAMES cargo)
+  if(NOT VKERNELS_CARGO_EXECUTABLE)
+    message(FATAL_ERROR "VKERNELS_BUILD_RUST=ON requires cargo on PATH")
+  endif()
+  if(VKERNELS_BUILD_TESTS)
+    add_test(NAME rust_bindings
+      COMMAND ${VKERNELS_CARGO_EXECUTABLE} test --manifest-path
+              ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml)
+    set_tests_properties(rust_bindings PROPERTIES
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/rust")
+  endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # Configuration summary (printed at the end of configuration)
 # ---------------------------------------------------------------------------
@@ -68,6 +95,8 @@ if(VKERNELS_HAS_CUDA)
 endif()
 message(STATUS "  Tests         : ${VKERNELS_BUILD_TESTS} (${VKERNELS_TEST_FRAMEWORK})")
 message(STATUS "  Benchmarks    : ${VKERNELS_BUILD_BENCHMARKS}")
+message(STATUS "  Python bindings: ${VKERNELS_BUILD_PYTHON}")
+message(STATUS "  Rust bindings  : ${VKERNELS_BUILD_RUST}")
 message(STATUS "  Coverage      : ${VKERNELS_ENABLE_COVERAGE}")
 message(STATUS "  ASan/UBSan    : ${VKERNELS_ENABLE_ASAN}/${VKERNELS_ENABLE_UBSAN}")
 message(STATUS "=================================")

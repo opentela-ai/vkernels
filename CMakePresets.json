@@ -59,6 +59,26 @@
       }
     },
     {
+      "name": "python",
+      "displayName": "Host + Python bindings",
+      "inherits": "_base",
+      "cacheVariables": {
+        "VKERNELS_BUILD_CUDA": "OFF",
+        "VKERNELS_BUILD_PYTHON": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "rust",
+      "displayName": "Host + Rust bindings",
+      "inherits": "_base",
+      "cacheVariables": {
+        "VKERNELS_BUILD_CUDA": "OFF",
+        "VKERNELS_BUILD_RUST": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
       "name": "cuda-debug",
       "displayName": "CUDA debug + coverage",
       "inherits": "cuda",
@@ -74,6 +94,8 @@
     { "name": "coverage", "configurePreset": "coverage" },
     { "name": "asan", "configurePreset": "asan" },
     { "name": "cuda", "configurePreset": "cuda" },
+    { "name": "python", "configurePreset": "python" },
+    { "name": "rust", "configurePreset": "rust" },
     { "name": "cuda-debug", "configurePreset": "cuda-debug" }
   ],
   "testPresets": [
@@ -82,6 +104,8 @@
     { "name": "coverage", "configurePreset": "coverage", "output": { "outputOnFailure": true } },
     { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
     { "name": "cuda", "configurePreset": "cuda", "output": { "outputOnFailure": true } },
+    { "name": "python", "configurePreset": "python", "output": { "outputOnFailure": true } },
+    { "name": "rust", "configurePreset": "rust", "output": { "outputOnFailure": true } },
     { "name": "cuda-debug", "configurePreset": "cuda-debug", "output": { "outputOnFailure": true } }
   ]
 }

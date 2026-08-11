@@ -43,9 +43,13 @@ coverage.info
 
 # Python
 __pycache__/
+.pytest_cache/
 *.egg-info/
 .venv/
 venv/
+
+# Rust (bindings under rust/)
+/rust/target/
 
 # Editor / OS
 .vscode/

@@ -10,6 +10,8 @@
 #   make tidy                    clang-tidy over changed sources (needs build/)
 #
 P ?= host
+PYTHON ?= python3
+ARGS ?= list
 
 configure:
 	cmake --preset $(P)
@@ -38,4 +40,27 @@ tidy:
 	@command -v clang-tidy >/dev/null 2>&1 || { echo "clang-tidy not installed"; exit 1; }; \
 	clang-tidy -p build/$(P) $$(git ls-files '*.cpp' '*.hpp')
 
-.PHONY: configure build test coverage clean fmt tidy
+# Python CLI (src/) — managed by uv (see pyproject.toml):
+#   make py-sync         uv sync -> .venv/ + editable install + uv.lock
+#   make vkl ARGS=list   run `vkl list` (default ARGS=list)
+#   make py-test         run the CLI's unittest suite (or: uv run pytest)
+#   make py-lock         refresh uv.lock
+vkl:
+	uv run python -m vkernels.cli $(ARGS)
+
+py-test:
+	uv run python -m unittest discover -s tests/python -v
+
+py-sync:
+	uv sync
+
+py-lock:
+	uv lock
+
+# Rust bindings (rust/) — cargo builds the C++ library itself:
+#   make rust-test       cargo test (host path by default)
+#   VKERNELS_RUST_CUDA=ON make rust-test   also compile the CUDA kernels
+rust-test:
+	cargo test --manifest-path rust/Cargo.toml
+
+.PHONY: configure build test coverage clean fmt tidy vkl py-test py-sync py-lock rust-test

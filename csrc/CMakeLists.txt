@@ -17,10 +17,16 @@ target_sources(vkernels
     vkernels/comm/channel.cpp
     vkernels/comm/allreduce.cpp
     vkernels/comm/overlap.cpp
+    vkernels/comm/p2p_gather.cpp
+    vkernels/capi/capi.cpp
 )
 
 # The CUDA sources compile only when a toolkit is present.
 if(VKERNELS_HAS_CUDA)
+  # Host translation units (e.g. device.cpp) include <cuda_runtime.h> under
+  # VKERNELS_HAS_CUDA; expose the toolkit headers to the host compiler too,
+  # not just to nvcc.
+  target_include_directories(vkernels PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_sources(vkernels
     PRIVATE
       vkernels/core/stream.cu
@@ -28,8 +34,23 @@ if(VKERNELS_HAS_CUDA)
       vkernels/kernels/elementwise.cu
       vkernels/kernels/reduce.cu
       vkernels/kernels/gemm.cu
-      vkernels/comm/allreduce.cu)
+      vkernels/comm/allreduce.cu
+      vkernels/comm/p2p_gather.cu)
   set_target_properties(vkernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+  # C ABI shared library: `extern "C"` entry points over the CUDA primitive,
+  # for non-C++ consumers (e.g. a serving runtime). The wrapper is the sole
+  # source; it links the static `vkernels` for the C++ implementation and
+  # folds every C++ exception into a status code so nothing is thrown across
+  # the boundary. Built only with a CUDA toolkit — the entry points take a
+  # raw cudaStream_t.
+  add_library(vkernels_c SHARED vkernels/comm/p2p_gather_c.cu)
+  add_library(vkernels::vkernels_c ALIAS vkernels_c)
+  target_link_libraries(vkernels_c PRIVATE vkernels)
+  target_include_directories(vkernels_c PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_compile_features(vkernels_c PRIVATE cxx_std_17)
+  vkernels_set_warnings(vkernels_c)
 endif()
 
 # Propagate the CUDA availability flag to consumers and to the library's
@@ -37,6 +58,10 @@ endif()
 target_compile_definitions(vkernels PUBLIC $<$<BOOL:${VKERNELS_HAS_CUDA}>:VKERNELS_HAS_CUDA=1>)
 
 target_link_libraries(vkernels PUBLIC Threads::Threads)
+
+# Allow linking the static library into a shared consumer (e.g. the
+# CUDA-gated `vkernels_c` C ABI shared library below).
+set_target_properties(vkernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 vkernels_set_warnings(vkernels)
 vkernels_apply_sanitizers(vkernels)

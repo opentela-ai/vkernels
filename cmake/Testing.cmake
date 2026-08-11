@@ -16,12 +16,21 @@
 include(GoogleTest OPTIONAL RESULT_VARIABLE _have_gtest)
 
 function(vkernels_add_test)
-  cmake_parse_arguments(ARG "" "NAME" "SOURCES;INCLUDE_DIRS;LIBS" ${ARGN})
+  cmake_parse_arguments(ARG "NO_VKERNELS_LIB" "NAME" "SOURCES;INCLUDE_DIRS;LIBS" ${ARGN})
 
   set(_exe "vkernels_test_${ARG_NAME}")
   add_executable(${_exe} ${ARG_SOURCES})
   target_compile_features(${_exe} PRIVATE cxx_std_17)
-  target_link_libraries(${_exe} PRIVATE vkernels ${ARG_LIBS})
+  # Most tests link the static C++ library directly. Tests that exercise a
+  # separate ABI boundary (e.g. the CUDA-gated `vkernels_c` shared library)
+  # pass NO_VKERNELS_LIB and provide the boundary library via LIBS instead,
+  # so two copies of the CUDA kernels never link into the same binary.
+  if(NOT ARG_NO_VKERNELS_LIB)
+    target_link_libraries(${_exe} PRIVATE vkernels)
+  endif()
+  if(ARG_LIBS)
+    target_link_libraries(${_exe} PRIVATE ${ARG_LIBS})
+  endif()
 
   # The shared test-main provides int main() -> run() for the minitest harness.
   target_link_libraries(${_exe} PRIVATE vkernels_test_main)

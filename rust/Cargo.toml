@@ -1,0 +1,18 @@
+# Rust bindings for the vkernels kernel library.
+#
+# This workspace mirrors the Python bindings under src/: `vkernels-sys` is
+# the unsafe FFI layer (links the C++ static library built from csrc/ via its
+# C ABI in csrc/vkernels/capi/), and `vkernels` is the safe, idiomatic API.
+# See docs/rust-bindings.md.
+[workspace]
+members = ["vkernels-sys", "vkernels"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+description = "Low-level CUDA kernels and GPU communication primitives for opentela."
+repository = "https://github.com/opentela-ai/vkernels"
+
+[workspace.dependencies]
+vkernels-sys = { path = "vkernels-sys", version = "0.1.0" }

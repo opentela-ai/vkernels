@@ -22,8 +22,9 @@ void Device::sync() const {
 
 bool Device::supports_peer(const Device& other) const {
   int can = 0;
-  cudaError_t err = cudaDeviceCanAccessPeer(index_ < 0 ? 0 : index_,
-                                            other.index_ < 0 ? 0 : other.index_, &can);
+  cudaError_t err = cudaDeviceCanAccessPeer(&can,
+                                            index_ < 0 ? 0 : index_,
+                                            other.index_ < 0 ? 0 : other.index_);
   if (err != cudaSuccess) return false;
   return can != 0;
 }

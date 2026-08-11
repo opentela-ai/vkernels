@@ -1,0 +1,24 @@
+# vkernels-sys — unsafe FFI bindings to the vkernels C++ library.
+#
+# build.rs configures the repository's own CMake build (the single source of
+# truth for the library) with the cmake crate, then this crate declares the
+# C ABI from csrc/vkernels/capi/capi.hpp as `extern "C"` functions. The safe
+# layer in the `vkernels` crate builds on top of these declarations.
+#
+# CUDA: by default the library is built host-only (CPU reference path), so
+# this crate builds and tests on any machine. Set VKERNELS_RUST_CUDA=ON to
+# compile the CUDA kernels as well (requires a CUDA toolkit; the vkernels
+# CMake build degrades gracefully to the host path when nvcc is missing).
+[package]
+name = "vkernels-sys"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+links = "vkernels"
+
+[build-dependencies]
+cmake = "0.1"
+
+[dependencies]
+libc = "0.2"
