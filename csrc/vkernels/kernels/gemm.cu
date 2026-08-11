@@ -33,6 +33,11 @@ __global__ void gemm_kernel(const float* A, const float* B, float* C, int M,
   C[row * N + col] = alpha * acc + beta * C[row * N + col];
 }
 
+// The CUDA launcher lives in `cuda::` (like elementwise.cu) so the host
+// reference (gemm.cpp) and this device launcher are separate symbols and do
+// not clash when both objects link into the same library.
+namespace cuda {
+
 void gemm(std::size_t M, std::size_t N, std::size_t K, float alpha,
           Span<const float> A, Span<const float> B, float beta, Span<float> C) {
   VK_EXPECTS(A.size() == M * K, "A must be M*K");
@@ -48,6 +53,7 @@ void gemm(std::size_t M, std::size_t N, std::size_t K, float alpha,
   VK_ENSURES(err == cudaSuccess, "cuda gemm launch failed");
 }
 
+}  // namespace cuda
 }  // namespace vkernels::kernels
 
 #endif  // VKERNELS_HAS_CUDA

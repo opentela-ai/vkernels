@@ -18,7 +18,11 @@ OverlapExecutor::Result OverlapExecutor::run(std::size_t iters,
     ready[i] = promise->get_future().share();
 
     // Submit compute(i) on the compute stream; it fulfils the promise.
-    compute_.submit([compute, i, promise]() {
+    // Note: `compute`/`comm` are captured BY REFERENCE. Copying a
+    // pybind11-wrapped std::function (func_handle) needs the GIL, and the
+    // caller may have released it while we block below; the reference is
+    // safe because run() waits for every task before returning.
+    compute_.submit([&compute, i, promise]() {
       int v = compute(i);
       promise->set_value(v);
     });
@@ -26,7 +30,7 @@ OverlapExecutor::Result OverlapExecutor::run(std::size_t iters,
     // Submit comm(i) on the comm stream; it blocks on the future (honouring the
     // data dependency) while the compute stream is free to start compute(i+1).
     auto fut = ready[i];
-    comm_.submit([comm, i, fut]() {
+    comm_.submit([&comm, i, fut]() {
       int v = fut.get();
       comm(i, v);
     });

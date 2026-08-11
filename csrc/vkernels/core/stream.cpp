@@ -39,7 +39,9 @@ struct Stream::Impl {
         task = std::move(queue.front());
         queue.pop_front();
       }
-      task();
+      {
+        task();  // may acquire/release the GIL via wrapped callables
+      }          // task destroyed here, BEFORE the completion signal
       {
         std::lock_guard<std::mutex> lk(m);
         if (--outstanding == 0) done_cv.notify_all();
