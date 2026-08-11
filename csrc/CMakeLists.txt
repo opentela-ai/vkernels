@@ -18,6 +18,7 @@ target_sources(vkernels
     vkernels/comm/allreduce.cpp
     vkernels/comm/overlap.cpp
     vkernels/comm/p2p_gather.cpp
+    vkernels/capi/capi.cpp
 )
 
 # The CUDA sources compile only when a toolkit is present.
