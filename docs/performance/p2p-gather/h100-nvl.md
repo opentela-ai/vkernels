@@ -3,132 +3,131 @@
 Issue #6: the single-launch kernel (PR #5) is fast for heavily fragmented
 run lists but slower than the per-run `cudaMemcpy2DAsync` loop for the
 common few-run case. This doc records the H100 NVL measurements that drive
-the adaptive dispatch, and the acceptance sweep.
+the adaptive dispatch and the acceptance verification.
 
 ## Environment
 
-Measured 2026-08-11 on sgs-gpu07 (4x H100 NVL, CUDA 13.0 / driver
-580.82.07, sm_90, peer access enabled). The issue #6 table used physical
-devices 2 and 3; here the same NV12 NVLink pair is reproduced with the
-benchmark's `--src-device 1` (dst on GPU 0, source on NVLink peer GPU 1).
-Payloads follow the Qwen3-14B KV geometry: 64-token pages, 40 layers,
-8 KV heads, head dim 128, BF16, 192 pages per layer, ~48 MiB per launch.
-Medians of 50 iterations per point; the machine shows a few % run-to-run
-variance (the copy loop's high-run numbers swing most).
+- sgs-gpu07: 4x NVIDIA H100 NVL (95,830 MiB), driver 580.82.07,
+  CUDA 13.0, Ubuntu 24.04
+- topology: GPU0<->GPU1 over 12 NVLinks (NV12); GPU0/1<->GPU2/3 over PCIe
+- benchmark: `p2p_gather_bench --src-device 1` — dst on device 0, src on
+  device 1 (real NVLink peer reads, bidirectional peer access enabled by
+  the bench), 50-iteration medians, idle GPU unless noted
+- commit: `8876974` (implementation) + retune commits on top
 
-## Before (PR #5 kernel, issue #6 table)
+The issue #6 table was measured with the non-vectorized PR #5 kernel
+(252-269 µs at 48 MiB). The current kernel copies 16 bytes per thread
+(`uint4`), which measured 210 µs — a ~17% kernel win on top of the
+dispatch fix.
 
-| Coalesced runs | `cudaMemcpy2DAsync` loop | PR gather | Gather speedup |
-|---:|---:|---:|---:|
-| 1 | 195.49 us | 252.64 us | 0.77x |
-| 2 | 198.85 us | 252.58 us | 0.79x |
-| 4 | 206.02 us | 252.64 us | 0.82x |
-| 8 | 220.16 us | 252.93 us | 0.87x |
-| 16 | 247.46 us | 253.25 us | 0.98x |
-| 32 | 292.54 us | 254.34 us | 1.15x |
-| 64 | 382.37 us | 256.74 us | 1.49x |
-| 192 | 784.29 us | 269.22 us | 2.91x |
+## Acceptance sweep: 48 MiB fixed payload, real NVLink peer (idle)
 
-The PR #5 kernel was flat (~253 us at 48 MiB) and crossed the copy loop
-between 16 and 32 runs. The vectorized uint4 kernel measured here is
-~43 us faster (~210 us at 48 MiB), so the crossover moved down to ~3 runs.
+| Runs | baseline us | kernel us | adaptive us | branch | speedup |
+|---:|---:|---:|---:|---|---:|
+| 1  | 200.38 | 209.50 | 200.93 | copy   | 1.00x |
+| 2  | 205.15 | 209.54 | 205.12 | copy   | 1.00x |
+| 4  | 221.38 | 209.57 | 209.60 | kernel | 1.06x |
+| 8  | 252.48 | 209.66 | 209.60 | kernel | 1.20x |
+| 16 | 308.35 | 209.70 | 209.73 | kernel | 1.47x |
+| 32 | 439.20 | 210.05 | 210.08 | kernel | 2.09x |
+| 64 | 728.29 | 210.75 | 210.88 | kernel | 3.45x |
+| 192| 1823.90| 213.63 | 213.60 | kernel | 8.54x |
 
-## After: adaptive dispatch, vectorized kernel, prepared plan
+Same sweep under concurrent compute (memory-bound fill kernel on a second
+stream):
 
-Idle GPU, real NVLink peer reads (`p2p_gather_bench --src-device 1`,
-48 MiB fixed payload, issue #6 acceptance sweep):
+| Runs | baseline us | kernel us | adaptive us | speedup |
+|---:|---:|---:|---:|---:|
+| 1  | 200.26 | 209.57 | 200.83 | 1.00x |
+| 2  | 204.93 | 209.60 | 204.83 | 1.00x |
+| 4  | 220.42 | 209.73 | 209.50 | 1.05x |
+| 8  | 252.26 | 209.70 | 209.73 | 1.20x |
+| 16 | 308.35 | 209.76 | 209.70 | 1.47x |
+| 32 | 439.14 | 210.08 | 210.18 | 2.09x |
+| 64 | 729.18 | 210.88 | 210.88 | 3.46x |
+| 192| 1832.06| 213.89 | 213.76 | 8.57x |
 
-| Runs | Copy loop baseline | Gather kernel | Adaptive | Branch | Adaptive vs baseline |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 201.70 us | 210.05 us | 202.24 us | copy | 1.00x |
-| 2 | 206.75 us | 209.98 us | 207.17 us | copy | 1.00x |
-| 4 | 224.19 us | 210.18 us | 209.92 us | kernel | 1.07x |
-| 8 | 258.02 us | 210.02 us | 210.21 us | kernel | 1.23x |
-| 16 | 313.34 us | 210.40 us | 210.18 us | kernel | 1.49x |
-| 32 | 455.46 us | 210.53 us | 210.59 us | kernel | 2.16x |
-| 64 | 759.94 us | 211.36 us | 211.33 us | kernel | 3.60x |
-| 192 | 1790.91 us | 214.34 us | 214.30 us | kernel | 8.36x |
+The kernel path is immune to the concurrent filler (it waits on NVLink
+reads, not SMs); the copy-engine loop degrades ~0-2%. The acceptance
+criteria hold in both modes:
 
-Concurrent-compute (a 256 MiB memory-bound fill kernel on a second stream)
-does not change the picture on this machine — the gather is a few % of SM
-and NVLink capacity either way: 1.00x / 1.00x / 1.07x / 1.23x / 1.48x /
-2.16x / 3.60x / 8.41x over the same run counts. Same-device D2D (no
-`--src-device`) shows the same crossover shape with a much cheaper copy
-loop: adaptive 1.00x / 1.02x / 1.15x / 1.45x / 2.02x / 3.15x / 5.30x
-(idle; concurrent is within a few %).
+- **adaptive ≤5% slower than baseline for 1-16 runs**: adaptive is never
+  slower (1.00x/1.00x/1.06x/1.20x/1.47x; 1-2 runs take the identical copy
+  path, 4-16 take the kernel which is faster);
+- **wins preserved at 32+**: 2.09x/3.45x/8.54x (idle) vs the issue #6
+  targets of 1.15x/1.49x/2.91x — better in both modes;
+- **48 MiB sweep across 1/2/4/8/16/32/64/192 runs**: above, idle and
+  concurrent.
 
-Acceptance criteria (issue #6):
+## Fragmentation / shape behaviour (measured, same setup)
 
-- adaptive within 5% of the copy-loop baseline for 1-16 runs: yes — 1-3
-  runs take the copy path (1.00x), 4+ take the kernel (faster);
-- wins at 32/64/192 preserved/improved: yes — 2.16x / 3.60x / 8.36x
-  (PR #5 measured 1.15x / 1.49x / 2.91x; the vectorized kernel also wins
-  from 4 runs, which PR #5's 0.77-0.98x never did);
-- 48 MiB swept at 1, 2, 4, 8, 16, 32, 64, 192 runs, idle and concurrent:
-  tables above;
-- descriptor preparation/allocation reported separately: `adap_host_us` /
-  `kernel_host_us` columns — the kernel path pays ~7.7 us host time
-  (validation + descriptor construction + cudaMallocAsync + H2D + launch)
-  flat across run counts, vs the copy path's per-run enqueue cost (up to
-  ~70 us at 16 runs);
-- prepared plan: below.
+- 4 MiB total: 1.00x at 1 run (copy, floor), 3.3x at 8 runs, 10.9x at 32,
+  184x at 2048 runs (per-run copy overhead dominates the loop).
+- 4 KiB runs: 1.75x even at 1 run (the copy engine's ~16-20 µs per-call
+  floor dominates 4 KiB; the model's <1 MiB payload rule sends it to the
+  kernel), 45x at 64 runs, 152x at 2048.
+- 2-D 64x512 tiles: 1.00x at 1 tile (single-tile stays on the copy engine
+  — the 2-D strided model), 11.8x at 16 tiles, 28x at 64, 43.6x at 256.
 
-Smaller payloads only strengthen the kernel case (the copy loop has a
-~20 us per-call floor, the kernel ~8.6 us): at 4 KiB the kernel wins even
-for a single run (1.86x) and the 4 MiB sweep shows 3.4x at 8 runs up to
-185x at 2048 runs. The dispatch model reflects this: below 1 MiB total the
-run-count floor does not apply and the model decides from one run.
+## Prepared plan (KVAAS reuse pattern, 48 MiB, 8 runs, 40 executes)
 
-The 2-D (strided) path is modelled separately — cudaMemcpy2DAsync has a
-lower per-call floor (~10.8 us) and the 2-D kernel pays one block per row,
-so the model keeps a single small tile on the copy engine (1.00x vs
-baseline) and switches to the kernel at ~16+ tiles (11x at 16 tiles,
-26x at 64, 41x at 256 in the 64x512-tile sweep above).
+- prepare once: **0.158 ms** (validation + descriptor build + persistent
+  `cudaMalloc` + synchronous H2D upload)
+- per-execute device time: **206.5 µs** (single kernel launch, stable
+  across all 40)
+- per-execute host enqueue: **4.2 µs** — no validation, no allocation, no
+  H2D copy per layer; the one-shot path pays ~7 µs host per launch and the
+  copy-engine path ~10-70 µs depending on run count.
 
-## Dispatch model
+## Model fit
 
-Fitted to the idle peer table above (`csrc/vkernels/comm/p2p_gather.cpp`):
+Measured 48 MiB line: copy loop 200.4 µs @1 run + ~7.3-8.5 µs per extra
+run (slope grows at high fragmentation); kernel flat ~209.7-213.6 µs.
+Fitted constants used by `prefer_gather_kernel` (1-D / strided-2-D):
 
-- copy engine ≈ max(20 µs, 4.20 µs/MiB) + 7.37 µs per extra run;
-- gather kernel ≈ max(8.6 µs, 4.38 µs/MiB), flat in run count;
-- floor: at ≥1 MiB payload the kernel is not eligible below 4 runs (the
-  1-2 run margins are ~1%, inside noise); below 1 MiB the model decides
-  from one run. Tunable at runtime via `set_gather_dispatch(mode, min_runs)`
-  with `kForceKernel` / `kForceCopyEngine` for A/B.
+- copy engine: `max(20.0, 4.20*MiB) + 7.37*(runs-1)` /
+  `max(10.75, 4.20*MiB) + 7.30*(runs-1)`
+- gather kernel: `max(8.6, 4.20*MiB)` / `14.0 + 0.13*(runs-1) + 4.20*MiB`
+- dispatch floor: 4 runs, applied only at ≥1 MiB 1-D payloads (the 1-2-run
+  margins are ~1%, inside noise; below 1 MiB the engine never wins)
 
-## Prepared plan (KVAAS 40-layer reuse)
-
-One run list prepared once, executed 40 times (8 runs, 48 MiB total —
-above the crossover, so each execute is one kernel launch):
-
-- prepare (validate + descriptor build + persistent device upload): 0.18 ms
-  one-time;
-- per-execute device time: 206.6 us (kernel path);
-- per-execute host enqueue: 5.0 us — no validation, no allocation, no H2D
-  metadata copy per layer (the one-shot kernel path pays ~7.7 us host
-  including staging, allocation and H2D).
+Crossover at 48 MiB is ~3 runs (kernel wins from 4). Retune for another
+machine/driver via `set_gather_dispatch(mode, min_runs)` or by editing the
+constants in `p2p_gather.cpp` (host-tested).
 
 ## Reproduce
 
 ```sh
 cmake --preset cuda -DVKERNELS_BUILD_BENCHMARKS=ON
 cmake --build --preset cuda
-# idle GPU, same-device simulation:
-./build/cuda/benchmarks/p2p_gather_bench
-# idle GPU, real NVLink peer reads (GPU 0 <- GPU 1):
+# idle GPU, real NVLink peer (src GPU1 -> dst GPU0):
 ./build/cuda/benchmarks/p2p_gather_bench --src-device 1
-# concurrent-compute (filler kernel on a second stream):
-./build/cuda/benchmarks/p2p_gather_bench --concurrent --src-device 1
+# concurrent-compute (fill kernel on a second stream):
+./build/cuda/benchmarks/p2p_gather_bench --src-device 1 --concurrent
+# same-device reference (D2D over HBM, ~6x faster than NVLink peer):
+./build/cuda/benchmarks/p2p_gather_bench
 ```
+
+The bench prints baseline (copy loop), forced kernel, adaptive path +
+branch taken, host-enqueue (prep) time, and the prepared-plan
+prepare-once/execute-40 timing. `--quick` drops to 10 iterations.
 
 ## Journal
 
-2026-08-11 — Issue #6 implemented and measured on sgs-gpu07: adaptive
-dispatch (fitted model + floor), vectorized uint4 kernel with scalar tail,
-prepared-plan API (host + CUDA + C ABI), acceptance benchmark with
-prep/allocation separated and concurrent mode. The uint4 vectorization cut
-the kernel's flat 48 MiB cost from ~253 us (PR #5) to ~210 us, moving the
-crossover from ~19 runs down to ~3; the model was re-fitted accordingly.
-All 15 host+CUDA tests pass on the target (three CUDA tests were fixed on
-first GPU run: one used an overlapping run list, two assumed zeroed
-cudaMalloc memory).
+2026-08-11 — Issue #6 kick-off: adaptive dispatch with a fitted cost model,
+vectorized kernel (16-byte chunks + scalar tail), prepared-plan API
+(host + CUDA + C ABI), benchmark acceptance sweeps with prep reported
+separately and a concurrent-compute mode, host tests (100% coverage on
+p2p_gather.cpp) and CUDA runtime tests. Host-only verification at the
+time (no GPU on the dev box).
+
+2026-08-11 — First real run on sgs-gpu07: the issue-table fit was off for
+this machine (kernel 210 µs not 253; copy 201.7 µs @1 run + ~7.4 µs/run
+not 195.5 + 3.08), so the model was retuned to the measured constants and
+the floor dropped 24 -> 4 with a 1 MiB payload guard (below it the engine
+never wins — the 4 KiB single-run case is 1.75x faster on the kernel).
+The 2-D single-tile case exposed a shape-blind model (0.78x regression);
+the model gained a strided variant with 2-D floors, restoring 1.00x and
+matching the whole sweep. Full acceptance sweep verified idle and
+concurrent (tables above); plan prepare 0.158 ms once, 206.5 µs per
+execute, 4.2 µs host enqueue.

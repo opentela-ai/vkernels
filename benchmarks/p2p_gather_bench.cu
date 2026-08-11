@@ -284,7 +284,7 @@ void print_header(const char* title) {
               "count", "run_bytes", "baseline_us", "kernel_us", "adaptive_us",
               "adap_kern", "adap_host_us", "kernel_host_us", "speedup");
   std::printf("%s\n",
-              "--------------------------------------------------------------------------------------");
+              "------------------------------------------------------------------------------------");
 }
 
 void print_row(std::size_t count, std::size_t run_bytes, const Timings& t) {

@@ -103,22 +103,30 @@ oracle and is fully unit-tested. The CUDA path (`p2p_gather.cu`, in
 `vkernels::comm::cuda`) reuses the oracle's `stage_runs_1d` / `stage_runs_2d`
 for validation, then dispatches **adaptively** (issue #6):
 
-- **Few runs** (below the measured 16-32 crossover on H100 NVL): one
-  `cudaMemcpyAsync` / `cudaMemcpy2DAsync` per run on the caller's stream —
-  the copy engine wins there (no SM occupancy, cheap per-run driver calls),
-  and this is byte-for-byte the baseline the primitive is measured against.
+- **Few runs** (below the crossover — 16-32 in the issue #6 table, ~3 on the
+  H100 NVL box measured here): one `cudaMemcpyAsync` / `cudaMemcpy2DAsync`
+  per run on the caller's stream — the copy engine wins there (no SM
+  occupancy, cheap per-run driver calls), and this is byte-for-byte the
+  baseline the primitive is measured against.
 - **Many runs** (at/above the crossover): the run descriptors are staged to a
   per-launch device buffer (allocated with `cudaMallocAsync` on the caller's
   stream) and **exactly one kernel** is launched — there are no per-run CUDA
   API calls after the metadata is prepared.
 
 The decision is the pure, host-tested function `prefer_gather_kernel(num_runs,
- total_bytes)` with a cost model fitted to H100 NVL measurements
-(48 MiB, CUDA 13 / sm90, real NVLink peer reads): copy engine ≈ max(20 µs,
-4.20 µs/MiB) + 7.37 µs/run, gather kernel ≈ max(8.6 µs, 4.38 µs/MiB). The
-vectorized uint4 kernel is flat (~210 µs at 48 MiB) and crosses the copy
-loop at ~3 runs, so a 4-run floor (applied only at ≥1 MiB payloads) keeps
-the 1-2 run cases on the copy engine while the kernel wins from 4 runs.
+ total_bytes, strided)` with a cost model fitted to H100 NVL measurements
+(sgs-gpu07, CUDA 13 / driver 580.82.07, real NVLink peer reads GPU1->GPU0):
+
+- copy engine ≈ `max(20 µs, 4.20 µs/MiB) + 7.37 µs/run` (2-D:
+  `max(10.75 µs, 4.20 µs/MiB) + 7.30 µs/run` — the engine's 2-D setup is
+  cheaper);
+- gather kernel ≈ `max(8.6 µs, 4.20 µs/MiB)` flat in run count (2-D:
+  `14.0 µs + 0.13 µs/run + 4.20 µs/MiB` — one block per row);
+- a 4-run floor, applied only at ≥1 MiB 1-D payloads, keeps the 1-2 run
+  cases on the copy engine where the measured margins are ~1% (inside
+  noise); below 1 MiB the engine never wins (its fixed floor dominates),
+  so the model decides from one run (1.75x kernel win at 4 KiB).
+
 `set_gather_dispatch(mode, min_runs)` overrides the model for testing
 (`kForceKernel` / `kForceCopyEngine`) and A/B tuning on a target machine.
 

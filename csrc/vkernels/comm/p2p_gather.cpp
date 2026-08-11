@@ -267,8 +267,8 @@ double est_gather_kernel_us(std::size_t num_runs, std::size_t total_bytes, bool 
   if (strided) {
     // One block per row (grid.y = height) plus grid.z = num_runs: the floor
     // and a small per-run term cover the block overhead.
-    return kKernel2DFixedUs + kKernel2DPerRunUs * static_cast<double>(num_runs > 0 ? num_runs - 1 : 0) +
-           kKernelPerMiBUs * mib;
+    const double runs = static_cast<double>(num_runs > 0 ? num_runs - 1 : 0);
+    return kKernel2DFixedUs + kKernel2DPerRunUs * runs + kKernelPerMiBUs * mib;
   }
   (void)num_runs;  // flat in run count below the 65535-run grid cap
   return std::max(kKernelFixedUs, kKernelPerMiBUs * mib);
