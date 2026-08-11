@@ -26,7 +26,8 @@ __global__ void relu_kernel(const float* x, float* out, int n) {
 namespace cuda {
 
 void add(Span<const float> a, Span<const float> b, Span<float> out) {
-  check_same(a, b, out);  // reuse CPU contract
+  VK_EXPECTS(a.size() == b.size(), "a and b must have equal length");
+  VK_EXPECTS(a.size() == out.size(), "out must have the same length as inputs");
   int n = static_cast<int>(a.size());
   // NOTE: device pointers expected here; host launch path wired in a later change.
   add_kernel<<<(n + 255) / 256, 256>>>(a.data(), b.data(), out.data(), n);

@@ -17,10 +17,15 @@ target_sources(vkernels
     vkernels/comm/channel.cpp
     vkernels/comm/allreduce.cpp
     vkernels/comm/overlap.cpp
+    vkernels/comm/p2p_gather.cpp
 )
 
 # The CUDA sources compile only when a toolkit is present.
 if(VKERNELS_HAS_CUDA)
+  # Host translation units (e.g. device.cpp) include <cuda_runtime.h> under
+  # VKERNELS_HAS_CUDA; expose the toolkit headers to the host compiler too,
+  # not just to nvcc.
+  target_include_directories(vkernels PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_sources(vkernels
     PRIVATE
       vkernels/core/stream.cu
@@ -28,7 +33,8 @@ if(VKERNELS_HAS_CUDA)
       vkernels/kernels/elementwise.cu
       vkernels/kernels/reduce.cu
       vkernels/kernels/gemm.cu
-      vkernels/comm/allreduce.cu)
+      vkernels/comm/allreduce.cu
+      vkernels/comm/p2p_gather.cu)
   set_target_properties(vkernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 

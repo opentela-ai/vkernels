@@ -56,6 +56,10 @@ if(VKERNELS_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
+if(VKERNELS_BUILD_BENCHMARKS)
+  add_subdirectory(benchmarks)
+endif()
+
 # ---------------------------------------------------------------------------
 # Configuration summary (printed at the end of configuration)
 # ---------------------------------------------------------------------------
