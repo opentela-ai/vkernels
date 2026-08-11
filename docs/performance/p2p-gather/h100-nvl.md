@@ -33,31 +33,27 @@ dispatch fix.
 | 64 | 728.29 | 210.75 | 210.88 | kernel | 3.45x |
 | 192| 1823.90| 213.63 | 213.60 | kernel | 8.54x |
 
-Same sweep under concurrent compute (memory-bound fill kernel on a second
-stream):
+Same sweep under concurrent compute. The bench's `--concurrent` mode keeps a
+**persistent** memory-bound filler kernel (1 block/SM, tunable via
+`VK_BENCH_FILL_BLOCKS`) running on a second stream for the whole bench — a
+finite burst of fill kernels drains before the measured sections run (an
+early bench bug, caught with nsys) — so every timed section genuinely
+overlaps the load:
 
 | Runs | baseline us | kernel us | adaptive us | speedup |
 |---:|---:|---:|---:|---:|
-| 1  | 200.26 | 209.57 | 200.83 | 1.00x |
-| 2  | 204.93 | 209.60 | 204.83 | 1.00x |
-| 4  | 220.42 | 209.73 | 209.50 | 1.05x |
-| 8  | 252.26 | 209.70 | 209.73 | 1.20x |
-| 16 | 308.35 | 209.76 | 209.70 | 1.47x |
-| 32 | 439.14 | 210.08 | 210.18 | 2.09x |
-| 64 | 729.18 | 210.88 | 210.88 | 3.46x |
-| 192| 1832.06| 213.89 | 213.76 | 8.57x |
+| 1  | 201.38 | 210.53 | 201.95 | 1.00x |
+| 2  | 207.07 | 210.34 | 207.14 | 1.00x |
+| 4  | 224.42 | 210.43 | 210.50 | 1.07x |
+| 8  | 257.50 | 210.30 | 210.40 | 1.22x |
+| 16 | 312.83 | 210.62 | 210.69 | 1.48x |
+| 32 | 454.14 | 210.78 | 210.88 | 2.15x |
+| 64 | 759.01 | 211.68 | 211.62 | 3.59x |
+| 192| 1807.42| 214.37 | 214.40 | 8.43x |
 
-The kernel path is immune to the concurrent filler (it waits on NVLink
-reads, not SMs); the copy-engine loop degrades ~0-2%. The acceptance
-criteria hold in both modes:
-
-- **adaptive ≤5% slower than baseline for 1-16 runs**: adaptive is never
-  slower (1.00x/1.00x/1.06x/1.20x/1.47x; 1-2 runs take the identical copy
-  path, 4-16 take the kernel which is faster);
-- **wins preserved at 32+**: 2.09x/3.45x/8.54x (idle) vs the issue #6
-  targets of 1.15x/1.49x/2.91x — better in both modes;
-- **48 MiB sweep across 1/2/4/8/16/32/64/192 runs**: above, idle and
-  concurrent.
+The acceptance criteria hold in both modes (the 1-2 run copy path is
+identical to the baseline by construction; 4-16 run the kernel which is
+faster):
 
 ## Fragmentation / shape behaviour (measured, same setup)
 
@@ -102,8 +98,10 @@ cmake --preset cuda -DVKERNELS_BUILD_BENCHMARKS=ON
 cmake --build --preset cuda
 # idle GPU, real NVLink peer (src GPU1 -> dst GPU0):
 ./build/cuda/benchmarks/p2p_gather_bench --src-device 1
-# concurrent-compute (fill kernel on a second stream):
+# concurrent-compute (persistent fill kernel on a second stream):
 ./build/cuda/benchmarks/p2p_gather_bench --src-device 1 --concurrent
+# different concurrent-load levels (blocks of the persistent filler):
+VK_BENCH_FILL_BLOCKS=512 ./build/cuda/benchmarks/p2p_gather_bench --src-device 1 --concurrent
 # same-device reference (D2D over HBM, ~6x faster than NVLink peer):
 ./build/cuda/benchmarks/p2p_gather_bench
 ```
@@ -111,6 +109,51 @@ cmake --build --preset cuda
 The bench prints baseline (copy loop), forced kernel, adaptive path +
 branch taken, host-enqueue (prep) time, and the prepared-plan
 prepare-once/execute-40 timing. `--quick` drops to 10 iterations.
+
+## Profiling (issue #6 item 4): copy engine vs SM gather
+
+nsys CUDA trace of the concurrent quick bench (20000+ GPU ops):
+
+- **DMA ops are cheap on the device but expensive to enqueue**: each
+  `cudaMemcpyPeerAsync`/`cudaMemcpy2DAsync` takes ~1.76 µs of device time
+  (median) but the loop pays ~8 µs between ops (host enqueue ~6.3 µs per
+  call, driver-bound — 83k calls = 523 ms of host time in the quick bench)
+  and ~7.3-8.5 µs/run of device time at 48 MiB. The kernel replaces N
+  enqueues + N DMAs with 1 enqueue + 1 launch.
+- **SM gather is immune to concurrent memory-bound compute at realistic
+  occupancy** (issue #6's concern that the gather steals SMs from
+  attention): with the persistent filler at 64-512 blocks (0.5-4 blocks per
+  SM, hammering HBM), the 48 MiB gather stays 210-217 µs — identical to
+  idle. It only pays when the GPU is at full occupancy (1024 filler blocks,
+  8 blocks/SM = all resident slots): then it starves for slots, 1259 µs
+  (~6x) at 1-64 runs (still beats the copy loop at 192 runs: 1397 vs
+  1821 µs).
+- **The copy engine is immune at every load level** (it never touches
+  SMs): baseline stays 201-207 µs at 1-2 runs even under full-occupancy
+  load. The adaptive dispatch inherits this — the 1-2-run path is
+  unaffected by any concurrent load.
+- The nsys trace confirms real overlap: with the fixed bench, 483/484
+  gather kernels and 88,725/88,728 DMA ops execute inside the persistent
+  filler's lifetime (the earlier burst filler drained in 56 ms, i.e. before
+  the measured sections started — a bench bug that silently made the
+  "concurrent" numbers idle numbers).
+
+Bench-harness notes for the concurrent mode (all three bit us on this
+machine; the first one is the interesting general rule):
+
+1. **Synchronous CUDA memory ops wait for device quiescence**: the first
+   `cudaMemPoolSetAttribute` (default-pool tuning on the first
+   `cudaMallocAsync`), the first launch of a not-yet-JIT'd kernel, and any
+   `cudaMalloc`/`cudaFree` all block until the persistent filler exits
+   (~2 min). Fix: allocate all scratch buffers once in main, warm up the
+   pool + both kernels before the filler, and prepare/destroy the plan
+   around it.
+2. The filler must poll a *volatile* stop flag — a plain `int*` load is
+   hoisted by the compiler (type-based aliasing proves the float4 stores
+   can't touch it) and the kernel never exits.
+3. The release memset must run on a stream that is not queued behind the
+   filler kernel (it would never execute); from the main stream it runs on
+   the copy engine while the filler still occupies SMs.
 
 ## Journal
 
@@ -130,4 +173,14 @@ The 2-D single-tile case exposed a shape-blind model (0.78x regression);
 the model gained a strided variant with 2-D floors, restoring 1.00x and
 matching the whole sweep. Full acceptance sweep verified idle and
 concurrent (tables above); plan prepare 0.158 ms once, 206.5 µs per
-execute, 4.2 µs host enqueue.
+execute, 4.2 µs host enqueue. Bench concurrency was re-verified with nsys:
+the burst filler drained before the timed sections (concurrent numbers were
+idle numbers); replaced it with a persistent filler (volatile stop flag,
+release memset off-stream, no synchronous cudaMalloc/cudaFree during the
+bench), giving real overlap (483/484 gathers inside the filler window).
+Profiling answers (item 4): DMA ops cost ~1.76 µs device + ~6.3 µs host
+enqueue each; the SM gather is immune to the filler up to 4 blocks/SM
+(210-217 µs at 48 MiB) and only pays ~6x at full SM occupancy (1024
+blocks), where it still beats the copy loop at 192 runs; the copy engine is
+immune at every load level, so the 1-2-run adaptive path never regresses
+under load.

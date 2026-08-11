@@ -64,12 +64,39 @@ namespace {
 // Source device for the "peer" buffer (0 = same-device simulation).
 int g_src_dev = 0;
 
-// Memory-bound filler kernel run concurrently on a second stream in
-// --concurrent mode: it competes with the gather for SMs and HBM bandwidth,
-// the way attention kernels do during model execution.
+// Memory-bound filler kernels run concurrently on a second stream in
+// --concurrent mode: they compete with the gather for SMs and HBM
+// bandwidth, the way attention kernels do during model execution.
 __global__ void fill_kernel(float* p, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) p[i] = 1.0f;
+}
+
+// Persistent filler: occupies kFillBlocks SMs for the whole bench (the
+// finite burst of fill_kernel launches drained in ~56 ms, i.e. before the
+// measured sections even started — no real overlap). Each thread streams
+// float4 stores over the buffer in a grid-stride loop until the host sets
+// *stop (a 4-byte cudaMemsetAsync on the filler stream right before the
+// final sync) or a generous clock64 timeout fires. 64 blocks leaves ~half
+// the H100's SMs free, so the timed gather kernels still get slots and the
+// comparison measures contention rather than full starvation.
+__global__ void fill_persistent_kernel(float4* p, int n4, const volatile int* stop) {
+  long long t0 = clock64();
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = gridDim.x * blockDim.x;
+  float4 v = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+  while (*stop == 0 && clock64() - t0 < 120LL * 1890000000LL) {
+    p[i] = v;
+    v.x += 1.0f; v.y += 1.0f; v.z += 1.0f; v.w += 1.0f;
+    i += stride;
+    if (i >= n4) i -= n4;  // wrap within the buffer
+  }
+}
+
+// Trace helper for VK_BENCH_TRACE (debugging the concurrent filler).
+double trace_ms_since_start() {
+  static const auto t0 = std::chrono::steady_clock::now();
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 struct Timings {
@@ -118,30 +145,38 @@ void time_median(cudaStream_t stream, int iters, Fn fn, float* device_ms,
   cudaEventDestroy(e);
 }
 
-// If --concurrent, enqueue `fillers` fill kernels on `s2` writing to `buf` so
-// the device is still busy with them while the timed work on `s1` runs.
-// The buffer is owned by the caller (never cudaFree it here: cudaFree would
-// block the host until the enqueued fills finish, serialising the very
-// overlap this mode exists to create); free it after
-// cudaStreamSynchronize(s2).
-void maybe_start_filler(bool concurrent, float* buf, int n, cudaStream_t s2) {
+// If --concurrent, launch the persistent filler on `s2` writing to `buf` so
+// the device stays busy with it while the timed work on `s1` runs. `stop`
+// is a device int the host clears to 1 (cudaMemsetAsync on `s2`) before
+// cudaStreamSynchronize(s2), releasing the SMs. The buffer is owned by the
+// caller (never cudaFree it here: cudaFree would block the host until the
+// enqueued fills finish, serialising the very overlap this mode exists to
+// create); free it after cudaStreamSynchronize(s2).
+void maybe_start_filler(bool concurrent, float* buf, int n, int* stop,
+                        cudaStream_t s2) {
   if (!concurrent) return;
-  for (int i = 0; i < 20000; ++i)
-    fill_kernel<<<1024, 256, 0, s2>>>(buf, n);
+  // Number of blocks (SM slots) the persistent filler occupies. Tunable via
+  // VK_BENCH_FILL_BLOCKS to model different concurrent-load levels; the
+  // default 128 puts one 256-thread block on each H100 SM, leaving the
+  // gather to contend for the remaining resident-block slots.
+  int blocks = 128;
+  if (const char* e = std::getenv("VK_BENCH_FILL_BLOCKS")) blocks = std::atoi(e);
+  if (blocks < 1) blocks = 1;
+  cudaMemsetAsync(stop, 0, sizeof(int), s2);
+  fill_persistent_kernel<<<blocks, 256, 0, s2>>>(
+      reinterpret_cast<float4*>(buf), n / 4, stop);
 }
 
 // 1-D sweep: `count` disjoint runs of `run_bytes` each, total = count*run_bytes.
-// Times the per-run copy loop (baseline), the forced kernel, and the
-// adaptive path; reports host-enqueue time for the adaptive path.
+// 1-D sweep: `count` disjoint runs of `run_bytes` each, total = count*run_bytes
+// into pre-allocated scratch `dst`/`src` (owned by main: no cudaMalloc/cudaFree
+// here — synchronous memory ops wait for device quiescence, which with the
+// persistent filler running would block the host for the whole filler
+// duration). Times the per-run copy loop (baseline), the forced kernel, and
+// the adaptive path; reports host-enqueue time for the adaptive path.
 Timings bench_1d(cudaStream_t stream, std::size_t count, std::size_t run_bytes,
-                 int iters) {
+                 int iters, std::uint8_t* dst, std::uint8_t* src) {
   const std::size_t total = count * run_bytes;
-  std::uint8_t* dst = nullptr;
-  std::uint8_t* src = nullptr;  // one contiguous "peer" region, sliced per run
-  cudaMalloc(&dst, total);
-  cudaSetDevice(g_src_dev);
-  cudaMalloc(&src, total);
-  cudaSetDevice(0);
 
   std::vector<const void*> src_ptrs(count);
   std::vector<std::size_t> dst_offsets(count);
@@ -165,6 +200,8 @@ Timings bench_1d(cudaStream_t stream, std::size_t count, std::size_t run_bytes,
       cudaMemcpyPeerAsync(dst + dst_offsets[i], 0, src_ptrs[i], g_src_dev,
                           lengths[i], stream);
   }, &t.baseline_ms, &h);
+  if (std::getenv("VK_BENCH_TRACE"))
+    std::fprintf(stderr, "[%.0f ms] bench_1d n=%zu baseline done\n", trace_ms_since_start(), count);
 
   // Forced kernel: the PR #5 single-launch path, measured directly.
   set_gather_dispatch(GatherDispatchMode::kForceKernel, 1);
@@ -172,6 +209,8 @@ Timings bench_1d(cudaStream_t stream, std::size_t count, std::size_t run_bytes,
     p2p_gather_runs(dst, total, src_ptrs.data(), dst_offsets.data(),
                     lengths.data(), count, stream);
   }, &t.kernel_ms, &t.kernel_host_ms);
+  if (std::getenv("VK_BENCH_TRACE"))
+    std::fprintf(stderr, "[%.0f ms] bench_1d n=%zu kernel done\n", trace_ms_since_start(), count);
 
   // Adaptive: the production path — copy engine below the crossover, kernel
   // at/above it (which branch was taken is reported for verification).
@@ -182,26 +221,21 @@ Timings bench_1d(cudaStream_t stream, std::size_t count, std::size_t run_bytes,
                     lengths.data(), count, stream);
   }, &t.adaptive_ms, &t.adaptive_host_ms);
   set_gather_dispatch();  // restore defaults
-
-  cudaFree(dst);
-  cudaFree(src);
+  if (std::getenv("VK_BENCH_TRACE"))
+    std::fprintf(stderr, "[%.0f ms] bench_1d n=%zu adaptive done\n", trace_ms_since_start(), count);
   return t;
 }
 
 // 2-D sweep: `count` strided tiles, each `height` x `width` bytes copied from a
 // row-major peer region (src stride `src_stride`) into `dst` (dst stride
-// `dst_stride`). Baseline is one cudaMemcpy2DAsync per tile.
+// `dst_stride`). Baseline is one cudaMemcpy2DAsync per tile. dst/src are the
+// shared scratch buffers from main (see bench_1d).
 Timings bench_2d(cudaStream_t stream, std::size_t count, std::size_t width,
                  std::size_t height, std::size_t src_stride,
-                 std::size_t dst_stride, int iters) {
+                 std::size_t dst_stride, int iters, std::uint8_t* dst,
+                 std::uint8_t* src) {
   const std::size_t src_bytes = count * height * src_stride;
   const std::size_t dst_bytes = count * height * dst_stride;
-  std::uint8_t* dst = nullptr;
-  std::uint8_t* src = nullptr;
-  cudaMalloc(&dst, dst_bytes);
-  cudaSetDevice(g_src_dev);
-  cudaMalloc(&src, src_bytes);
-  cudaSetDevice(0);
 
   std::vector<Gather2DRun> runs(count);
   for (std::size_t i = 0; i < count; ++i)
@@ -233,8 +267,6 @@ Timings bench_2d(cudaStream_t stream, std::size_t count, std::size_t width,
   }, &t.adaptive_ms, &t.adaptive_host_ms);
   set_gather_dispatch();
 
-  cudaFree(dst);
-  cudaFree(src);
   return t;
 }
 
@@ -242,15 +274,17 @@ Timings bench_2d(cudaStream_t stream, std::size_t count, std::size_t width,
 // then time `repeats` execute() calls — the KVAAS "one run list, 40 layers"
 // pattern. Reports the median per-execute device time and the total, so the
 // per-layer overhead of validation/allocation/H2D is visible as zero.
-void bench_plan_1d(cudaStream_t stream, std::size_t count, std::size_t run_bytes,
-                   int repeats) {
+// dst/src are the shared scratch buffers from main; the plan borrows them
+// (it must outlive its streams, and main frees them after the filler).
+// The plan is created BEFORE the filler launches (its prepare's cudaMalloc
+// and its destructor's cudaFree are synchronous and would otherwise block
+// for the filler's lifetime) and destroyed AFTER the filler is released.
+// Returns the one-time prepare host time; the caller prints it with the
+// execute() timing.
+double bench_plan_prepare(std::size_t count, std::size_t run_bytes,
+                          std::uint8_t* dst, std::uint8_t* src,
+                          P2PGatherPlan1D** out) {
   const std::size_t total = count * run_bytes;
-  std::uint8_t* dst = nullptr;
-  std::uint8_t* src = nullptr;
-  cudaMalloc(&dst, total);
-  cudaSetDevice(g_src_dev);
-  cudaMalloc(&src, total);
-  cudaSetDevice(0);
   std::vector<const void*> src_ptrs(count);
   std::vector<std::size_t> dst_offsets(count), lengths(count);
   for (std::size_t i = 0; i < count; ++i) {
@@ -263,19 +297,10 @@ void bench_plan_1d(cudaStream_t stream, std::size_t count, std::size_t run_bytes
   // device allocation + synchronous H2D upload. Host wall time only (the
   // upload is synchronous so it is included).
   auto p0 = std::chrono::steady_clock::now();
-  P2PGatherPlan1D plan(dst, total, src_ptrs.data(), dst_offsets.data(),
-                       lengths.data(), count);
+  *out = new P2PGatherPlan1D(dst, total, src_ptrs.data(), dst_offsets.data(),
+                             lengths.data(), count);
   auto p1 = std::chrono::steady_clock::now();
-  const double prepare_ms =
-      std::chrono::duration<double, std::milli>(p1 - p0).count();
-
-  float dev = 0.0f, host = 0.0f;
-  time_median(stream, std::min(repeats, 25), [&] { plan.execute(stream); },
-              &dev, &host);
-  std::printf("  plan  %-5zu %-10zu %-12.3f %-12.2f %-12.2f\n",
-              count, run_bytes, prepare_ms, dev * 1e3f, host * 1e3f);
-  cudaFree(dst);
-  cudaFree(src);
+  return std::chrono::duration<double, std::milli>(p1 - p0).count();
 }
 
 void print_header(const char* title) {
@@ -284,7 +309,7 @@ void print_header(const char* title) {
               "count", "run_bytes", "baseline_us", "kernel_us", "adaptive_us",
               "adap_kern", "adap_host_us", "kernel_host_us", "speedup");
   std::printf("%s\n",
-              "------------------------------------------------------------------------------------");
+              "-----------------------------------------------------------------------------");
 }
 
 void print_row(std::size_t count, std::size_t run_bytes, const Timings& t) {
@@ -358,53 +383,144 @@ int main(int argc, char** argv) {
   // before the final sync would serialise the overlap (see
   // maybe_start_filler).
   float* filler_buf = nullptr;
+  int* filler_stop = nullptr;
   const int filler_n = static_cast<int>(256u * 1024u * 1024u / sizeof(float));
-  if (concurrent) cudaMalloc(&filler_buf, 256u * 1024u * 1024u);
+  if (concurrent) {
+    cudaMalloc(&filler_buf, 256u * 1024u * 1024u);
+    cudaMalloc(&filler_stop, sizeof(int));
+  }
+
+  // Shared scratch buffers, allocated ONCE before the filler and freed only
+  // after it is released: synchronous cudaMalloc/cudaFree wait for device
+  // quiescence, which with the persistent filler running would block the
+  // host for the whole filler duration, serialising the very overlap the
+  // concurrent mode exists to measure. 48 MiB covers every sweep (the 2-D
+  // and plan sections need at most 16 MiB / 48 MiB).
+  const std::size_t k48MiB = 48u * 1024u * 1024u;
+  std::uint8_t* dst_buf = nullptr;
+  std::uint8_t* src_buf = nullptr;
+  cudaMalloc(&dst_buf, k48MiB);
+  cudaSetDevice(g_src_dev);
+  cudaMalloc(&src_buf, k48MiB);
+  cudaSetDevice(0);
 
   // Issue #6 acceptance sweep: fixed 48 MiB payload across the run counts
   // that bracket the measured 16-32 crossover (1, 2, 4, 8, 16 below it;
   // 32, 64, 192 at/above it).
-  maybe_start_filler(concurrent, filler_buf, filler_n, filler_stream);
+  // The prepared plan is created BEFORE the filler: its prepare does a
+  // synchronous cudaMalloc and its destructor a synchronous cudaFree — both
+  // wait for device quiescence, which would block for the filler's whole
+  // lifetime. The plan borrows the shared scratch buffers (it must outlive
+  // the streams it executes on; main frees the buffers after the filler is
+  // released and the plan is destroyed).
+  print_header("Prepared plan: prepare once, 40 layer executes (48 MiB total)");
+  constexpr std::size_t kPlanRuns = 8;
+  P2PGatherPlan1D* plan = nullptr;
+  const double plan_prepare_ms =
+      bench_plan_prepare(kPlanRuns, k48MiB / kPlanRuns, dst_buf, src_buf,
+                         &plan);
+
+  if (concurrent) {
+    // Warm up the one-time default-pool tuning and the gather-kernel JIT
+    // BEFORE the filler launches: cudaMemPoolSetAttribute on first use
+    // synchronizes the device, so a first timed kernel section would block
+    // until the persistent filler exits (~2 min). A tiny warmup gather on
+    // the idle device makes the timed sections' pool allocations cheap
+    // pool-internal bumps.
+    set_gather_dispatch(GatherDispatchMode::kForceKernel, 1);
+    const std::size_t kWarm = 256u * 1024u;  // fits the 64x512 2-D tile
+    std::uint8_t* wsrc = nullptr;
+    std::uint8_t* wdst = nullptr;
+    cudaMalloc(&wsrc, kWarm);
+    cudaMalloc(&wdst, kWarm);
+    const void* wsrcs[1] = {wsrc};
+    std::size_t woff[1] = {0};
+    std::size_t wlen[1] = {4096};
+    p2p_gather_runs(wdst, kWarm, wsrcs, woff, wlen, 1, stream);
+    // Also warm the 2-D kernel (first launch synchronizes the device, like
+    // the pool tuning): one 64x512 tile.
+    Gather2DRun wrun = {wsrc, 4096, 0, 4096, 512, 64};
+    p2p_gather_runs_2d(wdst, kWarm, &wrun, 1, stream);
+    cudaStreamSynchronize(stream);
+    cudaFree(wsrc);
+    cudaFree(wdst);
+    set_gather_dispatch();
+  }
+  maybe_start_filler(concurrent, filler_buf, filler_n, filler_stop,
+                     filler_stream);
+  auto wall0 = std::chrono::steady_clock::now();
+  auto wall = [&](const char* tag) {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - wall0)
+                          .count();
+    std::fprintf(stderr, "[wall %.0f ms] %s\n", ms, tag);
+  };
+  wall("filler launched");
   print_header("1-D gather: 48 MiB fixed payload, issue #6 acceptance sweep");
-  constexpr std::size_t k48MiB = 48u * 1024u * 1024u;
   for (std::size_t count : {1u, 2u, 4u, 8u, 16u, 32u, 64u, 192u}) {
-    const Timings t = bench_1d(stream, count, k48MiB / count, iters);
+    const Timings t = bench_1d(stream, count, k48MiB / count, iters,
+                               dst_buf, src_buf);
     print_row(count, k48MiB / count, t);
   }
+  wall("48MiB sweep done");
 
   // Existing sweep: 4 MiB total at increasing fragmentation.
   print_header("1-D gather: 4 MiB total, sweep fragmentation");
   constexpr std::size_t k4MiB = 4u * 1024u * 1024u;
   for (std::size_t count : {1u, 8u, 32u, 128u, 512u, 2048u}) {
-    const Timings t = bench_1d(stream, count, k4MiB / count, iters);
+    const Timings t = bench_1d(stream, count, k4MiB / count, iters,
+                               dst_buf, src_buf);
     print_row(count, k4MiB / count, t);
   }
+  wall("4MiB sweep done");
 
   // Fixed page size: 4 KiB runs, sweep count.
   print_header("1-D gather: 4 KiB runs, sweep count");
   for (std::size_t count : {1u, 64u, 256u, 1024u, 2048u}) {
-    const Timings t = bench_1d(stream, count, 4u * 1024u, iters);
+    const Timings t = bench_1d(stream, count, 4u * 1024u, iters,
+                               dst_buf, src_buf);
     print_row(count, 4u * 1024u, t);
   }
+  wall("4KiB sweep done");
 
   // 2-D: strided tiles, sweep count.
   print_header("2-D gather: 64x512 strided tiles, sweep count");
   for (std::size_t count : {1u, 16u, 64u, 256u}) {
-    const Timings t = bench_2d(stream, count, 512u, 64u, 1024u, 1024u, iters);
+    const Timings t = bench_2d(stream, count, 512u, 64u, 1024u, 1024u, iters,
+                               dst_buf, src_buf);
     print_row(count, 0, t);
   }
+  wall("2D sweep done");
 
-  // Prepared plan: the KVAAS reuse pattern (one run list, many layer
-  // launches). prepare_ms is the ONE-TIME cost; the per-execute device and
-  // host times are what every layer pays after that (no allocation, no H2D).
-  print_header("Prepared plan: prepare once, 40 layer executes (48 MiB total)");
-  constexpr std::size_t kPlanRuns = 8;
-  bench_plan_1d(stream, kPlanRuns, k48MiB / kPlanRuns, 40);
+  // Prepared plan executes: the KVAAS reuse pattern (one run list, many
+  // layer launches). prepare_ms (reported above, measured on the idle
+  // device before the filler) is the ONE-TIME cost; the per-execute device
+  // and host times are what every layer pays after that (no allocation, no
+  // H2D) — timed here under the concurrent filler when --concurrent.
+  float plan_dev = 0.0f, plan_host = 0.0f;
+  time_median(stream, 25, [&] { plan->execute(stream); }, &plan_dev,
+              &plan_host);
+  std::printf("  plan  %-5zu %-10zu %-12.3f %-12.2f %-12.2f\n",
+              kPlanRuns, k48MiB / kPlanRuns, plan_prepare_ms,
+              plan_dev * 1e3f, plan_host * 1e3f);
+  wall("plan done");
 
   if (concurrent) {
+    // Release the persistent filler. The memset must go on a stream that is
+    // NOT blocked behind the filler kernel (on the filler stream it would
+    // queue after the kernel and never execute — the kernel polls *stop):
+    // from the main stream it runs on the copy engine while the filler
+    // still occupies SMs, and the filler exits on its next poll. Then wait
+    // for it to drain and free the buffer.
+    cudaMemsetAsync(filler_stop, 1, sizeof(int), stream);
     cudaStreamSynchronize(filler_stream);
+    wall("filler released");
     cudaFree(filler_buf);
+    cudaFree(filler_stop);
   }
+  delete plan;  // destructor's cudaFree runs after the filler is gone
+  cudaFree(dst_buf);
+  cudaFree(src_buf);
   cudaStreamDestroy(filler_stream);
   cudaStreamDestroy(stream);
   return 0;

@@ -234,8 +234,19 @@ caught inside the wrapper and mapped to `VKERNELS_ERR_INVALID_ARGUMENT` or
 cmake --preset cuda -DVKERNELS_BUILD_BENCHMARKS=ON
 cmake --build --preset cuda
 ./build/cuda/benchmarks/p2p_gather_bench            # idle GPU
-./build/cuda/benchmarks/p2p_gather_bench --concurrent  # filler kernel on a 2nd stream
+./build/cuda/benchmarks/p2p_gather_bench --concurrent  # persistent filler on a 2nd stream
+VK_BENCH_FILL_BLOCKS=1024 ./build/cuda/benchmarks/p2p_gather_bench --concurrent  # full-occupancy load
 ```
+
+The `--concurrent` filler is a persistent kernel occupying one block per SM
+(`VK_BENCH_FILL_BLOCKS` to change) for the whole bench, released by a
+volatile stop flag — a finite burst of fill kernels drains before the
+measured sections and silently measures idle (see
+`docs/performance/p2p-gather/h100-nvl.md` for the nsys evidence). The
+bench allocates its scratch buffers once and warms up the pool tuning and
+both kernels before the filler: synchronous `cudaMalloc`/`cudaFree` and
+the first-use `cudaMemPoolSetAttribute` wait for device quiescence and
+would block for the filler's whole lifetime.
 
 The benchmark covers the issue #6 acceptance criteria: a fixed 48 MiB
 payload swept across 1, 2, 4, 8, 16, 32, 64 and 192 runs (bracketing the
