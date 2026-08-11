@@ -429,12 +429,20 @@ TEST(GatherDispatch, CostModelMatchesH100NVLMeasurements) {
   EXPECT_EQ(est_copy_engine_us(0, 0), 0.0);
   EXPECT_EQ(est_copy_engine_us(1, 0), 0.0);  // one run, zero bytes: no cost
 
-  // Gather kernel: ~210 us flat at 48 MiB, independent of run count; the
-  // fixed launch floor covers tiny transfers (8.58 us measured at 4 KiB).
-  EXPECT_NEAR(est_gather_kernel_us(1, k48MiB), 210.2, 1.0);
-  EXPECT_NEAR(est_gather_kernel_us(192, k48MiB), 210.2, 1.0);
+  // Gather kernel: ~210 us measured flat at 48 MiB (4.20 us/MiB with the
+  // 8.6 us floor), independent of run count; the floor covers tiny
+  // transfers (9.4 us measured at 4 KiB).
+  EXPECT_NEAR(est_gather_kernel_us(1, k48MiB), 201.6, 1.0);
+  EXPECT_NEAR(est_gather_kernel_us(192, k48MiB), 201.6, 1.0);
   EXPECT_NEAR(est_gather_kernel_us(1, 4096), 8.6, 0.5);
   EXPECT_EQ(est_gather_kernel_us(1, 0), 0.0);
+
+  // Strided (2-D) shapes: the engine's per-call floor is lower (~10.8 us)
+  // and the kernel pays one block per row (floor ~14 us + 0.13 us/run).
+  EXPECT_NEAR(est_copy_engine_us(1, 32768, true), 10.75, 0.2);
+  EXPECT_NEAR(est_copy_engine_us(16, 524288, true), 120.3, 1.0);
+  EXPECT_NEAR(est_gather_kernel_us(1, 32768, true), 14.1, 0.2);
+  EXPECT_NEAR(est_gather_kernel_us(16, 524288, true), 18.1, 0.5);
 
   // Monotonicity: the loop grows with run count, the kernel does not.
   EXPECT_LT(est_copy_engine_us(1, k48MiB), est_copy_engine_us(2, k48MiB));
@@ -453,6 +461,18 @@ TEST(GatherDispatch, AdaptiveChoosesKernelAboveMeasuredCrossover) {
   for (std::size_t n : {4u, 8u, 16u, 32u, 64u, 192u}) {
     EXPECT_TRUE(prefer_gather_kernel(n, k48MiB));
   }
+}
+
+TEST(GatherDispatch, Strided2DDecisionsMatchMeasurements) {
+  set_gather_dispatch(GatherDispatchMode::kAdaptive, 4);
+  // 2-D never applies the min-runs floor (the acceptance region is 1-D):
+  // the model decides, and it matches the 64x512-tile sweep — a single
+  // tile goes to the copy engine (10.8 vs 14.1 us measured), two or more
+  // to the kernel (the loop's per-run cost dominates: 8.3x at 16 tiles).
+  EXPECT_FALSE(prefer_gather_kernel(1, 32768, true));
+  EXPECT_TRUE(prefer_gather_kernel(2, 65536, true));
+  EXPECT_TRUE(prefer_gather_kernel(16, 524288, true));
+  EXPECT_TRUE(prefer_gather_kernel(256, 8u * 1024u * 1024u, true));
 }
 
 TEST(GatherDispatch, FloorHoldsBelowMinRunsForLargePayloads) {

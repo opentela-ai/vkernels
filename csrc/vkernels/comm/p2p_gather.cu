@@ -362,7 +362,7 @@ void p2p_gather_runs_2d(std::uint8_t* dst, std::size_t dst_capacity, const Gathe
 
   std::size_t total = 0;
   for (const auto& r : staged) total += r.width * r.height;
-  if (prefer_gather_kernel(staged.size(), total)) {
+  if (prefer_gather_kernel(staged.size(), total, /*strided=*/true)) {
     kernel_2d_oneshot(dst, staged, stream);
   } else {
     copy_engine_2d(staged, dst, stream);
@@ -517,7 +517,7 @@ std::size_t P2PGatherPlan2D::total_bytes() const { return impl_->total; }
 
 void P2PGatherPlan2D::execute(cudaStream_t stream) const {
   if (impl_->host_runs.empty()) return;  // valid no-op plan
-  if (prefer_gather_kernel(impl_->host_runs.size(), impl_->total)) {
+  if (prefer_gather_kernel(impl_->host_runs.size(), impl_->total, /*strided=*/true)) {
     launch_gather_2d(impl_->d_runs, impl_->host_runs.size(), impl_->max_units,
                      impl_->max_height, stream);
   } else {

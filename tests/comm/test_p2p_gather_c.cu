@@ -62,8 +62,8 @@ TEST(P2pGatherCAdaptive, FewRunsUseCopyEngineByteExact) {
 }
 
 TEST(P2pGatherCAdaptive, ManyRunsUseKernelByteExact) {
-  // 32 runs x 48 KiB: above the 24-run floor and the fitted crossover, so
-  // the adaptive path must take the single-launch kernel.
+  // 32 runs x 48 KiB (1.5 MiB total, >= the 1 MiB floor threshold and
+  // >= the 4-run floor): the model must take the single-launch kernel.
   constexpr size_t kRuns = 32, kRun = 48 * 1024;
   std::vector<uint8_t> hsrc = patterned(kRuns * kRun);
   uint8_t* dsrc = nullptr, *ddst = nullptr;

@@ -224,7 +224,10 @@ Timings bench_2d(cudaStream_t stream, std::size_t count, std::size_t width,
   }, &t.kernel_ms, &t.kernel_host_ms);
 
   set_gather_dispatch(GatherDispatchMode::kAdaptive, 4);
-  t.adaptive_took_kernel = vkernels::comm::prefer_gather_kernel(count, count * width * height);
+  // Report the branch the 2-D dispatch itself takes (strided model).
+  t.adaptive_took_kernel =
+      vkernels::comm::prefer_gather_kernel(count, count * width * height,
+                                           /*strided=*/true);
   time_median(stream, iters, [&] {
     p2p_gather_runs_2d(dst, dst_bytes, runs.data(), count, stream);
   }, &t.adaptive_ms, &t.adaptive_host_ms);

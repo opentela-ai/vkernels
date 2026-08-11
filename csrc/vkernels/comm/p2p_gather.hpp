@@ -130,14 +130,16 @@ void memcpy_peer_batch_async(Span<std::uint8_t> dst, const void* const* src_ptrs
 //
 // On H100 NVL the single-launch SM gather kernel is NOT always faster than
 // the per-run cudaMemcpy*Async loop it replaces: the copy engine wins for
-// few runs (per-run driver calls are cheap, the engine runs without
-// occupying SMs), while the kernel wins for heavily fragmented lists. Issue
-// #6 measured a 48 MiB payload and found the crossover between 16 and 32
-// runs. The CUDA entry points therefore dispatch adaptively: below the
-// threshold they issue one cudaMemcpyAsync / cudaMemcpy2DAsync per run
-// (the exact baseline), at or above it they launch the single gather
-// kernel. The decision is a pure function of run count and total bytes so
-// it is unit-testable on the host and tunable per deployment.
+// very few runs (per-run driver calls are cheap, the engine runs without
+// occupying SMs), while the kernel wins for fragmented lists. Issue #6
+// measured a 48 MiB payload and found the PR #5 kernel crossing the copy
+// loop between 16 and 32 runs; the vectorized uint4 kernel is ~43 us
+// faster at 48 MiB and crosses at ~3 runs. The CUDA entry points therefore
+// dispatch adaptively: below the threshold they issue one cudaMemcpyAsync /
+// cudaMemcpy2DAsync per run (the exact baseline), at or above it they
+// launch the single gather kernel. The decision is a pure function of run
+// count and total bytes so it is unit-testable on the host and tunable per
+// deployment.
 
 // Forced-dispatch modes, for testing and A/B tuning on a target machine.
 // kAdaptive applies the cost model below; the force modes bypass it.
@@ -160,20 +162,28 @@ std::pair<GatherDispatchMode, std::size_t> gather_dispatch_config();
 // fitted to H100 NVL measurements (sgs-gpu07, CUDA 13 / driver 580.82.07,
 // real NVLink peer reads): ~201.7 us for 48 MiB in one run (~4.20 us/MiB)
 // plus ~7.37 us per extra run, with a ~20 us per-call floor that dominates
-// transfers below a few MiB. `num_runs` counts only non-empty runs (empty
-// runs are dropped before dispatch); zero bytes estimates 0.
-double est_copy_engine_us(std::size_t num_runs, std::size_t total_bytes);
+// transfers below a few MiB. `strided` (2-D cudaMemcpy2DAsync) has a lower
+// per-call floor (~10.8 us) and a slightly lower per-run term (~7.30 us).
+// `num_runs` counts only non-empty runs (empty runs are dropped before
+// dispatch); zero bytes estimates 0.
+double est_copy_engine_us(std::size_t num_runs, std::size_t total_bytes,
+                          bool strided = false);
 
 // Estimated device time (microseconds) of the single-launch gather kernel:
-// ~210 us for 48 MiB (~4.38 us/MiB of SM-driven peer reads, faster than
-// the copy engine's 4.20 us/MiB but with no per-run cost), plus a ~8.6 us
-// launch floor; flat in run count below the 65535-run cap.
-double est_gather_kernel_us(std::size_t num_runs, std::size_t total_bytes);
+// ~210 us for 48 MiB (~4.20 us/MiB of SM-driven peer reads, no per-run
+// driver cost), plus a ~8.6 us launch floor; flat in run count below the
+// 65535-run cap. Strided (2-D) kernels pay one block per row, so the floor
+// is ~14 us and grows ~0.13 us per extra run.
+double est_gather_kernel_us(std::size_t num_runs, std::size_t total_bytes,
+                            bool strided = false);
 
 // Pure dispatch decision: true -> single-launch SM gather kernel, false ->
-// per-run copy-engine loop. Honours the configured mode and min-runs floor;
-// zero bytes (nothing to copy) never takes the kernel.
-bool prefer_gather_kernel(std::size_t num_runs, std::size_t total_bytes);
+// per-run copy-engine loop. Honours the configured mode and min-runs floor
+// (large 1-D payloads only; strided 2-D uses the model directly, its
+// low-run margin is not the acceptance region); zero bytes (nothing to
+// copy) never takes the kernel.
+bool prefer_gather_kernel(std::size_t num_runs, std::size_t total_bytes,
+                          bool strided = false);
 
 // ---------------------------------------------------------------------------
 // Prepared plan API

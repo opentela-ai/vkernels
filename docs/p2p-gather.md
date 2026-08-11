@@ -113,12 +113,14 @@ for validation, then dispatches **adaptively** (issue #6):
   API calls after the metadata is prepared.
 
 The decision is the pure, host-tested function `prefer_gather_kernel(num_runs,
- total_bytes)` with a cost model fitted to the issue #6 H100 NVL table
-(48 MiB, CUDA 13 / sm90): copy engine ≈ 4.07 µs/MiB + 3.08 µs/run, gather
-kernel ≈ 5.27 µs/MiB, crossover at ~19 runs. A 24-run floor (default) keeps
-the 1-16 run range safely on the copy engine. `set_gather_dispatch(mode,
-min_runs)` overrides the model for testing (`kForceKernel` /
-`kForceCopyEngine`) and A/B tuning on a target machine.
+ total_bytes)` with a cost model fitted to H100 NVL measurements
+(48 MiB, CUDA 13 / sm90, real NVLink peer reads): copy engine ≈ max(20 µs,
+4.20 µs/MiB) + 7.37 µs/run, gather kernel ≈ max(8.6 µs, 4.38 µs/MiB). The
+vectorized uint4 kernel is flat (~210 µs at 48 MiB) and crosses the copy
+loop at ~3 runs, so a 4-run floor (applied only at ≥1 MiB payloads) keeps
+the 1-2 run cases on the copy engine while the kernel wins from 4 runs.
+`set_gather_dispatch(mode, min_runs)` overrides the model for testing
+(`kForceKernel` / `kForceCopyEngine`) and A/B tuning on a target machine.
 
 The default memory pool is tuned once (`cudaMemPoolSetAttribute` with
 `cudaMemPoolAttrReleaseThreshold = UINT64_MAX`) so freed memory stays in the
