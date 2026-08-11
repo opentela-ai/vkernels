@@ -356,4 +356,20 @@ void P2PGatherPlan2D::execute(Stream* stream) const {
   stream->submit(std::move(copy_all));
 }
 
+void P2PGatherPlan2D::execute(std::size_t src_byte_offset, Stream* stream) const {
+  if (runs_.empty()) return;  // 0 tiles, or every tile empty: enqueue nothing
+  const P2PGatherPlan2D* self = this;
+  auto copy_all = [self, src_byte_offset]() {
+    for (const auto& r : self->runs_)
+      for (std::size_t y = 0; y < r.height; ++y)
+        std::memcpy(self->dst_ + r.dst_offset + y * r.dst_stride,
+                    r.src + src_byte_offset + y * r.src_stride, r.width);
+  };
+  if (stream == nullptr) {
+    copy_all();
+    return;
+  }
+  stream->submit(std::move(copy_all));
+}
+
 }  // namespace vkernels::comm

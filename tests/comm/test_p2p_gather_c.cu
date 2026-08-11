@@ -428,6 +428,154 @@ TEST(P2pGatherC2d, OverlappingTilesThrow) {
   cudaFree(ddst);
 }
 
+// ---------------------------------------------------------------------------
+// 2-D prepared plan: layer-relative offset execute via C ABI
+// ---------------------------------------------------------------------------
+TEST(P2pGatherPlan2dC, OffsetExecuteByteExact) {
+  // Plan with one tile at base src, execute with offset. The C ABI exposes
+  // vkernels_p2p_plan_2d_execute_offset for the layer-relative reuse pattern.
+  std::vector<uint8_t> hsrc = filled(64, 0xCD);  // 2 rows x 32 bytes
+  uint8_t* dsrc = nullptr, *ddst = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dsrc, 64) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&ddst, kCap) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(dsrc, hsrc.data(), 64, cudaMemcpyHostToDevice) == cudaSuccess);
+
+  // dst stride 32, width 8, height 2: copy 8 bytes from each of 2 rows,
+  // leaving 24-byte gaps between dst rows.
+  vkernels_gather_2d_run_t runs[1] = {{dsrc, 32, 0, 32, 8, 2}};
+  vkernels_status_t status = VKERNELS_OK;
+  vkernels_p2p_plan_2d_t* plan =
+      vkernels_p2p_plan_2d_create(ddst, kCap, runs, 1, &status);
+  ASSERT_EQ(status, VKERNELS_OK);
+  ASSERT_TRUE(plan != nullptr);
+
+  // Offset 4: copy columns 4-11 of each source row.
+  status = vkernels_p2p_plan_2d_execute_offset(plan, 4, 0);
+  ASSERT_EQ(status, VKERNELS_OK);
+
+  std::vector<uint8_t> hdst(kCap, 0);
+  ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kCap, cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (size_t r = 0; r < 2; ++r)
+    for (size_t c = 0; c < 8; ++c)
+      ASSERT_EQ(hdst[r * 32 + c], 0xCD);  // columns 4-11 of hsrc are 0xCD
+
+  vkernels_p2p_plan_2d_destroy(plan);
+  cudaFree(dsrc); cudaFree(ddst);
+}
+
+TEST(P2pGatherPlan2dC, OffsetExecute40Layers) {
+  // The KVAAS pattern: one plan, many layer offsets. Small-scale: 4 pages,
+  // each a 256-byte row, 40 layers.
+  constexpr size_t kLayerBytes = 256, kPages = 4, kLayers = 40;
+  std::vector<uint8_t> hsrc =
+      patterned(kPages * kLayerBytes * kLayers);  // 4 pages x 256 B x 40
+  uint8_t* dsrc = nullptr, *ddst = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dsrc, hsrc.size()) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&ddst, kPages * kLayerBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(dsrc, hsrc.data(), hsrc.size(),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+
+  std::vector<vkernels_gather_2d_run_t> runs(kPages);
+  for (size_t p = 0; p < kPages; ++p) {
+    runs[p] = {dsrc + p * kLayerBytes, kLayerBytes, p * kLayerBytes, kLayerBytes,
+               kLayerBytes, 1u};
+  }
+  vkernels_status_t status = VKERNELS_OK;
+  vkernels_p2p_plan_2d_t* plan =
+      vkernels_p2p_plan_2d_create(ddst, kPages * kLayerBytes, runs.data(),
+                                  kPages, &status);
+  ASSERT_EQ(status, VKERNELS_OK);
+
+  for (size_t layer = 0; layer < kLayers; ++layer) {
+    status =
+        vkernels_p2p_plan_2d_execute_offset(plan, layer * kLayerBytes, 0);
+    ASSERT_EQ(status, VKERNELS_OK);
+  }
+
+  // Verify the last layer (39).
+  std::vector<uint8_t> hdst(kPages * kLayerBytes, 0);
+  ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kPages * kLayerBytes,
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+  const size_t last = (kLayers - 1) * kLayerBytes;
+  for (size_t p = 0; p < kPages; ++p)
+    for (size_t i = 0; i < kLayerBytes; ++i)
+      ASSERT_EQ(hdst[p * kLayerBytes + i],
+                hsrc[p * kLayerBytes + last + i]);
+
+  vkernels_p2p_plan_2d_destroy(plan);
+  cudaFree(dsrc); cudaFree(ddst);
+}
+
+TEST(P2pGatherPlan2dC, OffsetExecuteConcurrentStreams) {
+  // Two streams, different offsets, one immutable plan — no races on the
+  // plan's read-only device metadata.
+  std::vector<uint8_t> hsrc = patterned(1024);
+  uint8_t* dsrc = nullptr, *ddst = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dsrc, 1024) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&ddst, kCap) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(dsrc, hsrc.data(), 1024, cudaMemcpyHostToDevice) == cudaSuccess);
+
+  vkernels_gather_2d_run_t runs[1] = {{dsrc, 256, 0, 32, 32, 2}};
+  vkernels_status_t status = VKERNELS_OK;
+  vkernels_p2p_plan_2d_t* plan =
+      vkernels_p2p_plan_2d_create(ddst, kCap, runs, 1, &status);
+  ASSERT_EQ(status, VKERNELS_OK);
+
+  cudaStream_t s1, s2;
+  ASSERT_TRUE(cudaStreamCreate(&s1) == cudaSuccess);
+  ASSERT_TRUE(cudaStreamCreate(&s2) == cudaSuccess);
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_EQ(vkernels_p2p_plan_2d_execute_offset(plan, 0, s1), VKERNELS_OK);
+    ASSERT_EQ(vkernels_p2p_plan_2d_execute_offset(plan, 256, s2), VKERNELS_OK);
+  }
+  ASSERT_TRUE(cudaStreamSynchronize(s1) == cudaSuccess);
+  ASSERT_TRUE(cudaStreamSynchronize(s2) == cudaSuccess);
+
+  // Both streams wrote the same dst; last to finish (s2, offset 256) wins.
+  std::vector<uint8_t> hdst(kCap, 0);
+  ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kCap, cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (size_t r = 0; r < 2; ++r)
+    for (size_t c = 0; c < 32; ++c)
+      ASSERT_EQ(hdst[r * 32 + c], hsrc[256 + r * 256 + c]);
+
+  vkernels_p2p_plan_2d_destroy(plan);
+  cudaStreamDestroy(s1); cudaStreamDestroy(s2);
+  cudaFree(dsrc); cudaFree(ddst);
+}
+
+TEST(P2pGatherPlan2dC, OffsetExecuteUnaligned16) {
+  // An offset not a multiple of 16 forces the scalar path in the kernel
+  // (grid.x is sized to max width). Verify byte-exact correctness.
+  std::vector<uint8_t> hsrc = patterned(256);
+  uint8_t* dsrc = nullptr, *ddst = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dsrc, 256) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&ddst, kCap) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(dsrc, hsrc.data(), 256, cudaMemcpyHostToDevice) == cudaSuccess);
+
+  // Force the kernel path so the scalar fallback is exercised.
+  vkernels::comm::set_gather_dispatch(vkernels::comm::GatherDispatchMode::kForceKernel, 1);
+
+  // 16-byte aligned base src, width = 128 (aligned, vec=true at prepare).
+  vkernels_gather_2d_run_t runs[1] = {{dsrc, 256, 0, 128, 128, 1}};
+  vkernels_status_t status = VKERNELS_OK;
+  vkernels_p2p_plan_2d_t* plan =
+      vkernels_p2p_plan_2d_create(ddst, kCap, runs, 1, &status);
+  ASSERT_EQ(status, VKERNELS_OK);
+
+  // Offset 1: unaligned → scalar fallback, grid.x = tiles(128).
+  status = vkernels_p2p_plan_2d_execute_offset(plan, 1, 0);
+  ASSERT_EQ(status, VKERNELS_OK);
+
+  std::vector<uint8_t> hdst(kCap, 0);
+  ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kCap, cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (size_t i = 0; i < 128; ++i)
+    ASSERT_EQ(hdst[i], hsrc[1 + i]);
+
+  vkernels_p2p_plan_2d_destroy(plan);
+  vkernels::comm::set_gather_dispatch();  // restore adaptive defaults
+  cudaFree(dsrc); cudaFree(ddst);
+}
+
 #else  // !VKERNELS_C_HAS_CUDA
 
 // When no CUDA toolkit is on the include path the C ABI entry points are not

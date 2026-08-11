@@ -182,12 +182,30 @@ separately. Lifetime: destroy the plan only after every stream it was
 executed on has been synchronised (the persistent buffer is freed in the
 destructor).
 
+**2-D layer-relative plans** (KVAAS pattern, issue #8): a prepared 2-D
+plan stores the construction-time source base pointers (peer page bases,
+without the per-layer offset). `execute(src_byte_offset, stream)` adds the
+scalar offset to every run's source pointer before copying. Both dispatch
+branches apply it — the kernel as a scalar parameter, the copy engine as a
+pointer offset — so no per-layer H2D descriptor upload is needed.
+
 ```cpp
 // CUDA plan, the KVAAS 40-layer pattern:
 std::vector<std::uint8_t> scratch(48 * 1024 * 1024);  // bound destination
+// 1-D:
 P2PGatherPlan1D plan(scratch.data(), scratch.size(), srcs, offs, lens, runs);
 for (int layer = 0; layer < 40; ++layer) plan.execute(stream);  // enqueue only
+
+// 2-D layer-relative (one topology, shifting source for every layer):
+P2PGatherPlan2D plan2d(scratch.data(), scratch.size(), page_runs, num_pages);
+for (int layer = 0; layer < 40; ++layer)
+  plan2d.execute(layer * layer_bytes, stream);  // offset applied, no H2D
 ```
+
+When the offset is a multiple of 16 the vectorized kernel path stays
+enabled (prepare-time alignment is preserved); an unaligned offset falls
+back to the scalar path and grid.x is sized to max width to cover every
+row. `cudaMemcpy2DAsync` handles any alignment natively.
 
 ## C ABI
 
@@ -220,6 +238,11 @@ void     vkernels_p2p_plan_1d_destroy(vkernels_p2p_plan_1d_t* plan);
 vkernels_status_t vkernels_p2p_plan_1d_execute(vkernels_p2p_plan_1d_t* plan,
                                               cudaStream_t stream);
 // vkernels_p2p_plan_2d_create / _destroy / _execute mirror the 1-D trio.
+
+// Layer-relative 2-D execute (KVAAS reuse pattern): adds src_byte_offset
+// to every run's source pointer before copying.
+vkernels_status_t vkernels_p2p_plan_2d_execute_offset(
+    vkernels_p2p_plan_2d_t* plan, size_t src_byte_offset, cudaStream_t stream);
 ```
 
 `vkernels_gather_2d_run_t` is layout-compatible with `Gather2DRun`. A C++
