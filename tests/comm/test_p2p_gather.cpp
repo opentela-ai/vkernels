@@ -19,9 +19,17 @@
 using vkernels::Span;
 using vkernels::Stream;
 using vkernels::comm::Gather2DRun;
+using vkernels::comm::GatherDispatchMode;
+using vkernels::comm::P2PGatherPlan1D;
+using vkernels::comm::P2PGatherPlan2D;
+using vkernels::comm::est_copy_engine_us;
+using vkernels::comm::est_gather_kernel_us;
+using vkernels::comm::gather_dispatch_config;
 using vkernels::comm::memcpy_peer_batch_async;
 using vkernels::comm::p2p_gather_runs;
 using vkernels::comm::p2p_gather_runs_2d;
+using vkernels::comm::prefer_gather_kernel;
+using vkernels::comm::set_gather_dispatch;
 
 namespace {
 // A small "peer allocation": distinct bytes so a mis-routed copy is obvious.
@@ -396,4 +404,259 @@ TEST(P2pGather2d, AdjacentTilesAreAllowed) {
       ASSERT_EQ(dst[y * 8 + x], a[y * 8 + x]);
       ASSERT_EQ(dst[12 + y * 8 + x], b[y * 8 + x]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive dispatch policy (pure, host-testable)
+// ---------------------------------------------------------------------------
+namespace {
+constexpr std::size_t k48MiB = 48u * 1024u * 1024u;
+}
+
+TEST(GatherDispatch, DefaultsAreAdaptiveWithFloor24) {
+  auto [mode, min_runs] = gather_dispatch_config();
+  EXPECT_EQ(static_cast<int>(mode), static_cast<int>(GatherDispatchMode::kAdaptive));
+  EXPECT_EQ(min_runs, 24u);
+}
+
+TEST(GatherDispatch, CostModelMatchesIssue6Measurements) {
+  // Copy engine: ~195.5 us @ 1 run / 48 MiB, +~3.08 us per extra run
+  // (the issue #6 table's slope from 1 to 192 runs is (784.29-195.49)/191).
+  EXPECT_NEAR(est_copy_engine_us(1, k48MiB), 195.4, 1.0);
+  EXPECT_NEAR(est_copy_engine_us(192, k48MiB), 783.7, 1.0);
+  EXPECT_NEAR(est_copy_engine_us(16, k48MiB), 241.6, 1.0);
+  EXPECT_EQ(est_copy_engine_us(0, 0), 0.0);
+  EXPECT_EQ(est_copy_engine_us(1, 0), 0.0);  // one run, zero bytes: no per-run term
+
+  // Gather kernel: ~253 us flat at 48 MiB, independent of run count.
+  EXPECT_NEAR(est_gather_kernel_us(1, k48MiB), 253.0, 1.0);
+  EXPECT_NEAR(est_gather_kernel_us(192, k48MiB), 253.0, 1.0);
+  EXPECT_EQ(est_gather_kernel_us(1, 0), 0.0);
+
+  // Monotonicity: the loop grows with run count, the kernel does not.
+  EXPECT_LT(est_copy_engine_us(1, k48MiB), est_copy_engine_us(2, k48MiB));
+  EXPECT_EQ(est_gather_kernel_us(1, k48MiB), est_gather_kernel_us(2, k48MiB));
+}
+
+TEST(GatherDispatch, AdaptiveChoosesKernelOnlyAboveCrossover) {
+  set_gather_dispatch(GatherDispatchMode::kAdaptive, 24);
+  // 1-16 runs: copy engine (the 0.77x-0.98x low-run region of the table).
+  for (std::size_t n : {1u, 2u, 4u, 8u, 16u}) {
+    EXPECT_FALSE(prefer_gather_kernel(n, k48MiB));
+  }
+  // At/above the min-runs floor the model wins: 32/64/192 runs were 1.15x/
+  // 1.49x/2.91x for the kernel in the issue #6 table.
+  for (std::size_t n : {24u, 32u, 64u, 192u}) {
+    EXPECT_TRUE(prefer_gather_kernel(n, k48MiB));
+  }
+}
+
+TEST(GatherDispatch, FloorHoldsBelowMinRuns) {
+  set_gather_dispatch(GatherDispatchMode::kAdaptive, 24);
+  // Even though the fitted model says the kernel wins from ~21 runs, the
+  // 24-run floor keeps a margin below the measured 16-32 crossover.
+  EXPECT_FALSE(prefer_gather_kernel(20, k48MiB));
+  EXPECT_FALSE(prefer_gather_kernel(23, k48MiB));
+  EXPECT_TRUE(prefer_gather_kernel(24, k48MiB));
+}
+
+TEST(GatherDispatch, ZeroBytesNeverTakesTheKernel) {
+  set_gather_dispatch(GatherDispatchMode::kAdaptive, 1);
+  EXPECT_FALSE(prefer_gather_kernel(100, 0));
+  EXPECT_FALSE(prefer_gather_kernel(1, 0));
+}
+
+TEST(GatherDispatch, ForcedModesOverrideTheModel) {
+  set_gather_dispatch(GatherDispatchMode::kForceKernel, 24);
+  EXPECT_TRUE(prefer_gather_kernel(1, 1024));  // kernel even for one tiny run
+  EXPECT_TRUE(prefer_gather_kernel(1, k48MiB));
+  set_gather_dispatch(GatherDispatchMode::kForceCopyEngine, 24);
+  EXPECT_FALSE(prefer_gather_kernel(192, k48MiB));  // loop even at 192 runs
+  EXPECT_FALSE(prefer_gather_kernel(0, k48MiB));
+
+  // Setter round-trips both parameters.
+  set_gather_dispatch(GatherDispatchMode::kAdaptive, 7);
+  auto [mode, min_runs] = gather_dispatch_config();
+  EXPECT_EQ(static_cast<int>(mode), static_cast<int>(GatherDispatchMode::kAdaptive));
+  EXPECT_EQ(min_runs, 7u);
+  set_gather_dispatch();  // restore the defaults for later tests
+  auto [mode2, min_runs2] = gather_dispatch_config();
+  EXPECT_EQ(static_cast<int>(mode2), static_cast<int>(GatherDispatchMode::kAdaptive));
+  EXPECT_EQ(min_runs2, 24u);
+}
+
+// Host mirror of the CUDA kernel's grid-sizing contract (p2p_gather.cu): the
+// 1-D kernel is launched with grid.y = num_runs and grid.x = tiles(max_units)
+// where a vectorized run occupies ceil(length/16) units and a scalar run
+// occupies `length` units. Every run's units must fit inside grid.x*256
+// threads, and the vectorized tail thread (index length/16) must exist in
+// the grid so the <16-byte tail is always copied. This test locks that
+// invariant for the boundary lengths around the 16-byte chunk size.
+TEST(GatherDispatch, KernelGridContractCoversEveryRun) {
+  const std::size_t lens[] = {1u, 15u, 16u, 17u, 31u, 32u, 47u, 48u, 49u, 63u,
+                              64u, 65u, 255u, 256u, 257u, 4095u, 4096u, 4097u};
+  const bool vecs[] = {false, true};
+  for (std::size_t len : lens) {
+    for (bool vec : vecs) {
+      // units_1d: vectorized -> ceil(len/16), scalar -> len.
+      const std::size_t units = vec ? (len + 15u) / 16u : len;
+      // tiles(): ceil(units / 256) blocks of 256 threads, at least one.
+      const std::size_t blocks = units > 0 ? (units + 255u) / 256u : 1u;
+      const std::size_t threads = blocks * 256u;
+      // Every unit index is covered.
+      EXPECT_GE(threads, units);
+      // A vectorized run with a <16-byte tail needs its tail thread (index
+      // len/16) inside the grid; lengths that are multiples of 16 have no
+      // tail and need no such thread.
+      if (vec && (len & 15u) != 0u) {
+        EXPECT_LT(len / 16u, threads);
+        EXPECT_LE((len / 16u) * 16u, len);  // tail offset stays in range
+      }
+      // Scalar path: the last byte index len-1 is covered.
+      if (!vec && len > 0) EXPECT_LT(len - 1u, threads);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Prepared plan API (host reference): validate once, execute many
+// ---------------------------------------------------------------------------
+TEST(P2PGatherPlan1d, PrepareOnceExecuteReusesNoValidation) {
+  auto a = peer(2, 100);   // -> dst[0..2)
+  auto b = peer(4, 200);   // -> dst[8..12)
+  auto c = peer(1, 250);   // -> dst[24..25)
+  auto dst = scratch(32, 0);
+  const void* srcs[3] = {a.data(), b.data(), c.data()};
+  std::size_t offs[3] = {0, 8, 24};
+  std::size_t lens[3] = {2, 4, 1};
+
+  P2PGatherPlan1D plan(dst.data(), dst.size(), srcs, offs, lens, 3);
+  EXPECT_EQ(plan.num_runs(), 3u);
+  EXPECT_EQ(plan.total_bytes(), 7u);
+  EXPECT_EQ(plan.dst(), dst.data());
+  EXPECT_EQ(plan.dst_capacity(), 32u);
+
+  // The KVAAS pattern: one run list reused for 40 layer launches, each a
+  // single stream task with no per-call metadata work.
+  Stream s;
+  for (int layer = 0; layer < 40; ++layer) {
+    std::size_t before = s.submitted();
+    plan.execute(&s);
+    EXPECT_EQ(s.submitted() - before, 1u);  // exactly one task per execute
+  }
+  s.wait();
+  EXPECT_TRUE(same(dst, a, 0, 2));
+  EXPECT_TRUE(same(dst, b, 8, 4));
+  EXPECT_TRUE(same(dst, c, 24, 1));
+  EXPECT_EQ(dst[2], 0);  // untouched gaps keep the fill
+  EXPECT_EQ(dst[12], 0);
+}
+
+TEST(P2PGatherPlan1d, ExecuteWithoutStreamRunsSynchronously) {
+  auto a = peer(3, 5);
+  auto dst = scratch(16, 0);
+  const void* srcs[1] = {a.data()};
+  std::size_t offs[1] = {0};
+  std::size_t lens[1] = {3};
+  P2PGatherPlan1D plan(dst.data(), dst.size(), srcs, offs, lens, 1);
+  plan.execute();  // stream == nullptr: runs to completion
+  EXPECT_TRUE(same(dst, a, 0, 3));
+}
+
+TEST(P2PGatherPlan1d, ConcurrentExecutesOnTwoStreams) {
+  auto a = peer(2, 1);
+  auto b = peer(2, 9);
+  auto dst = scratch(16, 0);
+  const void* srcs[2] = {a.data(), b.data()};
+  std::size_t offs[2] = {0, 4};
+  std::size_t lens[2] = {2, 2};
+  P2PGatherPlan1D plan(dst.data(), dst.size(), srcs, offs, lens, 2);
+
+  // Two streams submit the same (read-only) plan concurrently; the host
+  // Stream model runs tasks on separate worker threads, so this is a real
+  // concurrency exercise of the reuse contract.
+  Stream s1, s2;
+  for (int i = 0; i < 8; ++i) {
+    plan.execute(&s1);
+    plan.execute(&s2);
+  }
+  s1.wait();
+  s2.wait();
+  EXPECT_TRUE(same(dst, a, 0, 2));
+  EXPECT_TRUE(same(dst, b, 4, 2));
+}
+
+TEST(P2PGatherPlan1d, ValidationHappensOnceAtPrepare) {
+  auto src = peer(8, 1);
+  auto dst = scratch(16, 0);
+
+  // Null source for a non-empty run.
+  const void* bad_srcs[1] = {nullptr};
+  std::size_t o = 0, l = 4;
+  EXPECT_THROW(P2PGatherPlan1D(dst.data(), dst.size(), bad_srcs, &o, &l, 1),
+               std::invalid_argument);
+
+  // Capacity violation.
+  const void* srcs[1] = {src.data()};
+  std::size_t big = 32;
+  EXPECT_THROW(P2PGatherPlan1D(dst.data(), dst.size(), srcs, &o, &big, 1),
+               std::invalid_argument);
+
+  // Overlapping output runs.
+  const void* two[2] = {src.data(), src.data()};
+  std::size_t offs[2] = {0, 4};
+  std::size_t lens[2] = {8, 8};
+  EXPECT_THROW(P2PGatherPlan1D(dst.data(), dst.size(), two, offs, lens, 2),
+               std::invalid_argument);
+}
+
+TEST(P2PGatherPlan1d, EmptyRunListIsANoOpPlan) {
+  auto dst = scratch(8, 0);
+  P2PGatherPlan1D plan(dst.data(), dst.size(), nullptr, nullptr, nullptr, 0);
+  EXPECT_EQ(plan.num_runs(), 0u);
+  EXPECT_EQ(plan.total_bytes(), 0u);
+  Stream s;
+  std::size_t before = s.submitted();
+  plan.execute(&s);
+  EXPECT_EQ(s.submitted() - before, 0u);  // nothing enqueued
+  s.wait();
+  EXPECT_EQ(dst[0], 0);
+}
+
+TEST(P2PGatherPlan2d, PrepareOnceExecuteManyTiles) {
+  auto a = peer(16, 1);  // 4x4 tile
+  auto b = peer(12, 9);  // 3x3 tile in 3x4 region (src stride 4)
+  auto dst = scratch(64, 0);
+  Gather2DRun runs[2] = {{a.data(), 4, 0, 4, 4, 4},
+                         {b.data(), 4, 24, 4, 3, 3}};
+  P2PGatherPlan2D plan(dst.data(), dst.size(), runs, 2);
+  EXPECT_EQ(plan.num_runs(), 2u);
+  EXPECT_EQ(plan.total_bytes(), 25u);
+
+  Stream s;
+  for (int i = 0; i < 5; ++i) {
+    std::size_t before = s.submitted();
+    plan.execute(&s);
+    EXPECT_EQ(s.submitted() - before, 1u);
+  }
+  s.wait();
+  EXPECT_TRUE(same(dst, a, 0, 16));
+  for (std::size_t y = 0; y < 3; ++y)
+    for (std::size_t x = 0; x < 3; ++x)
+      ASSERT_EQ(dst[24 + y * 4 + x], b[y * 4 + x]);
+}
+
+TEST(P2PGatherPlan2d, SyncExecuteAndValidation) {
+  auto src = peer(8, 1);
+  auto dst = scratch(8, 0);
+  Gather2DRun ok[1] = {{src.data(), 4, 0, 4, 4, 1}};
+  P2PGatherPlan2D plan(dst.data(), dst.size(), ok, 1);
+  plan.execute();  // synchronous
+  EXPECT_TRUE(same(dst, src, 0, 4));
+
+  // A bad 2-D list is rejected at prepare, not at execute.
+  auto dst2 = scratch(8, 0);
+  Gather2DRun bad[1] = {{nullptr, 4, 0, 4, 4, 1}};
+  EXPECT_THROW(P2PGatherPlan2D(dst2.data(), dst2.size(), bad, 1),
+               std::invalid_argument);
 }

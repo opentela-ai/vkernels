@@ -69,5 +69,68 @@ extern "C" vkernels_status_t vkernels_p2p_gather_runs_2d(
   return VKERNELS_OK;
 }
 
+// Prepared plans: opaque handles over the cuda:: P2PGatherPlan* classes.
+// create() maps a validation failure (std::invalid_argument) or device
+// failure (std::runtime_error) to a status code and returns NULL; destroy()
+// and execute() never throw across the boundary.
+extern "C" vkernels_p2p_plan_1d_t* vkernels_p2p_plan_1d_create(
+    uint8_t* dst, size_t dst_capacity, const void* const* src_ptrs,
+    const size_t* dst_offsets, const size_t* lengths, size_t num_runs,
+    vkernels_status_t* status_out) {
+  if (status_out) *status_out = VKERNELS_OK;
+  try {
+    return reinterpret_cast<vkernels_p2p_plan_1d_t*>(
+        new vkernels::comm::cuda::P2PGatherPlan1D(
+            dst, dst_capacity, src_ptrs, dst_offsets, lengths, num_runs));
+  } catch (const std::exception& e) {
+    if (status_out) *status_out = to_status(e);
+    return nullptr;
+  }
+}
+
+extern "C" void vkernels_p2p_plan_1d_destroy(vkernels_p2p_plan_1d_t* plan) {
+  delete reinterpret_cast<vkernels::comm::cuda::P2PGatherPlan1D*>(plan);
+}
+
+extern "C" vkernels_status_t vkernels_p2p_plan_1d_execute(
+    vkernels_p2p_plan_1d_t* plan, cudaStream_t stream) {
+  try {
+    reinterpret_cast<vkernels::comm::cuda::P2PGatherPlan1D*>(plan)->execute(stream);
+  } catch (const std::exception& e) {
+    return to_status(e);
+  }
+  return VKERNELS_OK;
+}
+
+extern "C" vkernels_p2p_plan_2d_t* vkernels_p2p_plan_2d_create(
+    uint8_t* dst, size_t dst_capacity, const vkernels_gather_2d_run_t* runs,
+    size_t num_runs, vkernels_status_t* status_out) {
+  if (status_out) *status_out = VKERNELS_OK;
+  try {
+    return reinterpret_cast<vkernels_p2p_plan_2d_t*>(
+        new vkernels::comm::cuda::P2PGatherPlan2D(
+            dst, dst_capacity,
+            reinterpret_cast<const vkernels::comm::Gather2DRun*>(runs),
+            num_runs));
+  } catch (const std::exception& e) {
+    if (status_out) *status_out = to_status(e);
+    return nullptr;
+  }
+}
+
+extern "C" void vkernels_p2p_plan_2d_destroy(vkernels_p2p_plan_2d_t* plan) {
+  delete reinterpret_cast<vkernels::comm::cuda::P2PGatherPlan2D*>(plan);
+}
+
+extern "C" vkernels_status_t vkernels_p2p_plan_2d_execute(
+    vkernels_p2p_plan_2d_t* plan, cudaStream_t stream) {
+  try {
+    reinterpret_cast<vkernels::comm::cuda::P2PGatherPlan2D*>(plan)->execute(stream);
+  } catch (const std::exception& e) {
+    return to_status(e);
+  }
+  return VKERNELS_OK;
+}
+
 #  endif  // __CUDA_ARCH__
 #endif  // defined(VKERNELS_C_HAS_CUDA)

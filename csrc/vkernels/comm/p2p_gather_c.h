@@ -73,6 +73,47 @@ vkernels_status_t vkernels_p2p_gather_runs(uint8_t* dst, size_t dst_capacity,
 vkernels_status_t vkernels_p2p_gather_runs_2d(uint8_t* dst, size_t dst_capacity,
                                               const vkernels_gather_2d_run_t* runs,
                                               size_t num_runs, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Prepared plans (opaque handles)
+// ---------------------------------------------------------------------------
+//
+// A plan validates the run list and uploads the run metadata to a
+// persistent per-device buffer ONCE at create; execute() only enqueues
+// (adaptive: copy engine for few runs, one kernel launch above the
+// crossover). Bind one plan to one destination allocation and reuse it
+// across layer launches — no per-launch allocation or H2D metadata copy.
+// The plan owns the device metadata; destroy it only after every stream it
+// was executed on has been synchronised.
+typedef struct vkernels_p2p_plan_1d vkernels_p2p_plan_1d_t;
+typedef struct vkernels_p2p_plan_2d vkernels_p2p_plan_2d_t;
+
+// Create a prepared 1-D plan bound to `dst`. On success returns a non-NULL
+// handle and sets *status_out to VKERNELS_OK. On a contract violation
+// (null source, capacity exceeded, overlapping runs) or a device failure
+// returns NULL and sets *status_out to the corresponding error code.
+vkernels_p2p_plan_1d_t* vkernels_p2p_plan_1d_create(
+    uint8_t* dst, size_t dst_capacity, const void* const* src_ptrs,
+    const size_t* dst_offsets, const size_t* lengths, size_t num_runs,
+    vkernels_status_t* status_out);
+
+// Destroy a plan, freeing its persistent device metadata.
+void vkernels_p2p_plan_1d_destroy(vkernels_p2p_plan_1d_t* plan);
+
+// Enqueue the plan's gather on `stream` (no validation, no allocation, no
+// H2D metadata copy). Safe to call concurrently on several streams.
+vkernels_status_t vkernels_p2p_plan_1d_execute(vkernels_p2p_plan_1d_t* plan,
+                                               cudaStream_t stream);
+
+// 2-D variant over vkernels_gather_2d_run_t descriptors.
+vkernels_p2p_plan_2d_t* vkernels_p2p_plan_2d_create(
+    uint8_t* dst, size_t dst_capacity, const vkernels_gather_2d_run_t* runs,
+    size_t num_runs, vkernels_status_t* status_out);
+
+void vkernels_p2p_plan_2d_destroy(vkernels_p2p_plan_2d_t* plan);
+
+vkernels_status_t vkernels_p2p_plan_2d_execute(vkernels_p2p_plan_2d_t* plan,
+                                               cudaStream_t stream);
 #endif  // VKERNELS_C_HAS_CUDA
 
 #ifdef __cplusplus

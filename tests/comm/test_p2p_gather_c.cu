@@ -15,6 +15,8 @@
 
 #if defined(VKERNELS_C_HAS_CUDA) && !defined(__CUDA_ARCH__)
 
+#  include "vkernels/comm/p2p_gather.hpp"  // set_gather_dispatch / force modes
+
 namespace {
 
 constexpr size_t kCap = 4096;
@@ -24,7 +26,262 @@ std::vector<uint8_t> filled(size_t n, uint8_t b) {
   return std::vector<uint8_t>(n, b);
 }
 
+// A pseudo-random but deterministic byte pattern (i % 251) so mis-routed
+// copies and off-by-one tails are obvious.
+std::vector<uint8_t> patterned(size_t n) {
+  std::vector<uint8_t> v(n);
+  for (size_t i = 0; i < n; ++i) v[i] = static_cast<uint8_t>(i % 251);
+  return v;
+}
+
 }  // namespace
+
+TEST(P2pGatherCAdaptive, FewRunsUseCopyEngineByteExact) {
+  // Default dispatch: 1-2 runs sit below the crossover, so the CUDA path
+  // must take the per-run copy engine and still be byte-exact.
+  std::vector<uint8_t> h0 = filled(128, 0x10);
+  std::vector<uint8_t> h1 = filled(64, 0x20);
+  uint8_t* d0 = nullptr, *d1 = nullptr, *ddst = nullptr;
+  ASSERT_TRUE(cudaMalloc(&d0, 128) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&d1, 64) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&ddst, kCap) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(d0, h0.data(), 128, cudaMemcpyHostToDevice) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(d1, h1.data(), 64, cudaMemcpyHostToDevice) == cudaSuccess);
+
+  const void* ptrs[2] = {d0, d1};
+  size_t offs[2] = {0, 200};
+  size_t lens[2] = {128, 64};
+  vkernels_status_t st = vkernels_p2p_gather_runs(ddst, kCap, ptrs, offs, lens, 2, 0);
+  ASSERT_EQ(st, VKERNELS_OK);
+
+  std::vector<uint8_t> hdst(kCap, 0);
+  ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kCap, cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (size_t i = 0; i < 128; ++i) ASSERT_EQ(hdst[i], 0x10);
+  for (size_t i = 200; i < 264; ++i) ASSERT_EQ(hdst[i], 0x20);
+  cudaFree(d0); cudaFree(d1); cudaFree(ddst);
+}
+
+TEST(P2pGatherCAdaptive, ManyRunsUseKernelByteExact) {
+  // 32 runs x 48 KiB: above the 24-run floor and the fitted crossover, so
+  // the adaptive path must take the single-launch kernel.
+  constexpr size_t kRuns = 32, kRun = 48 * 1024;
+  std::vector<uint8_t> hsrc = patterned(kRuns * kRun);
+  uint8_t* dsrc = nullptr, *ddst = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dsrc, kRuns * kRun) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&ddst, kRuns * kRun) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(dsrc, hsrc.data(), kRuns * kRun, cudaMemcpyHostToDevice) == cudaSuccess);
+
+  std::vector<const void*> ptrs(kRuns);
+  std::vector<size_t> offs(kRuns), lens(kRuns);
+  for (size_t i = 0; i < kRuns; ++i) {
+    ptrs[i] = dsrc + i * kRun;
+    offs[i] = i * kRun;
+    lens[i] = kRun;
+  }
+  vkernels_status_t st = vkernels_p2p_gather_runs(ddst, kRuns * kRun, ptrs.data(),
+                                                  offs.data(), lens.data(), kRuns, 0);
+  ASSERT_EQ(st, VKERNELS_OK);
+
+  std::vector<uint8_t> hdst(kRuns * kRun, 0);
+  ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kRuns * kRun, cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (size_t r = 0; r < kRuns; ++r)
+    for (size_t i = 0; i < kRun; ++i)
+      ASSERT_EQ(hdst[r * kRun + i], static_cast<uint8_t>((r * kRun + i) % 251));
+  cudaFree(dsrc); cudaFree(ddst);
+}
+
+TEST(P2pGatherCAdaptive, ForcedKernelVectorizedTailAndUnaligned) {
+  // Force the kernel and mix vectorized and scalar runs in ONE launch:
+  //   run0: src aligned, dst off 0,      len 48  -> vec, 3 chunks, tail 0
+  //   run1: src unaligned (+3), dst off 32, len 50 -> scalar path
+  //   run2: src aligned (+16), dst off 100, len 17 -> vec, 1 chunk + 1 tail
+  vkernels::comm::set_gather_dispatch(vkernels::comm::GatherDispatchMode::kForceKernel, 1);
+
+  std::vector<uint8_t> hsrc = patterned(256);
+  uint8_t* dsrc = nullptr, *ddst = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dsrc, 256) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&ddst, kCap) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(dsrc, hsrc.data(), 256, cudaMemcpyHostToDevice) == cudaSuccess);
+
+  const void* ptrs[3] = {dsrc, dsrc + 3, dsrc + 16};
+  size_t offs[3] = {0, 32, 100};
+  size_t lens[3] = {48, 50, 17};
+  vkernels_status_t st = vkernels_p2p_gather_runs(ddst, kCap, ptrs, offs, lens, 3, 0);
+  ASSERT_EQ(st, VKERNELS_OK);
+
+  std::vector<uint8_t> hdst(kCap, 0);
+  ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kCap, cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (size_t i = 0; i < 48; ++i) ASSERT_EQ(hdst[i], hsrc[i]);
+  for (size_t i = 0; i < 50; ++i) ASSERT_EQ(hdst[32 + i], hsrc[3 + i]);
+  for (size_t i = 0; i < 17; ++i) ASSERT_EQ(hdst[100 + i], hsrc[16 + i]);
+  ASSERT_EQ(hdst[48], 0);   // gaps stay untouched
+  ASSERT_EQ(hdst[82], 0);
+  ASSERT_EQ(hdst[117], 0);
+
+  cudaFree(dsrc); cudaFree(ddst);
+  vkernels::comm::set_gather_dispatch();  // restore adaptive defaults
+}
+
+TEST(P2pGatherCAdaptive, ForcedCopyEngineManyRuns) {
+  // Force the copy-engine path even at 32 runs: byte-exact equivalence with
+  // the kernel result (the same list through the forced kernel above).
+  constexpr size_t kRuns = 32, kRun = 256;
+  std::vector<uint8_t> hsrc = patterned(kRuns * kRun);
+  uint8_t* dsrc = nullptr, *ddst = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dsrc, kRuns * kRun) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&ddst, kRuns * kRun) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(dsrc, hsrc.data(), kRuns * kRun, cudaMemcpyHostToDevice) == cudaSuccess);
+
+  vkernels::comm::set_gather_dispatch(vkernels::comm::GatherDispatchMode::kForceCopyEngine, 24);
+  std::vector<const void*> ptrs(kRuns);
+  std::vector<size_t> offs(kRuns), lens(kRuns);
+  for (size_t i = 0; i < kRuns; ++i) {
+    ptrs[i] = dsrc + i * kRun;
+    offs[i] = i * kRun;
+    lens[i] = kRun;
+  }
+  vkernels_status_t st = vkernels_p2p_gather_runs(ddst, kRuns * kRun, ptrs.data(),
+                                                  offs.data(), lens.data(), kRuns, 0);
+  ASSERT_EQ(st, VKERNELS_OK);
+
+  std::vector<uint8_t> hdst(kRuns * kRun, 0);
+  ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kRuns * kRun, cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (size_t i = 0; i < kRuns * kRun; ++i) ASSERT_EQ(hdst[i], hsrc[i]);
+
+  cudaFree(dsrc); cudaFree(ddst);
+  vkernels::comm::set_gather_dispatch();  // restore adaptive defaults
+}
+
+// ---------------------------------------------------------------------------
+// Prepared plans (CUDA): validate + upload once, reuse across launches
+// ---------------------------------------------------------------------------
+TEST(P2pGatherPlan1dC, ReuseAcrossManyLaunchesAndStreams) {
+  // The KVAAS pattern: one run list bound to one scratch, reused across 40
+  // layer launches with no per-launch metadata allocation or H2D copy.
+  constexpr size_t kRuns = 8, kRun = 512, kLayers = 40;
+  std::vector<uint8_t> hsrc = patterned(kRuns * kRun);
+  uint8_t* dsrc = nullptr, *ddst = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dsrc, kRuns * kRun) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&ddst, kRuns * kRun) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(dsrc, hsrc.data(), kRuns * kRun, cudaMemcpyHostToDevice) == cudaSuccess);
+
+  std::vector<const void*> ptrs(kRuns);
+  std::vector<size_t> offs(kRuns), lens(kRuns);
+  for (size_t i = 0; i < kRuns; ++i) {
+    ptrs[i] = dsrc + i * kRun;
+    offs[i] = i * kRun;
+    lens[i] = kRun;
+  }
+
+  vkernels_status_t status = VKERNELS_OK;
+  vkernels_p2p_plan_1d_t* plan =
+      vkernels_p2p_plan_1d_create(ddst, kRuns * kRun, ptrs.data(), offs.data(),
+                                  lens.data(), kRuns, &status);
+  ASSERT_EQ(status, VKERNELS_OK);
+  ASSERT_TRUE(plan != nullptr);
+
+  // 40 sequential layer launches on one stream.
+  cudaStream_t s;
+  ASSERT_TRUE(cudaStreamCreate(&s) == cudaSuccess);
+  for (int layer = 0; layer < kLayers; ++layer) {
+    ASSERT_EQ(vkernels_p2p_plan_1d_execute(plan, s), VKERNELS_OK);
+  }
+  ASSERT_TRUE(cudaStreamSynchronize(s) == cudaSuccess);
+
+  std::vector<uint8_t> hdst(kRuns * kRun, 0);
+  ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kRuns * kRun, cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (size_t i = 0; i < kRuns * kRun; ++i) ASSERT_EQ(hdst[i], hsrc[i]);
+
+  // Concurrent execution on two streams is safe: the plan's metadata is
+  // read-only after create (8 interleaved executes per stream, 3 runs).
+  cudaStream_t s2;
+  ASSERT_TRUE(cudaStreamCreate(&s2) == cudaSuccess);
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_EQ(vkernels_p2p_plan_1d_execute(plan, s), VKERNELS_OK);
+    ASSERT_EQ(vkernels_p2p_plan_1d_execute(plan, s2), VKERNELS_OK);
+  }
+  ASSERT_TRUE(cudaStreamSynchronize(s) == cudaSuccess);
+  ASSERT_TRUE(cudaStreamSynchronize(s2) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kRuns * kRun, cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (size_t i = 0; i < kRuns * kRun; ++i) ASSERT_EQ(hdst[i], hsrc[i]);
+
+  vkernels_p2p_plan_1d_destroy(plan);
+  cudaStreamDestroy(s);
+  cudaStreamDestroy(s2);
+  cudaFree(dsrc); cudaFree(ddst);
+}
+
+TEST(P2pGatherPlan1dC, ValidationAtCreateReturnsNullWithStatus) {
+  uint8_t* d0 = nullptr, *d1 = nullptr, *ddst = nullptr;
+  ASSERT_TRUE(cudaMalloc(&d0, 32) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&d1, 32) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&ddst, kCap) == cudaSuccess);
+
+  // Overlapping output runs: rejected at create, nothing allocated/launched.
+  const void* ptrs[2] = {d0, d1};
+  size_t offs[2] = {0, 8};
+  size_t lens[2] = {16, 16};
+  vkernels_status_t status = VKERNELS_OK;
+  vkernels_p2p_plan_1d_t* plan =
+      vkernels_p2p_plan_1d_create(ddst, kCap, ptrs, offs, lens, 2, &status);
+  ASSERT_EQ(status, VKERNELS_ERR_INVALID_ARGUMENT);
+  ASSERT_TRUE(plan == nullptr);
+
+  // Capacity violation at create.
+  size_t lens2[1] = {64};
+  vkernels_status_t status2 = VKERNELS_OK;
+  vkernels_p2p_plan_1d_t* plan2 =
+      vkernels_p2p_plan_1d_create(ddst, 32, ptrs, offs, lens2, 1, &status2);
+  ASSERT_EQ(status2, VKERNELS_ERR_INVALID_ARGUMENT);
+  ASSERT_TRUE(plan2 == nullptr);
+
+  // A valid plan still round-trips through execute after the failures.
+  size_t lens3[1] = {16};
+  vkernels_status_t status3 = VKERNELS_OK;
+  vkernels_p2p_plan_1d_t* plan3 =
+      vkernels_p2p_plan_1d_create(ddst, kCap, ptrs, offs, lens3, 1, &status3);
+  ASSERT_EQ(status3, VKERNELS_OK);
+  ASSERT_TRUE(plan3 != nullptr);
+  ASSERT_EQ(vkernels_p2p_plan_1d_execute(plan3, 0), VKERNELS_OK);
+  vkernels_p2p_plan_1d_destroy(plan3);
+
+  cudaFree(d0); cudaFree(d1); cudaFree(ddst);
+}
+
+TEST(P2pGatherPlan2dC, PrepareAndExecuteStridedTiles) {
+  // Two strided tiles with distinct sources, prepared once and executed
+  // twice (a tiny stand-in for the layer-reuse pattern).
+  std::vector<uint8_t> h0 = filled(64, 0x5A);  // 2 rows x 32 bytes
+  std::vector<uint8_t> h1 = filled(24, 0x3C);  // 2 rows x 12 bytes
+  uint8_t* d0 = nullptr, *d1 = nullptr, *ddst = nullptr;
+  ASSERT_TRUE(cudaMalloc(&d0, 64) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&d1, 24) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&ddst, kCap) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(d0, h0.data(), 64, cudaMemcpyHostToDevice) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(d1, h1.data(), 24, cudaMemcpyHostToDevice) == cudaSuccess);
+
+  vkernels_gather_2d_run_t runs[2] = {{d0, 32, 0, 32, 32, 2},
+                                       {d1, 12, 200, 12, 12, 2}};
+  vkernels_status_t status = VKERNELS_OK;
+  vkernels_p2p_plan_2d_t* plan =
+      vkernels_p2p_plan_2d_create(ddst, kCap, runs, 2, &status);
+  ASSERT_EQ(status, VKERNELS_OK);
+  ASSERT_TRUE(plan != nullptr);
+
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_EQ(vkernels_p2p_plan_2d_execute(plan, 0), VKERNELS_OK);
+  }
+
+  std::vector<uint8_t> hdst(kCap, 0);
+  ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kCap, cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (size_t r = 0; r < 2; ++r)
+    for (size_t c = 0; c < 32; ++c) ASSERT_EQ(hdst[r * 32 + c], 0x5A);
+  for (size_t r = 0; r < 2; ++r)
+    for (size_t c = 0; c < 12; ++c) ASSERT_EQ(hdst[200 + r * 12 + c], 0x3C);
+
+  vkernels_p2p_plan_2d_destroy(plan);
+  cudaFree(d0); cudaFree(d1); cudaFree(ddst);
+}
 
 TEST(P2pGatherC, OneRunCopiesByteExact) {
   std::vector<uint8_t> hsrc = filled(256, 0xAB);

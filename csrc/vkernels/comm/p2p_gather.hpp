@@ -42,6 +42,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "vkernels/core/stream.hpp"
@@ -122,5 +123,135 @@ void p2p_gather_runs_2d(Span<std::uint8_t> dst, Span<const Gather2DRun> runs,
 void memcpy_peer_batch_async(Span<std::uint8_t> dst, const void* const* src_ptrs,
                              const std::size_t* dst_offsets, const std::size_t* lengths,
                              std::size_t num_runs, Stream* stream = nullptr);
+
+// ---------------------------------------------------------------------------
+// Adaptive dispatch (CUDA path only; host-testable pure functions)
+// ---------------------------------------------------------------------------
+//
+// On H100 NVL the single-launch SM gather kernel is NOT always faster than
+// the per-run cudaMemcpy*Async loop it replaces: the copy engine wins for
+// few runs (per-run driver calls are cheap, the engine runs without
+// occupying SMs), while the kernel wins for heavily fragmented lists. Issue
+// #6 measured a 48 MiB payload and found the crossover between 16 and 32
+// runs. The CUDA entry points therefore dispatch adaptively: below the
+// threshold they issue one cudaMemcpyAsync / cudaMemcpy2DAsync per run
+// (the exact baseline), at or above it they launch the single gather
+// kernel. The decision is a pure function of run count and total bytes so
+// it is unit-testable on the host and tunable per deployment.
+
+// Forced-dispatch modes, for testing and A/B tuning on a target machine.
+// kAdaptive applies the cost model below; the force modes bypass it.
+enum class GatherDispatchMode { kAdaptive = 0, kForceKernel = 1, kForceCopyEngine = 2 };
+
+// Set the dispatch mode and the minimum run count at which the gather
+// kernel is eligible. Defaults: kAdaptive with min_runs = 24 (the issue #6
+// measurement shows the crossover at ~19 runs for 48 MiB; the floor keeps a
+// margin so the 1-16 run range stays within 5% of the copy-engine
+// baseline). Thread-safe (atomics); typically set once before launching.
+void set_gather_dispatch(GatherDispatchMode mode = GatherDispatchMode::kAdaptive,
+                         std::size_t min_runs_for_kernel = 24);
+std::pair<GatherDispatchMode, std::size_t> gather_dispatch_config();
+
+// Estimated device time (microseconds) of the per-run copy-engine loop for
+// `total_bytes` split across `num_runs` cudaMemcpy*Async calls. Constants
+// are fitted to the issue #6 H100 NVL table (48 MiB, CUDA 13 / sm90,
+// peer-enabled H100 NVL): ~195.5 us for one run (~4.07 us/MiB of copy
+// bandwidth) plus ~3.08 us of per-run driver/launch overhead. `num_runs`
+// counts only non-empty runs (empty runs are dropped before dispatch).
+double est_copy_engine_us(std::size_t num_runs, std::size_t total_bytes);
+
+// Estimated device time (microseconds) of the single-launch gather kernel:
+// ~253 us for 48 MiB (~5.27 us/MiB of SM-driven peer reads), essentially
+// flat in run count (grid.y growth is negligible below the 65535-run cap).
+double est_gather_kernel_us(std::size_t num_runs, std::size_t total_bytes);
+
+// Pure dispatch decision: true -> single-launch SM gather kernel, false ->
+// per-run copy-engine loop. Honours the configured mode and min-runs floor;
+// zero bytes (nothing to copy) never takes the kernel.
+bool prefer_gather_kernel(std::size_t num_runs, std::size_t total_bytes);
+
+// ---------------------------------------------------------------------------
+// Prepared plan API
+// ---------------------------------------------------------------------------
+//
+// KVAAS resolves one run list and reuses it for all 40 layers, but the
+// one-shot functions repeat validation, host-vector construction, device
+// metadata allocation, H2D metadata copy and free for every layer. A plan
+// moves all of that to a single prepare step: the constructor validates the
+// run list once (via stage_runs_*), copies the descriptors into owned
+// storage, and — on the CUDA path — uploads them to a persistent per-device
+// buffer. execute() then only enqueues: no validation, no allocation, no
+// H2D copy. The plan is bound to one destination allocation (the scratch
+// buffer KVAAS reuses across layers); a plan for a different destination is
+// prepared separately.
+//
+// Concurrency: after prepare the run metadata is immutable, so one plan may
+// be executed concurrently on several streams without cross-stream races
+// (the CUDA device descriptors are read-only to every kernel).
+
+// A prepared 1-D run list, bound to one destination allocation.
+class P2PGatherPlan1D {
+ public:
+  // Validate `num_runs` runs against (dst, dst_capacity) once — same
+  // contract checks as p2p_gather_runs, throwing std::invalid_argument on
+  // violation — and copy the descriptors into owned storage. num_runs == 0
+  // is a valid no-op plan. The source pointers and the destination must
+  // outlive every execute() that uses the plan (the metadata is copied, the
+  // memory is not).
+  P2PGatherPlan1D(std::uint8_t* dst, std::size_t dst_capacity,
+                  const void* const* src_ptrs, const std::size_t* dst_offsets,
+                  const std::size_t* lengths, std::size_t num_runs);
+
+  P2PGatherPlan1D(const P2PGatherPlan1D&) = delete;
+  P2PGatherPlan1D& operator=(const P2PGatherPlan1D&) = delete;
+
+  std::size_t num_runs() const { return runs_.size(); }
+  std::size_t total_bytes() const { return total_bytes_; }
+  std::uint8_t* dst() const { return dst_; }
+  std::size_t dst_capacity() const { return dst_capacity_; }
+
+  // Copy every run to the bound destination: exactly ONE stream task
+  // regardless of run count (host reference), or one kernel launch / one
+  // copy-engine sequence (CUDA). No validation, allocation or metadata work
+  // happens here — all of it was done in the constructor (execute captures
+  // the plan itself, not a copy of the descriptors, so there is no per-call
+  // host-vector construction). A null stream runs to completion before
+  // returning.
+  //
+  // Lifetime: the plan must outlive the stream it is executed on (destroy
+  // it only after stream->wait()).
+  void execute(Stream* stream = nullptr) const;
+
+ private:
+  std::uint8_t* dst_;
+  std::size_t dst_capacity_;
+  std::vector<StagedRun1D> runs_;
+  std::size_t total_bytes_ = 0;
+};
+
+// A prepared 2-D strided run list, bound to one destination allocation.
+class P2PGatherPlan2D {
+ public:
+  P2PGatherPlan2D(std::uint8_t* dst, std::size_t dst_capacity,
+                  const Gather2DRun* runs, std::size_t num_runs);
+
+  P2PGatherPlan2D(const P2PGatherPlan2D&) = delete;
+  P2PGatherPlan2D& operator=(const P2PGatherPlan2D&) = delete;
+
+  std::size_t num_runs() const { return runs_.size(); }
+  std::size_t total_bytes() const { return total_bytes_; }
+  std::uint8_t* dst() const { return dst_; }
+  std::size_t dst_capacity() const { return dst_capacity_; }
+
+  // Same contract as P2PGatherPlan1D::execute: one stream task, no per-call
+  // metadata work, plan must outlive the stream.
+  void execute(Stream* stream = nullptr) const;
+
+ private:
+  std::uint8_t* dst_;
+  std::size_t dst_capacity_;
+  std::vector<StagedRun2D> runs_;
+  std::size_t total_bytes_ = 0;
+};
 
 }  // namespace vkernels::comm

@@ -11,6 +11,7 @@
 #include "vkernels/util/error.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -188,6 +189,131 @@ void memcpy_peer_batch_async(Span<std::uint8_t> dst, const void* const* src_ptrs
   // runs.size() here, against 1 for p2p_gather_runs.
   for (const auto& r : runs)
     stream->submit([base, r]() { std::memcpy(base + r.dst_offset, r.src, r.length); });
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive dispatch
+// ---------------------------------------------------------------------------
+namespace {
+
+// Runtime-tunable dispatch state. Atomically read by the CUDA path
+// (p2p_gather.cu) and written by set_gather_dispatch; a pair of atomics is
+// enough because the two values are independent (mode and min-runs floor).
+std::atomic<unsigned> g_dispatch_mode(static_cast<unsigned>(GatherDispatchMode::kAdaptive));
+std::atomic<std::size_t> g_dispatch_min_runs(24);
+
+// Cost-model constants fitted to the issue #6 H100 NVL table (48 MiB
+// payload, CUDA 13 / sm90, peer-enabled H100 NVL):
+//   * copy-engine loop: 195.5 us @ 1 run, +3.08 us per extra run. The
+//     per-MiB term absorbs the single-copy bandwidth (48 MiB / 195.5 us
+//     ~= 4.07 us/MiB); the per-run term is the driver/launch overhead the
+//     loop pays for fragmentation.
+//   * gather kernel: ~253 us flat at 48 MiB (~5.27 us/MiB of SM-driven
+//     peer reads), flat in run count (grid.y growth is negligible).
+constexpr double kCopyPerMiBUs = 4.07;
+constexpr double kCopyPerRunUs = 3.08;
+constexpr double kKernelPerMiBUs = 5.27;
+
+}  // namespace
+
+void set_gather_dispatch(GatherDispatchMode mode, std::size_t min_runs_for_kernel) {
+  g_dispatch_mode.store(static_cast<unsigned>(mode));
+  g_dispatch_min_runs.store(min_runs_for_kernel);
+}
+
+std::pair<GatherDispatchMode, std::size_t> gather_dispatch_config() {
+  return {static_cast<GatherDispatchMode>(g_dispatch_mode.load()),
+          g_dispatch_min_runs.load()};
+}
+
+double est_copy_engine_us(std::size_t num_runs, std::size_t total_bytes) {
+  const double mib = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
+  const double runs = static_cast<double>(num_runs);
+  return kCopyPerMiBUs * mib + kCopyPerRunUs * (runs > 1.0 ? runs - 1.0 : 0.0);
+}
+
+double est_gather_kernel_us(std::size_t num_runs, std::size_t total_bytes) {
+  (void)num_runs;  // flat in run count below the 65535-run grid cap
+  return kKernelPerMiBUs * (static_cast<double>(total_bytes) / (1024.0 * 1024.0));
+}
+
+bool prefer_gather_kernel(std::size_t num_runs, std::size_t total_bytes) {
+  if (total_bytes == 0) return false;  // nothing to copy: never pay a launch
+  switch (static_cast<GatherDispatchMode>(g_dispatch_mode.load())) {
+    case GatherDispatchMode::kForceKernel: return true;
+    case GatherDispatchMode::kForceCopyEngine: return false;
+    case GatherDispatchMode::kAdaptive: break;
+  }
+  if (num_runs < g_dispatch_min_runs.load()) return false;  // floor: keep 1-16 near baseline
+  return est_gather_kernel_us(num_runs, total_bytes) <
+         est_copy_engine_us(num_runs, total_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Prepared plan API (host reference)
+// ---------------------------------------------------------------------------
+namespace {
+
+// Sum of the staged runs' lengths. The kernel path sizes its grid by the
+// longest run and the copy-engine path needs the total for dispatch.
+std::size_t total_bytes_1d(const std::vector<StagedRun1D>& runs) {
+  std::size_t t = 0;
+  for (const auto& r : runs) t += r.length;
+  return t;
+}
+
+std::size_t total_bytes_2d(const std::vector<StagedRun2D>& runs) {
+  std::size_t t = 0;
+  for (const auto& r : runs) t += r.width * r.height;
+  return t;
+}
+
+}  // namespace
+
+P2PGatherPlan1D::P2PGatherPlan1D(std::uint8_t* dst, std::size_t dst_capacity,
+                                 const void* const* src_ptrs,
+                                 const std::size_t* dst_offsets,
+                                 const std::size_t* lengths, std::size_t num_runs)
+    : dst_(dst),
+      dst_capacity_(dst_capacity),
+      runs_(stage_runs_1d(dst, dst_capacity, src_ptrs, dst_offsets, lengths, num_runs)),
+      total_bytes_(0) {
+  total_bytes_ = total_bytes_1d(runs_);
+}
+
+void P2PGatherPlan1D::execute(Stream* stream) const {
+  if (runs_.empty()) return;  // 0 runs, or every run empty: enqueue nothing
+  // Capture `this`, not a copy of the descriptors: a plan's whole point is
+  // that execute() performs no per-call host-vector construction. The plan
+  // (like the source pointers and destination it references) must therefore
+  // outlive the stream; see the class contract.
+  const P2PGatherPlan1D* self = this;
+  auto copy_all = [self]() { copy_all_1d(self->runs_, self->dst_); };
+  if (stream == nullptr) {
+    copy_all();
+    return;
+  }
+  stream->submit(std::move(copy_all));
+}
+
+P2PGatherPlan2D::P2PGatherPlan2D(std::uint8_t* dst, std::size_t dst_capacity,
+                                 const Gather2DRun* runs, std::size_t num_runs)
+    : dst_(dst),
+      dst_capacity_(dst_capacity),
+      runs_(stage_runs_2d(dst, dst_capacity, runs, num_runs)),
+      total_bytes_(0) {
+  total_bytes_ = total_bytes_2d(runs_);
+}
+
+void P2PGatherPlan2D::execute(Stream* stream) const {
+  if (runs_.empty()) return;  // 0 tiles, or every tile empty: enqueue nothing
+  const P2PGatherPlan2D* self = this;
+  auto copy_all = [self]() { copy_all_2d(self->runs_, self->dst_); };
+  if (stream == nullptr) {
+    copy_all();
+    return;
+  }
+  stream->submit(std::move(copy_all));
 }
 
 }  // namespace vkernels::comm

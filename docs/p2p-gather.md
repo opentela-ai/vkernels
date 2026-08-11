@@ -101,10 +101,24 @@ kernel issues direct peer reads over NVLink with no host staging of data.
 The CPU reference (`p2p_gather.cpp`) is the always-compiled correctness
 oracle and is fully unit-tested. The CUDA path (`p2p_gather.cu`, in
 `vkernels::comm::cuda`) reuses the oracle's `stage_runs_1d` / `stage_runs_2d`
-for validation, then stages the run descriptors to a per-launch device
-buffer (allocated with `cudaMallocAsync` on the caller's stream) and launches
-exactly one kernel — there are no per-run CUDA API calls after the metadata
-is prepared.
+for validation, then dispatches **adaptively** (issue #6):
+
+- **Few runs** (below the measured 16-32 crossover on H100 NVL): one
+  `cudaMemcpyAsync` / `cudaMemcpy2DAsync` per run on the caller's stream —
+  the copy engine wins there (no SM occupancy, cheap per-run driver calls),
+  and this is byte-for-byte the baseline the primitive is measured against.
+- **Many runs** (at/above the crossover): the run descriptors are staged to a
+  per-launch device buffer (allocated with `cudaMallocAsync` on the caller's
+  stream) and **exactly one kernel** is launched — there are no per-run CUDA
+  API calls after the metadata is prepared.
+
+The decision is the pure, host-tested function `prefer_gather_kernel(num_runs,
+ total_bytes)` with a cost model fitted to the issue #6 H100 NVL table
+(48 MiB, CUDA 13 / sm90): copy engine ≈ 4.07 µs/MiB + 3.08 µs/run, gather
+kernel ≈ 5.27 µs/MiB, crossover at ~19 runs. A 24-run floor (default) keeps
+the 1-16 run range safely on the copy engine. `set_gather_dispatch(mode,
+min_runs)` overrides the model for testing (`kForceKernel` /
+`kForceCopyEngine`) and A/B tuning on a target machine.
 
 The default memory pool is tuned once (`cudaMemPoolSetAttribute` with
 `cudaMemPoolAttrReleaseThreshold = UINT64_MAX`) so freed memory stays in the
@@ -115,11 +129,55 @@ mutable `__constant__` symbol — is safe across concurrent streams (a
 second launch gets its own allocation that cannot be overwritten while the
 first stream's kernel is still reading it).
 
+The kernel copies 16 bytes per thread (`uint4` load/store) for runs whose
+source, destination and (2-D) strides are 16-byte aligned, with a <16-byte
+scalar tail handled by one thread per run/row; unaligned runs fall back to
+the byte-per-thread path. The vectorizable flag is computed once on the host
+at staging time, so the kernel does no per-thread alignment arithmetic.
+Grid units are 16 bytes (vectorized) or 1 byte (scalar) per thread, so one
+grid sized to the largest unit count covers mixed lists.
+
 Kernel grid (current limits):
-- 1-D: `grid.x` tiles the longest run's byte range (256 threads/block),
+- 1-D: `grid.x` tiles the longest run's unit range (256 threads/block),
   `grid.y = num_runs`. Capped at 65535 runs (the grid-y limit).
 - 2-D: `grid.x` tiles the row `width`, `grid.y = max_height` across runs,
   `grid.z = num_runs`. Capped at 65535 runs and 65535 rows independently.
+
+## Prepared plan API (reuse across layer launches)
+
+KVAAS resolves one run list and reuses it for all 40 layers, but the one-shot
+functions repeat validation, host-vector construction, device metadata
+allocation, H2D metadata copy and free for every layer. A plan moves all of
+that to a single prepare step:
+
+```cpp
+// Host reference (always compiled) and CUDA implementation both expose:
+//   P2PGatherPlan1D / P2PGatherPlan2D (host, vkernels::comm)
+//   vkernels::comm::cuda::P2PGatherPlan1D / _2D (CUDA, cudaStream_t)
+//
+// Construct:  validate the run list ONCE (throws on violation), copy the
+//             descriptors into owned storage, and — CUDA — allocate a
+//             persistent per-device buffer and upload the descriptors with
+//             a synchronous cudaMemcpy (one-time cost, no cross-stream
+//             race because there is no stream association).
+// execute():  enqueue only — no validation, no allocation, no H2D copy.
+//             CUDA: adaptive dispatch (copy engine / kernel) exactly like
+//             the one-shot functions. Safe concurrently on several streams
+//             because the plan's metadata is read-only after construction.
+```
+
+The plan is bound to one destination allocation (the scratch buffer KVAAS
+reuses across layers); a plan for a different destination is prepared
+separately. Lifetime: destroy the plan only after every stream it was
+executed on has been synchronised (the persistent buffer is freed in the
+destructor).
+
+```cpp
+// CUDA plan, the KVAAS 40-layer pattern:
+std::vector<std::uint8_t> scratch(48 * 1024 * 1024);  // bound destination
+P2PGatherPlan1D plan(scratch.data(), scratch.size(), srcs, offs, lens, runs);
+for (int layer = 0; layer < 40; ++layer) plan.execute(stream);  // enqueue only
+```
 
 ## C ABI
 
@@ -141,6 +199,19 @@ vkernels_status_t vkernels_p2p_gather_runs_2d(
     cudaStream_t stream);
 ```
 
+The plan API is exposed as opaque handles for the same non-C++ consumers:
+
+```c
+vkernels_p2p_plan_1d_t* vkernels_p2p_plan_1d_create(
+    uint8_t* dst, size_t dst_capacity, const void* const* src_ptrs,
+    const size_t* dst_offsets, const size_t* lengths, size_t num_runs,
+    vkernels_status_t* status_out);   // NULL + status on validation failure
+void     vkernels_p2p_plan_1d_destroy(vkernels_p2p_plan_1d_t* plan);
+vkernels_status_t vkernels_p2p_plan_1d_execute(vkernels_p2p_plan_1d_t* plan,
+                                              cudaStream_t stream);
+// vkernels_p2p_plan_2d_create / _destroy / _execute mirror the 1-D trio.
+```
+
 `vkernels_gather_2d_run_t` is layout-compatible with `Gather2DRun`. A C++
 exception thrown by the staging validators (`std::invalid_argument` via
 `VK_EXPECTS`) or the launch path (`std::runtime_error` via `VK_ENSURES`) is
@@ -152,13 +223,28 @@ caught inside the wrapper and mapped to `VKERNELS_ERR_INVALID_ARGUMENT` or
 ```sh
 cmake --preset cuda -DVKERNELS_BUILD_BENCHMARKS=ON
 cmake --build --preset cuda
-./build/cuda/benchmarks/p2p_gather_bench
+./build/cuda/benchmarks/p2p_gather_bench            # idle GPU
+./build/cuda/benchmarks/p2p_gather_bench --concurrent  # filler kernel on a 2nd stream
 ```
 
-The benchmark sweeps run count and size (1-D, 4 MiB total — fragmentation —
-and fixed 4 KiB pages — count) and 2-D strided tiles, timing the
-single-launch kernel against a per-run `cudaMemcpyAsync` / `cudaMemcpy2DAsync`
-loop with raw `cudaEvent` and a median over iterations. On a single-GPU box
-the peer source is another device allocation and the baseline uses
-`cudaMemcpyDeviceToDevice`; on a multi-GPU system point `src_ptrs[i]` at peer
-memory and enable peer access — the kernel and measurement are unchanged.
+The benchmark covers the issue #6 acceptance criteria: a fixed 48 MiB
+payload swept across 1, 2, 4, 8, 16, 32, 64 and 192 runs (bracketing the
+measured 16-32 crossover), the existing 4 MiB fragmentation and 4 KiB page
+sweeps, and 2-D strided tiles. Each row reports the per-run copy-engine
+baseline, the forced kernel, the adaptive path (and which branch it took),
+and — separately — the host enqueue time (validation + descriptor
+construction + metadata allocation + H2D enqueue + launch), so the
+preparation/allocation contribution is visible next to kernel execution. A
+final section prepares a plan ONCE and times 40 executes, the KVAAS
+layer-reuse pattern.
+
+Timing is raw `cudaEvent` (device) + `steady_clock` (host enqueue) with
+warmup and a median over iterations. On a single-GPU box the peer source is
+another device allocation and the baseline uses `cudaMemcpyDeviceToDevice`;
+on a multi-GPU system point `src_ptrs[i]` at peer memory and enable peer
+access — the kernel and measurement are unchanged.
+
+Measured results so far live in `docs/performance/p2p-gather/` (per
+architecture): `gb10.md` for NVIDIA GB10, `h100-nvl.md` for the H100 NVL
+machine (issue #6 environment) with the baseline table and the acceptance
+sweep to be re-run on the target.

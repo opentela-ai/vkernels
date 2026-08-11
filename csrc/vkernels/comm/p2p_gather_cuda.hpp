@@ -31,6 +31,61 @@ void p2p_gather_runs(std::uint8_t* dst, std::size_t dst_capacity,
 void p2p_gather_runs_2d(std::uint8_t* dst, std::size_t dst_capacity, const Gather2DRun* runs,
                         std::size_t num_runs, cudaStream_t_p2p stream);
 
+// ---------------------------------------------------------------------------
+// Prepared plan API (CUDA implementation)
+// ---------------------------------------------------------------------------
+//
+// Same semantics as vkernels::comm::P2PGatherPlan1D / _2D (validate once at
+// construction, execute() only enqueues) with the CUDA specifics: the
+// constructor also uploads the run descriptors to a persistent per-device
+// buffer with a synchronous cudaMemcpy (one-time cost, no cross-stream
+// race), and execute() adaptively dispatches between the per-run copy
+// engine and the single-launch kernel using prefer_gather_kernel.
+//
+// Lifetime: the plan owns the device descriptor buffer; destroy the plan
+// only after every stream it was executed on has been synchronised.
+// Read-only after construction, so concurrent execute() on several streams
+// is safe.
+class P2PGatherPlan1D {
+ public:
+  P2PGatherPlan1D(std::uint8_t* dst, std::size_t dst_capacity,
+                  const void* const* src_ptrs, const std::size_t* dst_offsets,
+                  const std::size_t* lengths, std::size_t num_runs);
+  ~P2PGatherPlan1D();
+  P2PGatherPlan1D(const P2PGatherPlan1D&) = delete;
+  P2PGatherPlan1D& operator=(const P2PGatherPlan1D&) = delete;
+
+  std::size_t num_runs() const;
+  std::size_t total_bytes() const;
+
+  // Enqueue the gather on `stream`. Adaptive: per-run cudaMemcpyAsync below
+  // the dispatch crossover, one kernel launch at or above it. No
+  // validation, no allocation, no H2D metadata copy.
+  void execute(cudaStream_t_p2p stream) const;
+
+ private:
+  struct Impl;
+  Impl* impl_;
+};
+
+class P2PGatherPlan2D {
+ public:
+  P2PGatherPlan2D(std::uint8_t* dst, std::size_t dst_capacity,
+                  const Gather2DRun* runs, std::size_t num_runs);
+  ~P2PGatherPlan2D();
+  P2PGatherPlan2D(const P2PGatherPlan2D&) = delete;
+  P2PGatherPlan2D& operator=(const P2PGatherPlan2D&) = delete;
+
+  std::size_t num_runs() const;
+  std::size_t total_bytes() const;
+
+  void execute(cudaStream_t_p2p stream) const;
+
+ private:
+  struct Impl;
+  Impl* impl_;
+};
+
 }  // namespace vkernels::comm::cuda
 
 #endif  // VKERNELS_HAS_CUDA
