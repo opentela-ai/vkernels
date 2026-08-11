@@ -62,8 +62,11 @@ std::vector<StagedRun1D> stage_runs_1d(const std::uint8_t* dst_base,
     // Source and destination byte ranges for this run must not overlap. The
     // CUDA path reuses this check; with UVA the peer and local pointers share
     // one address space, so a mistakenly-aliased source is still caught.
-    const std::uint8_t* d = dst_base + off;
-    VK_EXPECTS(s + len <= d || s >= d + len, "src and dst ranges must not overlap");
+    // Comparing uintptr_t avoids the UB of ordering pointers from different
+    // allocations.
+    const std::uintptr_t su = reinterpret_cast<std::uintptr_t>(s);
+    const std::uintptr_t du = reinterpret_cast<std::uintptr_t>(dst_base) + off;
+    VK_EXPECTS(su + len <= du || su >= du + len, "src and dst ranges must not overlap");
     runs.push_back({s, off, len});
   }
 
@@ -80,11 +83,28 @@ std::vector<StagedRun1D> stage_runs_1d(const std::uint8_t* dst_base,
 
 // Validate and stage a 2-D strided run list. Empty tiles (zero width or
 // height) are dropped. The destination extent is checked in steps so an
-// oversized tile cannot overflow while computing it.
-std::vector<StagedRun2D> stage_runs_2d(std::size_t dst_capacity, const Gather2DRun* runs,
+// oversized tile cannot overflow while computing it. Two further checks
+// mirror `stage_runs_1d` so the CUDA kernel (which copies runs with no
+// inter-run ordering) can rely on the host oracle:
+//   * per-tile src/dst non-overlap, using the conservative bounding box that
+//     spans every row (sufficient: a non-overlapping bounding box guarantees
+//     no row overlaps; not necessary when strides carve gaps), and
+//   * mutually-disjoint output bounding boxes (sorted, then checked pairwise).
+//
+// The bounding-box check is intentionally conservative: it may reject a
+// pathological strided layout whose tiles' boxes overlap while their actual
+// rows do not. For the coalesced, packed layouts this primitive targets such
+// false positives do not arise, and the guarantee (no two tiles write the
+// same destination byte) is what the concurrent CUDA kernel needs.
+std::vector<StagedRun2D> stage_runs_2d(const std::uint8_t* dst_base,
+                                      std::size_t dst_capacity, const Gather2DRun* runs,
                                       std::size_t num_runs) {
+  VK_EXPECTS(num_runs == 0 || runs != nullptr, "runs must be non-null");
+
   std::vector<StagedRun2D> out;
   out.reserve(num_runs);
+  std::vector<std::pair<std::uintptr_t, std::uintptr_t>> dst_boxes;
+  dst_boxes.reserve(num_runs);
   for (std::size_t i = 0; i < num_runs; ++i) {
     const Gather2DRun& g = runs[i];
     if (g.width == 0 || g.height == 0) continue;  // empty tile: nothing to copy
@@ -98,9 +118,28 @@ std::vector<StagedRun2D> stage_runs_2d(std::size_t dst_capacity, const Gather2DR
                "2-D row stride exceeds dst capacity");
     const std::size_t row_span = rows * g.dst_stride;
     VK_EXPECTS(g.width <= dst_capacity - off - row_span, "2-D run exceeds dst capacity");
+
+    // Per-tile src/dst non-overlap via the conservative bounding box spanning
+    // every row (min corner = first row start; the box also covers the inter-
+    // row gaps when stride > width, which is what makes it conservative).
+    const std::size_t src_span = rows * g.src_stride;
+    const std::uintptr_t s_lo = reinterpret_cast<std::uintptr_t>(g.src);
+    const std::uintptr_t s_hi = s_lo + src_span + g.width;
+    const std::uintptr_t d_lo = reinterpret_cast<std::uintptr_t>(dst_base) + off;
+    const std::uintptr_t d_hi = d_lo + row_span + g.width;
+    VK_EXPECTS(s_hi <= d_lo || s_lo >= d_hi, "2-D src and dst ranges must not overlap");
+
     const auto* s = static_cast<const std::uint8_t*>(g.src);
     out.push_back({s, off, g.src_stride, g.dst_stride, g.width, g.height});
+    dst_boxes.emplace_back(d_lo, d_hi);
   }
+
+  // Output tiles must be mutually disjoint (checked in sorted box order).
+  std::sort(dst_boxes.begin(), dst_boxes.end());
+  for (std::size_t i = 1; i < dst_boxes.size(); ++i)
+    VK_EXPECTS(dst_boxes[i - 1].second <= dst_boxes[i].first,
+               "output tiles must be disjoint");
+
   return out;
 }
 
@@ -121,7 +160,7 @@ void p2p_gather_runs(Span<std::uint8_t> dst, const void* const* src_ptrs,
 }
 
 void p2p_gather_runs_2d(Span<std::uint8_t> dst, Span<const Gather2DRun> runs, Stream* stream) {
-  auto staged = stage_runs_2d(dst.size(), runs.data(), runs.size());
+  auto staged = stage_runs_2d(dst.data(), dst.size(), runs.data(), runs.size());
   if (staged.empty()) return;  // 0 tiles, or every tile empty: enqueue nothing
 
   std::uint8_t* base = dst.data();

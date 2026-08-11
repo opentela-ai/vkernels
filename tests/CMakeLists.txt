@@ -19,3 +19,13 @@ vkernels_add_test(NAME channel     SOURCES comm/test_channel.cpp)
 vkernels_add_test(NAME allreduce   SOURCES comm/test_allreduce.cpp)
 vkernels_add_test(NAME overlap     SOURCES comm/test_overlap.cpp)
 vkernels_add_test(NAME p2p_gather SOURCES comm/test_p2p_gather.cpp)
+
+# The `extern "C"` ABI is CUDA-only (the entry points take a raw
+# cudaStream_t); its runtime test is a .cu compiled when a toolkit is
+# present. It links the shared `vkernels_c` boundary plus the CUDA runtime
+# (pulled in automatically for .cu translation units).
+if(VKERNELS_HAS_CUDA)
+  vkernels_add_test(NAME p2p_gather_c SOURCES comm/test_p2p_gather_c.cu
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/csrc
+                    LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
+endif()

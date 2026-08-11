@@ -168,9 +168,9 @@ int main() {
 
   // 1-D: fixed total (4 MiB), sweep run count to vary fragmentation. The
   // single-launch kernel pulls ahead as run count (and thus per-run launch
-  // overhead in the baseline) grows. All counts fit the __constant__ cap
-  // (2048), so these are the fast path.
-  print_header("1-D gather: 4 MiB total, sweep fragmentation (__constant__ path)");
+  // overhead in the baseline) grows. The per-launch cudaMallocAsync staging
+  // buffer is cheap (pool-tuned, reused after the first call).
+  print_header("1-D gather: 4 MiB total, sweep fragmentation");
   constexpr std::size_t kTotal = 4u * 1024u * 1024u;
   for (std::size_t count : {1u, 8u, 32u, 128u, 512u, 2048u}) {
     const std::size_t run_bytes = kTotal / count;
@@ -178,25 +178,24 @@ int main() {
     print_row(count, run_bytes, 0, 0, t);
   }
 
-  // 1-D: fixed page size (4 KiB), sweep count within the __constant__ cap.
-  print_header("1-D gather: 4 KiB runs, sweep count (__constant__ path)");
+  // 1-D: fixed page size (4 KiB), sweep count.
+  print_header("1-D gather: 4 KiB runs, sweep count");
   for (std::size_t count : {1u, 64u, 256u, 1024u, 2048u}) {
     const Timings t = bench_1d(stream, count, 4u * 1024u);
     print_row(count, 4u * 1024u, 0, 0, t);
   }
 
-  // 1-D: above the __constant__ cap (2048). These fall back to a
-  // stream-ordered cudaMallocAsync staging buffer — still one kernel, now
-  // with a metadata allocation that very large lists justify. The single
-  // launch still beats the per-run loop because N is so large.
-  print_header("1-D gather: 4 KiB runs, above __constant__ cap (cudaMallocAsync fallback)");
+  // 1-D: large lists. The per-launch staging allocation grows linearly, but
+  // the pool-tuned cudaMallocAsync keeps it a cheap pointer bump and the
+  // single launch still beats the per-run loop because N is so large.
+  print_header("1-D gather: 4 KiB runs, large lists");
   for (std::size_t count : {4096u, 8192u}) {
     const Timings t = bench_1d(stream, count, 4u * 1024u);
     print_row(count, 4u * 1024u, 0, 0, t);
   }
 
-  // 2-D: strided tiles, sweep count within the __constant__ cap (1024).
-  print_header("2-D gather: 64x512 strided tiles, sweep count (__constant__ path)");
+  // 2-D: strided tiles, sweep count.
+  print_header("2-D gather: 64x512 strided tiles, sweep count");
   for (std::size_t count : {1u, 16u, 64u, 256u}) {
     const Timings t = bench_2d(stream, count, 512u, 64u, 1024u, 1024u);
     print_row(count, 0, 512u, 64u, t);

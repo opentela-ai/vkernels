@@ -10,7 +10,10 @@ csrc/vkernels/comm/p2p_gather.hpp      public API + contract
 csrc/vkernels/comm/p2p_gather.cpp      host reference (the correctness oracle)
 csrc/vkernels/comm/p2p_gather.cu       CUDA single-launch kernel
 csrc/vkernels/comm/p2p_gather_cuda.hpp CUDA-only declarations (cudaStream_t)
+csrc/vkernels/comm/p2p_gather_c.h      C ABI (extern "C", status codes)
+csrc/vkernels/comm/p2p_gather_c.cu     C ABI implementation (CUDA-gated)
 tests/comm/test_p2p_gather.cpp         host oracle tests
+tests/comm/test_p2p_gather_c.cu       C ABI runtime tests (CUDA-gated)
 benchmarks/p2p_gather_bench.cu         CUDA sweep vs the per-run loop
 ```
 
@@ -98,15 +101,51 @@ kernel issues direct peer reads over NVLink with no host staging of data.
 The CPU reference (`p2p_gather.cpp`) is the always-compiled correctness
 oracle and is fully unit-tested. The CUDA path (`p2p_gather.cu`, in
 `vkernels::comm::cuda`) reuses the oracle's `stage_runs_1d` / `stage_runs_2d`
-for validation, then stages the run descriptors to device memory once and
-launches exactly one kernel — there are no per-run CUDA API calls after the
-metadata is prepared.
+for validation, then stages the run descriptors to a per-launch device
+buffer (allocated with `cudaMallocAsync` on the caller's stream) and launches
+exactly one kernel — there are no per-run CUDA API calls after the metadata
+is prepared.
+
+The default memory pool is tuned once (`cudaMemPoolSetAttribute` with
+`cudaMemPoolAttrReleaseThreshold = UINT64_MAX`) so freed memory stays in the
+pool and a subsequent `cudaMallocAsync` is a pool-internal pointer bump
+rather than a driver memory-acquisition syscall. This keeps the per-launch
+staging allocation cheap even for very large run lists, and — unlike a
+mutable `__constant__` symbol — is safe across concurrent streams (a
+second launch gets its own allocation that cannot be overwritten while the
+first stream's kernel is still reading it).
 
 Kernel grid (current limits):
 - 1-D: `grid.x` tiles the longest run's byte range (256 threads/block),
   `grid.y = num_runs`. Capped at 65535 runs (the grid-y limit).
 - 2-D: `grid.x` tiles the row `width`, `grid.y = max_height` across runs,
   `grid.z = num_runs`. Capped at 65535 runs and 65535 rows independently.
+
+## C ABI
+
+Non-C++ consumers (e.g. a serving runtime that links the primitive without
+the C++ headers) use the `extern "C"` entry points declared in
+`p2p_gather_c.h` and exported by the CUDA-gated `libvkernels_c` shared
+library. They take raw pointers and a `cudaStream_t` and return a
+`vkernels_status_t` code (never throw across the boundary):
+
+```c
+vkernels_status_t vkernels_p2p_gather_runs(
+    uint8_t* dst, size_t dst_capacity,
+    const void* const* src_ptrs, const size_t* dst_offsets,
+    const size_t* lengths, size_t num_runs, cudaStream_t stream);
+
+vkernels_status_t vkernels_p2p_gather_runs_2d(
+    uint8_t* dst, size_t dst_capacity,
+    const vkernels_gather_2d_run_t* runs, size_t num_runs,
+    cudaStream_t stream);
+```
+
+`vkernels_gather_2d_run_t` is layout-compatible with `Gather2DRun`. A C++
+exception thrown by the staging validators (`std::invalid_argument` via
+`VK_EXPECTS`) or the launch path (`std::runtime_error` via `VK_ENSURES`) is
+caught inside the wrapper and mapped to `VKERNELS_ERR_INVALID_ARGUMENT` or
+`VKERNELS_ERR_INTERNAL` respectively.
 
 ## Benchmark
 

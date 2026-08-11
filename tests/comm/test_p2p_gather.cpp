@@ -359,3 +359,41 @@ TEST(P2pGather2d, LastRowExceedsCapacityThrows) {
   Gather2DRun runs[1] = {{src.data(), 64, 0, 80, 30, 2}};
   EXPECT_THROW(p2p_gather_runs_2d(span(dst), gruns(runs, 1)), std::invalid_argument);
 }
+
+// 2-D now mirrors 1-D: per-tile src/dst non-overlap and mutually-disjoint
+// output tiles, so the concurrent CUDA kernel (no inter-run ordering) can
+// trust the staged metadata.
+TEST(P2pGather2d, SrcOverlapsDstThrows) {
+  // Source tile points into the destination buffer (4 bytes in), so the
+  // src and dst bounding boxes overlap.
+  auto dst = scratch(64, 0);
+  Gather2DRun runs[1] = {{dst.data() + 4, 8, 0, 8, 4, 4}};
+  EXPECT_THROW(p2p_gather_runs_2d(span(dst), gruns(runs, 1)), std::invalid_argument);
+}
+
+TEST(P2pGather2d, OverlappingOutputTilesThrow) {
+  // Two tiles with overlapping destination bounding boxes: tile 0 owns
+  // [0,12), tile 1 owns [8,20) — they overlap at [8,12).
+  auto a = peer(32, 1);
+  auto b = peer(32, 9);
+  auto dst = scratch(64, 0);
+  Gather2DRun runs[2] = {{a.data(), 8, 0, 8, 4, 2},   // dst box [0, 12)
+                         {b.data(), 8, 8, 8, 4, 2}};  // dst box [8, 20)
+  EXPECT_THROW(p2p_gather_runs_2d(span(dst), gruns(runs, 2)), std::invalid_argument);
+}
+
+TEST(P2pGather2d, AdjacentTilesAreAllowed) {
+  // Tile 0 owns [0,12), tile 1 owns [12,24): adjacent, not overlapping, so
+  // the disjointness check must accept them and copy both byte-exact.
+  auto a = peer(16, 1);
+  auto b = peer(16, 9);
+  auto dst = scratch(64, 0);
+  Gather2DRun runs[2] = {{a.data(), 8, 0, 8, 4, 2},    // dst box [0, 12)
+                         {b.data(), 8, 12, 8, 4, 2}};  // dst box [12, 24)
+  p2p_gather_runs_2d(span(dst), gruns(runs, 2));
+  for (std::size_t y = 0; y < 2; ++y)
+    for (std::size_t x = 0; x < 4; ++x) {
+      ASSERT_EQ(dst[y * 8 + x], a[y * 8 + x]);
+      ASSERT_EQ(dst[12 + y * 8 + x], b[y * 8 + x]);
+    }
+}

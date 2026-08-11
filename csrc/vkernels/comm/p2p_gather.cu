@@ -9,18 +9,31 @@
 // metadata is prepared — that is the overhead the per-run
 // cudaMemcpyPeerAsync / cudaMemcpy2DAsync loop paid.
 //
-// Run descriptors live in `__constant__` memory. Every thread in a block
-// reads the SAME run (blockIdx.y/z selects it), so the read is a uniform
-// broadcast — ideal for the constant cache — and `cudaMemcpyToSymbolAsync`
-// is a single cheap driver call with NO per-launch allocation. Lists larger
-// than the constant cap fall back to a stream-ordered `cudaMallocAsync`
-// staging buffer; that path still launches one kernel, just with a metadata
-// allocation that large (multi-thousand-run) lists justify.
+// Run descriptors are staged into a PER-LAUNCH device buffer allocated with
+// cudaMallocAsync on the caller's stream and freed with cudaFreeAsync before
+// the entry point returns (the kernel is already enqueued). This is the key
+// design choice over an earlier __constant__ approach:
+//
+//   * Correctness on every arch. Taking the address of a __constant__ symbol
+//     and passing it as a generic `const T*` kernel argument faults with
+//     cudaErrorIllegalAddress on Hopper (sm_90); a plain device pointer does
+//     not. (Every block still reads the SAME run, so the metadata lands in L2
+//     after the first few blocks — the constant-cache broadcast property is
+//     preserved in practice.)
+//   * Concurrency. A single mutable __constant__ symbol is unsafe across
+//     concurrent streams (a second launch can overwrite descriptors while the
+//     first stream's kernel is still reading them). A per-launch allocation
+//     is private to one launch and therefore safe to overlap.
+//
+// To keep the per-launch allocation cheap, the default memory pool is tuned
+// ONCE (release threshold = UINT64_MAX) so freed memory stays in the pool and
+// a subsequent cudaMallocAsync is a pool-internal pointer bump rather than a
+// driver memory-acquisition syscall.
 //
 // The CUDA entry points live in `vkernels::comm::cuda` (mirroring the
 // elementwise `cuda::` split) so they coexist with the host reference as
-// separate symbols; CUDA test and benchmark targets call them directly with a
-// `cudaStream_t`.
+// separate symbols. The C ABI (p2p_gather_c.h / p2p_gather_c.cu) wraps these
+// for non-C++ consumers, returning error codes instead of throwing.
 #include "vkernels/comm/p2p_gather.hpp"
 
 #if VKERNELS_HAS_CUDA
@@ -30,15 +43,21 @@
 #  include "vkernels/util/error.hpp"
 
 #  include <cstddef>
-#  include <optional>
+#  include <cstdint>
+#  include <limits>
+#  include <mutex>
 #  include <vector>
 
 namespace vkernels::comm {
 namespace cuda {
 namespace {
 
+// Hardware grid-axis limits used to bound input ranges up front (the launch
+// would fail anyway; checking gives a clear contract violation instead).
+constexpr unsigned kMaxGridAxis = 65535u;
+
 // Fixed-width device descriptor (8-byte fields keep host/device layout stable
-// across the host->constant copy). `dst` is the resolved absolute destination
+// across the host->device copy). `dst` is the resolved absolute destination
 // pointer (scratch base + dst_offset) so the kernel needs no per-run offset
 // arithmetic.
 struct RunDev1D {
@@ -56,24 +75,27 @@ struct RunDev2D {
   unsigned long long height;
 };
 
-// Run descriptors live in ONE __constant__ symbol shared by the 1-D and 2-D
-// paths (they are never active in the same launch). A union of POD arrays is
-// the standard CUDA idiom for bounded per-launch metadata that every thread
-// in a block reads uniformly (constant-cache broadcast), and `cudaMemcpyToSymbol`
-// is a single cheap driver call with no per-launch allocation. Lists larger
-// than the cap fall back to a stream-ordered `cudaMallocAsync` buffer.
-constexpr int kMaxConst1D = 2048;  // 48 KiB; 1-D is the primary use case
-constexpr int kMaxConst2D = 1024;  // 48 KiB; both fit in one 64 KiB bank
-
-union RunDescConst {
-  RunDev1D d1[kMaxConst1D];  // 2048 * 24 B = 48 KiB
-  RunDev2D d2[kMaxConst2D];  // 1024 * 48 B = 48 KiB
-};
-__constant__ RunDescConst c_runs;
+// Tune the default memory pool once so freed memory is retained: repeated
+// per-launch cudaMallocAsync/cudaFreeAsync pairs become cheap pool-internal
+// pointer bumps instead of driver syscalls. Idempotent; std::call_once makes
+// the one-time guarantee explicit and data-race-free.
+void tune_default_pool_once() {
+  static std::once_flag flag;
+  std::call_once(flag, [] {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return;
+    cudaMemPool_t pool = nullptr;
+    if (cudaDeviceGetDefaultMemPool(&pool, device) != cudaSuccess) return;
+    std::uint64_t keep = UINT64_MAX;  // never release freed memory to the OS
+    cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
+  });
+}
 
 // 1-D gather. blockIdx.y selects the run; blockIdx.x tiles its byte range.
 // Shorter runs' trailing threads return via the `idx < length` guard, so the
-// grid can be sized to the longest run.
+// grid can be sized to the longest run. `runs` is a plain device pointer
+// (read from L2 by every block of the same run), not a __constant__ symbol,
+// so it is correct on every architecture and safe across concurrent streams.
 __global__ void gather_1d_kernel(const RunDev1D* __restrict__ runs, int num_runs) {
   int r = blockIdx.y;
   if (r >= num_runs) return;
@@ -84,34 +106,41 @@ __global__ void gather_1d_kernel(const RunDev1D* __restrict__ runs, int num_runs
 }
 
 // 2-D gather. blockIdx.z selects the run, blockIdx.y the row within it, and
-// blockIdx.x tiles the row's `width` bytes. Using grid.z (capped at 65535
-// runs) and grid.y (capped at 65535 rows) independently avoids the combined
-// (run*row) encoding, which would overflow the grid.y limit for tall tiles.
-__global__ void gather_2d_kernel(const RunDev2D* __restrict__ runs, int num_runs,
-                                 int max_height) {
+// blockIdx.x tiles the row's `width` bytes. Using grid.z (runs) and grid.y
+// (rows) independently avoids the combined (run*row) encoding, which would
+// overflow the grid.y limit for tall tiles. Each block compares its row
+// against the run's own `height` (read from the descriptor), so no separate
+// max-height parameter is needed and there is no narrowing int cast.
+__global__ void gather_2d_kernel(const RunDev2D* __restrict__ runs, int num_runs) {
   int r = blockIdx.z;
-  int row = blockIdx.y;
+  unsigned long long row = static_cast<unsigned long long>(blockIdx.y);
   if (r >= num_runs) return;
   RunDev2D run = runs[r];
-  if (row >= static_cast<int>(run.height)) return;  // run shorter than max_height
+  if (row >= run.height) return;  // run shorter than the grid's row extent
   unsigned long long col =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (col < run.width)
     run.dst[row * run.dst_stride + col] = run.src[row * run.src_stride + col];
 }
 
-// Number of 256-byte blocks covering `n` bytes (at least one).
+// Number of 256-byte blocks covering `n` bytes (at least one). `n` is bounded
+// by the caller to stay well under the grid.x limit (INT_MAX blocks).
 inline int tiles(std::size_t n) {
-  return static_cast<int>((n + 255u) / 256u) > 0 ? static_cast<int>((n + 255u) / 256u) : 1;
+  VK_EXPECTS(n <= static_cast<std::size_t>(std::numeric_limits<int>::max()) * 256u,
+             "byte range exceeds the grid.x block limit");
+  const std::size_t t = (n + 255u) / 256u;
+  return t > 0 ? static_cast<int>(t) : 1;
 }
 
 // RAII wrapper over a stream-ordered device allocation so the staging buffer
 // is freed even when a subsequent VK_ENSURES throws. The destructor issues
-// cudaFreeAsync (which returns an error code, never throws).
+// cudaFreeAsync (which returns an error code, never throws). Tuning the
+// default pool here makes this allocation cheap after the first call.
 struct ScopedDevBuf {
   void* ptr = nullptr;
   cudaStream_t stream = nullptr;
   explicit ScopedDevBuf(std::size_t bytes, cudaStream_t s) : stream(s) {
+    tune_default_pool_once();
     cudaError_t err = cudaMallocAsync(&ptr, bytes, stream);
     VK_ENSURES(err == cudaSuccess, "cudaMallocAsync for run metadata failed");
   }
@@ -138,36 +167,25 @@ void p2p_gather_runs(std::uint8_t* dst, std::size_t dst_capacity,
     dev.push_back({r.src, dst + r.dst_offset, static_cast<unsigned long long>(r.length)});
     if (max_len < r.length) max_len = r.length;
   }
-  const std::size_t bytes = dev.size() * sizeof(RunDev1D);
+  VK_EXPECTS(dev.size() <= kMaxGridAxis, "too many runs for the grid.y axis");
 
-  const RunDev1D* runs_ptr = nullptr;
-  std::optional<ScopedDevBuf> fallback;  // device buffer, only for > cap lists
-  if (dev.size() <= static_cast<std::size_t>(kMaxConst1D)) {
-    // Common case: stage into __constant__ memory (one cheap driver call,
-    // no allocation; uniform block reads hit the constant cache).
-    cudaError_t err = cudaMemcpyToSymbolAsync(c_runs, dev.data(), bytes, 0,
-                                              cudaMemcpyHostToDevice, stream);
-    VK_ENSURES(err == cudaSuccess, "cudaMemcpyToSymbolAsync for run metadata failed");
-    runs_ptr = c_runs.d1;
-  } else {
-    // Very large list: stage into a fresh device buffer. Still one kernel.
-    fallback.emplace(bytes, stream);
-    cudaError_t err = cudaMemcpyAsync(fallback->ptr, dev.data(), bytes,
-                                      cudaMemcpyHostToDevice, stream);
-    VK_ENSURES(err == cudaSuccess, "cudaMemcpyAsync for run metadata failed");
-    runs_ptr = static_cast<const RunDev1D*>(fallback->ptr);
-  }
+  const std::size_t bytes = dev.size() * sizeof(RunDev1D);
+  ScopedDevBuf meta(bytes, stream);
+  cudaError_t err = cudaMemcpyAsync(meta.ptr, dev.data(), bytes,
+                                    cudaMemcpyHostToDevice, stream);
+  VK_ENSURES(err == cudaSuccess, "cudaMemcpyAsync for run metadata failed");
 
   dim3 block(256);
   dim3 grid(tiles(max_len), static_cast<unsigned>(dev.size()));
-  gather_1d_kernel<<<grid, block, 0, stream>>>(runs_ptr, static_cast<int>(dev.size()));
-  cudaError_t err = cudaGetLastError();
+  gather_1d_kernel<<<grid, block, 0, stream>>>(
+      static_cast<const RunDev1D*>(meta.ptr), static_cast<int>(dev.size()));
+  err = cudaGetLastError();
   VK_ENSURES(err == cudaSuccess, "cuda gather_1d launch failed");
 }
 
 void p2p_gather_runs_2d(std::uint8_t* dst, std::size_t dst_capacity, const Gather2DRun* runs,
                         std::size_t num_runs, cudaStream_t stream) {
-  auto staged = stage_runs_2d(dst_capacity, runs, num_runs);
+  auto staged = stage_runs_2d(dst, dst_capacity, runs, num_runs);
   if (staged.empty()) return;
 
   std::vector<RunDev2D> dev;
@@ -182,28 +200,20 @@ void p2p_gather_runs_2d(std::uint8_t* dst, std::size_t dst_capacity, const Gathe
     if (max_w < r.width) max_w = r.width;
     if (max_h < r.height) max_h = r.height;
   }
+  VK_EXPECTS(dev.size() <= kMaxGridAxis, "too many runs for the grid.z axis");
+  VK_EXPECTS(max_h <= kMaxGridAxis, "tile height exceeds the grid.y axis");
+
   const std::size_t bytes = dev.size() * sizeof(RunDev2D);
+  ScopedDevBuf meta(bytes, stream);
+  cudaError_t err = cudaMemcpyAsync(meta.ptr, dev.data(), bytes,
+                                    cudaMemcpyHostToDevice, stream);
+  VK_ENSURES(err == cudaSuccess, "cudaMemcpyAsync for 2-D run metadata failed");
 
-  const RunDev2D* runs_ptr = nullptr;
-  std::optional<ScopedDevBuf> fallback;
-  if (dev.size() <= static_cast<std::size_t>(kMaxConst2D)) {
-    cudaError_t err = cudaMemcpyToSymbolAsync(c_runs, dev.data(), bytes, 0,
-                                              cudaMemcpyHostToDevice, stream);
-    VK_ENSURES(err == cudaSuccess, "cudaMemcpyToSymbolAsync for 2-D run metadata failed");
-    runs_ptr = c_runs.d2;
-  } else {
-    fallback.emplace(bytes, stream);
-    cudaError_t err = cudaMemcpyAsync(fallback->ptr, dev.data(), bytes,
-                                      cudaMemcpyHostToDevice, stream);
-    VK_ENSURES(err == cudaSuccess, "cudaMemcpyAsync for 2-D run metadata failed");
-    runs_ptr = static_cast<const RunDev2D*>(fallback->ptr);
-  }
-
-  const int mh = static_cast<int>(max_h > 0 ? max_h : 1);
   dim3 block(256);
-  dim3 grid(tiles(max_w), static_cast<unsigned>(mh), static_cast<unsigned>(dev.size()));
-  gather_2d_kernel<<<grid, block, 0, stream>>>(runs_ptr, static_cast<int>(dev.size()), mh);
-  cudaError_t err = cudaGetLastError();
+  dim3 grid(tiles(max_w), static_cast<unsigned>(max_h), static_cast<unsigned>(dev.size()));
+  gather_2d_kernel<<<grid, block, 0, stream>>>(
+      static_cast<const RunDev2D*>(meta.ptr), static_cast<int>(dev.size()));
+  err = cudaGetLastError();
   VK_ENSURES(err == cudaSuccess, "cuda gather_2d launch failed");
 }
 

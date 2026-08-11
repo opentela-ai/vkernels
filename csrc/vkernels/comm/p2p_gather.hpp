@@ -21,9 +21,11 @@
 //    NVLink are issued from inside the kernel, with no host staging of data.
 //  * `dst_offsets[i]` / `lengths[i]` describe disjoint output runs. Source and
 //    destination byte ranges must not overlap. The host reference (the
-//    correctness oracle) validates these; the CUDA entry point trusts the
-//    caller (the metadata is the coalescer's output) so the hot path stays
-//    free of O(N log N) checks.
+//    correctness oracle) validates these for both the 1-D and 2-D paths —
+//    per-run src/dst non-overlap and mutually-disjoint outputs — so the CUDA
+//    entry point (which has no inter-run ordering guarantee) can trust the
+//    already-coalesced metadata and the hot path stays free of O(N log N)
+//    checks.
 //
 // Lifetime
 // --------
@@ -100,7 +102,8 @@ std::vector<StagedRun1D> stage_runs_1d(const std::uint8_t* dst_base,
                                        const std::size_t* lengths,
                                        std::size_t num_runs);
 
-std::vector<StagedRun2D> stage_runs_2d(std::size_t dst_capacity,
+std::vector<StagedRun2D> stage_runs_2d(const std::uint8_t* dst_base,
+                                       std::size_t dst_capacity,
                                        const Gather2DRun* runs, std::size_t num_runs);
 
 // 2-D run-list gather: every run is a strided tile copied by a single
