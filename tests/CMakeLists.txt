@@ -15,12 +15,14 @@ vkernels_add_test(NAME elementwise SOURCES kernels/elementwise/test_elementwise.
 vkernels_add_test(NAME reduce      SOURCES kernels/reduce/test_reduce.cpp)
 vkernels_add_test(NAME gemm        SOURCES kernels/gemm/test_gemm.cpp)
 vkernels_add_test(NAME moe         SOURCES kernels/moe/test_moe.cpp)
+vkernels_add_test(NAME moe_fused   SOURCES kernels/moe/test_moe_fused.cpp)
 vkernels_add_test(NAME topology    SOURCES comm/test_topology.cpp)
 vkernels_add_test(NAME channel     SOURCES comm/test_channel.cpp)
 vkernels_add_test(NAME allreduce   SOURCES comm/test_allreduce.cpp)
 vkernels_add_test(NAME overlap     SOURCES comm/test_overlap.cpp)
 vkernels_add_test(NAME p2p_gather SOURCES comm/test_p2p_gather.cpp)
 vkernels_add_test(NAME p2p_kv_restore SOURCES comm/test_p2p_kv_restore.cpp)
+vkernels_add_test(NAME capi         SOURCES capi/test_capi.cpp)
 
 # The `extern "C"` ABI is CUDA-only (the entry points take a raw
 # cudaStream_t); its runtime test is a .cu compiled when a toolkit is

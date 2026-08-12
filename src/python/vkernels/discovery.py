@@ -49,7 +49,8 @@ class Entry:
     signature: str
     header: str        # repo-relative path to the declaring header
     host: bool         # CPU reference implementation exists (.cpp or inline)
-    cuda: bool         # a CUDA implementation file exists for this module
+    cuda: bool         # a CUDA implementation file (.cu) exists for this module
+    hip: bool          # a HIP implementation file (.hip) exists for this module
 
 
 @dataclass(frozen=True)
@@ -158,6 +159,7 @@ def _parse_header(header: Path, root: Path) -> list[Entry]:
     n = len(lines)
     category = "comm" if header.parent.name == "comm" else header.stem
     cuda = header.with_suffix(".cu").exists()
+    hip = header.with_suffix(".hip").exists()
     cpp = header.with_suffix(".cpp").exists()
 
     def make(name, kind, signature, start, raw_stmt="") -> Entry:
@@ -174,6 +176,7 @@ def _parse_header(header: Path, root: Path) -> list[Entry]:
             header=str(header.relative_to(root)),
             host=host,
             cuda=cuda,
+            hip=hip,
         )
 
     entries: list[Entry] = []

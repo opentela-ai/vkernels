@@ -10,6 +10,12 @@ file under ``--source-dir`` (default src/c/).
 Branch coverage is computed and reported for information but, unless
 ``--require-branches`` is set, it does not fail the gate.
 
+Lines whose source carries a ``LCOV_EXCL_LINE`` comment are intentionally
+excluded from the gate (used for defensively-dead branches such as malloc
+failure handling that a test cannot deterministically trigger). gcov's ``-b``
+mode appends ``*`` to the count on lines with an unexecuted branch; that
+suffix is ignored so such lines still count as covered.
+
 Example:
     python3 scripts/coverage.py --build-dir build/coverage --source-dir src/c --min 100
 """
@@ -24,7 +30,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 
-_SOURCE_LINE = re.compile(r"^\s*([^:]+):\s*(\d+):")
+_SOURCE_LINE = re.compile(r"^\s*([^:]+):\s*(\d+):(.*)$")
 _SOURCE_HDR = re.compile(r"^\s*-:\s*0:Source:(.+)$")
 _BRANCH_HDR = re.compile(r"^\s*branch\s+\d+\s+(taken|never executed)")
 _NUMERIC = re.compile(r"^\d+$")
@@ -84,9 +90,12 @@ def parse_gcov(gcov_path: str) -> tuple[str | None, FileStats]:
             m = _SOURCE_LINE.match(line)
             if not m:
                 continue
-            tok, ln = m.group(1).strip(), int(m.group(2))
+            tok, ln, src = m.group(1).strip(), int(m.group(2)), m.group(3)
             if ln == 0 or tok == "-":
                 continue
+            if "LCOV_EXCL_LINE" in src:
+                continue  # explicitly excluded from coverage
+            tok = tok.rstrip("*")  # gcov -b: "N*" = executed with a branch not taken
             if tok == "#####":
                 stats.add_exec(ln)
             elif _NUMERIC.match(tok):

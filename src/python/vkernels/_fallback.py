@@ -179,6 +179,388 @@ def gemm(M: int, N: int, K: int, alpha, A: np.ndarray, B: np.ndarray, beta,
             c[i * N + j] = np.float32(alpha * acc + beta * c[i * N + j])
 
 
+# --- moe: fp4 dequant, LDS fill, MFMA ---------------------------------------
+
+def direct_lds_fill_bf16(lds_dst: int, global_src: int, elements: int) -> None:
+    """Copy `elements` bf16 values from global memory to LDS.
+
+    Uses a plain ctypes memmove; on the host this is the reference for the
+    HIP vectorised-loads + LDS-stores path.
+    """
+    if elements == 0:
+        return
+    if lds_dst == 0:
+        raise ValueError("lds_dst must not be null")
+    if global_src == 0:
+        raise ValueError("global_src must not be null")
+    nbytes = elements * 2  # bf16 = 2 bytes
+    ctypes.memmove(ctypes.c_void_p(lds_dst), ctypes.c_void_p(global_src), nbytes)
+
+
+# fp4 E2M1 representable values, indexed by nibble.
+# Nibble layout: [s:1][e1:1][e0:1][m:1] → 4-bit value = s*8 + e*2 + m.
+# Positive values (s=0) occupy indices 0-7; negative (s=1) occupy 8-15.
+_FP4_NIBBLE_VALUES: list[float] = [
+    # s=0, e=0: zero / subnormal (m=1 → 0.25)
+    0.0, 0.25,
+    # s=0, e=1: normal ×2^(1-1)= ×1
+    1.0, 1.5,
+    # s=0, e=2: normal ×2^(2-1)= ×2
+    2.0, 3.0,
+    # s=0, e=3: inf / NaN
+    float("inf"), float("nan"),
+    # s=1, e=0: negative zero / subnormal
+    -0.0, -0.25,
+    # s=1, e=1: negative normal
+    -1.0, -1.5,
+    # s=1, e=2: negative normal
+    -2.0, -3.0,
+    # s=1, e=3: negative inf / NaN
+    -float("inf"), float("nan"),
+]
+
+
+def _float_to_bf16_bits(f: float) -> int:
+    """Round a float32 to bf16 and return the uint16 bit pattern."""
+    bits = int.from_bytes(np.float32(f).tobytes(), "little")
+    # Round-to-nearest-even: add half-ulp of the truncated 16 LSBs.
+    lsb = (bits >> 16) & 1
+    bits = (bits + 0x7FFF + lsb) & 0xFFFFFFFF
+    return (bits >> 16) & 0xFFFF
+
+
+def fp4_to_bf16_dequant(packed: np.ndarray, scale: float = 1.0) -> np.ndarray:
+    """Convert packed fp4 (E2M1, two values per byte, low nibble first) to
+    bf16 (uint16 bit patterns).
+
+    Args:
+        packed: uint8 array of packed fp4 values.
+        scale: per-block scale factor (default 1.0).
+
+    Returns:
+        uint16 array of bf16 bit patterns, length = 2 × len(packed).
+    """
+    packed = np.asarray(packed, dtype=np.uint8)
+    out = np.empty(packed.size * 2, dtype=np.uint16)
+    scale_f = float(scale)
+    for i in range(packed.size):
+        byte = int(packed[i])
+        lo_val = _FP4_NIBBLE_VALUES[byte & 0x0F] * scale_f
+        hi_val = _FP4_NIBBLE_VALUES[(byte >> 4) & 0x0F] * scale_f
+        out[i * 2] = _float_to_bf16_bits(lo_val)
+        out[i * 2 + 1] = _float_to_bf16_bits(hi_val)
+    return out
+
+
+def use_async_copy_default() -> bool:
+    """Return True if async copy should be used by default.
+
+    On gfx942 (CDNA3) it misbehaves and defaults to OFF; elsewhere ON.
+    The K3_NO_ASYNC env var overrides: '0'=ON, '1'=OFF.
+    On the host fallback path this always returns True.
+    """
+    import os
+
+    env = os.environ.get("K3_NO_ASYNC", "")
+    if env == "1":
+        return False
+    return True
+
+
+def mfma_f32_16x16x16bf16(c: list[float], a: list[int], b: list[int],
+                          cbsz: int = 0, abid: int = 0, blgp: int = 0) -> None:
+    """K16 bf16 MFMA: C[0..3] += A[0..1] × B[0..1] (16×16×16 bf16, acc fp32).
+
+    `c` is a list of 4 floats updated in-place.
+    `a` and `b` are lists of 2 uint32_t each, packing 2 bf16 values per
+    uint32_t (low 16 bits, high 16 bits).
+
+    The control flags (cbsz, abid, blgp) are accepted but ignored on the
+    host reference path.
+    """
+    if len(c) < 4 or len(a) < 2 or len(b) < 2:
+        raise ValueError(
+            "c must have 4 floats; a and b must each have 2 uint32_t"
+        )
+
+    # Unpack a[2] → 4 bf16 values, b[2] → 4 bf16 values.
+    def _unpack_bf16(v32: int) -> tuple[float, float]:
+        lo_bits = (v32 & 0xFFFF) << 16
+        hi_bits = (v32 >> 16) << 16
+        lo = np.frombuffer(lo_bits.to_bytes(4, "little"), dtype=np.float32)[0]
+        hi = np.frombuffer(hi_bits.to_bytes(4, "little"), dtype=np.float32)[0]
+        return float(lo), float(hi)
+
+    a_lo, a_hi = _unpack_bf16(int(a[0]))
+    a2_lo, a2_hi = _unpack_bf16(int(a[1]))
+    b_lo, b_hi = _unpack_bf16(int(b[0]))
+    b2_lo, b2_hi = _unpack_bf16(int(b[1]))
+
+    a_f32 = [a_lo, a_hi, a2_lo, a2_hi]
+    b_f32 = [b_lo, b_hi, b2_lo, b2_hi]
+
+    # Per-thread dot: C[i] += A[i] × B[i]
+    for i in range(4):
+        c[i] = float(np.float32(c[i]) + np.float32(a_f32[i] * b_f32[i]))
+
+
+# --- moe fused: expert alignment + grouped GEMM ---------------------------------
+
+
+def _ue8m0_to_float(s: int) -> np.float32:
+    """Decode a ue8m0 scale byte to float32 (0xFF → 0.0, else 2^(s-127))."""
+    if s == 0xFF:
+        return np.float32(0.0)
+    unbiased = s - 127
+    if unbiased >= -126:
+        bits = s << 23
+        return np.frombuffer(bits.to_bytes(4, "little"), dtype=np.float32)[0]
+    shift = -(unbiased + 126)
+    if shift < 32:
+        mant = 0x00800000 >> shift
+        return np.frombuffer(mant.to_bytes(4, "little"), dtype=np.float32)[0]
+    return np.float32(0.0)
+
+
+def _bf16_to_float(bits: int) -> np.float32:
+    """Reinterpret a bf16 uint16 bit pattern as float32."""
+    return np.frombuffer((bits << 16).to_bytes(4, "little"),
+                         dtype=np.float32)[0]
+
+
+def _dequant_weight_tile(packed, scale, p_base, s_base,
+                         N, K, group_size, stride_packed, stride_scale_n):
+    """Dequant a [N, K] packed fp4 + ue8m0 tile into out[K, N] bf16.
+
+    Mirrors ``dequant_weight_tile`` in moe_fused.cpp: the result is rounded
+    to bf16 (RNE) exactly once, indexed transposed (out[k][n]).
+    """
+    out = np.empty((K, N), dtype=np.uint16)
+    for n in range(N):
+        for kp in range(K // 2):
+            pb = int(packed[p_base + n * stride_packed + kp])
+            gi = (kp * 2) // group_size
+            sc = int(scale[s_base + n * stride_scale_n + gi])
+            s = _ue8m0_to_float(sc)
+            lo = np.float32(_FP4_NIBBLE_VALUES[pb & 0x0F]) * s
+            hi = np.float32(_FP4_NIBBLE_VALUES[(pb >> 4) & 0x0F]) * s
+            out[kp * 2, n] = _float_to_bf16_bits(float(lo))
+            out[kp * 2 + 1, n] = _float_to_bf16_bits(float(hi))
+    return out
+
+
+def moe_align_block_size(topk_ids, M, top_k, block_size, num_experts):
+    """Map the flat [M*top_k] token→expert routing to block-aligned
+    ``sorted_ids`` / ``expert_ids``. Returns (sorted_ids, expert_ids, EM)."""
+    ids = np.asarray(topk_ids, dtype=np.int32).ravel()
+    if ids.size != M * top_k:
+        raise ValueError("topk_ids must have M*top_k elements")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+
+    N = M * top_k
+    per_expert = [[] for _ in range(num_experts)]
+    for i in range(N):
+        e = int(ids[i])
+        if 0 <= e < num_experts:
+            per_expert[e].append(i)  # flat index
+
+    EM = 0
+    for v in per_expert:
+        EM += ((len(v) + block_size - 1) // block_size) * block_size
+    sorted_ids = np.empty(EM, dtype=np.int32)
+    idx = 0
+    for e in range(num_experts):
+        tokens = per_expert[e]
+        nt = len(tokens)
+        for t in tokens:
+            sorted_ids[idx] = t
+            idx += 1
+        padded = ((nt + block_size - 1) // block_size) * block_size
+        for _ in range(nt, padded):
+            sorted_ids[idx] = N  # padding sentinel
+            idx += 1
+
+    num_blocks = EM // block_size
+    expert_ids = np.full(num_blocks, -1, dtype=np.int32)
+    idx = 0
+    for e in range(num_experts):
+        nt = len(per_expert[e])
+        padded_blocks = (nt + block_size - 1) // block_size
+        for b in range(padded_blocks):
+            expert_ids[idx] = e if b * block_size < nt else -1
+            idx += 1
+    return sorted_ids, expert_ids, EM
+
+
+def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
+                    expert_ids, act_scratch, out,
+                    M, hidden, ispp, top_k, EM, group_size,
+                    swiglu_limit, activation=0, beta=4.0, linear_beta=25.0,
+                    b13=None, b2=None):
+    """Fused MXFP4 MoE grouped GEMM (CPU-reference oracle, in place).
+
+    Writes the activation intermediate into ``act_scratch`` [EM*ispp] bf16
+    (SwiGLU by default, or Kimi-K3 SiTU via ``activation=1``) and accumulates
+    into ``out`` [M*hidden] fp32 (which the caller must zero-initialise).
+    Mirrors ``fused_moe_mxfp4_cpu`` block for block.
+    """
+    BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 64
+    N = M * top_k
+
+    A = np.asarray(A, dtype=np.uint16).ravel()
+    w13 = np.asarray(w13, dtype=np.uint8).ravel()
+    w13_scale = np.asarray(w13_scale, dtype=np.uint8).ravel()
+    w2 = np.asarray(w2, dtype=np.uint8).ravel()
+    w2_scale = np.asarray(w2_scale, dtype=np.uint8).ravel()
+    sorted_ids = np.asarray(sorted_ids, dtype=np.int32).ravel()
+    topk_w = np.asarray(topk_w, dtype=np.float32).ravel()
+    expert_ids = np.asarray(expert_ids, dtype=np.int32).ravel()
+    act = np.asarray(act_scratch, dtype=np.uint16).ravel()
+    out_arr = np.asarray(out, dtype=np.float32).ravel()
+    b13 = np.asarray(b13, dtype=np.float32).ravel() if b13 is not None else None
+    b2 = np.asarray(b2, dtype=np.float32).ravel() if b2 is not None else None
+
+    def _f2bf(v: float) -> np.uint16:
+        return np.uint16(_float_to_bf16_bits(v))
+
+    # ===== Stage 0: gate_up + activation → act [EM, ispp] =====
+    w13_expert_bytes = 2 * ispp * (hidden // 2)
+    w13s_expert_bytes = 2 * ispp * (hidden // group_size)
+    num_m_blocks = EM // BLOCK_M
+    num_n_blocks = ispp // BLOCK_N
+    num_k_blocks = hidden // BLOCK_K
+
+    for mb in range(num_m_blocks):
+        expert = int(expert_ids[mb])
+        if expert < 0:
+            continue
+        token_base = mb * BLOCK_M
+        for nb in range(num_n_blocks):
+            acc_gate = np.zeros((BLOCK_M, BLOCK_N), dtype=np.float32)
+            acc_up = np.zeros((BLOCK_M, BLOCK_N), dtype=np.float32)
+            for kb in range(num_k_blocks):
+                k_start = kb * BLOCK_K
+                tile_A = np.zeros((BLOCK_M, BLOCK_K), dtype=np.uint16)
+                for m in range(BLOCK_M):
+                    flat = int(sorted_ids[token_base + m])
+                    if flat < N:
+                        token = flat // top_k
+                        tile_A[m] = A[token * hidden + k_start:
+                                      token * hidden + k_start + BLOCK_K]
+
+                # gate half
+                p_gate = expert * w13_expert_bytes + nb * BLOCK_N * (hidden // 2)
+                s_gate = expert * w13s_expert_bytes + nb * BLOCK_N * (hidden // group_size)
+                tile_gate = _dequant_weight_tile(
+                    w13, w13_scale, p_gate + k_start // 2,
+                    s_gate + k_start // group_size,
+                    BLOCK_N, BLOCK_K, group_size, hidden // 2,
+                    hidden // group_size)
+                # up half (offset by ispp rows in w13)
+                p_up = expert * w13_expert_bytes + (nb * BLOCK_N + ispp) * (hidden // 2)
+                s_up = expert * w13s_expert_bytes + (nb * BLOCK_N + ispp) * (hidden // group_size)
+                tile_up = _dequant_weight_tile(
+                    w13, w13_scale, p_up + k_start // 2,
+                    s_up + k_start // group_size,
+                    BLOCK_N, BLOCK_K, group_size, hidden // 2,
+                    hidden // group_size)
+
+                for m in range(BLOCK_M):
+                    for n in range(BLOCK_N):
+                        dg = np.float32(0.0)
+                        du = np.float32(0.0)
+                        for k in range(BLOCK_K):
+                            a = _bf16_to_float(int(tile_A[m, k]))
+                            dg = np.float32(
+                                dg + np.float32(a * _bf16_to_float(int(tile_gate[k, n]))))
+                            du = np.float32(
+                                du + np.float32(a * _bf16_to_float(int(tile_up[k, n]))))
+                        acc_gate[m, n] = np.float32(acc_gate[m, n] + dg)
+                        acc_up[m, n] = np.float32(acc_up[m, n] + du)
+
+            # Activation epilogue (skip padding rows)
+            for m in range(BLOCK_M):
+                flat = int(sorted_ids[token_base + m])
+                if flat >= N:
+                    continue
+                for n in range(BLOCK_N):
+                    g = float(acc_gate[m, n])
+                    u = float(acc_up[m, n])
+                    if b13 is not None:
+                        g += float(b13[expert * 2 * ispp + nb * BLOCK_N + n])
+                        u += float(b13[expert * 2 * ispp + nb * BLOCK_N + n + ispp])
+                    if activation == 1:
+                        # Kimi-K3 SiTU (situ_and_mul): no clamp.
+                        sig = 1.0 / (1.0 + np.exp(-g))
+                        gate_out = beta * np.tanh(g / beta) * sig
+                        up_out = (linear_beta * np.tanh(u / linear_beta)
+                                  if linear_beta > 0.0 else u)
+                        result = gate_out * up_out
+                    else:
+                        if swiglu_limit > 0.0:
+                            g = min(g, swiglu_limit)
+                            u = min(u, swiglu_limit)
+                            u = -min(-u, swiglu_limit)  # max(u, -limit)
+                        silu_g = g / (1.0 + np.exp(-g))
+                        result = silu_g * u
+                    act[(token_base + m) * ispp + nb * BLOCK_N + n] = \
+                        _f2bf(result)
+
+    # ===== Stage 1: down + combine → out [M, hidden] =====
+    w2_expert_bytes = hidden * (ispp // 2)
+    w2s_expert_bytes = hidden * (ispp // group_size)
+    num_down_n_blocks = hidden // BLOCK_N
+    num_down_k_blocks = ispp // BLOCK_K
+
+    for mb in range(num_m_blocks):
+        expert = int(expert_ids[mb])
+        if expert < 0:
+            continue
+        token_base = mb * BLOCK_M
+        for nb in range(num_down_n_blocks):
+            acc_down = np.zeros((BLOCK_M, BLOCK_N), dtype=np.float32)
+            for kb in range(num_down_k_blocks):
+                k_start = kb * BLOCK_K
+                tile_A = np.zeros((BLOCK_M, BLOCK_K), dtype=np.uint16)
+                for m in range(BLOCK_M):
+                    flat = int(sorted_ids[token_base + m])
+                    if flat < N:
+                        tile_A[m] = act[(token_base + m) * ispp + k_start:
+                                        (token_base + m) * ispp + k_start + BLOCK_K]
+
+                p_down = expert * w2_expert_bytes + nb * BLOCK_N * (ispp // 2)
+                s_down = expert * w2s_expert_bytes + nb * BLOCK_N * (ispp // group_size)
+                tile_down = _dequant_weight_tile(
+                    w2, w2_scale, p_down + k_start // 2,
+                    s_down + k_start // group_size,
+                    BLOCK_N, BLOCK_K, group_size, ispp // 2,
+                    ispp // group_size)
+
+                for m in range(BLOCK_M):
+                    for n in range(BLOCK_N):
+                        dot = np.float32(0.0)
+                        for k in range(BLOCK_K):
+                            a = _bf16_to_float(int(tile_A[m, k]))
+                            dot = np.float32(
+                                dot + np.float32(a * _bf16_to_float(int(tile_down[k, n]))))
+                        acc_down[m, n] = np.float32(acc_down[m, n] + dot)
+
+            # Combine: bias + weight + scatter-add
+            for m in range(BLOCK_M):
+                flat = int(sorted_ids[token_base + m])
+                if flat >= N:
+                    continue
+                token = flat // top_k
+                weight = float(topk_w[token_base + m])
+                for n in range(BLOCK_N):
+                    val = float(acc_down[m, n])
+                    if b2 is not None:
+                        val += float(b2[expert * hidden + nb * BLOCK_N + n])
+                    val *= weight
+                    out_arr[token * hidden + nb * BLOCK_N + n] += np.float32(val)
+
+
 # ---------------------------------------------------------------------------
 # comm: topology, channels, ring all-reduce
 # ---------------------------------------------------------------------------

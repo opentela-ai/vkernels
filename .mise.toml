@@ -1,11 +1,18 @@
 # mise configuration for the vkernels multi-language repository.
 #
-#   mise install          install all tool versions below
-#   mise run configure    cmake configure (P=host by default)
-#   mise run build        cmake build
-#   mise run test         run all tests (C++ + Python)
-#   mise run py-sync      uv sync -> .venv/
-#   mise run fmt          clang-format check
+#   mise install              install all tool versions below
+#   mise run configure         cmake configure (P=host by default)
+#   mise run build             cmake build
+#   mise run test              run all tests (C++ + Python)
+#   mise run configure-cuda    cmake configure (CUDA)
+#   mise run build-cuda        cmake build (CUDA)
+#   mise run configure-hip     cmake configure (HIP/ROCm, gfx942)
+#   mise run build-hip         cmake build (HIP)
+#   mise run build-wheel       package a host wheel
+#   mise run build-wheel-cuda  package a CUDA wheel
+#   mise run build-wheel-hip   package an AMD ROCm wheel
+#   mise run py-sync           uv sync -> .venv/
+#   mise run fmt               clang-format check
 #
 # CUDA & HIP toolkits are typically installed at the system level
 # (see CMakePresets.json); they are not pinned here.
@@ -25,10 +32,30 @@ UV_PROJECT_ENVIRONMENT = ".venv"
 
 [tasks]
 # ---- C/C++ build (mirrors Makefile) ----
+# The P env var selects the CMake preset: host, debug, coverage, asan,
+# cuda, hip, python, hip-python, etc.  Shortcut tasks below set P for
+# convenience (e.g. `mise run build-hip` instead of `P=hip mise run build`).
 configure = "cmake --preset ${P:-host}"
 build = "cmake --build --preset ${P:-host}"
 test = "cmake --build --preset ${P:-host} --target test"
 clean = "rm -rf build/${P:-host}"
+
+# ---- Toolchain shortcuts (CUDA / HIP) ----
+# C++ library only  (cuda → build/cuda,  hip → build/hip)
+configure-cuda = "cmake --preset cuda"
+build-cuda     = "cmake --build --preset cuda"
+test-cuda      = "cmake --build --preset cuda --target test"
+
+configure-hip  = "cmake --preset hip"
+build-hip      = "cmake --build --preset hip"
+test-hip       = "cmake --build --preset hip --target test"
+
+# Python bindings  → build/*-python/python/vkernels/_core*.so
+configure-cuda-python = "cmake --preset cuda-python"
+build-cuda-python     = "cmake --build --preset cuda-python"
+
+configure-hip-python  = "cmake --preset hip-python"
+build-hip-python      = "cmake --build --preset hip-python"
 
 # ---- Python (uv) ----
 py-sync = "uv sync"
@@ -48,4 +75,47 @@ coverage = [
     "cmake --build --preset coverage",
     "ctest --preset coverage",
     "python3 meta/scripts/coverage.py --build-dir build/coverage --source-dir src/c --min 100",
+]
+
+# ---- Wheel packaging ----
+# Build a platform wheel with the compiled pybind11 extension.
+#   mise run build-wheel              host-only (CPU reference)
+#   mise run build-wheel-cuda         NVIDIA CUDA (needs nvcc)
+#   mise run build-wheel-hip          AMD ROCm/HIP (gfx942, needs hipcc)
+build-wheel = "bash meta/scripts/build_wheel.sh"
+build-wheel-cuda = "bash meta/scripts/build_wheel.sh --cuda"
+build-wheel-hip = "bash meta/scripts/build_wheel.sh --hip"
+
+# Install + smoke-test the built wheel in a temp venv.
+test-wheel = [
+    "bash meta/scripts/build_wheel.sh --output-dir dist/test",
+    "python3 -m venv /tmp/vkernels-test-venv --clear",
+    "/tmp/vkernels-test-venv/bin/pip install dist/*.whl numpy",
+    "/tmp/vkernels-test-venv/bin/python -c 'from vkernels import kernels; print(\"backend:\", __import__(\"vkernels\").backend); print(kernels.add([1,2],[3,4]))'",
+]
+test-wheel-hip = [
+    "bash meta/scripts/build_wheel.sh --hip --output-dir dist/test",
+    "python3 -m venv /tmp/vkernels-test-hip-venv --clear",
+    "/tmp/vkernels-test-hip-venv/bin/pip install dist/*.whl numpy",
+    "/tmp/vkernels-test-hip-venv/bin/python -c 'from vkernels import kernels; print(\"backend:\", __import__(\"vkernels\").backend); print(kernels.mfma_f32_16x16x16bf16([0]*4,[1]*2,[1]*2,0,0,0))'",
+]
+test-wheel-cuda = [
+    "bash meta/scripts/build_wheel.sh --cuda --output-dir dist/test",
+    "python3 -m venv /tmp/vkernels-test-cuda-venv --clear",
+    "/tmp/vkernels-test-cuda-venv/bin/pip install dist/*.whl numpy",
+    "/tmp/vkernels-test-cuda-venv/bin/python -c 'from vkernels import kernels; print(\"backend:\", __import__(\"vkernels\").backend); print(kernels.mfma_f32_16x16x16bf16([0]*4,[1]*2,[1]*2,0,0,0))'",
+]
+
+# Publish to PyPI (set TWINE_USERNAME / TWINE_PASSWORD or use a token).
+#   TWINE_USERNAME=__token__ TWINE_PASSWORD=pypi-... mise run publish
+publish = [
+    "bash meta/scripts/build_wheel.sh",
+    "uv run twine upload dist/*.whl",
+]
+
+# Full release: build, test, publish.
+release = [
+    "mise run test",
+    "mise run test-wheel",
+    "mise run publish",
 ]

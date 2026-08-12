@@ -1,0 +1,83 @@
+# .github/workflows/ci.yml — host + CUDA CI
+#
+# Runs on every push and PR.  The host job compiles and tests the full
+# C++ library with 100% line-coverage enforcement.  The CUDA job runs
+# only on self-hosted runners tagged `cuda`.
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------
+  # Host build + test + coverage (no GPU required)
+  # ------------------------------------------------------------------
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+
+      - name: Configure (coverage)
+        run: cmake --preset coverage
+
+      - name: Build
+        run: cmake --build --preset coverage -j$(nproc)
+
+      - name: Test
+        run: ctest --preset coverage --output-on-failure -j$(nproc)
+
+      - name: Coverage gate (100 %)
+        run: >
+          python3 meta/scripts/coverage.py
+          --build-dir build/coverage
+          --source-dir src/c
+          --min 100
+
+      - name: Python smoke tests (fallback backend)
+        run: |
+          uv run vkl list
+          uv run vkl info gemm
+          uv run python -m pytest tests/python/ -v
+
+  # ------------------------------------------------------------------
+  # CUDA build + test (needs self-hosted runner with toolkit + GPU)
+  # ------------------------------------------------------------------
+  cuda:
+    runs-on: [self-hosted, cuda]
+    if: ${{ false }}  # opt-in: change to `true` or remove to activate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+
+      - name: Configure (CUDA release)
+        run: cmake --preset cuda
+
+      - name: Build
+        run: cmake --build --preset cuda -j$(nproc)
+
+      - name: Test
+        run: ctest --preset cuda --output-on-failure
+
+      - name: Build wheel (CUDA)
+        run: bash meta/scripts/build_wheel.sh --cuda --output-dir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-cuda
+          path: dist/*.whl
+          if-no-files-found: ignore

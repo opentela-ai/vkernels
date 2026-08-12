@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,8 @@
 #include "vkernels/core/stream.hpp"
 #include "vkernels/kernels/elementwise.hpp"
 #include "vkernels/kernels/gemm.hpp"
+#include "vkernels/kernels/moe.hpp"
+#include "vkernels/kernels/moe_fused.hpp"
 #include "vkernels/kernels/reduce.hpp"
 #include "vkernels/util/config.hpp"
 #include "vkernels/util/version.hpp"
@@ -59,6 +62,10 @@ using FloatArray = py::array_t<float, py::array::c_style | py::array::forcecast>
 
 // A numpy byte buffer (uint8). Used for p2p gather destinations and sources.
 using ByteArray = py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast>;
+
+// bf16 (uint16) and int32 buffers used by the MoE kernels.
+using U16Array = py::array_t<std::uint16_t, py::array::c_style | py::array::forcecast>;
+using I32Array = py::array_t<std::int32_t, py::array::c_style | py::array::forcecast>;
 
 // `out`/`dst` arrays must be writable: writing into a copied or read-only
 // buffer would silently discard the result.
@@ -204,6 +211,115 @@ PYBIND11_MODULE(_core, m) {
       py::arg("B"), py::arg("beta"), py::arg("C"),
       "C = alpha * A @ B + beta * C (row-major, in place). A is M*K, B is "
       "K*N, C is M*N elements.");
+
+  // --- moe (fp4 dequant, LDS fill, MFMA) ---------------------------------
+  kernels.def(
+      "direct_lds_fill_bf16",
+      [](std::uintptr_t lds_dst, std::uintptr_t global_src,
+         std::size_t elements) {
+        kernels::direct_lds_fill_bf16(reinterpret_cast<void*>(lds_dst),
+                                      reinterpret_cast<const void*>(global_src),
+                                      elements);
+      },
+      py::arg("lds_dst"), py::arg("global_src"), py::arg("elements"),
+      "Copy `elements` bf16 values from global memory to LDS (plain memcpy "
+      "on the host; vectorised loads + LDS stores in the HIP path).");
+
+  kernels.def(
+      "fp4_to_bf16_dequant",
+      [](py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast>
+             packed,
+         float scale) {
+        auto out = py::array_t<std::uint16_t>(packed.size() * 2);
+        Span<std::uint8_t> packed_span(const_cast<std::uint8_t*>(packed.data()),
+                                       packed.size());
+        Span<std::uint16_t> out_span(out.mutable_data(), out.size());
+        kernels::fp4_to_bf16_dequant(packed_span, out_span, scale);
+        return out;
+      },
+      py::arg("packed"), py::arg("scale") = 1.0f,
+      "Convert packed fp4 (E2M1, two values per byte, low nibble first) to "
+      "bf16 (uint16 bit patterns). Returns a new uint16 array of 2× length.");
+
+  kernels.def(
+      "use_async_copy_default", &kernels::use_async_copy_default,
+      "Return True if async copy should be used by default. On gfx942 "
+      "(CDNA3) it misbehaves and defaults to OFF; elsewhere ON. "
+      "K3_NO_ASYNC env var overrides: '0'=ON, '1'=OFF.");
+
+  kernels.def(
+      "mfma_f32_16x16x16bf16",
+      [](std::vector<float>& c, const std::vector<std::uint32_t>& a,
+         const std::vector<std::uint32_t>& b, int cbsz, int abid, int blgp) {
+        if (c.size() < 4 || a.size() < 2 || b.size() < 2) {
+          throw py::value_error(
+              "c must have 4 floats; a and b must each have 2 uint32_t");
+        }
+        kernels::mfma_f32_16x16x16bf16(c.data(), a.data(), b.data(), cbsz,
+                                       abid, blgp);
+      },
+      py::arg("c"), py::arg("a"), py::arg("b"), py::arg("cbsz") = 0,
+      py::arg("abid") = 0, py::arg("blgp") = 0,
+      "K16 bf16 MFMA: C[0..3] += A[0..1] × B[0..1] (16×16×16 bf16, acc "
+      "fp32). `c` is 4 floats updated in-place; `a` and `b` are 2 packed "
+      "bf16 uint32_t each.");
+
+  // --- moe fused (grouped GEMM + expert alignment) -------------------------
+  kernels.def(
+      "moe_align_block_size",
+      [](I32Array topk_ids, int M, int top_k, int block_size,
+         int num_experts) {
+        int N = M * top_k;
+        int max_EM =
+            ((N + block_size - 1) / block_size + num_experts) * block_size;
+        auto sorted = py::array_t<std::int32_t>(max_EM);
+        auto experts = py::array_t<std::int32_t>(max_EM / block_size);
+        int EM = kernels::moe_align_block_size(
+            topk_ids.data(), M, top_k, block_size, num_experts,
+            sorted.mutable_data(), experts.mutable_data());
+        sorted.resize({static_cast<py::ssize_t>(EM)});
+        experts.resize({static_cast<py::ssize_t>(EM / block_size)});
+        return py::make_tuple(sorted, experts, EM);
+      },
+      py::arg("topk_ids"), py::arg("M"), py::arg("top_k"),
+      py::arg("block_size"), py::arg("num_experts"),
+      "Map the [M, top_k] token→expert routing table to the block-aligned "
+      "sorted layout. Returns (sorted_ids [EM], expert_ids [EM/block], "
+      "EM). sorted_ids holds flat topk indices (token*top_k + sel), padded "
+      "per expert with M*top_k; expert_ids[i] is -1 for pure-padding blocks.");
+
+  kernels.def(
+      "fused_moe_mxfp4",
+      [](U16Array A, ByteArray w13, ByteArray w13_scale, ByteArray w2,
+         ByteArray w2_scale, I32Array sorted_ids, FloatArray topk_w,
+         I32Array expert_ids, U16Array act_scratch, FloatArray out, int M,
+         int hidden, int ispp, int top_k, int EM, int group_size,
+         float swiglu_limit, int activation, float beta, float linear_beta,
+         std::optional<FloatArray> b13,
+         std::optional<FloatArray> b2) {
+        require_writeable(act_scratch);
+        require_writeable(out);
+        kernels::fused_moe_mxfp4_cpu(
+            A.data(), w13.data(), w13_scale.data(), w2.data(),
+            w2_scale.data(), sorted_ids.data(), topk_w.data(),
+            expert_ids.data(), act_scratch.mutable_data(),
+            out.mutable_data(), M, hidden, ispp, top_k, EM, group_size,
+            swiglu_limit, activation, beta, linear_beta,
+            b13 ? b13->data() : nullptr,
+            b2 ? b2->data() : nullptr);
+      },
+      py::arg("A"), py::arg("w13"), py::arg("w13_scale"), py::arg("w2"),
+      py::arg("w2_scale"), py::arg("sorted_ids"), py::arg("topk_w"),
+      py::arg("expert_ids"), py::arg("act_scratch"), py::arg("out"),
+      py::arg("M"), py::arg("hidden"), py::arg("ispp"), py::arg("top_k"),
+      py::arg("EM"), py::arg("group_size"), py::arg("swiglu_limit"),
+      py::arg("activation") = 0, py::arg("beta") = 4.0f,
+      py::arg("linear_beta") = 25.0f,
+      py::arg("b13") = py::none(), py::arg("b2") = py::none(),
+      "Fused MXFP4 MoE grouped GEMM (CPU reference): gate_up + activation "
+      "(SwiGLU by default, or Kimi-K3 SiTU via activation=1/beta/linear_beta) "
+      "into act_scratch [EM, ispp] bf16, then down + routed combine "
+      "accumulated into out [M, hidden] fp32 (caller must zero-init out).");
 
   // -------------------------------------------------------------------------
   // vkernels._core.comm — collectives, topology, overlap, p2p gather
