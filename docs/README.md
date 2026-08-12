@@ -1,0 +1,243 @@
+# vkernels — Supported Kernels & Primitives
+
+This document lists every kernel and communication primitive in vkernels,
+along with the mathematical computation each performs. Every operation follows
+the **two-implementation model**: a CPU reference (oracle, always compiled)
+and a GPU-accelerated path (CUDA or HIP, compiled when the toolkit is present).
+
+All kernels operate on **float32** unless noted. Inputs are C-contiguous
+arrays. Contract violations raise exceptions (C++), `ValueError` (Python),
+or `Error::InvalidArgument` (Rust).
+
+---
+
+## Element-wise kernels
+
+| Function | Computation | Data type | GPU backend |
+|---|---|---|---|
+| `add(a, b)` | `out[i] = a[i] + b[i]` | float32 | CUDA |
+| `scale(x, α)` | `out[i] = α · x[i]` | float32 | CUDA |
+| `relu(x)` | `out[i] = max(x[i], 0)` | float32 | CUDA |
+
+- **File**: `src/c/vkernels/kernels/elementwise.cpp` (CPU), `.cu` (CUDA)
+- **Python**: `vkernels.kernels.add / scale / relu`
+- **Rust**: `vkernels::kernels::add / scale / relu`
+
+---
+
+## Reduction kernels
+
+| Function | Computation | Data type | GPU backend |
+|---|---|---|---|
+| `sum(x)` | `Σ x[i]` (float32-accumulated) | float32 → float32 | CUDA (two-stage) |
+| `max(x)` | `max x[i]` | float32 → float32 | CUDA |
+
+- **File**: `src/c/vkernels/kernels/reduce.cpp` (CPU), `.cu` (CUDA)
+- **Python**: `vkernels.kernels.sum / max`
+- **Rust**: `vkernels::kernels::sum / max`
+- Empty input raises an error on all backends.
+
+---
+
+## GEMM (SGEMM)
+
+| Function | Computation | Data type | GPU backend |
+|---|---|---|---|
+| `gemm(M, N, K, α, A, B, β, C)` | `C = α · A @ B + β · C` | float32 | CUDA (tiled 16×16) |
+
+- **File**: `src/c/vkernels/kernels/gemm.cpp` (CPU), `.cu` (CUDA)
+- **Python**: `vkernels.kernels.gemm(A, B, alpha=1.0, beta=0.0)` (shapes inferred)
+- **Rust**: `vkernels::kernels::gemm(M, N, K, alpha, A, B, beta, C)` (explicit dimensions)
+- Row-major layout. `A` is M×K, `B` is K×N, `C` is M×N.
+- CUDA kernel uses shared-memory tiling with 16×16 thread blocks.
+
+---
+
+## MoE (Mixture of Experts) — AMD gfx942 / CDNA3 low-level primitives
+
+These fill gaps where CDNA4-only (gfx950) instructions used in the AITER flydsl
+MXFP4 fused-MoE path do not lower on gfx942.
+
+### #12 — Software direct-to-LDS fill
+
+| Function | Computation | Data type | Backend |
+|---|---|---|---|
+| `direct_lds_fill_bf16(lds_dst, global_src, elements)` | Copy `elements` bf16 values from global → LDS | bf16 (uint16_t) | HIP (vectorised loads), CPU (memcpy) |
+
+Replaces CDNA4's `rocdl.raw_ptr_buffer_load_lds` with vectorised global loads
+(`global_load_dwordx4`) into VGPRs followed by LDS stores at lane-major offsets.
+
+- **File**: `src/c/vkernels/kernels/moe.cpp` (CPU), `.hip` (HIP)
+
+### #13 — Software fp4→bf16 dequant
+
+| Function | Computation | Data type | Backend |
+|---|---|---|---|
+| `fp4_to_bf16_dequant(packed, scale)` | `out[2i], out[2i+1] = fp4_to_bf16(packed[i] & 0xF, (packed[i] >> 4) & 0xF) · scale` | fp4 (packed uint8) → bf16 (uint16_t) | HIP, CPU |
+
+Decodes E2M1 microscaling format (sign|2-bit-exponent|1-bit-mantissa, two
+values per byte, low nibble first).
+
+- **Representable fp4 values**: 0, ±0.25, ±1.0, ±1.5, ±2.0, ±3.0, ±∞, NaN
+- **File**: `src/c/vkernels/kernels/moe.cpp` (CPU), `.hip` (HIP)
+- **Python**: `vkernels.kernels.fp4_to_bf16_dequant(packed, scale=1.0)`
+
+### #14 — Platform async-copy gate
+
+| Function | Computation |
+|---|---|
+| `use_async_copy_default()` | Returns `true` if async copy should be enabled; `false` on gfx942 |
+
+- Defaults to OFF on gfx942 (CDNA3, MI300X/A) where the async-copy path
+  misbehaves. ON everywhere else.
+- Override with env var `K3_NO_ASYNC=0` (force ON) or `=1` (force OFF).
+
+- **File**: `src/c/vkernels/kernels/moe.cpp` (CPU), `.hip` (HIP)
+
+### #15 — K16 bf16 MFMA
+
+| Function | Computation | Data type |
+|---|---|---|
+| `mfma_f32_16x16x16bf16(c[4], a[2], b[2])` | `C₀₋₃ += A₀₋₁ ⊗ B₀₋₁` (16×16×16 bf16, fp32 accum) | bf16 packed → fp32 |
+
+A single `v_mfma_f32_16x16x16bf16_1k` instruction on gfx942. K32 bf16 MFMA
+(CDNA4-only) is emulated by calling this K16 function twice:
+once for K=0..15 (low halves of A/B), once for K=16..31 (high halves).
+
+- **File**: `src/c/vkernels/kernels/moe.cpp` (CPU), `.hip` (HIP)
+- **Python**: `vkernels.kernels.mfma_f32_16x16x16bf16(c, a, b)`
+
+---
+
+## MoE Fused — End-to-end MXFP4 grouped GEMM
+
+Implements the full xkernels `fused_moe_mxfp4` interface by wiring together
+the low-level primitives above. The fused kernel performs:
+
+### Stage 0 — gate_up + SwiGLU
+```
+act[EM, ispp] = silu(clamp(A_sorted @ w13_gate + b13_gate, L))
+              · clamp(A_sorted @ w13_up   + b13_up,   L)
+```
+
+### Stage 1 — down + routed combine
+```
+out[M, hidden] += act @ w2^T · topk_w_sorted + b2
+```
+(scatter-add by token row, weighted by the routing weight)
+
+| Function | Tile constants | Data types | Backend |
+|---|---|---|---|
+| `fused_moe_mxfp4(...)` | BM=16, BN=64, BK=64, Group=32 | bf16 activations, fp4 (E2M1) weights with ue8m0 scales, fp32 output | HIP, CPU |
+
+- Dequantization (E2M1 + ue8m0) is done inline during the K-loop — no full
+  bf16 materialization of the weight buffer.
+- Uses `mfma_f32_16x16x16bf16` (4 per K-block × 2 halves) and
+  `direct_lds_fill_bf16` for LDS tile staging.
+
+### Expert alignment helper
+
+| Function | Computation |
+|---|---|
+| `moe_align_block_size(topk_ids, M, top_k, block_size, num_experts)` | Maps `[M, top_k]` token→expert routing into block-aligned `sorted_ids` and `expert_ids` |
+
+- **Files**: `src/c/vkernels/kernels/moe_fused.cpp` (CPU), `.hip` (HIP)
+
+---
+
+## Communication primitives
+
+### Ring all-reduce
+
+| Function | Computation |
+|---|---|
+| `ring_allreduce_rank(local, rank, world, next, prev)` | Sum-reduces `local` in-place across `world` ranks via ring topology |
+| `ring_allreduce(locals)` | Simulates all ranks in one process: every rank's `local` becomes `Σ locals[0..world-1]` |
+
+- **File**: `src/c/vkernels/comm/allreduce.cpp`
+- **Python**: `vkernels.comm.ring_allreduce(locals)`
+- **Rust**: `vkernels::comm::ring_allreduce(&[a, b])`
+
+### P2P run-list gather
+
+Single-launch gather of many disjoint byte-runs from peer UVA into a local
+scratch buffer, replacing per-run `cudaMemcpyPeerAsync` loops.
+
+| Function | Computation |
+|---|---|
+| `p2p_gather_runs(dst, src_ptrs, dst_offsets, lengths, N)` | For each `i`: `dst[dst_offsets[i]:...] = peer[src_ptrs[i]:...]` (1-D) |
+| `p2p_gather_runs_2d(dst, runs)` | Strided 2-D tiles: `height × width` bytes per run, with independent src/dst strides |
+
+- Adaptive dispatch: copy engine below the crossover run count, single kernel
+  launch above it.
+- Plan API (`P2PGatherPlan1D/2D`) for reuse across layer launches.
+- Vectorized 16-byte (`uint4`) path for aligned runs.
+
+- **File**: `src/c/vkernels/comm/p2p_gather.cpp` (CPU), `.cu` (CUDA)
+- **Docs**: [p2p-gather.md](p2p-gather.md)
+- **Performance**: [performance/p2p-gather/](performance/p2p-gather/)
+
+### P2P KV restore (fused)
+
+Fuses peer gather + indexed scatter into one kernel:
+
+| Function | Computation |
+|---|---|
+| `p2p_kv_restore(k_dst, v_dst, slot_ids, peer_src_ptrs, ...)` | Reads KV data directly from peer UVA and writes into indexed K/V slot destinations |
+
+- Eliminates the intermediate scratch buffer and separate scatter launch.
+- **File**: `src/c/vkernels/comm/p2p_kv_restore.cpp` (CPU), `.cu` (CUDA)
+
+### Compute/communication overlap
+
+| Class / Function | Computation |
+|---|---|
+| `OverlapExecutor.run(iters, compute_fn, comm_fn)` | Runs `compute_fn` on stream A and `comm_fn` on stream B in lockstep, returning a `Result(compute_count, comm_count)` |
+
+- In-order execution within a stream, concurrency across streams.
+- **File**: `src/c/vkernels/comm/overlap.cpp`
+- **Python**: `vkernels.comm.OverlapExecutor()`
+- **Rust**: `vkernels::comm::OverlapExecutor::new()`
+
+---
+
+## Core infrastructure
+
+| Component | Description |
+|---|---|
+| `Device(index)` | GPU device selection, synchronization, peer-access queries |
+| `Stream()` | In-order task queue; one worker thread per stream |
+| `Span<T>` | Non-owning view of contiguous memory (C++ only) |
+
+---
+
+## File layout
+
+```
+src/c/vkernels/
+├── kernels/
+│   ├── elementwise.{cpp,cu}     # add, scale, relu
+│   ├── reduce.{cpp,cu}          # sum, max
+│   ├── gemm.{cpp,cu}            # tiled SGEMM
+│   ├── moe.{cpp,hip}            # gfx942 primitives (#12–#15)
+│   └── moe_fused.{cpp,hip}      # fused MXFP4 MoE grouped GEMM
+├── comm/
+│   ├── allreduce.{cpp,cu}       # ring all-reduce
+│   ├── p2p_gather.{cpp,cu}      # single-launch peer gather
+│   ├── p2p_kv_restore.{cpp,cu}  # fused KV restore
+│   ├── overlap.cpp              # compute/comm overlap executor
+│   ├── channel.cpp              # blocking queue & mock channel
+│   └── topology.{cpp,hpp}       # ring topology helpers
+└── core/
+    ├── device.cpp               # Device abstraction
+    ├── stream.{cpp,cu}          # Stream (async task queue)
+    └── allocator.cpp            # CUDA memory pool tuning
+```
+
+## Language bindings
+
+| Language | Module | Docs |
+|---|---|---|
+| Python | `vkernels.kernels`, `vkernels.comm`, `vkernels.core` | [python-bindings.md](python-bindings.md) |
+| Rust | `vkernels::kernels`, `vkernels::comm`, `vkernels::core` | [rust-bindings.md](rust-bindings.md) |
+| C | `vkernels_c_*` (C ABI via `capi.hpp`) | — |

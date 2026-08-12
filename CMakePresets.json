@@ -86,6 +86,34 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "VKERNELS_ENABLE_COVERAGE": "ON"
       }
+    },
+    {
+      "name": "cuda-python",
+      "displayName": "CUDA + Python bindings",
+      "inherits": "cuda",
+      "cacheVariables": {
+        "VKERNELS_BUILD_PYTHON": "ON",
+        "VKERNELS_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "hip",
+      "displayName": "HIP (AMD ROCm, gfx942)",
+      "inherits": "_base",
+      "cacheVariables": {
+        "VKERNELS_BUILD_HIP": "ON",
+        "CMAKE_HIP_ARCHITECTURES": "gfx942",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "hip-python",
+      "displayName": "HIP + Python bindings",
+      "inherits": "hip",
+      "cacheVariables": {
+        "VKERNELS_BUILD_PYTHON": "ON",
+        "VKERNELS_BUILD_TESTS": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -94,9 +122,12 @@
     { "name": "coverage", "configurePreset": "coverage" },
     { "name": "asan", "configurePreset": "asan" },
     { "name": "cuda", "configurePreset": "cuda" },
+    { "name": "cuda-python", "configurePreset": "cuda-python" },
     { "name": "python", "configurePreset": "python" },
     { "name": "rust", "configurePreset": "rust" },
-    { "name": "cuda-debug", "configurePreset": "cuda-debug" }
+    { "name": "cuda-debug", "configurePreset": "cuda-debug" },
+    { "name": "hip", "configurePreset": "hip" },
+    { "name": "hip-python", "configurePreset": "hip-python" }
   ],
   "testPresets": [
     { "name": "host", "configurePreset": "host", "output": { "outputOnFailure": true } },
@@ -104,8 +135,11 @@
     { "name": "coverage", "configurePreset": "coverage", "output": { "outputOnFailure": true } },
     { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
     { "name": "cuda", "configurePreset": "cuda", "output": { "outputOnFailure": true } },
+    { "name": "cuda-python", "configurePreset": "cuda-python", "output": { "outputOnFailure": true } },
     { "name": "python", "configurePreset": "python", "output": { "outputOnFailure": true } },
     { "name": "rust", "configurePreset": "rust", "output": { "outputOnFailure": true } },
-    { "name": "cuda-debug", "configurePreset": "cuda-debug", "output": { "outputOnFailure": true } }
+    { "name": "cuda-debug", "configurePreset": "cuda-debug", "output": { "outputOnFailure": true } },
+    { "name": "hip", "configurePreset": "hip", "output": { "outputOnFailure": true } },
+    { "name": "hip-python", "configurePreset": "hip-python", "output": { "outputOnFailure": true } }
   ]
 }

@@ -179,6 +179,131 @@ def gemm(M: int, N: int, K: int, alpha, A: np.ndarray, B: np.ndarray, beta,
             c[i * N + j] = np.float32(alpha * acc + beta * c[i * N + j])
 
 
+# --- moe: fp4 dequant, LDS fill, MFMA ---------------------------------------
+
+def direct_lds_fill_bf16(lds_dst: int, global_src: int, elements: int) -> None:
+    """Copy `elements` bf16 values from global memory to LDS.
+
+    Uses a plain ctypes memmove; on the host this is the reference for the
+    HIP vectorised-loads + LDS-stores path.
+    """
+    if elements == 0:
+        return
+    if lds_dst == 0:
+        raise ValueError("lds_dst must not be null")
+    if global_src == 0:
+        raise ValueError("global_src must not be null")
+    nbytes = elements * 2  # bf16 = 2 bytes
+    ctypes.memmove(ctypes.c_void_p(lds_dst), ctypes.c_void_p(global_src), nbytes)
+
+
+# fp4 E2M1 representable values, indexed by nibble.
+# Nibble layout: [s:1][e1:1][e0:1][m:1] → 4-bit value = s*8 + e*2 + m.
+# Positive values (s=0) occupy indices 0-7; negative (s=1) occupy 8-15.
+_FP4_NIBBLE_VALUES: list[float] = [
+    # s=0, e=0: zero / subnormal (m=1 → 0.25)
+    0.0, 0.25,
+    # s=0, e=1: normal ×2^(1-1)= ×1
+    1.0, 1.5,
+    # s=0, e=2: normal ×2^(2-1)= ×2
+    2.0, 3.0,
+    # s=0, e=3: inf / NaN
+    float("inf"), float("nan"),
+    # s=1, e=0: negative zero / subnormal
+    -0.0, -0.25,
+    # s=1, e=1: negative normal
+    -1.0, -1.5,
+    # s=1, e=2: negative normal
+    -2.0, -3.0,
+    # s=1, e=3: negative inf / NaN
+    -float("inf"), float("nan"),
+]
+
+
+def _float_to_bf16_bits(f: float) -> int:
+    """Round a float32 to bf16 and return the uint16 bit pattern."""
+    bits = int.from_bytes(np.float32(f).tobytes(), "little")
+    # Round-to-nearest-even: add half-ulp of the truncated 16 LSBs.
+    lsb = (bits >> 16) & 1
+    bits = (bits + 0x7FFF + lsb) & 0xFFFFFFFF
+    return (bits >> 16) & 0xFFFF
+
+
+def fp4_to_bf16_dequant(packed: np.ndarray, scale: float = 1.0) -> np.ndarray:
+    """Convert packed fp4 (E2M1, two values per byte, low nibble first) to
+    bf16 (uint16 bit patterns).
+
+    Args:
+        packed: uint8 array of packed fp4 values.
+        scale: per-block scale factor (default 1.0).
+
+    Returns:
+        uint16 array of bf16 bit patterns, length = 2 × len(packed).
+    """
+    packed = np.asarray(packed, dtype=np.uint8)
+    out = np.empty(packed.size * 2, dtype=np.uint16)
+    scale_f = float(scale)
+    for i in range(packed.size):
+        byte = int(packed[i])
+        lo_val = _FP4_NIBBLE_VALUES[byte & 0x0F] * scale_f
+        hi_val = _FP4_NIBBLE_VALUES[(byte >> 4) & 0x0F] * scale_f
+        out[i * 2] = _float_to_bf16_bits(lo_val)
+        out[i * 2 + 1] = _float_to_bf16_bits(hi_val)
+    return out
+
+
+def use_async_copy_default() -> bool:
+    """Return True if async copy should be used by default.
+
+    On gfx942 (CDNA3) it misbehaves and defaults to OFF; elsewhere ON.
+    The K3_NO_ASYNC env var overrides: '0'=ON, '1'=OFF.
+    On the host fallback path this always returns True.
+    """
+    import os
+
+    env = os.environ.get("K3_NO_ASYNC", "")
+    if env == "1":
+        return False
+    return True
+
+
+def mfma_f32_16x16x16bf16(c: list[float], a: list[int], b: list[int],
+                          cbsz: int = 0, abid: int = 0, blgp: int = 0) -> None:
+    """K16 bf16 MFMA: C[0..3] += A[0..1] × B[0..1] (16×16×16 bf16, acc fp32).
+
+    `c` is a list of 4 floats updated in-place.
+    `a` and `b` are lists of 2 uint32_t each, packing 2 bf16 values per
+    uint32_t (low 16 bits, high 16 bits).
+
+    The control flags (cbsz, abid, blgp) are accepted but ignored on the
+    host reference path.
+    """
+    if len(c) < 4 or len(a) < 2 or len(b) < 2:
+        raise ValueError(
+            "c must have 4 floats; a and b must each have 2 uint32_t"
+        )
+
+    # Unpack a[2] → 4 bf16 values, b[2] → 4 bf16 values.
+    def _unpack_bf16(v32: int) -> tuple[float, float]:
+        lo_bits = (v32 & 0xFFFF) << 16
+        hi_bits = (v32 >> 16) << 16
+        lo = np.frombuffer(lo_bits.to_bytes(4, "little"), dtype=np.float32)[0]
+        hi = np.frombuffer(hi_bits.to_bytes(4, "little"), dtype=np.float32)[0]
+        return float(lo), float(hi)
+
+    a_lo, a_hi = _unpack_bf16(int(a[0]))
+    a2_lo, a2_hi = _unpack_bf16(int(a[1]))
+    b_lo, b_hi = _unpack_bf16(int(b[0]))
+    b2_lo, b2_hi = _unpack_bf16(int(b[1]))
+
+    a_f32 = [a_lo, a_hi, a2_lo, a2_hi]
+    b_f32 = [b_lo, b_hi, b2_lo, b2_hi]
+
+    # Per-thread dot: C[i] += A[i] × B[i]
+    for i in range(4):
+        c[i] = float(np.float32(c[i]) + np.float32(a_f32[i] * b_f32[i]))
+
+
 # ---------------------------------------------------------------------------
 # comm: topology, channels, ring all-reduce
 # ---------------------------------------------------------------------------

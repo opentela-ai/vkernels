@@ -223,3 +223,110 @@ def gemm(A, B, alpha: float = 1.0, beta: float = 0.0, out=None) -> np.ndarray:
     if out_arr.shape != (M, N):
         out_arr = out_arr.reshape(M, N)
     return out_arr
+
+
+# ---------------------------------------------------------------------------
+# MoE / AMD gfx942 low-level primitives
+# ---------------------------------------------------------------------------
+
+
+def direct_lds_fill_bf16(lds_dst: int, global_src: int,
+                         elements: int) -> None:
+    """Copy ``elements`` bf16 values from a global-memory address to an LDS
+    address (plain memcpy on the host; vectorised loads + LDS stores in the
+    HIP path).
+
+    This is the host replacement for CDNA4's ``raw_ptr_buffer_load_lds``.
+
+    Args:
+        lds_dst: byte address of the LDS destination.
+        global_src: byte address of the global-memory source.
+        elements: number of bf16 (2-byte) values to copy.
+
+    Raises:
+        ValueError: if either address is null (with non-zero elements).
+
+    Example:
+        >>> import ctypes
+        >>> src = (ctypes.c_uint16 * 4)(0x3F80, 0x4000, 0x4040, 0x4080)
+        >>> dst = (ctypes.c_uint16 * 4)()
+        >>> direct_lds_fill_bf16(ctypes.addressof(dst),
+        ...                      ctypes.addressof(src), 4)
+        >>> list(dst)
+        [16256, 16384, 16448, 16512]
+    """
+    _impl.direct_lds_fill_bf16(int(lds_dst), int(global_src),
+                               int(elements))
+
+
+def fp4_to_bf16_dequant(packed, scale: float = 1.0) -> np.ndarray:
+    """Convert packed fp4 (E2M1 microscaling format, two values per byte,
+    low nibble first) to bf16 (uint16 bit patterns).
+
+    Args:
+        packed: uint8 array (or anything convertible to uint8) of packed
+            fp4 values.
+        scale: per-block scale factor (default 1.0).
+
+    Returns:
+        A uint16 numpy array of bf16 bit patterns, length = 2 × len(packed).
+
+    Raises:
+        ValueError: if ``packed`` is empty.
+
+    Example:
+        >>> fp4_to_bf16_dequant(np.array([0x00], dtype=np.uint8))
+        array([0, 0], dtype=uint16)
+    """
+    packed_arr = np.ascontiguousarray(packed, dtype=np.uint8)
+    return _impl.fp4_to_bf16_dequant(packed_arr, float(np.float32(scale)))
+
+
+def use_async_copy_default() -> bool:
+    """Return True if async copy should be used by default.
+
+    On gfx942 (CDNA3) it misbehaves and the HIP implementation defaults to
+    OFF. On other architectures — and on the host build — it defaults to ON.
+    The ``K3_NO_ASYNC`` environment variable overrides: ``"0"`` = ON,
+    ``"1"`` = OFF.
+
+    Example:
+        >>> use_async_copy_default()
+        True
+    """
+    return _impl.use_async_copy_default()
+
+
+def mfma_f32_16x16x16bf16(c: list[float], a: list[int], b: list[int],
+                          cbsz: int = 0, abid: int = 0,
+                          blgp: int = 0) -> None:
+    """K16 bf16 MFMA: ``C[0..3] += A[0..1] × B[0..1]`` (16×16×16 bf16,
+    accumulator fp32).
+
+    On gfx942, the CDNA4-only K32 bf16 MFMA is emulated by calling this
+    K16 function twice (once for K=0..15, once for K=16..31).
+
+    Args:
+        c: list of 4 float accumulators (updated in-place).
+        a: list of 2 uint32_t — packed bf16 A fragment.
+        b: list of 2 uint32_t — packed bf16 B fragment.
+        cbsz: MFMA control flag (typically 0), ignored on the host path.
+        abid: MFMA control flag (typically 0), ignored on the host path.
+        blgp: MFMA control flag (typically 0), ignored on the host path.
+
+    Example:
+        >>> c = [0.0, 0.0, 0.0, 0.0]
+        >>> mfma_f32_16x16x16bf16(c, [0x3F803F80, 0x3F803F80],
+        ...                      [0x3F803F80, 0x3F803F80])
+        >>> c
+        [1.0, 1.0, 1.0, 1.0]
+    """
+    c_copy = [float(np.float32(v)) for v in c]
+    _impl.mfma_f32_16x16x16bf16(
+        c_copy,
+        [int(v) & 0xFFFFFFFF for v in a],
+        [int(v) & 0xFFFFFFFF for v in b],
+        int(cbsz), int(abid), int(blgp),
+    )
+    for i in range(4):
+        c[i] = c_copy[i]

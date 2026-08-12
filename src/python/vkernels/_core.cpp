@@ -42,6 +42,7 @@
 #include "vkernels/core/stream.hpp"
 #include "vkernels/kernels/elementwise.hpp"
 #include "vkernels/kernels/gemm.hpp"
+#include "vkernels/kernels/moe.hpp"
 #include "vkernels/kernels/reduce.hpp"
 #include "vkernels/util/config.hpp"
 #include "vkernels/util/version.hpp"
@@ -204,6 +205,58 @@ PYBIND11_MODULE(_core, m) {
       py::arg("B"), py::arg("beta"), py::arg("C"),
       "C = alpha * A @ B + beta * C (row-major, in place). A is M*K, B is "
       "K*N, C is M*N elements.");
+
+  // --- moe (fp4 dequant, LDS fill, MFMA) ---------------------------------
+  kernels.def(
+      "direct_lds_fill_bf16",
+      [](std::uintptr_t lds_dst, std::uintptr_t global_src,
+         std::size_t elements) {
+        kernels::direct_lds_fill_bf16(reinterpret_cast<void*>(lds_dst),
+                                      reinterpret_cast<const void*>(global_src),
+                                      elements);
+      },
+      py::arg("lds_dst"), py::arg("global_src"), py::arg("elements"),
+      "Copy `elements` bf16 values from global memory to LDS (plain memcpy "
+      "on the host; vectorised loads + LDS stores in the HIP path).");
+
+  kernels.def(
+      "fp4_to_bf16_dequant",
+      [](py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast>
+             packed,
+         float scale) {
+        auto out = py::array_t<std::uint16_t>(packed.size() * 2);
+        Span<std::uint8_t> packed_span(const_cast<std::uint8_t*>(packed.data()),
+                                       packed.size());
+        Span<std::uint16_t> out_span(out.mutable_data(), out.size());
+        kernels::fp4_to_bf16_dequant(packed_span, out_span, scale);
+        return out;
+      },
+      py::arg("packed"), py::arg("scale") = 1.0f,
+      "Convert packed fp4 (E2M1, two values per byte, low nibble first) to "
+      "bf16 (uint16 bit patterns). Returns a new uint16 array of 2× length.");
+
+  kernels.def(
+      "use_async_copy_default", &kernels::use_async_copy_default,
+      "Return True if async copy should be used by default. On gfx942 "
+      "(CDNA3) it misbehaves and defaults to OFF; elsewhere ON. "
+      "K3_NO_ASYNC env var overrides: '0'=ON, '1'=OFF.");
+
+  kernels.def(
+      "mfma_f32_16x16x16bf16",
+      [](std::vector<float>& c, const std::vector<std::uint32_t>& a,
+         const std::vector<std::uint32_t>& b, int cbsz, int abid, int blgp) {
+        if (c.size() < 4 || a.size() < 2 || b.size() < 2) {
+          throw py::value_error(
+              "c must have 4 floats; a and b must each have 2 uint32_t");
+        }
+        kernels::mfma_f32_16x16x16bf16(c.data(), a.data(), b.data(), cbsz,
+                                       abid, blgp);
+      },
+      py::arg("c"), py::arg("a"), py::arg("b"), py::arg("cbsz") = 0,
+      py::arg("abid") = 0, py::arg("blgp") = 0,
+      "K16 bf16 MFMA: C[0..3] += A[0..1] × B[0..1] (16×16×16 bf16, acc "
+      "fp32). `c` is 4 floats updated in-place; `a` and `b` are 2 packed "
+      "bf16 uint32_t each.");
 
   // -------------------------------------------------------------------------
   // vkernels._core.comm — collectives, topology, overlap, p2p gather

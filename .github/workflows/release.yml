@@ -1,0 +1,130 @@
+# .github/workflows/release.yml — build + publish wheels on version tags.
+#
+# Triggered by pushing a tag like `v0.1.0`.  Builds the compiled extension
+# wheel on each target platform, uploads them as GitHub Release assets, and
+# optionally publishes to PyPI.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish-pypi:
+        description: "Publish to PyPI?"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # needed to create a GitHub Release
+
+jobs:
+  # ------------------------------------------------------------------
+  # Host-only wheel (Linux x86_64, CPython 3.12)
+  # ------------------------------------------------------------------
+  build-host:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python-version: ["3.12"]   # add "3.11", "3.13" for multi-version wheels
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+
+      - name: Build wheel
+        run: bash meta/scripts/build_wheel.sh --output-dir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-host-cp${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # CUDA wheel (Linux x86_64, CUDA 12.x) — self-hosted
+  # ------------------------------------------------------------------
+  build-cuda:
+    runs-on: [self-hosted, cuda]
+    if: ${{ false }}  # opt-in: activate when a CUDA runner is available
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+
+      - name: Build wheel (CUDA)
+        run: bash meta/scripts/build_wheel.sh --cuda --output-dir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-cuda-amd64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # AMD ROCm/HIP wheel (Linux x86_64, ROCm 6.x, gfx942) — self-hosted
+  # ------------------------------------------------------------------
+  build-hip:
+    runs-on: [self-hosted, rocm]
+    if: ${{ false }}  # opt-in: activate when a ROCm runner is available
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+
+      - name: Build wheel (HIP)
+        run: bash meta/scripts/build_wheel.sh --hip --output-dir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-rocm-amd64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # GitHub Release: collect all artifacts, create a release, attach wheels
+  # ------------------------------------------------------------------
+  github-release:
+    needs: [build-host]   # add build-cuda, build-hip when active
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  # ------------------------------------------------------------------
+  # PyPI publish (opt-in via workflow_dispatch)
+  # ------------------------------------------------------------------
+  pypi-publish:
+    needs: [build-host]
+    runs-on: ubuntu-24.04
+    if: github.event.inputs.publish-pypi == 'true'
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

@@ -13,12 +13,31 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vkernels-cli"
 version = "0.1.0"
-description = "vkl — list and inspect the kernels implemented in the vkernels repository"
+description = "vkl — low-level GPU kernels and communication primitives with Python bindings"
 readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "opentela-ai" }]
+keywords = ["cuda", "kernels", "gpu", "collectives", "allreduce"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "numpy>=1.24",
 ]
+
+[project.optional-dependencies]
+# Compiled backend: the pybind11 extension (*not* shipped in the
+# pure-Python wheel; install a platform wheel or build from source).
+compiled = []
 
 [project.scripts]
 vkl = "vkernels.cli.main:main"
@@ -26,11 +45,28 @@ vkl = "vkernels.cli.main:main"
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "build>=1.0",
+    "twine>=5.0",
 ]
 
 # src-layout: the `vkernels` package lives under src/python/.
+# When building a platform wheel (meta/scripts/build_wheel.sh copies the
+# compiled _core*.so here before `python -m build`), setuptools includes
+# it automatically; the fallback backend is used when no .so is present.
 [tool.setuptools.packages.find]
 where = ["src/python"]
+
+# Include the compiled pybind11 extension in the wheel when it exists.
+# The build script (meta/scripts/build_wheel.sh) places the .so here
+# temporarily; pip-installing the resulting wheel places it alongside
+# the .py files so `import vkernels._core` works at runtime.
+[tool.setuptools.package-data]
+vkernels = ["_core*.so"]
+
+# setuptools needs this flag to actually include package-data files
+# that aren't tracked by a VCS (our temporary .so definitely isn't).
+[tool.setuptools]
+include-package-data = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
