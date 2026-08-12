@@ -36,18 +36,20 @@ have produced.
 __device__ void direct_lds_fill_bf16(void* lds_dst, const void* global_src,
                                      int elements_per_thread) {
   int tid = threadIdx.x;
-  const uint32_t* src = reinterpret_cast<const uint32_t*>(global_src)
+  const uint32_t* src = (const uint32_t*)global_src
                         + tid * (elements_per_thread / 2);
-  uint32_t* dst = reinterpret_cast<uint32_t*>(lds_dst)
+  uint32_t* dst = (uint32_t*)lds_dst
                   + tid * (elements_per_thread / 2);
 
-  uint4 v = *reinterpret_cast<const uint4*>(src);
+  uint4 v = *(const uint4*)src;
   dst[0] = v.x; dst[1] = v.y; dst[2] = v.z; dst[3] = v.w;
 }
 ```
 
 - Uses `uint4` (128-bit) loads: the compiler emits `global_load_dwordx4`
   for aligned 128-bit pointer dereferences on AMD GPUs.
+- C-style casts (`(const uint32_t*)global_src`) are required in device code —
+  the HIP compiler rejects `reinterpret_cast` on `void*`.
 - Each thread loads exactly 4 dwords = 8 bf16 values = 16 bytes.
 - The address in global is lane-major: thread `N` loads elements
   `[N*ept .. N*ept+ept-1]`.
@@ -245,45 +247,49 @@ compute a 16×16 output tile, with each lane holding 4 float32 accumulators.
 
 Each lane within a 64-thread warp holds:
 
-| Register | Content | Shape |
+| Register | Content | Mapping |
 |---|---|---|
-| `C[0..3]` | 4 float32 accumulators | A 4×4 sub-tile of the 16×16 output |
-| `A[0..1]` | 4 bf16 values packed into 2 uint32 | 1×4 vector from A |
-| `B[0..1]` | 4 bf16 values packed into 2 uint32 | 4×1 vector from B |
+| `C[0..3]` | 4 float32 accumulators | `col = lane % 16`, `row = (lane/16)*4 + i` — four **consecutive rows** at one column |
+| `A[0..1]` | 4 bf16 values packed into 2 uint32 | `m = lane % 16`, `a[i] = A[m][k0+i]` with `k0 = (lane/16)*4` (1 row × 4 K-cols) |
+| `B[0..1]` | 4 bf16 values packed into 2 uint32 | `n = lane % 16`, `b[i] = B[k0+i][n]` with `k0 = (lane/16)*4` (4 K-rows × 1 col) |
 
-The lane's 4 accumulators correspond to a 4×4 block within the 16×16 output
-tile. Each accumulator `C[i]` is the dot product of the lane's 4 A-values
-and 4 B-values.
+Each accumulator `C[i]` is the dot product of the lane's 4 A-values
+(`a[i]`) and 4 B-values (`b[i]`) over the K=16 reduction. Note the C layout
+is **not** a 4×4 sub-tile — it is 4 rows × 1 column (this was verified
+empirically with one-hot matrices on gfx90a).
 
 ### HIP inline assembly
 
 ```cpp
-__device__ void mfma_f32_16x16x16bf16(float c[4], const uint32_t a[2],
-                                      const uint32_t b[2],
-                                      int cbsz, int abid, int blgp) {
-  register float r0 asm("v0"), r1 asm("v1"), r2 asm("v2"), r3 asm("v3");
+__device__ __forceinline__ void mfma_f32_16x16x16bf16(
+    float c[4], const uint32_t a[2], const uint32_t b[2],
+    int cbsz = 0, int abid = 0, int blgp = 0) {
+  register float   r0 asm("v0"), r1 asm("v1"), r2 asm("v2"), r3 asm("v3");
   register uint32_t s0 asm("v4"), s1 asm("v5");
   register uint32_t t0 asm("v6"), t1 asm("v7");
-
-  // Load from memory into named registers
-  __builtin_memcpy(&r0, &c[0], 4); /* ... r1,r2,r3 similarly */
+  r0 = c[0]; r1 = c[1]; r2 = c[2]; r3 = c[3];
   s0 = a[0]; s1 = a[1]; t0 = b[0]; t1 = b[1];
-
   __asm__ __volatile__(
       "v_mfma_f32_16x16x16bf16_1k v[0:3], v[4:5], v[6:7], v[0:3]"
       : "+v"(r0), "+v"(r1), "+v"(r2), "+v"(r3)
-      :  "v"(s0),  "v"(s1),  "v"(t0),  "v"(t1));
-
-  __builtin_memcpy(&c[0], &r0, 4); /* ... write back */
+      : "v"(s0), "v"(s1), "v"(t0), "v"(t1));
+  c[0] = r0; c[1] = r1; c[2] = r2; c[3] = r3;
 }
 ```
 
 - Uses named VGPR variables (`asm("v0")` through `asm("v7")`) to guarantee
   the consecutive register ranges the instruction demands.
 - The accumulator registers are both inputs and outputs (`+v` constraint).
-- `cbsz`, `abid`, `blgp` are the MFMA control flags that set the
-  precision/rounding mode; they are accepted but ignored in the assembly
-  (the `_1k` variant hardcodes these).
+- `cbsz`, `abid`, `blgp` are the MFMA control flags (precision/rounding
+  mode); the `_1k` variant hardcodes these and they are ignored here.
+
+> **Caveat**: the pinned-VGPR + `__volatile__` form is fragile when called
+> repeatedly from a loop — on gfx90a the compiler's register tracking
+> breaks (accumulator corruption: 60 instead of 64 after 4 steps), and
+> blocks >64 threads crash with memory faults. The fused-MoE kernel
+> (`moe_fused.hip`) therefore does **not** call this function; it issues the
+> clang builtin `__builtin_amdgcn_mfma_f32_16x16x16bf16_1k` directly in the
+> kernel body, which is reliable across ROCm versions.
 
 ### CPU reference
 

@@ -1,6 +1,23 @@
 // vkernels/kernels/moe_fused.hip
 //
 // MXFP4 fused-MoE grouped GEMM — HIP kernel for AMD gfx942/gfx90a.
+//
+// Uses the clang MFMA builtin __builtin_amdgcn_mfma_f32_16x16x16bf16_1k,
+// which handles the VGPR fragment layout correctly across ROCm versions.
+//
+// Verified fragment layout (empirically confirmed on gfx90a):
+//   A: m = lane % 16, k0 = (lane/16)*4, a[i] = A[m][k0+i]
+//   B: n = lane % 16, k0 = (lane/16)*4, b[i] = B[k0+i][n]
+//   C: col = lane % 16, row = (lane/16)*4 + i, c[i] = C[row][col]
+//
+// Strategy (matches xkernels 2-stage fused-MoE):
+//   Stage 0: gate_up GEMM + SwiGLU → act [EM, ispp] bf16
+//            (gate and up accumulators held in fp32; single bf16 rounding)
+//   Stage 1: down GEMM + routed combine → out [M, hidden] fp32
+//
+// Each block is 64 threads (1 wavefront); the N dimension is split across
+// blockIdx.z (4 z-blocks, each a 16-column slice).
+
 #include <cstdint>
 #include <cmath>
 
@@ -13,102 +30,260 @@
 
 namespace vkernels::kernels::hip {
 
-static constexpr int kBM = 16, kBN = 64, kBK = 64;
+typedef float v4f __attribute__((ext_vector_type(4)));
+typedef short v4s __attribute__((ext_vector_type(4)));
+
+static constexpr int kBM = 16,  kBN = 64, kBK = 64;
 static constexpr int kGroupSize = 32;
 static constexpr int kMfmaK    = 16;
 static constexpr int kWarps    = 4;
-static constexpr int kWhreads  = kWarps * 64;
+static constexpr int kWhreads  = 64;
 
-static_assert(kBM * kBK == 1024, "A tile");
-static_assert(kBK * kBN == 4096, "B tile");
-static_assert(kWhreads == 256,   "threads");
+// Prefill tile config (M > 32): 64x128 tiles, 256 threads (4 wavefronts).
+// Bigger M-tiles raise arithmetic intensity ~3.3x by reusing the dequantized
+// B weights across 64 rows instead of 16, and a wider N-tile reuses the A
+// tile across 128 columns.
+static constexpr int kBM_pf = 64, kBN_pf = 128, kBK_pf = 64;
+static constexpr int kThreads_pf = 256;
 
 // ======================================================================
-//  ue8m0 scale decode
+//  Dequant helpers
 // ======================================================================
 __device__ __forceinline__ float ue8m0_decode(uint8_t s) {
   if (s == 0xFF) return 0.0f;
-  int unbiased = static_cast<int>(s) - 127;
-  uint32_t bits;
-  if (unbiased >= -126) {
-    bits = static_cast<uint32_t>(s) << 23;
-  } else {
-    int shift = -(unbiased + 126);
-    bits = (shift < 32) ? (0x00800000u >> shift) : 0u;
-  }
   float f;
+  uint32_t bits = static_cast<uint32_t>(s) << 23;
   __builtin_memcpy(&f, &bits, sizeof(float));
   return f;
 }
-
-// ======================================================================
-//  Dequantize BLOCK_K × BLOCK_N packed weights → smem (bf16)
-// ======================================================================
-__device__ void dequant_b_tile(
-    const uint8_t* b_packed, const uint8_t* b_scale,
-    int stride_n, int stride_scale_n, int stride_scale_k,
-    uint16_t* smem_b) {
-
-  constexpr int kN = kBN, kK = kBK;
-  constexpr int kPackedK = kK / 2;
-  constexpr int kBytesPerThread = (kPackedK * kN) / kWhreads;  // 8
-  constexpr int kKpStep = kWhreads / kN;  // 4
-
-  int n = threadIdx.x % kN;
-  int kp_base = threadIdx.x / kN;
-
-  for (int it = 0; it < kBytesPerThread; ++it) {
-    int kp = kp_base + it * kKpStep;
-    if (kp >= kPackedK) break;
-
-    uint8_t pb = b_packed[n * stride_n + kp];
-    int gi = (kp * 2) / kGroupSize;
-    uint8_t sc = b_scale[n * stride_scale_n + gi * stride_scale_k];
-
-    uint32_t flo = fp4nib_to_f32bits(pb & 0x0F);
-    float vlo; __builtin_memcpy(&vlo, &flo, sizeof(float));
-    vlo *= ue8m0_decode(sc);
-    __builtin_memcpy(&flo, &vlo, sizeof(float));
-
-    uint32_t fhi = fp4nib_to_f32bits((pb >> 4) & 0x0F);
-    float vhi; __builtin_memcpy(&vhi, &fhi, sizeof(float));
-    vhi *= ue8m0_decode(sc);
-    __builtin_memcpy(&fhi, &vhi, sizeof(float));
-
-    smem_b[(kp * 2)     * kN + n] = f32bits_to_bf16(flo);
-    smem_b[(kp * 2 + 1) * kN + n] = f32bits_to_bf16(fhi);
-  }
-}
-
-// ======================================================================
-//  MFMA fragment loaders
-// ======================================================================
-__device__ __forceinline__ void load_a(uint32_t a[2],
-    const uint16_t smem[][kBK], int k_off, int lane) {
-  int m = lane % 16;
-  int k0 = k_off + (lane / 16) * 4;
-  a[0] = (static_cast<uint32_t>(smem[m][k0+1])<<16) | smem[m][k0];
-  a[1] = (static_cast<uint32_t>(smem[m][k0+3])<<16) | smem[m][k0+2];
-}
-
-__device__ __forceinline__ void load_b(uint32_t b[2],
-    const uint16_t smem[][kBN], int k_off, int n_base, int lane) {
-  int n = n_base + (lane % 16);
-  int k0 = k_off + (lane / 16) * 4;
-  b[0] = (static_cast<uint32_t>(smem[k0+1][n])<<16) | smem[k0][n];
-  b[1] = (static_cast<uint32_t>(smem[k0+3][n])<<16) | smem[k0+2][n];
-}
-
-__device__ __forceinline__ int out_row(int lane) { return lane / 4; }
-__device__ __forceinline__ int out_col(int lane) { return (lane % 4) * 4; }
 
 __device__ __forceinline__ uint16_t f2bf(float v) {
   uint32_t b; __builtin_memcpy(&b, &v, sizeof(float));
   return f32bits_to_bf16(b);
 }
 
+// Load the 16x64 A tile into shared memory (stage 0: input activations).
+// 64 threads; each thread loads 16 bf16 = 4 uint2 reads.
+// sorted_ids holds FLAT topk indices (token*top_k + sel).
+__device__ __forceinline__ void load_a_tile(
+    uint16_t sA[kBM][kBK], const uint16_t* __restrict__ A,
+    const int32_t* __restrict__ sorted_ids, int tk_base,
+    int k_start, int stride, int M, int top_k, int lane) {
+  int row = lane % kBM;
+  int base_col = (lane / kBM) * (kBK / (kWhreads / kBM));
+  int flat = sorted_ids[tk_base + row];
+  int N = M * top_k;
+  if (flat < N) {
+    int token = flat / top_k;
+    for (int g = 0; g < 4; ++g) {
+      int col_off = base_col + g * 4;
+      const uint32_t* src = (const uint32_t*)(&A[(size_t)token * stride + k_start + col_off]);
+      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
+      uint2 v = *(const uint2*)(src);
+      dst[0] = v.x; dst[1] = v.y;
+    }
+  } else {
+    for (int g = 0; g < 4; ++g) {
+      int col_off = base_col + g * 4;
+      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
+      dst[0] = 0; dst[1] = 0;
+    }
+  }
+}
+
+// Load the act tile [EM, ispp] into shared memory, indexed by SORTED ROW
+// (tk_base + row).  Each expert's intermediate output occupies its own
+// sorted row, so top_k>1 does not overwrite.
+__device__ __forceinline__ void load_act_tile(
+    uint16_t sA[kBM][kBK], const uint16_t* __restrict__ act,
+    const int32_t* __restrict__ sorted_ids, int tk_base,
+    int k_start, int ispp, int M, int top_k, int lane) {
+  int row = lane % kBM;
+  int base_col = (lane / kBM) * (kBK / (kWhreads / kBM));
+  int flat = sorted_ids[tk_base + row];
+  int N = M * top_k;
+  if (flat < N) {
+    const uint16_t* src_row = &act[(size_t)(tk_base + row) * ispp + k_start];
+    for (int g = 0; g < 4; ++g) {
+      int col_off = base_col + g * 4;
+      const uint32_t* src = (const uint32_t*)(src_row + col_off);
+      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
+      uint2 v = *(const uint2*)(src);
+      dst[0] = v.x; dst[1] = v.y;
+    }
+  } else {
+    for (int g = 0; g < 4; ++g) {
+      int col_off = base_col + g * 4;
+      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
+      dst[0] = 0; dst[1] = 0;
+    }
+  }
+}
+
+// Dequant a packed fp4 weight column slice → sB[kBK][16].
+// packed/scale point at the [n_global, 0] origin; k_start selects the K tile.
+__device__ __forceinline__ void dequant_b_16cols(
+    uint16_t sB[kBK][16],
+    const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scale,
+    int k_start, int stride_packed, int stride_scale_n, int lane) {
+  int n = lane % 16;
+  int kp_base = lane / 16;
+  constexpr int kPackedK = kBK/2, kKpStep = kWhreads/16;
+  constexpr int kBytesPerThread = (kPackedK * 16) / kWhreads;
+  int kp_off = k_start / 2;
+  int sc_off = k_start / kGroupSize;
+  for (int it = 0; it < kBytesPerThread; ++it) {
+    int kp = kp_base + it * kKpStep;
+    if (kp >= kPackedK) break;
+    uint8_t pb = packed[n * stride_packed + kp_off + kp];
+    int gi = (kp * 2) / kGroupSize;
+    uint8_t sval = scale[n * stride_scale_n + sc_off + gi];
+    float s = ue8m0_decode(sval);
+    uint32_t flo = fp4nib_to_f32bits(pb & 0x0F);
+    float vlo; __builtin_memcpy(&vlo, &flo, sizeof(float));
+    vlo *= s; __builtin_memcpy(&flo, &vlo, sizeof(float));
+    sB[kp*2][n] = f32bits_to_bf16(flo);
+    uint32_t fhi = fp4nib_to_f32bits((pb>>4) & 0x0F);
+    float vhi; __builtin_memcpy(&vhi, &fhi, sizeof(float));
+    vhi *= s; __builtin_memcpy(&fhi, &vhi, sizeof(float));
+    sB[kp*2+1][n] = f32bits_to_bf16(fhi);
+  }
+}
+
+// Run the K=64 MFMA loop (4 steps of K=16), accumulating into acc.
+__device__ __forceinline__ void mfma_k64(
+    v4f& acc, const uint16_t sA[kBM][kBK], const uint16_t sB[kBK][16],
+    int lane) {
+  for (int mf = 0; mf < kBK / kMfmaK; ++mf) {
+    int m = lane % 16;
+    int k0 = mf * kMfmaK + (lane / 16) * 4;
+    int n = lane % 16;
+    v4s a = { (short)sA[m][k0], (short)sA[m][k0+1],
+              (short)sA[m][k0+2], (short)sA[m][k0+3] };
+    v4s b = { (short)sB[k0][n], (short)sB[k0+1][n],
+              (short)sB[k0+2][n], (short)sB[k0+3][n] };
+    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+  }
+}
+
 // ======================================================================
-//  Stage 0: gate_up + SwiGLU
+//  Prefill helpers (BM=64, BN=128, 256 threads)
+// ======================================================================
+
+// Load the 64x64 A/act tile. 256 threads; each thread loads 16 bf16 (4 uint2).
+__device__ __forceinline__ void load_a_tile_pf(
+    uint16_t sA[kBM_pf][kBK_pf], const uint16_t* __restrict__ src,
+    const int32_t* __restrict__ sorted_ids, int tk_base,
+    int k_start, int stride, int M, int top_k, int tid) {
+  int row = tid >> 2;                 // tid / 4 (0..63)
+  int base_col = (tid & 3) * 16;      // 4 threads per row, 16 cols each
+  int flat = sorted_ids[tk_base + row];
+  int N = M * top_k;
+  if (flat < N) {
+    int token = flat / top_k;
+    for (int g = 0; g < 4; ++g) {
+      int col_off = base_col + g * 4;
+      const uint32_t* s = (const uint32_t*)(&src[(size_t)token * stride + k_start + col_off]);
+      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
+      uint2 v = *(const uint2*)(s);
+      dst[0] = v.x; dst[1] = v.y;
+    }
+  } else {
+    for (int g = 0; g < 4; ++g) {
+      int col_off = base_col + g * 4;
+      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
+      dst[0] = 0; dst[1] = 0;
+    }
+  }
+}
+
+// Load the 64x64 act tile (stage 1).  act [EM, ispp] is indexed by SORTED ROW
+// (tk_base + row), unlike A which is indexed by token.
+__device__ __forceinline__ void load_act_tile_pf(
+    uint16_t sA[kBM_pf][kBK_pf], const uint16_t* __restrict__ act,
+    const int32_t* __restrict__ sorted_ids, int tk_base,
+    int k_start, int ispp, int M, int top_k, int tid) {
+  int row = tid >> 2;
+  int base_col = (tid & 3) * 16;
+  int flat = sorted_ids[tk_base + row];
+  int N = M * top_k;
+  if (flat < N) {
+    const uint16_t* src_row = &act[(size_t)(tk_base + row) * ispp + k_start];
+    for (int g = 0; g < 4; ++g) {
+      int col_off = base_col + g * 4;
+      const uint32_t* s = (const uint32_t*)(src_row + col_off);
+      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
+      uint2 v = *(const uint2*)(s);
+      dst[0] = v.x; dst[1] = v.y;
+    }
+  } else {
+    for (int g = 0; g < 4; ++g) {
+      int col_off = base_col + g * 4;
+      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
+      dst[0] = 0; dst[1] = 0;
+    }
+  }
+}
+
+// Dequant a packed fp4 weight tile into sB[kBK_pf][kBN_pf] (64x128).
+// packed: [N][K/2] row-major, N=128, K/2=32. 256 threads -> 16 bytes/thread.
+//   n = tid % 128, kp_grp = tid / 128; kp = kp_grp + 2*it (16 steps).
+// Consecutive threads write consecutive n (coalesced shared stores); the
+// global read is strided by stride_packed (uncoalesced, as in the decode
+// dequant) but each element is reused kBM_pf times by the MFMA loop.
+__device__ __forceinline__ void dequant_b_pf(
+    uint16_t sB[kBK_pf][kBN_pf],
+    const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scale,
+    int k_start, int stride_packed, int stride_scale_n, int tid) {
+  int n = tid & 127;          // tid % 128
+  int kp_grp = tid >> 7;      // tid / 128 (0..1)
+  constexpr int kPackedK = kBK_pf / 2;                    // 32
+  constexpr int kBytesPerThread = (kPackedK * kBN_pf) / kThreads_pf;  // 16
+  constexpr int kKpStep = kThreads_pf / kBN_pf;           // 2
+  int kp_off = k_start / 2;
+  int sc_off = k_start / kGroupSize;
+  for (int it = 0; it < kBytesPerThread; ++it) {
+    int kp = kp_grp + it * kKpStep;
+    uint8_t pb = packed[n * stride_packed + kp_off + kp];
+    int gi = (kp * 2) / kGroupSize;
+    float s = ue8m0_decode(scale[n * stride_scale_n + sc_off + gi]);
+    uint32_t flo = fp4nib_to_f32bits(pb & 0x0F);
+    float vlo; __builtin_memcpy(&vlo, &flo, sizeof(float));
+    vlo *= s; __builtin_memcpy(&flo, &vlo, sizeof(float));
+    sB[kp*2][n] = f32bits_to_bf16(flo);
+    uint32_t fhi = fp4nib_to_f32bits((pb >> 4) & 0x0F);
+    float vhi; __builtin_memcpy(&vhi, &fhi, sizeof(float));
+    vhi *= s; __builtin_memcpy(&fhi, &vhi, sizeof(float));
+    sB[kp*2+1][n] = f32bits_to_bf16(fhi);
+  }
+}
+
+// Run the K=64 MFMA loop over 8 column fragments (BN=128) for one 16-row
+// fragment.  Each wavefront (warp) owns row fragment warp (rows warp*16..+16)
+// and accumulates acc[nf] += sA[row_frag] x sB[:, nf*16..+16].
+__device__ __forceinline__ void mfma_k64_pf(
+    v4f acc[8], const uint16_t sA[kBM_pf][kBK_pf],
+    const uint16_t sB[kBK_pf][kBN_pf], int warp, int lane) {
+  int m = lane & 15;          // row within 16-row fragment
+  int n = lane & 15;          // col within 16-col fragment
+  int kq = lane >> 4;         // 0..3 -> which 4-K group
+  int row_base = warp * 16;
+  for (int mf = 0; mf < kBK_pf / kMfmaK; ++mf) {
+    int k0 = mf * kMfmaK + kq * 4;
+    v4s a = { (short)sA[row_base + m][k0],     (short)sA[row_base + m][k0 + 1],
+              (short)sA[row_base + m][k0 + 2], (short)sA[row_base + m][k0 + 3] };
+#pragma unroll
+    for (int nf = 0; nf < 8; ++nf) {
+      int nb = nf * 16 + n;
+      v4s b = { (short)sB[k0][nb],     (short)sB[k0 + 1][nb],
+                (short)sB[k0 + 2][nb], (short)sB[k0 + 3][nb] };
+      acc[nf] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc[nf], 0, 0, 0);
+    }
+  }
+}
+
+// ======================================================================
+//  Stage 0: gate_up GEMM + SwiGLU → act [EM, ispp] bf16
 // ======================================================================
 __global__ void gateup_swiglu_kernel(
     const uint16_t* __restrict__ A,
@@ -118,96 +293,77 @@ __global__ void gateup_swiglu_kernel(
     uint16_t*       __restrict__ act,
     const int32_t*  __restrict__ sorted_ids,
     const int32_t*  __restrict__ expert_ids,
-    int hidden, int ispp, float swiglu_limit, int has_bias) {
+    int hidden, int ispp, int M, int top_k, float swiglu_limit, int has_bias) {
 
   __shared__ uint16_t sA[kBM][kBK];
-  __shared__ uint16_t sB[kBK][kBN];
+  __shared__ uint16_t sB_gate[kBK][16];
+  __shared__ uint16_t sB_up[kBK][16];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
+  int warp_n = blockIdx.z;
   int expert = expert_ids[pid_m];
   if (expert < 0) return;
 
   int tk_base = pid_m * kBM;
   int w13_bytes = 2 * ispp * (hidden / 2);
   int w13s_bytes = 2 * ispp * (hidden / kGroupSize);
+  int lane = threadIdx.x;
+  int n_global = pid_n * kBN + warp_n * 16;
 
-  int warp = threadIdx.x / 64, lane = threadIdx.x % 64;
-  float cg[4]={0}, cu[4]={0};
+  const uint8_t* bp_gate = w13 + expert * w13_bytes
+      + n_global * (hidden / 2);
+  const uint8_t* sc_gate = w13_scale + expert * w13s_bytes
+      + n_global * (hidden / kGroupSize);
+  const uint8_t* bp_up = w13 + expert * w13_bytes
+      + (n_global + ispp) * (hidden / 2);
+  const uint8_t* sc_up = w13_scale + expert * w13s_bytes
+      + (n_global + ispp) * (hidden / kGroupSize);
+
+  v4f acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
+  v4f acc_u = {0.0f, 0.0f, 0.0f, 0.0f};
 
   for (int kb = 0; kb < hidden / kBK; ++kb) {
     int ks = kb * kBK;
-
-    // Load A tile: vectorized uint2 (4 bf16/thread)
-    {
-      int row = threadIdx.x % kBM;
-      int col_off = (threadIdx.x / kBM) * 4;
-      int token = sorted_ids[tk_base + row];
-      const uint32_t* src = (const uint32_t*)(
-          &A[static_cast<std::size_t>(token) * hidden + ks + col_off]);
-      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
-      uint2 v = *(const uint2*)(src);
-      dst[0] = v.x; dst[1] = v.y;
-    }
+    // sA load and sB dequant write different LDS buffers, so no barrier is
+    // needed between them; the barrier before MFMA orders both.
+    load_a_tile(sA, A, sorted_ids, tk_base, ks, hidden, M, top_k, lane);
+    dequant_b_16cols(sB_gate, bp_gate, sc_gate, ks,
+                     hidden / 2, hidden / kGroupSize, lane);
+    dequant_b_16cols(sB_up, bp_up, sc_up, ks,
+                     hidden / 2, hidden / kGroupSize, lane);
     __syncthreads();
 
-    // Gate
-    {
-      int kp_off = ks / 2, sc_off = ks / kGroupSize;
-      const uint8_t* bp = w13 + expert * w13_bytes
-                          + pid_n * kBN * (hidden / 2) + kp_off;
-      const uint8_t* sc = w13_scale + expert * w13s_bytes
-                          + pid_n * kBN * (hidden / kGroupSize) + sc_off;
-      dequant_b_tile(bp, sc, hidden/2, hidden/kGroupSize, 1,
-                     (uint16_t*)(sB));
-    }
-    __syncthreads();
-
-    for (int mf = 0; mf < kBK / kMfmaK; ++mf) {
-      uint32_t ar[2], br[2];
-      load_a(ar, sA, mf * kMfmaK, lane);
-      load_b(br, sB, mf * kMfmaK, warp * 16, lane);
-      mfma_f32_16x16x16bf16(cg, ar, br);
-    }
-
-    // Up
-    {
-      int kp_off = ks / 2, sc_off = ks / kGroupSize;
-      const uint8_t* bp = w13 + expert * w13_bytes
-                          + (pid_n * kBN + ispp) * (hidden / 2) + kp_off;
-      const uint8_t* sc = w13_scale + expert * w13s_bytes
-                          + (pid_n * kBN + ispp) * (hidden / kGroupSize) + sc_off;
-      dequant_b_tile(bp, sc, hidden/2, hidden/kGroupSize, 1,
-                     (uint16_t*)(sB));
-    }
-    __syncthreads();
-
-    for (int mf = 0; mf < kBK / kMfmaK; ++mf) {
-      uint32_t ar[2], br[2];
-      load_a(ar, sA, mf * kMfmaK, lane);
-      load_b(br, sB, mf * kMfmaK, warp * 16, lane);
-      mfma_f32_16x16x16bf16(cu, ar, br);
-    }
+    mfma_k64(acc_g, sA, sB_gate, lane);
+    mfma_k64(acc_u, sA, sB_up, lane);
     __syncthreads();
   }
 
-  // SwiGLU epilogue
-  int row = out_row(lane), cb = out_col(lane);
+  // Epilogue: act = silu(clamp(gate)) * clamp(up) → single bf16 rounding.
+  // C layout: col = lane % 16, row = (lane/16)*4 + i.
+  int col = lane % 16;
+  int row_base = (lane / 16) * 4;
   float lim = swiglu_limit;
   for (int i = 0; i < 4; ++i) {
-    float g = cg[i], u = cu[i];
-    if (has_bias) {
-      g += b13[static_cast<std::size_t>(expert)*2*ispp + pid_n*kBN + warp*16 + cb + i];
-      u += b13[static_cast<std::size_t>(expert)*2*ispp + pid_n*kBN + warp*16 + cb + i + ispp];
+    int flat = sorted_ids[tk_base + row_base + i];
+    if (flat < M * top_k) {
+      float g = acc_g[i];
+      if (has_bias)
+        g += b13[(size_t)expert*2*ispp + n_global + col];
+      if (lim > 0.0f && g > lim) g = lim;
+      float silu_g = g / (1.0f + expf(-g));
+
+      float u = acc_u[i];
+      if (has_bias)
+        u += b13[(size_t)expert*2*ispp + n_global + col + ispp];
+      if (lim > 0.0f) { if (u > lim) u = lim; if (u < -lim) u = -lim; }
+
+      act[(size_t)(tk_base + row_base + i)*ispp + n_global + col] = f2bf(silu_g * u);
     }
-    if (lim > 0) { if(g>lim) g=lim; if(u>lim) u=lim; if(u<-lim) u=-lim; }
-    float sg = g / (1.0f + expf(-g));
-    int tok = sorted_ids[tk_base + row];
-    act[static_cast<std::size_t>(tok)*ispp + pid_n*kBN + warp*16 + cb + i] = f2bf(sg * u);
   }
 }
 
 // ======================================================================
-//  Stage 1: down + combine
+//  Stage 1: down GEMM + routed combine → out
 // ======================================================================
 __global__ void down_combine_kernel(
     const uint16_t* __restrict__ act,
@@ -218,69 +374,213 @@ __global__ void down_combine_kernel(
     const float*    __restrict__ topk_ws,
     const int32_t*  __restrict__ sorted_ids,
     const int32_t*  __restrict__ expert_ids,
-    int ispp, int hidden, int has_bias) {
+    int ispp, int hidden, int M, int top_k, int has_bias) {
 
   __shared__ uint16_t sA[kBM][kBK];
-  __shared__ uint16_t sB[kBK][kBN];
+  __shared__ uint16_t sB[kBK][16];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
+  int warp_n = blockIdx.z;
   int expert = expert_ids[pid_m];
   if (expert < 0) return;
 
   int tk_base = pid_m * kBM;
   int w2_bytes = hidden * (ispp / 2);
   int w2s_bytes = hidden * (ispp / kGroupSize);
+  int lane = threadIdx.x;
+  int n_global = pid_n * kBN + warp_n * 16;
 
-  int warp = threadIdx.x / 64, lane = threadIdx.x % 64;
-  float c[4] = {0};
+  const uint8_t* bp = w2 + expert * w2_bytes
+      + n_global * (ispp / 2);
+  const uint8_t* sc = w2_scale + expert * w2s_bytes
+      + n_global * (ispp / kGroupSize);
+
+  v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
   for (int kb = 0; kb < ispp / kBK; ++kb) {
     int ks = kb * kBK;
-
-    {
-      int row = threadIdx.x % kBM;
-      int col_off = (threadIdx.x / kBM) * 4;
-      int token = sorted_ids[tk_base + row];
-      const uint32_t* src = (const uint32_t*)(
-          &act[static_cast<std::size_t>(token) * ispp + ks + col_off]);
-      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
-      uint2 v = *(const uint2*)(src);
-      dst[0] = v.x; dst[1] = v.y;
-    }
+    load_act_tile(sA, act, sorted_ids, tk_base, ks, ispp, M, top_k, lane);
+    dequant_b_16cols(sB, bp, sc, ks, ispp / 2, ispp / kGroupSize, lane);
     __syncthreads();
 
-    {
-      int kp_off = ks / 2, sc_off = ks / kGroupSize;
-      const uint8_t* bp = w2 + expert * w2_bytes
-                          + pid_n * kBN * (ispp / 2) + kp_off;
-      const uint8_t* sc = w2_scale + expert * w2s_bytes
-                          + pid_n * kBN * (ispp / kGroupSize) + sc_off;
-      dequant_b_tile(bp, sc, ispp/2, ispp/kGroupSize, 1,
-                     (uint16_t*)(sB));
-    }
-    __syncthreads();
-
-    for (int mf = 0; mf < kBK / kMfmaK; ++mf) {
-      uint32_t ar[2], br[2];
-      load_a(ar, sA, mf * kMfmaK, lane);
-      load_b(br, sB, mf * kMfmaK, warp * 16, lane);
-      mfma_f32_16x16x16bf16(c, ar, br);
-    }
+    mfma_k64(acc, sA, sB, lane);
     __syncthreads();
   }
 
-  int row = out_row(lane), cb = out_col(lane);
-  int tok = sorted_ids[tk_base + row];
-  float w = topk_ws[tk_base + row];
-
+  // Epilogue: bias + weight + scatter-add into out.
+  int col = lane % 16;
+  int row_base = (lane / 16) * 4;
   for (int i = 0; i < 4; ++i) {
-    float v = c[i];
-    if (has_bias)
-      v += b2[static_cast<std::size_t>(expert)*hidden + pid_n*kBN + warp*16 + cb + i];
-    v *= w;
-    int oc = pid_n * kBN + warp * 16 + cb + i;
-    if (oc < hidden)
-      atomicAdd(&out[static_cast<std::size_t>(tok) * hidden + oc], v);
+    int flat = sorted_ids[tk_base + row_base + i];
+    if (flat < M * top_k) {
+      int token = flat / top_k;
+      float v = acc[i];
+      if (has_bias)
+        v += b2[(size_t)expert*hidden + n_global + col];
+      v *= topk_ws[tk_base + row_base + i];
+      int oc = n_global + col;
+      if (oc < hidden)
+        atomicAdd(&out[(size_t)token * hidden + oc], v);
+    }
+  }
+}
+
+// ======================================================================
+//  Prefill: Stage 0 — gate_up GEMM + SwiGLU → act [EM, ispp] bf16
+//  (BM=64, BN=128, 256 threads). One expert per 64-row block (the caller
+//  must align with block_size=64).
+// ======================================================================
+__global__ void gateup_swiglu_kernel_prefill(
+    const uint16_t* __restrict__ A,
+    const uint8_t*  __restrict__ w13,
+    const uint8_t*  __restrict__ w13_scale,
+    const float*    __restrict__ b13,
+    uint16_t*       __restrict__ act,
+    const int32_t*  __restrict__ sorted_ids,
+    const int32_t*  __restrict__ expert_ids,
+    int hidden, int ispp, int M, int top_k, float swiglu_limit, int has_bias) {
+
+  __shared__ uint16_t sA[kBM_pf][kBK_pf];
+  __shared__ uint16_t sB[kBK_pf][kBN_pf];  // reused for gate then up
+
+  int pid_m = blockIdx.x, pid_n = blockIdx.y;
+  int expert = expert_ids[pid_m];
+  if (expert < 0) return;
+
+  int tk_base = pid_m * kBM_pf;
+  int w13_bytes = 2 * ispp * (hidden / 2);
+  int w13s_bytes = 2 * ispp * (hidden / kGroupSize);
+  int tid = threadIdx.x;
+  int lane = tid & 63;
+  int warp = tid >> 6;
+  int n_global = pid_n * kBN_pf;
+
+  const uint8_t* bp_gate = w13 + expert * w13_bytes
+      + n_global * (hidden / 2);
+  const uint8_t* sc_gate = w13_scale + expert * w13s_bytes
+      + n_global * (hidden / kGroupSize);
+  const uint8_t* bp_up = w13 + expert * w13_bytes
+      + (n_global + ispp) * (hidden / 2);
+  const uint8_t* sc_up = w13_scale + expert * w13s_bytes
+      + (n_global + ispp) * (hidden / kGroupSize);
+
+  v4f acc_g[8], acc_u[8];
+#pragma unroll
+  for (int nf = 0; nf < 8; ++nf) {
+    acc_g[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
+    acc_u[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
+  }
+
+  for (int kb = 0; kb < hidden / kBK_pf; ++kb) {
+    int ks = kb * kBK_pf;
+    // sA load and sB dequant are independent (different LDS buffers) — no
+    // barrier between them; the single barrier before each MFMA suffices.
+    load_a_tile_pf(sA, A, sorted_ids, tk_base, ks, hidden, M, top_k, tid);
+    dequant_b_pf(sB, bp_gate, sc_gate, ks, hidden / 2, hidden / kGroupSize, tid);
+    __syncthreads();
+    mfma_k64_pf(acc_g, sA, sB, warp, lane);
+    __syncthreads();
+
+    dequant_b_pf(sB, bp_up, sc_up, ks, hidden / 2, hidden / kGroupSize, tid);
+    __syncthreads();
+    mfma_k64_pf(acc_u, sA, sB, warp, lane);
+    __syncthreads();
+  }
+
+  // Epilogue: C col = lane%16, row = warp*16 + (lane/16)*4 + i.
+  int col = lane & 15;
+  int row_base = warp * 16 + (lane >> 4) * 4;
+  float lim = swiglu_limit;
+#pragma unroll
+  for (int nf = 0; nf < 8; ++nf) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      int flat = sorted_ids[tk_base + row_base + i];
+      if (flat < M * top_k) {
+        float g = acc_g[nf][i];
+        if (has_bias)
+          g += b13[(size_t)expert * 2 * ispp + n_global + nf * 16 + col];
+        if (lim > 0.0f && g > lim) g = lim;
+        float silu_g = g / (1.0f + expf(-g));
+
+        float u = acc_u[nf][i];
+        if (has_bias)
+          u += b13[(size_t)expert * 2 * ispp + n_global + nf * 16 + col + ispp];
+        if (lim > 0.0f) { if (u > lim) u = lim; if (u < -lim) u = -lim; }
+
+        act[(size_t)(tk_base + row_base + i) * ispp + n_global + nf * 16 + col] =
+            f2bf(silu_g * u);
+      }
+    }
+  }
+}
+
+// ======================================================================
+//  Prefill: Stage 1 — down GEMM + routed combine → out (BM=64, BN=128)
+// ======================================================================
+__global__ void down_combine_kernel_prefill(
+    const uint16_t* __restrict__ act,
+    const uint8_t*  __restrict__ w2,
+    const uint8_t*  __restrict__ w2_scale,
+    const float*    __restrict__ b2,
+    float*          __restrict__ out,
+    const float*    __restrict__ topk_ws,
+    const int32_t*  __restrict__ sorted_ids,
+    const int32_t*  __restrict__ expert_ids,
+    int ispp, int hidden, int M, int top_k, int has_bias) {
+
+  __shared__ uint16_t sA[kBM_pf][kBK_pf];
+  __shared__ uint16_t sB[kBK_pf][kBN_pf];
+
+  int pid_m = blockIdx.x, pid_n = blockIdx.y;
+  int expert = expert_ids[pid_m];
+  if (expert < 0) return;
+
+  int tk_base = pid_m * kBM_pf;
+  int w2_bytes = hidden * (ispp / 2);
+  int w2s_bytes = hidden * (ispp / kGroupSize);
+  int tid = threadIdx.x;
+  int lane = tid & 63;
+  int warp = tid >> 6;
+  int n_global = pid_n * kBN_pf;
+
+  const uint8_t* bp = w2 + expert * w2_bytes
+      + n_global * (ispp / 2);
+  const uint8_t* sc = w2_scale + expert * w2s_bytes
+      + n_global * (ispp / kGroupSize);
+
+  v4f acc[8];
+#pragma unroll
+  for (int nf = 0; nf < 8; ++nf) acc[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  for (int kb = 0; kb < ispp / kBK_pf; ++kb) {
+    int ks = kb * kBK_pf;
+    load_act_tile_pf(sA, act, sorted_ids, tk_base, ks, ispp, M, top_k, tid);
+    dequant_b_pf(sB, bp, sc, ks, ispp / 2, ispp / kGroupSize, tid);
+    __syncthreads();
+
+    mfma_k64_pf(acc, sA, sB, warp, lane);
+    __syncthreads();
+  }
+
+  int col = lane & 15;
+  int row_base = warp * 16 + (lane >> 4) * 4;
+#pragma unroll
+  for (int nf = 0; nf < 8; ++nf) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      int flat = sorted_ids[tk_base + row_base + i];
+      if (flat < M * top_k) {
+        int token = flat / top_k;
+        float v = acc[nf][i];
+        if (has_bias)
+          v += b2[(size_t)expert * hidden + n_global + nf * 16 + col];
+        v *= topk_ws[tk_base + row_base + i];
+        int oc = n_global + nf * 16 + col;
+        if (oc < hidden)
+          atomicAdd(&out[(size_t)token * hidden + oc], v);
+      }
+    }
   }
 }
 
@@ -289,9 +589,12 @@ __global__ void down_combine_kernel(
 // ======================================================================
 __global__ void gather_weights_kernel(
     float* __restrict__ sw, const float* __restrict__ tw,
-    const int32_t* __restrict__ sid, int n) {
+    const int32_t* __restrict__ sid, int n, int nflat) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) sw[i] = tw[sid[i]];
+  if (i < n) {
+    int f = sid[i];
+    sw[i] = (f >= 0 && f < nflat) ? tw[f] : 0.0f;
+  }
 }
 
 // ======================================================================
@@ -308,28 +611,47 @@ void fused_moe_mxfp4(
     int M, int hidden, int ispp, int top_k,
     const int32_t* sorted_ids, const int32_t* expert_ids,
     int EM, float swiglu_limit,
-    const float* b13, const float* b2) {
+    const float* b13, const float* b2, int block_size) {
 
   float* sorted_w = nullptr;
   (void)hipMalloc(&sorted_w, EM * sizeof(float));
   {
     int nb = (EM + 255) / 256;
-    gather_weights_kernel<<<nb, 256>>>(sorted_w, topk_w, sorted_ids, EM);
+    gather_weights_kernel<<<nb, 256>>>(sorted_w, topk_w, sorted_ids, EM, M * top_k);
   }
 
-  {
-    dim3 g(EM / kBM, ispp / kBN);
-    gateup_swiglu_kernel<<<g, kWhreads>>>(
-        A, w13, w13_scale, b13, act_scratch,
-        sorted_ids, expert_ids, hidden, ispp, swiglu_limit,
-        b13 != nullptr);
-  }
-
-  {
-    dim3 g(EM / kBM, hidden / kBN);
-    down_combine_kernel<<<g, kWhreads>>>(
-        act_scratch, w2, w2_scale, b2, out, sorted_w,
-        sorted_ids, expert_ids, ispp, hidden, b2 != nullptr);
+  if (block_size >= kBM_pf) {
+    // Prefill regime: 64x128 tiles, 256 threads.  The caller must have
+    // aligned expert_ids per 64-row block (EM % 64 == 0).
+    {
+      dim3 g(EM / kBM_pf, ispp / kBN_pf);
+      gateup_swiglu_kernel_prefill<<<g, kThreads_pf>>>(
+          A, w13, w13_scale, b13, act_scratch,
+          sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
+          b13 != nullptr);
+    }
+    {
+      dim3 g(EM / kBM_pf, hidden / kBN_pf);
+      down_combine_kernel_prefill<<<g, kThreads_pf>>>(
+          act_scratch, w2, w2_scale, b2, out, sorted_w,
+          sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
+    }
+  } else {
+    // Decode regime: 16x64 tiles, 64 threads (1 wavefront), blockIdx.z
+    // splits the N dimension into 4 warps of 16 columns.
+    {
+      dim3 g(EM / kBM, ispp / kBN, kWarps);
+      gateup_swiglu_kernel<<<g, kWhreads>>>(
+          A, w13, w13_scale, b13, act_scratch,
+          sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
+          b13 != nullptr);
+    }
+    {
+      dim3 g(EM / kBM, hidden / kBN, kWarps);
+      down_combine_kernel<<<g, kWhreads>>>(
+          act_scratch, w2, w2_scale, b2, out, sorted_w,
+          sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
+    }
   }
 
   (void)hipFree(sorted_w);

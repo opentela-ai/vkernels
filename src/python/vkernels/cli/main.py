@@ -70,8 +70,8 @@ def _print_section(title: str, entries: list, extra_label: str | None,
     desc_w = max(len(d) for d in descs)
 
     labels = ["NAME", extra_label if extra_label else None, "CPU", "CUDA",
-              "DESCRIPTION"]
-    widths = [name_w, extra_w if extra_label else 0, 3, 4, desc_w]
+              "HIP", "DESCRIPTION"]
+    widths = [name_w, extra_w if extra_label else 0, 3, 4, 3, desc_w]
     cols = [(lab, w) for lab, w in zip(labels, widths) if lab is not None]
 
     header = "  ".join(f"{lab:<{w}}" for lab, w in cols)
@@ -82,7 +82,8 @@ def _print_section(title: str, entries: list, extra_label: str | None,
         cells = [e.name]
         if extra_label:
             cells.append(extra_getter(e))
-        cells += ["yes" if e.host else "no", "yes" if e.cuda else "no", d]
+        cells += ["yes" if e.host else "no", "yes" if e.cuda else "no",
+                  "yes" if e.hip else "no", d]
         print("  ".join(f"{c:<{w}}" for c, w in zip(cells, [w for _, w in cols])))
 
 
@@ -95,6 +96,7 @@ def _entry_dict(e: discovery.Entry) -> dict:
         "signature": e.signature,
         "host": e.host,
         "cuda": e.cuda,
+        "hip": e.hip,
         "header": e.header,
     }
 
@@ -164,6 +166,7 @@ def _cmd_info(root: Path, name: str) -> int:
     print(f"signature:   {entry.signature}")
     print(f"host:        {'yes' if entry.host else 'no'}")
     print(f"cuda:        {'yes' if entry.cuda else 'no'}")
+    print(f"hip:         {'yes' if entry.hip else 'no'}")
     print(f"header:      {entry.header}")
     return 0
 

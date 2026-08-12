@@ -15,7 +15,9 @@ except ImportError:  # pragma: no cover
     np = None
 
 from vkernels import _backend, kernels
-from vkernels.kernels import add, gemm, max as vk_max, relu, scale, sum as vk_sum
+from vkernels.kernels import (add, fused_moe_mxfp4, gemm, max as vk_max,
+                              moe_align_block_size, relu, scale,
+                              sum as vk_sum)
 
 _F32 = np.dtype(np.float32) if np is not None else None
 
@@ -171,6 +173,249 @@ class GemmTest(unittest.TestCase):
             gemm(np.zeros(4, dtype=_F32), np.zeros((2, 2), dtype=_F32))
 
 
+# --- MoE helpers (mirror tests/kernels/moe/test_moe_fused.cpp) ------------
+
+def _bf2f(v):
+    return float(np.frombuffer((int(v) << 16).to_bytes(4, "little"),
+                               dtype=np.float32)[0])
+
+
+def _f2bf(v):
+    bits = int.from_bytes(np.float32(v).tobytes(), "little")
+    lsb = (bits >> 16) & 1
+    bits = (bits + 0x7FFF + lsb) & 0xFFFFFFFF
+    return np.uint16((bits >> 16) & 0xFFFF)
+
+
+def _e2m1_nibble(f):
+    neg = f < 0
+    af = abs(f)
+    if af == 0.0 or np.isnan(af):
+        return 0x8 if neg else 0x0
+    if np.isinf(af):
+        return 0xE if neg else 0x6
+    vals = [0.25, 1.0, 1.5, 2.0, 3.0]
+    nibs = [1, 2, 3, 4, 5]
+    best_d = abs(af - vals[0])
+    best_n = nibs[0]
+    for v, n in zip(vals[1:], nibs[1:]):
+        d = abs(af - v)
+        if d < best_d:
+            best_d = d
+            best_n = n
+    return (best_n | 0x8) if neg else best_n
+
+
+def _pack_e2m1_pair(v0, v1):
+    return _e2m1_nibble(v0) | (_e2m1_nibble(v1) << 4)
+
+
+def _random_packed(shape, rng):
+    """Random packed E2M1 weight array (each byte = two nearest-nibble fp4)."""
+    n = int(np.prod(shape))
+    vals = rng.uniform(-3.0, 3.0, n * 2)
+    out = np.empty(n, dtype=np.uint8)
+    for i in range(n):
+        out[i] = _pack_e2m1_pair(float(vals[2 * i]), float(vals[2 * i + 1]))
+    return out.reshape(shape)
+
+
+def _ones_weight_bytes(*shape):
+    return np.full(shape, _pack_e2m1_pair(1.0, 1.0), dtype=np.uint8)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class FusedMoeTinySanityTest(unittest.TestCase):
+    def test_tiny_sanity(self):
+        M, hidden, ispp = 16, 128, 64
+        group_size, BLOCK_M = 32, 16
+        EM = M  # top_k=1
+
+        A = np.full((M, hidden), _f2bf(1.0), dtype=np.uint16)
+        w13 = _ones_weight_bytes(1, 2 * ispp, hidden // 2)
+        w13_scale = np.full((1, 2 * ispp, hidden // group_size), 127, dtype=np.uint8)
+        w2 = _ones_weight_bytes(1, hidden, ispp // 2)
+        w2_scale = np.full((1, hidden, ispp // group_size), 127, dtype=np.uint8)
+        sorted_ids = np.arange(EM, dtype=np.int32)
+        topk_w = np.ones(EM, dtype=_F32)
+        expert_ids = np.zeros(EM // BLOCK_M, dtype=np.int32)
+        act = np.empty(EM * ispp, dtype=np.uint16)
+
+        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
+                              sorted_ids, topk_w, expert_ids,
+                              act_scratch=act, out=None, top_k=1,
+                              group_size=group_size)
+
+        silu128 = 128.0 / (1.0 + np.exp(-128.0))
+        expected_act = silu128 * 128.0
+        expected_out = expected_act * ispp
+
+        np.testing.assert_allclose(out, expected_out, rtol=1e-2)
+        np.testing.assert_allclose([_bf2f(v) for v in act], expected_act, atol=0.5)
+
+    def test_returns_2d_and_zeroes_out(self):
+        M, hidden, ispp = 16, 128, 64
+        A = np.full((M, hidden), _f2bf(0.0), dtype=np.uint16)
+        w13 = np.zeros((1, 2 * ispp, hidden // 2), dtype=np.uint8)
+        w13_scale = np.full((1, 2 * ispp, hidden // 32), 127, dtype=np.uint8)
+        w2 = np.zeros((1, hidden, ispp // 2), dtype=np.uint8)
+        w2_scale = np.full((1, hidden, ispp // 32), 127, dtype=np.uint8)
+        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
+                              np.arange(16, dtype=np.int32),
+                              np.ones(16, dtype=_F32),
+                              np.zeros(1, dtype=np.int32), top_k=1)
+        self.assertEqual(out.shape, (M, hidden))
+        self.assertEqual(out.dtype, _F32)
+        np.testing.assert_array_equal(out, np.zeros((M, hidden), dtype=_F32))
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class FusedMoeBiasSanityTest(unittest.TestCase):
+    def test_bias_sanity(self):
+        M, hidden, ispp = 16, 128, 64
+        group_size, BLOCK_M = 32, 16
+        EM = M
+
+        A = np.full((M, hidden), _f2bf(0.0), dtype=np.uint16)
+        w13 = np.zeros((1, 2 * ispp, hidden // 2), dtype=np.uint8)
+        w13_scale = np.full((1, 2 * ispp, hidden // group_size), 127, dtype=np.uint8)
+        w2 = np.zeros((1, hidden, ispp // 2), dtype=np.uint8)
+        w2_scale = np.full((1, hidden, ispp // group_size), 127, dtype=np.uint8)
+        b13 = np.empty(2 * ispp, dtype=_F32)
+        b13[:ispp] = 1.0
+        b13[ispp:] = 2.0
+        b2 = np.ones(hidden, dtype=_F32)
+
+        act = np.empty(EM * ispp, dtype=np.uint16)
+        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
+                              np.arange(EM, dtype=np.int32),
+                              np.ones(EM, dtype=_F32),
+                              np.zeros(EM // BLOCK_M, dtype=np.int32),
+                              act_scratch=act, top_k=1,
+                              group_size=group_size, b13=b13, b2=b2)
+
+        silu1 = 1.0 / (1.0 + np.exp(-1.0))
+        expected_act = silu1 * 2.0
+        np.testing.assert_allclose([_bf2f(v) for v in act], expected_act, rtol=1e-2)
+        np.testing.assert_allclose(out, 1.0, rtol=1e-4)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class FusedMoeSwiGLUClampTest(unittest.TestCase):
+    def test_swiglu_clamp(self):
+        M, hidden, ispp = 16, 128, 64
+        group_size, BLOCK_M = 32, 16
+        EM = M
+
+        A = np.full((M, hidden), _f2bf(1.0), dtype=np.uint16)
+        w13 = _ones_weight_bytes(1, 2 * ispp, hidden // 2)
+        w13_scale = np.full((1, 2 * ispp, hidden // group_size), 127, dtype=np.uint8)
+        w2 = _ones_weight_bytes(1, hidden, ispp // 2)
+        w2_scale = np.full((1, hidden, ispp // group_size), 127, dtype=np.uint8)
+
+        act = np.empty(EM * ispp, dtype=np.uint16)
+        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
+                              np.arange(EM, dtype=np.int32),
+                              np.ones(EM, dtype=_F32),
+                              np.zeros(EM // BLOCK_M, dtype=np.int32),
+                              act_scratch=act, top_k=1,
+                              group_size=group_size, swiglu_limit=10.0)
+
+        silu10 = 10.0 / (1.0 + np.exp(-10.0))
+        expected_act = silu10 * 10.0
+        expected_out = expected_act * ispp
+        np.testing.assert_allclose([_bf2f(v) for v in act], expected_act, atol=0.2)
+        np.testing.assert_allclose(out, expected_out, rtol=1e-2)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class FusedMoeMultiExpertTest(unittest.TestCase):
+    def test_multi_expert(self):
+        M, hidden, ispp, E = 8, 128, 64, 4
+        group_size, BLOCK_M = 32, 16
+        EM = 16  # padded
+
+        A = np.full((M, hidden), _f2bf(1.0), dtype=np.uint16)
+        w13 = np.empty((E, 2 * ispp, hidden // 2), dtype=np.uint8)
+        w13_scale = np.full((E, 2 * ispp, hidden // group_size), 127, dtype=np.uint8)
+        w2 = np.empty((E, hidden, ispp // 2), dtype=np.uint8)
+        w2_scale = np.full((E, hidden, ispp // group_size), 127, dtype=np.uint8)
+        for e in range(E):
+            wv = 1.0 + e  # 1, 2, 3, 4
+            w13[e] = _pack_e2m1_pair(wv, wv)
+            w2[e] = _pack_e2m1_pair(wv, wv)
+
+        sorted_ids = np.array([i % M for i in range(EM)], dtype=np.int32)
+        expert_ids = np.array([i % E for i in range(EM // BLOCK_M)], dtype=np.int32)
+
+        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
+                              sorted_ids, np.ones(EM, dtype=_F32),
+                              expert_ids, top_k=1, group_size=group_size)
+        self.assertTrue(np.all(np.isfinite(out)))
+        self.assertTrue(np.all(out > 0.0))
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class FusedMoeExpertFilterTest(unittest.TestCase):
+    def test_expert_filter(self):
+        M, hidden, ispp = 16, 128, 64
+        group_size, BLOCK_M = 32, 16
+        EM = M
+
+        A = np.full((M, hidden), _f2bf(1.0), dtype=np.uint16)
+        w13 = _ones_weight_bytes(1, 2 * ispp, hidden // 2)
+        w13_scale = np.full((1, 2 * ispp, hidden // group_size), 127, dtype=np.uint8)
+        w2 = _ones_weight_bytes(1, hidden, ispp // 2)
+        w2_scale = np.full((1, hidden, ispp // group_size), 127, dtype=np.uint8)
+        expert_ids = np.full(EM // BLOCK_M, -1, dtype=np.int32)  # all filtered
+
+        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
+                              np.arange(EM, dtype=np.int32),
+                              np.ones(EM, dtype=_F32), expert_ids,
+                              out=np.full(M * hidden, 99.0, dtype=_F32),
+                              top_k=1, group_size=group_size)
+        np.testing.assert_allclose(out, 99.0, rtol=0.01)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class MoeAlignTest(unittest.TestCase):
+    def test_basic_8x4(self):
+        M, top_k, E, BS = 8, 4, 4, 16
+        N = M * top_k  # 32
+
+        # Expert 0: 5 (token0 ×4, token1 sel0); expert 1: 11; expert 2: 16
+        topk_ids = np.zeros((M, top_k), dtype=np.int32)
+        topk_ids[0] = 0
+        topk_ids[1] = [0, 1, 1, 1]
+        topk_ids[2] = 1
+        topk_ids[3] = 1
+        topk_ids[4] = 2
+        topk_ids[5] = 2
+        topk_ids[6] = 2
+        topk_ids[7] = 2
+
+        sorted_ids, expert_ids, EM = moe_align_block_size(topk_ids, E, BS)
+
+        self.assertEqual(EM, 48)
+        self.assertEqual(expert_ids[0], 0)
+        self.assertEqual(expert_ids[1], 1)
+        self.assertEqual(expert_ids[2], 2)
+
+        # Expert 0 block: 5 real flat indices [0,1,2,3,4], padded with 32
+        self.assertEqual(np.count_nonzero(sorted_ids[:BS] == 0), 1)
+        self.assertEqual(sorted_ids[4], 4)  # flat 4 = token 1 sel 0
+
+        # Expert 2 block: flat indices 16..31 (tokens 4,5,6,7)
+        cnt16 = np.count_nonzero(sorted_ids[32:48] == 16)
+        cnt31 = np.count_nonzero(sorted_ids[32:48] == 31)
+        self.assertEqual(cnt16, 1)
+        self.assertEqual(cnt31, 1)
+
+    def test_rejects_non_2d(self):
+        with self.assertRaises(ValueError):
+            moe_align_block_size(np.zeros(8, dtype=np.int32), 4)
+
+
 @unittest.skipIf(np is None, "numpy is required for these tests")
 class BackendConsistencyTest(unittest.TestCase):
     """Bit-for-bit agreement between compiled and fallback backends."""
@@ -211,6 +456,42 @@ class BackendConsistencyTest(unittest.TestCase):
         _backend.load_extension().kernels.gemm(7, 6, 8, 1.0, A, B, 0.5, Cc)
         _fallback_impl().gemm(7, 6, 8, 1.0, A, B, 0.5, Cf)
         np.testing.assert_array_equal(Cc, Cf)
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_fused_moe_consistent(self):
+        rng = np.random.default_rng(24)
+        M, hidden, ispp, E = 32, 128, 64, 2
+        group_size, BLOCK_M = 32, 16
+        EM = 2 * BLOCK_M  # one 16-row block per expert; all 32 rows real
+
+        A = np.array([_f2bf(float(v))
+                      for v in rng.uniform(-1.0, 1.0, M * hidden)]).reshape(
+            M, hidden).astype(np.uint16)
+        w13 = _random_packed((E, 2 * ispp, hidden // 2), rng)
+        w13_scale = np.full((E, 2 * ispp, hidden // group_size), 127,
+                            dtype=np.uint8)
+        w2 = _random_packed((E, hidden, ispp // 2), rng)
+        w2_scale = np.full((E, hidden, ispp // group_size), 127, dtype=np.uint8)
+        sorted_ids = np.arange(EM, dtype=np.int32)  # flat, token = i (top_k=1)
+        topk_w = rng.uniform(0.5, 1.5, EM).astype(_F32)
+        expert_ids = np.array([0, 1], dtype=np.int32)
+
+        fb = _fallback_impl()
+        act_c = np.empty(EM * ispp, dtype=np.uint16)
+        act_f = np.empty(EM * ispp, dtype=np.uint16)
+        out_c = np.zeros(M * hidden, dtype=_F32)
+        out_f = np.zeros(M * hidden, dtype=_F32)
+        common = (A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
+                  expert_ids)
+        _backend.load_extension().kernels.fused_moe_mxfp4(
+            *common, act_c, out_c, M, hidden, ispp, 1, EM, group_size, 0.0,
+            None, None)
+        fb.fused_moe_mxfp4(*common, act_f, out_f, M, hidden, ispp, 1, EM,
+                           group_size, 0.0, None, None)
+
+        np.testing.assert_allclose(out_c, out_f, rtol=1e-3, atol=1e-2)
+        np.testing.assert_allclose([_bf2f(int(v)) for v in act_c],
+                                   [_bf2f(int(v)) for v in act_f], atol=0.5)
 
 
 if __name__ == "__main__":

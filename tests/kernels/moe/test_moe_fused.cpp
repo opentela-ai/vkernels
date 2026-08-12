@@ -97,7 +97,7 @@ TEST(FusedMoe, TinySanity) {
       w2.data(), w2_scale.data(),
       sorted_ids.data(), topk_ws.data(), expert_ids.data(),
       act_h.data(), out_h.data(),
-      M, hidden, ispp, EM, group_size,
+      M, hidden, ispp, 1, EM, group_size,
       0.0f, nullptr, nullptr);
 
   float silu128 = 128.0f / (1.0f + std::exp(-128.0f));
@@ -149,7 +149,7 @@ TEST(FusedMoe, BiasSanity) {
       w2.data(), w2_scale.data(),
       sorted_ids.data(), topk_ws.data(), expert_ids.data(),
       act_h.data(), out_h.data(),
-      M, hidden, ispp, EM, group_size,
+      M, hidden, ispp, 1, EM, group_size,
       0.0f, b13.data(), b2.data());
 
   float silu1 = 1.0f / (1.0f + std::exp(-1.0f));
@@ -192,7 +192,7 @@ TEST(FusedMoe, SwiGLUClamp) {
       w2.data(), w2_scale.data(),
       sorted_ids.data(), topk_ws.data(), expert_ids.data(),
       act_h.data(), out_h.data(),
-      M, hidden, ispp, EM, group_size,
+      M, hidden, ispp, 1, EM, group_size,
       10.0f, nullptr, nullptr);
 
   float silu10 = 10.0f / (1.0f + std::exp(-10.0f));
@@ -249,7 +249,7 @@ TEST(FusedMoe, MultiExpert) {
       w2.data(), w2_scale.data(),
       sorted_ids.data(), topk_ws.data(), expert_ids.data(),
       act_h.data(), out_h.data(),
-      M, hidden, ispp, EM, group_size, 0.0f,
+      M, hidden, ispp, 1, EM, group_size, 0.0f,
       nullptr, nullptr);
 
   // Just verify finite and positive
@@ -287,7 +287,7 @@ TEST(FusedMoe, ExpertFilter) {
       w2.data(), w2_scale.data(),
       sorted_ids.data(), topk_ws.data(), expert_ids.data(),
       act_h.data(), out_h.data(),
-      M, hidden, ispp, EM, group_size, 0.0f,
+      M, hidden, ispp, 1, EM, group_size, 0.0f,
       nullptr, nullptr);
 
   // Output unchanged
@@ -328,18 +328,18 @@ TEST(MoeAlign, Basic8x4) {
   EXPECT_EQ(expert_ids[1], 1);
   EXPECT_EQ(expert_ids[2], 2);
 
-  // Expert 0 block: 5 real tokens (0×4 + 1×1), padded
+  // Expert 0 block: 5 real flat indices [0,1,2,3,4], padded with N=32
   int cnt0 = 0;
   for (int i = 0; i < BS; ++i) if (sorted_ids[i] == 0) ++cnt0;
-  EXPECT_EQ(cnt0, 4);
-  EXPECT_EQ(sorted_ids[4], 1);
+  EXPECT_EQ(cnt0, 1);         // flat 0 (token 0 sel 0) appears once
+  EXPECT_EQ(sorted_ids[4], 4);  // flat 4 = token 1 sel 0
 
-  // Expert 2 block: all 16 from tokens 4,5,6,7
-  int cnt4 = 0, cnt7 = 0;
+  // Expert 2 block: flat indices 16..31 (tokens 4,5,6,7)
+  int cnt16 = 0, cnt31 = 0;
   for (int i = 32; i < 48; ++i) {
-    if (sorted_ids[i] == 4) ++cnt4;
-    if (sorted_ids[i] == 7) ++cnt7;
+    if (sorted_ids[i] == 16) ++cnt16;  // token 4 sel 0
+    if (sorted_ids[i] == 31) ++cnt31;  // token 7 sel 3
   }
-  EXPECT_EQ(cnt4, 4);
-  EXPECT_EQ(cnt7, 4);
+  EXPECT_EQ(cnt16, 1);
+  EXPECT_EQ(cnt31, 1);
 }

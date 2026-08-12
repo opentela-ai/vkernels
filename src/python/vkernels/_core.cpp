@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,7 @@
 #include "vkernels/kernels/elementwise.hpp"
 #include "vkernels/kernels/gemm.hpp"
 #include "vkernels/kernels/moe.hpp"
+#include "vkernels/kernels/moe_fused.hpp"
 #include "vkernels/kernels/reduce.hpp"
 #include "vkernels/util/config.hpp"
 #include "vkernels/util/version.hpp"
@@ -60,6 +62,10 @@ using FloatArray = py::array_t<float, py::array::c_style | py::array::forcecast>
 
 // A numpy byte buffer (uint8). Used for p2p gather destinations and sources.
 using ByteArray = py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast>;
+
+// bf16 (uint16) and int32 buffers used by the MoE kernels.
+using U16Array = py::array_t<std::uint16_t, py::array::c_style | py::array::forcecast>;
+using I32Array = py::array_t<std::int32_t, py::array::c_style | py::array::forcecast>;
 
 // `out`/`dst` arrays must be writable: writing into a copied or read-only
 // buffer would silently discard the result.
@@ -257,6 +263,58 @@ PYBIND11_MODULE(_core, m) {
       "K16 bf16 MFMA: C[0..3] += A[0..1] × B[0..1] (16×16×16 bf16, acc "
       "fp32). `c` is 4 floats updated in-place; `a` and `b` are 2 packed "
       "bf16 uint32_t each.");
+
+  // --- moe fused (grouped GEMM + expert alignment) -------------------------
+  kernels.def(
+      "moe_align_block_size",
+      [](I32Array topk_ids, int M, int top_k, int block_size,
+         int num_experts) {
+        int N = M * top_k;
+        int max_EM =
+            ((N + block_size - 1) / block_size + num_experts) * block_size;
+        auto sorted = py::array_t<std::int32_t>(max_EM);
+        auto experts = py::array_t<std::int32_t>(max_EM / block_size);
+        int EM = kernels::moe_align_block_size(
+            topk_ids.data(), M, top_k, block_size, num_experts,
+            sorted.mutable_data(), experts.mutable_data());
+        sorted.resize({static_cast<py::ssize_t>(EM)});
+        experts.resize({static_cast<py::ssize_t>(EM / block_size)});
+        return py::make_tuple(sorted, experts, EM);
+      },
+      py::arg("topk_ids"), py::arg("M"), py::arg("top_k"),
+      py::arg("block_size"), py::arg("num_experts"),
+      "Map the [M, top_k] token→expert routing table to the block-aligned "
+      "sorted layout. Returns (sorted_ids [EM], expert_ids [EM/block], "
+      "EM). sorted_ids holds flat topk indices (token*top_k + sel), padded "
+      "per expert with M*top_k; expert_ids[i] is -1 for pure-padding blocks.");
+
+  kernels.def(
+      "fused_moe_mxfp4",
+      [](U16Array A, ByteArray w13, ByteArray w13_scale, ByteArray w2,
+         ByteArray w2_scale, I32Array sorted_ids, FloatArray topk_w,
+         I32Array expert_ids, U16Array act_scratch, FloatArray out, int M,
+         int hidden, int ispp, int top_k, int EM, int group_size,
+         float swiglu_limit, std::optional<FloatArray> b13,
+         std::optional<FloatArray> b2) {
+        require_writeable(act_scratch);
+        require_writeable(out);
+        kernels::fused_moe_mxfp4_cpu(
+            A.data(), w13.data(), w13_scale.data(), w2.data(),
+            w2_scale.data(), sorted_ids.data(), topk_w.data(),
+            expert_ids.data(), act_scratch.mutable_data(),
+            out.mutable_data(), M, hidden, ispp, top_k, EM, group_size,
+            swiglu_limit, b13 ? b13->data() : nullptr,
+            b2 ? b2->data() : nullptr);
+      },
+      py::arg("A"), py::arg("w13"), py::arg("w13_scale"), py::arg("w2"),
+      py::arg("w2_scale"), py::arg("sorted_ids"), py::arg("topk_w"),
+      py::arg("expert_ids"), py::arg("act_scratch"), py::arg("out"),
+      py::arg("M"), py::arg("hidden"), py::arg("ispp"), py::arg("top_k"),
+      py::arg("EM"), py::arg("group_size"), py::arg("swiglu_limit"),
+      py::arg("b13") = py::none(), py::arg("b2") = py::none(),
+      "Fused MXFP4 MoE grouped GEMM (CPU reference): gate_up + SwiGLU into "
+      "act_scratch [EM, ispp] bf16, then down + routed combine accumulated "
+      "into out [M, hidden] fp32 (caller must zero-init out).");
 
   // -------------------------------------------------------------------------
   // vkernels._core.comm — collectives, topology, overlap, p2p gather

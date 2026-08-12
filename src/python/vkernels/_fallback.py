@@ -304,6 +304,252 @@ def mfma_f32_16x16x16bf16(c: list[float], a: list[int], b: list[int],
         c[i] = float(np.float32(c[i]) + np.float32(a_f32[i] * b_f32[i]))
 
 
+# --- moe fused: expert alignment + grouped GEMM ---------------------------------
+
+
+def _ue8m0_to_float(s: int) -> np.float32:
+    """Decode a ue8m0 scale byte to float32 (0xFF → 0.0, else 2^(s-127))."""
+    if s == 0xFF:
+        return np.float32(0.0)
+    unbiased = s - 127
+    if unbiased >= -126:
+        bits = s << 23
+        return np.frombuffer(bits.to_bytes(4, "little"), dtype=np.float32)[0]
+    shift = -(unbiased + 126)
+    if shift < 32:
+        mant = 0x00800000 >> shift
+        return np.frombuffer(mant.to_bytes(4, "little"), dtype=np.float32)[0]
+    return np.float32(0.0)
+
+
+def _bf16_to_float(bits: int) -> np.float32:
+    """Reinterpret a bf16 uint16 bit pattern as float32."""
+    return np.frombuffer((bits << 16).to_bytes(4, "little"),
+                         dtype=np.float32)[0]
+
+
+def _dequant_weight_tile(packed, scale, p_base, s_base,
+                         N, K, group_size, stride_packed, stride_scale_n):
+    """Dequant a [N, K] packed fp4 + ue8m0 tile into out[K, N] bf16.
+
+    Mirrors ``dequant_weight_tile`` in moe_fused.cpp: the result is rounded
+    to bf16 (RNE) exactly once, indexed transposed (out[k][n]).
+    """
+    out = np.empty((K, N), dtype=np.uint16)
+    for n in range(N):
+        for kp in range(K // 2):
+            pb = int(packed[p_base + n * stride_packed + kp])
+            gi = (kp * 2) // group_size
+            sc = int(scale[s_base + n * stride_scale_n + gi])
+            s = _ue8m0_to_float(sc)
+            lo = np.float32(_FP4_NIBBLE_VALUES[pb & 0x0F]) * s
+            hi = np.float32(_FP4_NIBBLE_VALUES[(pb >> 4) & 0x0F]) * s
+            out[kp * 2, n] = _float_to_bf16_bits(float(lo))
+            out[kp * 2 + 1, n] = _float_to_bf16_bits(float(hi))
+    return out
+
+
+def moe_align_block_size(topk_ids, M, top_k, block_size, num_experts):
+    """Map the flat [M*top_k] token→expert routing to block-aligned
+    ``sorted_ids`` / ``expert_ids``. Returns (sorted_ids, expert_ids, EM)."""
+    ids = np.asarray(topk_ids, dtype=np.int32).ravel()
+    if ids.size != M * top_k:
+        raise ValueError("topk_ids must have M*top_k elements")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+
+    N = M * top_k
+    per_expert = [[] for _ in range(num_experts)]
+    for i in range(N):
+        e = int(ids[i])
+        if 0 <= e < num_experts:
+            per_expert[e].append(i)  # flat index
+
+    EM = 0
+    for v in per_expert:
+        EM += ((len(v) + block_size - 1) // block_size) * block_size
+    sorted_ids = np.empty(EM, dtype=np.int32)
+    idx = 0
+    for e in range(num_experts):
+        tokens = per_expert[e]
+        nt = len(tokens)
+        for t in tokens:
+            sorted_ids[idx] = t
+            idx += 1
+        padded = ((nt + block_size - 1) // block_size) * block_size
+        for _ in range(nt, padded):
+            sorted_ids[idx] = N  # padding sentinel
+            idx += 1
+
+    num_blocks = EM // block_size
+    expert_ids = np.full(num_blocks, -1, dtype=np.int32)
+    idx = 0
+    for e in range(num_experts):
+        nt = len(per_expert[e])
+        padded_blocks = (nt + block_size - 1) // block_size
+        for b in range(padded_blocks):
+            expert_ids[idx] = e if b * block_size < nt else -1
+            idx += 1
+    return sorted_ids, expert_ids, EM
+
+
+def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
+                    expert_ids, act_scratch, out,
+                    M, hidden, ispp, top_k, EM, group_size,
+                    swiglu_limit, b13=None, b2=None):
+    """Fused MXFP4 MoE grouped GEMM (CPU-reference oracle, in place).
+
+    Writes the SwiGLU intermediate into ``act_scratch`` [EM*ispp] bf16 and
+    accumulates into ``out`` [M*hidden] fp32 (which the caller must
+    zero-initialise). Mirrors ``fused_moe_mxfp4_cpu`` block for block.
+    """
+    BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 64
+    N = M * top_k
+
+    A = np.asarray(A, dtype=np.uint16).ravel()
+    w13 = np.asarray(w13, dtype=np.uint8).ravel()
+    w13_scale = np.asarray(w13_scale, dtype=np.uint8).ravel()
+    w2 = np.asarray(w2, dtype=np.uint8).ravel()
+    w2_scale = np.asarray(w2_scale, dtype=np.uint8).ravel()
+    sorted_ids = np.asarray(sorted_ids, dtype=np.int32).ravel()
+    topk_w = np.asarray(topk_w, dtype=np.float32).ravel()
+    expert_ids = np.asarray(expert_ids, dtype=np.int32).ravel()
+    act = np.asarray(act_scratch, dtype=np.uint16).ravel()
+    out_arr = np.asarray(out, dtype=np.float32).ravel()
+    b13 = np.asarray(b13, dtype=np.float32).ravel() if b13 is not None else None
+    b2 = np.asarray(b2, dtype=np.float32).ravel() if b2 is not None else None
+
+    def _f2bf(v: float) -> np.uint16:
+        return np.uint16(_float_to_bf16_bits(v))
+
+    # ===== Stage 0: gate_up + SwiGLU → act [EM, ispp] =====
+    w13_expert_bytes = 2 * ispp * (hidden // 2)
+    w13s_expert_bytes = 2 * ispp * (hidden // group_size)
+    num_m_blocks = EM // BLOCK_M
+    num_n_blocks = ispp // BLOCK_N
+    num_k_blocks = hidden // BLOCK_K
+
+    for mb in range(num_m_blocks):
+        expert = int(expert_ids[mb])
+        if expert < 0:
+            continue
+        token_base = mb * BLOCK_M
+        for nb in range(num_n_blocks):
+            acc_gate = np.zeros((BLOCK_M, BLOCK_N), dtype=np.float32)
+            acc_up = np.zeros((BLOCK_M, BLOCK_N), dtype=np.float32)
+            for kb in range(num_k_blocks):
+                k_start = kb * BLOCK_K
+                tile_A = np.zeros((BLOCK_M, BLOCK_K), dtype=np.uint16)
+                for m in range(BLOCK_M):
+                    flat = int(sorted_ids[token_base + m])
+                    if flat < N:
+                        token = flat // top_k
+                        tile_A[m] = A[token * hidden + k_start:
+                                      token * hidden + k_start + BLOCK_K]
+
+                # gate half
+                p_gate = expert * w13_expert_bytes + nb * BLOCK_N * (hidden // 2)
+                s_gate = expert * w13s_expert_bytes + nb * BLOCK_N * (hidden // group_size)
+                tile_gate = _dequant_weight_tile(
+                    w13, w13_scale, p_gate + k_start // 2,
+                    s_gate + k_start // group_size,
+                    BLOCK_N, BLOCK_K, group_size, hidden // 2,
+                    hidden // group_size)
+                # up half (offset by ispp rows in w13)
+                p_up = expert * w13_expert_bytes + (nb * BLOCK_N + ispp) * (hidden // 2)
+                s_up = expert * w13s_expert_bytes + (nb * BLOCK_N + ispp) * (hidden // group_size)
+                tile_up = _dequant_weight_tile(
+                    w13, w13_scale, p_up + k_start // 2,
+                    s_up + k_start // group_size,
+                    BLOCK_N, BLOCK_K, group_size, hidden // 2,
+                    hidden // group_size)
+
+                for m in range(BLOCK_M):
+                    for n in range(BLOCK_N):
+                        dg = np.float32(0.0)
+                        du = np.float32(0.0)
+                        for k in range(BLOCK_K):
+                            a = _bf16_to_float(int(tile_A[m, k]))
+                            dg = np.float32(
+                                dg + np.float32(a * _bf16_to_float(int(tile_gate[k, n]))))
+                            du = np.float32(
+                                du + np.float32(a * _bf16_to_float(int(tile_up[k, n]))))
+                        acc_gate[m, n] = np.float32(acc_gate[m, n] + dg)
+                        acc_up[m, n] = np.float32(acc_up[m, n] + du)
+
+            # SwiGLU epilogue (skip padding rows)
+            for m in range(BLOCK_M):
+                flat = int(sorted_ids[token_base + m])
+                if flat >= N:
+                    continue
+                for n in range(BLOCK_N):
+                    g = float(acc_gate[m, n])
+                    u = float(acc_up[m, n])
+                    if b13 is not None:
+                        g += float(b13[expert * 2 * ispp + nb * BLOCK_N + n])
+                        u += float(b13[expert * 2 * ispp + nb * BLOCK_N + n + ispp])
+                    if swiglu_limit > 0.0:
+                        g = min(g, swiglu_limit)
+                        u = min(u, swiglu_limit)
+                        u = max(u, -swiglu_limit)
+                    silu_g = g / (1.0 + np.exp(-g))
+                    act[(token_base + m) * ispp + nb * BLOCK_N + n] = \
+                        _f2bf(silu_g * u)
+
+    # ===== Stage 1: down + combine → out [M, hidden] =====
+    w2_expert_bytes = hidden * (ispp // 2)
+    w2s_expert_bytes = hidden * (ispp // group_size)
+    num_down_n_blocks = hidden // BLOCK_N
+    num_down_k_blocks = ispp // BLOCK_K
+
+    for mb in range(num_m_blocks):
+        expert = int(expert_ids[mb])
+        if expert < 0:
+            continue
+        token_base = mb * BLOCK_M
+        for nb in range(num_down_n_blocks):
+            acc_down = np.zeros((BLOCK_M, BLOCK_N), dtype=np.float32)
+            for kb in range(num_down_k_blocks):
+                k_start = kb * BLOCK_K
+                tile_A = np.zeros((BLOCK_M, BLOCK_K), dtype=np.uint16)
+                for m in range(BLOCK_M):
+                    flat = int(sorted_ids[token_base + m])
+                    if flat < N:
+                        tile_A[m] = act[(token_base + m) * ispp + k_start:
+                                        (token_base + m) * ispp + k_start + BLOCK_K]
+
+                p_down = expert * w2_expert_bytes + nb * BLOCK_N * (ispp // 2)
+                s_down = expert * w2s_expert_bytes + nb * BLOCK_N * (ispp // group_size)
+                tile_down = _dequant_weight_tile(
+                    w2, w2_scale, p_down + k_start // 2,
+                    s_down + k_start // group_size,
+                    BLOCK_N, BLOCK_K, group_size, ispp // 2,
+                    ispp // group_size)
+
+                for m in range(BLOCK_M):
+                    for n in range(BLOCK_N):
+                        dot = np.float32(0.0)
+                        for k in range(BLOCK_K):
+                            a = _bf16_to_float(int(tile_A[m, k]))
+                            dot = np.float32(
+                                dot + np.float32(a * _bf16_to_float(int(tile_down[k, n]))))
+                        acc_down[m, n] = np.float32(acc_down[m, n] + dot)
+
+            # Combine: bias + weight + scatter-add
+            for m in range(BLOCK_M):
+                flat = int(sorted_ids[token_base + m])
+                if flat >= N:
+                    continue
+                token = flat // top_k
+                weight = float(topk_w[token_base + m])
+                for n in range(BLOCK_N):
+                    val = float(acc_down[m, n])
+                    if b2 is not None:
+                        val += float(b2[expert * hidden + nb * BLOCK_N + n])
+                    val *= weight
+                    out_arr[token * hidden + nb * BLOCK_N + n] += np.float32(val)
+
+
 # ---------------------------------------------------------------------------
 # comm: topology, channels, ring all-reduce
 # ---------------------------------------------------------------------------

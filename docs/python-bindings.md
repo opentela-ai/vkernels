@@ -131,10 +131,37 @@ into a caller-provided `out` or a freshly allocated array.
 | `sum(x) -> float` | float32-accumulated sum | raises on empty input |
 | `max(x) -> float` | maximum | raises on empty input |
 | `gemm(A, B, alpha=1.0, beta=0.0, out=None)` | `C = alpha*A@B + beta*C` | shapes `(M,K)`, `(K,N)`, `(M,N)` |
+| `fp4_to_bf16_dequant(packed, scale=1.0)` | fp4 (E2M1) → bf16 | returns `uint16[2·len]` |
+| `mfma_f32_16x16x16bf16(c, a, b, cbsz=0, abid=0, blgp=0)` | K16 bf16 MFMA: `c[0..3] += a[0..1]·b[0..1]` | `c` 4 floats in-place; `a`,`b` 2 packed uint32 |
+| `direct_lds_fill_bf16(lds_dst, global_src, elements)` | global → LDS bf16 copy | raw byte addresses |
+| `use_async_copy_default() -> bool` | async-copy gate (host: always `True`) | `K3_NO_ASYNC` overrides |
+| `moe_align_block_size(topk_ids, num_experts, block_size=16)` | `[M, top_k]` routing → block-aligned layout | returns `(sorted_ids, expert_ids, EM)` |
+| `fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w, expert_ids, *, top_k=1, group_size=32, swiglu_limit=0.0, b13=None, b2=None, act_scratch=None, out=None)` | fused MXFP4 MoE grouped GEMM (gate_up + SwiGLU, then down + combine) | CPU-reference oracle; returns `out` `(M, hidden)` |
 
 Contract violations raise `ValueError`; a badly-typed `out` raises
 `TypeError`. `out` must be writable, C-contiguous `float32` and exactly the
 right length — never passed by value expecting a silent copy.
+
+#### MoE fused usage
+
+The fused MoE kernel consumes the *sorted* layout produced by
+`moe_align_block_size` (flat topk indices, per-expert padded). The routing
+weights must be gathered into the same order before the call:
+
+```python
+sorted_ids, expert_ids, EM = kernels.moe_align_block_size(topk_ids, E)
+# topk_w is [M, top_k]; gather into sorted order, zeroing padding entries.
+N = M * top_k
+tw = np.where(sorted_ids < N, topk_w.ravel()[np.clip(sorted_ids, 0, N - 1)], 0.0)
+out = kernels.fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
+                              sorted_ids, tw, expert_ids, top_k=top_k)
+```
+
+`A` is bf16 (`uint16`) `[M, hidden]`; `w13`/`w2` are packed E2M1 `uint8`;
+`w13_scale`/`w2_scale` are ue8m0 `uint8`. These bindings call the CPU
+reference (`fused_moe_mxfp4_cpu`), matching the C++ oracle bit-for-bit up to
+float32 operation order; the HIP GPU path is invoked from the C++ API
+(`vkernels::kernels::hip::fused_moe_mxfp4`).
 
 ### `vkernels.comm`
 

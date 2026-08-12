@@ -57,10 +57,16 @@ def _as_out(n: int, out, name: str = "out") -> np.ndarray:
     """
     if out is None:
         return np.empty(n, dtype=_F32)
+    return _as_out_typed(out, _F32, n, name)
+
+
+def _as_out_typed(out, dtype, n: int, name: str = "out") -> np.ndarray:
+    """Validate a caller-provided output buffer (writable, C-contiguous,
+    exact dtype and length). Used for non-float32 outputs (bf16, uint8…)."""
     if not isinstance(out, np.ndarray):
         raise TypeError(f"{name} must be a numpy array (or None)")
-    if out.dtype != _F32:
-        raise TypeError(f"{name} must have dtype float32, got {out.dtype}")
+    if out.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {out.dtype}")
     if not out.flags.c_contiguous:
         raise ValueError(f"{name} must be C-contiguous")
     if not out.flags.writeable:
@@ -330,3 +336,185 @@ def mfma_f32_16x16x16bf16(c: list[float], a: list[int], b: list[int],
     )
     for i in range(4):
         c[i] = c_copy[i]
+
+
+# ---------------------------------------------------------------------------
+# MoE fused — expert alignment + fused MXFP4 grouped GEMM
+# ---------------------------------------------------------------------------
+
+_BLOCK_M = 16
+
+
+def moe_align_block_size(topk_ids, num_experts: int,
+                         block_size: int = _BLOCK_M):
+    """Map the ``[M, top_k]`` token→expert routing table to the block-aligned
+    sorted layout consumed by :func:`fused_moe_mxfp4`.
+
+    Args:
+        topk_ids: int32 array of shape ``(M, top_k)`` (or a flat ``(M*top_k,)``
+            view) — which expert each ``(token, selection)`` maps to.
+        num_experts: total number of experts (``E``).
+        block_size: block alignment (``BLOCK_M``, default 16).
+
+    Returns:
+        ``(sorted_ids, expert_ids, EM)`` where
+
+        * ``sorted_ids`` — ``[EM]`` int32 flat topk indices
+          (``token*top_k + sel``), grouped by expert and padded per expert
+          with ``M*top_k``;
+        * ``expert_ids`` — ``[EM // block_size]`` int32, the expert per block
+          (``-1`` for pure-padding blocks);
+        * ``EM`` — the padded row count (a multiple of ``block_size``).
+
+    Raises:
+        ValueError: if ``topk_ids`` is not 2-D, or ``block_size`` is not
+            positive.
+
+    Example:
+        >>> ids = np.array([[0, 1], [1, 1]], dtype=np.int32)  # M=2, top_k=2
+        >>> sorted_ids, expert_ids, EM = moe_align_block_size(ids, 2, 16)
+        >>> EM
+        32
+    """
+    ids = np.ascontiguousarray(topk_ids, dtype=np.int32)
+    if ids.ndim != 2:
+        raise ValueError("topk_ids must be 2-D [M, top_k]")
+    if int(block_size) <= 0:
+        raise ValueError("block_size must be positive")
+    M, top_k = ids.shape
+    sorted_ids, expert_ids, EM = _impl.moe_align_block_size(
+        ids, int(M), int(top_k), int(block_size), int(num_experts))
+    return sorted_ids, expert_ids, int(EM)
+
+
+def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
+                    sorted_ids, topk_w, expert_ids,
+                    act_scratch=None, out=None, *,
+                    top_k: int = 1, group_size: int = 32,
+                    swiglu_limit: float = 0.0,
+                    b13=None, b2=None) -> np.ndarray:
+    """Fused MXFP4 MoE grouped GEMM (CPU reference oracle).
+
+    Stage 0 — gate_up + SwiGLU::
+
+        act[EM, ispp] = silu(clamp(A_sorted @ w13_gate + b13_gate, L))
+                      · clamp(A_sorted @ w13_up   + b13_up,   L)
+
+    Stage 1 — down + routed combine::
+
+        out[M, hidden] += act @ w2^T · topk_w_sorted + b2
+
+    Args:
+        A: uint16 bf16 activations of shape ``(M, hidden)``.
+        w13: uint8 packed E2M1 weights ``(E, 2*ispp, hidden//2)``
+            (gate rows then up rows).
+        w13_scale: uint8 ue8m0 scales ``(E, 2*ispp, hidden//group_size)``.
+        w2: uint8 packed E2M1 weights ``(E, hidden, ispp//2)``.
+        w2_scale: uint8 ue8m0 scales ``(E, hidden, ispp//group_size)``.
+        sorted_ids: int32 ``[EM]`` flat topk indices (token*top_k + sel) —
+            from :func:`moe_align_block_size`.
+        topk_w: float32 ``[EM]`` routing weights, sorted to match
+            ``sorted_ids``.
+        expert_ids: int32 ``[EM // 16]`` expert per block (``-1`` = padding).
+        act_scratch: optional writable uint16 ``[EM * ispp]`` buffer for the
+            SwiGLU intermediate; allocated when omitted.
+        out: optional writable float32 ``[M * hidden]`` buffer; the caller
+            must zero-initialise it (stage 1 accumulates). A zeroed
+            ``(M, hidden)`` array is allocated when omitted.
+        top_k: number of experts selected per token (required to decode the
+            flat index: ``token = flat / top_k``).
+        group_size: ue8m0 scale group size (typically 32).
+        swiglu_limit: clamp limit ``L`` (``<= 0`` disables clamping).
+        b13: optional float32 ``[E * 2 * ispp]`` gate/up bias.
+        b2: optional float32 ``[E * hidden]`` down bias.
+
+    Returns:
+        The ``out`` array (``(M, hidden)`` float32).
+
+    Raises:
+        ValueError: on inconsistent shapes/dimensions.
+
+    Example:
+        >>> sorted_ids, expert_ids, EM = moe_align_block_size(topk_ids, E)
+        >>> out = fused_moe_mxfp4(A, w13, w13s, w2, w2s,
+        ...                       sorted_ids, topk_w, expert_ids, top_k=top_k)
+    """
+    A_arr = np.ascontiguousarray(A, dtype=np.uint16)
+    if A_arr.ndim != 2:
+        raise ValueError("A must be 2-D [M, hidden]")
+    M, hidden = A_arr.shape
+
+    w13_arr = np.ascontiguousarray(w13, dtype=np.uint8)
+    if w13_arr.ndim != 3:
+        raise ValueError("w13 must be 3-D [E, 2*ispp, hidden/2]")
+    E, two_ispp, h2 = w13_arr.shape
+    if h2 * 2 != hidden:
+        raise ValueError(
+            f"w13 last dim must be hidden/2 = {hidden // 2}, got {h2}")
+    if two_ispp % 2 != 0:
+        raise ValueError("w13 second dim must be even (2*ispp)")
+    ispp = two_ispp // 2
+
+    w13_scale_arr = np.ascontiguousarray(w13_scale, dtype=np.uint8)
+    w2_arr = np.ascontiguousarray(w2, dtype=np.uint8)
+    if w2_arr.ndim != 3:
+        raise ValueError("w2 must be 3-D [E, hidden, ispp/2]")
+    E2, h2_, i2 = w2_arr.shape
+    if E2 != E or h2_ != hidden or i2 * 2 != ispp:
+        raise ValueError(
+            f"w2 must be [E, hidden, ispp/2] = [{E}, {hidden}, {ispp // 2}], "
+            f"got {w2_arr.shape}")
+    w2_scale_arr = np.ascontiguousarray(w2_scale, dtype=np.uint8)
+
+    sorted_ids_arr = np.ascontiguousarray(sorted_ids, dtype=np.int32)
+    if sorted_ids_arr.ndim != 1:
+        raise ValueError("sorted_ids must be 1-D [EM]")
+    EM = sorted_ids_arr.size
+    if EM % _BLOCK_M != 0:
+        raise ValueError(f"EM must be a multiple of {_BLOCK_M}")
+
+    topk_w_arr = np.ascontiguousarray(topk_w, dtype=np.float32)
+    if topk_w_arr.size != EM:
+        raise ValueError(
+            f"topk_w must have EM = {EM} elements, got {topk_w_arr.size}")
+
+    expert_ids_arr = np.ascontiguousarray(expert_ids, dtype=np.int32)
+    if expert_ids_arr.size != EM // _BLOCK_M:
+        raise ValueError(
+            f"expert_ids must have EM/{_BLOCK_M} = {EM // _BLOCK_M} elements, "
+            f"got {expert_ids_arr.size}")
+
+    b13_arr = None
+    if b13 is not None:
+        b13_arr = np.ascontiguousarray(b13, dtype=np.float32)
+        if b13_arr.size != E * 2 * ispp:
+            raise ValueError(
+                f"b13 must have E*2*ispp = {E * 2 * ispp} elements, "
+                f"got {b13_arr.size}")
+    b2_arr = None
+    if b2 is not None:
+        b2_arr = np.ascontiguousarray(b2, dtype=np.float32)
+        if b2_arr.size != E * hidden:
+            raise ValueError(
+                f"b2 must have E*hidden = {E * hidden} elements, "
+                f"got {b2_arr.size}")
+
+    if act_scratch is None:
+        act_scratch_arr = np.empty(EM * ispp, dtype=np.uint16)
+    else:
+        act_scratch_arr = _as_out_typed(act_scratch, np.uint16, EM * ispp,
+                                        "act_scratch")
+
+    if out is None:
+        out_arr = np.zeros(M * hidden, dtype=np.float32)
+    else:
+        out_arr = _as_out_typed(out, np.float32, M * hidden, "out")
+
+    _impl.fused_moe_mxfp4(
+        A_arr, w13_arr, w13_scale_arr, w2_arr, w2_scale_arr,
+        sorted_ids_arr, topk_w_arr, expert_ids_arr,
+        act_scratch_arr, out_arr,
+        int(M), int(hidden), int(ispp), int(top_k), int(EM),
+        int(group_size), float(np.float32(swiglu_limit)), b13_arr, b2_arr)
+
+    return out_arr.reshape(M, hidden)

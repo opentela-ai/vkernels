@@ -37,12 +37,12 @@ namespace vkernels::kernels {
 //   w13_scale     [E, 2*ispp, hidden//group_size] uint8 ue8m0
 //   w2            [E, hidden, ispp//2] uint8 packed E2M1
 //   w2_scale      [E, hidden, ispp//group_size] uint8 ue8m0
-//   sorted_ids    [EM] int32  expert-aligned token indices
+//   sorted_ids    [EM] int32  flat topk index (token*top_k + sel) per row
 //   topk_w_sorted [EM] float  routing weights (sorted to match sorted_ids)
 //   expert_ids    [EM/BLOCK_M] int32  expert per M-block (-1 = filtered)
-//   act_scratch   [EM, ispp] bf16  intermediate (output of stage 0)
+//   act_scratch   [EM, ispp] bf16  intermediate, indexed by SORTED ROW
 //   out           [M, hidden] fp32  output
-//   M, hidden, ispp, EM       dimensions
+//   M, hidden, ispp, top_k, EM  dimensions
 //   group_size                ue8m0 group size (typically 32)
 //   swiglu_limit              clamp limit (>= 0; 0 = no limit)
 //   b13           [E, 2*ispp]  gate_up bias (nullptr → skip)
@@ -64,7 +64,7 @@ void fused_moe_mxfp4_cpu(
     const int32_t*  expert_ids,
     uint16_t*       act_scratch,
     float*          out,
-    int M, int hidden, int ispp, int EM,
+    int M, int hidden, int ispp, int top_k, int EM,
     int group_size,
     float swiglu_limit,
     const float* b13,
@@ -82,7 +82,8 @@ void fused_moe_mxfp4_cpu(
 //   num_experts            total experts (e.g. 256)
 //
 // Outputs:
-//   sorted_ids [EM_padded]    int32  — token indices sorted by expert
+//   sorted_ids [EM_padded]    int32  — FLAT index (token*top_k + sel),
+//                                      sorted by expert; padded with M*top_k
 //   expert_ids [EM_padded/B]  int32  — expert id per block (-1 = pad)
 //   → returns EM_padded (multiple of block_size)
 
@@ -103,6 +104,12 @@ namespace vkernels::kernels::hip {
 // Same interface as the CPU reference, but the topk_w here is the RAW
 // [M, top_k] matrix (the HIP host launcher gathers into sorted order
 // internally, matching the xkernels contract).
+//
+// block_size selects the tile config:
+//   16  — decode regime (16x64 tiles, 64 threads); sorted_ids/expert_ids
+//         must be aligned with block_size=16.
+//   64  — prefill regime (64x128 tiles, 256 threads); the caller must align
+//         with block_size=64 (EM % 64 == 0, expert_ids per 64-row block).
 
 void fused_moe_mxfp4(
     const uint16_t* A,
@@ -120,7 +127,8 @@ void fused_moe_mxfp4(
     int EM,
     float swiglu_limit,
     const float* b13,
-    const float* b2);
+    const float* b2,
+    int block_size = 16);
 
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP

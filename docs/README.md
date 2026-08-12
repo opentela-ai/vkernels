@@ -100,40 +100,66 @@ values per byte, low nibble first).
 |---|---|---|
 | `mfma_f32_16x16x16bf16(c[4], a[2], b[2])` | `C₀₋₃ += A₀₋₁ ⊗ B₀₋₁` (16×16×16 bf16, fp32 accum) | bf16 packed → fp32 |
 
-A single `v_mfma_f32_16x16x16bf16_1k` instruction on gfx942. K32 bf16 MFMA
-(CDNA4-only) is emulated by calling this K16 function twice:
+A single `v_mfma_f32_16x16x16bf16_1k` instruction on gfx942. K32 bf16
+MFMA (CDNA4-only) is emulated by calling this K16 function twice:
 once for K=0..15 (low halves of A/B), once for K=16..31 (high halves).
+
+The standalone primitive issues the instruction via inline asm with pinned
+VGPRs; the fused-MoE kernel instead calls the clang builtin
+`__builtin_amdgcn_mfma_f32_16x16x16bf16_1k` directly, which keeps register
+allocation correct where the pinned-VGPR form corrupted accumulators and
+crashed for >64-thread blocks on gfx90a.
+
+**Fragment layout** (one warp, lane `0..63`):
+- A operand: `m = lane % 16`, `a[i]` packs rows `m` for K `k0+i` (`k0 = (lane/16)*4`)
+- B operand: `n = lane % 16`, `b[i]` packs column `n` for K `k0+i`
+- C accumulator: `col = lane % 16`, `row = (lane/16)*4 + i` — four **consecutive rows** per thread (not transposed)
 
 - **File**: `src/c/vkernels/kernels/moe.cpp` (CPU), `.hip` (HIP)
 - **Python**: `vkernels.kernels.mfma_f32_16x16x16bf16(c, a, b)`
+- **Docs**: [kernels/moe.md](kernels/moe.md)
 
 ---
 
 ## MoE Fused — End-to-end MXFP4 grouped GEMM
 
 Implements the full xkernels `fused_moe_mxfp4` interface by wiring together
-the low-level primitives above. The fused kernel performs:
+the low-level primitives above. Two HIP kernels (plus a routing-weight gather):
 
-### Stage 0 — gate_up + SwiGLU
+### Kernel 0 — gate_up + SwiGLU (`gateup_swiglu_kernel`)
 ```
 act[EM, ispp] = silu(clamp(A_sorted @ w13_gate + b13_gate, L))
               · clamp(A_sorted @ w13_up   + b13_up,   L)
 ```
+Gate and up are accumulated in the same kernel and the SwiGLU product is
+rounded to bf16 **once**, matching the xkernels oracle exactly (a split
+3-kernel pipeline introduced a spurious intermediate bf16 rounding). The
+gate value is clamped to `L` *before* the sigmoid (SwiGLU clamp).
 
-### Stage 1 — down + routed combine
+### Kernel 1 — down + routed combine (`down_combine_kernel`)
 ```
 out[M, hidden] += act @ w2^T · topk_w_sorted + b2
 ```
-(scatter-add by token row, weighted by the routing weight)
+(scatter-add by token row via `atomicAdd`, weighted by the routing weight)
 
 | Function | Tile constants | Data types | Backend |
 |---|---|---|---|
-| `fused_moe_mxfp4(...)` | BM=16, BN=64, BK=64, Group=32 | bf16 activations, fp4 (E2M1) weights with ue8m0 scales, fp32 output | HIP, CPU |
+| `fused_moe_mxfp4(..., block_size=16)` | decode: BM=16, BN=64, BK=64, 64 threads/block | bf16 activations, fp4 (E2M1) weights with ue8m0 scales, fp32 output | HIP, CPU |
+| `fused_moe_mxfp4(..., block_size=64)` | prefill: BM=64, BN=128, BK=64, 256 threads/block | same | HIP |
+
+`block_size` selects the tile config: `16` = decode (16×64, 64 threads),
+`64` = prefill (64×128, 256 threads). The caller aligns with the matching
+`block_size` (so `expert_ids` is indexed per 16- or 64-row block).
 
 - Dequantization (E2M1 + ue8m0) is done inline during the K-loop — no full
-  bf16 materialization of the weight buffer.
-- Uses `mfma_f32_16x16x16bf16` (4 per K-block × 2 halves) and
-  `direct_lds_fill_bf16` for LDS tile staging.
+  bf16 materialization of the 138 GB expert weight buffer.
+- MFMA via `__builtin_amdgcn_mfma_f32_16x16x16bf16_1k`; A-tiles staged with
+  vectorised `uint2` global loads; N-dimension is split across `blockIdx.z`
+  (fixed 64-thread blocks, avoiding gfx90a pinned-VGPR crashes).
+- `act_scratch` is indexed by **sorted row** (`EM`), not token (`M`) — this
+  is required for `top_k > 1`, where the same token appears in multiple
+  experts and would otherwise race.
+- The caller must zero-initialise `out` (down-combine accumulates into it).
 
 ### Expert alignment helper
 
@@ -141,7 +167,41 @@ out[M, hidden] += act @ w2^T · topk_w_sorted + b2
 |---|---|
 | `moe_align_block_size(topk_ids, M, top_k, block_size, num_experts)` | Maps `[M, top_k]` token→expert routing into block-aligned `sorted_ids` and `expert_ids` |
 
+- `sorted_ids` stores the **flat topk index** (`token*top_k + sel`), padded
+  per expert with `M*top_k`. This preserves the selection index so the
+  routing-weight gather (`sw[i] = tw[sorted_ids[i]]`) is correct for
+  `top_k > 1`. Consumers derive `token = flat / top_k`.
 - **Files**: `src/c/vkernels/kernels/moe_fused.cpp` (CPU), `.hip` (HIP)
+- **Python**: `vkernels.kernels.moe_align_block_size / fused_moe_mxfp4`
+  (CPU-reference backed; see [python-bindings.md](python-bindings.md))
+- **Docs**: [kernels/moe_fused.md](kernels/moe_fused.md)
+
+### Verified performance (vs xkernels torch-loop)
+
+> **Full benchmark records** (reproduce commands, per-M tables, primitives,
+> caveats, journal): [`docs/performance/moe-fused/gfx90a.md`](performance/moe-fused/gfx90a.md)
+> (MI250X) and [`docs/performance/moe-fused/gfx942.md`](performance/moe-fused/gfx942.md)
+> (MI300A).
+
+E=256, hidden=4096, ispp=512, top_k=6. Latency in ms (lower is better);
+TFLOP/s is arithmetic on the *padded* EM rows, so the decode regime is
+heavily padding-dominated.
+
+| M | vkernels HIP (MI250X) | vkernels HIP (MI300A) | xkernels torch (MI250X) | xkernels torch (MI300A) |
+|---|---:|---:|---:|---:|
+| 1  | 0.66 | 0.45 | 6.0  | 4.4  |
+| 8  | 3.4  | 0.89 | ~30  | ~15  |
+| 16 | 4.1  | 2.2  | ~40  | ~30  |
+| 48 | 10.4 | 4.0  | 162.2 | 127.2 |
+
+GPU results are exact matches against the CPU reference
+(`max_rel < 0.00001` decode, `< 0.02` prefill) on both gfx90a and gfx942.
+
+The prefill config (E=8, top_k=2, denser routing) wins once each expert
+fills its 64-row block: ~1.2× on gfx90a (M ≥ 512), ~1.3–1.5× on gfx942
+(M ≥ 1024). With sparse routing (few tokens/expert) the 64-row padding
+dominates and decode stays faster — see [kernels/moe_fused.md](kernels/moe_fused.md)
+for full numbers.
 
 ---
 

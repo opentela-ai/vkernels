@@ -33,6 +33,13 @@ EXPECTED_KERNELS = [
     ("scale", "elementwise"),
     ("relu", "elementwise"),
     ("gemm", "gemm"),
+    ("direct_lds_fill_bf16", "moe"),
+    ("fp4_to_bf16_dequant", "moe"),
+    ("use_async_copy_default", "moe"),
+    ("mfma_f32_16x16x16bf16", "moe"),
+    ("fused_moe_mxfp4_cpu", "moe_fused"),
+    ("moe_align_block_size", "moe_fused"),
+    ("fused_moe_mxfp4", "moe_fused"),
     ("sum", "reduce"),
     ("max", "reduce"),
 ]
@@ -54,6 +61,15 @@ EXPECTED_COMM = [
     ("stage_runs_2d", "function"),
     ("p2p_gather_runs_2d", "function"),
     ("memcpy_peer_batch_async", "function"),
+    ("set_gather_dispatch", "function"),
+    ("gather_dispatch_config", "function"),
+    ("est_copy_engine_us", "function"),
+    ("est_gather_kernel_us", "function"),
+    ("prefer_gather_kernel", "function"),
+    ("P2PGatherPlan1D", "class"),
+    ("P2PGatherPlan2D", "class"),
+    ("p2p_kv_restore_layer", "function"),
+    ("p2p_kv_restore_layer_twostage", "function"),
     ("Topology", "struct"),
     ("ring_rank", "function"),
     ("build_ring_topology", "function"),
@@ -77,7 +93,16 @@ class DiscoveryTest(unittest.TestCase):
             e = self.kernels[name]
             self.assertEqual(e.kind, "kernel", name)
             self.assertTrue(e.host, f"{name} must have a CPU reference")
-            self.assertTrue(e.cuda, f"{name} must have a CUDA source")
+            self.assertTrue(e.cuda or e.hip,
+                            f"{name} must have a GPU (CUDA or HIP) source")
+
+    def test_moe_kernels_are_hip(self):
+        for name in ("direct_lds_fill_bf16", "fp4_to_bf16_dequant",
+                     "use_async_copy_default", "mfma_f32_16x16x16bf16",
+                     "fused_moe_mxfp4_cpu", "moe_align_block_size",
+                     "fused_moe_mxfp4"):
+            self.assertTrue(self.kernels[name].hip, name)
+            self.assertFalse(self.kernels[name].cuda, name)
 
     def test_comm_names_kinds_and_order(self):
         self.assertEqual(

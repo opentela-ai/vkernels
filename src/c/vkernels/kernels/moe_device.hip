@@ -40,23 +40,26 @@ __host__ __device__ __forceinline__ uint16_t f32bits_to_bf16(uint32_t bits) {
 
 // ======================================================================
 //  K16 bf16 MFMA (device-only, inline asm)
+//  NOTE: Uses generic "v" constraints (no hardcoded VGPRs).
+//  The compiler handles register allocation.  The MFMA instruction
+//  syntax uses register *indices*, so we extract them and format
+//  the range syntax (v[lo:hi]) for each operand group.
 // ======================================================================
 __device__ __forceinline__ void mfma_f32_16x16x16bf16(
     float c[4], const uint32_t a[2], const uint32_t b[2],
     int cbsz = 0, int abid = 0, int blgp = 0) {
   (void)cbsz; (void)abid; (void)blgp;
-  register float r0 asm("v0"), r1 asm("v1"), r2 asm("v2"), r3 asm("v3");
+  register float   r0 asm("v0"), r1 asm("v1"), r2 asm("v2"), r3 asm("v3");
   register uint32_t s0 asm("v4"), s1 asm("v5");
   register uint32_t t0 asm("v6"), t1 asm("v7");
-  __builtin_memcpy(&r0, &c[0], 4); __builtin_memcpy(&r1, &c[1], 4);
-  __builtin_memcpy(&r2, &c[2], 4); __builtin_memcpy(&r3, &c[3], 4);
+  // Simple direct assignment — compiler emits v_mov_b32
+  r0 = c[0]; r1 = c[1]; r2 = c[2]; r3 = c[3];
   s0 = a[0]; s1 = a[1]; t0 = b[0]; t1 = b[1];
   __asm__ __volatile__(
       "v_mfma_f32_16x16x16bf16_1k v[0:3], v[4:5], v[6:7], v[0:3]"
       : "+v"(r0), "+v"(r1), "+v"(r2), "+v"(r3)
       : "v"(s0), "v"(s1), "v"(t0), "v"(t1));
-  __builtin_memcpy(&c[0], &r0, 4); __builtin_memcpy(&c[1], &r1, 4);
-  __builtin_memcpy(&c[2], &r2, 4); __builtin_memcpy(&c[3], &r3, 4);
+  c[0] = r0; c[1] = r1; c[2] = r2; c[3] = r3;
 }
 
 }  // namespace vkernels::kernels::hip

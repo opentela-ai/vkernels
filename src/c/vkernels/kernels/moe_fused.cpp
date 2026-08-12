@@ -143,16 +143,16 @@ void fused_moe_mxfp4_cpu(
     const int32_t*  expert_ids,
     uint16_t*       act_scratch,
     float*          out,
-    int M, int hidden, int ispp, int EM,
+    int M, int hidden, int ispp, int top_k, int EM,
     int group_size,
     float swiglu_limit,
     const float* b13,
     const float* b2) {
 
   constexpr int BLOCK_M = 16;
-  (void)M;
   constexpr int BLOCK_N = 64;
   constexpr int BLOCK_K = 64;
+  const int N = M * top_k;
 
   // ==================================================================
   // Stage 0: gate_up + SwiGLU → act_scratch [EM, ispp]
@@ -190,11 +190,16 @@ void fused_moe_mxfp4_cpu(
       for (int kb = 0; kb < num_k_blocks; ++kb) {
         int k_start = kb * BLOCK_K;
 
-        // Load A tile
+        // Load A tile (zero-out padding tokens)
         for (int m = 0; m < BLOCK_M; ++m) {
-          int token = sorted_ids[token_base + m];
-          for (int k = 0; k < BLOCK_K; ++k) {
-            tile_A[m * BLOCK_K + k] = A[token * static_cast<std::size_t>(hidden) + k_start + k];
+          int flat = sorted_ids[token_base + m];
+          if (flat < N) {
+            int token = flat / top_k;
+            for (int k = 0; k < BLOCK_K; ++k) {
+              tile_A[m * BLOCK_K + k] = A[token * static_cast<std::size_t>(hidden) + k_start + k];
+            }
+          } else {
+            for (int k = 0; k < BLOCK_K; ++k) tile_A[m * BLOCK_K + k] = 0;
           }
         }
 
@@ -249,9 +254,10 @@ void fused_moe_mxfp4_cpu(
         }
       }
 
-      // SwiGLU epilogue
+      // SwiGLU epilogue (skip padding tokens)
       for (int m = 0; m < BLOCK_M; ++m) {
-        int token = sorted_ids[token_base + m];
+        int flat = sorted_ids[token_base + m];
+        if (flat >= N) continue;  // padding token, skip
         for (int n = 0; n < BLOCK_N; ++n) {
           float g = acc_gate[m * BLOCK_N + n];
           float u = acc_up[m * BLOCK_N + n];
@@ -273,7 +279,7 @@ void fused_moe_mxfp4_cpu(
           // Round to bf16
           uint32_t bits;
           std::memcpy(&bits, &result, sizeof(float));
-          act_scratch[token * static_cast<std::size_t>(ispp) + nb * BLOCK_N + n] =
+          act_scratch[(token_base + m) * static_cast<std::size_t>(ispp) + nb * BLOCK_N + n] =
               f32bits_to_bf16_local(bits);
         }
       }
@@ -304,11 +310,15 @@ void fused_moe_mxfp4_cpu(
       for (int kb = 0; kb < num_down_k_blocks; ++kb) {
         int k_start = kb * BLOCK_K;
 
-        // Load A (act [EM, ispp])
+        // Load A (act [EM, ispp]) — zero-out padding tokens
         for (int m = 0; m < BLOCK_M; ++m) {
-          int token = sorted_ids[token_base + m];
-          for (int k = 0; k < BLOCK_K; ++k) {
-            tile_A[m * BLOCK_K + k] = act_scratch[token * static_cast<std::size_t>(ispp) + k_start + k];
+          int flat = sorted_ids[token_base + m];
+          if (flat < N) {
+            for (int k = 0; k < BLOCK_K; ++k) {
+              tile_A[m * BLOCK_K + k] = act_scratch[(token_base + m) * static_cast<std::size_t>(ispp) + k_start + k];
+            }
+          } else {
+            for (int k = 0; k < BLOCK_K; ++k) tile_A[m * BLOCK_K + k] = 0;
           }
         }
 
@@ -338,9 +348,11 @@ void fused_moe_mxfp4_cpu(
         }
       }
 
-      // Combine: bias + weight + scatter-add
+      // Combine: bias + weight + scatter-add (skip padding tokens)
       for (int m = 0; m < BLOCK_M; ++m) {
-        int token = sorted_ids[token_base + m];
+        int flat = sorted_ids[token_base + m];
+        if (flat >= N) continue;  // padding token, skip
+        int token = flat / top_k;
         float weight = topk_w_sorted[token_base + m];
         for (int n = 0; n < BLOCK_N; ++n) {
           float val = acc_down[m * BLOCK_N + n];
@@ -370,14 +382,12 @@ int moe_align_block_size(
 
   int N = M * top_k;
 
-  // 1. Collect token indices per expert
-  //    Per expert we need a list of (token_index, selection_index).
-  //    token_index = flat_index / top_k, the original token row.
+  // 1. Collect flat indices per expert (token*top_k + sel).
   std::vector<std::vector<int32_t>> per_expert(num_experts);
   for (int i = 0; i < N; ++i) {
     int e = topk_ids[i];
     if (e >= 0 && e < num_experts) {
-      per_expert[e].push_back(i / top_k);  // token index
+      per_expert[e].push_back(i);  // flat index
     }
   }
 
@@ -390,7 +400,7 @@ int moe_align_block_size(
   }
   int EM_padded = total_tokens;
 
-  // 3. Fill sorted_ids: concatenate per-expert token indices, pad with 0
+  // 3. Fill sorted_ids: concatenate per-expert flat indices, pad with N
   int idx = 0;
   for (int e = 0; e < num_experts; ++e) {
     const auto& tokens = per_expert[e];
@@ -398,7 +408,7 @@ int moe_align_block_size(
     for (int i = 0; i < nt; ++i) sorted_ids[idx++] = tokens[i];
     // Pad this expert's token list to block_size multiple
     int padded_nt = ((nt + block_size - 1) / block_size) * block_size;
-    for (int i = nt; i < padded_nt; ++i) sorted_ids[idx++] = M;  // pad with out-of-bounds token
+    for (int i = nt; i < padded_nt; ++i) sorted_ids[idx++] = N;  // pad with out-of-bounds flat index
   }
 
   // 4. Fill expert_ids: one expert id per block
