@@ -12,10 +12,12 @@
 
 #  include <cstddef>
 #  include <exception>
+#  include <functional>
+#  include <stdexcept>
 
 namespace {
 
-vkernels_status_t wrap(void (*fn)()) {
+vkernels_status_t wrap(const std::function<void()>& fn) {
   try {
     fn();
     return VKERNELS_OK;

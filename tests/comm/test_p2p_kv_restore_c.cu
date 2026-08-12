@@ -1,8 +1,10 @@
 // tests/comm/test_p2p_kv_restore_c.cu
 //
-// Runtime tests for the `extern "C"` P2P KV restore ABI and the CUDA C++
-// entry points. These are CUDA-only and run on a single GPU using same-device
-// pointers as a stand-in for cross-GPU peer memory.
+// Runtime tests for the `extern "C"` P2P KV restore ABI. These are CUDA-only
+// and run on a single GPU using same-device pointers as a stand-in for
+// cross-GPU peer memory — the same stand-in the p2p_gather_c tests use, and
+// sufficient to exercise the validators, the kernel launch, and the
+// status-code return path.
 #include "vkernels/comm/p2p_kv_restore_c.h"
 
 #include "minitest.hpp"
@@ -13,16 +15,12 @@
 
 #if defined(VKERNELS_C_HAS_CUDA) && !defined(__CUDA_ARCH__)
 
-#  include "vkernels/comm/p2p_kv_restore_cuda.hpp"
-
-#  include <cstdio>
-
 namespace {
 
 // Fill a host vector with a deterministic byte pattern.
 std::vector<uint8_t> patterned(size_t n, uint8_t seed) {
   std::vector<uint8_t> v(n);
-  for (size_t i = 0; i < n; ++i) v[i] = static_cast<uint8_t>(seed + i);
+  for (size_t i = 0; i < n; ++i) v[i] = static_cast<uint8_t>(seed + (i % 251));
   return v;
 }
 
@@ -46,12 +44,18 @@ bool device_equal(const uint8_t* d_a, const uint8_t* d_b, size_t n) {
   return true;
 }
 
+// Fill device memory with a sentinel byte.
+void fill_device(uint8_t* d, size_t n, uint8_t fill) {
+  std::vector<uint8_t> h(n, fill);
+  cudaMemcpy(d, h.data(), n, cudaMemcpyHostToDevice);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// C++ CUDA entry points: fused equals two-stage (byte-exact)
+// Fused equals two-stage (byte-exact)
 // ---------------------------------------------------------------------------
-TEST(P2pKvRestoreCuda, FusedEqualsTwoStageSinglePage) {
+TEST(P2pKvRestoreCAbi, FusedEqualsTwoStageSinglePage) {
   constexpr size_t kPageSize = 4, kHeads = 2, kHeadDim = 8, kElem = 2;
   constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;  // 32
   constexpr size_t kSlots = 16;
@@ -74,28 +78,22 @@ TEST(P2pKvRestoreCuda, FusedEqualsTwoStageSinglePage) {
   ASSERT_TRUE(cudaMemcpy(d_slots, h_slots, 4 * sizeof(int),
                          cudaMemcpyHostToDevice) == cudaSuccess);
 
-  // Fill destinations with sentinel.
-  std::vector<uint8_t> sentinel(kSlots * kSlotBytes, 0xCC);
-  ASSERT_TRUE(cudaMemcpy(dk_f, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dv_f, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dk_t, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dv_t, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
+  fill_device(dk_f, kSlots * kSlotBytes, 0xCC);
+  fill_device(dv_f, kSlots * kSlotBytes, 0xCC);
+  fill_device(dk_t, kSlots * kSlotBytes, 0xCC);
+  fill_device(dv_t, kSlots * kSlotBytes, 0xCC);
 
   const void* ptrs[1] = {d_page};
   const size_t offs[1] = {0};
 
-  vkernels::comm::cuda::p2p_kv_restore_layer(dk_f, dv_f, d_slots, ptrs, offs,
-                                             1, kPageSize, kHeads, kHeadDim,
-                                             kElem, 0);
+  vkernels_status_t st = vkernels_p2p_kv_restore_layer(
+      dk_f, dv_f, d_slots, ptrs, offs, 1, kPageSize, kHeads, kHeadDim, kElem, 0);
+  ASSERT_EQ(st, VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
 
-  vkernels::comm::cuda::p2p_kv_restore_layer_twostage(dk_t, dv_t, d_slots, ptrs, offs,
-                                                      1, kPageSize, kHeads, kHeadDim,
-                                                      kElem, 0);
+  st = vkernels_p2p_kv_restore_layer_twostage(
+      dk_t, dv_t, d_slots, ptrs, offs, 1, kPageSize, kHeads, kHeadDim, kElem, 0);
+  ASSERT_EQ(st, VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
 
   ASSERT_TRUE(device_equal(dk_f, dk_t, kSlots * kSlotBytes));
@@ -105,7 +103,7 @@ TEST(P2pKvRestoreCuda, FusedEqualsTwoStageSinglePage) {
   cudaFree(dk_t); cudaFree(dv_t); cudaFree(d_slots);
 }
 
-TEST(P2pKvRestoreCuda, FusedEqualsTwoStageMultiPage) {
+TEST(P2pKvRestoreCAbi, FusedEqualsTwoStageMultiPage) {
   constexpr size_t kPageSize = 2, kHeads = 4, kHeadDim = 16, kElem = 2;
   constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;  // 128
   constexpr size_t kNumPages = 3, kSlots = 16;
@@ -133,27 +131,22 @@ TEST(P2pKvRestoreCuda, FusedEqualsTwoStageMultiPage) {
   ASSERT_TRUE(cudaMemcpy(d_slots, h_slots, 6 * sizeof(int),
                          cudaMemcpyHostToDevice) == cudaSuccess);
 
-  std::vector<uint8_t> sentinel(kSlots * kSlotBytes, 0xCC);
-  ASSERT_TRUE(cudaMemcpy(dk_f, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dv_f, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dk_t, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dv_t, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
+  fill_device(dk_f, kSlots * kSlotBytes, 0xCC);
+  fill_device(dv_f, kSlots * kSlotBytes, 0xCC);
+  fill_device(dk_t, kSlots * kSlotBytes, 0xCC);
+  fill_device(dv_t, kSlots * kSlotBytes, 0xCC);
 
   const void* ptrs[3] = {d0, d1, d2};
   const size_t offs[3] = {0, 0, 0};
 
-  vkernels::comm::cuda::p2p_kv_restore_layer(dk_f, dv_f, d_slots, ptrs, offs,
-                                             kNumPages, kPageSize, kHeads, kHeadDim,
-                                             kElem, 0);
+  vkernels_status_t st = vkernels_p2p_kv_restore_layer(
+      dk_f, dv_f, d_slots, ptrs, offs, kNumPages, kPageSize, kHeads, kHeadDim, kElem, 0);
+  ASSERT_EQ(st, VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
 
-  vkernels::comm::cuda::p2p_kv_restore_layer_twostage(dk_t, dv_t, d_slots, ptrs, offs,
-                                                      kNumPages, kPageSize, kHeads,
-                                                      kHeadDim, kElem, 0);
+  st = vkernels_p2p_kv_restore_layer_twostage(
+      dk_t, dv_t, d_slots, ptrs, offs, kNumPages, kPageSize, kHeads, kHeadDim, kElem, 0);
+  ASSERT_EQ(st, VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
 
   ASSERT_TRUE(device_equal(dk_f, dk_t, kSlots * kSlotBytes));
@@ -163,9 +156,8 @@ TEST(P2pKvRestoreCuda, FusedEqualsTwoStageMultiPage) {
   cudaFree(dk_f); cudaFree(dv_f); cudaFree(dk_t); cudaFree(dv_t); cudaFree(d_slots);
 }
 
-// Test that vec tail path works on unaligned slot_bytes (odd number of heads
-// with odd head_dim, so slot_bytes = heads*head_dim*2 is not a multiple of 16).
-TEST(P2pKvRestoreCuda, UnalignedSlotBytesFusedEqualsTwoStage) {
+// Test that the vec tail path works on unaligned slot_bytes.
+TEST(P2pKvRestoreCAbi, UnalignedSlotBytesFusedEqualsTwoStage) {
   constexpr size_t kPageSize = 1, kHeads = 3, kHeadDim = 5, kElem = 2;
   constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;  // 30 bytes
   constexpr size_t kSlots = 4;
@@ -187,26 +179,22 @@ TEST(P2pKvRestoreCuda, UnalignedSlotBytesFusedEqualsTwoStage) {
                          cudaMemcpyHostToDevice) == cudaSuccess);
   ASSERT_TRUE(cudaMemcpy(d_slots, h_slots, sizeof(int),
                          cudaMemcpyHostToDevice) == cudaSuccess);
-  std::vector<uint8_t> sentinel(kSlots * kSlotBytes, 0xCC);
-  ASSERT_TRUE(cudaMemcpy(dk_f, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dv_f, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dk_t, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dv_t, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
+  fill_device(dk_f, kSlots * kSlotBytes, 0xCC);
+  fill_device(dv_f, kSlots * kSlotBytes, 0xCC);
+  fill_device(dk_t, kSlots * kSlotBytes, 0xCC);
+  fill_device(dv_t, kSlots * kSlotBytes, 0xCC);
 
   const void* ptrs[1] = {d_page};
   const size_t offs[1] = {0};
 
-  vkernels::comm::cuda::p2p_kv_restore_layer(dk_f, dv_f, d_slots, ptrs, offs,
-                                             1, kPageSize, kHeads, kHeadDim,
-                                             kElem, 0);
+  vkernels_status_t st = vkernels_p2p_kv_restore_layer(
+      dk_f, dv_f, d_slots, ptrs, offs, 1, kPageSize, kHeads, kHeadDim, kElem, 0);
+  ASSERT_EQ(st, VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
-  vkernels::comm::cuda::p2p_kv_restore_layer_twostage(dk_t, dv_t, d_slots, ptrs, offs,
-                                                      1, kPageSize, kHeads, kHeadDim,
-                                                      kElem, 0);
+
+  st = vkernels_p2p_kv_restore_layer_twostage(
+      dk_t, dv_t, d_slots, ptrs, offs, 1, kPageSize, kHeads, kHeadDim, kElem, 0);
+  ASSERT_EQ(st, VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
 
   ASSERT_TRUE(device_equal(dk_f, dk_t, kSlots * kSlotBytes));
@@ -217,13 +205,12 @@ TEST(P2pKvRestoreCuda, UnalignedSlotBytesFusedEqualsTwoStage) {
 }
 
 // Test with a non-zero page offset.
-TEST(P2pKvRestoreCuda, PageOffsetIsHonoured) {
+TEST(P2pKvRestoreCAbi, PageOffsetIsHonoured) {
   constexpr size_t kPageSize = 1, kHeads = 2, kHeadDim = 4, kElem = 2;
   constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;  // 16
   constexpr size_t kTokenStr = 2 * kSlotBytes;               // 32
   constexpr size_t kSlots = 4;
 
-  // Buffer with two pages' worth of data; offset selects the second.
   auto h_buf = patterned(page_bytes(2, kHeads, kHeadDim, kElem), 0x21);
   const int h_slots[1] = {1};
 
@@ -238,18 +225,15 @@ TEST(P2pKvRestoreCuda, PageOffsetIsHonoured) {
                          cudaMemcpyHostToDevice) == cudaSuccess);
   ASSERT_TRUE(cudaMemcpy(d_slots, h_slots, sizeof(int),
                          cudaMemcpyHostToDevice) == cudaSuccess);
-  std::vector<uint8_t> sentinel(kSlots * kSlotBytes, 0xCC);
-  ASSERT_TRUE(cudaMemcpy(dk, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dv, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
+  fill_device(dk, kSlots * kSlotBytes, 0xCC);
+  fill_device(dv, kSlots * kSlotBytes, 0xCC);
 
   const void* ptrs[1] = {d_buf};
   const size_t offs[1] = {kTokenStr};  // skip the first token
 
-  vkernels::comm::cuda::p2p_kv_restore_layer(dk, dv, d_slots, ptrs, offs,
-                                             1, kPageSize, kHeads, kHeadDim,
-                                             kElem, 0);
+  vkernels_status_t st = vkernels_p2p_kv_restore_layer(
+      dk, dv, d_slots, ptrs, offs, 1, kPageSize, kHeads, kHeadDim, kElem, 0);
+  ASSERT_EQ(st, VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
 
   // Verify: dst slot 1 should match the second token's K and V.
@@ -291,7 +275,7 @@ TEST(P2pKvRestoreCAbi, SuccessReturnsOk) {
   const void* ptrs[1] = {d_page};
   const size_t offs[1] = {0};
   vkernels_status_t st = vkernels_p2p_kv_restore_layer(
-      dk, dv, d_slots, ptrs, offs, kPageSize, 1, kHeads, kHeadDim, kElem, 0);
+      dk, dv, d_slots, ptrs, offs, 1, kPageSize, kHeads, kHeadDim, kElem, 0);
   ASSERT_EQ(st, VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
 
@@ -334,7 +318,7 @@ TEST(P2pKvRestoreCAbi, NonUniqueSlotsReturnsInvalidArgument) {
 // ---------------------------------------------------------------------------
 // Async stream: two concurrent streams on the fused path
 // ---------------------------------------------------------------------------
-TEST(P2pKvRestoreCuda, ConcurrentStreams) {
+TEST(P2pKvRestoreCAbi, ConcurrentStreams) {
   constexpr size_t kPageSize = 2, kHeads = 2, kHeadDim = 8, kElem = 2;
   constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;  // 32
   constexpr size_t kSlots = 8;
@@ -364,16 +348,10 @@ TEST(P2pKvRestoreCuda, ConcurrentStreams) {
   ASSERT_TRUE(cudaMemcpy(ds1, h_slots, 4 * sizeof(int),
                          cudaMemcpyHostToDevice) == cudaSuccess);
 
-  // Fill dst with sentinel.
-  std::vector<uint8_t> sentinel(kSlots * kSlotBytes, 0xCC);
-  ASSERT_TRUE(cudaMemcpy(dk0, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dv0, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dk1, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dv1, sentinel.data(), sentinel.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
+  fill_device(dk0, kSlots * kSlotBytes, 0xCC);
+  fill_device(dv0, kSlots * kSlotBytes, 0xCC);
+  fill_device(dk1, kSlots * kSlotBytes, 0xCC);
+  fill_device(dv1, kSlots * kSlotBytes, 0xCC);
 
   cudaStream_t s0, s1;
   ASSERT_TRUE(cudaStreamCreate(&s0) == cudaSuccess);
@@ -383,17 +361,17 @@ TEST(P2pKvRestoreCuda, ConcurrentStreams) {
   const void* ptrs1[1] = {dp1};
   const size_t offs[1] = {0};
 
-  vkernels::comm::cuda::p2p_kv_restore_layer(dk0, dv0, ds0, ptrs0, offs,
-                                             1, kPageSize, kHeads, kHeadDim,
-                                             kElem, s0);
-  vkernels::comm::cuda::p2p_kv_restore_layer(dk1, dv1, ds1, ptrs1, offs,
-                                             1, kPageSize, kHeads, kHeadDim,
-                                             kElem, s1);
+  vkernels_status_t st = vkernels_p2p_kv_restore_layer(
+      dk0, dv0, ds0, ptrs0, offs, 1, kPageSize, kHeads, kHeadDim, kElem, s0);
+  ASSERT_EQ(st, VKERNELS_OK);
+  st = vkernels_p2p_kv_restore_layer(
+      dk1, dv1, ds1, ptrs1, offs, 1, kPageSize, kHeads, kHeadDim, kElem, s1);
+  ASSERT_EQ(st, VKERNELS_OK);
 
   ASSERT_TRUE(cudaStreamSynchronize(s0) == cudaSuccess);
   ASSERT_TRUE(cudaStreamSynchronize(s1) == cudaSuccess);
 
-  // Verify: both streams should have correct results.
+  // Verify both streams have correct data.
   std::vector<uint8_t> hk0(kSlots * kSlotBytes), hv0(kSlots * kSlotBytes);
   std::vector<uint8_t> hk1(kSlots * kSlotBytes), hv1(kSlots * kSlotBytes);
   cudaMemcpy(hk0.data(), dk0, hk0.size(), cudaMemcpyDeviceToHost);
@@ -401,7 +379,6 @@ TEST(P2pKvRestoreCuda, ConcurrentStreams) {
   cudaMemcpy(hk1.data(), dk1, hk1.size(), cudaMemcpyDeviceToHost);
   cudaMemcpy(hv1.data(), dv1, hv1.size(), cudaMemcpyDeviceToHost);
 
-  // Both streams should have the same correct data.
   for (size_t i = 0; i < hk0.size(); ++i) {
     ASSERT_EQ(hk0[i], hk1[i]);
     ASSERT_EQ(hv0[i], hv1[i]);

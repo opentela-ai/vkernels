@@ -71,13 +71,13 @@ std::vector<uint8_t> fill_pattern(size_t n, uint8_t seed) {
 
 // Timed launch: record device time for one fused-restore launch.
 double time_fused(uint8_t* d_k, uint8_t* d_v, const int* d_slots,
-                  const void* const* d_ptrs, const size_t* d_offs,
+                  const void* const* ptrs, const size_t* offs,
                   size_t num_pages, cudaStream_t stream) {
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
   cudaEventRecord(start, stream);
-  p2p_kv_restore_layer(d_k, d_v, d_slots, d_ptrs, d_offs,
+  p2p_kv_restore_layer(d_k, d_v, d_slots, ptrs, offs,
                        num_pages, S::page_size, S::num_kv_heads, S::head_dim,
                        S::elem_size, stream);
   cudaEventRecord(stop, stream);
@@ -90,13 +90,13 @@ double time_fused(uint8_t* d_k, uint8_t* d_v, const int* d_slots,
 
 // Timed launch for the two-stage reference.
 double time_twostage(uint8_t* d_k, uint8_t* d_v, const int* d_slots,
-                     const void* const* d_ptrs, const size_t* d_offs,
+                     const void* const* ptrs, const size_t* offs,
                      size_t num_pages, cudaStream_t stream) {
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
   cudaEventRecord(start, stream);
-  p2p_kv_restore_layer_twostage(d_k, d_v, d_slots, d_ptrs, d_offs,
+  p2p_kv_restore_layer_twostage(d_k, d_v, d_slots, ptrs, offs,
                                 num_pages, S::page_size, S::num_kv_heads,
                                 S::head_dim, S::elem_size, stream);
   cudaEventRecord(stop, stream);
@@ -172,15 +172,9 @@ int main(int argc, char** argv) {
   }
 
   // Source offsets (all zero for this benchmark — pages are standalone
-  // allocations so the base pointer is enough).
+  // allocations so the base pointer is enough). These are host arrays
+  // passed directly to the API.
   std::vector<size_t> h_offs(kMaxPages, 0);
-  size_t* d_offs = nullptr;
-  if (cudaMalloc(&d_offs, kMaxPages * sizeof(size_t)) != cudaSuccess) {
-    std::fprintf(stderr, "cudaMalloc for offsets failed\n");
-    return 1;
-  }
-  cudaMemcpy(d_offs, h_offs.data(), kMaxPages * sizeof(size_t),
-             cudaMemcpyHostToDevice);
 
   cudaStream_t stream;
   cudaStreamCreate(&stream);
@@ -211,19 +205,15 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_k, zero.data(), zero.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(d_v, zero.data(), zero.size(), cudaMemcpyHostToDevice);
 
-    // Build the source pointer array on the device (page pointers).
-    // We need a device-side array of const void* pointing to each page.
+    // Build the source pointer array on the HOST (peer_src_ptrs is a host
+    // array of UVA device pointers).
     std::vector<const void*> h_ptrs(num_pages);
     for (size_t p = 0; p < num_pages; ++p) h_ptrs[p] = d_src_pages[p];
-    const void** d_ptrs = nullptr;
-    cudaMalloc(&d_ptrs, num_pages * sizeof(const void*));
-    cudaMemcpy(d_ptrs, h_ptrs.data(), num_pages * sizeof(const void*),
-               cudaMemcpyHostToDevice);
 
     // Warmup.
     for (int i = 0; i < warmup; ++i) {
-      time_twostage(d_k, d_v, d_slots, d_ptrs, d_offs, num_pages, stream);
-      time_fused(d_k, d_v, d_slots, d_ptrs, d_offs, num_pages, stream);
+      time_twostage(d_k, d_v, d_slots, h_ptrs.data(), h_offs.data(), num_pages, stream);
+      time_fused(d_k, d_v, d_slots, h_ptrs.data(), h_offs.data(), num_pages, stream);
     }
 
     // Measure.
@@ -231,9 +221,9 @@ int main(int argc, char** argv) {
     ts_us.reserve(iters);
     fused_us.reserve(iters);
     for (int i = 0; i < iters; ++i) {
-      ts_us.push_back(time_twostage(d_k, d_v, d_slots, d_ptrs, d_offs,
+      ts_us.push_back(time_twostage(d_k, d_v, d_slots, h_ptrs.data(), h_offs.data(),
                                     num_pages, stream));
-      fused_us.push_back(time_fused(d_k, d_v, d_slots, d_ptrs, d_offs,
+      fused_us.push_back(time_fused(d_k, d_v, d_slots, h_ptrs.data(), h_offs.data(),
                                     num_pages, stream));
     }
 
@@ -249,7 +239,7 @@ int main(int argc, char** argv) {
     std::printf("%6zu %10.2f %10.2f %10.2f %7.2fx %10.4f\n",
                 num_pages, mib, ts_med, fused_med, speedup, saved_per_token);
 
-    cudaFree(d_ptrs);
+
   }
 
   cudaStreamDestroy(stream);
@@ -258,7 +248,6 @@ int main(int argc, char** argv) {
   cudaFree(d_k);
   cudaFree(d_v);
   cudaFree(d_slots);
-  cudaFree(d_offs);
   for (size_t p = 0; p < kMaxPages; ++p) cudaFree(d_src_pages[p]);
 
   if (peer) {
