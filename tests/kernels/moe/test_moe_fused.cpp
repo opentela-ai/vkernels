@@ -280,6 +280,169 @@ TEST(FusedMoe, SiTU) {
 }
 
 // ======================================================================
+//  E2M1 / ue8m0 decode edge cases
+// ======================================================================
+// Exercise the branches of the local fp4/ue8m0 decoders that an "all weights
+// are 1.0" test never reaches: subnormal ±0.25, ±inf, NaN nibbles, and the
+// ue8m0 subnormal scale (scale byte 0x00).
+
+TEST(FusedMoe, E2M1SubnormalQuarter) {
+  constexpr int M = 16, hidden = 128, ispp = 64;
+  constexpr int group_size = 32, BLOCK_M = 16;
+  constexpr int EM = M;
+
+  std::vector<uint16_t> A_bf16(M * hidden, f2bf(1.0f));
+  // 0x11: low nibble 0x1 (+0.25) and high nibble 0x1 (+0.25) — E2M1 subnormal.
+  std::vector<uint8_t> w13(2 * ispp * hidden / 2, 0x11);
+  std::vector<uint8_t> w13_scale(2 * ispp * hidden / group_size, 127);
+  std::vector<uint8_t> w2(hidden * ispp / 2, 0x11);
+  std::vector<uint8_t> w2_scale(hidden * ispp / group_size, 127);
+
+  std::vector<int32_t> sorted_ids(EM);
+  std::iota(sorted_ids.begin(), sorted_ids.end(), 0);
+  std::vector<float> topk_ws(EM, 1.0f);
+  std::vector<int32_t> expert_ids(EM / BLOCK_M, 0);
+
+  std::vector<uint16_t> act_h(EM * ispp, 0);
+  std::vector<float> out_h(M * hidden, 0.0f);
+
+  fused_moe_mxfp4_cpu(
+      A_bf16.data(), w13.data(), w13_scale.data(),
+      w2.data(), w2_scale.data(),
+      sorted_ids.data(), topk_ws.data(), expert_ids.data(),
+      act_h.data(), out_h.data(),
+      M, hidden, ispp, 1, EM, group_size,
+      0.0f, 0, 4.0f, 25.0f, nullptr, nullptr);
+
+  // gate = up = 128 * 0.25 = 32; act = silu(32) * 32.
+  float gate = 32.0f;
+  float silu = gate / (1.0f + std::exp(-gate));
+  float expected_act = silu * gate;
+  for (int i = 0; i < EM * ispp; ++i) {
+    EXPECT_NEAR(bf2f(act_h[i]), expected_act, 0.5f);  // bf16 precision
+  }
+  for (int i = 0; i < M * hidden; ++i) {
+    EXPECT_TRUE(std::isfinite(out_h[i]));
+    EXPECT_GT(out_h[i], 0.0f);
+  }
+}
+
+TEST(FusedMoe, E2M1InfAndNaN) {
+  constexpr int M = 16, hidden = 128, ispp = 64;
+  constexpr int group_size = 32, BLOCK_M = 16;
+  constexpr int EM = M;
+
+  std::vector<uint16_t> A_bf16(M * hidden, f2bf(1.0f));
+  // 0x76: low nibble 0x6 (+inf) and high nibble 0x7 (NaN).
+  std::vector<uint8_t> w13(2 * ispp * hidden / 2, 0x76);
+  std::vector<uint8_t> w13_scale(2 * ispp * hidden / group_size, 127);
+  std::vector<uint8_t> w2(hidden * ispp / 2, 0x22);  // 1.0
+  std::vector<uint8_t> w2_scale(hidden * ispp / group_size, 127);
+
+  std::vector<int32_t> sorted_ids(EM);
+  std::iota(sorted_ids.begin(), sorted_ids.end(), 0);
+  std::vector<float> topk_ws(EM, 1.0f);
+  std::vector<int32_t> expert_ids(EM / BLOCK_M, 0);
+
+  std::vector<uint16_t> act_h(EM * ispp, 0);
+  std::vector<float> out_h(M * hidden, 0.0f);
+
+  fused_moe_mxfp4_cpu(
+      A_bf16.data(), w13.data(), w13_scale.data(),
+      w2.data(), w2_scale.data(),
+      sorted_ids.data(), topk_ws.data(), expert_ids.data(),
+      act_h.data(), out_h.data(),
+      M, hidden, ispp, 1, EM, group_size,
+      0.0f, 0, 4.0f, 25.0f, nullptr, nullptr);
+
+  // inf and NaN propagate through the GEMM and activation.
+  for (int i = 0; i < EM * ispp; ++i) {
+    EXPECT_TRUE(std::isnan(bf2f(act_h[i])));
+  }
+  for (int i = 0; i < M * hidden; ++i) {
+    EXPECT_TRUE(std::isnan(out_h[i]));
+  }
+}
+
+TEST(FusedMoe, Ue8m0SubnormalScale) {
+  constexpr int M = 16, hidden = 128, ispp = 64;
+  constexpr int group_size = 32, BLOCK_M = 16;
+  constexpr int EM = M;
+
+  std::vector<uint16_t> A_bf16(M * hidden, f2bf(1.0f));
+  std::vector<uint8_t> w13(2 * ispp * hidden / 2, 0x22);  // 1.0
+  std::vector<uint8_t> w13_scale(2 * ispp * hidden / group_size, 0x00);
+  std::vector<uint8_t> w2(hidden * ispp / 2, 0x22);
+  std::vector<uint8_t> w2_scale(hidden * ispp / group_size, 0x00);
+
+  std::vector<int32_t> sorted_ids(EM);
+  std::iota(sorted_ids.begin(), sorted_ids.end(), 0);
+  std::vector<float> topk_ws(EM, 1.0f);
+  std::vector<int32_t> expert_ids(EM / BLOCK_M, 0);
+
+  std::vector<uint16_t> act_h(EM * ispp, 0);
+  std::vector<float> out_h(M * hidden, 0.0f);
+
+  fused_moe_mxfp4_cpu(
+      A_bf16.data(), w13.data(), w13_scale.data(),
+      w2.data(), w2_scale.data(),
+      sorted_ids.data(), topk_ws.data(), expert_ids.data(),
+      act_h.data(), out_h.data(),
+      M, hidden, ispp, 1, EM, group_size,
+      0.0f, 0, 4.0f, 25.0f, nullptr, nullptr);
+
+  // scale 0x00 decodes to 2^-127; weights ~2^-127, so gate ≈ 2^-120 and
+  // act ≈ 2^-241 underflows to zero.
+  for (int i = 0; i < EM * ispp; ++i) {
+    EXPECT_NEAR(bf2f(act_h[i]), 0.0f, 1e-30f);
+  }
+  for (int i = 0; i < M * hidden; ++i) {
+    EXPECT_NEAR(out_h[i], 0.0f, 1e-30f);
+  }
+}
+
+TEST(FusedMoe, PaddingTokens) {
+  constexpr int M = 8, hidden = 128, ispp = 64, top_k = 1;
+  constexpr int group_size = 32, BLOCK_M = 16;
+  constexpr int EM = 16;  // one block: 8 real tokens + 8 padding
+
+  std::vector<uint16_t> A_bf16(M * hidden, f2bf(1.0f));
+  uint8_t one_byte = pack_e2m1_pair(1.0f, 1.0f);
+  std::vector<uint8_t> w13(2 * ispp * hidden / 2, one_byte);
+  std::vector<uint8_t> w13_scale(2 * ispp * hidden / group_size, 127);
+  std::vector<uint8_t> w2(hidden * ispp / 2, one_byte);
+  std::vector<uint8_t> w2_scale(hidden * ispp / group_size, 127);
+
+  // Real tokens flat 0..7; padding uses flat = N = 8 (>= N → zero-filled).
+  std::vector<int32_t> sorted_ids(EM, 8);
+  for (int i = 0; i < M; ++i) sorted_ids[i] = i;
+  std::vector<float> topk_ws(EM, 1.0f);
+  std::vector<int32_t> expert_ids(EM / BLOCK_M, 0);
+
+  std::vector<uint16_t> act_h(EM * ispp, 0);
+  std::vector<float> out_h(M * hidden, 0.0f);
+
+  fused_moe_mxfp4_cpu(
+      A_bf16.data(), w13.data(), w13_scale.data(),
+      w2.data(), w2_scale.data(),
+      sorted_ids.data(), topk_ws.data(), expert_ids.data(),
+      act_h.data(), out_h.data(),
+      M, hidden, ispp, top_k, EM, group_size,
+      0.0f, 0, 4.0f, 25.0f, nullptr, nullptr);
+
+  float silu128 = 128.0f / (1.0f + std::exp(-128.0f));
+  float expected_out = silu128 * 128.0f * static_cast<float>(ispp);
+  for (int i = 0; i < M * hidden; ++i) {
+    float err = std::fabs(out_h[i] - expected_out);
+    EXPECT_LT(err / expected_out, 1e-2f);
+  }
+  // Padding act entries are never written (skipped in the epilogue).
+  for (int i = M * ispp; i < EM * ispp; ++i) {
+    EXPECT_NEAR(bf2f(act_h[i]), 0.0f, 1e-6f);
+  }
+}
+
+// ======================================================================
 //  Multi-expert: E=4, varied expert weights
 // ======================================================================
 TEST(FusedMoe, MultiExpert) {

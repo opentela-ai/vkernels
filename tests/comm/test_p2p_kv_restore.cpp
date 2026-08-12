@@ -289,6 +289,35 @@ TEST(KvRestore, FusedEqualsTwoStageMultiPage) {
   }
 }
 
+TEST(KvRestore, TwoStageAsyncEqualsSync) {
+  constexpr std::size_t kPageSize = 2, kHeads = 2, kHeadDim = 16, kElem = 2;
+  auto p0 = make_page(kPageSize, kHeads, kHeadDim, kElem, 0x21);
+  auto p1 = make_page(kPageSize, kHeads, kHeadDim, kElem, 0x9A);
+  constexpr std::size_t kSlots = 8;
+  const int slot_ids[4] = {1, 6, 3, 7};
+  const void* ptrs[2] = {p0.data(), p1.data()};
+  const std::size_t offs[2] = {0, 0};
+
+  auto ka = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto va = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto ks = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vs = make_dst(kSlots, kHeads, kHeadDim, kElem);
+
+  Stream s;
+  std::size_t before = s.submitted();
+  p2p_kv_restore_layer_twostage(ka.data(), va.data(), slot_ids, ptrs, offs,
+                                2, kPageSize, kHeads, kHeadDim, kElem, &s);
+  EXPECT_EQ(s.submitted() - before, 2u);  // one task per page
+  s.wait();
+  p2p_kv_restore_layer_twostage(ks.data(), vs.data(), slot_ids, ptrs, offs,
+                                2, kPageSize, kHeads, kHeadDim, kElem);
+
+  for (std::size_t i = 0; i < ka.size(); ++i) {
+    ASSERT_EQ(ka[i], ks[i]);
+    ASSERT_EQ(va[i], vs[i]);
+  }
+}
+
 // Test realistic shapes from the acceptance criteria.
 TEST(KvRestore, RealisticShapesBF16) {
   // head_dim 64, 128, 256; page_size 16, 32, 64; num_kv_heads = 4

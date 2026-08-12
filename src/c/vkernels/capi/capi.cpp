@@ -144,9 +144,9 @@ template <typename T>
 void* malloc_copy(const std::vector<T>& v) {
   void* p = std::malloc(v.size() * sizeof(T));
   if (p == nullptr && !v.empty()) {
-    g_last_error = "malloc failed";
-    g_last_error_code = VK_ERROR_INTERNAL;
-    return nullptr;
+    g_last_error = "malloc failed";         // LCOV_EXCL_LINE
+    g_last_error_code = VK_ERROR_INTERNAL;  // LCOV_EXCL_LINE
+    return nullptr;                         // LCOV_EXCL_LINE
   }
   if (!v.empty()) std::memcpy(p, v.data(), v.size() * sizeof(T));
   return p;
@@ -391,9 +391,9 @@ int32_t vk_make_ring_channels(int32_t world, vk_channel*** out,
   vk_channel** arr = static_cast<vk_channel**>(
       std::malloc(channels.size() * sizeof(vk_channel*)));
   if (arr == nullptr) {
-    g_last_error = "malloc failed";
-    g_last_error_code = VK_ERROR_INTERNAL;
-    return VK_ERROR_INTERNAL;
+    g_last_error = "malloc failed";         // LCOV_EXCL_LINE
+    g_last_error_code = VK_ERROR_INTERNAL;  // LCOV_EXCL_LINE
+    return VK_ERROR_INTERNAL;               // LCOV_EXCL_LINE
   }
   for (std::size_t i = 0; i < channels.size(); ++i) {
     vk_channel_impl* c = new vk_channel_impl{};

@@ -11,6 +11,7 @@
 #include "minitest.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -245,6 +246,15 @@ TEST(AsyncCopyDefault, ReturnsBool) {
   bool result = use_async_copy_default();
   (void)result;
   EXPECT_NO_THROW(use_async_copy_default());
+}
+
+TEST(AsyncCopyDefault, EnvVarOverride) {
+  ::setenv("K3_NO_ASYNC", "1", 1);
+  EXPECT_FALSE(use_async_copy_default());  // "1" forces OFF
+  ::setenv("K3_NO_ASYNC", "0", 1);
+  EXPECT_TRUE(use_async_copy_default());  // anything but "1" → ON
+  ::unsetenv("K3_NO_ASYNC");
+  EXPECT_TRUE(use_async_copy_default());  // default ON
 }
 
 // ======================================================================

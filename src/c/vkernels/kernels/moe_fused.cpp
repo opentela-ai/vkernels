@@ -54,16 +54,12 @@ float ue8m0_to_float(uint8_t s) {
     float f;
     std::memcpy(&f, &bits, sizeof(float));
     return f;
-  } else {
-    int shift = -(unbiased + 126);
-    if (shift < 32) {
-      uint32_t mant = 0x00800000u >> shift;
-      float f;
-      std::memcpy(&f, &mant, sizeof(float));
-      return f;
-    }
-    return 0.0f;
   }
+  // Only s == 0 reaches here: the smallest subnormal, 2^-127.
+  uint32_t mant = 0x00400000u;
+  float f;
+  std::memcpy(&f, &mant, sizeof(float));
+  return f;
 }
 
 // ======================================================================
