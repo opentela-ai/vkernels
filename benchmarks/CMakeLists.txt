@@ -19,3 +19,8 @@ add_executable(p2p_gather_bench p2p_gather_bench.cu)
 target_link_libraries(p2p_gather_bench PRIVATE vkernels::vkernels)
 target_compile_features(p2p_gather_bench PRIVATE cxx_std_17)
 vkernels_set_warnings(p2p_gather_bench)
+
+add_executable(p2p_kv_restore_bench p2p_kv_restore_bench.cu)
+target_link_libraries(p2p_kv_restore_bench PRIVATE vkernels::vkernels)
+target_compile_features(p2p_kv_restore_bench PRIVATE cxx_std_17)
+vkernels_set_warnings(p2p_kv_restore_bench)

@@ -18,6 +18,7 @@ target_sources(vkernels
     vkernels/comm/allreduce.cpp
     vkernels/comm/overlap.cpp
     vkernels/comm/p2p_gather.cpp
+    vkernels/comm/p2p_kv_restore.cpp
     vkernels/capi/capi.cpp
 )
 
@@ -35,7 +36,8 @@ if(VKERNELS_HAS_CUDA)
       vkernels/kernels/reduce.cu
       vkernels/kernels/gemm.cu
       vkernels/comm/allreduce.cu
-      vkernels/comm/p2p_gather.cu)
+      vkernels/comm/p2p_gather.cu
+      vkernels/comm/p2p_kv_restore.cu)
   set_target_properties(vkernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
   # C ABI shared library: `extern "C"` entry points over the CUDA primitive,
@@ -44,7 +46,7 @@ if(VKERNELS_HAS_CUDA)
   # folds every C++ exception into a status code so nothing is thrown across
   # the boundary. Built only with a CUDA toolkit — the entry points take a
   # raw cudaStream_t.
-  add_library(vkernels_c SHARED vkernels/comm/p2p_gather_c.cu)
+  add_library(vkernels_c SHARED vkernels/comm/p2p_gather_c.cu vkernels/comm/p2p_kv_restore_c.cu)
   add_library(vkernels::vkernels_c ALIAS vkernels_c)
   target_link_libraries(vkernels_c PRIVATE vkernels)
   target_include_directories(vkernels_c PRIVATE
