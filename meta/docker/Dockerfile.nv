@@ -1,0 +1,97 @@
+# meta/docker/Dockerfile.nv
+#
+# Build container for vkernels with NVIDIA CUDA support.
+# Uses nvcr.io/nvidia/pytorch:26.07-py3, which bundles:
+#   - CUDA toolkit + drivers
+#   - PyTorch with CUDA backend
+#   - Python 3.12+
+#   - Ubuntu 24.04 base
+#
+# Build (from vkernels repo root):
+#   podman build -t vkernels:cuda -f meta/docker/Dockerfile.nv .
+#
+# Run tests + benchmarks:
+#   podman run --rm --gpus all vkernels:cuda
+#
+# Run interactively:
+#   podman run --gpus all -it vkernels:cuda bash
+#
+# Profile a benchmark:
+#   podman run --gpus all --cap-add SYS_ADMIN \
+#       vkernels:cuda nsys profile -o /tmp/report \
+#       /workspace/vkernels/build-cuda/benchmarks/moe_bench
+#
+# Override target architectures at build time:
+#   podman build --build-arg CUDA_ARCHS="80;86;90" \
+#       -t vkernels:cuda -f meta/docker/Dockerfile.nv .
+
+FROM nvcr.io/nvidia/pytorch:26.07-py3
+
+# Build-time arguments
+ARG CUDA_ARCHS=native
+ARG NSIGHT_SYSTEMS_VER=2025.6
+ARG NSIGHT_COMPUTE_VER=2025.4
+
+# ------------------------------------------------------------------
+# System dependencies
+# ------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake ninja-build \
+    git curl ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------------
+# Nsight Systems (nsys) — timeline profiler
+# ------------------------------------------------------------------
+RUN wget -q --show-progress \
+    "https://developer.download.nvidia.com/compute/nsight-systems/${NSIGHT_SYSTEMS_VER}/nsight-systems-${NSIGHT_SYSTEMS_VER}_${NSIGHT_SYSTEMS_VER}-1_amd64.deb" \
+    -O /tmp/nsys.deb \
+    && apt-get update && apt-get install -y --no-install-recommends /tmp/nsys.deb \
+    && rm /tmp/nsys.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------------
+# Nsight Compute (ncu) — kernel profiler
+# ------------------------------------------------------------------
+RUN wget -q --show-progress \
+    "https://developer.download.nvidia.com/compute/nsight-compute/${NSIGHT_COMPUTE_VER}/nsight-compute_${NSIGHT_COMPUTE_VER}-1_amd64.deb" \
+    -O /tmp/ncu.deb \
+    && apt-get update && apt-get install -y --no-install-recommends /tmp/ncu.deb \
+    && rm /tmp/ncu.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------------
+# vkernels: build library + benchmarks + tests
+# ------------------------------------------------------------------
+WORKDIR /workspace/vkernels
+COPY . .
+
+RUN rm -rf build-cuda && \
+    cmake -B build-cuda -G Ninja \
+    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+    -DVKERNELS_BUILD_CUDA=ON \
+    -DVKERNELS_BUILD_HIP=OFF \
+    -DVKERNELS_BUILD_TESTS=ON \
+    -DVKERNELS_BUILD_BENCHMARKS=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build-cuda -j$(nproc)
+
+# ------------------------------------------------------------------
+# Verify toolchain
+# ------------------------------------------------------------------
+RUN python3 -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())" \
+    && nvcc --version \
+    && nsys --version \
+    && ncu --version \
+    && nvidia-smi
+
+CMD ["bash", "-c", "\
+echo '=== vkernels tests ===' && \
+cd /workspace/vkernels/build-cuda && ctest --output-on-failure && \
+echo && echo '=== vkernels moe benchmark ===' && \
+./benchmarks/moe_bench && \
+echo && echo '=== vkernels p2p gather benchmark ===' && \
+./benchmarks/p2p_gather_bench && \
+echo && echo '=== vkernels p2p kv restore benchmark ===' && \
+./benchmarks/p2p_kv_restore_bench \
+"]

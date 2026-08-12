@@ -14,6 +14,7 @@ target_sources(vkernels
     vkernels/kernels/elementwise.cpp
     vkernels/kernels/reduce.cpp
     vkernels/kernels/gemm.cpp
+    vkernels/kernels/moe.cpp
     vkernels/comm/channel.cpp
     vkernels/comm/allreduce.cpp
     vkernels/comm/overlap.cpp
@@ -55,9 +56,19 @@ if(VKERNELS_HAS_CUDA)
   vkernels_set_warnings(vkernels_c)
 endif()
 
-# Propagate the CUDA availability flag to consumers and to the library's
-# own translation units.
-target_compile_definitions(vkernels PUBLIC $<$<BOOL:${VKERNELS_HAS_CUDA}>:VKERNELS_HAS_CUDA=1>)
+# HIP sources compile only when ROCm is present.
+if(VKERNELS_HAS_HIP)
+  target_sources(vkernels
+    PRIVATE
+      vkernels/kernels/moe.hip)
+  set_target_properties(vkernels PROPERTIES HIP_SEPARABLE_COMPILATION ON)
+endif()
+
+# Propagate the CUDA and HIP availability flags to consumers and to the
+# library's own translation units.
+target_compile_definitions(vkernels PUBLIC
+  $<$<BOOL:${VKERNELS_HAS_CUDA}>:VKERNELS_HAS_CUDA=1>
+  $<$<BOOL:${VKERNELS_HAS_HIP}>:VKERNELS_HAS_HIP=1>)
 
 target_link_libraries(vkernels PUBLIC Threads::Threads)
 
