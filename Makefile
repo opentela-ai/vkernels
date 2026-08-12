@@ -26,7 +26,7 @@ coverage:
 	cmake --preset coverage
 	cmake --build --preset coverage
 	ctest --preset coverage
-	python3 scripts/coverage.py --build-dir build/coverage --source-dir csrc --min 100
+	python3 meta/scripts/coverage.py --build-dir build/coverage --source-dir src/c --min 100
 
 clean:
 	rm -rf build/$(P)
@@ -40,7 +40,7 @@ tidy:
 	@command -v clang-tidy >/dev/null 2>&1 || { echo "clang-tidy not installed"; exit 1; }; \
 	clang-tidy -p build/$(P) $$(git ls-files '*.cpp' '*.hpp')
 
-# Python CLI (src/) — managed by uv (see pyproject.toml):
+# Python CLI (src/python/) — managed by uv (see pyproject.toml):
 #   make py-sync         uv sync -> .venv/ + editable install + uv.lock
 #   make vkl ARGS=list   run `vkl list` (default ARGS=list)
 #   make py-test         run the CLI's unittest suite (or: uv run pytest)
@@ -57,10 +57,10 @@ py-sync:
 py-lock:
 	uv lock
 
-# Rust bindings (rust/) — cargo builds the C++ library itself:
+# Rust bindings (src/rust/) — cargo builds the C++ library itself:
 #   make rust-test       cargo test (host path by default)
 #   VKERNELS_RUST_CUDA=ON make rust-test   also compile the CUDA kernels
 rust-test:
-	cargo test --manifest-path rust/Cargo.toml
+	cargo test --manifest-path src/rust/Cargo.toml
 
 .PHONY: configure build test coverage clean fmt tidy vkl py-test py-sync py-lock rust-test

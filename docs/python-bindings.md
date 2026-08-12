@@ -1,16 +1,16 @@
 # Python bindings
 
-The Python package under [`src/vkernels/`](../src/vkernels/) is the documented
+The Python package under [`src/python/vkernels/`](../src/python/vkernels/) is the documented
 way to drive the kernels and communication primitives in
-[`csrc/vkernels/`](../csrc/vkernels/) from Python. It has two layers:
+[`src/c/vkernels/`](../src/c/vkernels/) from Python. It has two layers:
 
-* **Discovery / CLI** — [`vkernels.discovery`](../src/vkernels/discovery.py)
-  scans the C++/CUDA sources and [`vkernels.cli`](../src/vkernels/cli/) backs
+* **Discovery / CLI** — [`vkernels.discovery`](../src/python/vkernels/discovery.py)
+  scans the C++/CUDA sources and [`vkernels.cli`](../src/python/vkernels/cli/) backs
   the `vkl` command (`python3 -m vkernels.cli list`). No third-party
   dependencies.
-* **Bindings** — [`vkernels.kernels`](../src/vkernels/kernels.py),
-  [`vkernels.comm`](../src/vkernels/comm.py) and
-  [`vkernels.core`](../src/vkernels/core.py) implement the callable
+* **Bindings** — [`vkernels.kernels`](../src/python/vkernels/kernels.py),
+  [`vkernels.comm`](../src/python/vkernels/comm.py) and
+  [`vkernels.core`](../src/python/vkernels/core.py) implement the callable
   interface to the kernels. These require numpy.
 
 This document covers the bindings.
@@ -21,8 +21,8 @@ The public modules dispatch to one of two interchangeable backends:
 
 | Backend | Implementation | When used |
 |---|---|---|
-| **compiled** | [`vkernels._core`](../src/vkernels/_core.cpp) — a pybind11 extension that calls the C++ library directly | whenever the extension can be loaded (see below) |
-| **fallback** | [`vkernels._fallback`](../src/vkernels/_fallback.py) — pure-Python (numpy) reference mirroring the C++ CPU oracles | when the extension is not built / not loadable |
+| **compiled** | [`vkernels._core`](../src/python/vkernels/_core.cpp) — a pybind11 extension that calls the C++ library directly | whenever the extension can be loaded (see below) |
+| **fallback** | [`vkernels._fallback`](../src/python/vkernels/_fallback.py) — pure-Python (numpy) reference mirroring the C++ CPU oracles | when the extension is not built / not loadable |
 
 The active backend is exposed as `vkernels.backend` (`"compiled"` or
 `"fallback"`). Both backends are bit-identical for element-wise ops, GEMM
@@ -32,7 +32,7 @@ backend is the fast path and the one that exercises the real kernels; the
 fallback keeps the package importable and testable on any laptop — the same
 "CPU reference always works" philosophy as the C++ side.
 
-The loader ([`vkernels/_backend.py`](../src/vkernels/_backend.py)) resolves
+The loader ([`vkernels/_backend.py`](../src/python/vkernels/_backend.py)) resolves
 the extension in this order:
 
 1. an importable `vkernels._core` (installed copy, or `PYTHONPATH` pointing
@@ -51,7 +51,7 @@ cmake --build --preset python
 ctest --preset python        # includes the Python test suite
 ```
 
-This compiles [`src/vkernels/_core.cpp`](../src/vkernels/_core.cpp) into
+This compiles [`src/python/vkernels/_core.cpp`](../src/python/vkernels/_core.cpp) into
 `build/python/python/vkernels/_core.cpython-*.so`. pybind11 is found via
 `find_package` or fetched at configure time (pinned release); a CUDA build
 (`--preset cuda -DVKERNELS_BUILD_PYTHON=ON`) links the same extension against
@@ -68,7 +68,7 @@ cmake --preset python -DVKERNELS_PYTHON_EXECUTABLE=/path/to/venv/bin/python
 Without a build, everything still works through the fallback:
 
 ```sh
-python3 -c "import numpy, sys; sys.path.insert(0, 'src'); import vkernels; print(vkernels.backend)"  # fallback
+python3 -c "import numpy, sys; sys.path.insert(0, 'src/python'); import vkernels; print(vkernels.backend)"  # fallback
 ```
 
 ## Usage
@@ -201,17 +201,19 @@ numpy when the system Python does not).
 ```
 pyproject.toml                # uv-managed Python project (src-layout, numpy dep)
 ├── src/
-│   ├── CMakeLists.txt        # extension build + Python tests under CTest
-│   └── vkernels/
-│       ├── __init__.py       # version, backend flag, lazy submodules
-│       ├── _backend.py       # extension loader (compiled vs fallback)
-│       ├── _core.cpp         # pybind11 bindings to csrc (the caller)
-│       ├── _fallback.py      # pure-Python reference (numpy)
-│       ├── _types.py         # shared dataclasses (Topology, runs, ...)
-│       ├── core.py           # public Device/Stream API
-│       ├── kernels.py        # public elementwise/reduce/gemm API
-│       ├── comm.py           # public collectives/overlap/p2p API
-│       ├── discovery.py      # C++/CUDA source scanner (no deps)
-│       └── cli/              # the `vkl` command
+│   ├── python/
+│   │   ├── CMakeLists.txt    # extension build + Python tests under CTest
+│   │   └── vkernels/
+│   │       ├── __init__.py   # version, backend flag, lazy submodules
+│   │       ├── _backend.py   # extension loader (compiled vs fallback)
+│   │       ├── _core.cpp     # pybind11 bindings to src/c (the caller)
+│   │       ├── _fallback.py  # pure-Python reference (numpy)
+│   │       ├── _types.py     # shared dataclasses (Topology, runs, ...)
+│   │       ├── core.py       # public Device/Stream API
+│   │       ├── kernels.py    # public elementwise/reduce/gemm API
+│   │       ├── comm.py       # public collectives/overlap/p2p API
+│   │       ├── discovery.py  # C++/CUDA source scanner (no deps)
+│   │       └── cli/          # the `vkl` command
+│   └── rust/                 # Rust bindings (workspace: vkernels-sys FFI + vkernels)
 └── tests/python/             # unittest suites (CTest, uv, make py-test)
 ```

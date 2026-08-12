@@ -1,0 +1,21 @@
+# meta/docker/.dockerignore
+# Keep build context small — exclude git and pre-existing build artifacts.
+
+.git
+.gitignore
+.gitattributes
+
+build/
+build-*/
+out/
+
+*.o
+*.a
+*.so
+
+.agents/
+.venv/
+__pycache__/
+*.pyc
+
+rust/

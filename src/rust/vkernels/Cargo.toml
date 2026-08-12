@@ -1,0 +1,18 @@
+# vkernels — safe Rust bindings to the vkernels kernel library.
+#
+# Built on vkernels-sys (which links the C++ static library built from src/c/
+# via its C ABI). Mirrors the Python bindings under src/python/: kernels, core
+# (device/stream) and comm (topology, channels, ring all-reduce, overlap,
+# p2p run-list gather). See docs/rust-bindings.md.
+[package]
+name = "vkernels"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+
+[dependencies]
+vkernels-sys = { workspace = true }
+
+[dev-dependencies]
+rand = "0.8"

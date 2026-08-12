@@ -6,15 +6,15 @@ memory into one local scratch buffer, replacing the per-run
 `PeerFetcher.fetch_pages_into_scratch` pay for a fragmented hit prefix.
 
 ```
-csrc/vkernels/comm/p2p_gather.hpp      public API + contract
-csrc/vkernels/comm/p2p_gather.cpp      host reference (the correctness oracle)
-csrc/vkernels/comm/p2p_gather.cu       CUDA single-launch kernel
-csrc/vkernels/comm/p2p_gather_cuda.hpp CUDA-only declarations (cudaStream_t)
-csrc/vkernels/comm/p2p_gather_c.h      C ABI (extern "C", status codes)
-csrc/vkernels/comm/p2p_gather_c.cu     C ABI implementation (CUDA-gated)
+src/c/vkernels/comm/p2p_gather.hpp      public API + contract
+src/c/vkernels/comm/p2p_gather.cpp      host reference (the correctness oracle)
+src/c/vkernels/comm/p2p_gather.cu       CUDA single-launch kernel
+src/c/vkernels/comm/p2p_gather_cuda.hpp CUDA-only declarations (cudaStream_t)
+src/c/vkernels/comm/p2p_gather_c.h      C ABI (extern "C", status codes)
+src/c/vkernels/comm/p2p_gather_c.cu     C ABI implementation (CUDA-gated)
 tests/comm/test_p2p_gather.cpp         host oracle tests
 tests/comm/test_p2p_gather_c.cu       C ABI runtime tests (CUDA-gated)
-benchmarks/p2p_gather_bench.cu         CUDA sweep vs the per-run loop
+meta/benchmarks/p2p_gather_bench.cu         CUDA sweep vs the per-run loop
 ```
 
 ## API
@@ -256,9 +256,9 @@ caught inside the wrapper and mapped to `VKERNELS_ERR_INVALID_ARGUMENT` or
 ```sh
 cmake --preset cuda -DVKERNELS_BUILD_BENCHMARKS=ON
 cmake --build --preset cuda
-./build/cuda/benchmarks/p2p_gather_bench            # idle GPU
-./build/cuda/benchmarks/p2p_gather_bench --concurrent  # persistent filler on a 2nd stream
-VK_BENCH_FILL_BLOCKS=1024 ./build/cuda/benchmarks/p2p_gather_bench --concurrent  # full-occupancy load
+./build/cuda/meta/benchmarks/p2p_gather_bench            # idle GPU
+./build/cuda/meta/benchmarks/p2p_gather_bench --concurrent  # persistent filler on a 2nd stream
+VK_BENCH_FILL_BLOCKS=1024 ./build/cuda/meta/benchmarks/p2p_gather_bench --concurrent  # full-occupancy load
 ```
 
 The `--concurrent` filler is a persistent kernel occupying one block per SM

@@ -48,8 +48,8 @@ __pycache__/
 .venv/
 venv/
 
-# Rust (bindings under rust/)
-/rust/target/
+# Rust (bindings under src/rust/)
+/src/rust/target/
 
 # Editor / OS
 .vscode/

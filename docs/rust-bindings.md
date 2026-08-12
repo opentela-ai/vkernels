@@ -1,22 +1,22 @@
 # Rust bindings
 
-The Rust workspace under [`rust/`](../rust/) is the Rust counterpart of the
-Python bindings under [`src/vkernels/`](../src/vkernels/): it drives the same
-kernels and communication primitives from [`csrc/vkernels/`](../csrc/vkernels/)
+The Rust workspace under [`src/rust/`](../src/rust/) is the Rust counterpart of the
+Python bindings under [`src/python/vkernels/`](../src/python/vkernels/): it drives the same
+kernels and communication primitives from [`src/c/vkernels/`](../src/c/vkernels/)
 with an idiomatic, safe API.
 
 It has two layers:
 
-* **`vkernels-sys`** ([`rust/vkernels-sys/`](../rust/vkernels-sys)) — the
+* **`vkernels-sys`** ([`src/rust/vkernels-sys/`](../src/rust/vkernels-sys)) — the
   unsafe FFI layer. Its `build.rs` configures the repository's own CMake
   build (the single source of truth for the library) with the `cmake` crate
   and links the resulting static library. The C ABI it binds to lives in
-  [`csrc/vkernels/capi/`](../csrc/vkernels/capi/) — `extern "C"` wrappers
+  [`src/c/vkernels/capi/`](../src/c/vkernels/capi/) — `extern "C"` wrappers
   around the C++ API that fold every C++ exception into a status code plus a
   thread-local message (exceptions cannot cross the ABI). The C shim is
   compiled into the `vkernels` static library itself, so there is nothing
   extra to link.
-* **`vkernels`** ([`rust/vkernels/`](../rust/vkernels)) — the safe,
+* **`vkernels`** ([`src/rust/vkernels/`](../src/rust/vkernels)) — the safe,
   idiomatic API built on `vkernels-sys`, mirroring the Python modules
   `vkernels.kernels`, `vkernels.comm` and `vkernels.core` function for
   function. Contract violations (length mismatches, empty inputs, invalid
@@ -32,7 +32,7 @@ library is compiled by CMake in the host (CPU-reference) configuration by
 default, so no CUDA toolkit is required:
 
 ```sh
-cargo test --manifest-path rust/Cargo.toml    # from the repository root
+cargo test --manifest-path src/rust/Cargo.toml    # from the repository root
 # or: make rust-test
 # or, via the CMake presets (registers `rust_bindings` with CTest):
 cmake --preset rust
@@ -44,7 +44,7 @@ With a CUDA toolkit, set `VKERNELS_RUST_CUDA=ON` when building to compile
 the CUDA kernels too (the same entry points then drive the GPU path):
 
 ```sh
-VKERNELS_RUST_CUDA=ON cargo test --manifest-path rust/Cargo.toml
+VKERNELS_RUST_CUDA=ON cargo test --manifest-path src/rust/Cargo.toml
 ```
 
 `vkernels::has_cuda()` reports how the linked library was built.
@@ -172,7 +172,7 @@ panics, and only on an out-of-memory failure of the C++ side.
 ## Testing
 
 ```sh
-cargo test --manifest-path rust/Cargo.toml   # unit + integration tests
+cargo test --manifest-path src/rust/Cargo.toml   # unit + integration tests
 ctest --preset rust                          # same, via CTest (rust_bindings)
 ```
 
@@ -186,15 +186,15 @@ rest of the repository.
 ## Layout
 
 ```
-rust/                         # Rust workspace
+src/rust/                     # Rust workspace
 ├── Cargo.toml                #   members: vkernels-sys, vkernels
-├── vkernels-sys/             #   unsafe FFI (build.rs drives CMake, links csrc)
+├── vkernels-sys/             #   unsafe FFI (build.rs drives CMake, links src/c)
 │   ├── build.rs              #     cmake crate + link lines (CUDA opt-in)
 │   └── src/lib.rs            #     extern "C" declarations of the C ABI
 └── vkernels/                 #   safe API
     ├── src/{lib,core,kernels,comm}.rs
     └── tests/                #   integration tests (mirror tests/python)
-csrc/vkernels/capi/           # C ABI shim compiled into the vkernels library
+src/c/vkernels/capi/           # C ABI shim compiled into the vkernels library
 ├── capi.hpp                  #   the C interface (also usable from plain C)
 └── capi.cpp                  #   exception -> status-code translation
 ```

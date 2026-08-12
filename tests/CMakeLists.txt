@@ -14,6 +14,7 @@ vkernels_add_test(NAME allocator   SOURCES core/test_allocator.cpp)
 vkernels_add_test(NAME elementwise SOURCES kernels/elementwise/test_elementwise.cpp)
 vkernels_add_test(NAME reduce      SOURCES kernels/reduce/test_reduce.cpp)
 vkernels_add_test(NAME gemm        SOURCES kernels/gemm/test_gemm.cpp)
+vkernels_add_test(NAME moe         SOURCES kernels/moe/test_moe.cpp)
 vkernels_add_test(NAME topology    SOURCES comm/test_topology.cpp)
 vkernels_add_test(NAME channel     SOURCES comm/test_channel.cpp)
 vkernels_add_test(NAME allreduce   SOURCES comm/test_allreduce.cpp)
@@ -27,9 +28,9 @@ vkernels_add_test(NAME p2p_kv_restore SOURCES comm/test_p2p_kv_restore.cpp)
 # (pulled in automatically for .cu translation units).
 if(VKERNELS_HAS_CUDA)
   vkernels_add_test(NAME p2p_gather_c SOURCES comm/test_p2p_gather_c.cu
-                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/csrc
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
                     LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
   vkernels_add_test(NAME p2p_kv_restore_c SOURCES comm/test_p2p_kv_restore_c.cu
-                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/csrc
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
                     LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
 endif()

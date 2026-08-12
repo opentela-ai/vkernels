@@ -10,5 +10,5 @@ Checks: >
   -readability-identifier-length,
   -bugprone-easily-swappable-parameters
 WarningsAsErrors: ''
-HeaderFilterRegex: 'csrc/.*'
+HeaderFilterRegex: 'src/c/.*'
 FormatStyle: file

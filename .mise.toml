@@ -1,0 +1,51 @@
+# mise configuration for the vkernels multi-language repository.
+#
+#   mise install          install all tool versions below
+#   mise run configure    cmake configure (P=host by default)
+#   mise run build        cmake build
+#   mise run test         run all tests (C++ + Python)
+#   mise run py-sync      uv sync -> .venv/
+#   mise run fmt          clang-format check
+#
+# CUDA & HIP toolkits are typically installed at the system level
+# (see CMakePresets.json); they are not pinned here.
+
+[tools]
+python = "3.12"              # pyproject.toml requires >=3.9; uv manages .venv/
+uv = "latest"                # Python package manager (see pyproject.toml)
+cmake = "latest"             # build system (CMakeLists.txt requires >=3.18)
+rust = "latest"              # optional: src/rust/ bindings (edition 2021)
+clang-format = "latest"      # also provides clang-tidy (from LLVM via asdf)
+ccache = "latest"            # optional: faster C++ recompilation
+ninja = "latest"             # optional: alternative CMake generator
+
+[env]
+# Tell uv to target the repository-local virtualenv.
+UV_PROJECT_ENVIRONMENT = ".venv"
+
+[tasks]
+# ---- C/C++ build (mirrors Makefile) ----
+configure = "cmake --preset ${P:-host}"
+build = "cmake --build --preset ${P:-host}"
+test = "cmake --build --preset ${P:-host} --target test"
+clean = "rm -rf build/${P:-host}"
+
+# ---- Python (uv) ----
+py-sync = "uv sync"
+py-test = "uv run python -m unittest discover -s tests/python -v"
+vkl = "uv run vkl"
+
+# ---- Rust bindings ----
+rust-test = "cargo test --manifest-path src/rust/Cargo.toml"
+
+# ---- Code quality ----
+fmt = "clang-format --dry-run -i $(git ls-files '*.cpp' '*.hpp' '*.h' '*.cu' '*.cuh')"
+fmt-check = "clang-format --dry-run --Werror -i $(git ls-files '*.cpp' '*.hpp' '*.h' '*.cu' '*.cuh')"
+
+# ---- Coverage ----
+coverage = [
+    "cmake --preset coverage",
+    "cmake --build --preset coverage",
+    "ctest --preset coverage",
+    "python3 meta/scripts/coverage.py --build-dir build/coverage --source-dir src/c --min 100",
+]
