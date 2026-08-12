@@ -1,6 +1,6 @@
 // meta/benchmarks/test_moe_fused_prefill_correct.hip
 //
-// Correctness test for the PREFILL tile config (BM=64, BN=128, 256 threads)
+// Correctness test for the PREFILL tile config (BM=64, BN=64, 256 threads)
 // of the fused MXFP4 MoE HIP kernel, checked against the CPU reference.
 //
 // The CPU oracle always uses the decode tiling (BLOCK_M=16); the GPU prefill

@@ -39,11 +39,12 @@ static constexpr int kMfmaK    = 16;
 static constexpr int kWarps    = 4;
 static constexpr int kWhreads  = 64;
 
-// Prefill tile config (M > 32): 64x128 tiles, 256 threads (4 wavefronts).
-// Bigger M-tiles raise arithmetic intensity ~3.3x by reusing the dequantized
-// B weights across 64 rows instead of 16, and a wider N-tile reuses the A
-// tile across 128 columns.
-static constexpr int kBM_pf = 64, kBN_pf = 128, kBK_pf = 64;
+// Prefill tile config (M > 32): 64x64 tiles, 256 threads (4 wavefronts).
+// A 64-row M-tile reuses each dequantized B column across 64 rows instead of
+// 16.  BN is 64, not 128: BN=128 (24 KB LDS + 64 accumulator VGPRs) caps the
+// kernel at 2 blocks/CU, while BN=64 (16 KB LDS + 32 accumulator VGPRs) lifts
+// it to 3 blocks/CU — measured ~1.5x faster despite halving the B-tile reuse.
+static constexpr int kBM_pf = 64, kBN_pf = 64, kBK_pf = 64;
 static constexpr int kThreads_pf = 256;
 
 // ======================================================================
@@ -167,7 +168,7 @@ __device__ __forceinline__ void mfma_k64(
 }
 
 // ======================================================================
-//  Prefill helpers (BM=64, BN=128, 256 threads)
+//  Prefill helpers (BM=64, BN=64, 256 threads)
 // ======================================================================
 
 // Load the 64x64 A/act tile. 256 threads; each thread loads 16 bf16 (4 uint2).
@@ -225,21 +226,22 @@ __device__ __forceinline__ void load_act_tile_pf(
   }
 }
 
-// Dequant a packed fp4 weight tile into sB[kBK_pf][kBN_pf] (64x128).
-// packed: [N][K/2] row-major, N=128, K/2=32. 256 threads -> 16 bytes/thread.
-//   n = tid % 128, kp_grp = tid / 128; kp = kp_grp + 2*it (16 steps).
+// Dequant a packed fp4 weight tile into sB[kBK_pf][kBN] (64x64).
+// packed: [N][K/2] row-major, N=kBN, K/2=32. 256 threads.
+//   n = tid % kBN, kp_grp = tid / kBN; kp = kp_grp + (256/kBN)*it.
 // Consecutive threads write consecutive n (coalesced shared stores); the
 // global read is strided by stride_packed (uncoalesced, as in the decode
 // dequant) but each element is reused kBM_pf times by the MFMA loop.
+template <int kBN>
 __device__ __forceinline__ void dequant_b_pf(
-    uint16_t sB[kBK_pf][kBN_pf],
+    uint16_t sB[kBK_pf][kBN],
     const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scale,
     int k_start, int stride_packed, int stride_scale_n, int tid) {
-  int n = tid & 127;          // tid % 128
-  int kp_grp = tid >> 7;      // tid / 128 (0..1)
-  constexpr int kPackedK = kBK_pf / 2;                    // 32
-  constexpr int kBytesPerThread = (kPackedK * kBN_pf) / kThreads_pf;  // 16
-  constexpr int kKpStep = kThreads_pf / kBN_pf;           // 2
+  int n = tid & (kBN - 1);
+  int kp_grp = tid / kBN;
+  constexpr int kPackedK = kBK_pf / 2;                     // 32
+  constexpr int kBytesPerThread = (kPackedK * kBN) / kThreads_pf;
+  constexpr int kKpStep = kThreads_pf / kBN;
   int kp_off = k_start / 2;
   int sc_off = k_start / kGroupSize;
   for (int it = 0; it < kBytesPerThread; ++it) {
@@ -258,12 +260,14 @@ __device__ __forceinline__ void dequant_b_pf(
   }
 }
 
-// Run the K=64 MFMA loop over 8 column fragments (BN=128) for one 16-row
+// Run the K=64 MFMA loop over kBN/16 column fragments for one 16-row
 // fragment.  Each wavefront (warp) owns row fragment warp (rows warp*16..+16)
 // and accumulates acc[nf] += sA[row_frag] x sB[:, nf*16..+16].
+template <int kBN>
 __device__ __forceinline__ void mfma_k64_pf(
-    v4f acc[8], const uint16_t sA[kBM_pf][kBK_pf],
-    const uint16_t sB[kBK_pf][kBN_pf], int warp, int lane) {
+    v4f acc[kBN / 16], const uint16_t sA[kBM_pf][kBK_pf],
+    const uint16_t sB[kBK_pf][kBN], int warp, int lane) {
+  constexpr int kNF = kBN / 16;
   int m = lane & 15;          // row within 16-row fragment
   int n = lane & 15;          // col within 16-col fragment
   int kq = lane >> 4;         // 0..3 -> which 4-K group
@@ -273,7 +277,7 @@ __device__ __forceinline__ void mfma_k64_pf(
     v4s a = { (short)sA[row_base + m][k0],     (short)sA[row_base + m][k0 + 1],
               (short)sA[row_base + m][k0 + 2], (short)sA[row_base + m][k0 + 3] };
 #pragma unroll
-    for (int nf = 0; nf < 8; ++nf) {
+    for (int nf = 0; nf < kNF; ++nf) {
       int nb = nf * 16 + n;
       v4s b = { (short)sB[k0][nb],     (short)sB[k0 + 1][nb],
                 (short)sB[k0 + 2][nb], (short)sB[k0 + 3][nb] };
@@ -427,9 +431,10 @@ __global__ void down_combine_kernel(
 
 // ======================================================================
 //  Prefill: Stage 0 — gate_up GEMM + SwiGLU → act [EM, ispp] bf16
-//  (BM=64, BN=128, 256 threads). One expert per 64-row block (the caller
-//  must align with block_size=64).
+//  (BM=64, BN=64, 256 threads). One expert per 64-row block (the
+//  caller must align with block_size=64).
 // ======================================================================
+template <int kBN>
 __global__ void gateup_swiglu_kernel_prefill(
     const uint16_t* __restrict__ A,
     const uint8_t*  __restrict__ w13,
@@ -440,8 +445,9 @@ __global__ void gateup_swiglu_kernel_prefill(
     const int32_t*  __restrict__ expert_ids,
     int hidden, int ispp, int M, int top_k, float swiglu_limit, int has_bias) {
 
+  constexpr int kNF = kBN / 16;
   __shared__ uint16_t sA[kBM_pf][kBK_pf];
-  __shared__ uint16_t sB[kBK_pf][kBN_pf];  // reused for gate then up
+  __shared__ uint16_t sB[kBK_pf][kBN];  // reused for gate then up
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int expert = expert_ids[pid_m];
@@ -453,7 +459,7 @@ __global__ void gateup_swiglu_kernel_prefill(
   int tid = threadIdx.x;
   int lane = tid & 63;
   int warp = tid >> 6;
-  int n_global = pid_n * kBN_pf;
+  int n_global = pid_n * kBN;
 
   const uint8_t* bp_gate = w13 + expert * w13_bytes
       + n_global * (hidden / 2);
@@ -464,9 +470,9 @@ __global__ void gateup_swiglu_kernel_prefill(
   const uint8_t* sc_up = w13_scale + expert * w13s_bytes
       + (n_global + ispp) * (hidden / kGroupSize);
 
-  v4f acc_g[8], acc_u[8];
+  v4f acc_g[kNF], acc_u[kNF];
 #pragma unroll
-  for (int nf = 0; nf < 8; ++nf) {
+  for (int nf = 0; nf < kNF; ++nf) {
     acc_g[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
     acc_u[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
   }
@@ -492,7 +498,7 @@ __global__ void gateup_swiglu_kernel_prefill(
   int row_base = warp * 16 + (lane >> 4) * 4;
   float lim = swiglu_limit;
 #pragma unroll
-  for (int nf = 0; nf < 8; ++nf) {
+  for (int nf = 0; nf < kNF; ++nf) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       int flat = sorted_ids[tk_base + row_base + i];
@@ -516,8 +522,9 @@ __global__ void gateup_swiglu_kernel_prefill(
 }
 
 // ======================================================================
-//  Prefill: Stage 1 — down GEMM + routed combine → out (BM=64, BN=128)
+//  Prefill: Stage 1 — down GEMM + routed combine → out (BM=64, BN=64)
 // ======================================================================
+template <int kBN>
 __global__ void down_combine_kernel_prefill(
     const uint16_t* __restrict__ act,
     const uint8_t*  __restrict__ w2,
@@ -529,8 +536,9 @@ __global__ void down_combine_kernel_prefill(
     const int32_t*  __restrict__ expert_ids,
     int ispp, int hidden, int M, int top_k, int has_bias) {
 
+  constexpr int kNF = kBN / 16;
   __shared__ uint16_t sA[kBM_pf][kBK_pf];
-  __shared__ uint16_t sB[kBK_pf][kBN_pf];
+  __shared__ uint16_t sB[kBK_pf][kBN];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int expert = expert_ids[pid_m];
@@ -542,16 +550,16 @@ __global__ void down_combine_kernel_prefill(
   int tid = threadIdx.x;
   int lane = tid & 63;
   int warp = tid >> 6;
-  int n_global = pid_n * kBN_pf;
+  int n_global = pid_n * kBN;
 
   const uint8_t* bp = w2 + expert * w2_bytes
       + n_global * (ispp / 2);
   const uint8_t* sc = w2_scale + expert * w2s_bytes
       + n_global * (ispp / kGroupSize);
 
-  v4f acc[8];
+  v4f acc[kNF];
 #pragma unroll
-  for (int nf = 0; nf < 8; ++nf) acc[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int nf = 0; nf < kNF; ++nf) acc[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
 
   for (int kb = 0; kb < ispp / kBK_pf; ++kb) {
     int ks = kb * kBK_pf;
@@ -566,7 +574,7 @@ __global__ void down_combine_kernel_prefill(
   int col = lane & 15;
   int row_base = warp * 16 + (lane >> 4) * 4;
 #pragma unroll
-  for (int nf = 0; nf < 8; ++nf) {
+  for (int nf = 0; nf < kNF; ++nf) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       int flat = sorted_ids[tk_base + row_base + i];
@@ -621,18 +629,18 @@ void fused_moe_mxfp4(
   }
 
   if (block_size >= kBM_pf) {
-    // Prefill regime: 64x128 tiles, 256 threads.  The caller must have
+    // Prefill regime: 64x64 tiles, 256 threads.  The caller must have
     // aligned expert_ids per 64-row block (EM % 64 == 0).
     {
       dim3 g(EM / kBM_pf, ispp / kBN_pf);
-      gateup_swiglu_kernel_prefill<<<g, kThreads_pf>>>(
+      gateup_swiglu_kernel_prefill<kBN_pf><<<g, kThreads_pf>>>(
           A, w13, w13_scale, b13, act_scratch,
           sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
           b13 != nullptr);
     }
     {
       dim3 g(EM / kBM_pf, hidden / kBN_pf);
-      down_combine_kernel_prefill<<<g, kThreads_pf>>>(
+      down_combine_kernel_prefill<kBN_pf><<<g, kThreads_pf>>>(
           act_scratch, w2, w2_scale, b2, out, sorted_w,
           sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
     }

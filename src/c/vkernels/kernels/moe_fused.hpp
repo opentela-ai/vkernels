@@ -108,7 +108,7 @@ namespace vkernels::kernels::hip {
 // block_size selects the tile config:
 //   16  — decode regime (16x64 tiles, 64 threads); sorted_ids/expert_ids
 //         must be aligned with block_size=16.
-//   64  — prefill regime (64x128 tiles, 256 threads); the caller must align
+//   64  — prefill regime (64x64 tiles, 256 threads); the caller must align
 //         with block_size=64 (EM % 64 == 0, expert_ids per 64-row block).
 
 void fused_moe_mxfp4(

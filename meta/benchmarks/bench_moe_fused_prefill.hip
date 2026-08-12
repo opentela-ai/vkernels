@@ -1,6 +1,6 @@
 // meta/benchmarks/bench_moe_fused_prefill.hip
 //
-// PREFILL-regime benchmark for the fused MXFP4 MoE kernel (BM=64, BN=128,
+// PREFILL-regime benchmark for the fused MXFP4 MoE kernel (BM=64, BN=64,
 // 256 threads).  Prefill uses a denser routing config (E=8, top_k=2) so each
 // expert receives many tokens and the 64-row blocks amortize their padding;
 // with E=256/top_k=6 a 64-row block needs M >= ~2700 tokens to fill.

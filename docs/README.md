@@ -145,10 +145,10 @@ out[M, hidden] += act @ w2^T · topk_w_sorted + b2
 | Function | Tile constants | Data types | Backend |
 |---|---|---|---|
 | `fused_moe_mxfp4(..., block_size=16)` | decode: BM=16, BN=64, BK=64, 64 threads/block | bf16 activations, fp4 (E2M1) weights with ue8m0 scales, fp32 output | HIP, CPU |
-| `fused_moe_mxfp4(..., block_size=64)` | prefill: BM=64, BN=128, BK=64, 256 threads/block | same | HIP |
+| `fused_moe_mxfp4(..., block_size=64)` | prefill: BM=64, BN=64, BK=64, 256 threads/block | same | HIP |
 
 `block_size` selects the tile config: `16` = decode (16×64, 64 threads),
-`64` = prefill (64×128, 256 threads). The caller aligns with the matching
+`64` = prefill (64×64, 256 threads). The caller aligns with the matching
 `block_size` (so `expert_ids` is indexed per 16- or 64-row block).
 
 - Dequantization (E2M1 + ue8m0) is done inline during the K-loop — no full

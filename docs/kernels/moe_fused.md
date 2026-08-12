@@ -76,7 +76,7 @@ Two tile configs are compiled in, selected by the `block_size` argument to
 | Constant | Decode | Prefill | Meaning |
 |---|---:|---:|---|
 | BLOCK_M | 16 (`kBM`) | 64 (`kBM_pf`) | Rows per output tile (expert-aligned sorted rows) |
-| BLOCK_N | 64 (`kBN`) | 128 (`kBN_pf`) | Columns per output tile |
+| BLOCK_N | 64 (`kBN`) | 64 (`kBN_pf`) | Columns per output tile |
 | BLOCK_K | 64 (`kBK`) | 64 (`kBK_pf`) | Inner dimension per K-tile |
 | GROUP_SIZE (`kGroupSize`) | 32 | 32 | ue8m0 scale shared across 32 K elements |
 | MFMA_K (`kMfmaK`) | 16 | 16 | K dimension of one MFMA instruction |
@@ -86,7 +86,7 @@ Two tile configs are compiled in, selected by the `block_size` argument to
 
 ```
 decode:  hidden % 64 == 0,  ispp % 64 == 0,  EM % 16 == 0
-prefill: hidden % 128 == 0, ispp % 128 == 0, EM % 64 == 0
+prefill: hidden % 64 == 0,  ispp % 64 == 0,  EM % 64 == 0
 group_size == 32
 ```
 
@@ -116,17 +116,22 @@ col       = lane % 16
 row_base  = (lane / 16) * 4          (rows row_base .. row_base+3)
 ```
 
-### Prefill (256 threads, 64×128 tile)
+### Prefill (256 threads, 64×64 tile)
 
 Four wavefronts per block; wavefront `w` owns the 16-row fragment
-`rows w*16 .. w*16+15` and loops over **8 column fragments** (128 columns),
-accumulating `acc[8]` (one `v4f` per column fragment). The gate and up
-weights share one `sB[64][128]` buffer (dequant gate → MFMA → dequant up →
-MFMA) to keep LDS at 24 KB. The caller must align with `block_size=64`, so
+`rows w*16 .. w*16+15` and loops over **4 column fragments** (64 columns),
+accumulating `acc[4]` (one `v4f` per column fragment). The gate and up
+weights share one `sB[64][64]` buffer (dequant gate → MFMA → dequant up →
+MFMA) to keep LDS at 16 KB. The caller must align with `block_size=64`, so
 `expert_ids` is indexed per 64-row block and each block is a single expert.
 
+BN is 64, not 128: BN=128 costs 24 KB LDS and 64 accumulator VGPRs, capping
+the kernel at 2 blocks/CU; BN=64 (16 KB LDS, 32 accumulator VGPRs) lifts it
+to 3 blocks/CU, which measures ~1.5× faster despite halving the B-tile
+reuse (the kernel is occupancy-bound, not reuse-bound).
+
 ```
-grid  = (EM / 64,  N / 128)        (N = ispp for stage 0, hidden for stage 1)
+grid  = (EM / 64,  N / 64)        (N = ispp for stage 0, hidden for stage 1)
 block = 256 threads = 4 wavefronts
 warp  = tid / 64,  lane = tid % 64
 ```
@@ -312,27 +317,29 @@ MI250X (gfx90a):
 
 | M | decode (µs) | decode TFLOP/s | prefill (µs) | prefill TFLOP/s | speedup |
 |---:|---:|---:|---:|---:|---:|
-| 128  | 969  | 1.66 | 2099 | 0.77 | 0.46× |
-| 256  | 1426 | 2.26 | 2122 | 1.52 | 0.67× |
-| 512  | 2708 | 2.38 | 2393 | 2.69 | 1.13× |
-| 1024 | 5182 | 2.49 | 4092 | 3.15 | 1.27× |
-| 2048 | 10294 | 2.50 | 8718 | 2.96 | 1.18× |
+| 128  | 958  | 1.68 | 1175 | 1.37 | 0.81× |
+| 256  | 1356 | 2.38 | 1201 | 2.68 | 1.13× |
+| 512  | 2697 | 2.39 | 1945 | 3.31 | 1.39× |
+| 1024 | 5151 | 2.50 | 2993 | 4.31 | 1.72× |
+| 2048 | 10236 | 2.52 | 5781 | 4.46 | 1.77× |
 
 MI300A (gfx942):
 
 | M | decode (µs) | decode TFLOP/s | prefill (µs) | prefill TFLOP/s | speedup |
 |---:|---:|---:|---:|---:|---:|
-| 128  | 561  | 2.87 | 1303 | 1.24 | 0.43× |
-| 256  | 729  | 4.42 | 1308 | 2.46 | 0.56× |
-| 512  | 1198 | 5.38 | 1400 | 4.60 | 0.86× |
-| 1024 | 2052 | 6.28 | 1580 | 8.16 | 1.30× |
-| 2048 | 3882 | 6.64 | 2540 | 10.15 | 1.53× |
+| 128  | 557  | 2.89 | 724  | 2.22 | 0.77× |
+| 256  | 722  | 4.46 | 737  | 4.37 | 0.98× |
+| 512  | 1209 | 5.33 | 804  | 8.02 | 1.50× |
+| 1024 | 2352 | 5.48 | 1303 | 9.89 | 1.81× |
+| 2048 | 4982 | 5.17 | 1981 | 13.01 | 2.51× |
 
-The prefill config wins once each expert fills its 64-row block (M ≥ 512 on
-gfx90a, M ≥ 1024 on gfx942 here); below that, 64-row padding waste dominates
+The prefill config wins once each expert fills its 64-row block (M ≥ 256 on
+gfx90a, M ≥ 512 on gfx942 here); below that, 64-row padding waste dominates
 and the decode config is faster. Both configs sit far below the MFMA roof
-because dequant and MFMA are serialised by `__syncthreads()` and occupancy is
-~2 blocks/CU (prefill: 116 VGPRs + 24 KB LDS, no spills).
+because dequant and MFMA are serialised by `__syncthreads()` and the kernel
+is occupancy-bound (prefill: ~3 blocks/CU at 16 KB LDS + 32 accumulator
+VGPRs; the earlier BN=128 prefill was ~2 blocks/CU at 24 KB LDS + 64
+accumulator VGPRs and ~1.5× slower).
 
 ---
 
@@ -344,16 +351,20 @@ because dequant and MFMA are serialised by `__syncthreads()` and occupancy is
   extra concurrent warps provide more latency hiding than the load→MFMA
   overlap does. The redundant barrier between the A-tile load and the
   weight dequant *was* removed (they write different LDS buffers); that is
-  a free, small win. To raise throughput, the lever is **more occupancy**
-  (fewer VGPRs / less LDS per block), not deeper software pipelining.
+  a free, small win. Acting on this finding, the prefill BN was reduced
+  128→64 (24→16 KB LDS, 64→32 accumulator VGPRs), lifting occupancy from 2
+  to 3 blocks/CU and measuring ~1.5× faster — confirming that the lever is
+  **more occupancy** (fewer VGPRs / less LDS per block), not deeper
+  software pipelining.
 - **No wavefront specialization**: every wavefront both dequantizes and
   issues MFMA. A producer/consumer split could overlap them without
   doubling LDS, but costs VGPRs and is only worth it once occupancy is
   already saturated.
-- **Prefill is a modest win**: ~1.2× at M ≥ 512 (gfx90a), ~1.3–1.5× at
-  M ≥ 1024 (gfx942). The 64-row block wastes compute when routing is sparse
-  (tokens/expert < 64); a smaller prefill tile (e.g. BM=32, BN=64) or a
-  padding-aware launch heuristic could close the small-M gap.
+- **Prefill is now a solid win** (BN=64): from M ≥ 256 on gfx90a (1.13×)
+  and M ≥ 512 on gfx942 (1.50×), rising to 1.77× and 2.51× at M=2048.
+  The 64-row block still wastes compute when routing is sparse
+  (tokens/expert < 64); a smaller prefill tile (e.g. BM=32) or a
+  padding-aware launch heuristic could close the remaining small-M gap.
 - **Padding overhead in decode**: per-expert block padding (16 rows) makes
   small-M latency scale with the number of routed experts, not the number
   of tokens.
