@@ -260,6 +260,23 @@ TEST(FusedMoe, SiTU) {
     float err = std::fabs(out_h[i] - expected_out);
     EXPECT_LT(err / expected_out, 1e-2f);
   }
+
+  // linear_beta <= 0: `up` passes through unmodified (no softcap) — covers
+  // the passthrough branch of the SiTU epilogue.
+  std::fill(out_h.begin(), out_h.end(), 0.0f);
+  fused_moe_mxfp4_cpu(
+      A_bf16.data(), w13.data(), w13_scale.data(),
+      w2.data(), w2_scale.data(),
+      sorted_ids.data(), topk_ws.data(), expert_ids.data(),
+      act_h.data(), out_h.data(),
+      M, hidden, ispp, 1, EM, group_size,
+      1.0f, 1 /* kSiTU */, beta, 0.0f /* linear_beta <= 0 */,
+      nullptr, nullptr);
+  // gate_out = beta * tanh(128/beta) * sigmoid(128) = 4.0; up_out = up = 128.
+  float expected_act_passthrough = (beta * std::tanh(gate / beta) * sig) * up;
+  for (int i = 0; i < EM * ispp; ++i) {
+    EXPECT_NEAR(bf2f(act_h[i]), expected_act_passthrough, 0.5f);
+  }
 }
 
 // ======================================================================
