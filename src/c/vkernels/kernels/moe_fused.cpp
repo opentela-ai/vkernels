@@ -146,6 +146,9 @@ void fused_moe_mxfp4_cpu(
     int M, int hidden, int ispp, int top_k, int EM,
     int group_size,
     float swiglu_limit,
+    int activation,
+    float beta,
+    float linear_beta,
     const float* b13,
     const float* b2) {
 
@@ -254,7 +257,7 @@ void fused_moe_mxfp4_cpu(
         }
       }
 
-      // SwiGLU epilogue (skip padding tokens)
+      // Epilogue: bias, then SwiGLU or SiTU (skip padding tokens).
       for (int m = 0; m < BLOCK_M; ++m) {
         int flat = sorted_ids[token_base + m];
         if (flat >= N) continue;  // padding token, skip
@@ -267,14 +270,26 @@ void fused_moe_mxfp4_cpu(
             u += b13[expert * static_cast<std::size_t>(2 * ispp) + nb * BLOCK_N + n + ispp];
           }
 
-          if (swiglu_limit > 0.0f) {
-            if (g > swiglu_limit) g = swiglu_limit;
-            if (u > swiglu_limit) u = swiglu_limit;
-            if (u < -swiglu_limit) u = -swiglu_limit;
+          float result;
+          if (activation == kSiTU) {
+            // Kimi-K3 SiTU (situ_and_mul): no clamp; tanh softcaps bound the
+            // operands instead. Matches vLLM's csrc/libtorch_stable/
+            // activation_kernels.cu `situ_and_mul_kernel` exactly.
+            float sig = 1.0f / (1.0f + std::exp(-g));
+            float gate_out = beta * std::tanh(g / beta) * sig;
+            float up_out = (linear_beta > 0.0f)
+                               ? linear_beta * std::tanh(u / linear_beta)
+                               : u;
+            result = gate_out * up_out;
+          } else {
+            if (swiglu_limit > 0.0f) {
+              if (g > swiglu_limit) g = swiglu_limit;
+              if (u > swiglu_limit) u = swiglu_limit;
+              if (u < -swiglu_limit) u = -swiglu_limit;
+            }
+            float silu_g = g / (1.0f + std::exp(-g));
+            result = silu_g * u;
           }
-
-          float silu_g = g / (1.0f + std::exp(-g));
-          float result = silu_g * u;
 
           // Round to bf16
           uint32_t bits;

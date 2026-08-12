@@ -294,7 +294,8 @@ PYBIND11_MODULE(_core, m) {
          ByteArray w2_scale, I32Array sorted_ids, FloatArray topk_w,
          I32Array expert_ids, U16Array act_scratch, FloatArray out, int M,
          int hidden, int ispp, int top_k, int EM, int group_size,
-         float swiglu_limit, std::optional<FloatArray> b13,
+         float swiglu_limit, int activation, float beta, float linear_beta,
+         std::optional<FloatArray> b13,
          std::optional<FloatArray> b2) {
         require_writeable(act_scratch);
         require_writeable(out);
@@ -303,7 +304,8 @@ PYBIND11_MODULE(_core, m) {
             w2_scale.data(), sorted_ids.data(), topk_w.data(),
             expert_ids.data(), act_scratch.mutable_data(),
             out.mutable_data(), M, hidden, ispp, top_k, EM, group_size,
-            swiglu_limit, b13 ? b13->data() : nullptr,
+            swiglu_limit, activation, beta, linear_beta,
+            b13 ? b13->data() : nullptr,
             b2 ? b2->data() : nullptr);
       },
       py::arg("A"), py::arg("w13"), py::arg("w13_scale"), py::arg("w2"),
@@ -311,10 +313,13 @@ PYBIND11_MODULE(_core, m) {
       py::arg("expert_ids"), py::arg("act_scratch"), py::arg("out"),
       py::arg("M"), py::arg("hidden"), py::arg("ispp"), py::arg("top_k"),
       py::arg("EM"), py::arg("group_size"), py::arg("swiglu_limit"),
+      py::arg("activation") = 0, py::arg("beta") = 4.0f,
+      py::arg("linear_beta") = 25.0f,
       py::arg("b13") = py::none(), py::arg("b2") = py::none(),
-      "Fused MXFP4 MoE grouped GEMM (CPU reference): gate_up + SwiGLU into "
-      "act_scratch [EM, ispp] bf16, then down + routed combine accumulated "
-      "into out [M, hidden] fp32 (caller must zero-init out).");
+      "Fused MXFP4 MoE grouped GEMM (CPU reference): gate_up + activation "
+      "(SwiGLU by default, or Kimi-K3 SiTU via activation=1/beta/linear_beta) "
+      "into act_scratch [EM, ispp] bf16, then down + routed combine "
+      "accumulated into out [M, hidden] fp32 (caller must zero-init out).");
 
   // -------------------------------------------------------------------------
   // vkernels._core.comm — collectives, topology, overlap, p2p gather

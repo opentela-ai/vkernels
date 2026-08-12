@@ -396,12 +396,14 @@ def moe_align_block_size(topk_ids, M, top_k, block_size, num_experts):
 def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
                     expert_ids, act_scratch, out,
                     M, hidden, ispp, top_k, EM, group_size,
-                    swiglu_limit, b13=None, b2=None):
+                    swiglu_limit, activation=0, beta=4.0, linear_beta=25.0,
+                    b13=None, b2=None):
     """Fused MXFP4 MoE grouped GEMM (CPU-reference oracle, in place).
 
-    Writes the SwiGLU intermediate into ``act_scratch`` [EM*ispp] bf16 and
-    accumulates into ``out`` [M*hidden] fp32 (which the caller must
-    zero-initialise). Mirrors ``fused_moe_mxfp4_cpu`` block for block.
+    Writes the activation intermediate into ``act_scratch`` [EM*ispp] bf16
+    (SwiGLU by default, or Kimi-K3 SiTU via ``activation=1``) and accumulates
+    into ``out`` [M*hidden] fp32 (which the caller must zero-initialise).
+    Mirrors ``fused_moe_mxfp4_cpu`` block for block.
     """
     BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 64
     N = M * top_k
@@ -422,7 +424,7 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
     def _f2bf(v: float) -> np.uint16:
         return np.uint16(_float_to_bf16_bits(v))
 
-    # ===== Stage 0: gate_up + SwiGLU → act [EM, ispp] =====
+    # ===== Stage 0: gate_up + activation → act [EM, ispp] =====
     w13_expert_bytes = 2 * ispp * (hidden // 2)
     w13s_expert_bytes = 2 * ispp * (hidden // group_size)
     num_m_blocks = EM // BLOCK_M
@@ -477,7 +479,7 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
                         acc_gate[m, n] = np.float32(acc_gate[m, n] + dg)
                         acc_up[m, n] = np.float32(acc_up[m, n] + du)
 
-            # SwiGLU epilogue (skip padding rows)
+            # Activation epilogue (skip padding rows)
             for m in range(BLOCK_M):
                 flat = int(sorted_ids[token_base + m])
                 if flat >= N:
@@ -488,13 +490,22 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
                     if b13 is not None:
                         g += float(b13[expert * 2 * ispp + nb * BLOCK_N + n])
                         u += float(b13[expert * 2 * ispp + nb * BLOCK_N + n + ispp])
-                    if swiglu_limit > 0.0:
-                        g = min(g, swiglu_limit)
-                        u = min(u, swiglu_limit)
-                        u = max(u, -swiglu_limit)
-                    silu_g = g / (1.0 + np.exp(-g))
+                    if activation == 1:
+                        # Kimi-K3 SiTU (situ_and_mul): no clamp.
+                        sig = 1.0 / (1.0 + np.exp(-g))
+                        gate_out = beta * np.tanh(g / beta) * sig
+                        up_out = (linear_beta * np.tanh(u / linear_beta)
+                                  if linear_beta > 0.0 else u)
+                        result = gate_out * up_out
+                    else:
+                        if swiglu_limit > 0.0:
+                            g = min(g, swiglu_limit)
+                            u = min(u, swiglu_limit)
+                            u = -min(-u, swiglu_limit)  # max(u, -limit)
+                        silu_g = g / (1.0 + np.exp(-g))
+                        result = silu_g * u
                     act[(token_base + m) * ispp + nb * BLOCK_N + n] = \
-                        _f2bf(silu_g * u)
+                        _f2bf(result)
 
     # ===== Stage 1: down + combine → out [M, hidden] =====
     w2_expert_bytes = hidden * (ispp // 2)

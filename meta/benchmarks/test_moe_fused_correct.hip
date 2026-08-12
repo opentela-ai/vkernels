@@ -65,7 +65,7 @@ float bf2f(uint16_t v) { return bits2f((uint32_t)v << 16); }
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   hipDeviceProp_t p;
   CK(hipGetDeviceProperties(&p, 0), "props");
   std::printf("GPU: %s\n", p.name);
@@ -75,6 +75,10 @@ int main() {
   constexpr int M = 8, hidden = 256, ispp = 128, top_k = 2;
   constexpr int E = 4, BLOCK_M = 16, group_size = 32;
   constexpr float LIMIT = 4.0f;
+  const bool situ = (argc > 1) && std::strcmp(argv[1], "situ") == 0;
+  const int activation = situ ? vkernels::kernels::kSiTU : vkernels::kernels::kSwiGLU;
+  const float beta = 4.0f, linear_beta = 25.0f;
+  std::printf("activation=%s\n", situ ? "situ" : "swiglu");
 
   int N = M * top_k;
   // Upper bound for per-expert-padded EM: every expert gets its own block.
@@ -140,7 +144,8 @@ int main() {
   vkernels::kernels::fused_moe_mxfp4_cpu(
       hA.data(), hw13.data(), hw13s.data(), hw2.data(), hw2s.data(),
       h_sids.data(), h_tws.data(), h_eids.data(), act_cpu.data(), out_cpu.data(),
-      M, hidden, ispp, top_k, EM_p, group_size, LIMIT, hb13.data(), hb2.data());
+      M, hidden, ispp, top_k, EM_p, group_size, LIMIT, activation, beta,
+      linear_beta, hb13.data(), hb2.data());
 
   // --- Device ---
   uint16_t *dA, *dAct;
@@ -177,7 +182,8 @@ int main() {
 
   vkernels::kernels::hip::fused_moe_mxfp4(
       dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
-      M, hidden, ispp, top_k, dSids, dEids, EM_p, LIMIT, db13, db2);
+      M, hidden, ispp, top_k, dSids, dEids, EM_p, LIMIT, activation, beta,
+      linear_beta, db13, db2);
   CK(hipDeviceSynchronize(), "sync");
 
   std::vector<uint16_t> act_gpu(EM_p * ispp);

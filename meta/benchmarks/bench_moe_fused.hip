@@ -87,10 +87,14 @@ static BenchResult bench_kernel_us(const std::function<void()>& launch,
   return {};
 }
 
-int main() {
+int main(int argc, char** argv) {
   hipDeviceProp_t p;
   CK(hipGetDeviceProperties(&p, 0), "props");
   std::printf("GPU: %s (%s)\n\n", p.name, p.gcnArchName);
+
+  const bool situ = (argc > 1) && std::strcmp(argv[1], "situ") == 0;
+  const int activation = situ ? vkernels::kernels::kSiTU : vkernels::kernels::kSwiGLU;
+  const float beta = 4.0f, linear_beta = 25.0f;
 
   constexpr int E = 256, hidden = 4096, ispp = 512, top_k = 6;
   constexpr int BLOCK_M = 16, group_size = 32;
@@ -138,8 +142,10 @@ int main() {
   hipEventCreate(&start); hipEventCreate(&stop);
 
   const int Ms[] = {1, 2, 4, 8, 16, 32, 48};
-  std::printf("E=%d hidden=%d ispp=%d top_k=%d\n", E, hidden, ispp, top_k);
-  std::printf("%6s %8s %10s %10s %12s\n", "M", "EM", "lat(us)", "TFLOP/s", "status");
+  std::printf("E=%d hidden=%d ispp=%d top_k=%d activation=%s\n", E, hidden, ispp,
+              top_k, situ ? "situ" : "swiglu");
+  std::printf("%6s %8s %10s %10s %9s %9s\n", "M", "EM", "lat(us)", "TFLOP/s",
+              "cpu-rel", "status");
 
   for (int M : Ms) {
     int N = M * top_k;
@@ -178,11 +184,13 @@ int main() {
     auto launch = [&]() {
       vkernels::kernels::hip::fused_moe_mxfp4(
           dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
-          M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, db13, db2);
+          M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
+          linear_beta, db13, db2);
     };
 
     // Correctness check vs CPU reference (only for M <= 8 to bound host cost).
-    const char* status = "ok";
+    // cpu_rel < 0 means "not checked".
+    double cpu_rel = -1.0;
     if (M <= 8) {
       std::vector<float> h_tws(EM, 0.0f);
       for (int i = 0; i < EM; ++i)
@@ -192,7 +200,8 @@ int main() {
       vkernels::kernels::fused_moe_mxfp4_cpu(
           hA.data(), hw13.data(), hw13s.data(), hw2.data(), hw2s.data(),
           h_sids.data(), h_tws.data(), h_eids.data(), act_cpu.data(), out_cpu.data(),
-          M, hidden, ispp, top_k, EM, group_size, LIMIT, hb13.data(), hb2.data());
+          M, hidden, ispp, top_k, EM, group_size, LIMIT, activation, beta,
+          linear_beta, hb13.data(), hb2.data());
       launch();
       CK(hipDeviceSynchronize(), "sync");
       std::vector<float> out_gpu(M * hidden);
@@ -202,14 +211,20 @@ int main() {
         double e = std::fabs((double)out_gpu[i] - (double)out_cpu[i]);
         max_rel = std::fmax(max_rel, e / std::fmax(std::fabs((double)out_cpu[i]), 1.0));
       }
-      status = max_rel < 0.05 ? "ok" : "MISMATCH";
+      cpu_rel = max_rel;
     }
 
     auto r = bench_kernel_us(launch, start, stop);
     double total_flop = 6.0 * M * (double)ispp * hidden;
     double tflops = total_flop / (r.median_us / 1e6) / 1e12;
 
-    std::printf("%6d %8d %10.1f %10.3f %12s\n", M, EM, r.median_us, tflops, status);
+    if (cpu_rel < 0.0) {
+      std::printf("%6d %8d %10.1f %10.3f %9s %9s\n", M, EM, r.median_us, tflops, "-",
+                  "skip");
+    } else {
+      std::printf("%6d %8d %10.1f %10.3f %9.3g %9s\n", M, EM, r.median_us, tflops,
+                  cpu_rel, cpu_rel < 0.05 ? "ok" : "MISMATCH");
+    }
 
     hipFree(dA); hipFree(dAct); hipFree(dOut);
     hipFree(dTw); hipFree(dTids); hipFree(dSids); hipFree(dEids);

@@ -98,7 +98,7 @@ TEST(FusedMoe, TinySanity) {
       sorted_ids.data(), topk_ws.data(), expert_ids.data(),
       act_h.data(), out_h.data(),
       M, hidden, ispp, 1, EM, group_size,
-      0.0f, nullptr, nullptr);
+      0.0f, 0, 4.0f, 25.0f, nullptr, nullptr);
 
   float silu128 = 128.0f / (1.0f + std::exp(-128.0f));
   float expected_act = silu128 * 128.0f;
@@ -150,7 +150,7 @@ TEST(FusedMoe, BiasSanity) {
       sorted_ids.data(), topk_ws.data(), expert_ids.data(),
       act_h.data(), out_h.data(),
       M, hidden, ispp, 1, EM, group_size,
-      0.0f, b13.data(), b2.data());
+      0.0f, 0, 4.0f, 25.0f, b13.data(), b2.data());
 
   float silu1 = 1.0f / (1.0f + std::exp(-1.0f));
   float expected_act = silu1 * 2.0f;
@@ -193,7 +193,7 @@ TEST(FusedMoe, SwiGLUClamp) {
       sorted_ids.data(), topk_ws.data(), expert_ids.data(),
       act_h.data(), out_h.data(),
       M, hidden, ispp, 1, EM, group_size,
-      10.0f, nullptr, nullptr);
+      10.0f, 0, 4.0f, 25.0f, nullptr, nullptr);
 
   float silu10 = 10.0f / (1.0f + std::exp(-10.0f));
   float expected_act = silu10 * 10.0f;
@@ -201,6 +201,60 @@ TEST(FusedMoe, SwiGLUClamp) {
 
   for (int i = 0; i < EM * ispp; ++i) {
     EXPECT_NEAR(bf2f(act_h[i]), expected_act, 0.2f);
+  }
+  for (int i = 0; i < M * hidden; ++i) {
+    float err = std::fabs(out_h[i] - expected_out);
+    EXPECT_LT(err / expected_out, 1e-2f);
+  }
+}
+
+// ======================================================================
+//  SiTU activation test (Kimi-K3 situ_and_mul)
+// ======================================================================
+// gate = up = 128 (A=1, w=1, hidden=128). SiTU must NOT apply the
+// swiglu_limit clamp (passing limit=1.0 below is a regression guard):
+//   gate_out = beta * tanh(gate/beta) * sigmoid(gate)
+//   up_out   = linear_beta * tanh(up/linear_beta)
+//   act      = gate_out * up_out ≈ 4.0 * 25.0 = 100
+TEST(FusedMoe, SiTU) {
+  constexpr int M = 16, hidden = 128, ispp = 64;
+  constexpr int group_size = 32, BLOCK_M = 16;
+  constexpr int EM = M;
+
+  std::vector<uint16_t> A_bf16(M * hidden, f2bf(1.0f));
+  uint8_t one_byte = pack_e2m1_pair(1.0f, 1.0f);
+  std::vector<uint8_t> w13(2 * ispp * hidden / 2, one_byte);
+  std::vector<uint8_t> w13_scale(2 * ispp * hidden / group_size, 127);
+  std::vector<uint8_t> w2(hidden * ispp / 2, one_byte);
+  std::vector<uint8_t> w2_scale(hidden * ispp / group_size, 127);
+
+  std::vector<int32_t> sorted_ids(EM);
+  std::iota(sorted_ids.begin(), sorted_ids.end(), 0);
+  std::vector<float> topk_ws(EM, 1.0f);
+  std::vector<int32_t> expert_ids(EM / BLOCK_M, 0);
+
+  std::vector<uint16_t> act_h(EM * ispp, 0);
+  std::vector<float> out_h(M * hidden, 0.0f);
+
+  constexpr float beta = 4.0f, linear_beta = 25.0f;
+  fused_moe_mxfp4_cpu(
+      A_bf16.data(), w13.data(), w13_scale.data(),
+      w2.data(), w2_scale.data(),
+      sorted_ids.data(), topk_ws.data(), expert_ids.data(),
+      act_h.data(), out_h.data(),
+      M, hidden, ispp, 1, EM, group_size,
+      1.0f /* clamp must be ignored */, 1 /* kSiTU */, beta, linear_beta,
+      nullptr, nullptr);
+
+  // situ_and_mul reference (vLLM): gate = up = 128, unclamped.
+  float gate = 128.0f, up = 128.0f;
+  float sig = 1.0f / (1.0f + std::exp(-gate));
+  float expected_act = (beta * std::tanh(gate / beta) * sig)
+                     * (linear_beta * std::tanh(up / linear_beta));
+  float expected_out = expected_act * static_cast<float>(ispp);
+
+  for (int i = 0; i < EM * ispp; ++i) {
+    EXPECT_NEAR(bf2f(act_h[i]), expected_act, 0.5f);  // bf16 precision
   }
   for (int i = 0; i < M * hidden; ++i) {
     float err = std::fabs(out_h[i] - expected_out);
@@ -250,7 +304,7 @@ TEST(FusedMoe, MultiExpert) {
       sorted_ids.data(), topk_ws.data(), expert_ids.data(),
       act_h.data(), out_h.data(),
       M, hidden, ispp, 1, EM, group_size, 0.0f,
-      nullptr, nullptr);
+      0, 4.0f, 25.0f, nullptr, nullptr);
 
   // Just verify finite and positive
   for (int i = 0; i < M * hidden; ++i) {
@@ -288,7 +342,7 @@ TEST(FusedMoe, ExpertFilter) {
       sorted_ids.data(), topk_ws.data(), expert_ids.data(),
       act_h.data(), out_h.data(),
       M, hidden, ispp, 1, EM, group_size, 0.0f,
-      nullptr, nullptr);
+      0, 4.0f, 25.0f, nullptr, nullptr);
 
   // Output unchanged
   for (int i = 0; i < M * hidden; ++i) {

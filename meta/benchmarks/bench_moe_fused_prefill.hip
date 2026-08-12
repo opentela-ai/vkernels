@@ -84,10 +84,14 @@ static BenchResult bench_kernel_us(const std::function<void()>& launch,
   return {static_cast<double>(times[iters / 2])};
 }
 
-int main() {
+int main(int argc, char** argv) {
   hipDeviceProp_t p;
   CK(hipGetDeviceProperties(&p, 0), "props");
   std::printf("GPU: %s (%s)\n\n", p.name, p.gcnArchName);
+
+  const bool situ = (argc > 1) && std::strcmp(argv[1], "situ") == 0;
+  const int activation = situ ? vkernels::kernels::kSiTU : vkernels::kernels::kSwiGLU;
+  const float beta = 4.0f, linear_beta = 25.0f;
 
   constexpr int E = 8, hidden = 4096, ispp = 512, top_k = 2;
   constexpr int group_size = 32;
@@ -134,7 +138,8 @@ int main() {
   hipEventCreate(&start); hipEventCreate(&stop);
 
   const int Ms[] = {128, 256, 512, 1024, 2048};
-  std::printf("E=%d hidden=%d ispp=%d top_k=%d\n", E, hidden, ispp, top_k);
+  std::printf("E=%d hidden=%d ispp=%d top_k=%d activation=%s\n", E, hidden, ispp,
+              top_k, situ ? "situ" : "swiglu");
   std::printf("%6s %8s | %10s %10s | %10s %10s | %6s\n",
               "M", "EM64", "dec-us", "dec-TF", "pf-us", "pf-TF", "speedup");
 
@@ -177,7 +182,8 @@ int main() {
       auto launch = [&]() {
         vkernels::kernels::hip::fused_moe_mxfp4(
             dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
-            M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, db13, db2, block_size);
+            M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
+            linear_beta, db13, db2, block_size);
       };
 
       // CPU check for the small sizes (block_size=16 oracle).
@@ -195,7 +201,7 @@ int main() {
             h_sids16.data(), h_tws16.data(), h_eids16.data(),
             act_cpu.data(), out_cpu.data(),
             M, hidden, ispp, top_k, EM16, group_size, LIMIT,
-            hb13.data(), hb2.data());
+            activation, beta, linear_beta, hb13.data(), hb2.data());
         launch();
         CK(hipDeviceSynchronize(), "sync");
         std::vector<float> out_gpu(M * hidden);
@@ -205,8 +211,8 @@ int main() {
           double e = std::fabs((double)out_gpu[i] - (double)out_cpu[i]);
           max_rel = std::fmax(max_rel, e / std::fmax(std::fabs((double)out_cpu[i]), 1.0));
         }
-        if (max_rel >= 0.05)
-          std::printf("  WARNING: block_size=%d M=%d max_rel=%.4f\n", block_size, M, max_rel);
+        std::printf("  cpu-check block_size=%d M=%d max_rel=%.4f %s\n",
+                    block_size, M, max_rel, max_rel < 0.05 ? "ok" : "WARN");
       }
 
       auto r = bench_kernel_us(launch, start, stop);
