@@ -64,7 +64,8 @@ uint16_t f2bf(float v) {
 }
 
 // Run one prefill correctness case. Returns true on PASS.
-bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E) {
+bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E,
+             int activation) {
   constexpr int CPU_BLOCK_M = 16;
   constexpr int GPU_BLOCK_M = 64;
   constexpr int group_size = 32;
@@ -135,7 +136,8 @@ bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E) {
       hA.data(), hw13.data(), hw13s.data(), hw2.data(), hw2s.data(),
       h_sids_cpu.data(), h_tws_cpu.data(), h_eids_cpu.data(),
       act_cpu.data(), out_cpu.data(),
-      M, hidden, ispp, top_k, EM_cpu, group_size, LIMIT, hb13.data(), hb2.data());
+      M, hidden, ispp, top_k, EM_cpu, group_size, LIMIT, activation, 4.0f, 25.0f,
+      hb13.data(), hb2.data());
 
   // --- Device ---
   uint16_t *dA, *dAct;
@@ -171,7 +173,8 @@ bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E) {
 
   vkernels::kernels::hip::fused_moe_mxfp4(
       dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
-      M, hidden, ispp, top_k, dSids, dEids, EM_gpu, LIMIT, db13, db2,
+      M, hidden, ispp, top_k, dSids, dEids, EM_gpu, LIMIT, activation, 4.0f,
+      25.0f, db13, db2,
       GPU_BLOCK_M);
   CK(hipDeviceSynchronize(), "sync");
 
@@ -197,15 +200,19 @@ bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   hipDeviceProp_t p;
   CK(hipGetDeviceProperties(&p, 0), "props");
   std::printf("GPU: %s\n", p.name);
 
+  const bool situ = (argc > 1) && std::strcmp(argv[1], "situ") == 0;
+  const int activation = situ ? vkernels::kernels::kSiTU : vkernels::kernels::kSwiGLU;
+  std::printf("activation=%s\n", situ ? "situ" : "swiglu");
+
   // Clean prefill: 64 tokens/expert -> one full 64-row block, no padding.
-  bool ok1 = run_case("clean", 128, 512, 256, 2, 4);
+  bool ok1 = run_case("clean", 128, 512, 256, 2, 4, activation);
   // Padded prefill: 40 tokens/expert -> 24 padding rows per expert.
-  bool ok2 = run_case("padded", 80, 512, 256, 2, 4);
+  bool ok2 = run_case("padded", 80, 512, 256, 2, 4, activation);
 
   std::printf("%s\n", (ok1 && ok2) ? "PASS" : "FAIL");
   return (ok1 && ok2) ? 0 : 1;

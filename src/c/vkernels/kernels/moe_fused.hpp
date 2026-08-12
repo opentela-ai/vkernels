@@ -28,6 +28,28 @@
 namespace vkernels::kernels {
 
 // ---------------------------------------------------------------------------
+// Epilogue activation for the fused MoE gate/up stage
+// ---------------------------------------------------------------------------
+//
+//   kSwiGLU — silu(clamp(gate)) * clamp(up)  (the default; DeepSeek-V3/V4).
+//   kSiTU   — Kimi-K3 "SoftCap-GLU", matching vLLM's `situ_and_mul` exactly:
+//                gate' = beta * tanh(gate / beta) * sigmoid(gate)
+//                up'   = linear_beta * tanh(up / linear_beta)   (linear_beta > 0;
+//                        otherwise up is passed through unmodified)
+//                act   = gate' * up'
+//             No swiglu_limit clamp is applied on the SiTU path (the tanh
+//             softcaps bound the output instead).
+//
+//   The weight dequant (E2M1 + ue8m0 `s<<23`) is identical for both
+//   activations: Kimi-K3's "SiTU scale format" referenced by the cookbooks is
+//   the `activation_clamp == 0.03125` epilogue sentinel in DeepGEMM's
+//   sm100_fp8_fp4_mega_moe.cuh, not a different ue8m0 decode.
+enum MoEActivation : int {
+  kSwiGLU = 0,
+  kSiTU = 1,
+};
+
+// ---------------------------------------------------------------------------
 // fused_moe_mxfp4 — CPU reference (oracle)
 // ---------------------------------------------------------------------------
 //
@@ -44,7 +66,12 @@ namespace vkernels::kernels {
 //   out           [M, hidden] fp32  output
 //   M, hidden, ispp, top_k, EM  dimensions
 //   group_size                ue8m0 group size (typically 32)
-//   swiglu_limit              clamp limit (>= 0; 0 = no limit)
+//   swiglu_limit              SwiGLU clamp limit (>= 0; 0 = no limit; ignored
+//                             for the SiTU activation)
+//   activation                epilogue tag: kSwiGLU (0) or kSiTU (1)
+//   beta                      SiTU gate softcap (e.g. 4.0 for Kimi-K3)
+//   linear_beta               SiTU up softcap (e.g. 25.0 for Kimi-K3; <= 0
+//                             passes `up` through unmodified)
 //   b13           [E, 2*ispp]  gate_up bias (nullptr → skip)
 //   b2            [E, hidden]  down bias (nullptr → skip)
 //
@@ -67,8 +94,11 @@ void fused_moe_mxfp4_cpu(
     int M, int hidden, int ispp, int top_k, int EM,
     int group_size,
     float swiglu_limit,
-    const float* b13,
-    const float* b2);
+    int activation = kSwiGLU,
+    float beta = 4.0f,
+    float linear_beta = 25.0f,
+    const float* b13 = nullptr,
+    const float* b2 = nullptr);
 
 // ---------------------------------------------------------------------------
 // moe_align_block_size — map topk_ids → sorted_ids + expert_ids
@@ -126,8 +156,11 @@ void fused_moe_mxfp4(
     const int32_t* expert_ids,
     int EM,
     float swiglu_limit,
-    const float* b13,
-    const float* b2,
+    int activation = kSwiGLU,
+    float beta = 4.0f,
+    float linear_beta = 25.0f,
+    const float* b13 = nullptr,
+    const float* b2 = nullptr,
     int block_size = 16);
 
 }  // namespace vkernels::kernels::hip

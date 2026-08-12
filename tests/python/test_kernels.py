@@ -329,6 +329,56 @@ class FusedMoeSwiGLUClampTest(unittest.TestCase):
 
 
 @unittest.skipIf(np is None, "numpy is required for these tests")
+class FusedMoeSituTest(unittest.TestCase):
+    def test_situ_ignores_clamp(self):
+        M, hidden, ispp = 16, 128, 64
+        group_size, BLOCK_M = 32, 16
+        EM = M
+
+        A = np.full((M, hidden), _f2bf(1.0), dtype=np.uint16)
+        w13 = _ones_weight_bytes(1, 2 * ispp, hidden // 2)
+        w13_scale = np.full((1, 2 * ispp, hidden // group_size), 127,
+                            dtype=np.uint8)
+        w2 = _ones_weight_bytes(1, hidden, ispp // 2)
+        w2_scale = np.full((1, hidden, ispp // group_size), 127, dtype=np.uint8)
+
+        act = np.empty(EM * ispp, dtype=np.uint16)
+        # swiglu_limit=1.0 must be IGNORED on the SiTU path.
+        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
+                              np.arange(EM, dtype=np.int32),
+                              np.ones(EM, dtype=_F32),
+                              np.zeros(EM // BLOCK_M, dtype=np.int32),
+                              act_scratch=act, top_k=1, group_size=group_size,
+                              swiglu_limit=1.0, activation="situ",
+                              beta=4.0, linear_beta=25.0)
+
+        # situ_and_mul reference (vLLM): gate = up = 128, unclamped.
+        gate = up = 128.0
+        sig = 1.0 / (1.0 + np.exp(-gate))
+        expected_act = (4.0 * np.tanh(gate / 4.0) * sig) * (
+            25.0 * np.tanh(up / 25.0))
+        expected_out = expected_act * ispp
+
+        np.testing.assert_allclose([_bf2f(v) for v in act], expected_act,
+                                   atol=0.5)
+        np.testing.assert_allclose(out, expected_out, rtol=1e-2)
+
+    def test_rejects_unknown_activation(self):
+        M, hidden, ispp = 16, 128, 64
+        A = np.zeros((M, hidden), dtype=np.uint16)
+        w13 = np.zeros((1, 2 * ispp, hidden // 2), dtype=np.uint8)
+        w13_scale = np.full((1, 2 * ispp, hidden // 32), 127, dtype=np.uint8)
+        w2 = np.zeros((1, hidden, ispp // 2), dtype=np.uint8)
+        w2_scale = np.full((1, hidden, ispp // 32), 127, dtype=np.uint8)
+        with self.assertRaises(ValueError):
+            fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
+                            np.arange(16, dtype=np.int32),
+                            np.ones(16, dtype=_F32),
+                            np.zeros(1, dtype=np.int32),
+                            top_k=1, activation="gelu")
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
 class FusedMoeMultiExpertTest(unittest.TestCase):
     def test_multi_expert(self):
         M, hidden, ispp, E = 8, 128, 64, 4
@@ -485,9 +535,9 @@ class BackendConsistencyTest(unittest.TestCase):
                   expert_ids)
         _backend.load_extension().kernels.fused_moe_mxfp4(
             *common, act_c, out_c, M, hidden, ispp, 1, EM, group_size, 0.0,
-            None, None)
+            0, 4.0, 25.0, None, None)
         fb.fused_moe_mxfp4(*common, act_f, out_f, M, hidden, ispp, 1, EM,
-                           group_size, 0.0, None, None)
+                           group_size, 0.0, 0, 4.0, 25.0, None, None)
 
         np.testing.assert_allclose(out_c, out_f, rtol=1e-3, atol=1e-2)
         np.testing.assert_allclose([_bf2f(int(v)) for v in act_c],

@@ -392,13 +392,24 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
                     act_scratch=None, out=None, *,
                     top_k: int = 1, group_size: int = 32,
                     swiglu_limit: float = 0.0,
+                    activation: str = "swiglu",
+                    beta: float = 4.0,
+                    linear_beta: float = 25.0,
                     b13=None, b2=None) -> np.ndarray:
     """Fused MXFP4 MoE grouped GEMM (CPU reference oracle).
 
-    Stage 0 — gate_up + SwiGLU::
+    Stage 0 — gate_up + activation. With the default ``activation="swiglu"``::
 
         act[EM, ispp] = silu(clamp(A_sorted @ w13_gate + b13_gate, L))
                       · clamp(A_sorted @ w13_up   + b13_up,   L)
+
+    With ``activation="situ"`` (Kimi-K3, matches vLLM's ``situ_and_mul``):
+
+        gate' = beta · tanh(gate / beta) · sigmoid(gate)
+        up'   = linear_beta · tanh(up / linear_beta)   (linear_beta > 0)
+        act[EM, ispp] = gate' · up'
+
+    No ``swiglu_limit`` clamp is applied on the SiTU path.
 
     Stage 1 — down + routed combine::
 
@@ -417,14 +428,19 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
             ``sorted_ids``.
         expert_ids: int32 ``[EM // 16]`` expert per block (``-1`` = padding).
         act_scratch: optional writable uint16 ``[EM * ispp]`` buffer for the
-            SwiGLU intermediate; allocated when omitted.
+            activation intermediate; allocated when omitted.
         out: optional writable float32 ``[M * hidden]`` buffer; the caller
             must zero-initialise it (stage 1 accumulates). A zeroed
             ``(M, hidden)`` array is allocated when omitted.
         top_k: number of experts selected per token (required to decode the
             flat index: ``token = flat / top_k``).
         group_size: ue8m0 scale group size (typically 32).
-        swiglu_limit: clamp limit ``L`` (``<= 0`` disables clamping).
+        swiglu_limit: SwiGLU clamp limit ``L`` (``<= 0`` disables clamping;
+            ignored for ``activation="situ"``).
+        activation: epilogue tag, ``"swiglu"`` or ``"situ"``.
+        beta: SiTU gate softcap (used when ``activation="situ"``).
+        linear_beta: SiTU up softcap (``<= 0`` passes ``up`` through
+            unmodified; used when ``activation="situ"``).
         b13: optional float32 ``[E * 2 * ispp]`` gate/up bias.
         b2: optional float32 ``[E * hidden]`` down bias.
 
@@ -510,11 +526,19 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
     else:
         out_arr = _as_out_typed(out, np.float32, M * hidden, "out")
 
+    act_key = activation.lower()
+    if act_key not in ("swiglu", "situ"):
+        raise ValueError(
+            f"activation must be 'swiglu' or 'situ', got {activation!r}")
+    act_tag = 0 if act_key == "swiglu" else 1
+
     _impl.fused_moe_mxfp4(
         A_arr, w13_arr, w13_scale_arr, w2_arr, w2_scale_arr,
         sorted_ids_arr, topk_w_arr, expert_ids_arr,
         act_scratch_arr, out_arr,
         int(M), int(hidden), int(ispp), int(top_k), int(EM),
-        int(group_size), float(np.float32(swiglu_limit)), b13_arr, b2_arr)
+        int(group_size), float(np.float32(swiglu_limit)), act_tag,
+        float(np.float32(beta)), float(np.float32(linear_beta)),
+        b13_arr, b2_arr)
 
     return out_arr.reshape(M, hidden)

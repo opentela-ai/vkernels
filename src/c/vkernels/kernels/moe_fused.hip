@@ -63,6 +63,28 @@ __device__ __forceinline__ uint16_t f2bf(float v) {
   return f32bits_to_bf16(b);
 }
 
+// Apply the gate/up epilogue. `g`/`u` are the bias-adjusted accumulators;
+// `activation` selects SwiGLU (clamp + silu) or Kimi-K3 SiTU (situ_and_mul:
+// tanh softcaps, no swiglu_limit clamp).
+__device__ __forceinline__ float epilogue_act(
+    int activation, float g, float u, float beta, float linear_beta,
+    float limit) {
+  if (activation == kSiTU) {
+    float sig = 1.0f / (1.0f + expf(-g));
+    float gate_out = beta * tanhf(g / beta) * sig;
+    float up_out = (linear_beta > 0.0f) ? linear_beta * tanhf(u / linear_beta)
+                                        : u;
+    return gate_out * up_out;
+  }
+  if (limit > 0.0f) {
+    if (g > limit) g = limit;
+    if (u > limit) u = limit;
+    if (u < -limit) u = -limit;
+  }
+  float silu_g = g / (1.0f + expf(-g));
+  return silu_g * u;
+}
+
 // Load the 16x64 A tile into shared memory (stage 0: input activations).
 // 64 threads; each thread loads 16 bf16 = 4 uint2 reads.
 // sorted_ids holds FLAT topk indices (token*top_k + sel).
@@ -297,7 +319,8 @@ __global__ void gateup_swiglu_kernel(
     uint16_t*       __restrict__ act,
     const int32_t*  __restrict__ sorted_ids,
     const int32_t*  __restrict__ expert_ids,
-    int hidden, int ispp, int M, int top_k, float swiglu_limit, int has_bias) {
+    int hidden, int ispp, int M, int top_k, float swiglu_limit,
+    int activation, float beta, float linear_beta, int has_bias) {
 
   __shared__ uint16_t sA[kBM][kBK];
   __shared__ uint16_t sB_gate[kBK][16];
@@ -342,26 +365,22 @@ __global__ void gateup_swiglu_kernel(
     __syncthreads();
   }
 
-  // Epilogue: act = silu(clamp(gate)) * clamp(up) → single bf16 rounding.
+  // Epilogue: bias + activation → act [EM, ispp] bf16 (single bf16 rounding).
   // C layout: col = lane % 16, row = (lane/16)*4 + i.
   int col = lane % 16;
   int row_base = (lane / 16) * 4;
-  float lim = swiglu_limit;
   for (int i = 0; i < 4; ++i) {
     int flat = sorted_ids[tk_base + row_base + i];
     if (flat < M * top_k) {
       float g = acc_g[i];
       if (has_bias)
         g += b13[(size_t)expert*2*ispp + n_global + col];
-      if (lim > 0.0f && g > lim) g = lim;
-      float silu_g = g / (1.0f + expf(-g));
-
       float u = acc_u[i];
       if (has_bias)
         u += b13[(size_t)expert*2*ispp + n_global + col + ispp];
-      if (lim > 0.0f) { if (u > lim) u = lim; if (u < -lim) u = -lim; }
 
-      act[(size_t)(tk_base + row_base + i)*ispp + n_global + col] = f2bf(silu_g * u);
+      act[(size_t)(tk_base + row_base + i)*ispp + n_global + col] =
+          f2bf(epilogue_act(activation, g, u, beta, linear_beta, swiglu_limit));
     }
   }
 }
@@ -443,7 +462,8 @@ __global__ void gateup_swiglu_kernel_prefill(
     uint16_t*       __restrict__ act,
     const int32_t*  __restrict__ sorted_ids,
     const int32_t*  __restrict__ expert_ids,
-    int hidden, int ispp, int M, int top_k, float swiglu_limit, int has_bias) {
+    int hidden, int ispp, int M, int top_k, float swiglu_limit,
+    int activation, float beta, float linear_beta, int has_bias) {
 
   constexpr int kNF = kBN / 16;
   __shared__ uint16_t sA[kBM_pf][kBK_pf];
@@ -496,7 +516,6 @@ __global__ void gateup_swiglu_kernel_prefill(
   // Epilogue: C col = lane%16, row = warp*16 + (lane/16)*4 + i.
   int col = lane & 15;
   int row_base = warp * 16 + (lane >> 4) * 4;
-  float lim = swiglu_limit;
 #pragma unroll
   for (int nf = 0; nf < kNF; ++nf) {
 #pragma unroll
@@ -506,16 +525,12 @@ __global__ void gateup_swiglu_kernel_prefill(
         float g = acc_g[nf][i];
         if (has_bias)
           g += b13[(size_t)expert * 2 * ispp + n_global + nf * 16 + col];
-        if (lim > 0.0f && g > lim) g = lim;
-        float silu_g = g / (1.0f + expf(-g));
-
         float u = acc_u[nf][i];
         if (has_bias)
           u += b13[(size_t)expert * 2 * ispp + n_global + nf * 16 + col + ispp];
-        if (lim > 0.0f) { if (u > lim) u = lim; if (u < -lim) u = -lim; }
 
         act[(size_t)(tk_base + row_base + i) * ispp + n_global + nf * 16 + col] =
-            f2bf(silu_g * u);
+            f2bf(epilogue_act(activation, g, u, beta, linear_beta, swiglu_limit));
       }
     }
   }
@@ -619,6 +634,7 @@ void fused_moe_mxfp4(
     int M, int hidden, int ispp, int top_k,
     const int32_t* sorted_ids, const int32_t* expert_ids,
     int EM, float swiglu_limit,
+    int activation, float beta, float linear_beta,
     const float* b13, const float* b2, int block_size) {
 
   float* sorted_w = nullptr;
@@ -636,7 +652,7 @@ void fused_moe_mxfp4(
       gateup_swiglu_kernel_prefill<kBN_pf><<<g, kThreads_pf>>>(
           A, w13, w13_scale, b13, act_scratch,
           sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
-          b13 != nullptr);
+          activation, beta, linear_beta, b13 != nullptr);
     }
     {
       dim3 g(EM / kBM_pf, hidden / kBN_pf);
@@ -652,7 +668,7 @@ void fused_moe_mxfp4(
       gateup_swiglu_kernel<<<g, kWhreads>>>(
           A, w13, w13_scale, b13, act_scratch,
           sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
-          b13 != nullptr);
+          activation, beta, linear_beta, b13 != nullptr);
     }
     {
       dim3 g(EM / kBM, hidden / kBN, kWarps);
