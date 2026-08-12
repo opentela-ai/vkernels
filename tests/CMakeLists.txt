@@ -28,9 +28,9 @@ vkernels_add_test(NAME p2p_kv_restore SOURCES comm/test_p2p_kv_restore.cpp)
 # (pulled in automatically for .cu translation units).
 if(VKERNELS_HAS_CUDA)
   vkernels_add_test(NAME p2p_gather_c SOURCES comm/test_p2p_gather_c.cu
-                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/csrc
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
                     LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
   vkernels_add_test(NAME p2p_kv_restore_c SOURCES comm/test_p2p_kv_restore_c.cu
-                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/csrc
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
                     LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
 endif()

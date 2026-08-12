@@ -40,7 +40,7 @@ endif()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/meta/cmake")
 include(Warnings)
 include(Sanitizers)
 include(Coverage)
@@ -52,7 +52,7 @@ if(VKERNELS_ENABLE_COVERAGE)
   message(STATUS "vkernels: line-coverage instrumentation enabled (gcov)")
 endif()
 
-add_subdirectory(csrc)
+add_subdirectory(src/c)
 
 if(VKERNELS_BUILD_TESTS)
   enable_testing()
@@ -60,15 +60,15 @@ if(VKERNELS_BUILD_TESTS)
 endif()
 
 if(VKERNELS_BUILD_BENCHMARKS)
-  add_subdirectory(benchmarks)
+  add_subdirectory(meta/benchmarks)
 endif()
 
 if(VKERNELS_BUILD_PYTHON)
-  add_subdirectory(src)
+  add_subdirectory(src/python)
 endif()
 
 if(VKERNELS_BUILD_RUST)
-  # Rust bindings under rust/ (safe `vkernels` crate over the `vkernels-sys`
+  # Rust bindings under src/rust/ (safe `vkernels` crate over the `vkernels-sys`
   # FFI layer). `cargo test` builds the C++ library itself via the cmake
   # build script, so this only registers the test; the crate builds on any
   # machine (host path by default, VKERNELS_RUST_CUDA=ON for CUDA).
@@ -79,9 +79,9 @@ if(VKERNELS_BUILD_RUST)
   if(VKERNELS_BUILD_TESTS)
     add_test(NAME rust_bindings
       COMMAND ${VKERNELS_CARGO_EXECUTABLE} test --manifest-path
-              ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml)
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/rust/Cargo.toml)
     set_tests_properties(rust_bindings PROPERTIES
-      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/rust")
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/rust")
   endif()
 endif()
 

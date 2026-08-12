@@ -18,4 +18,4 @@ out/
 __pycache__/
 *.pyc
 
-rust/
+src/rust/target/

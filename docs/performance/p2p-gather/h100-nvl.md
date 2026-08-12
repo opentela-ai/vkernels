@@ -97,13 +97,13 @@ constants in `p2p_gather.cpp` (host-tested).
 cmake --preset cuda -DVKERNELS_BUILD_BENCHMARKS=ON
 cmake --build --preset cuda
 # idle GPU, real NVLink peer (src GPU1 -> dst GPU0):
-./build/cuda/benchmarks/p2p_gather_bench --src-device 1
+./build/cuda/meta/benchmarks/p2p_gather_bench --src-device 1
 # concurrent-compute (persistent fill kernel on a second stream):
-./build/cuda/benchmarks/p2p_gather_bench --src-device 1 --concurrent
+./build/cuda/meta/benchmarks/p2p_gather_bench --src-device 1 --concurrent
 # different concurrent-load levels (blocks of the persistent filler):
-VK_BENCH_FILL_BLOCKS=512 ./build/cuda/benchmarks/p2p_gather_bench --src-device 1 --concurrent
+VK_BENCH_FILL_BLOCKS=512 ./build/cuda/meta/benchmarks/p2p_gather_bench --src-device 1 --concurrent
 # same-device reference (D2D over HBM, ~6x faster than NVLink peer):
-./build/cuda/benchmarks/p2p_gather_bench
+./build/cuda/meta/benchmarks/p2p_gather_bench
 ```
 
 The bench prints baseline (copy loop), forced kernel, adaptive path +

@@ -89,9 +89,9 @@ CMD ["bash", "-c", "\
 echo '=== vkernels tests ===' && \
 cd /workspace/vkernels/build-cuda && ctest --output-on-failure && \
 echo && echo '=== vkernels moe benchmark ===' && \
-./benchmarks/moe_bench && \
+./meta/benchmarks/moe_bench && \
 echo && echo '=== vkernels p2p gather benchmark ===' && \
-./benchmarks/p2p_gather_bench && \
+./meta/benchmarks/p2p_gather_bench && \
 echo && echo '=== vkernels p2p kv restore benchmark ===' && \
-./benchmarks/p2p_kv_restore_bench \
+./meta/benchmarks/p2p_kv_restore_bench \
 "]

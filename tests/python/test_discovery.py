@@ -186,7 +186,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("name:        gemm", p.stdout)
         self.assertIn("category:    gemm", p.stdout)
-        self.assertIn("header:      csrc/vkernels/kernels/gemm.hpp", p.stdout)
+        self.assertIn("header:      src/c/vkernels/kernels/gemm.hpp", p.stdout)
 
     def test_info_class_lookup(self):
         p = _run_vkl("info", "OverlapExecutor")

@@ -1,11 +1,11 @@
 # Root project file for the vkernels repository, managed with uv.
 #
-# The Python side (the `vkl` CLI + kernel discovery, under src/vkernels/) is
+# The Python side (the `vkl` CLI + kernel discovery, under src/python/vkernels/) is
 # a src-layout package. `uv sync` installs it (editable) together with its
 # dependencies into .venv/; `uv run vkl ...` / `uv run python -m vkernels.cli`
 # then work from anywhere in the repository. The C++/CUDA library under
-# csrc/ is built separately with CMake (see CMakePresets.json / Makefile) and
-# is discovered at runtime by src/vkernels/_backend.py.
+# src/c/ is built separately with CMake (see CMakePresets.json / Makefile) and
+# is discovered at runtime by src/python/vkernels/_backend.py.
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -28,9 +28,9 @@ dev = [
     "pytest>=8",
 ]
 
-# src-layout: the `vkernels` package lives under src/.
+# src-layout: the `vkernels` package lives under src/python/.
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src/python"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

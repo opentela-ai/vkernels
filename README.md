@@ -10,9 +10,9 @@ compiled automatically when a CUDA toolkit is present.
 
 ```
 vkernels/
-├── pyproject.toml            # Python project (src/vkernels), managed with uv
+├── pyproject.toml            # Python project (src/python/vkernels), managed with uv
 ├── uv.lock                   #   `uv sync` installs the `vkl` CLI + deps
-├── csrc/                     # C++/CUDA sources (the kernel library)
+├── src/c/                     # C++/CUDA sources (the kernel library)
 │   └── vkernels/
 │       ├── util/             # Span, error/status, logging, build annotations
 │       ├── core/             # device, stream, allocator abstractions
@@ -25,23 +25,27 @@ vkernels/
 │           ├── channel.{hpp,cpp}    #   transport abstraction + mock backend
 │           ├── allreduce.{hpp,cpp,cu}#  ring all-reduce
 │           └── overlap.{hpp,cpp}    #   compute/communication overlap
-├── tests/                    # C++ unit tests mirroring csrc/ (100% line coverage target)
+├── tests/                    # C++ unit tests mirroring src/c/ (100% line coverage target)
 │   ├── python/               #   Python tests (vkl CLI + bindings)
 │   └── third_party/minitest.hpp     # dependency-free test harness
-├── cmake/                    # CMake helpers (CUDA, coverage, sanitizers, testing)
-├── scripts/                  # build / test / coverage / format helpers
-├── src/                      # Python package: `vkl` CLI + kernel bindings
-│   └── vkernels/
-│       ├── cli/              #   argparse CLI (`list`, `info`)
-│       ├── kernels.py        #   add/scale/relu/sum/max/gemm (public API)
-│       ├── comm.py           #   topology/channels/allreduce/overlap/p2p
-│       ├── core.py           #   Device/Stream
-│       ├── _core.cpp         #   optional pybind11 backend (built by CMake)
-│       └── _fallback.py      #   pure-Python reference (no build needed)
-├── rust/                     # Rust bindings (workspace: `vkernels-sys` FFI + `vkernels` safe API)
-│   ├── vkernels-sys/         #   unsafe FFI; build.rs links the C++ library via CMake
-│   └── vkernels/             #   safe `kernels`/`comm`/`core` API mirroring the Python one
-├── csrc/vkernels/capi/       # C ABI shim (extern "C" + exception translation) for non-C++ consumers
+├── meta/                     # build support: cmake, scripts, docker, benchmarks
+│   ├── cmake/                #   CMake helpers (CUDA, coverage, sanitizers, testing)
+│   ├── scripts/              #   build / test / coverage / format helpers
+│   ├── docker/               #   Dockerfiles and profiling toolchain
+│   └── benchmarks/           #   micro-benchmarks
+├── src/                      # Language bindings
+│   ├── python/               #   Python package: `vkl` CLI + kernel bindings
+│   │   └── vkernels/
+│   │       ├── cli/          #     argparse CLI (`list`, `info`)
+│   │       ├── kernels.py    #     add/scale/relu/sum/max/gemm (public API)
+│   │       ├── comm.py       #     topology/channels/allreduce/overlap/p2p
+│   │       ├── core.py       #     Device/Stream
+│   │       ├── _core.cpp     #     optional pybind11 backend (built by CMake)
+│   │       └── _fallback.py  #     pure-Python reference (no build needed)
+│   └── rust/                 #   Rust bindings (workspace: `vkernels-sys` FFI + `vkernels` safe API)
+│       ├── vkernels-sys/     #     unsafe FFI; build.rs links the C++ library via CMake
+│       └── vkernels/         #     safe `kernels`/`comm`/`core` API mirroring the Python one
+├── src/c/vkernels/capi/       # C ABI shim (extern "C" + exception translation) for non-C++ consumers
 ├── docs/                     # architecture, kernels, communication, testing
 └── .github/workflows/        # host (coverage) + CUDA CI
 ```
@@ -58,19 +62,50 @@ Every kernel and collective in this repo is provided **twice**:
 This means you can develop, review, and get to 100% coverage on any laptop, and run the
 GPU path only on machines that have a toolkit and device.
 
+## Development environment (mise)
+
+All language toolchains and build tools are pinned in [`.mise.toml`](.mise.toml) and
+managed by [mise](https://github.com/jdx/mise). After installing mise, trust the
+config and install the tools:
+
+```bash
+mise trust    # one-time: trust the repo-level .mise.toml
+mise install  # fetch python 3.12, uv, cmake, rust, clang-format, …
+```
+
+mise ensures every developer (and CI) uses the same versions of the tools listed below.
+It also provides tasks that mirror the Makefile — run `mise tasks` to see them.
+
+| Tool | Pinned version | Why |
+|---|---|---|
+| `python` | 3.12 | pyproject.toml requires `>=3.9`; uv manages `.venv/` from this python |
+| `uv` | latest | Python package manager (`uv sync`, `uv run`, …) |
+| `cmake` | latest | Build system; CMakeLists.txt requires `>=3.18` |
+| `rust` | latest | Optional Rust bindings under `src/rust/` (edition 2021) |
+| `clang-format` | latest | Code formatter; also provides `clang-tidy` (shipped from LLVM) |
+| `ccache` | latest | *Optional* — faster C++ recompilation |
+| `ninja` | latest | *Optional* — alternative CMake generator |
+
+CUDA and HIP toolkits are expected at the system level and are **not** pinned in
+`.mise.toml`.
+
 ## Quick start
 
 ```bash
+# One-time: install pinned tools
+mise install
+
 # Configure + build + test on the host (no GPU required)
 cmake --preset host
 cmake --build --preset host
 ctest --preset host          # or: cmake --build --preset host --target test
 
-# Line coverage (enforces 100% on code under csrc/)
+# Line coverage (enforces 100% on code under src/c/)
+# Or simply: mise run coverage
 cmake --preset coverage
 cmake --build --preset coverage
 ctest --preset coverage
-python3 scripts/coverage.py --build-dir build/coverage --source-dir csrc --min 100
+python3 meta/scripts/coverage.py --build-dir build/coverage --source-dir src/c --min 100
 ```
 
 When a CUDA toolkit is available:
@@ -83,9 +118,9 @@ ctest --preset cuda
 
 ## vkl — listing the implemented kernels
 
-`vkl` (Python, under `src/`) answers “what is implemented in this
-repository?”. It scans the public headers under `csrc/vkernels/kernels/` and
-`csrc/vkernels/comm/` and pairs each declaration with its implementations —
+`vkl` (Python, under `src/python/`) answers "what is implemented in this
+repository?”. It scans the public headers under `src/c/vkernels/kernels/` and
+`src/c/vkernels/comm/` and pairs each declaration with its implementations —
 a `.cpp` CPU reference and/or a `.cu` CUDA file — so the list always
 reflects the sources. No build step is required. The Python project is
 managed with [uv](https://docs.astral.sh/uv/) from the root `pyproject.toml`:
@@ -104,18 +139,18 @@ Or use the Makefile shortcuts (`make vkl ARGS=list`, `make py-test`,
 (`uv sync` does this in editable mode; plain `pip install -e .` works too).
 The repository root is auto-detected and can be overridden with `--root DIR`
 or the `VKERNELS_ROOT` environment variable; `vkl --version` reports the
-version from `csrc/vkernels/util/version.hpp`. See
+version from `src/c/vkernels/util/version.hpp`. See
 `tests/python/test_discovery.py` for the exact discovery contract.
 
 ## Python bindings (opt-in)
 
-Beyond the CLI, `src/vkernels/` exposes a documented Python interface to the
+Beyond the CLI, `src/python/vkernels/` exposes a documented Python interface to the
 kernels and communication primitives themselves — `vkernels.kernels`
 (add/scale/relu/sum/max/gemm), `vkernels.comm` (topology, channels, ring
 all-reduce, compute/communication overlap, the p2p run-list gather) and
 `vkernels.core` (Device, Stream). The interface dispatches to a compiled
-pybind11 backend (`vkernels._core`, built from `src/vkernels/_core.cpp`
-when `VKERNELS_BUILD_PYTHON=ON`) that calls the C++ library under `csrc/`,
+pybind11 backend (`vkernels._core`, built from `src/python/vkernels/_core.cpp`
+when `VKERNELS_BUILD_PYTHON=ON`) that calls the C++ library under `src/c/`,
 and falls back to pure-Python reference implementations otherwise — so it
 works with or without a build, and the two backends are cross-checked
 bit-for-bit by the tests.
@@ -136,14 +171,14 @@ and [`docs/communication.md`](docs/communication.md) for the design and conventi
 
 ## Rust bindings (opt-in)
 
-`rust/` is the Rust counterpart of the Python bindings: `vkernels-sys` links
+`src/rust/` is the Rust counterpart of the Python bindings: `vkernels-sys` links
 the C++ library (built by CMake through the `cmake` crate; host-only by
 default, `VKERNELS_RUST_CUDA=ON` for CUDA) via the C ABI in
-`csrc/vkernels/capi/`, and `vkernels` wraps it in a safe, `Result`-based API
+`src/c/vkernels/capi/`, and `vkernels` wraps it in a safe, `Result`-based API
 (`kernels`, `comm`, `core`). Build and test on any machine:
 
 ```bash
-cargo test --manifest-path rust/Cargo.toml   # or: make rust-test
+cargo test --manifest-path src/rust/Cargo.toml   # or: make rust-test
 # or via the CMake preset (registers `rust_bindings` with CTest):
 cmake --preset rust && cmake --build --preset rust && ctest --preset rust
 ```

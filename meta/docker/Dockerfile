@@ -14,7 +14,7 @@
 #   podman run --device=/dev/kfd --device=/dev/dri \
 #       --security-opt seccomp=unconfined -it vkernels:hip bash
 
-FROM rocm/dev-ubuntu-22.04:6.3
+FROM docker.io/rocm/dev-ubuntu-22.04:6.2.4
 
 # ------------------------------------------------------------------
 # System dependencies
@@ -28,7 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set up python3.11 as default python3
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
-# Install PyTorch for ROCm
+# Install numpy via pip (avoid system apt numpy which is for python3.10)
+RUN python3 -m pip install --no-cache-dir numpy
+
+# Install PyTorch for ROCm (matching ROCm 6.2.x)
 RUN python3 -m pip install --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/rocm6.2.4
 
@@ -48,10 +51,10 @@ RUN rm -rf build-hip && \
     && cmake --build build-hip -j$(nproc)
 
 # ------------------------------------------------------------------
-# xkernels: copy source and install
+# xkernels: copy source (installed via PYTHONPATH — src-layout, no need to pip install)
 # ------------------------------------------------------------------
 COPY xkernels-src /workspace/xkernels
-RUN python3 -m pip install --no-cache-dir /workspace/xkernels
+ENV PYTHONPATH=/workspace/xkernels/src:$PYTHONPATH
 
 # Verify both stacks
 RUN python3 -c "import torch; print('torch', torch.__version__, 'rocm=', torch.version.hip)" \
@@ -61,7 +64,7 @@ CMD ["bash", "-c", "\
 echo '=== vkernels tests ===' && \
 cd /workspace/vkernels/build-hip && ctest --output-on-failure && \
 echo && echo '=== vkernels moe benchmark ===' && \
-./benchmarks/moe_bench && \
+./meta/benchmarks/moe_bench && \
 echo && echo '=== xkernels moe benchmark ===' && \
 cd /workspace/xkernels && \
 python3 benchmarks/bench_moe_mxfp4.py --regime decode \
