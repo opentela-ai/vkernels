@@ -241,3 +241,45 @@ out             = vk.mxfp4_moe_scatter_reduce_q(partial_q, partial_s, topk_w,
 
 `moe_align_block_size` (from `moe_fused`) produces `sorted_ids` /
 `expert_ids` and is the entry point for the pipeline above.
+
+---
+
+## Validation on gfx942 (MI300A)
+
+`meta/benchmarks/test_moe_aux_correct.hip` cross-checks the five HIP kernels
+(`src/c/vkernels/kernels/moe_aux.hip`, `vkernels::kernels::hip`) against the
+CPU oracle (`moe_aux.cpp`, `vkernels::kernels`) on a real MI300A compute node.
+The two configs exercised:
+
+| op                          | small (M8 H256 tk2 E4) | K3 (M112 H7168 tk16 E64) |
+|-----------------------------|------------------------|---------------------------|
+| `mxfp4_moe_quant.packed`    | bit-exact (1024 B)     | bit-exact (401408 B)      |
+| `mxfp4_moe_quant.scales`    | bit-exact (64 B)       | bit-exact (25088 B)       |
+| `mxfp4_moe_sort`            | bit-exact (16384)      | bit-exact (14565376)      |
+| `mxfp4_moe_sort_scales`     | bit-exact (512 B)      | bit-exact (455168 B)      |
+| `mxfp4_moe_scatter_reduce`  | rel<1e-5 (max 0)       | rel<1e-5 (max 2.38e-07)   |
+| `mxfp4_moe_scatter_reduce_q`| rel<1e-5 (max 0)       | rel<1e-5 (max 1.19e-07)   |
+
+The quant and two sort ops are pure data movement / integer quantization (no
+floating accumulation across blocks) and so are bit-exact. The two
+scatter-reduce ops accumulate into each output token with `atomicAdd`; with
+`top_k = 2` the two addends commute (bit-exact), while the K3 shape
+(`top_k = 16`) has sixteen addends per token and so genuinely exercises the
+relative tolerance — the observed `~2e-7` is two orders of magnitude inside
+`1e-5`.
+
+Build & run (bare-metal, ROCm 6.3; the compute node has the runtime, so no
+container is needed):
+
+```sh
+cmake --preset hip -DVKERNELS_BUILD_BENCHMARKS=ON
+cmake --build build/hip --target test_moe_aux_correct
+srun --partition=mi300 --ntasks=1 --cpus-per-task=16 --time=00:05:00 \
+     ./build/hip/meta/benchmarks/test_moe_aux_correct
+```
+
+A latent buffer-overflow was caught at the K3 scale: the sort / scales /
+scatter buffers were sized `E * BLOCK_M`, which is too small whenever an
+expert receives more than `BLOCK_M` assignments (K3 has `~28/expert`, giving
+`EM = 2032` against the old bound of `1024`). They are now sized to the safe
+upper bound `EM_max = M * top_k + E * BLOCK_M` with a runtime assert.
