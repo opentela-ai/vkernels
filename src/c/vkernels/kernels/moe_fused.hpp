@@ -101,6 +101,96 @@ void fused_moe_mxfp4_cpu(
     const float* b2 = nullptr);
 
 // ---------------------------------------------------------------------------
+// Distributed (TP) stage split of the fused MoE
+// ---------------------------------------------------------------------------
+//
+// `fused_moe_mxfp4_cpu` fuses the activation into stage 0, which blocks
+// tensor-parallel execution: a TP rank owns a K-slice of `hidden`, so the
+// gate/up GEMM of each rank must be summed (all-reduced) BEFORE the
+// nonlinear activation.  The fused call is therefore split into four
+// composable stages with an explicit boundary between the linear GEMMs and
+// the elementwise epilogues:
+//
+//   Stage 0a  moe_gateup_cpu       gate_up[EM, 2*ispp]  = A_slice @ w13^T
+//            (caller: all-reduce gate_up across TP ranks)
+//   Stage 0b  moe_act_epilogue_cpu act[EM, ispp] = act(gate_up + b13)
+//   Stage 1a  moe_down_cpu         partial[EM, hidden] = act_slice @ w2^T
+//            (caller: all-reduce partial across TP ranks)
+//   Stage 1b  moe_combine_cpu      out[M, hidden] += (partial + b2) * topk_w
+//
+// `fused_moe_mxfp4_cpu` is exactly this composition with k_base = 0 and the
+// full K dimensions — byte-identical results, exposed for the TP rank whose
+// weights cover `k_base .. k_base + k_dim`.  The all-reduce points are the
+// hooks where the caller (e.g. vLLM on gfx942) runs its own collective; see
+// `dist_moe.hpp` for the distributed orchestrators.
+//
+// Stage 0a — gate/up GEMM (linear, pre-activation, pre-bias).
+//   A       [M, a_stride] bf16   input activations (full hidden rows on a TP
+//                                rank; a_stride == full hidden)
+//   k_base  column in each A row where this rank's weight shard starts
+//           (0 for the single-rank call; r*hidden_shard for TP rank r)
+//   hidden_k  K dimension of this GEMM == width of this rank's w13 shard
+//           (full hidden for single rank, hidden/tp for a TP rank)
+//   gate_up [EM, 2*ispp] fp32  raw gate (cols 0..ispp-1) and up
+//           (cols ispp..2*ispp-1) accumulators; rows of padding blocks
+//           (expert_ids[mb] < 0) are left untouched
+void moe_gateup_cpu(
+    const uint16_t* A,
+    const uint8_t*  w13,
+    const uint8_t*  w13_scale,
+    const int32_t*  sorted_ids,
+    const int32_t*  expert_ids,
+    float*          gate_up,
+    int M, int a_stride, int k_base, int hidden_k, int ispp, int top_k,
+    int EM, int group_size);
+
+// Stage 0b — bias + activation epilogue → act [EM, ispp] bf16.
+//   gate_up   [EM, 2*ispp] fp32 (all-reduced when TP > 1)
+//   b13       [E, 2*ispp] fp32 gate/up bias (nullptr → skip)
+//   act       [EM, ispp] bf16  written for real rows only (padding rows of
+//             the caller's buffer are left untouched, as in the fused call)
+void moe_act_epilogue_cpu(
+    const float*    gate_up,
+    const float*    b13,
+    uint16_t*       act,
+    const int32_t*  sorted_ids,
+    const int32_t*  expert_ids,
+    int M, int top_k, int EM, int ispp,
+    float swiglu_limit,
+    int activation = kSwiGLU,
+    float beta = 4.0f,
+    float linear_beta = 25.0f);
+
+// Stage 1a — down GEMM (linear, pre-bias, pre-combine).
+//   act       [EM, a_stride] bf16  stage-0 output (full ispp rows on a TP
+//                                   rank; a_stride == full ispp)
+//   k_base    column in each act row where this rank's w2 shard starts
+//   ispp_k    K dimension of this GEMM == width of this rank's w2 shard
+//   partial   [EM, hidden] fp32 raw down accumulators (full output width)
+void moe_down_cpu(
+    const uint16_t* act,
+    const uint8_t*  w2,
+    const uint8_t*  w2_scale,
+    const int32_t*  sorted_ids,
+    const int32_t*  expert_ids,
+    float*          partial,
+    int M, int a_stride, int k_base, int ispp_k, int hidden, int top_k,
+    int EM, int group_size);
+
+// Stage 1b — routed combine epilogue: out[M, hidden] += (partial + b2) * topk_w.
+//   partial  [EM, hidden] fp32 (all-reduced when TP > 1)
+//   b2       [E, hidden] fp32 down bias (nullptr → skip)
+//   out      [M, hidden] fp32  accumulates in place (caller zero-initialises)
+void moe_combine_cpu(
+    const float*    partial,
+    const float*    b2,
+    const float*    topk_w_sorted,
+    const int32_t*  sorted_ids,
+    const int32_t*  expert_ids,
+    float*          out,
+    int M, int hidden, int top_k, int EM);
+
+// ---------------------------------------------------------------------------
 // moe_align_block_size — map topk_ids → sorted_ids + expert_ids
 // ---------------------------------------------------------------------------
 //
@@ -125,6 +215,58 @@ int moe_align_block_size(
     int32_t* expert_ids);
 
 }  // namespace vkernels::kernels
+
+
+// ---------------------------------------------------------------------------
+// HIP stage kernels (TP mode), declared only when VKERNELS_HAS_HIP is set.
+// ---------------------------------------------------------------------------
+#if VKERNELS_HAS_HIP
+namespace vkernels::kernels::hip {
+
+// Distributed (TP) variant of the fused MoE, split so the caller can
+// all-reduce between the linear stages (see dist_moe.hpp).  Each function
+// consumes a per-rank weight shard: w13/w13_scale are [E, 2*ispp, hidden/tp]
+// slices of the full weight, w2/w2_scale are [E, hidden, ispp/tp] slices,
+// b13/b2 are shared (added post-all-reduce).  `k_base` is the column offset
+// into A / act where this rank's shard starts (r*hidden/tp, r*ispp/tp).
+//
+//   gate_up [EM, 2*ispp] fp32   ← stage 0a (then caller all-reduces)
+//   act     [EM, ispp]    bf16  ← stage 0b
+//   partial [EM, hidden]  fp32  ← stage 1a (then caller all-reduces)
+//   out     [M, hidden]   fp32  ← stage 1b (accumulates; zero-init first)
+//
+// The call sequence for one TP rank:
+//   moe_gateup_preact(...)   → all-reduce gate_up → moe_act_epilogue(...)
+//     → moe_down_preact(...) → all-reduce partial → moe_combine(...)
+// These are the GPU counterparts of the CPU stage functions above.  Decode
+// regime only (block_size == 16, 64-thread tiles); prefill follows the same
+// pattern with the 256-thread templates.
+
+void moe_gateup_preact(
+    const uint16_t* A, const uint8_t* w13, const uint8_t* w13_scale,
+    const int32_t* sorted_ids, const int32_t* expert_ids, float* gate_up,
+    int M, int hidden, int ispp, int top_k, int EM,
+    int k_base, int hidden_k);
+
+void moe_act_epilogue(
+    const float* gate_up, const float* b13, uint16_t* act,
+    const int32_t* sorted_ids, const int32_t* expert_ids,
+    int M, int top_k, int EM, int ispp, float swiglu_limit,
+    int activation, float beta, float linear_beta);
+
+void moe_down_preact(
+    const uint16_t* act, const uint8_t* w2, const uint8_t* w2_scale,
+    const int32_t* sorted_ids, const int32_t* expert_ids, float* partial,
+    int M, int ispp, int hidden, int top_k, int EM,
+    int k_base, int ispp_k);
+
+void moe_combine(
+    const float* partial, const float* b2, const float* topk_w_sorted,
+    const int32_t* sorted_ids, const int32_t* expert_ids, float* out,
+    int M, int hidden, int top_k, int EM);
+
+}  // namespace vkernels::kernels::hip
+#endif  // VKERNELS_HAS_HIP
 
 
 // HIP implementation (only declared when VKERNELS_HAS_HIP is set).

@@ -161,6 +161,29 @@ out[M, hidden] += act @ w2^T · topk_w_sorted + b2
   experts and would otherwise race.
 - The caller must zero-initialise `out` (down-combine accumulates into it).
 
+### Distributed (TP / EP / PP) — issue #18
+
+The fused kernel is single-device; `vkernels.dist` (C++ `dist/dist_moe.hpp`,
+Python `vkernels.dist`) shards the weights so per-rank shards are consumed
+verbatim by the fused kernel's stage functions, and provides the
+orchestration around them:
+
+- **TP** — gate/up weights split along `hidden`, down weights along `ispp`;
+  the linear stages are separated (`moe_gateup_cpu` / `moe_down_cpu`) so
+  rank partials can be all-reduced *before* the nonlinear epilogues.  The
+  multi-rank forward matches the CPU oracle.
+- **EP** — experts partitioned across ranks; `moe_ep_dispatch` produces the
+  all-to-all / sort re-layout with local expert ids.
+- **PP** — `pp_boundary_send`/`recv` fix the stage-boundary transfer
+  interface (graph-capturable primitive, issue #10) and `round_bf16`
+  re-quantises the bf16 stage input.
+- **Files**: `src/c/vkernels/dist/dist_moe.cpp` (+ `.hpp`), stage split in
+  `src/c/vkernels/kernels/moe_fused.{cpp,hip}`, Python `src/python/vkernels/dist.py`
+- **Tests**: `tests/kernels/moe/test_dist_moe.cpp`,
+  `tests/python/test_dist.py`, `meta/benchmarks/test_moe_fused_dist_correct.hip`
+  (GPU vs CPU oracle)
+- **Docs**: [kernels/moe_dist.md](kernels/moe_dist.md)
+
 ### Expert alignment helper
 
 | Function | Computation |

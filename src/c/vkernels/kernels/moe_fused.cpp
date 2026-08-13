@@ -126,36 +126,51 @@ float bf16_to_float(uint16_t v) {
 }  // namespace
 
 // ======================================================================
-//  fused_moe_mxfp4_cpu
+//  Epilogue: SwiGLU or SiTU over one (gate, up) pair
 // ======================================================================
-void fused_moe_mxfp4_cpu(
+float epilogue_value(int activation, float g, float u,
+                     float swiglu_limit, float beta, float linear_beta) {
+  if (activation == kSiTU) {
+    // Kimi-K3 SiTU (situ_and_mul): no clamp; tanh softcaps bound the
+    // operands instead. Matches vLLM's csrc/libtorch_stable/
+    // activation_kernels.cu `situ_and_mul_kernel` exactly.
+    float sig = 1.0f / (1.0f + std::exp(-g));
+    float gate_out = beta * std::tanh(g / beta) * sig;
+    float up_out = (linear_beta > 0.0f)
+                       ? linear_beta * std::tanh(u / linear_beta)
+                       : u;
+    return gate_out * up_out;
+  }
+  if (swiglu_limit > 0.0f) {
+    if (g > swiglu_limit) g = swiglu_limit;
+    if (u > swiglu_limit) u = swiglu_limit;
+    if (u < -swiglu_limit) u = -swiglu_limit;
+  }
+  float silu_g = g / (1.0f + std::exp(-g));
+  return silu_g * u;
+}
+
+// ======================================================================
+//  Stage 0a — gate/up GEMM (pre-activation, pre-bias) → gate_up [EM, 2*ispp]
+// ======================================================================
+// The linear GEMM of the fused MoE, separated from the nonlinear epilogue
+// so tensor-parallel ranks can all-reduce the accumulators between the two.
+// `a_stride`/`k_base` select the K-slice of A this rank's w13 shard covers
+// (single rank: a_stride == hidden_k == hidden, k_base == 0).
+void moe_gateup_cpu(
     const uint16_t* A,
     const uint8_t*  w13,
     const uint8_t*  w13_scale,
-    const uint8_t*  w2,
-    const uint8_t*  w2_scale,
     const int32_t*  sorted_ids,
-    const float*    topk_w_sorted,
     const int32_t*  expert_ids,
-    uint16_t*       act_scratch,
-    float*          out,
-    int M, int hidden, int ispp, int top_k, int EM,
-    int group_size,
-    float swiglu_limit,
-    int activation,
-    float beta,
-    float linear_beta,
-    const float* b13,
-    const float* b2) {
+    float*          gate_up,
+    int M, int a_stride, int k_base, int hidden_k, int ispp, int top_k,
+    int EM, int group_size) {
 
   constexpr int BLOCK_M = 16;
   constexpr int BLOCK_N = 64;
   constexpr int BLOCK_K = 64;
   const int N = M * top_k;
-
-  // ==================================================================
-  // Stage 0: gate_up + SwiGLU → act_scratch [EM, ispp]
-  // ==================================================================
 
   // Buffers for dequantized B tile [BLOCK_K][BLOCK_N] bf16
   std::vector<uint16_t> tile_gate(BLOCK_K * BLOCK_N);
@@ -168,12 +183,12 @@ void fused_moe_mxfp4_cpu(
   std::vector<float> acc_gate(BLOCK_M * BLOCK_N);
   std::vector<float> acc_up(BLOCK_M * BLOCK_N);
 
-  int w13_expert_bytes  = 2 * ispp * (hidden / 2);
-  int w13s_expert_bytes = 2 * ispp * (hidden / group_size);
+  int w13_expert_bytes  = 2 * ispp * (hidden_k / 2);
+  int w13s_expert_bytes = 2 * ispp * (hidden_k / group_size);
 
   int num_m_blocks = EM / BLOCK_M;
   int num_n_blocks = ispp / BLOCK_N;
-  int num_k_blocks = hidden / BLOCK_K;
+  int num_k_blocks = hidden_k / BLOCK_K;
 
   for (int mb = 0; mb < num_m_blocks; ++mb) {
     int expert = expert_ids[mb];
@@ -195,7 +210,8 @@ void fused_moe_mxfp4_cpu(
           if (flat < N) {
             int token = flat / top_k;
             for (int k = 0; k < BLOCK_K; ++k) {
-              tile_A[m * BLOCK_K + k] = A[token * static_cast<std::size_t>(hidden) + k_start + k];
+              tile_A[m * BLOCK_K + k] =
+                  A[static_cast<std::size_t>(token) * a_stride + k_base + k_start + k];
             }
           } else {
             for (int k = 0; k < BLOCK_K; ++k) tile_A[m * BLOCK_K + k] = 0;
@@ -207,12 +223,12 @@ void fused_moe_mxfp4_cpu(
           int kp_off = k_start / 2;
           int ks_off = k_start / group_size;
           const uint8_t* b_gate = w13 + expert * w13_expert_bytes
-                                  + nb * BLOCK_N * (hidden / 2) + kp_off;
+                                  + nb * BLOCK_N * (hidden_k / 2) + kp_off;
           const uint8_t* s_gate = w13_scale + expert * w13s_expert_bytes
-                                  + nb * BLOCK_N * (hidden / group_size) + ks_off;
+                                  + nb * BLOCK_N * (hidden_k / group_size) + ks_off;
           dequant_weight_tile(b_gate, s_gate, tile_gate.data(),
                               BLOCK_N, BLOCK_K, group_size,
-                              hidden / 2, hidden / group_size, 1);
+                              hidden_k / 2, hidden_k / group_size, 1);
         }
 
         // GEMM: acc_gate += A × gate^T
@@ -232,12 +248,12 @@ void fused_moe_mxfp4_cpu(
           int kp_off = k_start / 2;
           int ks_off = k_start / group_size;
           const uint8_t* b_up = w13 + expert * w13_expert_bytes
-                                + (nb * BLOCK_N + ispp) * (hidden / 2) + kp_off;
+                                + (nb * BLOCK_N + ispp) * (hidden_k / 2) + kp_off;
           const uint8_t* s_up = w13_scale + expert * w13s_expert_bytes
-                                + (nb * BLOCK_N + ispp) * (hidden / group_size) + ks_off;
+                                + (nb * BLOCK_N + ispp) * (hidden_k / group_size) + ks_off;
           dequant_weight_tile(b_up, s_up, tile_up.data(),
                               BLOCK_N, BLOCK_K, group_size,
-                              hidden / 2, hidden / group_size, 1);
+                              hidden_k / 2, hidden_k / group_size, 1);
         }
 
         // GEMM: acc_up += A × up^T
@@ -253,61 +269,103 @@ void fused_moe_mxfp4_cpu(
         }
       }
 
-      // Epilogue: bias, then SwiGLU or SiTU (skip padding tokens).
+      // Raw accumulators → gate_up (padding rows hold the zeroed-tile result).
+      for (int m = 0; m < BLOCK_M; ++m) {
+        for (int n = 0; n < BLOCK_N; ++n) {
+          gate_up[(token_base + m) * (2 * ispp) + nb * BLOCK_N + n] =
+              acc_gate[m * BLOCK_N + n];
+          gate_up[(token_base + m) * (2 * ispp) + ispp + nb * BLOCK_N + n] =
+              acc_up[m * BLOCK_N + n];
+        }
+      }
+    }
+  }
+}
+
+// ======================================================================
+//  Stage 0b — bias + activation epilogue → act [EM, ispp] bf16
+// ======================================================================
+void moe_act_epilogue_cpu(
+    const float*    gate_up,
+    const float*    b13,
+    uint16_t*       act,
+    const int32_t*  sorted_ids,
+    const int32_t*  expert_ids,
+    int M, int top_k, int EM, int ispp,
+    float swiglu_limit,
+    int activation,
+    float beta,
+    float linear_beta) {
+
+  constexpr int BLOCK_M = 16;
+  constexpr int BLOCK_N = 64;
+  const int N = M * top_k;
+
+  int num_m_blocks = EM / BLOCK_M;
+  int num_n_blocks = ispp / BLOCK_N;
+
+  for (int mb = 0; mb < num_m_blocks; ++mb) {
+    int expert = expert_ids[mb];
+    if (expert < 0) continue;
+    int token_base = mb * BLOCK_M;
+
+    for (int nb = 0; nb < num_n_blocks; ++nb) {
+      // Bias, then SwiGLU or SiTU (skip padding tokens).
       for (int m = 0; m < BLOCK_M; ++m) {
         int flat = sorted_ids[token_base + m];
         if (flat >= N) continue;  // padding token, skip
         for (int n = 0; n < BLOCK_N; ++n) {
-          float g = acc_gate[m * BLOCK_N + n];
-          float u = acc_up[m * BLOCK_N + n];
+          float g = gate_up[(token_base + m) * static_cast<std::size_t>(2 * ispp)
+                            + nb * BLOCK_N + n];
+          float u = gate_up[(token_base + m) * static_cast<std::size_t>(2 * ispp)
+                            + ispp + nb * BLOCK_N + n];
 
           if (b13) {
             g += b13[expert * static_cast<std::size_t>(2 * ispp) + nb * BLOCK_N + n];
             u += b13[expert * static_cast<std::size_t>(2 * ispp) + nb * BLOCK_N + n + ispp];
           }
 
-          float result;
-          if (activation == kSiTU) {
-            // Kimi-K3 SiTU (situ_and_mul): no clamp; tanh softcaps bound the
-            // operands instead. Matches vLLM's csrc/libtorch_stable/
-            // activation_kernels.cu `situ_and_mul_kernel` exactly.
-            float sig = 1.0f / (1.0f + std::exp(-g));
-            float gate_out = beta * std::tanh(g / beta) * sig;
-            float up_out = (linear_beta > 0.0f)
-                               ? linear_beta * std::tanh(u / linear_beta)
-                               : u;
-            result = gate_out * up_out;
-          } else {
-            if (swiglu_limit > 0.0f) {
-              if (g > swiglu_limit) g = swiglu_limit;
-              if (u > swiglu_limit) u = swiglu_limit;
-              if (u < -swiglu_limit) u = -swiglu_limit;
-            }
-            float silu_g = g / (1.0f + std::exp(-g));
-            result = silu_g * u;
-          }
+          float result = epilogue_value(activation, g, u,
+                                        swiglu_limit, beta, linear_beta);
 
           // Round to bf16
           uint32_t bits;
           std::memcpy(&bits, &result, sizeof(float));
-          act_scratch[(token_base + m) * static_cast<std::size_t>(ispp) + nb * BLOCK_N + n] =
+          act[(token_base + m) * static_cast<std::size_t>(ispp) + nb * BLOCK_N + n] =
               f32bits_to_bf16_local(bits);
         }
       }
     }
   }
+}
 
-  // ==================================================================
-  // Stage 1: down + combine → out [M, hidden]
-  // ==================================================================
+// ======================================================================
+//  Stage 1a — down GEMM (pre-bias, pre-combine) → partial [EM, hidden]
+// ======================================================================
+void moe_down_cpu(
+    const uint16_t* act,
+    const uint8_t*  w2,
+    const uint8_t*  w2_scale,
+    const int32_t*  sorted_ids,
+    const int32_t*  expert_ids,
+    float*          partial,
+    int M, int a_stride, int k_base, int ispp_k, int hidden, int top_k,
+    int EM, int group_size) {
+
+  constexpr int BLOCK_M = 16;
+  constexpr int BLOCK_N = 64;
+  constexpr int BLOCK_K = 64;
+  const int N = M * top_k;
 
   std::vector<uint16_t> tile_down(BLOCK_K * BLOCK_N);
+  std::vector<uint16_t> tile_A(BLOCK_M * BLOCK_K);
 
-  int w2_expert_bytes  = hidden * (ispp / 2);
-  int w2s_expert_bytes = hidden * (ispp / group_size);
+  int w2_expert_bytes  = hidden * (ispp_k / 2);
+  int w2s_expert_bytes = hidden * (ispp_k / group_size);
 
+  int num_m_blocks = EM / BLOCK_M;
   int num_down_n_blocks = hidden / BLOCK_N;
-  int num_down_k_blocks = ispp / BLOCK_K;
+  int num_down_k_blocks = ispp_k / BLOCK_K;
 
   for (int mb = 0; mb < num_m_blocks; ++mb) {
     int expert = expert_ids[mb];
@@ -326,7 +384,9 @@ void fused_moe_mxfp4_cpu(
           int flat = sorted_ids[token_base + m];
           if (flat < N) {
             for (int k = 0; k < BLOCK_K; ++k) {
-              tile_A[m * BLOCK_K + k] = act_scratch[(token_base + m) * static_cast<std::size_t>(ispp) + k_start + k];
+              tile_A[m * BLOCK_K + k] =
+                  act[static_cast<std::size_t>(token_base + m) * a_stride
+                      + k_base + k_start + k];
             }
           } else {
             for (int k = 0; k < BLOCK_K; ++k) tile_A[m * BLOCK_K + k] = 0;
@@ -338,12 +398,12 @@ void fused_moe_mxfp4_cpu(
           int kp_off = k_start / 2;
           int ks_off = k_start / group_size;
           const uint8_t* b_down = w2 + expert * w2_expert_bytes
-                                  + nb * BLOCK_N * (ispp / 2) + kp_off;
+                                  + nb * BLOCK_N * (ispp_k / 2) + kp_off;
           const uint8_t* s_down = w2_scale + expert * w2s_expert_bytes
-                                  + nb * BLOCK_N * (ispp / group_size) + ks_off;
+                                  + nb * BLOCK_N * (ispp_k / group_size) + ks_off;
           dequant_weight_tile(b_down, s_down, tile_down.data(),
                               BLOCK_N, BLOCK_K, group_size,
-                              ispp / 2, ispp / group_size, 1);
+                              ispp_k / 2, ispp_k / group_size, 1);
         }
 
         // GEMM: acc += A × down^T
@@ -359,25 +419,100 @@ void fused_moe_mxfp4_cpu(
         }
       }
 
-      // Combine: bias + weight + scatter-add (skip padding tokens)
+      // Raw accumulators → partial (padding rows hold the zeroed-tile result).
+      for (int m = 0; m < BLOCK_M; ++m) {
+        for (int n = 0; n < BLOCK_N; ++n) {
+          partial[(token_base + m) * static_cast<std::size_t>(hidden)
+                  + nb * BLOCK_N + n] = acc_down[m * BLOCK_N + n];
+        }
+      }
+    }
+  }
+}
+
+// ======================================================================
+//  Stage 1b — routed combine: out[M, hidden] += (partial + b2) * topk_w
+// ======================================================================
+void moe_combine_cpu(
+    const float*    partial,
+    const float*    b2,
+    const float*    topk_w_sorted,
+    const int32_t*  sorted_ids,
+    const int32_t*  expert_ids,
+    float*          out,
+    int M, int hidden, int top_k, int EM) {
+
+  constexpr int BLOCK_M = 16;
+  constexpr int BLOCK_N = 64;
+  const int N = M * top_k;
+
+  int num_m_blocks = EM / BLOCK_M;
+  int num_n_blocks = hidden / BLOCK_N;
+
+  for (int mb = 0; mb < num_m_blocks; ++mb) {
+    int expert = expert_ids[mb];
+    if (expert < 0) continue;
+
+    int token_base = mb * BLOCK_M;
+
+    for (int nb = 0; nb < num_n_blocks; ++nb) {
+      // Bias + weight + scatter-add (skip padding tokens)
       for (int m = 0; m < BLOCK_M; ++m) {
         int flat = sorted_ids[token_base + m];
         if (flat >= N) continue;  // padding token, skip
         int token = flat / top_k;
         float weight = topk_w_sorted[token_base + m];
         for (int n = 0; n < BLOCK_N; ++n) {
-          float val = acc_down[m * BLOCK_N + n];
+          float val = partial[(token_base + m) * static_cast<std::size_t>(hidden)
+                              + nb * BLOCK_N + n];
           if (b2) {
             val += b2[expert * static_cast<std::size_t>(hidden) + nb * BLOCK_N + n];
           }
           val *= weight;
-          int out_row = token;
-          int out_col = nb * BLOCK_N + n;
-          out[static_cast<std::size_t>(out_row) * hidden + out_col] += val;
+          out[static_cast<std::size_t>(token) * hidden + nb * BLOCK_N + n] += val;
         }
       }
     }
   }
+}
+
+// ======================================================================
+//  fused_moe_mxfp4_cpu — the four stages composed (k_base = 0, full K)
+// ======================================================================
+void fused_moe_mxfp4_cpu(
+    const uint16_t* A,
+    const uint8_t*  w13,
+    const uint8_t*  w13_scale,
+    const uint8_t*  w2,
+    const uint8_t*  w2_scale,
+    const int32_t*  sorted_ids,
+    const float*    topk_w_sorted,
+    const int32_t*  expert_ids,
+    uint16_t*       act_scratch,
+    float*          out,
+    int M, int hidden, int ispp, int top_k, int EM,
+    int group_size,
+    float swiglu_limit,
+    int activation,
+    float beta,
+    float linear_beta,
+    const float* b13,
+    const float* b2) {
+
+  // Raw pre-activation gate/up accumulators [EM, 2*ispp] fp32.
+  std::vector<float> gate_up(static_cast<std::size_t>(EM) * 2 * ispp);
+  // Raw pre-combine down accumulators [EM, hidden] fp32.
+  std::vector<float> partial(static_cast<std::size_t>(EM) * hidden);
+
+  moe_gateup_cpu(A, w13, w13_scale, sorted_ids, expert_ids, gate_up.data(),
+                 M, hidden, 0, hidden, ispp, top_k, EM, group_size);
+  moe_act_epilogue_cpu(gate_up.data(), b13, act_scratch, sorted_ids, expert_ids,
+                       M, top_k, EM, ispp, swiglu_limit, activation, beta,
+                       linear_beta);
+  moe_down_cpu(act_scratch, w2, w2_scale, sorted_ids, expert_ids, partial.data(),
+               M, ispp, 0, ispp, hidden, top_k, EM, group_size);
+  moe_combine_cpu(partial.data(), b2, topk_w_sorted, sorted_ids, expert_ids,
+                  out, M, hidden, top_k, EM);
 }
 
 // ======================================================================
