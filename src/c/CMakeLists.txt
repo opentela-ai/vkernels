@@ -21,6 +21,7 @@ target_sources(vkernels
     vkernels/comm/overlap.cpp
     vkernels/comm/p2p_gather.cpp
     vkernels/comm/p2p_kv_restore.cpp
+    vkernels/dist/dist_moe.cpp
     vkernels/capi/capi.cpp
 )
 

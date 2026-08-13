@@ -88,10 +88,13 @@ __device__ __forceinline__ float epilogue_act(
 // Load the 16x64 A tile into shared memory (stage 0: input activations).
 // 64 threads; each thread loads 16 bf16 = 4 uint2 reads.
 // sorted_ids holds FLAT topk indices (token*top_k + sel).
+// `k_base` is the column offset into each A row where the calling rank's
+// weight shard starts (0 for the single-rank fused call; r*hidden/tp for a
+// TP rank consuming a w13 shard of width hidden/tp).
 __device__ __forceinline__ void load_a_tile(
     uint16_t sA[kBM][kBK], const uint16_t* __restrict__ A,
     const int32_t* __restrict__ sorted_ids, int tk_base,
-    int k_start, int stride, int M, int top_k, int lane) {
+    int k_start, int stride, int M, int top_k, int lane, int k_base = 0) {
   int row = lane % kBM;
   int base_col = (lane / kBM) * (kBK / (kWhreads / kBM));
   int flat = sorted_ids[tk_base + row];
@@ -100,7 +103,7 @@ __device__ __forceinline__ void load_a_tile(
     int token = flat / top_k;
     for (int g = 0; g < 4; ++g) {
       int col_off = base_col + g * 4;
-      const uint32_t* src = (const uint32_t*)(&A[(size_t)token * stride + k_start + col_off]);
+      const uint32_t* src = (const uint32_t*)(&A[(size_t)token * stride + k_base + k_start + col_off]);
       uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
       uint2 v = *(const uint2*)(src);
       dst[0] = v.x; dst[1] = v.y;
@@ -117,16 +120,18 @@ __device__ __forceinline__ void load_a_tile(
 // Load the act tile [EM, ispp] into shared memory, indexed by SORTED ROW
 // (tk_base + row).  Each expert's intermediate output occupies its own
 // sorted row, so top_k>1 does not overwrite.
+// `k_base` is the column offset into each act row where the calling rank's
+// w2 shard starts (0 for the fused call; r*ispp/tp for a TP rank).
 __device__ __forceinline__ void load_act_tile(
     uint16_t sA[kBM][kBK], const uint16_t* __restrict__ act,
     const int32_t* __restrict__ sorted_ids, int tk_base,
-    int k_start, int ispp, int M, int top_k, int lane) {
+    int k_start, int ispp, int M, int top_k, int lane, int k_base = 0) {
   int row = lane % kBM;
   int base_col = (lane / kBM) * (kBK / (kWhreads / kBM));
   int flat = sorted_ids[tk_base + row];
   int N = M * top_k;
   if (flat < N) {
-    const uint16_t* src_row = &act[(size_t)(tk_base + row) * ispp + k_start];
+    const uint16_t* src_row = &act[(size_t)(tk_base + row) * ispp + k_base + k_start];
     for (int g = 0; g < 4; ++g) {
       int col_off = base_col + g * 4;
       const uint32_t* src = (const uint32_t*)(src_row + col_off);
@@ -679,6 +684,244 @@ void fused_moe_mxfp4(
   }
 
   (void)hipFree(sorted_w);
+}
+
+// ======================================================================
+//  Distributed (TP) stage kernels
+// ======================================================================
+// The single-rank fused path fuses the nonlinear epilogues into the two
+// GEMM kernels, which blocks tensor parallelism: a TP rank owns a K-slice of
+// hidden/ispp, so the linear accumulators of all ranks must be summed BEFORE
+// the activation.  These four kernels expose the stages with an explicit
+// boundary (moe_fused.hpp / dist_moe.hpp), so the caller can run its own
+// all-reduce in between:
+//
+//   moe_gateup_preact  gate_up[EM, 2*ispp] fp32  (raw gate|up accumulators)
+//   moe_act_epilogue   act[EM, ispp] bf16        (bias + activation)
+//   moe_down_preact    partial[EM, hidden] fp32  (raw down accumulators)
+//   moe_combine        out[M, hidden] fp32       (bias + weight + scatter)
+//
+// Each consumes the per-rank shard layouts produced by dist_moe.hpp (w13
+// [E, 2*ispp, hidden_k/2], w2 [E, hidden, ispp_k/2]); `k_base` is the column
+// offset into A / act where the shard starts.  Decode regime (16x64 tiles,
+// 64 threads); prefill follows with the 256-thread templates.
+
+// Stage 0a: gate/up GEMM (pre-activation, pre-bias) → gate_up [EM, 2*ispp].
+__global__ void gateup_preact_kernel(
+    const uint16_t* __restrict__ A,
+    const uint8_t*  __restrict__ w13,
+    const uint8_t*  __restrict__ w13_scale,
+    float*          __restrict__ gate_up,
+    const int32_t*  __restrict__ sorted_ids,
+    const int32_t*  __restrict__ expert_ids,
+    int a_stride, int k_base, int hidden_k, int ispp, int M, int top_k) {
+
+  __shared__ uint16_t sA[kBM][kBK];
+  __shared__ uint16_t sB_gate[kBK][16];
+  __shared__ uint16_t sB_up[kBK][16];
+
+  int pid_m = blockIdx.x, pid_n = blockIdx.y;
+  int warp_n = blockIdx.z;
+  int expert = expert_ids[pid_m];
+  if (expert < 0) return;
+
+  int tk_base = pid_m * kBM;
+  int w13_bytes = 2 * ispp * (hidden_k / 2);
+  int w13s_bytes = 2 * ispp * (hidden_k / kGroupSize);
+  int lane = threadIdx.x;
+  int n_global = pid_n * kBN + warp_n * 16;
+
+  const uint8_t* bp_gate = w13 + expert * w13_bytes
+      + n_global * (hidden_k / 2);
+  const uint8_t* sc_gate = w13_scale + expert * w13s_bytes
+      + n_global * (hidden_k / kGroupSize);
+  const uint8_t* bp_up = w13 + expert * w13_bytes
+      + (n_global + ispp) * (hidden_k / 2);
+  const uint8_t* sc_up = w13_scale + expert * w13s_bytes
+      + (n_global + ispp) * (hidden_k / kGroupSize);
+
+  v4f acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
+  v4f acc_u = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  for (int kb = 0; kb < hidden_k / kBK; ++kb) {
+    int ks = kb * kBK;
+    load_a_tile(sA, A, sorted_ids, tk_base, ks, a_stride, M, top_k, lane,
+                k_base);
+    dequant_b_16cols(sB_gate, bp_gate, sc_gate, ks,
+                     hidden_k / 2, hidden_k / kGroupSize, lane);
+    dequant_b_16cols(sB_up, bp_up, sc_up, ks,
+                     hidden_k / 2, hidden_k / kGroupSize, lane);
+    __syncthreads();
+
+    mfma_k64(acc_g, sA, sB_gate, lane);
+    mfma_k64(acc_u, sA, sB_up, lane);
+    __syncthreads();
+  }
+
+  // Raw accumulators → gate_up (padding rows hold the zeroed-tile result).
+  int col = lane % 16;
+  int row_base = (lane / 16) * 4;
+  for (int i = 0; i < 4; ++i) {
+    int row = tk_base + row_base + i;
+    gate_up[(size_t)row * 2 * ispp + n_global + col] = acc_g[i];
+    gate_up[(size_t)row * 2 * ispp + ispp + n_global + col] = acc_u[i];
+  }
+}
+
+// Stage 0b: bias + activation epilogue → act [EM, ispp] bf16.  One thread
+// per (sorted row, ispp col); padding rows are skipped.
+__global__ void act_epilogue_kernel(
+    const float*    __restrict__ gate_up,
+    const float*    __restrict__ b13,
+    uint16_t*       __restrict__ act,
+    const int32_t*  __restrict__ sorted_ids,
+    const int32_t*  __restrict__ expert_ids,
+    int M, int top_k, int EM, int ispp, float swiglu_limit,
+    int activation, float beta, float linear_beta, int has_bias) {
+
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)EM * ispp) return;
+  int row = (int)(idx / ispp);
+  int col = (int)(idx % ispp);
+  int flat = sorted_ids[row];
+  if (flat >= M * top_k) return;  // padding row
+  int expert = expert_ids[row / kBM];
+  if (expert < 0) return;         // padding block
+
+  float g = gate_up[(size_t)row * 2 * ispp + col];
+  float u = gate_up[(size_t)row * 2 * ispp + ispp + col];
+  if (has_bias) {
+    g += b13[(size_t)expert * 2 * ispp + col];
+    u += b13[(size_t)expert * 2 * ispp + ispp + col];
+  }
+  act[(size_t)row * ispp + col] =
+      f2bf(epilogue_act(activation, g, u, beta, linear_beta, swiglu_limit));
+}
+
+// Stage 1a: down GEMM (pre-bias, pre-combine) → partial [EM, hidden].
+__global__ void down_preact_kernel(
+    const uint16_t* __restrict__ act,
+    const uint8_t*  __restrict__ w2,
+    const uint8_t*  __restrict__ w2_scale,
+    float*          __restrict__ partial,
+    const int32_t*  __restrict__ sorted_ids,
+    const int32_t*  __restrict__ expert_ids,
+    int a_stride, int k_base, int ispp_k, int hidden, int M, int top_k) {
+
+  __shared__ uint16_t sA[kBM][kBK];
+  __shared__ uint16_t sB[kBK][16];
+
+  int pid_m = blockIdx.x, pid_n = blockIdx.y;
+  int warp_n = blockIdx.z;
+  int expert = expert_ids[pid_m];
+  if (expert < 0) return;
+
+  int tk_base = pid_m * kBM;
+  int w2_bytes = hidden * (ispp_k / 2);
+  int w2s_bytes = hidden * (ispp_k / kGroupSize);
+  int lane = threadIdx.x;
+  int n_global = pid_n * kBN + warp_n * 16;
+
+  const uint8_t* bp = w2 + expert * w2_bytes
+      + n_global * (ispp_k / 2);
+  const uint8_t* sc = w2_scale + expert * w2s_bytes
+      + n_global * (ispp_k / kGroupSize);
+
+  v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  for (int kb = 0; kb < ispp_k / kBK; ++kb) {
+    int ks = kb * kBK;
+    load_act_tile(sA, act, sorted_ids, tk_base, ks, a_stride, M, top_k, lane,
+                  k_base);
+    dequant_b_16cols(sB, bp, sc, ks, ispp_k / 2, ispp_k / kGroupSize, lane);
+    __syncthreads();
+
+    mfma_k64(acc, sA, sB, lane);
+    __syncthreads();
+  }
+
+  // Raw accumulators → partial (padding rows hold the zeroed-tile result).
+  int col = lane % 16;
+  int row_base = (lane / 16) * 4;
+  for (int i = 0; i < 4; ++i) {
+    int row = tk_base + row_base + i;
+    partial[(size_t)row * hidden + n_global + col] = acc[i];
+  }
+}
+
+// Stage 1b: routed combine → out[M, hidden] += (partial + b2) * topk_w.
+__global__ void combine_kernel(
+    const float*    __restrict__ partial,
+    const float*    __restrict__ b2,
+    const float*    __restrict__ topk_ws,
+    const int32_t*  __restrict__ sorted_ids,
+    const int32_t*  __restrict__ expert_ids,
+    float*          __restrict__ out,
+    int M, int hidden, int top_k, int EM, int has_bias) {
+
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)EM * hidden) return;
+  int row = (int)(idx / hidden);
+  int col = (int)(idx % hidden);
+  int flat = sorted_ids[row];
+  if (flat >= M * top_k) return;  // padding row
+  int token = flat / top_k;
+  int expert = expert_ids[row / kBM];
+  if (expert < 0) return;         // padding block
+
+  float v = partial[(size_t)row * hidden + col];
+  if (has_bias) v += b2[(size_t)expert * hidden + col];
+  v *= topk_ws[row];
+  atomicAdd(&out[(size_t)token * hidden + col], v);
+}
+
+// --------------------------------------------------------------------------
+//  Host launchers for the TP stages
+// --------------------------------------------------------------------------
+
+void moe_gateup_preact(
+    const uint16_t* A, const uint8_t* w13, const uint8_t* w13_scale,
+    const int32_t* sorted_ids, const int32_t* expert_ids, float* gate_up,
+    int M, int hidden, int ispp, int top_k, int EM,
+    int k_base, int hidden_k) {
+  dim3 g(EM / kBM, ispp / kBN, kWarps);
+  gateup_preact_kernel<<<g, kWhreads>>>(
+      A, w13, w13_scale, gate_up, sorted_ids, expert_ids,
+      hidden, k_base, hidden_k, ispp, M, top_k);
+}
+
+void moe_act_epilogue(
+    const float* gate_up, const float* b13, uint16_t* act,
+    const int32_t* sorted_ids, const int32_t* expert_ids,
+    int M, int top_k, int EM, int ispp, float swiglu_limit,
+    int activation, float beta, float linear_beta) {
+  long total = (long)EM * ispp;
+  int nb = (int)((total + 255) / 256);
+  act_epilogue_kernel<<<nb, 256>>>(
+      gate_up, b13, act, sorted_ids, expert_ids, M, top_k, EM, ispp,
+      swiglu_limit, activation, beta, linear_beta, b13 != nullptr);
+}
+
+void moe_down_preact(
+    const uint16_t* act, const uint8_t* w2, const uint8_t* w2_scale,
+    const int32_t* sorted_ids, const int32_t* expert_ids, float* partial,
+    int M, int ispp, int hidden, int top_k, int EM,
+    int k_base, int ispp_k) {
+  dim3 g(EM / kBM, hidden / kBN, kWarps);
+  down_preact_kernel<<<g, kWhreads>>>(
+      act, w2, w2_scale, partial, sorted_ids, expert_ids,
+      ispp, k_base, ispp_k, hidden, M, top_k);
+}
+
+void moe_combine(
+    const float* partial, const float* b2, const float* topk_w_sorted,
+    const int32_t* sorted_ids, const int32_t* expert_ids, float* out,
+    int M, int hidden, int top_k, int EM) {
+  long total = (long)EM * hidden;
+  int nb = (int)((total + 255) / 256);
+  combine_kernel<<<nb, 256>>>(
+      partial, b2, topk_w_sorted, sorted_ids, expert_ids, out,
+      M, hidden, top_k, EM, b2 != nullptr);
 }
 
 }  // namespace vkernels::kernels::hip
