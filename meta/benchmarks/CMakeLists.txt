@@ -41,6 +41,11 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(moe_fused_prefill_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(moe_fused_prefill_bench)
 
+  add_executable(moe_aux_bench bench_moe_aux.hip)
+  target_link_libraries(moe_aux_bench PRIVATE vkernels::vkernels)
+  target_compile_features(moe_aux_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(moe_aux_bench)
+
   add_executable(test_moe_fused_correct test_moe_fused_correct.hip)
   target_link_libraries(test_moe_fused_correct PRIVATE vkernels::vkernels)
   target_compile_features(test_moe_fused_correct PRIVATE cxx_std_17)
