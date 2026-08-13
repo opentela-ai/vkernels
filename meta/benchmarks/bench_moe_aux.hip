@@ -125,22 +125,29 @@ int main() {
   hipEventCreate(&s);
   hipEventCreate(&t);
 
-  // --- HBM bandwidth reference (streaming copy) ---
-  // Use enough data to exceed L2 (~256 MB) so the copy is HBM-bound.
-  {
-    constexpr size_t N = 64 * 1024 * 1024;  // 64M floats = 256 MB
-    float *din, *dout;
-    CK(hipMalloc(&din, N * 4), "cin");
-    CK(hipMalloc(&dout, N * 4), "cout");
-    CK(hipMemset(din, 1, N * 4), "zin");
-    auto copy = [&]() { copy_kernel<<<256, 256>>>(din, dout, N); };
+  // --- Bandwidth references: a large streaming copy (HBM, >> L2) and a
+  // K3-sized copy (~28 MB, fits L2) to show the L2 effect that the warm
+  // timed iterations of the K3 ops benefit from.
+  auto bench_copy = [&](const char* tag, size_t nf, int blocks) {
+    float* din; float* dout;
+    CK(hipMalloc(&din, nf * 4), "cin");
+    CK(hipMalloc(&dout, nf * 4), "cout");
+    CK(hipMemset(din, 1, nf * 4), "zin");
+    auto copy = [&]() { copy_kernel<<<blocks, 256>>>(din, dout, nf); };
     auto r = bench_us(copy, s, t, 5, 50);
-    double bw = hbm_gbs(2.0 * N * 4, r.median_us);  // read + write
-    std::printf("HBM streaming copy : %7.1f us  %6.0f GB/s  (%zu MB)\n\n",
-                r.median_us, bw, N * 4 / (1024 * 1024));
-    hipFree(din);
-    hipFree(dout);
-  }
+    double bw = hbm_gbs(2.0 * nf * 4, r.median_us);
+    std::printf("%-22s %7.1f us  %6.0f GB/s  (%zu MB)\n", tag, r.median_us,
+                bw, nf * 4 / (1024 * 1024));
+    hipFree(din); hipFree(dout);
+    return bw;
+  };
+  double hbm_bw = bench_copy("HBM copy (512 MB, L2-bypassed)",
+                              128 * 1024 * 1024, 4096);
+  double l2_bw = bench_copy("L2 copy (28 MB, K3-sized)",
+                             7 * 1024 * 1024, 1024);
+  std::printf("(bandwidth roof for warm K3 iterations: %.0f GB/s (L2);\n"
+              " raw HBM peak %.0f GB/s, published ~5.3 TB/s)\n\n", l2_bw,
+              hbm_bw);
 
   constexpr int hidden = 7168, top_k = 16, E = 64, BLOCK_M = 16, gs = 32;
   const int n_groups = hidden / gs;
@@ -148,7 +155,7 @@ int main() {
   std::printf("K3 shape: hidden=%d top_k=%d E=%d gs=%d n_groups=%d\n",
               hidden, top_k, E, gs, n_groups);
   std::printf("%6s %8s  %-22s %9s %10s %9s\n", "M", "EM", "op", "lat(us)",
-              "GB/s", "%HBM");
+              "GB/s", "%L2");
 
   const int Ms[] = {8, 32, 64, 112};  // 112 = K3
   for (int M : Ms) {
@@ -235,8 +242,10 @@ int main() {
 
     auto row = [&](const char* name, const Bench& r, size_t in, size_t out) {
       double gb = hbm_gbs(in + out, r.median_us);
+      // Warm iterations of these small ops hit L2; compare to the L2 roof
+      // (measured above), not raw HBM.
       std::printf("%6d %8d  %-22s %9.1f %10.1f %9.2f\n", M, EM, name,
-                  r.median_us, gb, gb / 5300.0 * 100.0);
+                  r.median_us, gb, gb / l2_bw * 100.0);
     };
 
     row("mxfp4_moe_quant", bench_us(run_quant, s, t), bq_in, bq_out);
@@ -255,7 +264,10 @@ int main() {
 
   hipEventDestroy(s);
   hipEventDestroy(t);
-  std::printf("Done. (%%HBM uses the published ~5.3 TB/s MI300A roof; the\n"
-              "streaming copy above is the practical achievable roof.)\n");
+  std::printf("(%%L2 uses the K3-sized copy roof (%.0f GB/s) since warm\n"
+              " iterations of these ops fit in the MI300A L2; HBM peak\n"
+              " %.0f GB/s, published ~5.3 TB/s. Latency is the primary\n"
+              " metric -- these are lightweight orchestration steps around\n"
+              " the heavy fused GEMM.)\n", l2_bw, hbm_bw);
   return 0;
 }
