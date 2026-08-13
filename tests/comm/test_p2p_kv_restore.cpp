@@ -318,6 +318,31 @@ TEST(KvRestorePlan, DeviceSlotsStillValidatesShape) {
                std::invalid_argument);  // non-BF16 elem_size
 }
 
+// The device-slot variant's zero-pages early-out: with num_pages == 0 the
+// borrowed slot pointer is dropped (set to nullptr) and execute() is a no-op
+// on both the sync and async paths.
+TEST(KvRestorePlan, DeviceSlotsZeroPagesIsNoOp) {
+  auto k_dst = make_dst(4, 2, 8, 2);
+  auto v_dst = make_dst(4, 2, 8, 2);
+  auto before_k = k_dst;
+  auto before_v = v_dst;
+  // A non-null slot_ids pointer is allowed; with zero pages it must not be
+  // read or copied.
+  int slot_ids[1] = {0};
+  const void* ptrs[1] = {k_dst.data()};
+  P2PKvRestorePlan plan(from_device_slots, k_dst.data(), v_dst.data(), 4,
+                        2, 8, 2, slot_ids, ptrs, 0, 64);
+  EXPECT_EQ(plan.num_pages(), 0u);
+  plan.execute(0);
+  Stream s;
+  plan.execute(0, &s);
+  s.wait();
+  for (std::size_t i = 0; i < k_dst.size(); ++i) {
+    ASSERT_EQ(k_dst[i], before_k[i]);
+    ASSERT_EQ(v_dst[i], before_v[i]);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // kv_scatter host reference (the second stage of the two-path)
 // ---------------------------------------------------------------------------
@@ -355,6 +380,41 @@ TEST(KvScatter, HostScatterMatchesTwoStage) {
   for (std::size_t i = 0; i < ks.size(); ++i) {
     ASSERT_EQ(ks[i], kr[i]);
     ASSERT_EQ(vs[i], vr[i]);
+  }
+}
+
+// The async branch of kv_scatter (stream != nullptr) captures slot_ids by
+// copy and submits exactly one stream task; the result must match the sync
+// path byte-for-byte once the stream is waited on.
+TEST(KvScatter, HostScatterAsyncMatchesSync) {
+  constexpr std::size_t kPageSize = 2, kHeads = 2, kHeadDim = 16, kElem = 2;
+  constexpr std::size_t kSlotBytes = kHeads * kHeadDim * kElem;
+  constexpr std::size_t kScratchPerPage = kPageSize * 2 * kSlotBytes;
+  constexpr std::size_t kSlots = 8;
+
+  std::vector<std::uint8_t> scratch(2 * kScratchPerPage);
+  for (std::size_t i = 0; i < scratch.size(); ++i)
+    scratch[i] = static_cast<std::uint8_t>(0x30 + (i % 200));
+
+  const int slot_ids[4] = {3, 1, 6, 4};
+
+  auto ks_sync = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vs_sync = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  kv_scatter(ks_sync.data(), vs_sync.data(), scratch.data(), slot_ids, 2,
+             kPageSize, kHeads, kHeadDim, kElem);
+
+  auto ks_async = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vs_async = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  Stream s;
+  std::size_t before = s.submitted();
+  kv_scatter(ks_async.data(), vs_async.data(), scratch.data(), slot_ids, 2,
+             kPageSize, kHeads, kHeadDim, kElem, &s);
+  EXPECT_EQ(s.submitted() - before, 1u);  // exactly one task
+  s.wait();
+
+  for (std::size_t i = 0; i < ks_async.size(); ++i) {
+    ASSERT_EQ(ks_async[i], ks_sync[i]);
+    ASSERT_EQ(vs_async[i], vs_sync[i]);
   }
 }
 
