@@ -17,6 +17,10 @@
 #include "vkernels/core/stream.hpp"
 
 using vkernels::Stream;
+using vkernels::comm::from_device_slots;
+using vkernels::comm::from_device_slots_int64;
+using vkernels::comm::kv_scatter;
+using vkernels::comm::P2PKvRestorePlan;
 using vkernels::comm::p2p_kv_restore_layer;
 using vkernels::comm::p2p_kv_restore_layer_twostage;
 
@@ -44,9 +48,457 @@ std::vector<std::uint8_t> make_dst(std::size_t num_slots, std::size_t num_kv_hea
   return std::vector<std::uint8_t>(total, fill);
 }
 
-
-
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Prepared plan: host reference (issue #27)
+// ---------------------------------------------------------------------------
+//
+// The plan validates and stages metadata once, then execute() adds a single
+// scalar source-layer offset to every peer page base and copies — the KVAAS
+// "one run list, many layers" reuse pattern. These tests pin the host plan
+// to the one-shot oracle byte-for-byte, including the offset path, the
+// device-slot (borrowed pointer) variant, the stream contract and the
+// contract checks moved out of the hot path into the constructor.
+
+TEST(KvRestorePlan, SyncExecuteEqualsOneShot) {
+  constexpr std::size_t kPageSize = 4, kHeads = 4, kHeadDim = 16, kElem = 2;
+  constexpr std::size_t kSlotBytes = kHeads * kHeadDim * kElem;
+  constexpr std::size_t kSlots = 16;
+
+  auto p0 = make_page(kPageSize, kHeads, kHeadDim, kElem, 0x11);
+  auto p1 = make_page(kPageSize, kHeads, kHeadDim, kElem, 0x77);
+  const int slot_ids[8] = {3, 1, 14, 7, 0, 9, 6, 12};
+  const void* ptrs[2] = {p0.data(), p1.data()};
+
+  auto kp = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vp = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto ko = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vo = make_dst(kSlots, kHeads, kHeadDim, kElem);
+
+  P2PKvRestorePlan plan(kSlots, kHeads, kHeadDim, kElem,
+                        slot_ids, ptrs, 2, kPageSize);
+  EXPECT_EQ(plan.num_pages(), 2u);
+  EXPECT_EQ(plan.total_bytes(), 2u * kPageSize * 2u * kSlotBytes);
+  plan.execute(kp.data(), vp.data(), 0);
+
+  const std::size_t offs[2] = {0, 0};
+  p2p_kv_restore_layer(ko.data(), vo.data(), slot_ids, ptrs, offs, 2,
+                       kPageSize, kHeads, kHeadDim, kElem);
+
+  for (std::size_t i = 0; i < kp.size(); ++i) {
+    ASSERT_EQ(kp[i], ko[i]);
+    ASSERT_EQ(vp[i], vo[i]);
+  }
+}
+
+// Two layers stored back-to-back in each page buffer; the plan selects layer
+// 1 with a single scalar offset, the one-shot uses per-page src_page_offsets.
+TEST(KvRestorePlan, OffsetExecuteMatchesPerPageOffsets) {
+  constexpr std::size_t kPageSize = 2, kHeads = 2, kHeadDim = 8, kElem = 2;
+  constexpr std::size_t kSlotBytes = kHeads * kHeadDim * kElem;   // 32
+  constexpr std::size_t kTokenStr = 2 * kSlotBytes;                // 64
+  constexpr std::size_t kLayerBytes = kPageSize * kTokenStr;       // 128
+  constexpr std::size_t kSlots = 8;
+
+  // Two layers per peer buffer.
+  auto buf0 = make_page(kPageSize * 2, kHeads, kHeadDim, kElem, 0x20);
+  auto buf1 = make_page(kPageSize * 2, kHeads, kHeadDim, kElem, 0xA0);
+  const int slot_ids[4] = {2, 5, 1, 6};
+  const void* ptrs[2] = {buf0.data(), buf1.data()};
+
+  auto kp = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vp = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto ko = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vo = make_dst(kSlots, kHeads, kHeadDim, kElem);
+
+  P2PKvRestorePlan plan(kSlots, kHeads, kHeadDim, kElem,
+                        slot_ids, ptrs, 2, kPageSize);
+  plan.execute(kp.data(), vp.data(), kLayerBytes);  // select layer 1 with one scalar
+
+  const std::size_t offs[2] = {kLayerBytes, kLayerBytes};
+  p2p_kv_restore_layer(ko.data(), vo.data(), slot_ids, ptrs, offs, 2,
+                       kPageSize, kHeads, kHeadDim, kElem);
+
+  for (std::size_t i = 0; i < kp.size(); ++i) {
+    ASSERT_EQ(kp[i], ko[i]);
+    ASSERT_EQ(vp[i], vo[i]);
+  }
+}
+
+TEST(KvRestorePlan, AsyncExecuteIsOneTaskAndCorrect) {
+  constexpr std::size_t kPageSize = 2, kHeads = 2, kHeadDim = 16, kElem = 2;
+  constexpr std::size_t kSlots = 8;
+  auto p0 = make_page(kPageSize, kHeads, kHeadDim, kElem, 0x33);
+  auto p1 = make_page(kPageSize, kHeads, kHeadDim, kElem, 0xEE);
+  const int slot_ids[4] = {1, 4, 7, 2};
+  const void* ptrs[2] = {p0.data(), p1.data()};
+
+  auto kp = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vp = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto ko = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vo = make_dst(kSlots, kHeads, kHeadDim, kElem);
+
+  P2PKvRestorePlan plan(kSlots, kHeads, kHeadDim, kElem,
+                        slot_ids, ptrs, 2, kPageSize);
+  Stream s;
+  const std::size_t before = s.submitted();
+  plan.execute(kp.data(), vp.data(), 0, &s);
+  EXPECT_EQ(s.submitted() - before, 1u);  // exactly one stream task
+  s.wait();
+
+  const std::size_t offs[2] = {0, 0};
+  p2p_kv_restore_layer(ko.data(), vo.data(), slot_ids, ptrs, offs, 2,
+                       kPageSize, kHeads, kHeadDim, kElem);
+  for (std::size_t i = 0; i < kp.size(); ++i) {
+    ASSERT_EQ(kp[i], ko[i]);
+    ASSERT_EQ(vp[i], vo[i]);
+  }
+}
+
+// Two plans share one destination buffer and execute on two streams — the
+// KVAAS reuse pattern across layers, and a sanity check that a plan is safe
+// to run on more than one stream.
+TEST(KvRestorePlan, TwoStreamsSharePlan) {
+  constexpr std::size_t kPageSize = 2, kHeads = 1, kHeadDim = 8, kElem = 2;
+  constexpr std::size_t kSlotBytes = kHeads * kHeadDim * kElem;   // 16
+  constexpr std::size_t kTokenStr = 2 * kSlotBytes;                // 32
+  constexpr std::size_t kSlots = 4;
+
+  // Two layers per peer buffer: layer 0 (seed 0x05) and layer 1 (seed 0x77).
+  // The plan's single page has two tokens written to slots 1 and 2. We run
+  // it twice concurrently on two streams. To make the outcome deterministic
+  // regardless of which stream wins the shared-destination write, BOTH runs
+  // read the same source offset (layer 0) — the test then asserts the
+  // correct layer-0 bytes, proving the plan is safe to share across
+  // streams (no deadlock, no metadata mutation during execute).
+  auto buf = make_page(kPageSize * 2, kHeads, kHeadDim, kElem, 0x05);
+  const int slot_ids[2] = {1, 2};
+  const void* ptrs[1] = {buf.data()};
+
+  auto k_dst = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto v_dst = make_dst(kSlots, kHeads, kHeadDim, kElem);
+
+  P2PKvRestorePlan plan(kSlots, kHeads, kHeadDim,
+                        kElem, slot_ids, ptrs, 1, kPageSize);
+  Stream s0, s1;
+  plan.execute(k_dst.data(), v_dst.data(), 0, &s0);  // layer 0 on stream 0
+  plan.execute(k_dst.data(), v_dst.data(), 0, &s1);  // layer 0 on stream 1 (concurrent, same source)
+  s0.wait();
+  s1.wait();
+
+  // Both writes read layer 0, so the final state is deterministic: slots 1
+  // and 2 hold layer 0's token 0 and token 1 respectively.
+  const std::uint8_t* layer0 = buf.data();
+  for (std::size_t i = 0; i < kSlotBytes; ++i) {
+    ASSERT_EQ(k_dst[1 * kSlotBytes + i], layer0[0 * kTokenStr + i]);
+    ASSERT_EQ(v_dst[1 * kSlotBytes + i], layer0[0 * kTokenStr + kSlotBytes + i]);
+    ASSERT_EQ(k_dst[2 * kSlotBytes + i], layer0[1 * kTokenStr + i]);
+    ASSERT_EQ(v_dst[2 * kSlotBytes + i], layer0[1 * kTokenStr + kSlotBytes + i]);
+  }
+}
+
+TEST(KvRestorePlan, ZeroPagesIsNoOp) {
+  auto k_dst = make_dst(4, 2, 8, 2);
+  auto v_dst = make_dst(4, 2, 8, 2);
+  auto before_k = k_dst;
+  auto before_v = v_dst;
+  P2PKvRestorePlan plan(4, 2, 8, 2,
+                        nullptr, nullptr, 0, 64);
+  EXPECT_EQ(plan.num_pages(), 0u);
+  plan.execute(k_dst.data(), v_dst.data(), 0);
+  Stream s;
+  plan.execute(k_dst.data(), v_dst.data(), 0, &s);
+  s.wait();
+  for (std::size_t i = 0; i < k_dst.size(); ++i) {
+    ASSERT_EQ(k_dst[i], before_k[i]);
+    ASSERT_EQ(v_dst[i], before_v[i]);
+  }
+}
+
+// The device-slot variant borrows the caller's pointer and skips slot
+// validation — but on the host it still produces byte-identical results.
+TEST(KvRestorePlan, DeviceSlotsBorrowsAndMatches) {
+  constexpr std::size_t kPageSize = 2, kHeads = 2, kHeadDim = 8, kElem = 2;
+  constexpr std::size_t kSlots = 8;
+  auto p0 = make_page(kPageSize, kHeads, kHeadDim, kElem, 0x44);
+  auto p1 = make_page(kPageSize, kHeads, kHeadDim, kElem, 0x88);
+  int slot_ids[4] = {3, 0, 7, 5};
+  const void* ptrs[2] = {p0.data(), p1.data()};
+
+  auto kp = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vp = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto ko = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vo = make_dst(kSlots, kHeads, kHeadDim, kElem);
+
+  P2PKvRestorePlan plan(from_device_slots, kSlots,
+                        kHeads, kHeadDim, kElem, slot_ids, ptrs, 2, kPageSize);
+  plan.execute(kp.data(), vp.data(), 0);
+
+  const std::size_t offs[2] = {0, 0};
+  p2p_kv_restore_layer(ko.data(), vo.data(), slot_ids, ptrs, offs, 2,
+                       kPageSize, kHeads, kHeadDim, kElem);
+  for (std::size_t i = 0; i < kp.size(); ++i) {
+    ASSERT_EQ(kp[i], ko[i]);
+    ASSERT_EQ(vp[i], vo[i]);
+  }
+}
+
+// Contract checks move OUT of the hot path and INTO the constructor: the
+// plan rejects a duplicate slot / out-of-range slot / non-BF16 / null dst at
+// create time, so execute() can stay free of checks.
+TEST(KvRestorePlan, RejectsDuplicateSlotAtCreate) {
+  auto p = make_page(2, 2, 4, 2, 0x10);
+  const int slot_ids[2] = {1, 1};
+  const void* ptrs[1] = {p.data()};
+  EXPECT_THROW(P2PKvRestorePlan(4, 2, 4, 2, slot_ids,
+                                ptrs, 1, 2),
+               std::invalid_argument);
+}
+
+TEST(KvRestorePlan, RejectsOutOfRangeSlotAtCreate) {
+  auto p = make_page(1, 2, 4, 2, 0x10);
+  const int slot_ids[1] = {4};     // == num_slots, out of range
+  const void* ptrs[1] = {p.data()};
+  EXPECT_THROW(P2PKvRestorePlan(4, 2, 4, 2, slot_ids,
+                                ptrs, 1, 1),
+               std::invalid_argument);
+}
+
+TEST(KvRestorePlan, RejectsNonBF16AtCreate) {
+  auto p = make_page(1, 2, 4, 4, 0x10);  // elem_size 4 -> non-BF16
+  const int slot_ids[1] = {0};
+  const void* ptrs[1] = {p.data()};
+  EXPECT_THROW(P2PKvRestorePlan(4, 2, 4, 4, slot_ids,
+                                ptrs, 1, 1),
+               std::invalid_argument);
+}
+
+// With the destination moved to execute(), a null destination is the only
+// check left on the hot path and is rejected there (matching the one-shot
+// p2p_kv_restore_layer). All other metadata validation stays at create.
+TEST(KvRestorePlan, RejectsNullDstAtExecute) {
+  auto p = make_page(1, 2, 4, 2, 0x10);
+  const int slot_ids[1] = {0};
+  const void* ptrs[1] = {p.data()};
+  P2PKvRestorePlan plan(4, 2, 4, 2, slot_ids, ptrs, 1, 1);
+  EXPECT_THROW(plan.execute(nullptr, (void*)0x2000, 0), std::invalid_argument);
+  EXPECT_THROW(plan.execute((void*)0x1000, nullptr, 0), std::invalid_argument);
+}
+
+TEST(KvRestorePlan, RejectsNegativeSlotAtCreate) {
+  auto p = make_page(1, 2, 4, 2, 0x10);
+  const int slot_ids[1] = {-1};
+  const void* ptrs[1] = {p.data()};
+  EXPECT_THROW(P2PKvRestorePlan(4, 2, 4, 2, slot_ids,
+                                ptrs, 1, 1),
+               std::invalid_argument);
+}
+
+// The device-slot variant does NOT validate slot contents (it would need a
+// D2H sync), so a duplicate slot is accepted at create — the caller owns
+// that invariant. Shape checks (non-BF16) still apply.
+TEST(KvRestorePlan, DeviceSlotsSkipsSlotValidation) {
+  auto p = make_page(2, 2, 4, 2, 0x10);
+  const int slot_ids[2] = {1, 1};   // would be rejected by the host-input ctor
+  const void* ptrs[1] = {p.data()};
+  EXPECT_NO_THROW(P2PKvRestorePlan(from_device_slots, 4,
+                                   2, 4, 2, slot_ids, ptrs, 1, 2));
+}
+
+TEST(KvRestorePlan, DeviceSlotsStillValidatesShape) {
+  const int slot_ids[1] = {0};
+  const void* ptrs[1] = {(void*)0x1000};
+  EXPECT_THROW(P2PKvRestorePlan(from_device_slots,
+                                4, 2, 4, 4, slot_ids, ptrs, 1, 1),
+               std::invalid_argument);  // non-BF16 elem_size
+}
+
+// The device-slot variant's zero-pages early-out: with num_pages == 0 the
+// borrowed slot pointer is dropped (set to nullptr) and execute() is a no-op
+// on both the sync and async paths.
+TEST(KvRestorePlan, DeviceSlotsZeroPagesIsNoOp) {
+  auto k_dst = make_dst(4, 2, 8, 2);
+  auto v_dst = make_dst(4, 2, 8, 2);
+  auto before_k = k_dst;
+  auto before_v = v_dst;
+  // A non-null slot_ids pointer is allowed; with zero pages it must not be
+  // read or copied.
+  int slot_ids[1] = {0};
+  const void* ptrs[1] = {k_dst.data()};
+  P2PKvRestorePlan plan(from_device_slots, 4,
+                        2, 8, 2, slot_ids, ptrs, 0, 64);
+  EXPECT_EQ(plan.num_pages(), 0u);
+  plan.execute(k_dst.data(), v_dst.data(), 0);
+  Stream s;
+  plan.execute(k_dst.data(), v_dst.data(), 0, &s);
+  s.wait();
+  for (std::size_t i = 0; i < k_dst.size(); ++i) {
+    ASSERT_EQ(k_dst[i], before_k[i]);
+    ASSERT_EQ(v_dst[i], before_v[i]);
+  }
+}
+
+// The KVAAS restore pattern (issue #27): one run list reused across all
+// model layers, each layer written into its OWN (k_dst, v_dst) pair with a
+// distinct source-layer offset. The destination is no longer bound at plan
+// creation — execute() takes it per call — so a single plan fans one run
+// list out into a distinct K/V buffer per layer, byte-exact against the
+// one-shot oracle run per layer.
+TEST(KvRestorePlan, DistinctDestinationsAcrossLayers) {
+  constexpr std::size_t kPageSize = 2, kHeads = 2, kHeadDim = 16, kElem = 2;
+  constexpr std::size_t kSlotBytes = kHeads * kHeadDim * kElem;    // 64
+  constexpr std::size_t kTokenStr = 2 * kSlotBytes;                 // 128
+  constexpr std::size_t kLayerBytes = kPageSize * kTokenStr;        // 256
+  constexpr std::size_t kPages = 2;
+  constexpr std::size_t kSlots = kPages * kPageSize;                // 4
+  constexpr std::size_t kLayers = 40;
+  // Each peer page holds every layer back-to-back.
+  std::vector<std::vector<std::uint8_t>> peer;
+  peer.push_back(make_page(kPageSize * kLayers, kHeads, kHeadDim, kElem, 0x09));
+  peer.push_back(make_page(kPageSize * kLayers, kHeads, kHeadDim, kElem, 0x51));
+  const void* ptrs[2] = {peer[0].data(), peer[1].data()};
+  const int slot_ids[4] = {2, 0, 3, 1};
+
+  P2PKvRestorePlan plan(kSlots, kHeads, kHeadDim, kElem, slot_ids, ptrs,
+                        kPages, kPageSize);
+
+  // One distinct destination pair per layer; the plan writes a different
+  // layer offset into each.
+  std::vector<std::vector<std::uint8_t>> kp(kLayers), vp(kLayers);
+  std::vector<std::vector<std::uint8_t>> ko(kLayers), vo(kLayers);
+  for (std::size_t l = 0; l < kLayers; ++l) {
+    kp[l] = make_dst(kSlots, kHeads, kHeadDim, kElem);
+    vp[l] = make_dst(kSlots, kHeads, kHeadDim, kElem);
+    ko[l] = make_dst(kSlots, kHeads, kHeadDim, kElem);
+    vo[l] = make_dst(kSlots, kHeads, kHeadDim, kElem);
+    plan.execute(kp[l].data(), vp[l].data(), l * kLayerBytes);
+
+    const std::size_t offs[2] = {l * kLayerBytes, l * kLayerBytes};
+    p2p_kv_restore_layer(ko[l].data(), vo[l].data(), slot_ids, ptrs, offs,
+                         kPages, kPageSize, kHeads, kHeadDim, kElem);
+    for (std::size_t i = 0; i < kp[l].size(); ++i) {
+      ASSERT_EQ(kp[l][i], ko[l][i]);
+      ASSERT_EQ(vp[l][i], vo[l][i]);
+    }
+  }
+}
+
+// The int64 device-slot variant mirrors the int32 one: it does NOT validate
+// slot contents (the CUDA path converts in-device and cannot read device
+// memory without a sync), but produces byte-identical results to the
+// one-shot oracle (which uses the same slots as int32).
+TEST(KvRestorePlan, DeviceSlotsInt64MatchesOneShot) {
+  constexpr std::size_t kPageSize = 2, kHeads = 2, kHeadDim = 8, kElem = 2;
+  constexpr std::size_t kSlots = 8;
+  auto p0 = make_page(kPageSize, kHeads, kHeadDim, kElem, 0x44);
+  auto p1 = make_page(kPageSize, kHeads, kHeadDim, kElem, 0x88);
+  const int slot_ids[4] = {3, 0, 7, 5};
+  const std::int64_t slot_ids_i64[4] = {3, 0, 7, 5};
+  const void* ptrs[2] = {p0.data(), p1.data()};
+
+  auto kp = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vp = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto ko = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vo = make_dst(kSlots, kHeads, kHeadDim, kElem);
+
+  P2PKvRestorePlan plan(from_device_slots_int64, kSlots, kHeads, kHeadDim,
+                        kElem, slot_ids_i64, ptrs, 2, kPageSize);
+  plan.execute(kp.data(), vp.data(), 0);
+
+  const std::size_t offs[2] = {0, 0};
+  p2p_kv_restore_layer(ko.data(), vo.data(), slot_ids, ptrs, offs, 2,
+                       kPageSize, kHeads, kHeadDim, kElem);
+  for (std::size_t i = 0; i < kp.size(); ++i) {
+    ASSERT_EQ(kp[i], ko[i]);
+    ASSERT_EQ(vp[i], vo[i]);
+  }
+}
+
+// The int64 device-slot variant still validates metadata shape (non-BF16 is
+// rejected at create), exactly like the int32 device-slot variant.
+TEST(KvRestorePlan, DeviceSlotsInt64StillValidatesShape) {
+  const std::int64_t slot_ids[1] = {0};
+  const void* ptrs[1] = {(void*)0x1000};
+  EXPECT_THROW(P2PKvRestorePlan(from_device_slots_int64,
+                                4, 2, 4, 4, slot_ids, ptrs, 1, 1),
+               std::invalid_argument);  // non-BF16 elem_size
+}
+
+// ---------------------------------------------------------------------------
+// kv_scatter host reference (the second stage of the two-path)
+// ---------------------------------------------------------------------------
+TEST(KvScatter, HostScatterMatchesTwoStage) {
+  constexpr std::size_t kPageSize = 2, kHeads = 2, kHeadDim = 16, kElem = 2;
+  constexpr std::size_t kSlotBytes = kHeads * kHeadDim * kElem;
+  constexpr std::size_t kScratchPerPage = kPageSize * 2 * kSlotBytes;
+  constexpr std::size_t kSlots = 8;
+
+  // Build a contiguous scratch = [num_pages, page_size, 2, num_kv_heads,
+  // head_dim] (two pages back-to-back).
+  std::vector<std::uint8_t> scratch(2 * kScratchPerPage);
+  for (std::size_t i = 0; i < scratch.size(); ++i)
+    scratch[i] = static_cast<std::uint8_t>(0x30 + (i % 200));
+
+  const int slot_ids[4] = {3, 1, 6, 4};
+  auto ks = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vs = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  kv_scatter(ks.data(), vs.data(), scratch.data(), slot_ids, 2, kPageSize,
+             kHeads, kHeadDim, kElem);
+
+  // Reference: same scatter, done by hand.
+  auto kr = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vr = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  for (int p = 0; p < 2; ++p) {
+    const std::uint8_t* pg = scratch.data() + p * kScratchPerPage;
+    for (int t = 0; t < 2; ++t) {
+      int slot = slot_ids[p * 2 + t];
+      const std::uint8_t* sk = pg + t * 2 * kSlotBytes;
+      const std::uint8_t* sv = sk + kSlotBytes;
+      std::memcpy(kr.data() + slot * kSlotBytes, sk, kSlotBytes);
+      std::memcpy(vr.data() + slot * kSlotBytes, sv, kSlotBytes);
+    }
+  }
+  for (std::size_t i = 0; i < ks.size(); ++i) {
+    ASSERT_EQ(ks[i], kr[i]);
+    ASSERT_EQ(vs[i], vr[i]);
+  }
+}
+
+// The async branch of kv_scatter (stream != nullptr) captures slot_ids by
+// copy and submits exactly one stream task; the result must match the sync
+// path byte-for-byte once the stream is waited on.
+TEST(KvScatter, HostScatterAsyncMatchesSync) {
+  constexpr std::size_t kPageSize = 2, kHeads = 2, kHeadDim = 16, kElem = 2;
+  constexpr std::size_t kSlotBytes = kHeads * kHeadDim * kElem;
+  constexpr std::size_t kScratchPerPage = kPageSize * 2 * kSlotBytes;
+  constexpr std::size_t kSlots = 8;
+
+  std::vector<std::uint8_t> scratch(2 * kScratchPerPage);
+  for (std::size_t i = 0; i < scratch.size(); ++i)
+    scratch[i] = static_cast<std::uint8_t>(0x30 + (i % 200));
+
+  const int slot_ids[4] = {3, 1, 6, 4};
+
+  auto ks_sync = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vs_sync = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  kv_scatter(ks_sync.data(), vs_sync.data(), scratch.data(), slot_ids, 2,
+             kPageSize, kHeads, kHeadDim, kElem);
+
+  auto ks_async = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  auto vs_async = make_dst(kSlots, kHeads, kHeadDim, kElem);
+  Stream s;
+  std::size_t before = s.submitted();
+  kv_scatter(ks_async.data(), vs_async.data(), scratch.data(), slot_ids, 2,
+             kPageSize, kHeads, kHeadDim, kElem, &s);
+  EXPECT_EQ(s.submitted() - before, 1u);  // exactly one task
+  s.wait();
+
+  for (std::size_t i = 0; i < ks_async.size(); ++i) {
+    ASSERT_EQ(ks_async[i], ks_sync[i]);
+    ASSERT_EQ(vs_async[i], vs_sync[i]);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Byte-exact correctness
