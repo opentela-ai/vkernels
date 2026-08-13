@@ -387,8 +387,7 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    std::printf("\n# Prepared plan across %zu layers (%zu pages, %zu MiB):
-",
+    std::printf("\n# Prepared plan across %zu layers (%zu pages, %zu MiB):\n",
                 kLayers, kPlanPages,
                 kPlanPages * kLayerBytes / (1024 * 1024));
     std::printf("#   plan prepare = %.3f ms (one-time validation + upload)\n",

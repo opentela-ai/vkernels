@@ -104,7 +104,12 @@ __global__ void p2p_kv_restore_kernel(
       // Vectorized path: uint4 = 16 bytes. slot_bytes is typically a
       // multiple of 16 for realistic shapes (head_dim ∈ {64,128,256},
       // elem_size=2), but we keep the scalar tail for generality.
-      const int vec_chunks = slot_bytes >> 4;  // slot_bytes / 16
+      // The vec path is only safe when slot_bytes is a multiple of 16:
+      // otherwise src_v = src_k + slot_bytes and dst_k = k_dst + slot*
+      // slot_bytes are misaligned, and a 16-byte uint4 load/store from a
+      // sub-16-aligned address is an illegal memory access on the GPU.
+      const bool aligned = (slot_bytes & 15) == 0;
+      const int vec_chunks = aligned ? (slot_bytes >> 4) : 0;  // slot_bytes / 16
       for (int i = threadIdx.x; i < vec_chunks; i += blockDim.x) {
         const int off = i << 4;  // i * 16
         *reinterpret_cast<uint4*>(dst_k + off) =
@@ -113,9 +118,10 @@ __global__ void p2p_kv_restore_kernel(
             *reinterpret_cast<const uint4*>(src_v + off);
       }
 
-      // Scalar tail for the <16-byte remainder.
-      const int tail_off = vec_chunks << 4;
-      const int tail_len = slot_bytes - tail_off;
+      // Scalar tail for the <16-byte remainder (or the whole slot when
+      // slot_bytes is not 16-aligned).
+      const int tail_off = aligned ? (vec_chunks << 4) : 0;
+      const int tail_len = aligned ? (slot_bytes - tail_off) : slot_bytes;
       for (int i = threadIdx.x; i < tail_len; i += blockDim.x) {
         dst_k[tail_off + i] = src_k[tail_off + i];
         dst_v[tail_off + i] = src_v[tail_off + i];
@@ -147,7 +153,12 @@ __global__ void kv_scatter_kernel(unsigned char* k_dst, unsigned char* v_dst,
       unsigned char* dst_k = k_dst + slot * slot_bytes;
       unsigned char* dst_v = v_dst + slot * slot_bytes;
 
-      const int vec_chunks = slot_bytes >> 4;
+      // The vec path is only safe when slot_bytes is a multiple of 16:
+      // otherwise src_v = src + slot_bytes and dst_v = v_dst + slot*slot_bytes
+      // are misaligned, and a 16-byte uint4 load/store from a sub-16-aligned
+      // address is an illegal memory access on the GPU.
+      const bool aligned = (slot_bytes & 15) == 0;
+      const int vec_chunks = aligned ? (slot_bytes >> 4) : 0;
       for (int i = threadIdx.x; i < vec_chunks; i += blockDim.x) {
         const int off = i << 4;
         *reinterpret_cast<uint4*>(dst_k + off) =
@@ -155,8 +166,8 @@ __global__ void kv_scatter_kernel(unsigned char* k_dst, unsigned char* v_dst,
         *reinterpret_cast<uint4*>(dst_v + off) =
             *reinterpret_cast<const uint4*>(src_v + off);
       }
-      const int tail_off = vec_chunks << 4;
-      const int tail_len = slot_bytes - tail_off;
+      const int tail_off = aligned ? (vec_chunks << 4) : 0;
+      const int tail_len = aligned ? (slot_bytes - tail_off) : slot_bytes;
       for (int i = threadIdx.x; i < tail_len; i += blockDim.x) {
         dst_k[tail_off + i] = src_k[tail_off + i];
         dst_v[tail_off + i] = src_v[tail_off + i];
@@ -481,8 +492,6 @@ struct P2PKvRestorePlan::Impl {
            d_pages(nullptr), slot_ids(nullptr), owns_slot_ids(false) {}
 };
 
-namespace {
-
 // Shared constructor body: validate metadata shape, resolve peer bases,
 // allocate the persistent descriptor buffer and (for host-input) the device
 // slot map. The synchronous cudaMalloc/cudaMemcpy use stream 0 so the
@@ -490,11 +499,11 @@ namespace {
 // execute() on arbitrary streams is race-free (CUDA default stream is
 // synchronising with respect to per-thread streams).
 template <bool ValidateSlots>
-std::unique_ptr<P2PKvRestorePlan::Impl>
-build_impl(void* k_dst, void* v_dst, std::size_t num_slots,
-          std::size_t num_kv_heads, std::size_t head_dim, std::size_t elem_size,
-          const int* slot_ids, const void* const* peer_src_ptrs,
-          std::size_t num_pages, std::size_t page_size) {
+P2PKvRestorePlan::Impl* P2PKvRestorePlan::init(
+    void* k_dst, void* v_dst, std::size_t num_slots,
+    std::size_t num_kv_heads, std::size_t head_dim, std::size_t elem_size,
+    const int* slot_ids, const void* const* peer_src_ptrs,
+    std::size_t num_pages, std::size_t page_size) {
   VK_EXPECTS(num_pages == 0 || k_dst != nullptr, "k_dst must be non-null");
   VK_EXPECTS(num_pages == 0 || v_dst != nullptr, "v_dst must be non-null");
   VK_EXPECTS(num_pages == 0 || num_slots > 0, "num_slots must be positive");
@@ -506,7 +515,7 @@ build_impl(void* k_dst, void* v_dst, std::size_t num_slots,
   VK_EXPECTS(num_pages == 0 || peer_src_ptrs != nullptr,
              "peer_src_ptrs must be non-null");
 
-  auto impl = std::make_unique<P2PKvRestorePlan::Impl>();
+  auto* impl = new Impl();
   impl->k_dst = static_cast<unsigned char*>(k_dst);
   impl->v_dst = static_cast<unsigned char*>(v_dst);
   impl->num_pages = static_cast<int>(num_pages);
@@ -523,14 +532,10 @@ build_impl(void* k_dst, void* v_dst, std::size_t num_slots,
 
   const std::size_t total_tokens = num_pages * page_size;
   if (ValidateSlots) {
-    std::vector<int> tmp(total_tokens);
-    for (std::size_t p = 0; p < num_pages; ++p)
-      std::memcpy(tmp.data() + p * page_size, slot_ids + p * page_size,
-                  page_size * sizeof(int));
     std::unordered_set<int> seen;
     seen.reserve(total_tokens);
     for (std::size_t i = 0; i < total_tokens; ++i) {
-      int slot = tmp[i];
+      int slot = slot_ids[i];
       VK_EXPECTS(slot >= 0, "slot_ids must be non-negative");
       VK_EXPECTS(slot < static_cast<int>(num_slots),
                  "slot_ids must be < num_slots");
@@ -578,8 +583,6 @@ build_impl(void* k_dst, void* v_dst, std::size_t num_slots,
   return impl;
 }
 
-}  // namespace
-
 P2PKvRestorePlan::P2PKvRestorePlan(void* k_dst, void* v_dst,
                                    std::size_t num_slots,
                                    std::size_t num_kv_heads,
@@ -588,9 +591,9 @@ P2PKvRestorePlan::P2PKvRestorePlan(void* k_dst, void* v_dst,
                                    const void* const* peer_src_ptrs,
                                    std::size_t num_pages,
                                    std::size_t page_size)
-    : impl_(build_impl<true>(k_dst, v_dst, num_slots, num_kv_heads, head_dim,
-                             elem_size, slot_ids, peer_src_ptrs, num_pages,
-                             page_size).release()) {}
+    : impl_(init<true>(k_dst, v_dst, num_slots, num_kv_heads, head_dim,
+                       elem_size, slot_ids, peer_src_ptrs, num_pages,
+                       page_size)) {}
 
 P2PKvRestorePlan::P2PKvRestorePlan(vkernels::comm::from_device_slots_t,
                                    void* k_dst, void* v_dst,
@@ -601,13 +604,13 @@ P2PKvRestorePlan::P2PKvRestorePlan(vkernels::comm::from_device_slots_t,
                                    const void* const* peer_src_ptrs,
                                    std::size_t num_pages,
                                    std::size_t page_size)
-    : impl_(build_impl<false>(k_dst, v_dst, num_slots, num_kv_heads, head_dim,
-                              elem_size, device_indices, peer_src_ptrs,
-                              num_pages, page_size).release()) {}
+    : impl_(init<false>(k_dst, v_dst, num_slots, num_kv_heads, head_dim,
+                        elem_size, device_indices, peer_src_ptrs, num_pages,
+                        page_size)) {}
 
 P2PKvRestorePlan::~P2PKvRestorePlan() {
   if (!impl_) return;
-  if (impl->owns_slot_ids && impl->slot_ids)
+  if (impl_->owns_slot_ids && impl_->slot_ids)
     cudaFree(const_cast<int*>(impl_->slot_ids));
   if (impl_->d_pages) cudaFree(impl_->d_pages);
   delete impl_;

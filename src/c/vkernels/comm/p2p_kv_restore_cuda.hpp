@@ -128,6 +128,16 @@ class P2PKvRestorePlan {
 
  private:
   struct Impl;
+  // Shared construction body (see p2p_kv_restore.cu). Validating form
+  // checks slot uniqueness/bounds and owns a device copy; non-validating
+  // form borrows the caller's device pointer. A member so it may name the
+  // private Impl type.
+  template <bool ValidateSlots>
+  Impl* init(void* k_dst, void* v_dst, std::size_t num_slots,
+             std::size_t num_kv_heads, std::size_t head_dim,
+             std::size_t elem_size, const int* slot_ids,
+             const void* const* peer_src_ptrs, std::size_t num_pages,
+             std::size_t page_size);
   Impl* impl_;
 };
 

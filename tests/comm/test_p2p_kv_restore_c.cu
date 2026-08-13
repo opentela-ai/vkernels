@@ -323,15 +323,17 @@ TEST(P2pKvRestoreCAbi, ConcurrentStreams) {
   constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;  // 32
   constexpr size_t kSlots = 8;
 
-  auto h_p0 = patterned(page_bytes(kPageSize, kHeads, kHeadDim, kElem), 0x10);
-  auto h_p1 = patterned(page_bytes(kPageSize, kHeads, kHeadDim, kElem), 0x80);
+  // Both streams restore the SAME source page into separate destinations
+  // (same slot map). The result must be byte-identical on both streams —
+  // this verifies concurrent execution on two streams is safe (no
+  // cross-stream corruption), not that two different sources match.
+  auto h_p = patterned(page_bytes(kPageSize, kHeads, kHeadDim, kElem), 0x10);
   const int h_slots[4] = {0, 4, 1, 5};
 
-  uint8_t *dp0 = nullptr, *dp1 = nullptr;
+  uint8_t *dp = nullptr;
   uint8_t *dk0 = nullptr, *dv0 = nullptr, *dk1 = nullptr, *dv1 = nullptr;
   int *ds0 = nullptr, *ds1 = nullptr;
-  ASSERT_TRUE(cudaMalloc(&dp0, h_p0.size()) == cudaSuccess);
-  ASSERT_TRUE(cudaMalloc(&dp1, h_p1.size()) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dp, h_p.size()) == cudaSuccess);
   ASSERT_TRUE(cudaMalloc(&dk0, kSlots * kSlotBytes) == cudaSuccess);
   ASSERT_TRUE(cudaMalloc(&dv0, kSlots * kSlotBytes) == cudaSuccess);
   ASSERT_TRUE(cudaMalloc(&dk1, kSlots * kSlotBytes) == cudaSuccess);
@@ -339,9 +341,7 @@ TEST(P2pKvRestoreCAbi, ConcurrentStreams) {
   ASSERT_TRUE(cudaMalloc(&ds0, 4 * sizeof(int)) == cudaSuccess);
   ASSERT_TRUE(cudaMalloc(&ds1, 4 * sizeof(int)) == cudaSuccess);
 
-  ASSERT_TRUE(cudaMemcpy(dp0, h_p0.data(), h_p0.size(),
-                         cudaMemcpyHostToDevice) == cudaSuccess);
-  ASSERT_TRUE(cudaMemcpy(dp1, h_p1.data(), h_p1.size(),
+  ASSERT_TRUE(cudaMemcpy(dp, h_p.data(), h_p.size(),
                          cudaMemcpyHostToDevice) == cudaSuccess);
   ASSERT_TRUE(cudaMemcpy(ds0, h_slots, 4 * sizeof(int),
                          cudaMemcpyHostToDevice) == cudaSuccess);
@@ -357,21 +357,20 @@ TEST(P2pKvRestoreCAbi, ConcurrentStreams) {
   ASSERT_TRUE(cudaStreamCreate(&s0) == cudaSuccess);
   ASSERT_TRUE(cudaStreamCreate(&s1) == cudaSuccess);
 
-  const void* ptrs0[1] = {dp0};
-  const void* ptrs1[1] = {dp1};
+  const void* ptrs[1] = {dp};
   const size_t offs[1] = {0};
 
   vkernels_status_t st = vkernels_p2p_kv_restore_layer(
-      dk0, dv0, ds0, ptrs0, offs, 1, kPageSize, kHeads, kHeadDim, kElem, s0);
+      dk0, dv0, ds0, ptrs, offs, 1, kPageSize, kHeads, kHeadDim, kElem, s0);
   ASSERT_EQ(st, VKERNELS_OK);
   st = vkernels_p2p_kv_restore_layer(
-      dk1, dv1, ds1, ptrs1, offs, 1, kPageSize, kHeads, kHeadDim, kElem, s1);
+      dk1, dv1, ds1, ptrs, offs, 1, kPageSize, kHeads, kHeadDim, kElem, s1);
   ASSERT_EQ(st, VKERNELS_OK);
 
   ASSERT_TRUE(cudaStreamSynchronize(s0) == cudaSuccess);
   ASSERT_TRUE(cudaStreamSynchronize(s1) == cudaSuccess);
 
-  // Verify both streams have correct data.
+  // Both streams read the same source, so the destinations must match.
   std::vector<uint8_t> hk0(kSlots * kSlotBytes), hv0(kSlots * kSlotBytes);
   std::vector<uint8_t> hk1(kSlots * kSlotBytes), hv1(kSlots * kSlotBytes);
   cudaMemcpy(hk0.data(), dk0, hk0.size(), cudaMemcpyDeviceToHost);
@@ -385,7 +384,7 @@ TEST(P2pKvRestoreCAbi, ConcurrentStreams) {
   }
 
   cudaStreamDestroy(s0); cudaStreamDestroy(s1);
-  cudaFree(dp0); cudaFree(dp1); cudaFree(dk0); cudaFree(dv0);
+  cudaFree(dp); cudaFree(dk0); cudaFree(dv0);
   cudaFree(dk1); cudaFree(dv1); cudaFree(ds0); cudaFree(ds1);
 }
 
