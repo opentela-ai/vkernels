@@ -414,6 +414,13 @@ int* ints_to_device(const int* h, size_t n) {
               cudaSuccess);
   return d;
 }
+int64_t* int64s_to_device(const int64_t* h, size_t n) {
+  int64_t* d = nullptr;
+  ASSERT_TRUE(cudaMalloc(&d, n * sizeof(int64_t)) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(d, h, n * sizeof(int64_t), cudaMemcpyHostToDevice) ==
+              cudaSuccess);
+  return d;
+}
 
 TEST(P2pKvRestoreCAbi, PlanFusedEqualsOneShot) {
   constexpr size_t kPageSize = 4, kHeads = 4, kHeadDim = 16, kElem = 2;
@@ -438,7 +445,7 @@ TEST(P2pKvRestoreCAbi, PlanFusedEqualsOneShot) {
   vkernels_status_t st;
   vkernels_p2p_kv_restore_plan_t* plan =
       vkernels_p2p_kv_restore_plan_create(
-          dk_p, dv_p, kSlots, kHeads, kHeadDim, kElem, h_slots, ptrs, 2,
+          kSlots, kHeads, kHeadDim, kElem, h_slots, ptrs, 2,
           kPageSize, &st);
   ASSERT_TRUE(plan != nullptr);
   ASSERT_EQ(st, VKERNELS_OK);
@@ -446,7 +453,7 @@ TEST(P2pKvRestoreCAbi, PlanFusedEqualsOneShot) {
   // Execute the plan (layer 0). The plan uploaded its own copy of d_slots
   // at create, so the caller may free d_slots now; keep it for the
   // one-shot oracle below.
-  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, 0, 0),
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, dk_p, dv_p, 0, 0),
             VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
 
@@ -492,11 +499,12 @@ TEST(P2pKvRestoreCAbi, PlanOffsetMatchesPerPageOffset) {
   vkernels_status_t st;
   vkernels_p2p_kv_restore_plan_t* plan =
       vkernels_p2p_kv_restore_plan_create(
-          dk_p, dv_p, kSlots, kHeads, kHeadDim, kElem, h_slots, ptrs, 2,
+          kSlots, kHeads, kHeadDim, kElem, h_slots, ptrs, 2,
           kPageSize, &st);
   ASSERT_TRUE(plan != nullptr);
   ASSERT_EQ(st, VKERNELS_OK);
-  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, kLayerBytes, 0),
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, dk_p, dv_p,
+                                                        kLayerBytes, 0),
             VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
 
@@ -535,7 +543,7 @@ TEST(P2pKvRestoreCAbi, PlanTwoStreams) {
   vkernels_status_t st;
   vkernels_p2p_kv_restore_plan_t* plan =
       vkernels_p2p_kv_restore_plan_create(
-          dk, dv, kSlots, kHeads, kHeadDim, kElem, h_slots, ptrs, 1,
+          kSlots, kHeads, kHeadDim, kElem, h_slots, ptrs, 1,
           kPageSize, &st);
   ASSERT_TRUE(plan != nullptr);
   ASSERT_EQ(st, VKERNELS_OK);
@@ -547,9 +555,9 @@ TEST(P2pKvRestoreCAbi, PlanTwoStreams) {
   // deterministic regardless of which stream wins the shared-destination
   // write — this tests concurrent plan sharing (no deadlock, no metadata
   // mutation) rather than relying on cross-stream write ordering.
-  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, 0, s0),
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, dk, dv, 0, s0),
             VKERNELS_OK);
-  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, 0, s1),
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, dk, dv, 0, s1),
             VKERNELS_OK);
   ASSERT_TRUE(cudaStreamSynchronize(s0) == cudaSuccess);
   ASSERT_TRUE(cudaStreamSynchronize(s1) == cudaSuccess);
@@ -597,11 +605,11 @@ TEST(P2pKvRestoreCAbi, PlanDeviceSlotsMatchesOneShot) {
   vkernels_status_t st;
   vkernels_p2p_kv_restore_plan_t* plan =
       vkernels_p2p_kv_restore_plan_create_device_slots(
-          dk_p, dv_p, kSlots, kHeads, kHeadDim, kElem, d_slots, ptrs, 2,
+          kSlots, kHeads, kHeadDim, kElem, d_slots, ptrs, 2,
           kPageSize, &st);
   ASSERT_TRUE(plan != nullptr);
   ASSERT_EQ(st, VKERNELS_OK);
-  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, 0, 0),
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, dk_p, dv_p, 0, 0),
             VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
 
@@ -622,37 +630,149 @@ TEST(P2pKvRestoreCAbi, PlanDeviceSlotsMatchesOneShot) {
   cudaFree(dk_p); cudaFree(dv_p); cudaFree(dk_o); cudaFree(dv_o);
 }
 
+// int64 device-slot variant (torch.int64 in KVAAS/SGLang): the plan
+// converts int64 indices to an owned int32 buffer at create and must be
+// byte-identical to the one-shot oracle (which uses int32).
+TEST(P2pKvRestoreCAbi, PlanDeviceSlotsInt64MatchesOneShot) {
+  constexpr size_t kPageSize = 2, kHeads = 2, kHeadDim = 8, kElem = 2;
+  constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;   // 32
+  constexpr size_t kSlots = 8;
+
+  auto h0 = patterned(page_bytes(kPageSize, kHeads, kHeadDim, kElem), 0x44);
+  auto h1 = patterned(page_bytes(kPageSize, kHeads, kHeadDim, kElem), 0x88);
+  const int h_slots[4] = {3, 0, 7, 5};
+  const int64_t h_slots_i64[4] = {3, 0, 7, 5};
+  uint8_t* d0 = to_device(h0);
+  uint8_t* d1 = to_device(h1);
+  int* d_slots = ints_to_device(h_slots, 4);
+  int64_t* d_slots_i64 = int64s_to_device(h_slots_i64, 4);
+  uint8_t *dk_p = nullptr, *dv_p = nullptr, *dk_o = nullptr, *dv_o = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dk_p, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv_p, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dk_o, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv_o, kSlots * kSlotBytes) == cudaSuccess);
+  fill_device(dk_p, kSlots * kSlotBytes, 0xCC); fill_device(dv_p, kSlots * kSlotBytes, 0xCC);
+  fill_device(dk_o, kSlots * kSlotBytes, 0xCC); fill_device(dv_o, kSlots * kSlotBytes, 0xCC);
+
+  const void* ptrs[2] = {d0, d1};
+  vkernels_status_t st;
+  vkernels_p2p_kv_restore_plan_t* plan =
+      vkernels_p2p_kv_restore_plan_create_device_slots_int64(
+          kSlots, kHeads, kHeadDim, kElem, d_slots_i64, ptrs, 2,
+          kPageSize, &st);
+  ASSERT_TRUE(plan != nullptr);
+  ASSERT_EQ(st, VKERNELS_OK);
+  // The int64 source buffer may be freed right after create: the plan owns
+  // its converted int32 copy, and the create-time D2D conversion kernel is
+  // serialized on the default stream ahead of the execute below.
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, dk_p, dv_p, 0, 0),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const size_t offs[2] = {0, 0};
+  ASSERT_EQ(vkernels_p2p_kv_restore_layer(
+                dk_o, dv_o, d_slots, ptrs, offs, 2, kPageSize, kHeads,
+                kHeadDim, kElem, 0),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+
+  ASSERT_TRUE(device_equal(dk_p, dk_o, kSlots * kSlotBytes));
+  ASSERT_TRUE(device_equal(dv_p, dv_o, kSlots * kSlotBytes));
+
+  vkernels_p2p_kv_restore_plan_destroy(plan);
+  cudaFree(d0); cudaFree(d1); cudaFree(d_slots); cudaFree(d_slots_i64);
+  cudaFree(dk_p); cudaFree(dv_p); cudaFree(dk_o); cudaFree(dv_o);
+}
+
+// The KVAAS restore pattern (issue #27): one run list reused across all
+// model layers, each layer written into its OWN (k_dst, v_dst) pair. The
+// destination is no longer bound at create — execute() takes it per call —
+// so one plan fans one run list out into distinct per-layer destination
+// buffers, byte-exact against the one-shot oracle run per layer.
+TEST(P2pKvRestoreCAbi, PlanDistinctDestinationsAcrossLayers) {
+  constexpr size_t kPageSize = 2, kHeads = 2, kHeadDim = 16, kElem = 2;
+  constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;    // 64
+  constexpr size_t kTokenStr = 2 * kSlotBytes;                 // 128
+  constexpr size_t kLayerBytes = kPageSize * kTokenStr;        // 256
+  constexpr size_t kLayers = 40;
+  constexpr size_t kSlots = 8;  // 2 pages x page_size 2 = 4 active, rest untouched
+
+  // Each peer page holds every layer back-to-back.
+  auto buf0 = patterned(page_bytes(kPageSize * kLayers, kHeads, kHeadDim, kElem), 0x09);
+  auto buf1 = patterned(page_bytes(kPageSize * kLayers, kHeads, kHeadDim, kElem), 0x51);
+  const int h_slots[4] = {2, 0, 3, 1};
+  uint8_t* d0 = to_device(buf0);
+  uint8_t* d1 = to_device(buf1);
+  int* d_slots = ints_to_device(h_slots, 4);
+  const void* ptrs[2] = {d0, d1};
+
+  vkernels_status_t st;
+  vkernels_p2p_kv_restore_plan_t* plan =
+      vkernels_p2p_kv_restore_plan_create(
+          kSlots, kHeads, kHeadDim, kElem, h_slots, ptrs, 2, kPageSize, &st);
+  ASSERT_TRUE(plan != nullptr);
+  ASSERT_EQ(st, VKERNELS_OK);
+
+  // One distinct destination K + V pair per layer.
+  std::vector<uint8_t*> dkp(kLayers), dvp(kLayers);
+  for (size_t l = 0; l < kLayers; ++l) {
+    ASSERT_TRUE(cudaMalloc(&dkp[l], kSlots * kSlotBytes) == cudaSuccess);
+    ASSERT_TRUE(cudaMalloc(&dvp[l], kSlots * kSlotBytes) == cudaSuccess);
+    fill_device(dkp[l], kSlots * kSlotBytes, 0xCC);
+    fill_device(dvp[l], kSlots * kSlotBytes, 0xCC);
+    ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(
+                  plan, dkp[l], dvp[l], l * kLayerBytes, 0),
+              VKERNELS_OK);
+  }
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+
+  // Per-layer one-shot oracle into scratch, then compare each layer's plan
+  // output against it.
+  uint8_t *dk_o = nullptr, *dv_o = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dk_o, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv_o, kSlots * kSlotBytes) == cudaSuccess);
+  for (size_t l = 0; l < kLayers; ++l) {
+    fill_device(dk_o, kSlots * kSlotBytes, 0xCC);
+    fill_device(dv_o, kSlots * kSlotBytes, 0xCC);
+    const size_t offs[2] = {l * kLayerBytes, l * kLayerBytes};
+    ASSERT_EQ(vkernels_p2p_kv_restore_layer(
+                  dk_o, dv_o, d_slots, ptrs, offs, 2, kPageSize, kHeads,
+                  kHeadDim, kElem, 0),
+              VKERNELS_OK);
+    ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+    ASSERT_TRUE(device_equal(dkp[l], dk_o, kSlots * kSlotBytes));
+    ASSERT_TRUE(device_equal(dvp[l], dv_o, kSlots * kSlotBytes));
+  }
+
+  cudaFree(dk_o); cudaFree(dv_o);
+  vkernels_p2p_kv_restore_plan_destroy(plan);
+  cudaFree(d0); cudaFree(d1); cudaFree(d_slots);
+  for (size_t l = 0; l < kLayers; ++l) { cudaFree(dkp[l]); cudaFree(dvp[l]); }
+}
+
 // Contract checks now return status codes at create time.
 TEST(P2pKvRestoreCAbi, PlanRejectsDuplicateSlot) {
   auto h = patterned(page_bytes(2, 2, 4, 2), 0x10);
   uint8_t* d = to_device(h);
   int h_slots[2] = {1, 1};
-  int* d_slots = ints_to_device(h_slots, 2);
-  uint8_t *dk = nullptr, *dv = nullptr;
-  ASSERT_TRUE(cudaMalloc(&dk, 4 * 2 * 4 * 2) == cudaSuccess);
-  ASSERT_TRUE(cudaMalloc(&dv, 4 * 2 * 4 * 2) == cudaSuccess);
   const void* ptrs[1] = {d};
   vkernels_status_t st = VKERNELS_OK;
   vkernels_p2p_kv_restore_plan_t* plan =
-      vkernels_p2p_kv_restore_plan_create(dk, dv, 4, 2, 4, 2, h_slots, ptrs,
+      vkernels_p2p_kv_restore_plan_create(4, 2, 4, 2, h_slots, ptrs,
                                           1, 2, &st);
   ASSERT_TRUE(plan == nullptr);
   ASSERT_EQ(st, VKERNELS_ERR_INVALID_ARGUMENT);
-  cudaFree(d); cudaFree(d_slots); cudaFree(dk); cudaFree(dv);
+  cudaFree(d);
 }
 
 TEST(P2pKvRestoreCAbi, PlanRejectsNonBF16) {
-  uint8_t* dk = nullptr;
-  ASSERT_TRUE(cudaMalloc(&dk, 4 * 2 * 4 * 4) == cudaSuccess);
   const void* ptrs[1] = {(void*)0x1000};
   int slot = 0;
   vkernels_status_t st = VKERNELS_OK;
   vkernels_p2p_kv_restore_plan_t* plan =
-      vkernels_p2p_kv_restore_plan_create(dk, dk, 4, 2, 4, 4, &slot, ptrs,
-                                          1, 1, &st);
+      vkernels_p2p_kv_restore_plan_create(4, 2, 4, 4, &slot, ptrs, 1, 1, &st);
   ASSERT_TRUE(plan == nullptr);
   ASSERT_EQ(st, VKERNELS_ERR_INVALID_ARGUMENT);
-  cudaFree(dk);
 }
 
 TEST(P2pKvRestoreCAbi, PlanZeroPagesIsNoOp) {
@@ -664,11 +784,13 @@ TEST(P2pKvRestoreCAbi, PlanZeroPagesIsNoOp) {
   fill_device(dv, 4 * 2 * 4 * 2, 0xAB);
   vkernels_status_t st = VKERNELS_OK;
   vkernels_p2p_kv_restore_plan_t* plan =
-      vkernels_p2p_kv_restore_plan_create(dk, dv, 4, 2, 4, 2, nullptr,
+      vkernels_p2p_kv_restore_plan_create(4, 2, 4, 2, nullptr,
                                           nullptr, 0, 64, &st);
   ASSERT_TRUE(plan != nullptr);
   ASSERT_EQ(st, VKERNELS_OK);
-  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, 0, 0),
+  // num_pages == 0 makes the destination irrelevant (nothing is written), so
+  // pass the buffers to execute to confirm it stays a no-op.
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, dk, dv, 0, 0),
             VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
   ASSERT_TRUE(device_equal(dk, dv, 4 * 2 * 4 * 2));  // both still 0xAB

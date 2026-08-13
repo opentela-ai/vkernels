@@ -80,6 +80,7 @@ EXPECTED_COMM = [
     ("p2p_kv_restore_layer_twostage", "function"),
     ("kv_scatter", "function"),
     ("from_device_slots_t", "struct"),
+    ("from_device_slots_int64_t", "struct"),
     ("P2PKvRestorePlan", "class"),
     ("Topology", "struct"),
     ("ring_rank", "function"),

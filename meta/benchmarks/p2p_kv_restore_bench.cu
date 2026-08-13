@@ -123,15 +123,17 @@ double time_oneshot_fused(uint8_t* d_k, uint8_t* d_v, const int* d_slots,
   return time_fused(d_k, d_v, d_slots, ptrs, offs.data(), num_pages, stream);
 }
 
-// Timed launch for the prepared plan: ONE kernel, no per-layer allocation
-// or H2D copy.
-double time_plan(P2PKvRestorePlan* plan, size_t layer_offset,
-                 cudaStream_t stream) {
+// Timed launch for the prepared plan: ONE kernel into the given destination,
+// no per-layer allocation or H2D copy. The destination is passed per-call
+// (it is no longer bound at plan creation), matching a KVAAS restore where
+// each model layer owns its own (k_dst, v_dst) pair.
+double time_plan(P2PKvRestorePlan* plan, uint8_t* d_k, uint8_t* d_v,
+                 size_t layer_offset, cudaStream_t stream) {
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
   cudaEventRecord(start, stream);
-  plan->execute(layer_offset, stream);
+  plan->execute(d_k, d_v, layer_offset, stream);
   cudaEventRecord(stop, stream);
   cudaEventSynchronize(stop);
   double us = elapsed_us(start, stop);
@@ -298,33 +300,51 @@ int main(int argc, char** argv) {
   }
 
   // ---------------------------------------------------------------------------
-  // Prepared plan across model layers (issue #27)
+  // Prepared plan across model layers (issue #27), KVAAS-shaped
   // ---------------------------------------------------------------------------
   //
   // The KVAAS restore pattern: one run list (peer pages + slot map) reused
-  // across all model layers (40 for Qwen3-14B), each layer at a fixed offset
-  // into every peer page. We compare:
+  // across all model layers (40 for Qwen3-14B). Crucially each layer writes
+  // into its OWN (k_dst, v_dst) buffer — the destination is a per-layer
+  // resource, not a per-plan constant — so the destination moved to
+  // execute(). We sweep the run-list size over {1, 16, 64, 192} pages and
+  // report the TOTAL cost of restoring the whole model (all 40 layers),
+  // INCLUDING the one-time plan creation, for:
   //   * one-shot fused  — re-prepares metadata (cudaMallocAsync + H2D copy
-  //     + cudaFreeAsync) every layer, exactly what a runtime without a plan
-  //     pays;
-  //   * PR #9 gather+scatter — prepare a P2PGatherPlan2D and the slot map
-  //     once, then per layer run gather (1 kernel) + indexed scatter
-  //     (1 kernel) = 2 kernels, no per-layer alloc/H2D;
-  //   * prepared plan     — prepare once, per layer run ONE fused kernel.
+  //     + cudaFreeAsync) every layer, what a runtime without a plan pays;
+  //   * PR #9 gather+scatter — prepare a P2PGatherPlan2D + the slot map once,
+  //     then per layer run gather (1 kernel) + indexed scatter (1 kernel);
+  //   * prepared plan     — prepare once, per layer run ONE fused kernel into
+  //     that layer's own K/V buffer.
   //
   // Pages here are KVAAS-style: one peer allocation per page holding
   // `kLayers` layers back-to-back, so a single scalar `layer_offset` selects
   // the layer.
   {
-    constexpr size_t kPlanPages = 16;   // 16 pages × 40 layers
-    constexpr size_t kLayers = 40;
-    constexpr size_t kLayerBytes = kPageBytes;            // one layer per page
+    constexpr size_t kLayers = 40;                       // Qwen3-14B depth
+    constexpr size_t kMaxPlanPages = 192;                // sweep upper bound
+    constexpr size_t kLayerBytes = kPageBytes;           // one layer per page
     constexpr size_t kPageBufBytes = kLayers * kPageBytes; // all layers/page
 
-    // KVAAS-style peer pages: one allocation per page, all layers back-to-back.
+    // One distinct destination K + V pair per layer, sized for the largest
+    // sweep point (kMaxPlanPages pages) and reused for the smaller ones.
+    cudaSetDevice(dst_device);
+    std::vector<uint8_t*> k_dst(kLayers), v_dst(kLayers);
+    for (size_t l = 0; l < kLayers; ++l) {
+      if (cudaMalloc(&k_dst[l], kMaxPlanPages * S::page_size * kSlotBytes) !=
+              cudaSuccess ||
+          cudaMalloc(&v_dst[l], kMaxPlanPages * S::page_size * kSlotBytes) !=
+              cudaSuccess) {
+        std::fprintf(stderr, "cudaMalloc for layer dst %zu failed\n", l);
+        return 1;
+      }
+    }
+
+    // KVAAS-style peer pages: one allocation per page, all 40 layers
+    // back-to-back. Allocated once at the sweep maximum on the source device.
     cudaSetDevice(src_device);
-    uint8_t* kvaas_pages[kPlanPages];
-    for (size_t p = 0; p < kPlanPages; ++p) {
+    std::vector<uint8_t*> kvaas_pages(kMaxPlanPages);
+    for (size_t p = 0; p < kMaxPlanPages; ++p) {
       if (cudaMalloc(&kvaas_pages[p], kPageBufBytes) != cudaSuccess) {
         std::fprintf(stderr, "cudaMalloc for kvaas page %zu failed\n", p);
         return 1;
@@ -334,110 +354,134 @@ int main(int argc, char** argv) {
     }
     cudaSetDevice(dst_device);
 
-    // Scratch for the PR #9 gather destination: [kPlanPages] pages contiguous.
-    uint8_t* d_scratch = nullptr;
-    if (cudaMalloc(&d_scratch, kPlanPages * kPageBytes) != cudaSuccess) {
-      std::fprintf(stderr, "cudaMalloc for scratch failed\n");
-      return 1;
-    }
+    std::printf("\n# Prepared plan across %zu layers (KVAAS-shaped: one run\n"
+                "# list, a DISTINCT destination K/V pair per layer), page\n"
+                "# sweep. total_40_layers = plan_create + 40 x med/layer.\n",
+                kLayers);
+    std::printf("%6s %8s %-14s %12s %12s %12s %9s\n",
+                "pages", "MiB/lyr", "method", "med/layer(us)",
+                "create(ms)", "total(us)", "vs_1shot");
 
-    // Slot map device buffer: sequential slots over the plan's pages.
-    std::vector<int> h_slots(kPlanPages * S::page_size);
-    for (size_t i = 0; i < h_slots.size(); ++i)
-      h_slots[i] = static_cast<int>(i % kPlanPages);  // unique within a page
-    // Make slots unique across pages: shift each page's slots by p*page_size.
-    for (size_t p = 0; p < kPlanPages; ++p)
-      for (size_t t = 0; t < S::page_size; ++t)
-        h_slots[p * S::page_size + t] = static_cast<int>(p * S::page_size + t);
-    cudaMemcpy(d_slots, h_slots.data(), h_slots.size() * sizeof(int),
-               cudaMemcpyHostToDevice);
+    for (size_t num_pages : {1u, 16u, 64u, 192u}) {
+      const size_t num_slots = num_pages * S::page_size;
+      const double mib =
+          static_cast<double>(num_pages * kPageBytes) / (1024.0 * 1024.0);
 
-    // Peer pointer array (host UVA pointers to the KVAAS page buffers).
-    std::vector<const void*> h_ptrs(kPlanPages);
-    for (size_t p = 0; p < kPlanPages; ++p) h_ptrs[p] = kvaas_pages[p];
+      // Slot map: sequential, unique across pages.
+      std::vector<int> h_slots(num_slots);
+      for (size_t i = 0; i < num_slots; ++i) h_slots[i] = static_cast<int>(i);
+      cudaMemcpy(d_slots, h_slots.data(), num_slots * sizeof(int),
+                 cudaMemcpyHostToDevice);
 
-    // --- Prepare the plan (one-time host + device cost). ---
-    auto p0 = std::chrono::steady_clock::now();
-    P2PKvRestorePlan* plan = nullptr;
-    try {
-      plan = new P2PKvRestorePlan(d_k, d_v, kPlanPages * S::page_size,
-                                  S::num_kv_heads, S::head_dim, S::elem_size,
-                                  h_slots.data(), h_ptrs.data(), kPlanPages,
-                                  S::page_size);
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "plan create failed: %s\n", e.what());
-      return 1;
-    }
-    auto p1 = std::chrono::steady_clock::now();
-    const double plan_prepare_ms =
-        std::chrono::duration<double, std::milli>(p1 - p0).count();
+      // Peer pointer array (host UVA pointers to the KVAAS page buffers).
+      std::vector<const void*> h_ptrs(num_pages);
+      for (size_t p = 0; p < num_pages; ++p) h_ptrs[p] = kvaas_pages[p];
 
-    // --- Prepare the PR #9 gather plan (one-time). ---
-    std::vector<Gather2DRun> runs(kPlanPages);
-    for (size_t p = 0; p < kPlanPages; ++p)
-      runs[p] = {kvaas_pages[p], kPageBufBytes, p * kPageBytes, kPageBytes,
-                 kPageBytes, 1u};
-    P2PGatherPlan2D* gather_plan = nullptr;
-    try {
-      gather_plan =
-          new P2PGatherPlan2D(d_scratch, kPlanPages * kPageBytes,
-                               runs.data(), kPlanPages);
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "gather plan create failed: %s\n", e.what());
-      return 1;
-    }
-
-    std::printf("\n# Prepared plan across %zu layers (%zu pages, %zu MiB):\n",
-                kLayers, kPlanPages,
-                kPlanPages * kLayerBytes / (1024 * 1024));
-    std::printf("#   plan prepare = %.3f ms (one-time validation + upload)\n",
-                plan_prepare_ms);
-    std::printf("%-16s %12s %12s %8s\n", "method", "med/layer(us)",
-                "total(us)", "vs_1shot");
-
-    // Warmup all three paths.
-    for (int i = 0; i < warmup; ++i) {
-      const size_t off = (i % kLayers) * kLayerBytes;
-      time_oneshot_fused(d_k, d_v, d_slots, h_ptrs.data(), off, kPlanPages,
-                         stream);
-      time_gather_scatter(gather_plan, d_slots, d_k, d_v, d_scratch, kPlanPages,
-                          off, stream);
-      time_plan(plan, off, stream);
-    }
-
-    auto run_method = [&](auto&& fn) {
-      std::vector<double> per_layer;
-      per_layer.reserve(iters);
-      for (int i = 0; i < iters; ++i) {
-        const size_t off = (i % kLayers) * kLayerBytes;
-        per_layer.push_back(fn(off));
+      // ---- one-shot fused (re-prepares metadata every layer) ----
+      for (int i = 0; i < warmup; ++i) {
+        const size_t l = static_cast<size_t>(i) % kLayers;
+        time_oneshot_fused(k_dst[l], v_dst[l], d_slots, h_ptrs.data(),
+                           l * kLayerBytes, num_pages, stream);
       }
-      const double med = median(std::move(per_layer));
-      const double total = med * static_cast<double>(kLayers);
-      return std::make_pair(med, total);
-    };
+      std::vector<double> oneshot_us;
+      oneshot_us.reserve(iters);
+      for (int i = 0; i < iters; ++i) {
+        const size_t l = static_cast<size_t>(i) % kLayers;
+        oneshot_us.push_back(time_oneshot_fused(k_dst[l], v_dst[l], d_slots,
+                                                h_ptrs.data(), l * kLayerBytes,
+                                                num_pages, stream));
+      }
+      const double oneshot_med = median(std::move(oneshot_us));
+      const double oneshot_total = oneshot_med * static_cast<double>(kLayers);
 
-    auto oneshot = run_method([&](size_t off) {
-      return time_oneshot_fused(d_k, d_v, d_slots, h_ptrs.data(), off,
-                                kPlanPages, stream);
-    });
-    auto gs = run_method([&](size_t off) {
-      return time_gather_scatter(gather_plan, d_slots, d_k, d_v, d_scratch,
-                                 kPlanPages, off, stream);
-    });
-    auto pl = run_method([&](size_t off) { return time_plan(plan, off, stream); });
+      // ---- PR #9 gather+scatter (prepare two plans once) ----
+      uint8_t* d_scratch = nullptr;
+      if (cudaMalloc(&d_scratch, num_pages * kPageBytes) != cudaSuccess) {
+        std::fprintf(stderr, "cudaMalloc for scratch failed\n");
+        return 1;
+      }
+      std::vector<Gather2DRun> runs(num_pages);
+      for (size_t p = 0; p < num_pages; ++p)
+        runs[p] = {kvaas_pages[p], kPageBufBytes, p * kPageBytes, kPageBytes,
+                   kPageBytes, 1u};
+      auto g0 = std::chrono::steady_clock::now();
+      P2PGatherPlan2D* gather_plan = nullptr;
+      try {
+        gather_plan = new P2PGatherPlan2D(d_scratch, num_pages * kPageBytes,
+                                          runs.data(), num_pages);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "gather plan create failed: %s\n", e.what());
+        return 1;
+      }
+      auto g1 = std::chrono::steady_clock::now();
+      const double gs_prepare_ms =
+          std::chrono::duration<double, std::milli>(g1 - g0).count();
+      for (int i = 0; i < warmup; ++i) {
+        const size_t l = static_cast<size_t>(i) % kLayers;
+        time_gather_scatter(gather_plan, d_slots, k_dst[l], v_dst[l],
+                            d_scratch, num_pages, l * kLayerBytes, stream);
+      }
+      std::vector<double> gs_us;
+      gs_us.reserve(iters);
+      for (int i = 0; i < iters; ++i) {
+        const size_t l = static_cast<size_t>(i) % kLayers;
+        gs_us.push_back(time_gather_scatter(gather_plan, d_slots, k_dst[l],
+                                            v_dst[l], d_scratch, num_pages,
+                                            l * kLayerBytes, stream));
+      }
+      const double gs_med = median(std::move(gs_us));
+      const double gs_total = gs_prepare_ms * 1000.0 +
+                              gs_med * static_cast<double>(kLayers);
 
-    std::printf("%-16s %12.2f %12.2f %8s\n", "one-shot fused",
-                oneshot.first, oneshot.second, "1.00x");
-    std::printf("%-16s %12.2f %12.2f %7.2fx\n", "gather+scatter",
-                gs.first, gs.second, oneshot.second / gs.second);
-    std::printf("%-16s %12.2f %12.2f %7.2fx\n", "prepared plan",
-                pl.first, pl.second, oneshot.second / pl.second);
+      // ---- prepared fused plan (create once; dst passed per layer) ----
+      auto p0 = std::chrono::steady_clock::now();
+      P2PKvRestorePlan* plan = nullptr;
+      try {
+        plan = new P2PKvRestorePlan(num_slots, S::num_kv_heads, S::head_dim,
+                                    S::elem_size, h_slots.data(),
+                                    h_ptrs.data(), num_pages, S::page_size);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "plan create failed: %s\n", e.what());
+        return 1;
+      }
+      auto p1 = std::chrono::steady_clock::now();
+      const double plan_prepare_ms =
+          std::chrono::duration<double, std::milli>(p1 - p0).count();
+      for (int i = 0; i < warmup; ++i) {
+        const size_t l = static_cast<size_t>(i) % kLayers;
+        time_plan(plan, k_dst[l], v_dst[l], l * kLayerBytes, stream);
+      }
+      std::vector<double> pl_us;
+      pl_us.reserve(iters);
+      for (int i = 0; i < iters; ++i) {
+        const size_t l = static_cast<size_t>(i) % kLayers;
+        pl_us.push_back(
+            time_plan(plan, k_dst[l], v_dst[l], l * kLayerBytes, stream));
+      }
+      const double pl_med = median(std::move(pl_us));
+      const double pl_total = plan_prepare_ms * 1000.0 +
+                              pl_med * static_cast<double>(kLayers);
 
-    delete plan;
-    delete gather_plan;
-    cudaFree(d_scratch);
-    for (size_t p = 0; p < kPlanPages; ++p) cudaFree(kvaas_pages[p]);
+      std::printf("%6zu %8.2f %-14s %12.2f %12s %12.2f %9s\n",
+                  num_pages, mib, "one-shot fused", oneshot_med, "-",
+                  oneshot_total, "1.00x");
+      std::printf("%6s %8s %-14s %12.2f %12.3f %12.2f %8.2fx\n",
+                  "", "", "gather+scatter", gs_med, gs_prepare_ms, gs_total,
+                  oneshot_total / gs_total);
+      std::printf("%6s %8s %-14s %12.2f %12.3f %12.2f %8.2fx\n",
+                  "", "", "prepared plan", pl_med, plan_prepare_ms, pl_total,
+                  oneshot_total / pl_total);
+
+      delete plan;
+      delete gather_plan;
+      cudaFree(d_scratch);
+    }
+
+    for (size_t l = 0; l < kLayers; ++l) {
+      cudaFree(k_dst[l]);
+      cudaFree(v_dst[l]);
+    }
+    for (size_t p = 0; p < kMaxPlanPages; ++p) cudaFree(kvaas_pages[p]);
   }
 
   cudaStreamDestroy(stream);

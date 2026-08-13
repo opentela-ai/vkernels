@@ -247,8 +247,6 @@ void kv_scatter(void* k_dst, void* v_dst, const void* scratch,
 // borrows the caller's pointer instead of copying it.
 
 void P2PKvRestorePlan::validate_shape(const void* const* peer_src_ptrs) const {
-  VK_EXPECTS(num_pages_ == 0 || k_dst_ != nullptr, "k_dst must be non-null");
-  VK_EXPECTS(num_pages_ == 0 || v_dst_ != nullptr, "v_dst must be non-null");
   VK_EXPECTS(num_slots_ > 0 || num_pages_ == 0, "num_slots must be positive");
   VK_EXPECTS(page_size_ > 0 || num_pages_ == 0, "page_size must be positive");
   VK_EXPECTS(num_kv_heads_ > 0 || num_pages_ == 0, "num_kv_heads must be positive");
@@ -261,15 +259,14 @@ void P2PKvRestorePlan::validate_shape(const void* const* peer_src_ptrs) const {
     VK_EXPECTS(peer_src_ptrs[p] != nullptr, "peer_src_ptrs[p] must be non-null");
 }
 
-P2PKvRestorePlan::P2PKvRestorePlan(void* k_dst, void* v_dst,
-                                   std::size_t num_slots,
+P2PKvRestorePlan::P2PKvRestorePlan(std::size_t num_slots,
                                    std::size_t num_kv_heads,
                                    std::size_t head_dim, std::size_t elem_size,
                                    const int* slot_ids,
                                    const void* const* peer_src_ptrs,
                                    std::size_t num_pages,
                                    std::size_t page_size)
-    : k_dst_(k_dst), v_dst_(v_dst), num_slots_(num_slots),
+    : num_slots_(num_slots),
       num_kv_heads_(num_kv_heads), head_dim_(head_dim), elem_size_(elem_size),
       page_size_(page_size), num_pages_(num_pages),
       slot_bytes_(per_slot_bytes(num_kv_heads, head_dim, elem_size)),
@@ -301,15 +298,14 @@ P2PKvRestorePlan::P2PKvRestorePlan(void* k_dst, void* v_dst,
   total_bytes_ = num_pages_ * page_size_ * token_stride_;
 }
 
-P2PKvRestorePlan::P2PKvRestorePlan(from_device_slots_t, void* k_dst, void* v_dst,
-                                   std::size_t num_slots,
+P2PKvRestorePlan::P2PKvRestorePlan(from_device_slots_t, std::size_t num_slots,
                                    std::size_t num_kv_heads,
                                    std::size_t head_dim, std::size_t elem_size,
                                    const int* device_indices,
                                    const void* const* peer_src_ptrs,
                                    std::size_t num_pages,
                                    std::size_t page_size)
-    : k_dst_(k_dst), v_dst_(v_dst), num_slots_(num_slots),
+    : num_slots_(num_slots),
       num_kv_heads_(num_kv_heads), head_dim_(head_dim), elem_size_(elem_size),
       page_size_(page_size), num_pages_(num_pages),
       slot_bytes_(per_slot_bytes(num_kv_heads, head_dim, elem_size)),
@@ -328,11 +324,51 @@ P2PKvRestorePlan::P2PKvRestorePlan(from_device_slots_t, void* k_dst, void* v_dst
   total_bytes_ = num_pages_ * page_size_ * token_stride_;
 }
 
-void P2PKvRestorePlan::execute(std::size_t source_layer_offset_bytes,
+// The int64 device-slot constructor (host reference): convert the caller's
+// int64 indices to an OWNED int32 array once, mirroring the CUDA plan's
+// device-side int64->int32 conversion. Like the int32 device-slot variant it
+// does NOT validate slot contents (the CUDA path converts in-device and
+// cannot read device memory without a sync), so the caller guarantees unique,
+// non-negative, in-range slots. The caller may free the int64 buffer as soon
+// as the constructor returns (the host reference owns its int32 copy).
+P2PKvRestorePlan::P2PKvRestorePlan(from_device_slots_int64_t,
+                                   std::size_t num_slots,
+                                   std::size_t num_kv_heads,
+                                   std::size_t head_dim, std::size_t elem_size,
+                                   const std::int64_t* device_indices,
+                                   const void* const* peer_src_ptrs,
+                                   std::size_t num_pages,
+                                   std::size_t page_size)
+    : num_slots_(num_slots),
+      num_kv_heads_(num_kv_heads), head_dim_(head_dim), elem_size_(elem_size),
+      page_size_(page_size), num_pages_(num_pages),
+      slot_bytes_(per_slot_bytes(num_kv_heads, head_dim, elem_size)),
+      token_stride_(token_stride_bytes(num_kv_heads, head_dim, elem_size)),
+      total_bytes_(0), slot_ids_(nullptr) {
+  // Convert the caller's int64 indices to an OWNED int32 array first so
+  // slot_ids_ is non-null for validate_shape (mirrors the int32 device-slot
+  // constructor borrowing the pointer).
+  const std::size_t total_tokens = num_pages_ * page_size_;
+  if (total_tokens > 0) {
+    owned_slots_.resize(total_tokens);
+    for (std::size_t i = 0; i < total_tokens; ++i)
+      owned_slots_[i] = static_cast<int>(device_indices[i]);
+    slot_ids_ = owned_slots_.data();
+  }
+  validate_shape(peer_src_ptrs);
+  if (num_pages_ == 0) return;
+  peer_bases_.assign(peer_src_ptrs, peer_src_ptrs + num_pages_);
+  total_bytes_ = num_pages_ * page_size_ * token_stride_;
+}
+
+void P2PKvRestorePlan::execute(void* k_dst, void* v_dst,
+                               std::size_t source_layer_offset_bytes,
                                Stream* stream) const {
   if (num_pages_ == 0) return;  // valid no-op plan
-  auto* k = static_cast<std::uint8_t*>(k_dst_);
-  auto* v = static_cast<std::uint8_t*>(v_dst_);
+  VK_EXPECTS(k_dst != nullptr, "k_dst must be non-null");
+  VK_EXPECTS(v_dst != nullptr, "v_dst must be non-null");
+  auto* k = static_cast<std::uint8_t*>(k_dst);
+  auto* v = static_cast<std::uint8_t*>(v_dst);
   const std::size_t slot_bytes = slot_bytes_;
   const std::size_t token_stride = token_stride_;
   const std::size_t page_size = page_size_;

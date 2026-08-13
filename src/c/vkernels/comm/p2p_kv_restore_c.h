@@ -82,20 +82,29 @@ vkernels_status_t vkernels_p2p_kv_scatter(
 // uploads the page descriptors (and, for the host-input variant, the slot
 // map) to a persistent per-device buffer; execute_offset() only launches ONE
 // page-by-token-group kernel, adding `source_layer_offset_bytes` to every
-// peer page base. Reuse one plan across all model layers (40 for
-// Qwen3-14B) with no per-layer allocation or H2D copy.
+// peer page base. The (k_dst, v_dst) destination is supplied at every
+// execute_offset(), so one plan fans one run list out into a distinct K/V
+// layer buffer per layer (the KVAAS restore pattern). Reuse one plan across
+// all model layers (40 for Qwen3-14B) with no per-layer allocation or H2D
+// copy.
 //
-// Two create entry points:
-//  * vkernels_p2p_kv_restore_plan_create: `slot_ids` is a HOST array. The
-//    plan validates uniqueness, non-negativity and bounds (slot < num_slots)
-//    once and copies the slot map to the device.
+// Three create entry points:
+//  * vkernels_p2p_kv_restore_plan_create: `slot_ids` is a HOST int32 array.
+//    The plan validates uniqueness, non-negativity and bounds
+//    (slot < num_slots) once and copies the slot map to the device.
 //  * vkernels_p2p_kv_restore_plan_create_device_slots: `slot_ids` is a
-//    caller-owned CUDA DEVICE pointer (e.g. SGLang's radix-tree
+//    caller-owned CUDA int32 DEVICE pointer (e.g. SGLang's radix-tree
 //    `device_indices`). The plan does NOT copy it and does NOT validate its
 //    contents (reading device memory to validate would force a D2H sync).
 //    The caller MUST guarantee unique, non-negative, in-range slots and MUST
 //    keep `slot_ids` alive until the plan is destroyed and every stream it
 //    was executed on has completed.
+//  * vkernels_p2p_kv_restore_plan_create_device_slots_int64: `slot_ids` is a
+//    caller-owned CUDA int64 DEVICE pointer (SGLang's indices are
+//    torch.int64). The plan runs a one-time int64->int32 conversion kernel
+//    and owns the int32 result (no D2H sync); the caller may free the int64
+//    buffer as soon as the create call returns. Slot contents are NOT
+//    validated (same as the int32 device-slot create).
 //
 // On success the create functions return a non-NULL handle and set
 // *status_out to VKERNELS_OK; on a contract violation or device failure they
@@ -105,16 +114,23 @@ vkernels_status_t vkernels_p2p_kv_scatter(
 typedef struct vkernels_p2p_kv_restore_plan vkernels_p2p_kv_restore_plan_t;
 
 vkernels_p2p_kv_restore_plan_t* vkernels_p2p_kv_restore_plan_create(
-    void* k_dst, void* v_dst, size_t num_slots,
+    size_t num_slots,
     size_t num_kv_heads, size_t head_dim, size_t elem_size,
     const int* slot_ids, const void* const* peer_src_ptrs,
     size_t num_pages, size_t page_size,
     vkernels_status_t* status_out);
 
 vkernels_p2p_kv_restore_plan_t* vkernels_p2p_kv_restore_plan_create_device_slots(
-    void* k_dst, void* v_dst, size_t num_slots,
+    size_t num_slots,
     size_t num_kv_heads, size_t head_dim, size_t elem_size,
     const int* device_indices, const void* const* peer_src_ptrs,
+    size_t num_pages, size_t page_size,
+    vkernels_status_t* status_out);
+
+vkernels_p2p_kv_restore_plan_t* vkernels_p2p_kv_restore_plan_create_device_slots_int64(
+    size_t num_slots,
+    size_t num_kv_heads, size_t head_dim, size_t elem_size,
+    const int64_t* device_indices, const void* const* peer_src_ptrs,
     size_t num_pages, size_t page_size,
     vkernels_status_t* status_out);
 
@@ -122,8 +138,8 @@ void vkernels_p2p_kv_restore_plan_destroy(
     vkernels_p2p_kv_restore_plan_t* plan);
 
 vkernels_status_t vkernels_p2p_kv_restore_plan_execute_offset(
-    vkernels_p2p_kv_restore_plan_t* plan, size_t source_layer_offset_bytes,
-    cudaStream_t stream);
+    vkernels_p2p_kv_restore_plan_t* plan, void* k_dst, void* v_dst,
+    size_t source_layer_offset_bytes, cudaStream_t stream);
 
 #endif  // VKERNELS_C_HAS_CUDA
 

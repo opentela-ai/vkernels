@@ -75,8 +75,11 @@ void kv_scatter(void* k_dst, void* v_dst, const void* scratch,
 // constructor also uploads the page descriptors — and, for the host-input
 // variant, the slot map — to a persistent per-device buffer with a
 // synchronous cudaMemcpy (one-time cost, no stream association so concurrent
-// execute() on arbitrary streams is race-free). execute() launches ONE
-// page-by-token-group kernel that adds `source_layer_offset_bytes` to every
+// execute() on arbitrary streams is race-free). The int64 device-slot
+// variant additionally runs a one-time int64->int32 conversion kernel (no
+// D2H sync) and owns the int32 result. execute(k_dst, v_dst,
+// source_layer_offset_bytes, stream) supplies the per-layer destination and
+// launches ONE page-by-token-group kernel that adds the offset to every
 // peer page base before reading, so the same plan is reused across all model
 // layers with zero per-layer allocation or H2D copy.
 //
@@ -89,22 +92,27 @@ void kv_scatter(void* k_dst, void* v_dst, const void* scratch,
 // 65535; for the KVAAS page counts (<=192) this is never reached.
 //
 // Lifetime: the plan owns the device descriptor buffer (and, for the
-// host-input variant, the device slot map); destroy the plan only after
-// every stream it was executed on has been synchronised. For the device-slot
-// variant the caller's `device_indices` buffer must outlive the plan for the
-// same reason. Read-only after construction, so concurrent execute() on
-// several streams is safe.
+// host-input and int64 variants, the device slot map); destroy the plan only
+// after every stream it was executed on has been synchronised. For the int32
+// device-slot variant the caller's `device_indices` buffer must outlive the
+// plan for the same reason (the int64 variant owns its copy and imposes no
+// such constraint). Read-only after construction, so concurrent execute() on
+// several streams is safe (each call supplies its own destination).
 class P2PKvRestorePlan {
  public:
-  P2PKvRestorePlan(void* k_dst, void* v_dst, std::size_t num_slots,
+  P2PKvRestorePlan(std::size_t num_slots, std::size_t num_kv_heads,
+                   std::size_t head_dim, std::size_t elem_size,
+                   const int* slot_ids, const void* const* peer_src_ptrs,
+                   std::size_t num_pages, std::size_t page_size);
+  P2PKvRestorePlan(vkernels::comm::from_device_slots_t, std::size_t num_slots,
                    std::size_t num_kv_heads, std::size_t head_dim,
-                   std::size_t elem_size, const int* slot_ids,
+                   std::size_t elem_size, const int* device_indices,
                    const void* const* peer_src_ptrs, std::size_t num_pages,
                    std::size_t page_size);
-  P2PKvRestorePlan(vkernels::comm::from_device_slots_t, void* k_dst, void* v_dst,
+  P2PKvRestorePlan(vkernels::comm::from_device_slots_int64_t,
                    std::size_t num_slots, std::size_t num_kv_heads,
                    std::size_t head_dim, std::size_t elem_size,
-                   const int* device_indices,
+                   const std::int64_t* device_indices,
                    const void* const* peer_src_ptrs, std::size_t num_pages,
                    std::size_t page_size);
   ~P2PKvRestorePlan();
@@ -119,23 +127,32 @@ class P2PKvRestorePlan {
   std::size_t page_size() const;
   std::size_t total_bytes() const;
 
-  // Enqueue the fused restore for one layer, adding `source_layer_offset_bytes`
-  // to every peer page base. One kernel launch; no validation, allocation or
-  // H2D copy. When the offset is not a multiple of 16 the kernel falls back
-  // to the scalar (one-byte) path, sized to the full slot width.
-  void execute(std::size_t source_layer_offset_bytes,
+  // Enqueue the fused restore for one layer into (k_dst, v_dst), adding
+  // `source_layer_offset_bytes` to every peer page base. One kernel launch;
+  // no metadata validation, allocation or H2D copy (a single
+  // null-destination guard is the only execute-time check). When the offset
+  // is not a multiple of 16 the kernel falls back to the scalar (one-byte)
+  // path, sized to the full slot width.
+  void execute(void* k_dst, void* v_dst,
+               std::size_t source_layer_offset_bytes,
                cudaStream_t_kv stream) const;
 
  private:
+  // How the plan obtains its device-side int32 slot map.
+  enum class SlotSource {
+    HostValidated,       // validate contents + H2D-copy owned int32 slot map
+    DeviceInt32Borrowed, // borrow caller's int32 device pointer, no validation
+    DeviceInt64Converted // own int32 buffer filled by an int64->int32 kernel
+  };
   struct Impl;
-  // Shared construction body (see p2p_kv_restore.cu). Validating form
-  // checks slot uniqueness/bounds and owns a device copy; non-validating
-  // form borrows the caller's device pointer. A member so it may name the
-  // private Impl type.
-  template <bool ValidateSlots>
-  Impl* init(void* k_dst, void* v_dst, std::size_t num_slots,
+  // Shared construction body (see p2p_kv_restore.cu). The slot source
+  // selects validation and whether an owned device slot map is allocated
+  // (HostValidated via H2D copy, DeviceInt64Converted via a kernel) or the
+  // caller's pointer is borrowed (DeviceInt32Borrowed). A member so it may
+  // name the private Impl type.
+  Impl* init(SlotSource mode, std::size_t num_slots,
              std::size_t num_kv_heads, std::size_t head_dim,
-             std::size_t elem_size, const int* slot_ids,
+             std::size_t elem_size, const void* slot_ids,
              const void* const* peer_src_ptrs, std::size_t num_pages,
              std::size_t page_size);
   Impl* impl_;

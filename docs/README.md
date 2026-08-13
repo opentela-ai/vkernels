@@ -274,12 +274,23 @@ Fuses peer gather + indexed scatter into one kernel:
 
 **Prepared plan (issue #27)** — `P2PKvRestorePlan` (host + CUDA) and the C
 ABI `vkernels_p2p_kv_restore_plan_t` validate the slot map and upload the
-page descriptors ONCE; `execute(source_layer_offset_bytes, stream)` then
-launches a single page-by-token-group kernel, reusing one plan across all
-40 model layers with no per-layer allocation or H2D copy. A
-`from_device_slots` constructor variant borrows a caller-owned device slot
-pointer (e.g. SGLang's radix-tree `device_indices`) to avoid a D2H sync at
-construction.
+page descriptors ONCE; `execute(k_dst, v_dst, source_layer_offset_bytes,
+stream)` then launches a single page-by-token-group kernel. The destination
+is taken per call because KVAAS/SGLang keep a distinct K/V pair per model
+layer — one plan fans one run list out across all 40 layers with no
+per-layer allocation or H2D copy. Three creation modes:
+
+- Host `slot_ids` (`const int*`): validated at create, owned copy uploaded.
+- `from_device_slots` (`const int*`, e.g. SGLang's `device_indices`):
+  borrows the device pointer, no D2H sync, no content validation.
+- `from_device_slots_int64` (`const int64_t*`): SGLang's `torch.int64`
+  indices; converted at create (device-side on CUDA, no sync) into an owned
+  int32 buffer so the caller may free the int64 buffer immediately.
+
+The C ABI mirrors all three (`vkernels_p2p_kv_restore_plan_create`,
+`..._create_device_slots`, `..._create_device_slots_int64`) plus
+`vkernels_p2p_kv_restore_plan_execute_offset(plan, k_dst, v_dst, offset,
+stream)`.
 
 ### Compute/communication overlap
 

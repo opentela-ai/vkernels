@@ -226,6 +226,29 @@ void launch_scatter_kernel(unsigned char* k_dst, unsigned char* v_dst,
 // Grid-axis limit (matches the gather kernels).
 constexpr unsigned kPlanMaxGridAxis = 65535u;
 
+// One-time int64 -> int32 device conversion (issue #27). The int64
+// device-slot plan owns its int32 slot map and fills it with this kernel so
+// no D2H sync is needed; the caller may free the int64 buffer as soon as the
+// constructor returns (the subsequent blocking cudaMemcpy for the page
+// descriptors serialises after this launch on the default stream).
+__global__ void convert_slots_i64_to_i32_kernel(
+    const long long* __restrict__ src, int* __restrict__ dst, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = static_cast<int>(src[i]);
+}
+
+void launch_convert_i64(const long long* src, int* dst, int n) {
+  if (n <= 0) return;
+  dim3 block(256);
+  unsigned long long grids =
+      (static_cast<unsigned long long>(n) + 255ULL) / 256ULL;
+  if (grids > kPlanMaxGridAxis) grids = kPlanMaxGridAxis;
+  dim3 grid(static_cast<unsigned>(grids));
+  convert_slots_i64_to_i32_kernel<<<grid, block>>>(src, dst, n);
+  cudaError_t err = cudaGetLastError();
+  VK_ENSURES(err == cudaSuccess, "cuda int64->int32 slot conversion launch failed");
+}
+
 // Plan restore kernel (issue #27). One block per (page, token-group) pair:
 // grid.x tiles each page's unit range, grid.y = num_pages, blockDim = 256.
 // A unit is one chunk of K plus one chunk of V for one token:
@@ -471,8 +494,6 @@ void kv_scatter(void* k_dst, void* v_dst, const void* scratch,
 // ---------------------------------------------------------------------------
 
 struct P2PKvRestorePlan::Impl {
-  unsigned char* k_dst;
-  unsigned char* v_dst;
   int num_pages;
   int page_size;
   int slot_bytes;
@@ -484,28 +505,25 @@ struct P2PKvRestorePlan::Impl {
   std::size_t total_bytes;
   PagePlanDev* d_pages;      // persistent [num_pages] descriptor buffer
   const int* slot_ids;       // device pointer: owned or borrowed
-  bool owns_slot_ids;        // true for host-input; false for device-slots
+  bool owns_slot_ids;        // true for host-input and int64; false for int32 borrow
 
-  Impl() : k_dst(nullptr), v_dst(nullptr), num_pages(0), page_size(0),
-           slot_bytes(0), token_stride(0), num_slots(0), num_kv_heads(0),
-           head_dim(0), elem_size(0), total_bytes(0),
-           d_pages(nullptr), slot_ids(nullptr), owns_slot_ids(false) {}
+  Impl() : num_pages(0), page_size(0), slot_bytes(0), token_stride(0),
+           num_slots(0), num_kv_heads(0), head_dim(0), elem_size(0),
+           total_bytes(0), d_pages(nullptr), slot_ids(nullptr),
+           owns_slot_ids(false) {}
 };
 
 // Shared constructor body: validate metadata shape, resolve peer bases,
-// allocate the persistent descriptor buffer and (for host-input) the device
-// slot map. The synchronous cudaMalloc/cudaMemcpy use stream 0 so the
+// allocate the persistent descriptor buffer and (for host-input / int64) the
+// device slot map. The synchronous cudaMalloc/cudaMemcpy use stream 0 so the
 // persistent buffers are not bound to any one stream and concurrent
 // execute() on arbitrary streams is race-free (CUDA default stream is
 // synchronising with respect to per-thread streams).
-template <bool ValidateSlots>
 P2PKvRestorePlan::Impl* P2PKvRestorePlan::init(
-    void* k_dst, void* v_dst, std::size_t num_slots,
-    std::size_t num_kv_heads, std::size_t head_dim, std::size_t elem_size,
-    const int* slot_ids, const void* const* peer_src_ptrs,
-    std::size_t num_pages, std::size_t page_size) {
-  VK_EXPECTS(num_pages == 0 || k_dst != nullptr, "k_dst must be non-null");
-  VK_EXPECTS(num_pages == 0 || v_dst != nullptr, "v_dst must be non-null");
+    SlotSource mode, std::size_t num_slots, std::size_t num_kv_heads,
+    std::size_t head_dim, std::size_t elem_size, const void* slot_ids,
+    const void* const* peer_src_ptrs, std::size_t num_pages,
+    std::size_t page_size) {
   VK_EXPECTS(num_pages == 0 || num_slots > 0, "num_slots must be positive");
   VK_EXPECTS(num_pages == 0 || page_size > 0, "page_size must be positive");
   VK_EXPECTS(num_pages == 0 || num_kv_heads > 0, "num_kv_heads must be positive");
@@ -516,8 +534,6 @@ P2PKvRestorePlan::Impl* P2PKvRestorePlan::init(
              "peer_src_ptrs must be non-null");
 
   auto* impl = new Impl();
-  impl->k_dst = static_cast<unsigned char*>(k_dst);
-  impl->v_dst = static_cast<unsigned char*>(v_dst);
   impl->num_pages = static_cast<int>(num_pages);
   impl->page_size = static_cast<int>(page_size);
   impl->slot_bytes = static_cast<int>(num_kv_heads * head_dim * elem_size);
@@ -531,11 +547,12 @@ P2PKvRestorePlan::Impl* P2PKvRestorePlan::init(
   if (num_pages == 0) return impl;
 
   const std::size_t total_tokens = num_pages * page_size;
-  if (ValidateSlots) {
+  if (mode == SlotSource::HostValidated) {
+    const int* host_slots = static_cast<const int*>(slot_ids);
     std::unordered_set<int> seen;
     seen.reserve(total_tokens);
     for (std::size_t i = 0; i < total_tokens; ++i) {
-      int slot = slot_ids[i];
+      int slot = host_slots[i];
       VK_EXPECTS(slot >= 0, "slot_ids must be non-negative");
       VK_EXPECTS(slot < static_cast<int>(num_slots),
                  "slot_ids must be < num_slots");
@@ -551,20 +568,31 @@ P2PKvRestorePlan::Impl* P2PKvRestorePlan::init(
     pages[p].src = static_cast<const unsigned char*>(peer_src_ptrs[p]);
   }
 
-  // Device slot map: owned for host-input, borrowed for device-slots.
+  // Device slot map: owned for host-input (H2D copy) and int64 (conversion
+  // kernel), borrowed for int32 device-slots.
   const int* d_slot_ids = nullptr;
   int* owned = nullptr;
-  if (ValidateSlots) {
-    cudaError_t err =
-        cudaMalloc(&owned, total_tokens * sizeof(int));
+  if (mode == SlotSource::HostValidated) {
+    cudaError_t err = cudaMalloc(&owned, total_tokens * sizeof(int));
     VK_ENSURES(err == cudaSuccess, "cudaMalloc for plan slot_ids failed");
     err = cudaMemcpy(owned, slot_ids, total_tokens * sizeof(int),
                      cudaMemcpyHostToDevice);
     VK_ENSURES(err == cudaSuccess, "cudaMemcpy for plan slot_ids failed");
     d_slot_ids = owned;
     impl->owns_slot_ids = true;
-  } else {
-    d_slot_ids = slot_ids;  // caller's device pointer
+  } else if (mode == SlotSource::DeviceInt64Converted) {
+    cudaError_t err = cudaMalloc(&owned, total_tokens * sizeof(int));
+    VK_ENSURES(err == cudaSuccess, "cudaMalloc for plan slot_ids failed");
+    // Convert the caller's int64 device buffer in-place to an owned int32
+    // buffer. Launched on the default stream; the blocking cudaMemcpy for
+    // the page descriptors below serialises after it, so the caller may free
+    // the int64 buffer as soon as the constructor returns.
+    launch_convert_i64(static_cast<const long long*>(slot_ids), owned,
+                       static_cast<int>(total_tokens));
+    d_slot_ids = owned;
+    impl->owns_slot_ids = true;
+  } else {  // DeviceInt32Borrowed
+    d_slot_ids = static_cast<const int*>(slot_ids);  // caller's device pointer
     impl->owns_slot_ids = false;
   }
   impl->slot_ids = d_slot_ids;
@@ -583,20 +611,18 @@ P2PKvRestorePlan::Impl* P2PKvRestorePlan::init(
   return impl;
 }
 
-P2PKvRestorePlan::P2PKvRestorePlan(void* k_dst, void* v_dst,
-                                   std::size_t num_slots,
+P2PKvRestorePlan::P2PKvRestorePlan(std::size_t num_slots,
                                    std::size_t num_kv_heads,
                                    std::size_t head_dim, std::size_t elem_size,
                                    const int* slot_ids,
                                    const void* const* peer_src_ptrs,
                                    std::size_t num_pages,
                                    std::size_t page_size)
-    : impl_(init<true>(k_dst, v_dst, num_slots, num_kv_heads, head_dim,
-                       elem_size, slot_ids, peer_src_ptrs, num_pages,
-                       page_size)) {}
+    : impl_(init(SlotSource::HostValidated, num_slots, num_kv_heads,
+                 head_dim, elem_size, slot_ids, peer_src_ptrs, num_pages,
+                 page_size)) {}
 
 P2PKvRestorePlan::P2PKvRestorePlan(vkernels::comm::from_device_slots_t,
-                                   void* k_dst, void* v_dst,
                                    std::size_t num_slots,
                                    std::size_t num_kv_heads,
                                    std::size_t head_dim, std::size_t elem_size,
@@ -604,9 +630,21 @@ P2PKvRestorePlan::P2PKvRestorePlan(vkernels::comm::from_device_slots_t,
                                    const void* const* peer_src_ptrs,
                                    std::size_t num_pages,
                                    std::size_t page_size)
-    : impl_(init<false>(k_dst, v_dst, num_slots, num_kv_heads, head_dim,
-                        elem_size, device_indices, peer_src_ptrs, num_pages,
-                        page_size)) {}
+    : impl_(init(SlotSource::DeviceInt32Borrowed, num_slots, num_kv_heads,
+                 head_dim, elem_size, device_indices, peer_src_ptrs, num_pages,
+                 page_size)) {}
+
+P2PKvRestorePlan::P2PKvRestorePlan(vkernels::comm::from_device_slots_int64_t,
+                                   std::size_t num_slots,
+                                   std::size_t num_kv_heads,
+                                   std::size_t head_dim, std::size_t elem_size,
+                                   const std::int64_t* device_indices,
+                                   const void* const* peer_src_ptrs,
+                                   std::size_t num_pages,
+                                   std::size_t page_size)
+    : impl_(init(SlotSource::DeviceInt64Converted, num_slots, num_kv_heads,
+                 head_dim, elem_size, device_indices, peer_src_ptrs, num_pages,
+                 page_size)) {}
 
 P2PKvRestorePlan::~P2PKvRestorePlan() {
   if (!impl_) return;
@@ -624,10 +662,14 @@ std::size_t P2PKvRestorePlan::num_slots() const { return impl_->num_slots; }
 std::size_t P2PKvRestorePlan::page_size() const { return impl_->page_size; }
 std::size_t P2PKvRestorePlan::total_bytes() const { return impl_->total_bytes; }
 
-void P2PKvRestorePlan::execute(std::size_t source_layer_offset_bytes,
+void P2PKvRestorePlan::execute(void* k_dst, void* v_dst,
+                               std::size_t source_layer_offset_bytes,
                                cudaStream_t stream) const {
   if (impl_->num_pages == 0) return;
-  launch_plan_kernel(impl_->k_dst, impl_->v_dst, impl_->d_pages,
+  VK_EXPECTS(k_dst != nullptr, "k_dst must be non-null");
+  VK_EXPECTS(v_dst != nullptr, "v_dst must be non-null");
+  launch_plan_kernel(static_cast<unsigned char*>(k_dst),
+                     static_cast<unsigned char*>(v_dst), impl_->d_pages,
                      impl_->num_pages, impl_->page_size, impl_->slot_bytes,
                      impl_->token_stride,
                      static_cast<unsigned long long>(source_layer_offset_bytes),
