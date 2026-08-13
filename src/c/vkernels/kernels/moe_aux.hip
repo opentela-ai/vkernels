@@ -17,6 +17,7 @@
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
 #  include "vkernels/kernels/moe_device.hip"
+#  include "vkernels/util/error.hpp"
 
 namespace vkernels::kernels::hip {
 
@@ -30,22 +31,13 @@ __device__ __forceinline__ float bf16_to_f32(uint16_t b) {
   return f;
 }
 
-// E2M1 nibble → float32 (identical to fp4_nibble_to_float in moe.cpp).
+// E2M1 nibble → float32, via the shared bit-pattern decode in moe_device.hip
+// (identical to fp4_nibble_to_float in moe.cpp: 0/±0.25/±1.0/±1.5/±2.0/±3.0/±inf/NaN).
 __device__ __forceinline__ float fp4_nib_to_f32(uint8_t n) {
-  int s = (n >> 3) & 1;
-  int e = (n >> 1) & 3;
-  int m = n & 1;
-  if (e == 0) {
-    if (m == 0) return s ? -0.0f : 0.0f;
-    return s ? -0.25f : 0.25f;
-  }
-  if (e == 3) {
-    if (m == 0) return s ? -__builtin_amdgcn_inf_f32() : __builtin_amdgcn_inf_f32();
-    return __builtin_amdgcn_nan_f32();
-  }
-  float v = (1.0f + static_cast<float>(m) * 0.5f) *
-            static_cast<float>(1 << (e - 1));
-  return s ? -v : v;
+  uint32_t bits = fp4nib_to_f32bits(n);
+  float f;
+  __builtin_memcpy(&f, &bits, sizeof(f));
+  return f;
 }
 
 // Inverse of fp4_nib_to_f32 for |v| ≤ FP4_MAX (= 3.0).  Ties round to the
@@ -114,6 +106,9 @@ __global__ void mxfp4_moe_quant_kernel(
   // the 0xFF (zero) scale and zero nibbles for the whole group. For a real
   // amax the scale byte is clamped to [1, 254] (never 0) so the emitted
   // scale is a normal power of two that decodes identically via `s << 23`.
+  // Every thread computes the same (sb, scale) from the shared amax.
+  uint8_t sb;
+  float scale;
   if (!(s_amax > 0.0f) || !__builtin_isfinite(s_amax)) {
     sb = 0xFF;
     scale = 0.0f;
@@ -222,9 +217,6 @@ __global__ void moe_scatter_reduce_q_kernel(
 namespace vkernels::kernels::hip {
 
 namespace {
-void check(hipError_t e) {
-  if (e != hipSuccess) throw std::runtime_error("hip error in moe_aux");
-}
 int block_of(int n) { return n < 1024 ? (n > 0 ? n : 1) : 1024; }
 }  // namespace
 
@@ -232,31 +224,36 @@ void mxfp4_moe_quant(const uint16_t* A, uint8_t* packed, uint8_t* scales,
                      int M, int hidden, int group_size) {
   int n_groups = hidden / group_size;
   int gs = group_size < 256 ? group_size : 256;
-  check(hipLaunchKernelGGL(mxfp4_moe_quant_kernel,
-                           dim3(M * n_groups), dim3(gs), 0, 0,
-                           A, packed, scales, hidden, n_groups, group_size));
+  mxfp4_moe_quant_kernel<<<dim3(M * n_groups), dim3(gs)>>>(
+      A, packed, scales, hidden, n_groups, group_size);
+  hipError_t err = hipGetLastError();
+  VK_ENSURES(err == hipSuccess, "mxfp4_moe_quant launch failed");
 }
 
 void mxfp4_moe_sort(const uint16_t* A, const int32_t* sorted_ids,
                     uint16_t* A_sorted, int M, int hidden, int top_k, int EM) {
-  check(hipLaunchKernelGGL(moe_sort_kernel, dim3(EM), dim3(block_of(hidden)),
-                           0, 0, A, sorted_ids, A_sorted, hidden, M, top_k, 2));
+  moe_sort_kernel<<<dim3(EM), dim3(block_of(hidden))>>>(
+      A, sorted_ids, A_sorted, hidden, M, top_k, 2);
+  hipError_t err = hipGetLastError();
+  VK_ENSURES(err == hipSuccess, "mxfp4_moe_sort launch failed");
 }
 
 void mxfp4_moe_sort_scales(const uint8_t* scales, const int32_t* sorted_ids,
                            uint8_t* scales_sorted, int M, int n_groups,
                            int top_k, int EM) {
-  check(hipLaunchKernelGGL(moe_sort_kernel, dim3(EM), dim3(block_of(n_groups)),
-                           0, 0, scales, sorted_ids, scales_sorted,
-                           n_groups, M, top_k, 1));
+  moe_sort_kernel<<<dim3(EM), dim3(block_of(n_groups))>>>(
+      scales, sorted_ids, scales_sorted, n_groups, M, top_k, 1);
+  hipError_t err = hipGetLastError();
+  VK_ENSURES(err == hipSuccess, "mxfp4_moe_sort_scales launch failed");
 }
 
 void mxfp4_moe_scatter_reduce(const float* partial, const float* topk_w,
                               const int32_t* sorted_ids, float* out,
                               int M, int width, int top_k, int EM) {
-  check(hipLaunchKernelGGL(moe_scatter_reduce_kernel, dim3(EM),
-                           dim3(block_of(width)), 0, 0,
-                           partial, topk_w, sorted_ids, out, width, M, top_k));
+  moe_scatter_reduce_kernel<<<dim3(EM), dim3(block_of(width))>>>(
+      partial, topk_w, sorted_ids, out, width, M, top_k);
+  hipError_t err = hipGetLastError();
+  VK_ENSURES(err == hipSuccess, "mxfp4_moe_scatter_reduce launch failed");
 }
 
 void mxfp4_moe_scatter_reduce_q(const uint8_t* partial_q,
@@ -266,10 +263,11 @@ void mxfp4_moe_scatter_reduce_q(const uint8_t* partial_q,
                                 int M, int width, int top_k, int EM,
                                 int group_size) {
   int n_groups = width / group_size;
-  check(hipLaunchKernelGGL(moe_scatter_reduce_q_kernel, dim3(EM),
-                           dim3(block_of(width)), 0, 0,
-                           partial_q, partial_s, topk_w, sorted_ids, out,
-                           width, M, top_k, n_groups, group_size));
+  moe_scatter_reduce_q_kernel<<<dim3(EM), dim3(block_of(width))>>>(
+      partial_q, partial_s, topk_w, sorted_ids, out, width, M, top_k,
+      n_groups, group_size);
+  hipError_t err = hipGetLastError();
+  VK_ENSURES(err == hipSuccess, "mxfp4_moe_scatter_reduce_q launch failed");
 }
 
 }  // namespace vkernels::kernels::hip
