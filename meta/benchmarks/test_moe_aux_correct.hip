@@ -7,9 +7,16 @@
 // The five ops are pure data-movement / integer-quantization primitives
 // (no floating accumulation across blocks), so the quant and two sort ops
 // are checked bit-exact. The two scatter-reduce ops accumulate into each
-// output token with atomicAdd (top_k > 1 → several sorted rows land on one
-// token), so the reduction order can differ host vs device; those are
-// checked with a small relative tolerance.
+// output token with atomicAdd (top_k > 1 -> several sorted rows land on
+// one token), so the reduction order can differ host vs device; those are
+// checked with a small relative tolerance. With top_k=2 the sum has only
+// two addends per token so float addition is commutative and the result is
+// bit-exact; the K3 config (top_k=16) has sixteen addends per token and so
+// genuinely exercises the 1e-5 tolerance.
+//
+// Two configs are run:
+//   small : M=8   hidden=256  top_k=2  E=4   (fast, bit-exact scatter)
+//   K3    : M=112 hidden=7168 top_k=16 E=64  (the issue's K3 shape)
 //
 // Build (inside the vkernels:hip-full container on an MI300A node):
 //   cmake --preset hip -B build-hip -DVKERNELS_BUILD_BENCHMARKS=ON
@@ -142,41 +149,44 @@ void check_float(const char* name, const float* cpu, const float* gpu,
   }
 }
 
-}  // namespace
+// Run the full quant -> sort -> sort_scales -> scatter_reduce[_q] pipeline
+// for one (M, hidden, top_k, E, BLOCK_M, group_size) shape and compare the
+// HIP kernels against the CPU oracle. Returns 0 on success, 1 on failure.
+int run_one(const char* label, int M, int hidden, int top_k, int E,
+            int BLOCK_M, int group_size) {
+  std::printf("\n=== %s: M=%d hidden=%d top_k=%d E=%d gs=%d ===\n",
+              label, M, hidden, top_k, E, group_size);
 
-int main() {
-  hipDeviceProp_t p;
-  CK(hipGetDeviceProperties(&p, 0), "props");
-  std::printf("GPU: %s (%s)\n", p.name, p.gcnArchName);
-
-  // Small-but-nontrivial config: multiple M/N blocks, padding rows, and
-  // multi-expert routing (top_k=2, each token to 2 distinct experts).
-  constexpr int M = 8, hidden = 256, ispp = 128, top_k = 2;
-  constexpr int E = 4, BLOCK_M = 16, group_size = 32;
-  static_assert(hidden % group_size == 0, "hidden must divide group_size");
+  // Safe upper bound on EM: each expert's assignments are padded up to a
+  // multiple of BLOCK_M, so EM <= M*top_k + E*(BLOCK_M-1) < M*top_k + E*BLOCK_M.
+  const int EM_max = M * top_k + E * BLOCK_M;
   const int n_groups = hidden / group_size;
   const int N = M * top_k;
-  const int EM_max = E * BLOCK_M;  // every expert padded to its own block
 
   // --- Host inputs ---
   std::vector<uint16_t> hA(M * hidden);
   for (int i = 0; i < M * hidden; ++i) hA[i] = f2bf(rnd(1, i) * 0.1f);
 
+  // Route each token to top_k distinct experts (deterministic pattern that
+  // spreads load while keeping >=2 experts busy even for small M).
   std::vector<int32_t> h_topk_ids(M * top_k);
   std::vector<float> h_topk_w(M * top_k);
-  for (int i = 0; i < M; ++i) {
-    h_topk_ids[i * top_k + 0] = i % E;
-    h_topk_ids[i * top_k + 1] = (i + 1) % E;
-    h_topk_w[i * top_k + 0] = 0.7f;
-    h_topk_w[i * top_k + 1] = 0.3f;
-  }
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < top_k; ++j) {
+      h_topk_ids[i * top_k + j] = (i + j) % E;
+      h_topk_w[i * top_k + j] =
+          (j == 0) ? 0.7f : static_cast<float>(0.3 / (top_k - 1));
+    }
 
-  std::vector<int32_t> h_sids(EM_max), h_eids(EM_max / BLOCK_M);
+  std::vector<int32_t> h_sids(EM_max), h_eids(EM_max / BLOCK_M + 1);
   int EM = vkernels::kernels::moe_align_block_size(
       h_topk_ids.data(), M, top_k, BLOCK_M, E, h_sids.data(), h_eids.data());
-  std::printf("config: M=%d hidden=%d ispp=%d top_k=%d E=%d gs=%d "
-              "EM=%d (padded to %d-blocks)\n",
-              M, hidden, ispp, top_k, E, group_size, EM, EM_max);
+  std::printf("  EM=%d (bound EM_max=%d)\n", EM, EM_max);
+  if (EM > EM_max) {
+    std::fprintf(stderr, "  EM %d exceeds bound %d\n", EM, EM_max);
+    ++g_fail;
+    return 1;
+  }
 
   // Per-sorted-row routing weights: tws[r] = topk_w_flat[sorted_ids[r]].
   std::vector<float> h_tws(EM, 0.0f);
@@ -189,13 +199,13 @@ int main() {
                                      scales_c.data(), M, hidden, group_size);
 
   std::vector<uint16_t> A_sorted_c(EM * hidden, 0);
-  vkernels::kernels::mxfp4_moe_sort(hA.data(), h_sids.data(), A_sorted_c.data(),
-                                    M, hidden, top_k, EM);
+  vkernels::kernels::mxfp4_moe_sort(hA.data(), h_sids.data(),
+                                     A_sorted_c.data(), M, hidden, top_k, EM);
 
   std::vector<uint8_t> scales_sorted_c(EM * n_groups, 0);
-  vkernels::kernels::mxfp4_moe_sort_scales(scales_c.data(), h_sids.data(),
-                                           scales_sorted_c.data(), M,
-                                           n_groups, top_k, EM);
+  vkernels::kernels::mxfp4_moe_sort_scales(
+      scales_c.data(), h_sids.data(), scales_sorted_c.data(), M,
+      n_groups, top_k, EM);
 
   // fp32 partials in sorted order (stand-in for the grouped-GEMM output).
   std::vector<float> partial(EM * hidden);
@@ -207,7 +217,7 @@ int main() {
 
   // Quantized partial for _q: reuse mxfp4_moe_quant on the [EM, hidden]
   // fp32-as-bf16 partial. The _q op dequantizes inline, so its oracle is the
-  // CPU _q on the same (partial_q, partial_s) — not the fp32 scatter above.
+  // CPU _q on the same (partial_q, partial_s) -- not the fp32 scatter above.
   std::vector<uint16_t> partial_bf(EM * hidden);
   for (int i = 0; i < EM * hidden; ++i) partial_bf[i] = f2bf(partial[i]);
   std::vector<uint8_t> partial_q(EM * hidden / 2), partial_s(EM * n_groups);
@@ -223,28 +233,30 @@ int main() {
   uint8_t *dPacked, *dScales, *dScalesSorted, *dPq, *dPs;
   int32_t *dSids;
   float *dTw, *dOut, *dOut_q, *dPartial;
-  CK(hipMalloc(&dA, M * hidden * 2), "mA");
-  CK(hipMalloc(&dA_sorted, EM * hidden * 2), "mA_sorted");
-  CK(hipMalloc(&dPbf, EM * hidden * 2), "mPbf");
-  CK(hipMalloc(&dPacked, M * hidden / 2), "mPacked");
-  CK(hipMalloc(&dScales, M * n_groups), "mScales");
-  CK(hipMalloc(&dScalesSorted, EM * n_groups), "mScalesSorted");
-  CK(hipMalloc(&dPq, EM * hidden / 2), "mPq");
-  CK(hipMalloc(&dPs, EM * n_groups), "mPs");
-  CK(hipMalloc(&dSids, EM * 4), "mSids");
-  CK(hipMalloc(&dTw, EM * 4), "mTw");
-  CK(hipMalloc(&dOut, M * hidden * 4), "mOut");
-  CK(hipMalloc(&dOut_q, M * hidden * 4), "mOut_q");
-  CK(hipMalloc(&dPartial, EM * hidden * 4), "mPartial");
+  CK(hipMalloc(&dA, (size_t)M * hidden * 2), "mA");
+  CK(hipMalloc(&dA_sorted, (size_t)EM * hidden * 2), "mA_sorted");
+  CK(hipMalloc(&dPbf, (size_t)EM * hidden * 2), "mPbf");
+  CK(hipMalloc(&dPacked, (size_t)M * hidden / 2), "mPacked");
+  CK(hipMalloc(&dScales, (size_t)M * n_groups), "mScales");
+  CK(hipMalloc(&dScalesSorted, (size_t)EM * n_groups), "mScalesSorted");
+  CK(hipMalloc(&dPq, (size_t)EM * hidden / 2), "mPq");
+  CK(hipMalloc(&dPs, (size_t)EM * n_groups), "mPs");
+  CK(hipMalloc(&dSids, (size_t)EM * 4), "mSids");
+  CK(hipMalloc(&dTw, (size_t)EM * 4), "mTw");
+  CK(hipMalloc(&dOut, (size_t)M * hidden * 4), "mOut");
+  CK(hipMalloc(&dOut_q, (size_t)M * hidden * 4), "mOut_q");
+  CK(hipMalloc(&dPartial, (size_t)EM * hidden * 4), "mPartial");
 
-  CK(hipMemcpy(dA, hA.data(), M * hidden * 2, hipMemcpyHostToDevice), "cA");
-  CK(hipMemcpy(dPbf, partial_bf.data(), EM * hidden * 2, hipMemcpyHostToDevice), "cPbf");
-  CK(hipMemcpy(dSids, h_sids.data(), EM * 4, hipMemcpyHostToDevice), "cSids");
-  CK(hipMemcpy(dTw, h_tws.data(), EM * 4, hipMemcpyHostToDevice), "cTw");
-  CK(hipMemcpy(dPartial, partial.data(), EM * hidden * 4, hipMemcpyHostToDevice), "cPartial");
+  CK(hipMemcpy(dA, hA.data(), (size_t)M * hidden * 2, hipMemcpyHostToDevice), "cA");
+  CK(hipMemcpy(dPbf, partial_bf.data(), (size_t)EM * hidden * 2,
+               hipMemcpyHostToDevice), "cPbf");
+  CK(hipMemcpy(dSids, h_sids.data(), (size_t)EM * 4, hipMemcpyHostToDevice), "cSids");
+  CK(hipMemcpy(dTw, h_tws.data(), (size_t)EM * 4, hipMemcpyHostToDevice), "cTw");
+  CK(hipMemcpy(dPartial, partial.data(), (size_t)EM * hidden * 4,
+               hipMemcpyHostToDevice), "cPartial");
 
   // --- HIP kernels ---
-  std::printf("HIP vs CPU:\n");
+  std::printf("  HIP vs CPU:\n");
   using namespace vkernels::kernels::hip;
 
   mxfp4_moe_quant(dA, dPacked, dScales, M, hidden, group_size);
@@ -255,9 +267,9 @@ int main() {
   // would produce), feeding scatter_reduce_q.
   mxfp4_moe_quant(dPbf, dPq, dPs, EM, hidden, group_size);
 
-  CK(hipMemset(dOut, 0, M * hidden * 4), "zOut");
+  CK(hipMemset(dOut, 0, (size_t)M * hidden * 4), "zOut");
   mxfp4_moe_scatter_reduce(dPartial, dTw, dSids, dOut, M, hidden, top_k, EM);
-  CK(hipMemset(dOut_q, 0, M * hidden * 4), "zOut_q");
+  CK(hipMemset(dOut_q, 0, (size_t)M * hidden * 4), "zOut_q");
   mxfp4_moe_scatter_reduce_q(dPq, dPs, dTw, dSids, dOut_q, M, hidden, top_k,
                              EM, group_size);
   CK(hipDeviceSynchronize(), "sync");
@@ -268,41 +280,70 @@ int main() {
   std::vector<uint8_t> scales_sorted_g(EM * n_groups, 0);
   std::vector<uint8_t> pq_g(EM * hidden / 2), ps_g(EM * n_groups);
   std::vector<float> out_g(M * hidden), out_q_g(M * hidden);
-  CK(hipMemcpy(packed_g.data(), dPacked, M * hidden / 2, hipMemcpyDeviceToHost), "rPacked");
-  CK(hipMemcpy(scales_g.data(), dScales, M * n_groups, hipMemcpyDeviceToHost), "rScales");
-  CK(hipMemcpy(A_sorted_g.data(), dA_sorted, EM * hidden * 2, hipMemcpyDeviceToHost), "rA_sorted");
-  CK(hipMemcpy(scales_sorted_g.data(), dScalesSorted, EM * n_groups, hipMemcpyDeviceToHost), "rScalesSorted");
-  CK(hipMemcpy(pq_g.data(), dPq, EM * hidden / 2, hipMemcpyDeviceToHost), "rPq");
-  CK(hipMemcpy(ps_g.data(), dPs, EM * n_groups, hipMemcpyDeviceToHost), "rPs");
-  CK(hipMemcpy(out_g.data(), dOut, M * hidden * 4, hipMemcpyDeviceToHost), "rOut");
-  CK(hipMemcpy(out_q_g.data(), dOut_q, M * hidden * 4, hipMemcpyDeviceToHost), "rOut_q");
+  CK(hipMemcpy(packed_g.data(), dPacked, (size_t)M * hidden / 2,
+               hipMemcpyDeviceToHost), "rPacked");
+  CK(hipMemcpy(scales_g.data(), dScales, (size_t)M * n_groups,
+               hipMemcpyDeviceToHost), "rScales");
+  CK(hipMemcpy(A_sorted_g.data(), dA_sorted, (size_t)EM * hidden * 2,
+               hipMemcpyDeviceToHost), "rA_sorted");
+  CK(hipMemcpy(scales_sorted_g.data(), dScalesSorted, (size_t)EM * n_groups,
+               hipMemcpyDeviceToHost), "rScalesSorted");
+  CK(hipMemcpy(pq_g.data(), dPq, (size_t)EM * hidden / 2,
+               hipMemcpyDeviceToHost), "rPq");
+  CK(hipMemcpy(ps_g.data(), dPs, (size_t)EM * n_groups,
+               hipMemcpyDeviceToHost), "rPs");
+  CK(hipMemcpy(out_g.data(), dOut, (size_t)M * hidden * 4,
+               hipMemcpyDeviceToHost), "rOut");
+  CK(hipMemcpy(out_q_g.data(), dOut_q, (size_t)M * hidden * 4,
+               hipMemcpyDeviceToHost), "rOut_q");
 
   check_bits("mxfp4_moe_quant.packed", packed_c.data(), packed_g.data(),
-             M * hidden / 2);
+             (size_t)M * hidden / 2);
   check_bits("mxfp4_moe_quant.scales", scales_c.data(), scales_g.data(),
-             M * n_groups);
+             (size_t)M * n_groups);
   check_bits16("mxfp4_moe_sort", A_sorted_c.data(), A_sorted_g.data(),
-               (std::size_t)EM * hidden);
+               (size_t)EM * hidden);
   check_bits("mxfp4_moe_sort_scales", scales_sorted_c.data(),
-             scales_sorted_g.data(), (std::size_t)EM * n_groups);
+             scales_sorted_g.data(), (size_t)EM * n_groups);
   // The on-device re-quant of the bf16 partial must match the CPU quant of
   // the same bf16 partial (both feed scatter_reduce_q).
   check_bits("mxfp4_moe_quant(partial).packed", partial_q.data(), pq_g.data(),
-             EM * hidden / 2);
+             (size_t)EM * hidden / 2);
   check_bits("mxfp4_moe_quant(partial).scales", partial_s.data(), ps_g.data(),
-             EM * n_groups);
-  // Scatter-reduce uses atomicAdd → tolerant comparison.
+             (size_t)EM * n_groups);
+  // Scatter-reduce uses atomicAdd -> tolerant comparison (more addends with
+  // larger top_k -> more ordering sensitivity, still well within 1e-5).
   check_float("mxfp4_moe_scatter_reduce", out_c.data(), out_g.data(),
-              M * hidden, 1e-5);
+              (size_t)M * hidden, 1e-5);
   check_float("mxfp4_moe_scatter_reduce_q", out_q_c.data(), out_q_g.data(),
-              M * hidden, 1e-5);
+              (size_t)M * hidden, 1e-5);
 
   hipFree(dA); hipFree(dA_sorted); hipFree(dPbf);
   hipFree(dPacked); hipFree(dScales); hipFree(dScalesSorted);
   hipFree(dPq); hipFree(dPs); hipFree(dSids); hipFree(dTw);
   hipFree(dOut); hipFree(dOut_q); hipFree(dPartial);
 
-  std::printf("%s (%d passed, %d failed)\n",
+  return g_fail == 0 ? 0 : 1;
+}
+
+}  // namespace
+
+int main() {
+  hipDeviceProp_t p;
+  CK(hipGetDeviceProperties(&p, 0), "props");
+  std::printf("GPU: %s (%s)\n", p.name, p.gcnArchName);
+
+  // small: fast, bit-exact scatter (top_k=2 -> 2 addends, float commutes).
+  run_one("small", /*M=*/8, /*hidden=*/256, /*top_k=*/2, /*E=*/4,
+          /*BLOCK_M=*/16, /*group_size=*/32);
+
+  // K3: the issue's target shape (M=112, hidden=7168, top_k=16). top_k=16
+  // gives sixteen addends per output token, so atomicAdd order sensitivity
+  // is real and the 1e-5 tolerance is genuinely exercised.
+  run_one("K3", /*M=*/112, /*hidden=*/7168, /*top_k=*/16, /*E=*/64,
+          /*BLOCK_M=*/16, /*group_size=*/32);
+
+  std::printf("\n%s (%d passed, %d failed)\n",
               g_fail == 0 ? "ALL PASS" : "FAILURES", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }
