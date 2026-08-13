@@ -147,7 +147,7 @@ void check_float(const char* name, const float* cpu, const float* gpu,
 int main() {
   hipDeviceProp_t p;
   CK(hipGetDeviceProperties(&p, 0), "props");
-  std::printf("GPU: %s (gfx%d)\n", p.name, p.gcnRevision);
+  std::printf("GPU: %s (%s)\n", p.name, p.gcnArchName);
 
   // Small-but-nontrivial config: multiple M/N blocks, padding rows, and
   // multi-expert routing (top_k=2, each token to 2 distinct experts).
