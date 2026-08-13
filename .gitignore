@@ -63,4 +63,4 @@ venv/
 
 # build
 build_host
-dist/
+/dist/
