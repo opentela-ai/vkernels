@@ -283,3 +283,55 @@ scatter buffers were sized `E * BLOCK_M`, which is too small whenever an
 expert receives more than `BLOCK_M` assignments (K3 has `~28/expert`, giving
 `EM = 2032` against the old bound of `1024`). They are now sized to the safe
 upper bound `EM_max = M * top_k + E * BLOCK_M` with a runtime assert.
+
+---
+
+## Latency & bandwidth on gfx942 (MI300A)
+
+`meta/benchmarks/bench_moe_aux.hip` times all five ops at the K3 decode
+shape (`M ∈ {8, 32, 64, 112}`, `hidden=7168`, `top_k=16`, `E=64`,
+`group_size=32`) with `hipEvent` timing (warmup + median over 100 iters).
+
+Because the K3 problem (1–58 MB per op) fits comfortably in the MI300A's
+~256 MB L2, the **warm** timed iterations measure L2 bandwidth, not raw
+HBM. Two streaming-copy references bracket the roof:
+
+| reference | size | bandwidth |
+|---|---|---|
+| HBM copy (L2-bypassed, 4096 blocks) | 512 MB | 2868 GB/s |
+| L2 copy (K3-sized, 1024 blocks) | 28 MB | 3219 GB/s |
+
+K3 row (`M=112`, `EM=2048`), latency primary, effective GB/s secondary:
+
+| op | lat (µs) | GB/s | %L2 |
+|---|---|---|---|
+| `mxfp4_moe_quant` | 17.8 | 114 | 3.6% |
+| `mxfp4_moe_sort` | 24.4 | 2253 | 70.0% |
+| `mxfp4_moe_sort_scales` | 5.6 | 155 | 4.8% |
+| `mxfp4_moe_scatter_reduce` | 42.4 | 1461 | 45.4% |
+| `mxfp4_moe_scatter_reduce_q` | 43.7 | 252 | 7.8% |
+
+Interpretation:
+
+- **`mxfp4_moe_sort`** (69.9% L2) and **`mxfp4_moe_scatter_reduce`**
+  (45.4% L2) are the pure data-movement paths and approach the bandwidth
+  roof; the latter is held below by `atomicAdd` contention (16 sorted rows
+  per output token).
+- **`mxfp4_moe_quant`** and **`mxfp4_moe_scatter_reduce_q`** are
+  partially **compute-bound**: the per-element E2M1 round-trip (branchy
+  nibble quantize / dequantize + shared-memory amax reduction) dominates
+  over the small memory footprint, so GB/s is low despite fast latency.
+- **`mxfp4_moe_sort_scales`** (0.8 MB, 5.6 µs) is **launch-bound** — the
+  kernel runtime is dominated by dispatch overhead.
+
+All five ops complete in 6–44 µs at K3, a fraction of the fused-GEMM step
+they orchestrate (milliseconds), so they add negligible end-to-end latency
+while keeping the activation in the quantized layout for bandwidth
+reduction.
+
+```sh
+cmake --preset hip -DVKERNELS_BUILD_BENCHMARKS=ON
+cmake --build build/hip --target moe_aux_bench
+srun --partition=mi300 --ntasks=1 --cpus-per-task=16 \
+     ./build/hip/meta/benchmarks/moe_aux_bench
+```
