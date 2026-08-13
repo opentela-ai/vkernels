@@ -705,8 +705,11 @@ def mxfp4_moe_quant(A, M: int, hidden: int, group_size: int = 32):
     scale_val = scale_val.astype(np.float32)  # [M, n_groups]
 
     # Quantize each element: nibble = round(x / scale) to nearest E2M1.
+    # Zero-scale groups (0xFF) contribute 0; suppress the divide-by-zero /
+    # invalid-value warnings since np.where masks them anyway.
     sv = np.broadcast_to(scale_val[:, :, None], (M, n_groups, group_size))
-    q = np.where(sv > 0.0, xg / sv, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        q = np.where(sv > 0.0, xg / sv, 0.0)
     nibs = _float_to_fp4_nib_vec(q)  # [M, n_groups, group_size] uint8
     lo = nibs[:, :, 0::2] & 0x0F
     hi = nibs[:, :, 1::2] & 0x0F

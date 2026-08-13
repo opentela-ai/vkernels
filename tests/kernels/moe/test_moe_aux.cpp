@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "vkernels/kernels/moe_aux.hpp"
@@ -228,6 +229,25 @@ TEST(MoeAux, ScatterReduceQ) {
   // Since the partial values are fp4-representable, dequant is exact and the
   // two paths must agree bit-for-bit.
   for (size_t i = 0; i < out_q.size(); ++i) EXPECT_EQ(out_q[i], out_f[i]);
+}
+
+// --- #19q mxfp4_moe_scatter_reduce_q: inf/NaN nibble codes propagate ------
+// fp4 nibble codes 6=+inf, 7=NaN, 14=-inf, 15=NaN must pass through the
+// e==3 dequant branch (fp4_nibble_to_float in moe_aux.cpp) untouched.
+TEST(MoeAux, ScatterReduceQNanInf) {
+  constexpr int M = 1, width = 4, top_k = 1, EM = 1, gs = 4;
+  // packed bytes: low->high nibbles = 6,7,14,15 (inf,NaN,-inf,NaN).
+  std::vector<uint8_t> pq = {0x76, 0xFE};
+  std::vector<uint8_t> ps = {127};          // scale = 2^0 = 1.0
+  std::vector<int32_t> ids = {0};
+  std::vector<float> w = {1.0f};
+  std::vector<float> out((size_t)M * width, 0.0f);
+  mxfp4_moe_scatter_reduce_q(pq.data(), ps.data(), w.data(), ids.data(),
+                             out.data(), M, width, top_k, EM, gs);
+  EXPECT_EQ(out[0], std::numeric_limits<float>::infinity());
+  EXPECT_TRUE(std::isnan(out[1]));
+  EXPECT_EQ(out[2], -std::numeric_limits<float>::infinity());
+  EXPECT_TRUE(std::isnan(out[3]));
 }
 
 // --- End-to-end: align → sort → quant → dequant ≈ A_sorted ------------------
