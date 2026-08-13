@@ -15,9 +15,21 @@ except ImportError:  # pragma: no cover
     np = None
 
 from vkernels import _backend, kernels
-from vkernels.kernels import (add, fused_moe_mxfp4, gemm, max as vk_max,
-                              moe_align_block_size, relu, scale,
-                              sum as vk_sum)
+from vkernels.kernels import (
+    add,
+    fused_moe_mxfp4,
+    gemm,
+    max as vk_max,
+    moe_align_block_size,
+    mxfp4_moe_quant,
+    mxfp4_moe_scatter_reduce,
+    mxfp4_moe_scatter_reduce_q,
+    mxfp4_moe_sort,
+    mxfp4_moe_sort_scales,
+    relu,
+    scale,
+    sum as vk_sum,
+)
 
 _F32 = np.dtype(np.float32) if np is not None else None
 
@@ -26,6 +38,7 @@ _COMPILED = _backend.load_extension() is not None
 
 def _fallback_impl():
     from vkernels import _fallback
+
     return _fallback
 
 
@@ -175,9 +188,11 @@ class GemmTest(unittest.TestCase):
 
 # --- MoE helpers (mirror tests/kernels/moe/test_moe_fused.cpp) ------------
 
+
 def _bf2f(v):
-    return float(np.frombuffer((int(v) << 16).to_bytes(4, "little"),
-                               dtype=np.float32)[0])
+    return float(
+        np.frombuffer((int(v) << 16).to_bytes(4, "little"), dtype=np.float32)[0]
+    )
 
 
 def _f2bf(v):
@@ -241,10 +256,20 @@ class FusedMoeTinySanityTest(unittest.TestCase):
         expert_ids = np.zeros(EM // BLOCK_M, dtype=np.int32)
         act = np.empty(EM * ispp, dtype=np.uint16)
 
-        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
-                              sorted_ids, topk_w, expert_ids,
-                              act_scratch=act, out=None, top_k=1,
-                              group_size=group_size)
+        out = fused_moe_mxfp4(
+            A,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            sorted_ids,
+            topk_w,
+            expert_ids,
+            act_scratch=act,
+            out=None,
+            top_k=1,
+            group_size=group_size,
+        )
 
         silu128 = 128.0 / (1.0 + np.exp(-128.0))
         expected_act = silu128 * 128.0
@@ -260,10 +285,17 @@ class FusedMoeTinySanityTest(unittest.TestCase):
         w13_scale = np.full((1, 2 * ispp, hidden // 32), 127, dtype=np.uint8)
         w2 = np.zeros((1, hidden, ispp // 2), dtype=np.uint8)
         w2_scale = np.full((1, hidden, ispp // 32), 127, dtype=np.uint8)
-        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
-                              np.arange(16, dtype=np.int32),
-                              np.ones(16, dtype=_F32),
-                              np.zeros(1, dtype=np.int32), top_k=1)
+        out = fused_moe_mxfp4(
+            A,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            np.arange(16, dtype=np.int32),
+            np.ones(16, dtype=_F32),
+            np.zeros(1, dtype=np.int32),
+            top_k=1,
+        )
         self.assertEqual(out.shape, (M, hidden))
         self.assertEqual(out.dtype, _F32)
         np.testing.assert_array_equal(out, np.zeros((M, hidden), dtype=_F32))
@@ -287,12 +319,21 @@ class FusedMoeBiasSanityTest(unittest.TestCase):
         b2 = np.ones(hidden, dtype=_F32)
 
         act = np.empty(EM * ispp, dtype=np.uint16)
-        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
-                              np.arange(EM, dtype=np.int32),
-                              np.ones(EM, dtype=_F32),
-                              np.zeros(EM // BLOCK_M, dtype=np.int32),
-                              act_scratch=act, top_k=1,
-                              group_size=group_size, b13=b13, b2=b2)
+        out = fused_moe_mxfp4(
+            A,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            np.arange(EM, dtype=np.int32),
+            np.ones(EM, dtype=_F32),
+            np.zeros(EM // BLOCK_M, dtype=np.int32),
+            act_scratch=act,
+            top_k=1,
+            group_size=group_size,
+            b13=b13,
+            b2=b2,
+        )
 
         silu1 = 1.0 / (1.0 + np.exp(-1.0))
         expected_act = silu1 * 2.0
@@ -314,12 +355,20 @@ class FusedMoeSwiGLUClampTest(unittest.TestCase):
         w2_scale = np.full((1, hidden, ispp // group_size), 127, dtype=np.uint8)
 
         act = np.empty(EM * ispp, dtype=np.uint16)
-        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
-                              np.arange(EM, dtype=np.int32),
-                              np.ones(EM, dtype=_F32),
-                              np.zeros(EM // BLOCK_M, dtype=np.int32),
-                              act_scratch=act, top_k=1,
-                              group_size=group_size, swiglu_limit=10.0)
+        out = fused_moe_mxfp4(
+            A,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            np.arange(EM, dtype=np.int32),
+            np.ones(EM, dtype=_F32),
+            np.zeros(EM // BLOCK_M, dtype=np.int32),
+            act_scratch=act,
+            top_k=1,
+            group_size=group_size,
+            swiglu_limit=10.0,
+        )
 
         silu10 = 10.0 / (1.0 + np.exp(-10.0))
         expected_act = silu10 * 10.0
@@ -337,30 +386,37 @@ class FusedMoeSituTest(unittest.TestCase):
 
         A = np.full((M, hidden), _f2bf(1.0), dtype=np.uint16)
         w13 = _ones_weight_bytes(1, 2 * ispp, hidden // 2)
-        w13_scale = np.full((1, 2 * ispp, hidden // group_size), 127,
-                            dtype=np.uint8)
+        w13_scale = np.full((1, 2 * ispp, hidden // group_size), 127, dtype=np.uint8)
         w2 = _ones_weight_bytes(1, hidden, ispp // 2)
         w2_scale = np.full((1, hidden, ispp // group_size), 127, dtype=np.uint8)
 
         act = np.empty(EM * ispp, dtype=np.uint16)
         # swiglu_limit=1.0 must be IGNORED on the SiTU path.
-        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
-                              np.arange(EM, dtype=np.int32),
-                              np.ones(EM, dtype=_F32),
-                              np.zeros(EM // BLOCK_M, dtype=np.int32),
-                              act_scratch=act, top_k=1, group_size=group_size,
-                              swiglu_limit=1.0, activation="situ",
-                              beta=4.0, linear_beta=25.0)
+        out = fused_moe_mxfp4(
+            A,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            np.arange(EM, dtype=np.int32),
+            np.ones(EM, dtype=_F32),
+            np.zeros(EM // BLOCK_M, dtype=np.int32),
+            act_scratch=act,
+            top_k=1,
+            group_size=group_size,
+            swiglu_limit=1.0,
+            activation="situ",
+            beta=4.0,
+            linear_beta=25.0,
+        )
 
         # situ_and_mul reference (vLLM): gate = up = 128, unclamped.
         gate = up = 128.0
         sig = 1.0 / (1.0 + np.exp(-gate))
-        expected_act = (4.0 * np.tanh(gate / 4.0) * sig) * (
-            25.0 * np.tanh(up / 25.0))
+        expected_act = (4.0 * np.tanh(gate / 4.0) * sig) * (25.0 * np.tanh(up / 25.0))
         expected_out = expected_act * ispp
 
-        np.testing.assert_allclose([_bf2f(v) for v in act], expected_act,
-                                   atol=0.5)
+        np.testing.assert_allclose([_bf2f(v) for v in act], expected_act, atol=0.5)
         np.testing.assert_allclose(out, expected_out, rtol=1e-2)
 
     def test_rejects_unknown_activation(self):
@@ -371,11 +427,18 @@ class FusedMoeSituTest(unittest.TestCase):
         w2 = np.zeros((1, hidden, ispp // 2), dtype=np.uint8)
         w2_scale = np.full((1, hidden, ispp // 32), 127, dtype=np.uint8)
         with self.assertRaises(ValueError):
-            fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
-                            np.arange(16, dtype=np.int32),
-                            np.ones(16, dtype=_F32),
-                            np.zeros(1, dtype=np.int32),
-                            top_k=1, activation="gelu")
+            fused_moe_mxfp4(
+                A,
+                w13,
+                w13_scale,
+                w2,
+                w2_scale,
+                np.arange(16, dtype=np.int32),
+                np.ones(16, dtype=_F32),
+                np.zeros(1, dtype=np.int32),
+                top_k=1,
+                activation="gelu",
+            )
 
 
 @unittest.skipIf(np is None, "numpy is required for these tests")
@@ -398,9 +461,18 @@ class FusedMoeMultiExpertTest(unittest.TestCase):
         sorted_ids = np.array([i % M for i in range(EM)], dtype=np.int32)
         expert_ids = np.array([i % E for i in range(EM // BLOCK_M)], dtype=np.int32)
 
-        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
-                              sorted_ids, np.ones(EM, dtype=_F32),
-                              expert_ids, top_k=1, group_size=group_size)
+        out = fused_moe_mxfp4(
+            A,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            sorted_ids,
+            np.ones(EM, dtype=_F32),
+            expert_ids,
+            top_k=1,
+            group_size=group_size,
+        )
         self.assertTrue(np.all(np.isfinite(out)))
         self.assertTrue(np.all(out > 0.0))
 
@@ -419,11 +491,19 @@ class FusedMoeExpertFilterTest(unittest.TestCase):
         w2_scale = np.full((1, hidden, ispp // group_size), 127, dtype=np.uint8)
         expert_ids = np.full(EM // BLOCK_M, -1, dtype=np.int32)  # all filtered
 
-        out = fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
-                              np.arange(EM, dtype=np.int32),
-                              np.ones(EM, dtype=_F32), expert_ids,
-                              out=np.full(M * hidden, 99.0, dtype=_F32),
-                              top_k=1, group_size=group_size)
+        out = fused_moe_mxfp4(
+            A,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            np.arange(EM, dtype=np.int32),
+            np.ones(EM, dtype=_F32),
+            expert_ids,
+            out=np.full(M * hidden, 99.0, dtype=_F32),
+            top_k=1,
+            group_size=group_size,
+        )
         np.testing.assert_allclose(out, 99.0, rtol=0.01)
 
 
@@ -514,12 +594,13 @@ class BackendConsistencyTest(unittest.TestCase):
         group_size, BLOCK_M = 32, 16
         EM = 2 * BLOCK_M  # one 16-row block per expert; all 32 rows real
 
-        A = np.array([_f2bf(float(v))
-                      for v in rng.uniform(-1.0, 1.0, M * hidden)]).reshape(
-            M, hidden).astype(np.uint16)
+        A = (
+            np.array([_f2bf(float(v)) for v in rng.uniform(-1.0, 1.0, M * hidden)])
+            .reshape(M, hidden)
+            .astype(np.uint16)
+        )
         w13 = _random_packed((E, 2 * ispp, hidden // 2), rng)
-        w13_scale = np.full((E, 2 * ispp, hidden // group_size), 127,
-                            dtype=np.uint8)
+        w13_scale = np.full((E, 2 * ispp, hidden // group_size), 127, dtype=np.uint8)
         w2 = _random_packed((E, hidden, ispp // 2), rng)
         w2_scale = np.full((E, hidden, ispp // group_size), 127, dtype=np.uint8)
         sorted_ids = np.arange(EM, dtype=np.int32)  # flat, token = i (top_k=1)
@@ -531,17 +612,361 @@ class BackendConsistencyTest(unittest.TestCase):
         act_f = np.empty(EM * ispp, dtype=np.uint16)
         out_c = np.zeros(M * hidden, dtype=_F32)
         out_f = np.zeros(M * hidden, dtype=_F32)
-        common = (A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
-                  expert_ids)
+        common = (A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w, expert_ids)
         _backend.load_extension().kernels.fused_moe_mxfp4(
-            *common, act_c, out_c, M, hidden, ispp, 1, EM, group_size, 0.0,
-            0, 4.0, 25.0, None, None)
-        fb.fused_moe_mxfp4(*common, act_f, out_f, M, hidden, ispp, 1, EM,
-                           group_size, 0.0, 0, 4.0, 25.0, None, None)
+            *common,
+            act_c,
+            out_c,
+            M,
+            hidden,
+            ispp,
+            1,
+            EM,
+            group_size,
+            0.0,
+            0,
+            4.0,
+            25.0,
+            None,
+            None,
+        )
+        fb.fused_moe_mxfp4(
+            *common,
+            act_f,
+            out_f,
+            M,
+            hidden,
+            ispp,
+            1,
+            EM,
+            group_size,
+            0.0,
+            0,
+            4.0,
+            25.0,
+            None,
+            None,
+        )
 
         np.testing.assert_allclose(out_c, out_f, rtol=1e-3, atol=1e-2)
-        np.testing.assert_allclose([_bf2f(int(v)) for v in act_c],
-                                   [_bf2f(int(v)) for v in act_f], atol=0.5)
+        np.testing.assert_allclose(
+            [_bf2f(int(v)) for v in act_c], [_bf2f(int(v)) for v in act_f], atol=0.5
+        )
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 MoE orchestration: mxfp4_moe_{quant,sort,sort_scales,scatter_reduce[_q]}.
+# These helpers exactly mirror the C++ kernels in src/c/vkernels/kernels/
+# moe_aux.{cpp,hpp} so the tests can serve as an independent oracle.
+# ---------------------------------------------------------------------------
+_FP4_LUT = None
+
+
+def _fp4_nib_c(x):
+    """Round to nearest E2M1 nibble, ties to the larger magnitude (mirrors
+    ``float_to_fp4_nib`` in moe_aux.cpp)."""
+    v = abs(float(x))
+    if v < 0.125:
+        mag = 0
+    elif v < 0.625:
+        mag = 1
+    elif v < 1.25:
+        mag = 2
+    elif v < 1.75:
+        mag = 3
+    elif v < 2.5:
+        mag = 4
+    else:
+        mag = 5
+    if x < 0.0:
+        mag |= 0x8
+    return mag
+
+
+def _nib2f_c(n):
+    """Decode an E2M1 nibble (mirrors the table in moe.cpp)."""
+    s = (n >> 3) & 1
+    e = (n >> 1) & 3
+    m = n & 1
+    if e == 0:
+        return (-0.25 if m else -0.0) if s else (0.25 if m else 0.0)
+    if e == 3:
+        # code 6 = +inf, 7 = NaN, 14 = -inf, 15 = NaN
+        if m:
+            return float("nan")
+        return float("-inf") if s else float("inf")
+    v = (1.0 + 0.5 * m) * (2.0 ** (e - 1))
+    return -v if s else v
+
+
+def _ue8m0_c(s):
+    """Decode a ue8m0 scale byte (mirrors the simple `s << 23` path)."""
+    if s == 0xFF:
+        return 0.0
+    return float(
+        np.frombuffer((int(s) << 23).to_bytes(4, "little"), dtype=np.float32)[0]
+    )
+
+
+def _fp4_lut():
+    global _FP4_LUT
+    if _FP4_LUT is None:
+        _FP4_LUT = np.array([_nib2f_c(i) for i in range(16)], dtype=np.float32)
+    return _FP4_LUT
+
+
+def _dequant_quantized(packed, scales, M, width, gs):
+    """Dequant an [M, width/2] E2M1 + [M, width/gs] ue8m0 pair to float32
+    [M, width], exactly as the kernels' scatter_reduce_q does inline."""
+    lo = (packed & 0x0F).astype(np.int64)
+    hi = ((packed >> 4) & 0x0F).astype(np.int64)
+    nibs = np.empty((M, width), dtype=np.int64)
+    nibs[:, 0::2] = lo
+    nibs[:, 1::2] = hi
+    vals = _fp4_lut()[nibs]
+    ng = width // gs
+    sc = np.array(
+        [[_ue8m0_c(int(s)) for s in row] for row in np.asarray(scales).reshape(M, ng)],
+        dtype=np.float32,
+    )
+    sc_full = np.repeat(sc, gs, axis=1)
+    return (vals * sc_full).astype(np.float32)
+
+
+def _align_ids(M, top_k, E, block_size, rng):
+    topk = rng.integers(0, E, size=(M, top_k), dtype=np.int32)
+    sorted_ids, expert_ids, EM = moe_align_block_size(topk, E, block_size)
+    return sorted_ids, EM
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class MoeAuxTest(unittest.TestCase):
+    M, hidden, gs = 7, 64, 32
+
+    def test_quant_round_trip(self):
+        rng = np.random.default_rng(31)
+        A = (
+            np.array(
+                [_f2bf(float(v)) for v in rng.uniform(-3.0, 3.0, self.M * self.hidden)]
+            )
+            .reshape(self.M, self.hidden)
+            .astype(np.uint16)
+        )
+        packed, scales = mxfp4_moe_quant(A, group_size=self.gs)
+        self.assertEqual(packed.shape, (self.M, self.hidden // 2))
+        self.assertEqual(scales.shape, (self.M, self.hidden // self.gs))
+        dq = _dequant_quantized(packed, scales, self.M, self.hidden, self.gs)
+        # Each element recovers the bf16 value within one fp4 quantum of its
+        # group scale (max step at the top of the range is 0.5 * scale).
+        Af = np.array([[_bf2f(int(v)) for v in row] for row in A], dtype=np.float32)
+        sc_full = np.repeat(
+            np.array(
+                [[_ue8m0_c(int(s)) for s in row] for row in scales], dtype=np.float32
+            ),
+            self.gs,
+            axis=1,
+        )
+        tol = np.maximum(np.abs(Af), np.abs(dq)) + 0.5 * sc_full + 1e-6
+        np.testing.assert_array_less(np.abs(Af - dq), tol)
+
+    def test_quant_zero_group(self):
+        A = np.zeros((self.M, self.hidden), dtype=np.uint16)
+        packed, scales = mxfp4_moe_quant(A, group_size=self.gs)
+        np.testing.assert_array_equal(scales, 0xFF)
+        np.testing.assert_array_equal(packed, 0)
+        dq = _dequant_quantized(packed, scales, self.M, self.hidden, self.gs)
+        np.testing.assert_array_equal(dq, 0.0)
+
+    def test_quant_rejects_bad_group_size(self):
+        A = np.zeros((4, 30), dtype=np.uint16)  # 30 not divisible by 32
+        with self.assertRaises(ValueError):
+            mxfp4_moe_quant(A, group_size=32)
+        A2 = np.zeros((4, 33), dtype=np.uint16)  # odd hidden
+        with self.assertRaises(ValueError):
+            mxfp4_moe_quant(A2, group_size=1)
+
+    def test_sort_gathers_and_pads(self):
+        rng = np.random.default_rng(32)
+        M, hidden, top_k, E, BS = 8, 16, 2, 4, 16
+        sorted_ids, EM = _align_ids(M, top_k, E, BS, rng)
+        A = (
+            rng.integers(1, 0x7FFF, size=M * hidden)
+            .astype(np.uint16)
+            .reshape(M, hidden)
+        )
+        A_sorted = mxfp4_moe_sort(A, sorted_ids, top_k=top_k)
+        self.assertEqual(A_sorted.shape, (EM, hidden))
+        for r in range(EM):
+            flat = int(sorted_ids[r])
+            if 0 <= flat < M * top_k:
+                np.testing.assert_array_equal(A_sorted[r], A[flat // top_k])
+            else:
+                np.testing.assert_array_equal(A_sorted[r], 0)
+
+    def test_sort_scales_gathers_and_pads(self):
+        rng = np.random.default_rng(33)
+        M, hidden, gs, top_k, E, BS = 6, 32, 16, 2, 4, 16
+        ng = hidden // gs
+        sorted_ids, EM = _align_ids(M, top_k, E, BS, rng)
+        scales = rng.integers(1, 200, size=M * ng).astype(np.uint8).reshape(M, ng)
+        s_sorted = mxfp4_moe_sort_scales(scales, sorted_ids, top_k=top_k)
+        self.assertEqual(s_sorted.shape, (EM, ng))
+        for r in range(EM):
+            flat = int(sorted_ids[r])
+            if 0 <= flat < M * top_k:
+                np.testing.assert_array_equal(s_sorted[r], scales[flat // top_k])
+            else:
+                np.testing.assert_array_equal(s_sorted[r], 0)
+
+    def _scatter_oracle(self, partial, w, sorted_ids, M, width, top_k, EM):
+        out = np.zeros((M, width), dtype=np.float32)
+        for r in range(EM):
+            flat = int(sorted_ids[r])
+            if 0 <= flat < M * top_k:
+                np.add.at(
+                    out,
+                    flat // top_k,
+                    np.asarray(partial[r], dtype=np.float32) * np.float32(w[r]),
+                )
+        return out
+
+    def test_scatter_reduce(self):
+        rng = np.random.default_rng(34)
+        M, width, top_k, E, BS = 5, 12, 2, 4, 16
+        sorted_ids, EM = _align_ids(M, top_k, E, BS, rng)
+        partial = rng.standard_normal((EM, width)).astype(np.float32)
+        w = rng.uniform(0.5, 1.5, EM).astype(np.float32)
+        out = mxfp4_moe_scatter_reduce(
+            partial, w, sorted_ids, M=M, width=width, top_k=top_k
+        )
+        oracle = self._scatter_oracle(partial, w, sorted_ids, M, width, top_k, EM)
+        np.testing.assert_array_equal(out, oracle)
+
+    def test_scatter_reduce_q(self):
+        rng = np.random.default_rng(35)
+        M, width, gs, top_k, E, BS = 5, 64, 32, 2, 4, 16
+        sorted_ids, EM = _align_ids(M, top_k, E, BS, rng)
+        # Build a quantized partial from a known float partial so the
+        # dequantized combine is bounded by the fp4 grid.
+        raw = rng.standard_normal((EM, width)).astype(np.float32)
+        packed, scales = mxfp4_moe_quant(raw, group_size=gs)
+        w = rng.uniform(0.5, 1.5, EM).astype(np.float32)
+        out = mxfp4_moe_scatter_reduce_q(
+            packed, scales, w, sorted_ids, M=M, width=width, top_k=top_k, group_size=gs
+        )
+        # Oracle: dequant the (same) quantized partial, then r-order add.
+        dq = _dequant_quantized(packed, scales, EM, width, gs)
+        oracle = self._scatter_oracle(dq, w, sorted_ids, M, width, top_k, EM)
+        np.testing.assert_allclose(out, oracle, rtol=1e-6, atol=1e-6)
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        """Compiled C++ reference and the pure-Python fallback must agree."""
+        ext = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(36)
+        M, hidden, gs = 6, 64, 32
+        A = (
+            np.array([_f2bf(float(v)) for v in rng.uniform(-3.0, 3.0, M * hidden)])
+            .reshape(M, hidden)
+            .astype(np.uint16)
+        )
+        pc, sc = ext.mxfp4_moe_quant(A, M, hidden, gs)
+        pf, sf = fb.mxfp4_moe_quant(A, M, hidden, gs)
+        np.testing.assert_array_equal(np.asarray(pc).ravel(), np.asarray(pf).ravel())
+        np.testing.assert_array_equal(np.asarray(sc).ravel(), np.asarray(sf).ravel())
+
+        top_k, E, BS = 2, 4, 16
+        topk = rng.integers(0, E, size=(M, top_k), dtype=np.int32)
+        sorted_ids, expert_ids, EM = moe_align_block_size(topk, E, BS)
+        EM = int(EM)
+
+        Ac = ext.mxfp4_moe_sort(A, sorted_ids, M, hidden, top_k, EM)
+        Af = fb.mxfp4_moe_sort(A, sorted_ids, M, hidden, top_k, EM)
+        np.testing.assert_array_equal(np.asarray(Ac).ravel(), np.asarray(Af).ravel())
+
+        ng = hidden // gs
+        scc = ext.mxfp4_moe_sort_scales(
+            np.asarray(sc).reshape(M, ng), sorted_ids, M, ng, top_k, EM
+        )
+        scf = fb.mxfp4_moe_sort_scales(
+            np.asarray(sf).reshape(M, ng), sorted_ids, M, ng, top_k, EM
+        )
+        np.testing.assert_array_equal(np.asarray(scc).ravel(), np.asarray(scf).ravel())
+
+        partial = rng.standard_normal((EM, hidden)).astype(np.float32)
+        w = rng.uniform(0.5, 1.5, EM).astype(np.float32)
+        oc = ext.mxfp4_moe_scatter_reduce(partial, w, sorted_ids, M, hidden, top_k, EM)
+        of = fb.mxfp4_moe_scatter_reduce(partial, w, sorted_ids, M, hidden, top_k, EM)
+        np.testing.assert_array_equal(np.asarray(oc).ravel(), np.asarray(of).ravel())
+
+        # scatter_reduce_q takes a partial already in sorted row order
+        # [EM, width] (one row per (token, selection), as produced by the
+        # per-expert grouped GEMM). Quantize that same float partial so the
+        # compiled dequant-scatter and the fallback can be cross-checked.
+        pq_c, ps_c = ext.mxfp4_moe_quant(partial, EM, hidden, gs)
+        pq_f, ps_f = fb.mxfp4_moe_quant(partial, EM, hidden, gs)
+        oqc = ext.mxfp4_moe_scatter_reduce_q(
+            pq_c, ps_c, w, sorted_ids, M, hidden, top_k, EM, gs
+        )
+        oqf = fb.mxfp4_moe_scatter_reduce_q(
+            pq_f, ps_f, w, sorted_ids, M, hidden, top_k, EM, gs
+        )
+        np.testing.assert_allclose(
+            np.asarray(oqc).ravel(), np.asarray(oqf).ravel(), rtol=1e-6, atol=1e-6
+        )
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_pipeline_k3(self):
+        """K3-shaped orchestration: align -> sort -> quant -> sort_scales
+        -> scatter_reduce_q composes at the K3 scale
+        (M=112, hidden=7168, ispp=3072, top_k=16)."""
+        M, hidden, ispp, top_k, E, gs, BS = 112, 7168, 3072, 16, 64, 32, 16
+        rng = np.random.default_rng(37)
+        topk = rng.integers(0, E, size=(M, top_k), dtype=np.int32)
+        sorted_ids, expert_ids, EM = moe_align_block_size(topk, E, BS)
+        EM = int(EM)
+        self.assertEqual(EM % BS, 0)
+        real = sorted_ids < M * top_k
+
+        A = (
+            np.array([_f2bf(float(v)) for v in rng.uniform(-1.0, 1.0, M * hidden)])
+            .reshape(M, hidden)
+            .astype(np.uint16)
+        )
+        # Per-token scales (token order) gathered into sorted order must
+        # match quantizing the already-gathered A_sorted: both express
+        # the per-group scale of token t at sorted row r where
+        # sorted_ids[r] = t*top_k + sel.
+        packed_tok, scales_tok = mxfp4_moe_quant(A, group_size=gs)
+        A_sorted = mxfp4_moe_sort(A, sorted_ids, top_k=top_k)
+        self.assertEqual(A_sorted.shape, (EM, hidden))
+        s_sorted = mxfp4_moe_sort_scales(scales_tok, sorted_ids, top_k=top_k)
+        ng = hidden // gs
+        self.assertEqual(s_sorted.shape, (EM, ng))
+        packed, scales = mxfp4_moe_quant(A_sorted, group_size=gs)
+        self.assertEqual(packed.shape, (EM, hidden // 2))
+        self.assertEqual(scales.shape, (EM, ng))
+        np.testing.assert_array_equal(s_sorted[real], scales[real])
+        # Real rows (sorted_ids < M*top_k) must carry a finite scale in
+        # [1, 254]; only padding rows may be 0xFF.
+        self.assertTrue(np.all(scales[real] >= 1) and np.all(scales[real] <= 254))
+        np.testing.assert_array_equal(packed[~real], 0)
+        np.testing.assert_array_equal(scales[~real], 0xFF)
+        # scatter_reduce_q of a synthesized quantized partial at the ispp
+        # width (the down-projection output dimension on K3).
+        raw_p = rng.standard_normal((EM, ispp)).astype(np.float32)
+        pq, ps = mxfp4_moe_quant(raw_p, group_size=gs)
+        w = rng.uniform(0.5, 1.5, EM).astype(np.float32)
+        out = mxfp4_moe_scatter_reduce_q(
+            pq, ps, w, sorted_ids, M=M, width=ispp, top_k=top_k, group_size=gs
+        )
+        self.assertEqual(out.shape, (M, ispp))
+        self.assertTrue(np.all(np.isfinite(out)))
+        # Real tokens receive a non-trivial reduction (>= 1 contributing row).
+        counts = np.bincount((sorted_ids[real] // top_k).astype(np.int64), minlength=M)
+        active = np.where(counts > 0)[0]
+        self.assertTrue(np.all(np.any(out[active] != 0.0, axis=1)))
 
 
 if __name__ == "__main__":

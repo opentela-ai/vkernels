@@ -37,6 +37,11 @@ EXPECTED_KERNELS = [
     ("fp4_to_bf16_dequant", "moe"),
     ("use_async_copy_default", "moe"),
     ("mfma_f32_16x16x16bf16", "moe"),
+    ("mxfp4_moe_quant", "moe_aux"),
+    ("mxfp4_moe_sort", "moe_aux"),
+    ("mxfp4_moe_sort_scales", "moe_aux"),
+    ("mxfp4_moe_scatter_reduce", "moe_aux"),
+    ("mxfp4_moe_scatter_reduce_q", "moe_aux"),
     ("fused_moe_mxfp4_cpu", "moe_fused"),
     ("moe_gateup_cpu", "moe_fused"),
     ("moe_act_epilogue_cpu", "moe_fused"),
@@ -105,14 +110,25 @@ class DiscoveryTest(unittest.TestCase):
             e = self.kernels[name]
             self.assertEqual(e.kind, "kernel", name)
             self.assertTrue(e.host, f"{name} must have a CPU reference")
-            self.assertTrue(e.cuda or e.hip,
-                            f"{name} must have a GPU (CUDA or HIP) source")
+            self.assertTrue(
+                e.cuda or e.hip, f"{name} must have a GPU (CUDA or HIP) source"
+            )
 
     def test_moe_kernels_are_hip(self):
-        for name in ("direct_lds_fill_bf16", "fp4_to_bf16_dequant",
-                     "use_async_copy_default", "mfma_f32_16x16x16bf16",
-                     "fused_moe_mxfp4_cpu", "moe_align_block_size",
-                     "fused_moe_mxfp4"):
+        for name in (
+            "direct_lds_fill_bf16",
+            "fp4_to_bf16_dequant",
+            "use_async_copy_default",
+            "mfma_f32_16x16x16bf16",
+            "fused_moe_mxfp4_cpu",
+            "moe_align_block_size",
+            "fused_moe_mxfp4",
+            "mxfp4_moe_quant",
+            "mxfp4_moe_sort",
+            "mxfp4_moe_sort_scales",
+            "mxfp4_moe_scatter_reduce",
+            "mxfp4_moe_scatter_reduce_q",
+        ):
             self.assertTrue(self.kernels[name].hip, name)
             self.assertFalse(self.kernels[name].cuda, name)
 
@@ -141,13 +157,17 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(self.kernels["add"].description, "out = a + b")
         self.assertEqual(self.kernels["scale"].description, "out = alpha * x")
         self.assertEqual(self.kernels["relu"].description, "out = max(x, 0)")
-        self.assertTrue(self.kernels["sum"].description.startswith(
-            "Sum of all elements"))
+        self.assertTrue(
+            self.kernels["sum"].description.startswith("Sum of all elements")
+        )
         self.assertTrue(self.kernels["gemm"].description.startswith("SGEMM"))
-        self.assertTrue(self.comm["ring_allreduce"].description.lower().find(
-            "all-reduce") >= 0)
-        self.assertTrue(self.comm["make_ring_channels"].description.lower().find(
-            "mock channels") >= 0)
+        self.assertTrue(
+            self.comm["ring_allreduce"].description.lower().find("all-reduce") >= 0
+        )
+        self.assertTrue(
+            self.comm["make_ring_channels"].description.lower().find("mock channels")
+            >= 0
+        )
 
     def test_signatures(self):
         self.assertEqual(
@@ -157,7 +177,8 @@ class DiscoveryTest(unittest.TestCase):
         self.assertTrue(self.kernels["gemm"].signature.startswith("gemm("))
         self.assertIn("float alpha", self.kernels["gemm"].signature)
         self.assertTrue(
-            self.comm["p2p_gather_runs"].signature.startswith("p2p_gather_runs("))
+            self.comm["p2p_gather_runs"].signature.startswith("p2p_gather_runs(")
+        )
 
     def test_version_reads_cpp_header(self):
         self.assertRegex(discovery.version(ROOT), r"^\d+\.\d+\.\d+$")
@@ -167,7 +188,10 @@ def _run_vkl(*args: str) -> subprocess.CompletedProcess:
     env = {**os.environ, "PYTHONPATH": str(_SRC)}
     return subprocess.run(
         [sys.executable, "-m", "vkernels.cli", *args],
-        cwd=_SRC, env=env, capture_output=True, text=True,
+        cwd=_SRC,
+        env=env,
+        capture_output=True,
+        text=True,
     )
 
 

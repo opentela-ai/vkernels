@@ -44,6 +44,7 @@
 #include "vkernels/kernels/elementwise.hpp"
 #include "vkernels/kernels/gemm.hpp"
 #include "vkernels/kernels/moe.hpp"
+#include "vkernels/kernels/moe_aux.hpp"
 #include "vkernels/kernels/moe_fused.hpp"
 #include "vkernels/kernels/reduce.hpp"
 #include "vkernels/util/config.hpp"
@@ -324,6 +325,92 @@ PYBIND11_MODULE(_core, m) {
   // -------------------------------------------------------------------------
   // vkernels._core.comm — collectives, topology, overlap, p2p gather
   // -------------------------------------------------------------------------
+  // --- moe orchestration (mxfp4_moe_aux: quant, sort, scatter-reduce) ----
+  kernels.def(
+      "mxfp4_moe_quant",
+      [](U16Array A, int M, int hidden, int group_size) {
+        if (hidden % 2 != 0)
+          throw py::value_error("hidden must be even (two nibbles per byte)");
+        if (hidden % group_size != 0)
+          throw py::value_error("hidden must be a multiple of group_size");
+        py::array_t<std::uint8_t> packed((std::size_t)M * (hidden / 2));
+        py::array_t<std::uint8_t> scales((std::size_t)M * (hidden / group_size));
+        kernels::mxfp4_moe_quant(A.data(), packed.mutable_data(),
+                                 scales.mutable_data(), M, hidden, group_size);
+        return py::make_tuple(packed, scales);
+      },
+      py::arg("A"), py::arg("M"), py::arg("hidden"),
+      py::arg("group_size") = 32,
+      "MXFP4 activation quant: bf16 A [M, hidden] -> (packed [M, hidden/2] "
+      "uint8 E2M1, scales [M, hidden/group] uint8 ue8m0). Per-group scale = "
+      "2^ceil(log2(amax/3)); ties round to the larger magnitude.");
+
+  kernels.def(
+      "mxfp4_moe_sort",
+      [](U16Array A, I32Array sorted_ids, int M, int hidden, int top_k,
+         int EM) {
+        py::array_t<std::uint16_t> out((std::size_t)EM * hidden);
+        kernels::mxfp4_moe_sort(A.data(), sorted_ids.data(),
+                                out.mutable_data(), M, hidden, top_k, EM);
+        return out;
+      },
+      py::arg("A"), py::arg("sorted_ids"), py::arg("M"), py::arg("hidden"),
+      py::arg("top_k"), py::arg("EM"),
+      "Gather bf16 A [M, hidden] into sorted row order [EM, hidden] by "
+      "sorted_ids (>= M*top_k = padding row, zeroed).");
+
+  kernels.def(
+      "mxfp4_moe_sort_scales",
+      [](ByteArray scales, I32Array sorted_ids, int M, int n_groups,
+         int top_k, int EM) {
+        py::array_t<std::uint8_t> out((std::size_t)EM * n_groups);
+        kernels::mxfp4_moe_sort_scales(scales.data(), sorted_ids.data(),
+                                       out.mutable_data(), M, n_groups, top_k,
+                                       EM);
+        return out;
+      },
+      py::arg("scales"), py::arg("sorted_ids"), py::arg("M"),
+      py::arg("n_groups"), py::arg("top_k"), py::arg("EM"),
+      "Gather per-token ue8m0 scales [M, n_groups] into sorted row order "
+      "[EM, n_groups] by sorted_ids (padding rows zeroed).");
+
+  kernels.def(
+      "mxfp4_moe_scatter_reduce",
+      [](FloatArray partial, FloatArray topk_w, I32Array sorted_ids, int M,
+         int width, int top_k, int EM) {
+        py::array_t<float> out((std::size_t)M * width);
+        std::memset(out.mutable_data(), 0, (std::size_t)M * width * sizeof(float));
+        kernels::mxfp4_moe_scatter_reduce(partial.data(), topk_w.data(),
+                                         sorted_ids.data(),
+                                         out.mutable_data(), M, width, top_k,
+                                         EM);
+        return out;
+      },
+      py::arg("partial"), py::arg("topk_w"), py::arg("sorted_ids"),
+      py::arg("M"), py::arg("width"), py::arg("top_k"), py::arg("EM"),
+      "Routed combine of float32 partials [EM, width] -> out [M, width] "
+      "(zero-initialised): out[token] += partial[r] * topk_w[r].");
+
+  kernels.def(
+      "mxfp4_moe_scatter_reduce_q",
+      [](ByteArray partial_q, ByteArray partial_s, FloatArray topk_w,
+         I32Array sorted_ids, int M, int width, int top_k, int EM,
+         int group_size) {
+        py::array_t<float> out((std::size_t)M * width);
+        std::memset(out.mutable_data(), 0, (std::size_t)M * width * sizeof(float));
+        kernels::mxfp4_moe_scatter_reduce_q(
+            partial_q.data(), partial_s.data(), topk_w.data(),
+            sorted_ids.data(), out.mutable_data(), M, width, top_k, EM,
+            group_size);
+        return out;
+      },
+      py::arg("partial_q"), py::arg("partial_s"), py::arg("topk_w"),
+      py::arg("sorted_ids"), py::arg("M"), py::arg("width"),
+      py::arg("top_k"), py::arg("EM"), py::arg("group_size") = 32,
+      "Routed combine of a quantized partial [EM, width/2] uint8 E2M1 + "
+      "[EM, width/group] uint8 ue8m0 -> out [M, width] float32 (zero-init), "
+      "dequantizing inline: out[token] += dequant(partial[r]) * topk_w[r].");
+
   auto comm = m.def_submodule("comm", "Communication primitives (src/c/vkernels/comm).");
 
   // --- topology ------------------------------------------------------------

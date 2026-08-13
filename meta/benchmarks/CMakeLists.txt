@@ -46,6 +46,11 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_moe_fused_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_moe_fused_correct)
 
+  add_executable(test_moe_aux_correct test_moe_aux_correct.hip)
+  target_link_libraries(test_moe_aux_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_moe_aux_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_moe_aux_correct)
+
   add_executable(test_moe_fused_prefill_correct test_moe_fused_prefill_correct.hip)
   target_link_libraries(test_moe_fused_prefill_correct PRIVATE vkernels::vkernels)
   target_compile_features(test_moe_fused_prefill_correct PRIVATE cxx_std_17)
