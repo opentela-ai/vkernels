@@ -39,6 +39,8 @@
 #  include <algorithm>
 #  include <cstddef>
 #  include <cstdint>
+#  include <memory>
+#  include <unordered_set>
 #  include <vector>
 
 namespace vkernels::comm {
@@ -54,6 +56,17 @@ namespace {
 struct PageDev {
   const unsigned char* src;  // peer UVA resolved pointer
   const int* slot_base;      // &slot_ids[p * page_size]
+};
+
+// Plan descriptor (issue #27). Unlike PageDev, `src` is the peer page BASE
+// (no per-page offset): the per-layer `src_offset` is a scalar kernel
+// argument added at execute time, so one descriptor buffer is reused across
+// every layer. `slot_base` points into either the plan's own device slot map
+// (host-input variant) or the caller's `device_indices` buffer
+// (from_device_slots variant) at offset `p * page_size`.
+struct PagePlanDev {
+  const unsigned char* src;
+  const int* slot_base;
 };
 
 // ---------------------------------------------------------------------------
@@ -193,6 +206,94 @@ void launch_scatter_kernel(unsigned char* k_dst, unsigned char* v_dst,
   VK_ENSURES(err == cudaSuccess, "cuda kv_scatter launch failed");
 }
 
+// Public scatter entry point (issue #27): one launch over a contiguous
+// [num_pages, page_size, 2, num_kv_heads, head_dim] scratch buffer that a
+// caller already gathered (e.g. with a prepared P2PGatherPlan2D), using a
+// persistent device slot map. This is the "prepared gather plus indexed
+// scatter" baseline the plan is measured against.
+
+// Grid-axis limit (matches the gather kernels).
+constexpr unsigned kPlanMaxGridAxis = 65535u;
+
+// Plan restore kernel (issue #27). One block per (page, token-group) pair:
+// grid.x tiles each page's unit range, grid.y = num_pages, blockDim = 256.
+// A unit is one chunk of K plus one chunk of V for one token:
+//   * vectorized path (slot_bytes % 16 == 0 and the base+offset is
+//     16-byte aligned): unit = 16 bytes of K + 16 bytes of V (one uint4
+//     each). units_per_token = slot_bytes / 16.
+//   * scalar fallback: unit = 1 byte of K + 1 byte of V. units_per_token =
+//     slot_bytes. This handles any slot_bytes / offset alignment and still
+//     fills the SMs via the page*units grid (vs one block per page).
+//
+// The unit index u (blockIdx.x*blockDim.x + threadIdx.x) maps to
+// (token, chunk) by t = u / units_per_token, chunk = u % units_per_token;
+// K is at src + src_offset + t*token_stride + chunk*unit_bytes and V at the
+// same offset plus slot_bytes. Slot lookups (pages[p].slot_base[t]) are
+// broadcast across the threads of a token, so the small device-side slot
+// map is read once per token from L2.
+__global__ void p2p_kv_restore_plan_kernel(
+    unsigned char* k_dst, unsigned char* v_dst,
+    const PagePlanDev* __restrict__ pages, int num_pages,
+    int page_size, int slot_bytes, int token_stride,
+    int units_per_token, int unit_bytes,
+    unsigned long long src_offset) {
+  int p = blockIdx.y;
+  if (p >= num_pages) return;
+  PagePlanDev page = pages[p];
+  const unsigned char* __restrict__ base = page.src;
+  const int* __restrict__ slots = page.slot_base;
+
+  unsigned long long u =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  unsigned long long page_units =
+      static_cast<unsigned long long>(page_size) * units_per_token;
+  if (u >= page_units) return;
+
+  int t = static_cast<int>(u / static_cast<unsigned long long>(units_per_token));
+  int chunk = static_cast<int>(u % static_cast<unsigned long long>(units_per_token));
+  int slot = slots[t];
+  unsigned long long off = static_cast<unsigned long long>(chunk) * unit_bytes;
+  const unsigned char* src_k = base + src_offset + t * token_stride + off;
+  const unsigned char* src_v = src_k + slot_bytes;
+  unsigned char* dst_k = k_dst + static_cast<unsigned long long>(slot) * slot_bytes + off;
+  unsigned char* dst_v = v_dst + static_cast<unsigned long long>(slot) * slot_bytes + off;
+  if (unit_bytes == 16) {
+    *reinterpret_cast<uint4*>(dst_k) = *reinterpret_cast<const uint4*>(src_k);
+    *reinterpret_cast<uint4*>(dst_v) = *reinterpret_cast<const uint4*>(src_v);
+  } else {
+    *dst_k = *src_k;
+    *dst_v = *src_v;
+  }
+}
+
+// One launch for a whole prepared plan. tile = 256 units; grid.x tiles the
+// page's unit range, grid.y = num_pages (capped at kPlanMaxGridAxis).
+void launch_plan_kernel(unsigned char* k_dst, unsigned char* v_dst,
+                        const PagePlanDev* d_pages, int num_pages,
+                        int page_size, int slot_bytes, int token_stride,
+                        unsigned long long src_offset, cudaStream_t stream) {
+  if (num_pages == 0) return;
+  const bool aligned = (slot_bytes % 16 == 0) && (src_offset % 16 == 0);
+  const int units_per_token = aligned ? (slot_bytes / 16) : slot_bytes;
+  const int unit_bytes = aligned ? 16 : 1;
+  const unsigned long long page_units =
+      static_cast<unsigned long long>(page_size) * units_per_token;
+  const unsigned grid_x =
+      page_units == 0 ? 1u
+                      : static_cast<unsigned>((page_units + 255ull) / 256ull);
+  const unsigned grid_y =
+      static_cast<unsigned>(num_pages) < kPlanMaxGridAxis
+          ? static_cast<unsigned>(num_pages)
+          : kPlanMaxGridAxis;
+  dim3 block(256);
+  dim3 grid(grid_x, grid_y);
+  p2p_kv_restore_plan_kernel<<<grid, block, 0, stream>>>(
+      k_dst, v_dst, d_pages, num_pages, page_size, slot_bytes, token_stride,
+      units_per_token, unit_bytes, src_offset);
+  cudaError_t err = cudaGetLastError();
+  VK_ENSURES(err == cudaSuccess, "cuda p2p_kv_restore_plan launch failed");
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -319,6 +420,215 @@ void p2p_kv_restore_layer_twostage(void* k_dst, void* v_dst,
 
   cudaFreeAsync(d_scratch, stream);
   cudaFreeAsync(d_slot_ids, stream);
+}
+
+// Public indexed-KV scatter (issue #27). `slot_ids` is a caller-owned
+// DEVICE pointer (shape [num_pages * page_size]); `scratch` is a device
+// buffer of [num_pages, page_size, 2, num_kv_heads, head_dim] gathered by a
+// prepared P2PGatherPlan2D. One kernel launch, no upload, no validation —
+// the caller MUST guarantee unique, non-negative, in-range slots and keep
+// both `slot_ids` and `scratch` alive until the kernel completes on `stream`.
+// This is the "prepared scatter" baseline the plan is measured against.
+void kv_scatter(void* k_dst, void* v_dst, const void* scratch,
+                const int* slot_ids, std::size_t num_pages,
+                std::size_t page_size, std::size_t num_kv_heads,
+                std::size_t head_dim, std::size_t elem_size,
+                cudaStream_t stream) {
+  VK_EXPECTS(num_pages == 0 || k_dst != nullptr, "k_dst must be non-null");
+  VK_EXPECTS(num_pages == 0 || v_dst != nullptr, "v_dst must be non-null");
+  VK_EXPECTS(num_pages == 0 || scratch != nullptr, "scratch must be non-null");
+  VK_EXPECTS(num_pages == 0 || slot_ids != nullptr, "slot_ids must be non-null");
+  VK_EXPECTS(page_size > 0 || num_pages == 0, "page_size must be positive");
+  VK_EXPECTS(num_kv_heads > 0 || num_pages == 0, "num_kv_heads must be positive");
+  VK_EXPECTS(head_dim > 0 || num_pages == 0, "head_dim must be positive");
+  VK_EXPECTS(elem_size == 2, "elem_size must be 2 for BF16/FP16");
+  if (num_pages == 0) return;
+
+  const int slot_bytes = static_cast<int>(num_kv_heads * head_dim * elem_size);
+  const int token_stride = 2 * slot_bytes;
+
+  launch_scatter_kernel(static_cast<unsigned char*>(k_dst),
+                        static_cast<unsigned char*>(v_dst),
+                        static_cast<const unsigned char*>(scratch), slot_ids,
+                        static_cast<int>(num_pages),
+                        static_cast<int>(page_size), slot_bytes, token_stride,
+                        stream);
+}
+
+// ---------------------------------------------------------------------------
+// Prepared fused peer-to-indexed-KV restore plan (CUDA, issue #27)
+// ---------------------------------------------------------------------------
+
+struct P2PKvRestorePlan::Impl {
+  unsigned char* k_dst;
+  unsigned char* v_dst;
+  int num_pages;
+  int page_size;
+  int slot_bytes;
+  int token_stride;
+  int num_slots;
+  int num_kv_heads;
+  int head_dim;
+  int elem_size;
+  std::size_t total_bytes;
+  PagePlanDev* d_pages;      // persistent [num_pages] descriptor buffer
+  const int* slot_ids;       // device pointer: owned or borrowed
+  bool owns_slot_ids;        // true for host-input; false for device-slots
+
+  Impl() : k_dst(nullptr), v_dst(nullptr), num_pages(0), page_size(0),
+           slot_bytes(0), token_stride(0), num_slots(0), num_kv_heads(0),
+           head_dim(0), elem_size(0), total_bytes(0),
+           d_pages(nullptr), slot_ids(nullptr), owns_slot_ids(false) {}
+};
+
+namespace {
+
+// Shared constructor body: validate metadata shape, resolve peer bases,
+// allocate the persistent descriptor buffer and (for host-input) the device
+// slot map. The synchronous cudaMalloc/cudaMemcpy use stream 0 so the
+// persistent buffers are not bound to any one stream and concurrent
+// execute() on arbitrary streams is race-free (CUDA default stream is
+// synchronising with respect to per-thread streams).
+template <bool ValidateSlots>
+std::unique_ptr<P2PKvRestorePlan::Impl>
+build_impl(void* k_dst, void* v_dst, std::size_t num_slots,
+          std::size_t num_kv_heads, std::size_t head_dim, std::size_t elem_size,
+          const int* slot_ids, const void* const* peer_src_ptrs,
+          std::size_t num_pages, std::size_t page_size) {
+  VK_EXPECTS(num_pages == 0 || k_dst != nullptr, "k_dst must be non-null");
+  VK_EXPECTS(num_pages == 0 || v_dst != nullptr, "v_dst must be non-null");
+  VK_EXPECTS(num_pages == 0 || num_slots > 0, "num_slots must be positive");
+  VK_EXPECTS(num_pages == 0 || page_size > 0, "page_size must be positive");
+  VK_EXPECTS(num_pages == 0 || num_kv_heads > 0, "num_kv_heads must be positive");
+  VK_EXPECTS(num_pages == 0 || head_dim > 0, "head_dim must be positive");
+  VK_EXPECTS(elem_size == 2, "elem_size must be 2 for BF16/FP16");
+  VK_EXPECTS(num_pages == 0 || slot_ids != nullptr, "slot_ids must be non-null");
+  VK_EXPECTS(num_pages == 0 || peer_src_ptrs != nullptr,
+             "peer_src_ptrs must be non-null");
+
+  auto impl = std::make_unique<P2PKvRestorePlan::Impl>();
+  impl->k_dst = static_cast<unsigned char*>(k_dst);
+  impl->v_dst = static_cast<unsigned char*>(v_dst);
+  impl->num_pages = static_cast<int>(num_pages);
+  impl->page_size = static_cast<int>(page_size);
+  impl->slot_bytes = static_cast<int>(num_kv_heads * head_dim * elem_size);
+  impl->token_stride = 2 * impl->slot_bytes;
+  impl->num_slots = static_cast<int>(num_slots);
+  impl->num_kv_heads = static_cast<int>(num_kv_heads);
+  impl->head_dim = static_cast<int>(head_dim);
+  impl->elem_size = static_cast<int>(elem_size);
+  impl->total_bytes = num_pages * page_size *
+                      static_cast<std::size_t>(impl->token_stride);
+  if (num_pages == 0) return impl;
+
+  const std::size_t total_tokens = num_pages * page_size;
+  if (ValidateSlots) {
+    std::vector<int> tmp(total_tokens);
+    for (std::size_t p = 0; p < num_pages; ++p)
+      std::memcpy(tmp.data() + p * page_size, slot_ids + p * page_size,
+                  page_size * sizeof(int));
+    std::unordered_set<int> seen;
+    seen.reserve(total_tokens);
+    for (std::size_t i = 0; i < total_tokens; ++i) {
+      int slot = tmp[i];
+      VK_EXPECTS(slot >= 0, "slot_ids must be non-negative");
+      VK_EXPECTS(slot < static_cast<int>(num_slots),
+                 "slot_ids must be < num_slots");
+      VK_EXPECTS(seen.insert(slot).second, "slot_ids must be unique");
+    }
+  }
+
+  // Build host-side page descriptors (resolved peer bases; slot base filled
+  // after the device slot map is allocated).
+  std::vector<PagePlanDev> pages(num_pages);
+  for (std::size_t p = 0; p < num_pages; ++p) {
+    VK_EXPECTS(peer_src_ptrs[p] != nullptr, "peer_src_ptrs[p] must be non-null");
+    pages[p].src = static_cast<const unsigned char*>(peer_src_ptrs[p]);
+  }
+
+  // Device slot map: owned for host-input, borrowed for device-slots.
+  const int* d_slot_ids = nullptr;
+  int* owned = nullptr;
+  if (ValidateSlots) {
+    cudaError_t err =
+        cudaMalloc(&owned, total_tokens * sizeof(int));
+    VK_ENSURES(err == cudaSuccess, "cudaMalloc for plan slot_ids failed");
+    err = cudaMemcpy(owned, slot_ids, total_tokens * sizeof(int),
+                     cudaMemcpyHostToDevice);
+    VK_ENSURES(err == cudaSuccess, "cudaMemcpy for plan slot_ids failed");
+    d_slot_ids = owned;
+    impl->owns_slot_ids = true;
+  } else {
+    d_slot_ids = slot_ids;  // caller's device pointer
+    impl->owns_slot_ids = false;
+  }
+  impl->slot_ids = d_slot_ids;
+
+  // Persistent page-descriptor buffer (not stream-bound).
+  PagePlanDev* d_pages = nullptr;
+  cudaError_t err = cudaMalloc(&d_pages, num_pages * sizeof(PagePlanDev));
+  VK_ENSURES(err == cudaSuccess, "cudaMalloc for plan page descriptors failed");
+  for (std::size_t p = 0; p < num_pages; ++p)
+    pages[p].slot_base = d_slot_ids + p * page_size;
+  err = cudaMemcpy(d_pages, pages.data(), num_pages * sizeof(PagePlanDev),
+                   cudaMemcpyHostToDevice);
+  VK_ENSURES(err == cudaSuccess, "cudaMemcpy for plan page descriptors failed");
+  impl->d_pages = d_pages;
+
+  return impl;
+}
+
+}  // namespace
+
+P2PKvRestorePlan::P2PKvRestorePlan(void* k_dst, void* v_dst,
+                                   std::size_t num_slots,
+                                   std::size_t num_kv_heads,
+                                   std::size_t head_dim, std::size_t elem_size,
+                                   const int* slot_ids,
+                                   const void* const* peer_src_ptrs,
+                                   std::size_t num_pages,
+                                   std::size_t page_size)
+    : impl_(build_impl<true>(k_dst, v_dst, num_slots, num_kv_heads, head_dim,
+                             elem_size, slot_ids, peer_src_ptrs, num_pages,
+                             page_size).release()) {}
+
+P2PKvRestorePlan::P2PKvRestorePlan(vkernels::comm::from_device_slots_t,
+                                   void* k_dst, void* v_dst,
+                                   std::size_t num_slots,
+                                   std::size_t num_kv_heads,
+                                   std::size_t head_dim, std::size_t elem_size,
+                                   const int* device_indices,
+                                   const void* const* peer_src_ptrs,
+                                   std::size_t num_pages,
+                                   std::size_t page_size)
+    : impl_(build_impl<false>(k_dst, v_dst, num_slots, num_kv_heads, head_dim,
+                              elem_size, device_indices, peer_src_ptrs,
+                              num_pages, page_size).release()) {}
+
+P2PKvRestorePlan::~P2PKvRestorePlan() {
+  if (!impl_) return;
+  if (impl->owns_slot_ids && impl->slot_ids)
+    cudaFree(const_cast<int*>(impl_->slot_ids));
+  if (impl_->d_pages) cudaFree(impl_->d_pages);
+  delete impl_;
+}
+
+std::size_t P2PKvRestorePlan::num_pages() const { return impl_->num_pages; }
+std::size_t P2PKvRestorePlan::num_kv_heads() const { return impl_->num_kv_heads; }
+std::size_t P2PKvRestorePlan::head_dim() const { return impl_->head_dim; }
+std::size_t P2PKvRestorePlan::elem_size() const { return impl_->elem_size; }
+std::size_t P2PKvRestorePlan::num_slots() const { return impl_->num_slots; }
+std::size_t P2PKvRestorePlan::page_size() const { return impl_->page_size; }
+std::size_t P2PKvRestorePlan::total_bytes() const { return impl_->total_bytes; }
+
+void P2PKvRestorePlan::execute(std::size_t source_layer_offset_bytes,
+                               cudaStream_t stream) const {
+  if (impl_->num_pages == 0) return;
+  launch_plan_kernel(impl_->k_dst, impl_->v_dst, impl_->d_pages,
+                     impl_->num_pages, impl_->page_size, impl_->slot_bytes,
+                     impl_->token_stride,
+                     static_cast<unsigned long long>(source_layer_offset_bytes),
+                     stream);
 }
 
 }  // namespace cuda

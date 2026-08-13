@@ -389,4 +389,334 @@ TEST(P2pKvRestoreCAbi, ConcurrentStreams) {
   cudaFree(dk1); cudaFree(dv1); cudaFree(ds0); cudaFree(ds1);
 }
 
+// ---------------------------------------------------------------------------
+// Prepared plan (issue #27)
+// ---------------------------------------------------------------------------
+//
+// A plan validates and uploads metadata once at create; execute_offset()
+// only launches one page-by-token-group kernel with a scalar source-layer
+// offset. These tests pin the plan to the one-shot C ABI byte-for-byte
+// (including the offset path and the device-slot variant), exercise two
+// concurrent streams on one plan, and check the contract checks now return
+// status codes at create time.
+
+// Device-allocate and H2D-copy a host vector.
+uint8_t* to_device(const std::vector<uint8_t>& h) {
+  uint8_t* d = nullptr;
+  ASSERT_TRUE(cudaMalloc(&d, h.size()) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(d, h.data(), h.size(), cudaMemcpyHostToDevice) ==
+              cudaSuccess);
+  return d;
+}
+int* ints_to_device(const int* h, size_t n) {
+  int* d = nullptr;
+  ASSERT_TRUE(cudaMalloc(&d, n * sizeof(int)) == cudaSuccess);
+  ASSERT_TRUE(cudaMemcpy(d, h, n * sizeof(int), cudaMemcpyHostToDevice) ==
+              cudaSuccess);
+  return d;
+}
+
+TEST(P2pKvRestoreCAbi, PlanFusedEqualsOneShot) {
+  constexpr size_t kPageSize = 4, kHeads = 4, kHeadDim = 16, kElem = 2;
+  constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;
+  constexpr size_t kSlots = 16;
+
+  auto h0 = patterned(page_bytes(kPageSize, kHeads, kHeadDim, kElem), 0x11);
+  auto h1 = patterned(page_bytes(kPageSize, kHeads, kHeadDim, kElem), 0x77);
+  const int h_slots[8] = {3, 1, 14, 7, 0, 9, 6, 12};
+  uint8_t* d0 = to_device(h0);
+  uint8_t* d1 = to_device(h1);
+  int* d_slots = ints_to_device(h_slots, 8);
+  uint8_t *dk_p = nullptr, *dv_p = nullptr, *dk_o = nullptr, *dv_o = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dk_p, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv_p, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dk_o, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv_o, kSlots * kSlotBytes) == cudaSuccess);
+  fill_device(dk_p, kSlots * kSlotBytes, 0xCC); fill_device(dv_p, kSlots * kSlotBytes, 0xCC);
+  fill_device(dk_o, kSlots * kSlotBytes, 0xCC); fill_device(dv_o, kSlots * kSlotBytes, 0xCC);
+
+  const void* ptrs[2] = {d0, d1};
+  vkernels_status_t st;
+  vkernels_p2p_kv_restore_plan_t* plan =
+      vkernels_p2p_kv_restore_plan_create(
+          dk_p, dv_p, kSlots, kHeads, kHeadDim, kElem, h_slots, ptrs, 2,
+          kPageSize, &st);
+  ASSERT_TRUE(plan != nullptr);
+  ASSERT_EQ(st, VKERNELS_OK);
+
+  // Execute the plan (layer 0). The plan uploaded its own copy of d_slots
+  // at create, so the caller may free d_slots now; keep it for the
+  // one-shot oracle below.
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, 0, 0),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const size_t offs[2] = {0, 0};
+  ASSERT_EQ(vkernels_p2p_kv_restore_layer(
+                dk_o, dv_o, d_slots, ptrs, offs, 2, kPageSize, kHeads,
+                kHeadDim, kElem, 0),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+
+  ASSERT_TRUE(device_equal(dk_p, dk_o, kSlots * kSlotBytes));
+  ASSERT_TRUE(device_equal(dv_p, dv_o, kSlots * kSlotBytes));
+
+  vkernels_p2p_kv_restore_plan_destroy(plan);
+  cudaFree(d0); cudaFree(d1); cudaFree(d_slots);
+  cudaFree(dk_p); cudaFree(dv_p); cudaFree(dk_o); cudaFree(dv_o);
+}
+
+// Two layers per peer buffer; the plan selects layer 1 with one scalar
+// offset, the one-shot uses per-page src_page_offsets.
+TEST(P2pKvRestoreCAbi, PlanOffsetMatchesPerPageOffset) {
+  constexpr size_t kPageSize = 2, kHeads = 2, kHeadDim = 8, kElem = 2;
+  constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;   // 32
+  constexpr size_t kTokenStr = 2 * kSlotBytes;                // 64
+  constexpr size_t kLayerBytes = kPageSize * kTokenStr;       // 128
+  constexpr size_t kSlots = 8;
+
+  auto buf0 = patterned(page_bytes(kPageSize * 2, kHeads, kHeadDim, kElem), 0x20);
+  auto buf1 = patterned(page_bytes(kPageSize * 2, kHeads, kHeadDim, kElem), 0xA0);
+  const int h_slots[4] = {2, 5, 1, 6};
+  uint8_t* d0 = to_device(buf0);
+  uint8_t* d1 = to_device(buf1);
+  int* d_slots = ints_to_device(h_slots, 4);
+  uint8_t *dk_p = nullptr, *dv_p = nullptr, *dk_o = nullptr, *dv_o = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dk_p, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv_p, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dk_o, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv_o, kSlots * kSlotBytes) == cudaSuccess);
+  fill_device(dk_p, kSlots * kSlotBytes, 0xCC); fill_device(dv_p, kSlots * kSlotBytes, 0xCC);
+  fill_device(dk_o, kSlots * kSlotBytes, 0xCC); fill_device(dv_o, kSlots * kSlotBytes, 0xCC);
+
+  const void* ptrs[2] = {d0, d1};
+  vkernels_status_t st;
+  vkernels_p2p_kv_restore_plan_t* plan =
+      vkernels_p2p_kv_restore_plan_create(
+          dk_p, dv_p, kSlots, kHeads, kHeadDim, kElem, h_slots, ptrs, 2,
+          kPageSize, &st);
+  ASSERT_TRUE(plan != nullptr);
+  ASSERT_EQ(st, VKERNELS_OK);
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, kLayerBytes, 0),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const size_t offs[2] = {kLayerBytes, kLayerBytes};
+  ASSERT_EQ(vkernels_p2p_kv_restore_layer(
+                dk_o, dv_o, d_slots, ptrs, offs, 2, kPageSize, kHeads,
+                kHeadDim, kElem, 0),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+
+  ASSERT_TRUE(device_equal(dk_p, dk_o, kSlots * kSlotBytes));
+  ASSERT_TRUE(device_equal(dv_p, dv_o, kSlots * kSlotBytes));
+
+  vkernels_p2p_kv_restore_plan_destroy(plan);
+  cudaFree(d0); cudaFree(d1); cudaFree(d_slots);
+  cudaFree(dk_p); cudaFree(dv_p); cudaFree(dk_o); cudaFree(dv_o);
+}
+
+// One plan on two streams (the KVAAS "one run list, many layers" reuse).
+TEST(P2pKvRestoreCAbi, PlanTwoStreams) {
+  constexpr size_t kPageSize = 2, kHeads = 1, kHeadDim = 8, kElem = 2;
+  constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;   // 16
+  constexpr size_t kTokenStr = 2 * kSlotBytes;                // 32
+  constexpr size_t kSlots = 4;
+
+  auto buf = patterned(page_bytes(kPageSize * 2, kHeads, kHeadDim, kElem), 0x05);
+  const int h_slots[2] = {1, 2};
+  uint8_t* db = to_device(buf);
+  int* d_slots = ints_to_device(h_slots, 2);
+  uint8_t *dk = nullptr, *dv = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dk, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv, kSlots * kSlotBytes) == cudaSuccess);
+  fill_device(dk, kSlots * kSlotBytes, 0xCC); fill_device(dv, kSlots * kSlotBytes, 0xCC);
+
+  const void* ptrs[1] = {db};
+  vkernels_status_t st;
+  vkernels_p2p_kv_restore_plan_t* plan =
+      vkernels_p2p_kv_restore_plan_create(
+          dk, dv, kSlots, kHeads, kHeadDim, kElem, h_slots, ptrs, 1,
+          kPageSize, &st);
+  ASSERT_TRUE(plan != nullptr);
+  ASSERT_EQ(st, VKERNELS_OK);
+
+  cudaStream_t s0, s1;
+  ASSERT_TRUE(cudaStreamCreate(&s0) == cudaSuccess);
+  ASSERT_TRUE(cudaStreamCreate(&s1) == cudaSuccess);
+  // Both executes read layer 0 (same offset), so the final state is
+  // deterministic regardless of which stream wins the shared-destination
+  // write — this tests concurrent plan sharing (no deadlock, no metadata
+  // mutation) rather than relying on cross-stream write ordering.
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, 0, s0),
+            VKERNELS_OK);
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, 0, s1),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaStreamSynchronize(s0) == cudaSuccess);
+  ASSERT_TRUE(cudaStreamSynchronize(s1) == cudaSuccess);
+
+  // Slot 1 = layer 0 token 0; slot 2 = layer 0 token 1 (both streams read
+  // layer 0, so the final state is deterministic).
+  std::vector<uint8_t> hk(kSlots * kSlotBytes), hv(kSlots * kSlotBytes);
+  cudaMemcpy(hk.data(), dk, hk.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpy(hv.data(), dv, hv.size(), cudaMemcpyDeviceToHost);
+  const uint8_t* layer0 = buf.data();
+  for (size_t i = 0; i < kSlotBytes; ++i) {
+    ASSERT_EQ(hk[1 * kSlotBytes + i], layer0[0 * kTokenStr + i]);
+    ASSERT_EQ(hv[1 * kSlotBytes + i], layer0[0 * kTokenStr + kSlotBytes + i]);
+    ASSERT_EQ(hk[2 * kSlotBytes + i], layer0[1 * kTokenStr + i]);
+    ASSERT_EQ(hv[2 * kSlotBytes + i], layer0[1 * kTokenStr + kSlotBytes + i]);
+  }
+
+  cudaStreamDestroy(s0); cudaStreamDestroy(s1);
+  vkernels_p2p_kv_restore_plan_destroy(plan);
+  cudaFree(db); cudaFree(d_slots); cudaFree(dk); cudaFree(dv);
+}
+
+// Device-slot variant: the plan borrows the caller's CUDA slot pointer and
+// must match the one-shot (which uses the same device pointer).
+TEST(P2pKvRestoreCAbi, PlanDeviceSlotsMatchesOneShot) {
+  constexpr size_t kPageSize = 2, kHeads = 2, kHeadDim = 8, kElem = 2;
+  constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;   // 32
+  constexpr size_t kSlots = 8;
+
+  auto h0 = patterned(page_bytes(kPageSize, kHeads, kHeadDim, kElem), 0x44);
+  auto h1 = patterned(page_bytes(kPageSize, kHeads, kHeadDim, kElem), 0x88);
+  const int h_slots[4] = {3, 0, 7, 5};
+  uint8_t* d0 = to_device(h0);
+  uint8_t* d1 = to_device(h1);
+  int* d_slots = ints_to_device(h_slots, 4);
+  uint8_t *dk_p = nullptr, *dv_p = nullptr, *dk_o = nullptr, *dv_o = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dk_p, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv_p, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dk_o, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv_o, kSlots * kSlotBytes) == cudaSuccess);
+  fill_device(dk_p, kSlots * kSlotBytes, 0xCC); fill_device(dv_p, kSlots * kSlotBytes, 0xCC);
+  fill_device(dk_o, kSlots * kSlotBytes, 0xCC); fill_device(dv_o, kSlots * kSlotBytes, 0xCC);
+
+  const void* ptrs[2] = {d0, d1};
+  vkernels_status_t st;
+  vkernels_p2p_kv_restore_plan_t* plan =
+      vkernels_p2p_kv_restore_plan_create_device_slots(
+          dk_p, dv_p, kSlots, kHeads, kHeadDim, kElem, d_slots, ptrs, 2,
+          kPageSize, &st);
+  ASSERT_TRUE(plan != nullptr);
+  ASSERT_EQ(st, VKERNELS_OK);
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, 0, 0),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const size_t offs[2] = {0, 0};
+  ASSERT_EQ(vkernels_p2p_kv_restore_layer(
+                dk_o, dv_o, d_slots, ptrs, offs, 2, kPageSize, kHeads,
+                kHeadDim, kElem, 0),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+
+  ASSERT_TRUE(device_equal(dk_p, dk_o, kSlots * kSlotBytes));
+  ASSERT_TRUE(device_equal(dv_p, dv_o, kSlots * kSlotBytes));
+
+  // The device-slot plan borrows d_slots: it must stay alive until after the
+  // plan is destroyed (destroy does not sync streams, but we synced above).
+  vkernels_p2p_kv_restore_plan_destroy(plan);
+  cudaFree(d0); cudaFree(d1); cudaFree(d_slots);
+  cudaFree(dk_p); cudaFree(dv_p); cudaFree(dk_o); cudaFree(dv_o);
+}
+
+// Contract checks now return status codes at create time.
+TEST(P2pKvRestoreCAbi, PlanRejectsDuplicateSlot) {
+  auto h = patterned(page_bytes(2, 2, 4, 2), 0x10);
+  uint8_t* d = to_device(h);
+  int h_slots[2] = {1, 1};
+  int* d_slots = ints_to_device(h_slots, 2);
+  uint8_t *dk = nullptr, *dv = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dk, 4 * 2 * 4 * 2) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv, 4 * 2 * 4 * 2) == cudaSuccess);
+  const void* ptrs[1] = {d};
+  vkernels_status_t st = VKERNELS_OK;
+  vkernels_p2p_kv_restore_plan_t* plan =
+      vkernels_p2p_kv_restore_plan_create(dk, dv, 4, 2, 4, 2, h_slots, ptrs,
+                                          1, 2, &st);
+  ASSERT_TRUE(plan == nullptr);
+  ASSERT_EQ(st, VKERNELS_ERR_INVALID_ARGUMENT);
+  cudaFree(d); cudaFree(d_slots); cudaFree(dk); cudaFree(dv);
+}
+
+TEST(P2pKvRestoreCAbi, PlanRejectsNonBF16) {
+  uint8_t* dk = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dk, 4 * 2 * 4 * 4) == cudaSuccess);
+  const void* ptrs[1] = {(void*)0x1000};
+  int slot = 0;
+  vkernels_status_t st = VKERNELS_OK;
+  vkernels_p2p_kv_restore_plan_t* plan =
+      vkernels_p2p_kv_restore_plan_create(dk, dk, 4, 2, 4, 4, &slot, ptrs,
+                                          1, 1, &st);
+  ASSERT_TRUE(plan == nullptr);
+  ASSERT_EQ(st, VKERNELS_ERR_INVALID_ARGUMENT);
+  cudaFree(dk);
+}
+
+TEST(P2pKvRestoreCAbi, PlanZeroPagesIsNoOp) {
+  uint8_t* dk = nullptr;
+  uint8_t* dv = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dk, 4 * 2 * 4 * 2) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv, 4 * 2 * 4 * 2) == cudaSuccess);
+  fill_device(dk, 4 * 2 * 4 * 2, 0xAB);
+  fill_device(dv, 4 * 2 * 4 * 2, 0xAB);
+  vkernels_status_t st = VKERNELS_OK;
+  vkernels_p2p_kv_restore_plan_t* plan =
+      vkernels_p2p_kv_restore_plan_create(dk, dv, 4, 2, 4, 2, nullptr,
+                                          nullptr, 0, 64, &st);
+  ASSERT_TRUE(plan != nullptr);
+  ASSERT_EQ(st, VKERNELS_OK);
+  ASSERT_EQ(vkernels_p2p_kv_restore_plan_execute_offset(plan, 0, 0),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+  ASSERT_TRUE(device_equal(dk, dv, 4 * 2 * 4 * 2));  // both still 0xAB
+  vkernels_p2p_kv_restore_plan_destroy(plan);
+  cudaFree(dk); cudaFree(dv);
+}
+
+// Indexed scatter C ABI (the second stage of the two-path).
+TEST(P2pKvRestoreCAbi, ScatterMatchesTwoStage) {
+  constexpr size_t kPageSize = 2, kHeads = 2, kHeadDim = 16, kElem = 2;
+  constexpr size_t kSlotBytes = kHeads * kHeadDim * kElem;
+  constexpr size_t kScratchPerPage = kPageSize * 2 * kSlotBytes;
+  constexpr size_t kSlots = 8;
+
+  std::vector<uint8_t> h_scratch(2 * kScratchPerPage);
+  for (size_t i = 0; i < h_scratch.size(); ++i)
+    h_scratch[i] = static_cast<uint8_t>(0x30 + (i % 200));
+  const int h_slots[4] = {3, 1, 6, 4};
+
+  uint8_t* d_scratch = to_device(h_scratch);
+  int* d_slots = ints_to_device(h_slots, 4);
+  uint8_t *dk_s = nullptr, *dv_s = nullptr, *dk_t = nullptr, *dv_t = nullptr;
+  ASSERT_TRUE(cudaMalloc(&dk_s, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv_s, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dk_t, kSlots * kSlotBytes) == cudaSuccess);
+  ASSERT_TRUE(cudaMalloc(&dv_t, kSlots * kSlotBytes) == cudaSuccess);
+  fill_device(dk_s, kSlots * kSlotBytes, 0xCC); fill_device(dv_s, kSlots * kSlotBytes, 0xCC);
+  fill_device(dk_t, kSlots * kSlotBytes, 0xCC); fill_device(dv_t, kSlots * kSlotBytes, 0xCC);
+
+  ASSERT_EQ(vkernels_p2p_kv_scatter(dk_s, dv_s, d_scratch, d_slots, 2,
+                                    kPageSize, kHeads, kHeadDim, kElem, 0),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const void* ptrs[2] = {d_scratch, d_scratch + kScratchPerPage};
+  const size_t offs[2] = {0, 0};
+  ASSERT_EQ(vkernels_p2p_kv_restore_layer_twostage(
+                dk_t, dv_t, d_slots, ptrs, offs, 2, kPageSize, kHeads,
+                kHeadDim, kElem, 0),
+            VKERNELS_OK);
+  ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
+
+  ASSERT_TRUE(device_equal(dk_s, dk_t, kSlots * kSlotBytes));
+  ASSERT_TRUE(device_equal(dv_s, dv_t, kSlots * kSlotBytes));
+
+  cudaFree(d_scratch); cudaFree(d_slots);
+  cudaFree(dk_s); cudaFree(dv_s); cudaFree(dk_t); cudaFree(dv_t);
+}
+
 #endif  // VKERNELS_C_HAS_CUDA

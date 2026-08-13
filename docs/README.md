@@ -267,9 +267,19 @@ Fuses peer gather + indexed scatter into one kernel:
 | Function | Computation |
 |---|---|
 | `p2p_kv_restore(k_dst, v_dst, slot_ids, peer_src_ptrs, ...)` | Reads KV data directly from peer UVA and writes into indexed K/V slot destinations |
+| `kv_scatter(k_dst, v_dst, scratch, slot_ids, ...)` | Indexed scatter of an already-gathered contiguous scratch buffer (the second stage, for the PR #9 gather+scatter baseline) |
 
 - Eliminates the intermediate scratch buffer and separate scatter launch.
 - **File**: `src/c/vkernels/comm/p2p_kv_restore.cpp` (CPU), `.cu` (CUDA)
+
+**Prepared plan (issue #27)** — `P2PKvRestorePlan` (host + CUDA) and the C
+ABI `vkernels_p2p_kv_restore_plan_t` validate the slot map and upload the
+page descriptors ONCE; `execute(source_layer_offset_bytes, stream)` then
+launches a single page-by-token-group kernel, reusing one plan across all
+40 model layers with no per-layer allocation or H2D copy. A
+`from_device_slots` constructor variant borrows a caller-owned device slot
+pointer (e.g. SGLang's radix-tree `device_indices`) to avoid a D2H sync at
+construction.
 
 ### Compute/communication overlap
 
