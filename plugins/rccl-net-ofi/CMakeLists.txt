@@ -19,6 +19,9 @@ endif()
 # librt.so-equivalent HIP bits; a plain cc cannot link hiprt).
 enable_language(HIP)
 
+add_library(rccl-net-ofi SHARED rccl_net_ofi.c)
+add_library(vkernels::rccl-net-ofi ALIAS rccl-net-ofi)
+
 # Portable symbol export (the loader dlsym's `nccl_ofi_net`).
 add_compile_definitions($<$<COMPILE_LANGUAGE:C>:
   DLL_EXPORT=__attribute__\(\(visibility\("default"\)\)\)>)
@@ -28,9 +31,6 @@ if(APPLE)
 else()
   target_compile_options(rccl-net-ofi PRIVATE -fvisibility=hidden)
 endif()
-
-add_library(rccl-net-ofi SHARED rccl_net_ofi.c)
-add_library(vkernels::rccl-net-ofi ALIAS rccl-net-ofi)
 
 target_include_directories(rccl-net-ofi PRIVATE ${VKERNELS_OFI_INCLUDE_DIRS})
 target_link_libraries(rccl-net-ofi PRIVATE ${VKERNELS_OFI_LIBRARIES})
