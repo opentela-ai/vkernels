@@ -184,7 +184,8 @@ RcclChannel::RcclChannel(RcclComm* comm, int peer, hipStream_t_hip stream,
   if (hipMalloc(&send_buf_, chunk_bytes_) != hipSuccess)
     throw std::runtime_error("vkernels::comm::hip: hipMalloc(send) failed");
   if (hipMalloc(&recv_buf_, chunk_bytes_) != hipSuccess) {
-    hipFree(send_buf_);
+    auto _e = hipFree(send_buf_);  // best-effort rollback before throwing
+    (void)_e;
     throw std::runtime_error("vkernels::comm::hip: hipMalloc(recv) failed");
   }
 }
