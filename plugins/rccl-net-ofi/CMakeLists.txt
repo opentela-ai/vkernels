@@ -25,9 +25,9 @@ enable_language(C)
 add_library(rccl-net-ofi SHARED rccl_net_ofi.c)
 add_library(vkernels::rccl-net-ofi ALIAS rccl-net-ofi)
 
-# Portable symbol export (the loader dlsym's `nccl_ofi_net`).
-add_compile_definitions($<$<COMPILE_LANGUAGE:C>:
-  DLL_EXPORT=__attribute__\(\(visibility\("default"\)\)\)>)
+# The export attribute is applied directly on `nccl_ofi_net` in the source;
+# -fvisibility=hidden (or -exported_symbol on macOS) hides every other symbol
+# so the RCCL loader only resolves `nccl_ofi_net`.
 if(APPLE)
   set_property(TARGET rccl-net-ofi APPEND PROPERTY
     LINK_FLAGS "-Wl,-exported_symbol,_nccl_ofi_net")

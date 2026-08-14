@@ -174,7 +174,7 @@ static ncclStatus ofi_plugin_close_listen(void* listenComm) { (void)listenComm; 
 // The single symbol RCCL dlsym's when NCCL_NET=librccl-net-ofi. Pure C:
 // links only libfabric, never libcudart or the HIP runtime, so it inits
 // on ROCm alongside a CUDA-built plugin that cannot.
-DLL_EXPORT
+__attribute__((visibility("default")))
 const ncclNet nccl_ofi_net = {
   .name = "librccl-net-ofi",
   .init = ofi_plugin_init,
