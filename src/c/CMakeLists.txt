@@ -14,6 +14,7 @@ target_sources(vkernels
     vkernels/kernels/elementwise.cpp
     vkernels/kernels/reduce.cpp
     vkernels/kernels/gemm.cpp
+    vkernels/kernels/gemm_bf16.cpp
     vkernels/kernels/moe.cpp
     vkernels/kernels/moe_fused.cpp
     vkernels/kernels/moe_aux.cpp
@@ -65,7 +66,8 @@ if(VKERNELS_HAS_HIP)
     PRIVATE
       vkernels/kernels/moe.hip
       vkernels/kernels/moe_fused.hip
-      vkernels/kernels/moe_aux.hip)
+      vkernels/kernels/moe_aux.hip
+      vkernels/kernels/gemm_bf16.hip)
   set_target_properties(vkernels PROPERTIES HIP_SEPARABLE_COMPILATION ON)
 endif()
 

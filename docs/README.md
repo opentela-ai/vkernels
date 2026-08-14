@@ -53,6 +53,38 @@ or `Error::InvalidArgument` (Rust).
 
 ---
 
+## GEMM (bf16 MFMA, gfx942)
+
+A tiled bf16 dense matrix multiply built on the AMD K16 bf16 MFMA
+(`__builtin_amdgcn_mfma_f32_16x16x16bf16_1k`) for the **Kimi-K3 projection
+shapes** — the ones that today fall back to AITER's untuned
+"torch solution:0" because `bf16_tuned_gemm.csv` has no gfx942 entries.
+
+| Function | Computation | Data type | GPU backend |
+|---|---|---|---|
+| `gemm_bf16_cpu(M, N, K, α, A, B, β, C)` | `C = α·A@B + β·C` (per-output fp32 dot, single RNE bf16 store) | bf16 (uint16_t) | CPU (oracle) |
+| `gemm_bf16_config_for(M, N, K, &bm, &bn, &bk, &threads)` | serving `M≤64`→`(16,16,64)` (measured; `BN=16` saturates the 228 CUs, 1.4–2.9× over `BN=64`), warmup `M>64`→`(64,64,256)`, `BK=64` | — | CPU |
+| `hip::gemm_bf16(M, N, K, α, A, B, β, C)` | tiled K16-MFMA GEMM, cooperative `uint2` loads, M/N/K bounds-checked | bf16 (uint16_t) | HIP |
+
+- **Layout**: `A` is M×K, `B` is K×N (the **transposed** projection
+  weight `W[N,K].T`), `C` is M×N. All K3 `K` are multiples of 64, so
+  `BK=64` never triggers its (defensive) K bounds-check; `N` is a
+  multiple of 16 (e.g. 6288 is 393×16, not a multiple of 64), handled by
+  a column bounds-check.
+- **MFMA fragment layout** mirrors the empirically verified `mfma_k64_pf`
+  helper in `moe_fused.hip` (A `m=lane%16`, B `n=lane%16`, C
+  `col=lane%16, row=(lane/16)*4+i`), generalised to arbitrary `(BM, BN)`.
+- **Files**: `src/c/vkernels/kernels/gemm_bf16.{hpp,cpp,hip}`;
+  `hip::gemm_bf16_with_config` (the explicit-tile dispatcher used by the
+  autotuner) is forward-declared by the harnesses, not in the public
+  header (keeps discovery at three entries).
+- **Tests**: `tests/kernels/gemm/test_gemm_bf16.cpp` (host),
+  `meta/benchmarks/test_gemm_bf16_correct.hip` (device vs CPU).
+- **Docs**: [kernels/gemm_bf16.md](kernels/gemm_bf16.md),
+  [performance/gemm-bf16/gfx942.md](performance/gemm-bf16/gfx942.md)
+
+---
+
 ## MoE (Mixture of Experts) — AMD gfx942 / CDNA3 low-level primitives
 
 These fill gaps where CDNA4-only (gfx950) instructions used in the AITER flydsl
@@ -352,6 +384,7 @@ src/c/vkernels/
 │   ├── elementwise.{cpp,cu}     # add, scale, relu
 │   ├── reduce.{cpp,cu}          # sum, max
 │   ├── gemm.{cpp,cu}            # tiled SGEMM
+│   ├── gemm_bf16.{cpp,hip}      # bf16 K16-MFMA GEMM (gfx942, #29)
 │   ├── moe.{cpp,hip}            # gfx942 primitives (#12–#15)
 │   ├── moe_aux.{cpp,hip}        # MXFP4 MoE orchestration: quant, sort, scatter-reduce (#22)
 │   └── moe_fused.{cpp,hip}      # fused MXFP4 MoE grouped GEMM
