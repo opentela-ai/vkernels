@@ -19,7 +19,19 @@ from vkernels.kernels import (
     add,
     fused_moe_mxfp4,
     gemm,
+    gemm_bf16,
+    gemm_bf16_config,
+    kda_delta_rule_fwd,
+    kda_delta_rule_intra,
+    kda_delta_rule_inter,
+    kda_gla_fwd_o,
+    kda_gate_chunk_cumsum,
+    kda_layer_norm_gated,
+    kda_naive_delta_rule_fwd,
+    kda_pack_bitmatrix,
     max as vk_max,
+    mla_fwd,
+    mla_config,
     moe_align_block_size,
     mxfp4_moe_quant,
     mxfp4_moe_scatter_reduce,
@@ -967,6 +979,488 @@ class MoeAuxTest(unittest.TestCase):
         counts = np.bincount((sorted_ids[real] // top_k).astype(np.int64), minlength=M)
         active = np.where(counts > 0)[0]
         self.assertTrue(np.all(np.any(out[active] != 0.0, axis=1)))
+
+
+# ---------------------------------------------------------------------------
+# bf16 GEMM, MLA, KDA: contract + backend-consistency tests (issues #21, #29).
+# The low-level C++ kernels live in src/c/vkernels/kernels/{gemm_bf16,mla,kda}.
+# and are exposed both as a compiled pybind11 backend and a pure-Python
+# mirror (vkernels._fallback). The tests below mirror the host C++ tests in
+# tests/kernels/{gemm/test_gemm_bf16,attn/test_mla,attn/test_kda}.cpp.
+# ---------------------------------------------------------------------------
+
+
+def _run_under(impl, fn):
+    """Run ``fn`` with ``kernels._impl`` temporarily set to ``impl``."""
+    prev = kernels._impl
+    try:
+        kernels._impl = impl
+        return fn()
+    finally:
+        kernels._impl = prev
+
+
+def _bf16_ref(M, N, K, alpha, A, B, beta, C):
+    """Independent fp32+RNE bf16 GEMM oracle (mirrors test_gemm_bf16.cpp ref)."""
+    out = C.copy()
+    for i in range(M):
+        for j in range(N):
+            acc = 0.0
+            for k in range(K):
+                acc += _bf2f(int(A[i * K + k])) * _bf2f(int(B[k * N + j]))
+            prev = _bf2f(int(out[i * N + j])) if beta != 0.0 else 0.0
+            out[i * N + j] = _f2bf(float(alpha * acc + beta * prev))
+    return out
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class GemmBf16Test(unittest.TestCase):
+    def test_identity_alpha_one_beta_zero(self):
+        A = np.array([_f2bf(1), _f2bf(2), _f2bf(3), _f2bf(4)],
+                     dtype=np.uint16).reshape(2, 2)
+        I = np.array([_f2bf(1), _f2bf(0), _f2bf(0), _f2bf(1)],
+                     dtype=np.uint16).reshape(2, 2)
+        C = gemm_bf16(A, I)
+        self.assertEqual(C.dtype, np.uint16)
+        np.testing.assert_allclose(
+            [_bf2f(int(v)) for v in C.ravel()], [1.0, 2.0, 3.0, 4.0], atol=1e-6
+        )
+
+    def test_non_square_and_beta_accumulation(self):
+        A = np.array([_f2bf(v) for v in (1, 2, 3, 4, 5, 6)],
+                     dtype=np.uint16).reshape(2, 3)
+        B = np.array([_f2bf(v) for v in (7, 8, 9, 10, 11, 12)],
+                     dtype=np.uint16).reshape(3, 2)
+        C = np.array([_f2bf(1)] * 4, dtype=np.uint16).reshape(2, 2)
+        got = gemm_bf16(A, B, alpha=1.0, beta=2.0, out=C)
+        self.assertIs(got, C)
+        exp = _bf16_ref(2, 2, 3, 1.0, A.ravel(), B.ravel(), 2.0,
+                        np.array([_f2bf(1)] * 4, dtype=np.uint16))
+        np.testing.assert_array_equal(C.ravel(), exp)
+
+    def test_config_serving_shape_picks_16x16(self):
+        self.assertEqual(gemm_bf16_config(8, 6288, 7168), (16, 16, 64, 64))
+        bm, bn, bk, th = gemm_bf16_config(64, 128, 512)
+        self.assertEqual((bm, bn, th), (16, 16, 64))
+
+    def test_config_warmup_shape_picks_64x64(self):
+        self.assertEqual(gemm_bf16_config(8192, 6288, 7168), (64, 64, 64, 256))
+        bm, bn, bk, th = gemm_bf16_config(65, 128, 64)
+        self.assertEqual((bm, bk, th), (64, 64, 256))
+
+    def test_out_dtype_and_shape_validated(self):
+        A = np.array([_f2bf(1)] * 4, dtype=np.uint16).reshape(2, 2)
+        with self.assertRaises(TypeError):
+            gemm_bf16(A, A, out=np.zeros(4, dtype=np.float32))  # wrong dtype
+        with self.assertRaises(ValueError):
+            gemm_bf16(A, A, out=np.zeros(3, dtype=np.uint16))   # wrong size
+
+    def test_inner_dim_mismatch_raises(self):
+        A = np.zeros((2, 3), dtype=np.uint16)
+        B = np.zeros((4, 2), dtype=np.uint16)
+        with self.assertRaises(ValueError):
+            gemm_bf16(A, B)
+
+    def test_empty_is_no_op(self):
+        C = np.array([_f2bf(5), _f2bf(6), _f2bf(7), _f2bf(8)], dtype=np.uint16)
+        E = C.copy()
+        out = gemm_bf16(np.zeros((0, 2), dtype=np.uint16),
+                        np.zeros((2, 2), dtype=np.uint16))
+        self.assertEqual(out.shape, (0, 2))
+        np.testing.assert_array_equal(C, E)
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency_bit_exact(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(29)
+        for (M, N, K) in [(3, 5, 2), (8, 8, 8), (13, 11, 9)]:
+            A = np.array([_f2bf(float(rng.uniform(-4, 4)))
+                          for _ in range(M * K)], dtype=np.uint16).reshape(M, K)
+            B = np.array([_f2bf(float(rng.uniform(-4, 4)))
+                          for _ in range(K * N)], dtype=np.uint16).reshape(K, N)
+            c = _run_under(core, lambda A=A, B=B: gemm_bf16(A, B).copy())
+            f = _run_under(fb, lambda A=A, B=B: gemm_bf16(A, B).copy())
+            np.testing.assert_array_equal(c, f)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class MlaFwdTest(unittest.TestCase):
+    def test_hand_checked(self):
+        # B=1 H=1 S_q=2 S_kv=2, lr=2 rhd=2, scale = 1/sqrt(4) = 0.5
+        q = np.array([1, 0, 0, 0, 0, 1, 1, 0], dtype=_F32).reshape(1, 1, 2, 4)
+        k_c = np.array([1, 0, 0, 1], dtype=_F32).reshape(1, 2, 2)
+        k_pe = np.array([0, 1, 1, 0], dtype=_F32).reshape(1, 2, 2)
+        v_c = np.array([5, 6, 7, 8], dtype=_F32).reshape(1, 2, 2)
+        out = mla_fwd(q, k_c, k_pe, v_c, scale=0.5)
+        self.assertEqual(out.shape, (1, 1, 2, 2))
+        self.assertEqual(out.dtype, _F32)
+        # q0 attends only k0 (causal): out0 = v_c[0] = [5, 6]
+        np.testing.assert_allclose(out[0, 0, 0], [5.0, 6.0], atol=1e-6)
+        # q1 attends k0,k1: s0=0,s1=1 -> w1=1/(1+e^-1); out1=w0*[5,6]+w1*[7,8]
+        import math
+        w1 = 1.0 / (1.0 + math.exp(-1.0))
+        w0 = 1.0 - w1
+        np.testing.assert_allclose(out[0, 0, 1],
+                                   [w0 * 5 + w1 * 7, w0 * 6 + w1 * 8],
+                                   atol=1e-6)
+
+    def test_causal_mask_via_q_start_kv_start(self):
+        # q_start=2: only j with 2+j <= 2+i are attended. With kv_start=0 and
+        # S_q=S_kv, query i attends exactly keys [0, i] (shifted by q_start-2).
+        rng = np.random.default_rng(5)
+        B, H, S, lr, rhd = 1, 1, 4, 2, 1
+        q = rng.standard_normal((B, H, S, lr + rhd)).astype(_F32)
+        k_c = rng.standard_normal((B, S, lr)).astype(_F32)
+        k_pe = rng.standard_normal((B, S, rhd)).astype(_F32)
+        v_c = rng.standard_normal((B, S, lr)).astype(_F32)
+        full = mla_fwd(q, k_c, k_pe, v_c, q_start=0, kv_start=0, scale=0.25)
+        # The last query (i=S-1) sees all keys; the first (i=0) sees only k0.
+        self.assertTrue(np.all(np.isfinite(full[0, 0, -1])))
+
+    def test_all_masked_row_is_zero(self):
+        # kv_start=10: every key is in the future relative to q (gqi=0,1 <
+        # kv_start+j=10,11), so no key is ever attended and the output is zero.
+        q = np.zeros((1, 1, 2, 4), dtype=_F32)
+        k_c = np.ones((1, 2, 2), dtype=_F32)
+        k_pe = np.ones((1, 2, 2), dtype=_F32)
+        v_c = np.array([[5.0, 6.0], [7.0, 8.0]], dtype=_F32).reshape(1, 2, 2)
+        out = mla_fwd(q, k_c, k_pe, v_c, q_start=0, kv_start=10, scale=1.0)
+        np.testing.assert_array_equal(out, np.zeros((1, 1, 2, 2), dtype=_F32))
+
+    def test_config_selector(self):
+        self.assertEqual(mla_config(1, 512, 64), (1, 64, 64))
+        self.assertEqual(mla_config(8, 512, 64), (1, 64, 64))
+        self.assertEqual(mla_config(9, 512, 64), (4, 64, 256))
+
+    def test_shape_inference_and_validation(self):
+        q = np.zeros((1, 1, 2, 4), dtype=_F32)
+        k_c = np.zeros((1, 2, 2), dtype=_F32)
+        k_pe = np.zeros((1, 2, 2), dtype=_F32)
+        v_c = np.zeros((1, 2, 2), dtype=_F32)
+        out = mla_fwd(q, k_c, k_pe, v_c)
+        self.assertEqual(out.shape, (1, 1, 2, 2))
+        # q last dim must equal lr + rhd
+        bad = np.zeros((1, 1, 2, 5), dtype=_F32)
+        with self.assertRaises(ValueError):
+            mla_fwd(bad, k_c, k_pe, v_c)
+        with self.assertRaises(ValueError):
+            mla_fwd(q, np.zeros((1, 3, 2), dtype=_F32), k_pe, v_c)  # S_kv
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(31)
+        for (B, H, Sq, Skv, lr, rhd) in [(1, 1, 2, 2, 2, 2), (1, 2, 4, 4, 2, 2),
+                                         (2, 1, 6, 6, 3, 1), (1, 1, 3, 3, 2, 2)]:
+            q = rng.standard_normal((B, H, Sq, lr + rhd)).astype(_F32)
+            k_c = rng.standard_normal((B, Skv, lr)).astype(_F32)
+            k_pe = rng.standard_normal((B, Skv, rhd)).astype(_F32)
+            v_c = rng.standard_normal((B, Skv, lr)).astype(_F32)
+            sc = np.float32(1.0 / np.sqrt(lr + rhd))
+            c = _run_under(core, lambda q=q, kc=k_c, kp=k_pe, vc=v_c, sc=sc:
+                           mla_fwd(q, kc, kp, vc, scale=sc).copy())
+            f = _run_under(fb, lambda q=q, kc=k_c, kp=k_pe, vc=v_c, sc=sc:
+                           mla_fwd(q, kc, kp, vc, scale=sc).copy())
+            np.testing.assert_allclose(c, f, rtol=1e-5, atol=1e-6)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class KdaLayerNormGatedTest(unittest.TestCase):
+    def test_identity_weight_and_unit_gate(self):
+        # weight=1, gate=5 -> silu(5)~4.966; x all ones -> rms=1 -> out~silu(5).
+        x = np.ones((1, 4), dtype=_F32)
+        w = np.ones(4, dtype=_F32)
+        gate = np.full((1, 4), 5.0, dtype=_F32)
+        out = kda_layer_norm_gated(x, w, gate)
+        import math
+        silu5 = 5.0 / (1.0 + math.exp(-5.0))
+        np.testing.assert_allclose(out, np.full((1, 4), silu5, dtype=_F32),
+                                   atol=1e-5)
+
+    def test_zero_gate_zero_output(self):
+        x = np.full((2, 3), 7.0, dtype=_F32)
+        w = np.full(3, 2.0, dtype=_F32)
+        gate = np.zeros((2, 3), dtype=_F32)
+        out = kda_layer_norm_gated(x, w, gate)
+        np.testing.assert_allclose(out, np.zeros((2, 3), dtype=_F32), atol=1e-6)
+
+    def test_rms_normalizes_then_scales(self):
+        # x=[3,4,0,0] -> rms=sqrt((9+16)/4)=2.5; gate=10 -> silu(10)~9.9995.
+        import math
+        x = np.array([3, 4, 0, 0], dtype=_F32).reshape(1, 4)
+        w = np.ones(4, dtype=_F32)
+        gate = np.full((1, 4), 10.0, dtype=_F32)
+        out = kda_layer_norm_gated(x, w, gate, eps=1e-12)
+        s = 10.0 / (1.0 + math.exp(-10.0))
+        np.testing.assert_allclose(out[0, 0], 3.0 / 2.5 * s, atol=1e-5)
+        np.testing.assert_allclose(out[0, 1], 4.0 / 2.5 * s, atol=1e-5)
+        np.testing.assert_allclose(out[0, 2:], [0.0, 0.0], atol=1e-6)
+
+    def test_shape_validation(self):
+        x = np.ones((2, 4), dtype=_F32)
+        with self.assertRaises(ValueError):
+            kda_layer_norm_gated(x, np.ones(3, dtype=_F32), np.ones((2, 4), dtype=_F32))
+        with self.assertRaises(ValueError):
+            kda_layer_norm_gated(x, np.ones(4, dtype=_F32), np.ones((2, 3), dtype=_F32))
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(33)
+        for (N, D) in [(1, 4), (4, 8), (7, 3), (2, 16)]:
+            x = rng.standard_normal((N, D)).astype(_F32)
+            w = rng.standard_normal(D).astype(_F32)
+            g = rng.standard_normal((N, D)).astype(_F32)
+            c = _run_under(core, lambda x=x, w=w, g=g:
+                           kda_layer_norm_gated(x, w, g).copy())
+            f = _run_under(fb, lambda x=x, w=w, g=g:
+                           kda_layer_norm_gated(x, w, g).copy())
+            np.testing.assert_allclose(c, f, rtol=1e-5, atol=1e-6)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class KdaGateChunkCumsumTest(unittest.TestCase):
+    def test_matches_independent_refs(self):
+        import math
+        B, H, nc, cs = 1, 1, 3, 4
+        rng = np.random.default_rng(11)
+        g = (0.3 + 0.7 * rng.random((B, H, nc, cs))).astype(_F32)
+        intra, inter = kda_gate_chunk_cumsum(g)
+        self.assertEqual(intra.shape, (B, H, nc, cs))
+        self.assertEqual(inter.shape, (B, H, nc))
+        # intra[c,t] = sum_{l<=t} log(g[c,l])
+        for c in range(nc):
+            acc = 0.0
+            for t in range(cs):
+                acc += math.log(float(g[0, 0, c, t]))
+                self.assertAlmostEqual(float(intra[0, 0, c, t]), acc, places=5)
+        # inter[c] = sum_{c'<c} intra[c', cs-1]
+        for c in range(nc):
+            acc = 0.0
+            for cp in range(c):
+                acc += float(intra[0, 0, cp, cs - 1])
+            self.assertAlmostEqual(float(inter[0, 0, c]), acc, places=5)
+
+    def test_zero_gate_clamped(self):
+        # g==0 in chunk 1 -> that chunk's intra drops to the floor (~-1e9).
+        g = np.array([1.0, 1.0, 0.0, 0.0], dtype=_F32).reshape(1, 1, 2, 2)
+        intra, inter = kda_gate_chunk_cumsum(g)
+        self.assertAlmostEqual(float(intra[0, 0, 0, 0]), 0.0, places=5)
+        self.assertAlmostEqual(float(intra[0, 0, 0, 1]), 0.0, places=5)
+        self.assertLess(float(intra[0, 0, 1, 0]), -1.0e8)
+        self.assertLess(float(intra[0, 0, 1, 1]), -1.0e8)
+        self.assertAlmostEqual(float(inter[0, 0, 0]), 0.0, places=5)
+        self.assertAlmostEqual(float(inter[0, 0, 1]), 0.0, places=5)
+
+    def test_shape_validation(self):
+        with self.assertRaises(ValueError):
+            kda_gate_chunk_cumsum(np.zeros((1, 1, 2), dtype=_F32))  # not 4-D
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(35)
+        for (B, H, nc, cs) in [(1, 1, 2, 4), (2, 2, 3, 4), (1, 1, 5, 8)]:
+            g = (0.3 + 0.7 * rng.random((B, H, nc, cs))).astype(_F32)
+            ic, ec = _run_under(core, lambda g=g: kda_gate_chunk_cumsum(g))
+            if_, ef_ = _run_under(fb, lambda g=g: kda_gate_chunk_cumsum(g))
+            np.testing.assert_allclose(ic, if_, rtol=1e-6, atol=1e-6)
+            np.testing.assert_allclose(ec, ef_, rtol=1e-6, atol=1e-6)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class KdaNaiveDeltaRuleTest(unittest.TestCase):
+    def test_tiny_recurrence(self):
+        # B=1 H=1 S=2 D=1 with g=1, beta=1: S_1 = v_1 (S_0=0); o_1 = S_1*q_1.
+        # S_2 = S_1 + (v_2 - S_1*k_2)*k_2; o_2 = S_2*q_2.
+        q = np.array([[[[2.0], [3.0]]]], dtype=_F32)
+        k = np.array([[[[1.0], [2.0]]]], dtype=_F32)
+        v = np.array([[[[5.0], [7.0]]]], dtype=_F32)
+        g = np.array([[[1.0, 1.0]]], dtype=_F32)
+        beta = np.array([[[1.0, 1.0]]], dtype=_F32)
+        out = kda_naive_delta_rule_fwd(q, k, v, g, beta)
+        # S_1 = 0 + 1*(5-0)*1 = 5; o_1 = 5*2 = 10
+        self.assertAlmostEqual(float(out[0, 0, 0, 0]), 10.0, places=5)
+        # S_2 = 1*5 + 1*(7-5*2)*2 = 5 + (7-10)*2 = 5-6 = -1; o_2 = -1*3 = -3
+        self.assertAlmostEqual(float(out[0, 0, 1, 0]), -3.0, places=5)
+
+    def test_shape_and_out(self):
+        rng = np.random.default_rng(1)
+        q = rng.standard_normal((1, 2, 8, 4)).astype(_F32)
+        k = rng.standard_normal((1, 2, 8, 4)).astype(_F32)
+        v = rng.standard_normal((1, 2, 8, 4)).astype(_F32)
+        g = (0.3 + 0.7 * rng.random((1, 2, 8))).astype(_F32)
+        b = (0.3 + 0.7 * rng.random((1, 2, 8))).astype(_F32)
+        out = np.empty((1, 2, 8, 4), dtype=_F32)
+        got = kda_naive_delta_rule_fwd(q, k, v, g, b, out=out)
+        self.assertIs(got, out)
+        self.assertTrue(np.all(np.isfinite(out)))
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency_bit_exact(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(37)
+        for (B, H, S, D) in [(1, 1, 8, 4), (1, 2, 12, 6), (2, 1, 16, 4)]:
+            q = rng.standard_normal((B, H, S, D)).astype(_F32)
+            k = rng.standard_normal((B, H, S, D)).astype(_F32)
+            v = rng.standard_normal((B, H, S, D)).astype(_F32)
+            g = (0.3 + 0.7 * rng.random((B, H, S))).astype(_F32)
+            b = (0.3 + 0.7 * rng.random((B, H, S))).astype(_F32)
+            c = _run_under(core, lambda q=q, k=k, v=v, g=g, b=b:
+                           kda_naive_delta_rule_fwd(q, k, v, g, b).copy())
+            f = _run_under(fb, lambda q=q, k=k, v=v, g=g, b=b:
+                           kda_naive_delta_rule_fwd(q, k, v, g, b).copy())
+            np.testing.assert_array_equal(c, f)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class KdaDeltaRuleFwdTest(unittest.TestCase):
+    """Chunked forward (L2..L6) vs the per-token naive oracle."""
+
+    def _args(self, B, H, S, D, rng):
+        q = rng.standard_normal((B, H, S, D)).astype(_F32)
+        k = rng.standard_normal((B, H, S, D)).astype(_F32)
+        v = rng.standard_normal((B, H, S, D)).astype(_F32)
+        g = (0.3 + 0.7 * rng.random((B, H, S))).astype(_F32)
+        beta = (0.3 + 0.7 * rng.random((B, H, S))).astype(_F32)
+        return q, k, v, g, beta
+
+    def test_chunked_matches_naive(self):
+        rng = np.random.default_rng(123)
+        for (B, H, S, D, cs) in [(1, 1, 4, 2, 2), (1, 1, 8, 4, 4),
+                                 (1, 2, 8, 3, 4), (2, 1, 12, 4, 4),
+                                 (1, 1, 16, 4, 8), (1, 1, 64, 8, 16)]:
+            q, k, v, g, beta = self._args(B, H, S, D, rng)
+            naive = kda_naive_delta_rule_fwd(q, k, v, g, beta)
+            chunked = kda_delta_rule_fwd(q, k, v, g, beta, chunk_size=cs)
+            maxd = float(np.max(np.abs(naive - chunked)))
+            maxabs = float(np.max(np.abs(naive)))
+            self.assertLessEqual(maxd, 1e-3 * (1.0 + maxabs))
+
+    def test_zero_forgetting_matches_naive(self):
+        rng = np.random.default_rng(7)
+        B, H, S, D, cs = 1, 1, 12, 4, 4
+        q = rng.standard_normal((B, H, S, D)).astype(_F32)
+        k = rng.standard_normal((B, H, S, D)).astype(_F32)
+        v = rng.standard_normal((B, H, S, D)).astype(_F32)
+        g = np.ones((B, H, S), dtype=_F32)
+        beta = np.full((B, H, S), 0.5, dtype=_F32)
+        naive = kda_naive_delta_rule_fwd(q, k, v, g, beta)
+        chunked = kda_delta_rule_fwd(q, k, v, g, beta, chunk_size=cs)
+        maxd = float(np.max(np.abs(naive - chunked)))
+        maxabs = float(np.max(np.abs(naive)))
+        self.assertLessEqual(maxd, 1e-3 * (1.0 + maxabs))
+
+    def test_chunk_size_must_divide_s(self):
+        q = np.ones((1, 1, 8, 1), dtype=_F32)
+        k = np.ones_like(q); v = np.ones_like(q)
+        g = np.ones((1, 1, 8), dtype=_F32); b = np.ones((1, 1, 8), dtype=_F32)
+        with self.assertRaises(ValueError):
+            kda_delta_rule_fwd(q, k, v, g, b, chunk_size=3)  # 8 % 3 != 0
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(41)
+        for (B, H, S, D, cs) in [(1, 1, 8, 4, 4), (1, 2, 16, 4, 8),
+                                 (2, 1, 16, 4, 8), (1, 1, 32, 6, 8)]:
+            q, k, v, g, beta = self._args(B, H, S, D, rng)
+            c = _run_under(core, lambda q=q, k=k, v=v, g=g, b=beta, cs=cs:
+                           kda_delta_rule_fwd(q, k, v, g, b, chunk_size=cs).copy())
+            f = _run_under(fb, lambda q=q, k=k, v=v, g=g, b=beta, cs=cs:
+                           kda_delta_rule_fwd(q, k, v, g, b, chunk_size=cs).copy())
+            np.testing.assert_allclose(c, f, rtol=1e-5, atol=1e-6)
+
+
+@unittest.skipUnless(_COMPILED, "compiled backend not available")
+class KdaPipelineTest(unittest.TestCase):
+    """The standalone stages (intra -> inter loop -> gla_fwd_o) must
+    compose to the full chunked forward (mirrors test_kda.cpp)."""
+
+    def _pipeline(self, q, k, v, g, beta, cs):
+        B, H, S, D = q.shape
+        nc = S // cs
+        intra_log, inter = kda_gate_chunk_cumsum(g.reshape(B, H, nc, cs))
+        u = np.zeros((B, H, S, D), dtype=_F32)
+        ist = np.zeros((B, H, nc + 1, D, D), dtype=_F32)
+        for c in range(nc):
+            kda_delta_rule_intra(q, k, v, g, beta, intra_log, ist,
+                                 u=u, chunk_size=cs, chunk_idx=c)
+            kda_delta_rule_inter(k, v, g, beta, intra_log, u,
+                                 inter_state=ist, chunk_size=cs, chunk_idx=c)
+        return kda_gla_fwd_o(q, k, g, beta, intra_log, ist, u, chunk_size=cs)
+
+    def test_pipeline_matches_full_forward(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(43)
+        for (B, H, S, D, cs) in [(1, 1, 8, 4, 4), (1, 1, 64, 8, 16),
+                                 (2, 2, 32, 6, 8), (1, 2, 16, 4, 8)]:
+            q = rng.standard_normal((B, H, S, D)).astype(_F32)
+            k = rng.standard_normal((B, H, S, D)).astype(_F32)
+            v = rng.standard_normal((B, H, S, D)).astype(_F32)
+            g = (0.3 + 0.7 * rng.random((B, H, S))).astype(_F32)
+            b = (0.3 + 0.7 * rng.random((B, H, S))).astype(_F32)
+            full_c = _run_under(core, lambda q=q, k=k, v=v, g=g, b=b, cs=cs:
+                                kda_delta_rule_fwd(q, k, v, g, b,
+                                                   chunk_size=cs).copy())
+            pipe_c = _run_under(core, lambda q=q, k=k, v=v, g=g, b=b, cs=cs:
+                                self._pipeline(q, k, v, g, b, cs).copy())
+            # On the compiled backend the stages compose bit-exactly.
+            np.testing.assert_array_equal(pipe_c, full_c)
+            pipe_f = _run_under(fb, lambda q=q, k=k, v=v, g=g, b=b, cs=cs:
+                                self._pipeline(q, k, v, g, b, cs).copy())
+            np.testing.assert_allclose(pipe_f, full_c, rtol=1e-5, atol=1e-6)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class KdaPackBitmatrixTest(unittest.TestCase):
+    def test_hand_checked(self):
+        # 10 bits: 1,0,1,1,0,0,0,1, 0,1 -> 0xB1, 0x40
+        bits = np.array([1, 0, 1, 1, 0, 0, 0, 1, 0, 1], dtype=np.uint8)
+        packed = kda_pack_bitmatrix(bits)
+        self.assertEqual(packed.dtype, np.uint8)
+        self.assertEqual(list(packed), [0xB1, 0x40])
+
+    def test_round_trip(self):
+        rng = np.random.default_rng(3)
+        for _ in range(10):
+            n = int(1 + rng.integers(0, 200))
+            bits = rng.integers(0, 2, size=n).astype(np.uint8)
+            packed = kda_pack_bitmatrix(bits)
+            self.assertEqual(packed.size, (n + 7) // 8)
+            for k in range(n):
+                byte = k // 8
+                bit = 7 - (k % 8)
+                self.assertEqual((int(packed[byte]) >> bit) & 1, int(bits[k]))
+
+    def test_partial_n_bits(self):
+        # bits = 1,0,1,1,0,0,0,1, 0,1  (index 8 = 0, index 9 = 1).
+        bits = np.array([1, 0, 1, 1, 0, 0, 0, 1, 0, 1], dtype=np.uint8)
+        self.assertEqual(list(kda_pack_bitmatrix(bits, n_bits=8)), [0xB1])
+        # n_bits=9: byte1 holds only bit index 8 (=0) -> 0x00.
+        self.assertEqual(list(kda_pack_bitmatrix(bits, n_bits=9)), [0xB1, 0x00])
+        # n_bits=10: byte1 holds bit index 8 (=0) and index 9 (=1) -> 0x40.
+        self.assertEqual(list(kda_pack_bitmatrix(bits, n_bits=10)), [0xB1, 0x40])
+        with self.assertRaises(ValueError):
+            kda_pack_bitmatrix(bits, n_bits=11)  # exceeds bits.size
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency_bit_exact(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(47)
+        for n in [8, 10, 7, 16, 1, 13]:
+            bits = rng.integers(0, 2, size=n).astype(np.uint8)
+            c = _run_under(core, lambda bits=bits: np.asarray(kda_pack_bitmatrix(bits)).copy())
+            f = _run_under(fb, lambda bits=bits: np.asarray(kda_pack_bitmatrix(bits)).copy())
+            np.testing.assert_array_equal(c, f)
 
 
 if __name__ == "__main__":
