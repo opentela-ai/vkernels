@@ -189,3 +189,18 @@ See [`docs/rust-bindings.md`](docs/rust-bindings.md) for the full API.
 
 Bootstrapped. The infrastructure (build, CUDA gating, testing, coverage, CI) is in place
 and the reference implementations are wired up with passing, fully-covered tests.
+
+### Kimi-K3 hybrid attention (issues #21, #29)
+
+- **MLA** — Multi-head Latent Attention forward (absorbed form, online
+  softmax), gfx942. See [`docs/kernels/mla.md`](docs/kernels/mla.md).
+- **KDA** — the seven Kimi Delta Attention kernels (gated RMSNorm,
+  gate chunk-cumsum, the gated delta-rule forward and its intra/inter/
+  output sub-kernels, and bit-matrix packing), gfx942. The host reference
+  is the cross-checked oracle; the device forward is a correctness-first
+  cooperative recurrence. See [`docs/kernels/kda.md`](docs/kernels/kda.md).
+- **bf16 GEMM** — tiled K16 bf16 MFMA GEMM for the K3 projection shapes.
+  See [`docs/kernels/gemm_bf16.md`](docs/kernels/gemm_bf16.md).
+
+A K3-shaped forward (MLA + KDA layers) runs on gfx942 and matches the
+CPU/torch reference; `K3_DISABLE_KDA=1` is no longer required.

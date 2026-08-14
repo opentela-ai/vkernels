@@ -14,7 +14,14 @@ endfunction()
 
 function(vkernels_apply_coverage target)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(${target} PRIVATE --coverage)
+    # `-fprofile-update=prefer-atomic`: thread-safe counter updates.  The
+    # default (single) mode emits plain increments, so a test that runs
+    # collectives on multiple threads (ring all-reduce, the distributed MoE
+    # ranks) tears the shared counters: gcov then reports negative branch
+    # counts and flips covered lines to uncovered, making the 100 % gate
+    # nondeterministic.  Atomic updates cost a little but keep the gate
+    # reliable.
+    target_compile_options(${target} PRIVATE --coverage -fprofile-update=prefer-atomic)
     target_link_options(${target} PRIVATE --coverage)
     target_compile_definitions(${target} PRIVATE VKERNELS_COVERAGE_BUILD=1)
   endif()

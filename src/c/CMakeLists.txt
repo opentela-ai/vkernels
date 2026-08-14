@@ -14,13 +14,18 @@ target_sources(vkernels
     vkernels/kernels/elementwise.cpp
     vkernels/kernels/reduce.cpp
     vkernels/kernels/gemm.cpp
+    vkernels/kernels/gemm_bf16.cpp
     vkernels/kernels/moe.cpp
     vkernels/kernels/moe_fused.cpp
+    vkernels/kernels/moe_aux.cpp
+    vkernels/kernels/mla.cpp
+    vkernels/kernels/kda.cpp
     vkernels/comm/channel.cpp
     vkernels/comm/allreduce.cpp
     vkernels/comm/overlap.cpp
     vkernels/comm/p2p_gather.cpp
     vkernels/comm/p2p_kv_restore.cpp
+    vkernels/dist/dist_moe.cpp
     vkernels/capi/capi.cpp
 )
 
@@ -62,7 +67,11 @@ if(VKERNELS_HAS_HIP)
   target_sources(vkernels
     PRIVATE
       vkernels/kernels/moe.hip
-      vkernels/kernels/moe_fused.hip)
+      vkernels/kernels/moe_fused.hip
+      vkernels/kernels/moe_aux.hip
+      vkernels/kernels/gemm_bf16.hip
+      vkernels/kernels/mla.hip
+      vkernels/kernels/kda.hip)
   set_target_properties(vkernels PROPERTIES HIP_SEPARABLE_COMPILATION ON)
 endif()
 

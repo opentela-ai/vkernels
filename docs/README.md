@@ -53,6 +53,38 @@ or `Error::InvalidArgument` (Rust).
 
 ---
 
+## GEMM (bf16 MFMA, gfx942)
+
+A tiled bf16 dense matrix multiply built on the AMD K16 bf16 MFMA
+(`__builtin_amdgcn_mfma_f32_16x16x16bf16_1k`) for the **Kimi-K3 projection
+shapes** — the ones that today fall back to AITER's untuned
+"torch solution:0" because `bf16_tuned_gemm.csv` has no gfx942 entries.
+
+| Function | Computation | Data type | GPU backend |
+|---|---|---|---|
+| `gemm_bf16_cpu(M, N, K, α, A, B, β, C)` | `C = α·A@B + β·C` (per-output fp32 dot, single RNE bf16 store) | bf16 (uint16_t) | CPU (oracle) |
+| `gemm_bf16_config_for(M, N, K, &bm, &bn, &bk, &threads)` | serving `M≤64`→`(16,16,64)` (measured; `BN=16` saturates the 228 CUs, 1.4–2.9× over `BN=64`), warmup `M>64`→`(64,64,256)`, `BK=64` | — | CPU |
+| `hip::gemm_bf16(M, N, K, α, A, B, β, C)` | tiled K16-MFMA GEMM, cooperative `uint2` loads, M/N/K bounds-checked | bf16 (uint16_t) | HIP |
+
+- **Layout**: `A` is M×K, `B` is K×N (the **transposed** projection
+  weight `W[N,K].T`), `C` is M×N. All K3 `K` are multiples of 64, so
+  `BK=64` never triggers its (defensive) K bounds-check; `N` is a
+  multiple of 16 (e.g. 6288 is 393×16, not a multiple of 64), handled by
+  a column bounds-check.
+- **MFMA fragment layout** mirrors the empirically verified `mfma_k64_pf`
+  helper in `moe_fused.hip` (A `m=lane%16`, B `n=lane%16`, C
+  `col=lane%16, row=(lane/16)*4+i`), generalised to arbitrary `(BM, BN)`.
+- **Files**: `src/c/vkernels/kernels/gemm_bf16.{hpp,cpp,hip}`;
+  `hip::gemm_bf16_with_config` (the explicit-tile dispatcher used by the
+  autotuner) is forward-declared by the harnesses, not in the public
+  header (keeps discovery at three entries).
+- **Tests**: `tests/kernels/gemm/test_gemm_bf16.cpp` (host),
+  `meta/benchmarks/test_gemm_bf16_correct.hip` (device vs CPU).
+- **Docs**: [kernels/gemm_bf16.md](kernels/gemm_bf16.md),
+  [performance/gemm-bf16/gfx942.md](performance/gemm-bf16/gfx942.md)
+
+---
+
 ## MoE (Mixture of Experts) — AMD gfx942 / CDNA3 low-level primitives
 
 These fill gaps where CDNA4-only (gfx950) instructions used in the AITER flydsl
@@ -121,6 +153,35 @@ crashed for >64-thread blocks on gfx90a.
 
 ---
 
+## MoE Aux — MXFP4 orchestration (quant, sort, scatter-reduce)
+
+The five per-block data-movement primitives from issue #22 that bracket a
+grouped MXFP4 GEMM: per-token / per-group activation quantization,
+token→expert gather (activation **and** scales), and the routed
+scatter-reduce combine (fp32 partials, plus a bandwidth-reduced MXFP4 form
+that dequantizes inline). On gfx950 these are AITER's
+`module_moe_mxfp4_aux` (its ~82 KB LDS exceeds the gfx942 / MI300A 64 KB
+limit), so vkernels re-implements them as portable host references + HIP
+kernels.
+
+| Function | Computation |
+|---|---|
+| `mxfp4_moe_quant(A, group_size)` | bf16 → packed E2M1 + ue8m0 per group (low nibble = even K) |
+| `mxfp4_moe_sort(A, sorted_ids, top_k)` | gather `A` into expert-grouped, block-aligned `[EM, hidden]` (pad rows zeroed) |
+| `mxfp4_moe_sort_scales(scales, sorted_ids, top_k)` | same gather for the per-token ue8m0 scales |
+| `mxfp4_moe_scatter_reduce(partial, topk_w, sorted_ids, M, width, top_k)` | bias-free weighted scatter-add of fp32 partials → `out[M, hidden]` |
+| `mxfp4_moe_scatter_reduce_q(partial_q, partial_s, topk_w, …, group_size)` | same combine with the partial in MXFP4, dequantized inline |
+
+- `moe_align_block_size` (above) produces `sorted_ids`; the pipeline is
+  `align → sort → quant → sort_scales → fused_moe_mxfp4 → scatter_reduce[_q]`.
+- Scale bytes are clamped to `[1, 254]` (never `0`); `0xFF` is the explicit
+  zero-group flag. Largest finite E2M1 is `FP4_MAX = 3.0`.
+- **Files**: `src/c/vkernels/kernels/moe_aux.cpp` (CPU), `.hip` (HIP)
+- **Python**: `vkernels.kernels.mxfp4_moe_{quant,sort,sort_scales,scatter_reduce,scatter_reduce_q}`
+- **Docs**: [kernels/moe_aux.md](kernels/moe_aux.md)
+
+---
+
 ## MoE Fused — End-to-end MXFP4 grouped GEMM
 
 Implements the full xkernels `fused_moe_mxfp4` interface by wiring together
@@ -160,6 +221,29 @@ out[M, hidden] += act @ w2^T · topk_w_sorted + b2
   is required for `top_k > 1`, where the same token appears in multiple
   experts and would otherwise race.
 - The caller must zero-initialise `out` (down-combine accumulates into it).
+
+### Distributed (TP / EP / PP) — issue #18
+
+The fused kernel is single-device; `vkernels.dist` (C++ `dist/dist_moe.hpp`,
+Python `vkernels.dist`) shards the weights so per-rank shards are consumed
+verbatim by the fused kernel's stage functions, and provides the
+orchestration around them:
+
+- **TP** — gate/up weights split along `hidden`, down weights along `ispp`;
+  the linear stages are separated (`moe_gateup_cpu` / `moe_down_cpu`) so
+  rank partials can be all-reduced *before* the nonlinear epilogues.  The
+  multi-rank forward matches the CPU oracle.
+- **EP** — experts partitioned across ranks; `moe_ep_dispatch` produces the
+  all-to-all / sort re-layout with local expert ids.
+- **PP** — `pp_boundary_send`/`recv` fix the stage-boundary transfer
+  interface (graph-capturable primitive, issue #10) and `round_bf16`
+  re-quantises the bf16 stage input.
+- **Files**: `src/c/vkernels/dist/dist_moe.cpp` (+ `.hpp`), stage split in
+  `src/c/vkernels/kernels/moe_fused.{cpp,hip}`, Python `src/python/vkernels/dist.py`
+- **Tests**: `tests/kernels/moe/test_dist_moe.cpp`,
+  `tests/python/test_dist.py`, `meta/benchmarks/test_moe_fused_dist_correct.hip`
+  (GPU vs CPU oracle)
+- **Docs**: [kernels/moe_dist.md](kernels/moe_dist.md)
 
 ### Expert alignment helper
 
@@ -244,9 +328,30 @@ Fuses peer gather + indexed scatter into one kernel:
 | Function | Computation |
 |---|---|
 | `p2p_kv_restore(k_dst, v_dst, slot_ids, peer_src_ptrs, ...)` | Reads KV data directly from peer UVA and writes into indexed K/V slot destinations |
+| `kv_scatter(k_dst, v_dst, scratch, slot_ids, ...)` | Indexed scatter of an already-gathered contiguous scratch buffer (the second stage, for the PR #9 gather+scatter baseline) |
 
 - Eliminates the intermediate scratch buffer and separate scatter launch.
 - **File**: `src/c/vkernels/comm/p2p_kv_restore.cpp` (CPU), `.cu` (CUDA)
+
+**Prepared plan (issue #27)** — `P2PKvRestorePlan` (host + CUDA) and the C
+ABI `vkernels_p2p_kv_restore_plan_t` validate the slot map and upload the
+page descriptors ONCE; `execute(k_dst, v_dst, source_layer_offset_bytes,
+stream)` then launches a single page-by-token-group kernel. The destination
+is taken per call because KVAAS/SGLang keep a distinct K/V pair per model
+layer — one plan fans one run list out across all 40 layers with no
+per-layer allocation or H2D copy. Three creation modes:
+
+- Host `slot_ids` (`const int*`): validated at create, owned copy uploaded.
+- `from_device_slots` (`const int*`, e.g. SGLang's `device_indices`):
+  borrows the device pointer, no D2H sync, no content validation.
+- `from_device_slots_int64` (`const int64_t*`): SGLang's `torch.int64`
+  indices; converted at create (device-side on CUDA, no sync) into an owned
+  int32 buffer so the caller may free the int64 buffer immediately.
+
+The C ABI mirrors all three (`vkernels_p2p_kv_restore_plan_create`,
+`..._create_device_slots`, `..._create_device_slots_int64`) plus
+`vkernels_p2p_kv_restore_plan_execute_offset(plan, k_dst, v_dst, offset,
+stream)`.
 
 ### Compute/communication overlap
 
@@ -279,7 +384,9 @@ src/c/vkernels/
 │   ├── elementwise.{cpp,cu}     # add, scale, relu
 │   ├── reduce.{cpp,cu}          # sum, max
 │   ├── gemm.{cpp,cu}            # tiled SGEMM
+│   ├── gemm_bf16.{cpp,hip}      # bf16 K16-MFMA GEMM (gfx942, #29)
 │   ├── moe.{cpp,hip}            # gfx942 primitives (#12–#15)
+│   ├── moe_aux.{cpp,hip}        # MXFP4 MoE orchestration: quant, sort, scatter-reduce (#22)
 │   └── moe_fused.{cpp,hip}      # fused MXFP4 MoE grouped GEMM
 ├── comm/
 │   ├── allreduce.{cpp,cu}       # ring all-reduce
