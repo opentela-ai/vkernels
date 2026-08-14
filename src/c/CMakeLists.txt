@@ -16,6 +16,7 @@ target_sources(vkernels
     vkernels/kernels/gemm.cpp
     vkernels/kernels/moe.cpp
     vkernels/kernels/moe_fused.cpp
+    vkernels/kernels/moe_aux.cpp
     vkernels/comm/channel.cpp
     vkernels/comm/allreduce.cpp
     vkernels/comm/overlap.cpp
@@ -63,7 +64,8 @@ if(VKERNELS_HAS_HIP)
   target_sources(vkernels
     PRIVATE
       vkernels/kernels/moe.hip
-      vkernels/kernels/moe_fused.hip)
+      vkernels/kernels/moe_fused.hip
+      vkernels/kernels/moe_aux.hip)
   set_target_properties(vkernels PROPERTIES HIP_SEPARABLE_COMPILATION ON)
 endif()
 

@@ -220,12 +220,18 @@ def gemm(A, B, alpha: float = 1.0, beta: float = 0.0, out=None) -> np.ndarray:
     M, K = a_arr.shape
     k2, N = b_arr.shape
     if K != k2:
-        raise ValueError(
-            f"inner dimensions must match: A is {M}x{K} but B is {k2}x{N}"
-        )
+        raise ValueError(f"inner dimensions must match: A is {M}x{K} but B is {k2}x{N}")
     out_arr = _as_out(M * N, out, "out")
-    _impl.gemm(M, N, K, float(np.float32(alpha)), a_arr, b_arr,
-               float(np.float32(beta)), out_arr)
+    _impl.gemm(
+        M,
+        N,
+        K,
+        float(np.float32(alpha)),
+        a_arr,
+        b_arr,
+        float(np.float32(beta)),
+        out_arr,
+    )
     if out_arr.shape != (M, N):
         out_arr = out_arr.reshape(M, N)
     return out_arr
@@ -236,8 +242,7 @@ def gemm(A, B, alpha: float = 1.0, beta: float = 0.0, out=None) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def direct_lds_fill_bf16(lds_dst: int, global_src: int,
-                         elements: int) -> None:
+def direct_lds_fill_bf16(lds_dst: int, global_src: int, elements: int) -> None:
     """Copy ``elements`` bf16 values from a global-memory address to an LDS
     address (plain memcpy on the host; vectorised loads + LDS stores in the
     HIP path).
@@ -261,8 +266,7 @@ def direct_lds_fill_bf16(lds_dst: int, global_src: int,
         >>> list(dst)
         [16256, 16384, 16448, 16512]
     """
-    _impl.direct_lds_fill_bf16(int(lds_dst), int(global_src),
-                               int(elements))
+    _impl.direct_lds_fill_bf16(int(lds_dst), int(global_src), int(elements))
 
 
 def fp4_to_bf16_dequant(packed, scale: float = 1.0) -> np.ndarray:
@@ -303,9 +307,14 @@ def use_async_copy_default() -> bool:
     return _impl.use_async_copy_default()
 
 
-def mfma_f32_16x16x16bf16(c: list[float], a: list[int], b: list[int],
-                          cbsz: int = 0, abid: int = 0,
-                          blgp: int = 0) -> None:
+def mfma_f32_16x16x16bf16(
+    c: list[float],
+    a: list[int],
+    b: list[int],
+    cbsz: int = 0,
+    abid: int = 0,
+    blgp: int = 0,
+) -> None:
     """K16 bf16 MFMA: ``C[0..3] += A[0..1] × B[0..1]`` (16×16×16 bf16,
     accumulator fp32).
 
@@ -332,7 +341,9 @@ def mfma_f32_16x16x16bf16(c: list[float], a: list[int], b: list[int],
         c_copy,
         [int(v) & 0xFFFFFFFF for v in a],
         [int(v) & 0xFFFFFFFF for v in b],
-        int(cbsz), int(abid), int(blgp),
+        int(cbsz),
+        int(abid),
+        int(blgp),
     )
     for i in range(4):
         c[i] = c_copy[i]
@@ -345,8 +356,7 @@ def mfma_f32_16x16x16bf16(c: list[float], a: list[int], b: list[int],
 _BLOCK_M = 16
 
 
-def moe_align_block_size(topk_ids, num_experts: int,
-                         block_size: int = _BLOCK_M):
+def moe_align_block_size(topk_ids, num_experts: int, block_size: int = _BLOCK_M):
     """Map the ``[M, top_k]`` token→expert routing table to the block-aligned
     sorted layout consumed by :func:`fused_moe_mxfp4`.
 
@@ -383,19 +393,32 @@ def moe_align_block_size(topk_ids, num_experts: int,
         raise ValueError("block_size must be positive")
     M, top_k = ids.shape
     sorted_ids, expert_ids, EM = _impl.moe_align_block_size(
-        ids, int(M), int(top_k), int(block_size), int(num_experts))
+        ids, int(M), int(top_k), int(block_size), int(num_experts)
+    )
     return sorted_ids, expert_ids, int(EM)
 
 
-def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
-                    sorted_ids, topk_w, expert_ids,
-                    act_scratch=None, out=None, *,
-                    top_k: int = 1, group_size: int = 32,
-                    swiglu_limit: float = 0.0,
-                    activation: str = "swiglu",
-                    beta: float = 4.0,
-                    linear_beta: float = 25.0,
-                    b13=None, b2=None) -> np.ndarray:
+def fused_moe_mxfp4(
+    A,
+    w13,
+    w13_scale,
+    w2,
+    w2_scale,
+    sorted_ids,
+    topk_w,
+    expert_ids,
+    act_scratch=None,
+    out=None,
+    *,
+    top_k: int = 1,
+    group_size: int = 32,
+    swiglu_limit: float = 0.0,
+    activation: str = "swiglu",
+    beta: float = 4.0,
+    linear_beta: float = 25.0,
+    b13=None,
+    b2=None,
+) -> np.ndarray:
     """Fused MXFP4 MoE grouped GEMM (CPU reference oracle).
 
     Stage 0 — gate_up + activation. With the default ``activation="swiglu"``::
@@ -465,8 +488,7 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
         raise ValueError("w13 must be 3-D [E, 2*ispp, hidden/2]")
     E, two_ispp, h2 = w13_arr.shape
     if h2 * 2 != hidden:
-        raise ValueError(
-            f"w13 last dim must be hidden/2 = {hidden // 2}, got {h2}")
+        raise ValueError(f"w13 last dim must be hidden/2 = {hidden // 2}, got {h2}")
     if two_ispp % 2 != 0:
         raise ValueError("w13 second dim must be even (2*ispp)")
     ispp = two_ispp // 2
@@ -479,7 +501,8 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
     if E2 != E or h2_ != hidden or i2 * 2 != ispp:
         raise ValueError(
             f"w2 must be [E, hidden, ispp/2] = [{E}, {hidden}, {ispp // 2}], "
-            f"got {w2_arr.shape}")
+            f"got {w2_arr.shape}"
+        )
     w2_scale_arr = np.ascontiguousarray(w2_scale, dtype=np.uint8)
 
     sorted_ids_arr = np.ascontiguousarray(sorted_ids, dtype=np.int32)
@@ -491,35 +514,36 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
 
     topk_w_arr = np.ascontiguousarray(topk_w, dtype=np.float32)
     if topk_w_arr.size != EM:
-        raise ValueError(
-            f"topk_w must have EM = {EM} elements, got {topk_w_arr.size}")
+        raise ValueError(f"topk_w must have EM = {EM} elements, got {topk_w_arr.size}")
 
     expert_ids_arr = np.ascontiguousarray(expert_ids, dtype=np.int32)
     if expert_ids_arr.size != EM // _BLOCK_M:
         raise ValueError(
             f"expert_ids must have EM/{_BLOCK_M} = {EM // _BLOCK_M} elements, "
-            f"got {expert_ids_arr.size}")
+            f"got {expert_ids_arr.size}"
+        )
 
     b13_arr = None
     if b13 is not None:
         b13_arr = np.ascontiguousarray(b13, dtype=np.float32)
         if b13_arr.size != E * 2 * ispp:
             raise ValueError(
-                f"b13 must have E*2*ispp = {E * 2 * ispp} elements, "
-                f"got {b13_arr.size}")
+                f"b13 must have E*2*ispp = {E * 2 * ispp} elements, got {b13_arr.size}"
+            )
     b2_arr = None
     if b2 is not None:
         b2_arr = np.ascontiguousarray(b2, dtype=np.float32)
         if b2_arr.size != E * hidden:
             raise ValueError(
-                f"b2 must have E*hidden = {E * hidden} elements, "
-                f"got {b2_arr.size}")
+                f"b2 must have E*hidden = {E * hidden} elements, got {b2_arr.size}"
+            )
 
     if act_scratch is None:
         act_scratch_arr = np.empty(EM * ispp, dtype=np.uint16)
     else:
-        act_scratch_arr = _as_out_typed(act_scratch, np.uint16, EM * ispp,
-                                        "act_scratch")
+        act_scratch_arr = _as_out_typed(
+            act_scratch, np.uint16, EM * ispp, "act_scratch"
+        )
 
     if out is None:
         out_arr = np.zeros(M * hidden, dtype=np.float32)
@@ -528,17 +552,272 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
 
     act_key = activation.lower()
     if act_key not in ("swiglu", "situ"):
-        raise ValueError(
-            f"activation must be 'swiglu' or 'situ', got {activation!r}")
+        raise ValueError(f"activation must be 'swiglu' or 'situ', got {activation!r}")
     act_tag = 0 if act_key == "swiglu" else 1
 
     _impl.fused_moe_mxfp4(
-        A_arr, w13_arr, w13_scale_arr, w2_arr, w2_scale_arr,
-        sorted_ids_arr, topk_w_arr, expert_ids_arr,
-        act_scratch_arr, out_arr,
-        int(M), int(hidden), int(ispp), int(top_k), int(EM),
-        int(group_size), float(np.float32(swiglu_limit)), act_tag,
-        float(np.float32(beta)), float(np.float32(linear_beta)),
-        b13_arr, b2_arr)
+        A_arr,
+        w13_arr,
+        w13_scale_arr,
+        w2_arr,
+        w2_scale_arr,
+        sorted_ids_arr,
+        topk_w_arr,
+        expert_ids_arr,
+        act_scratch_arr,
+        out_arr,
+        int(M),
+        int(hidden),
+        int(ispp),
+        int(top_k),
+        int(EM),
+        int(group_size),
+        float(np.float32(swiglu_limit)),
+        act_tag,
+        float(np.float32(beta)),
+        float(np.float32(linear_beta)),
+        b13_arr,
+        b2_arr,
+    )
 
     return out_arr.reshape(M, hidden)
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 MoE orchestration ops (issue #22)
+#
+# Portable (gfx942) replacement for AITER's gfx950-only `module_moe_mxfp4_aux`.
+# These bracket a grouped MXFP4 GEMM to build a W4A4 MoE serving path:
+#
+#   align  (moe_align_block_size)
+#     -> mxfp4_moe_sort          gather A    [M, hidden]   -> [EM, hidden]
+#     -> mxfp4_moe_quant         E2M1 + ue8m0 per token/block
+#     -> mxfp4_moe_sort_scales   gather scales to sorted row order
+#     -> grouped GEMM (fused_moe_mxfp4)
+#     -> mxfp4_moe_scatter_reduce[_q]   routed combine -> [M, hidden]
+#
+# The fp4 (E2M1) and scale (ue8m0, `s << 23`) layouts are identical to the
+# weight decode in moe.cpp, so a W4A4 GEMM using the same format for A and W
+# is numerically symmetric.
+# ---------------------------------------------------------------------------
+
+
+def mxfp4_moe_quant(A, *, group_size: int = 32):
+    """MXFP4 (E2M1 + ue8m0) per-token, per-group activation quantization.
+
+    The exact inverse of the weight decode in :mod:`vkernels` — bf16
+    activations ``A`` of shape ``(M, hidden)`` are quantized to packed
+    E2M1 (two nibbles per byte, low nibble = even K) plus per-group ue8m0
+    scales, the same layout the grouped GEMM consumes for the weights. A
+    W4A4 GEMM that uses this output for ``A`` is therefore numerically
+    symmetric with the W4A16 weight path.
+
+    Per group of ``group_size`` consecutive hidden elements:
+      * ``amax = max |A[m, g*gs + i]|``
+      * if ``amax == 0`` (or non-finite): scale byte ``0xFF`` (decodes to 0)
+      * else ``e = ceil(log2(amax / 3))``, ``scale = 2^e`` (clamped so the
+        scale byte is in ``[0, 254]``), and each ``A[...] / scale`` is rounded
+        to the nearest representable E2M1 value (ties round to the larger
+        magnitude).
+
+    Args:
+        A: uint16 bf16 array of shape ``(M, hidden)``. ``hidden`` must be
+            divisible by ``group_size`` and even.
+        group_size: ue8m0 scale group length (default 32, the K3 setting).
+
+    Returns:
+        ``(packed, scales)`` — ``packed`` is uint8 ``[M, hidden/2]`` E2M1 and
+        ``scales`` is uint8 ``[M, hidden/group_size]`` ue8m0.
+
+    Raises:
+        ValueError: if ``A`` is not 2-D uint16-compatible, or ``hidden`` is
+            not divisible by ``group_size``.
+    """
+    A_arr = np.ascontiguousarray(A, dtype=np.uint16)
+    if A_arr.ndim != 2:
+        raise ValueError("A must be 2-D [M, hidden]")
+    M, hidden = A_arr.shape
+    if int(group_size) <= 0:
+        raise ValueError("group_size must be positive")
+    if hidden % int(group_size) != 0:
+        raise ValueError(
+            f"hidden ({hidden}) must be a multiple of group_size ({int(group_size)})"
+        )
+    packed, scales = _impl.mxfp4_moe_quant(A_arr, int(M), int(hidden), int(group_size))
+    return packed.reshape(M, hidden // 2), scales.reshape(M, hidden // group_size)
+
+
+def mxfp4_moe_sort(A, sorted_ids, *, top_k: int):
+    """Gather bf16 activations into the block-aligned sorted row order.
+
+    Row ``r`` of the output is ``A[sorted_ids[r] / top_k]`` when
+    ``sorted_ids[r] < M * top_k`` (a real ``(token, sel)`` pair), and zero
+    for padding rows (``sorted_ids[r] >= M * top_k``). The gather is exact
+    for bf16 (a 16-bit copy), so a subsequent :func:`mxfp4_moe_quant`
+    produces a ``0xFF`` scale and zero nibbles for padding rows.
+
+    Args:
+        A: uint16 bf16 array of shape ``(M, hidden)``.
+        sorted_ids: int32 array of shape ``(EM,)`` from
+            :func:`moe_align_block_size`.
+        top_k: experts selected per token (decodes ``token = flat / top_k``).
+
+    Returns:
+        uint16 bf16 array of shape ``(EM, hidden)`` in sorted row order.
+    """
+    A_arr = np.ascontiguousarray(A, dtype=np.uint16)
+    if A_arr.ndim != 2:
+        raise ValueError("A must be 2-D [M, hidden]")
+    M, hidden = A_arr.shape
+    ids = np.ascontiguousarray(sorted_ids, dtype=np.int32)
+    if ids.ndim != 1:
+        raise ValueError("sorted_ids must be 1-D [EM]")
+    EM = ids.size
+    out = _impl.mxfp4_moe_sort(A_arr, ids, int(M), int(hidden), int(top_k), int(EM))
+    return out.reshape(EM, hidden)
+
+
+def mxfp4_moe_sort_scales(scales, sorted_ids, *, top_k: int):
+    """Gather per-token ue8m0 scales into sorted row order.
+
+    Structurally identical to :func:`mxfp4_moe_sort` on the per-token scale
+    tensor: ``scales [M, n_groups] -> [EM, n_groups]`` by ``sorted_ids``, so
+    quantized activations and their scales share a row order. Padding rows
+    are zeroed.
+
+    Args:
+        scales: uint8 ue8m0 array of shape ``(M, n_groups)`` (e.g. the
+            second return value of :func:`mxfp4_moe_quant`).
+        sorted_ids: int32 array of shape ``(EM,)``.
+        top_k: experts selected per token.
+
+    Returns:
+        uint8 array of shape ``(EM, n_groups)``.
+    """
+    s = np.ascontiguousarray(scales, dtype=np.uint8)
+    if s.ndim != 2:
+        raise ValueError("scales must be 2-D [M, n_groups]")
+    M, n_groups = s.shape
+    ids = np.ascontiguousarray(sorted_ids, dtype=np.int32)
+    if ids.ndim != 1:
+        raise ValueError("sorted_ids must be 1-D [EM]")
+    EM = ids.size
+    out = _impl.mxfp4_moe_sort_scales(
+        s, ids, int(M), int(n_groups), int(top_k), int(EM)
+    )
+    return out.reshape(EM, n_groups)
+
+
+def mxfp4_moe_scatter_reduce(
+    partial, topk_w, sorted_ids, *, M: int, width: int, top_k: int
+):
+    """Routed output combine (float32 partials).
+
+    ``partial`` is the per-expert GEMM output in sorted row order
+    ``(EM, width)``; for each real sorted row ``r`` (``sorted_ids[r] <
+    M * top_k``), ``out[token] += partial[r] * topk_w[r]`` with
+    ``token = sorted_ids[r] / top_k``. ``out`` is zero-initialised and
+    accumulated with atomic semantics (several sorted rows map to one token).
+
+    This is the bias-free form of the fused-path combine; bias is added
+    separately in the W4A4 path. Matches AITER ``mxfp4_moe_scatter_reduce``.
+
+    Args:
+        partial: float32 array of shape ``(EM, width)``.
+        topk_w: float32 array of shape ``(EM,)`` routing weights, sorted to
+            match ``sorted_ids``.
+        sorted_ids: int32 array of shape ``(EM,)``.
+        M: original token count (``out`` has ``M`` rows).
+        width: output / partial column count (``hidden`` for the down output,
+            ``2*ispp`` for the gate/up intermediate).
+        top_k: experts selected per token.
+
+    Returns:
+        float32 array of shape ``(M, width)`` (the reduced output).
+    """
+    p = np.ascontiguousarray(partial, dtype=np.float32)
+    ids = np.ascontiguousarray(sorted_ids, dtype=np.int32)
+    w = np.ascontiguousarray(topk_w, dtype=np.float32)
+    if ids.ndim != 1:
+        raise ValueError("sorted_ids must be 1-D [EM]")
+    EM = ids.size
+    if int(M) <= 0:
+        raise ValueError("M must be positive")
+    if int(width) <= 0:
+        raise ValueError("width must be positive")
+    if int(top_k) <= 0:
+        raise ValueError("top_k must be positive")
+    if p.size != EM * int(width):
+        raise ValueError(
+            f"partial must have EM*width = {EM * int(width)} elements, got {p.size}"
+        )
+    if w.size != EM:
+        raise ValueError(f"topk_w must have EM = {EM} elements, got {w.size}")
+    out = _impl.mxfp4_moe_scatter_reduce(
+        p, w, ids, int(M), int(width), int(top_k), int(EM)
+    )
+    return out.reshape(M, width)
+
+
+def mxfp4_moe_scatter_reduce_q(
+    partial_q,
+    partial_s,
+    topk_w,
+    sorted_ids,
+    *,
+    M: int,
+    width: int,
+    top_k: int,
+    group_size: int = 32,
+):
+    """Routed output combine of a quantized partial (E2M1 + ue8m0).
+
+    Identical to :func:`mxfp4_moe_scatter_reduce` except the per-expert
+    partial is kept in the MXFP4 layout and dequantized inline — the "Q"
+    combine AITER ships on gfx950 to cut the scatter bandwidth.
+
+    Args:
+        partial_q: uint8 packed E2M1 array of shape ``(EM, width/2)``.
+        partial_s: uint8 ue8m0 array of shape ``(EM, width/group_size)``.
+        topk_w: float32 array of shape ``(EM,)``.
+        sorted_ids: int32 array of shape ``(EM,)``.
+        M: original token count (``out`` has ``M`` rows).
+        width: output column count (must be divisible by ``group_size``).
+        top_k: experts selected per token.
+        group_size: ue8m0 group length (default 32).
+
+    Returns:
+        float32 array of shape ``(M, width)`` (the reduced output).
+    """
+    pq = np.ascontiguousarray(partial_q, dtype=np.uint8)
+    ps = np.ascontiguousarray(partial_s, dtype=np.uint8)
+    ids = np.ascontiguousarray(sorted_ids, dtype=np.int32)
+    w = np.ascontiguousarray(topk_w, dtype=np.float32)
+    if ids.ndim != 1:
+        raise ValueError("sorted_ids must be 1-D [EM]")
+    EM = ids.size
+    if int(M) <= 0 or int(width) <= 0 or int(top_k) <= 0:
+        raise ValueError("M, width, top_k must be positive")
+    if int(group_size) <= 0:
+        raise ValueError("group_size must be positive")
+    if int(width) % int(group_size) != 0:
+        raise ValueError(
+            f"width ({int(width)}) must be a multiple of group_size ({int(group_size)})"
+        )
+    if pq.size != EM * (int(width) // 2):
+        raise ValueError(
+            f"partial_q must have EM*width/2 = "
+            f"{EM * (int(width) // 2)} elements, got {pq.size}"
+        )
+    if ps.size != EM * (int(width) // int(group_size)):
+        raise ValueError(
+            f"partial_s must have EM*width/group = "
+            f"{EM * (int(width) // int(group_size))} elements, "
+            f"got {ps.size}"
+        )
+    if w.size != EM:
+        raise ValueError(f"topk_w must have EM = {EM} elements, got {w.size}")
+    out = _impl.mxfp4_moe_scatter_reduce_q(
+        pq, ps, w, ids, int(M), int(width), int(top_k), int(EM), int(group_size)
+    )
+    return out.reshape(M, width)

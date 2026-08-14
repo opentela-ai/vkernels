@@ -121,6 +121,35 @@ crashed for >64-thread blocks on gfx90a.
 
 ---
 
+## MoE Aux — MXFP4 orchestration (quant, sort, scatter-reduce)
+
+The five per-block data-movement primitives from issue #22 that bracket a
+grouped MXFP4 GEMM: per-token / per-group activation quantization,
+token→expert gather (activation **and** scales), and the routed
+scatter-reduce combine (fp32 partials, plus a bandwidth-reduced MXFP4 form
+that dequantizes inline). On gfx950 these are AITER's
+`module_moe_mxfp4_aux` (its ~82 KB LDS exceeds the gfx942 / MI300A 64 KB
+limit), so vkernels re-implements them as portable host references + HIP
+kernels.
+
+| Function | Computation |
+|---|---|
+| `mxfp4_moe_quant(A, group_size)` | bf16 → packed E2M1 + ue8m0 per group (low nibble = even K) |
+| `mxfp4_moe_sort(A, sorted_ids, top_k)` | gather `A` into expert-grouped, block-aligned `[EM, hidden]` (pad rows zeroed) |
+| `mxfp4_moe_sort_scales(scales, sorted_ids, top_k)` | same gather for the per-token ue8m0 scales |
+| `mxfp4_moe_scatter_reduce(partial, topk_w, sorted_ids, M, width, top_k)` | bias-free weighted scatter-add of fp32 partials → `out[M, hidden]` |
+| `mxfp4_moe_scatter_reduce_q(partial_q, partial_s, topk_w, …, group_size)` | same combine with the partial in MXFP4, dequantized inline |
+
+- `moe_align_block_size` (above) produces `sorted_ids`; the pipeline is
+  `align → sort → quant → sort_scales → fused_moe_mxfp4 → scatter_reduce[_q]`.
+- Scale bytes are clamped to `[1, 254]` (never `0`); `0xFF` is the explicit
+  zero-group flag. Largest finite E2M1 is `FP4_MAX = 3.0`.
+- **Files**: `src/c/vkernels/kernels/moe_aux.cpp` (CPU), `.hip` (HIP)
+- **Python**: `vkernels.kernels.mxfp4_moe_{quant,sort,sort_scales,scatter_reduce,scatter_reduce_q}`
+- **Docs**: [kernels/moe_aux.md](kernels/moe_aux.md)
+
+---
+
 ## MoE Fused — End-to-end MXFP4 grouped GEMM
 
 Implements the full xkernels `fused_moe_mxfp4` interface by wiring together
@@ -324,6 +353,7 @@ src/c/vkernels/
 │   ├── reduce.{cpp,cu}          # sum, max
 │   ├── gemm.{cpp,cu}            # tiled SGEMM
 │   ├── moe.{cpp,hip}            # gfx942 primitives (#12–#15)
+│   ├── moe_aux.{cpp,hip}        # MXFP4 MoE orchestration: quant, sort, scatter-reduce (#22)
 │   └── moe_fused.{cpp,hip}      # fused MXFP4 MoE grouped GEMM
 ├── comm/
 │   ├── allreduce.{cpp,cu}       # ring all-reduce

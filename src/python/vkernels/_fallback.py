@@ -158,8 +158,9 @@ def max(x: np.ndarray) -> float:
     return float(m)
 
 
-def gemm(M: int, N: int, K: int, alpha, A: np.ndarray, B: np.ndarray, beta,
-         C: np.ndarray) -> None:
+def gemm(
+    M: int, N: int, K: int, alpha, A: np.ndarray, B: np.ndarray, beta, C: np.ndarray
+) -> None:
     if A.size != M * K:
         raise ValueError("A must be M*K")
     if B.size != K * N:
@@ -180,6 +181,7 @@ def gemm(M: int, N: int, K: int, alpha, A: np.ndarray, B: np.ndarray, beta,
 
 
 # --- moe: fp4 dequant, LDS fill, MFMA ---------------------------------------
+
 
 def direct_lds_fill_bf16(lds_dst: int, global_src: int, elements: int) -> None:
     """Copy `elements` bf16 values from global memory to LDS.
@@ -202,21 +204,29 @@ def direct_lds_fill_bf16(lds_dst: int, global_src: int, elements: int) -> None:
 # Positive values (s=0) occupy indices 0-7; negative (s=1) occupy 8-15.
 _FP4_NIBBLE_VALUES: list[float] = [
     # s=0, e=0: zero / subnormal (m=1 → 0.25)
-    0.0, 0.25,
+    0.0,
+    0.25,
     # s=0, e=1: normal ×2^(1-1)= ×1
-    1.0, 1.5,
+    1.0,
+    1.5,
     # s=0, e=2: normal ×2^(2-1)= ×2
-    2.0, 3.0,
+    2.0,
+    3.0,
     # s=0, e=3: inf / NaN
-    float("inf"), float("nan"),
+    float("inf"),
+    float("nan"),
     # s=1, e=0: negative zero / subnormal
-    -0.0, -0.25,
+    -0.0,
+    -0.25,
     # s=1, e=1: negative normal
-    -1.0, -1.5,
+    -1.0,
+    -1.5,
     # s=1, e=2: negative normal
-    -2.0, -3.0,
+    -2.0,
+    -3.0,
     # s=1, e=3: negative inf / NaN
-    -float("inf"), float("nan"),
+    -float("inf"),
+    float("nan"),
 ]
 
 
@@ -267,8 +277,14 @@ def use_async_copy_default() -> bool:
     return True
 
 
-def mfma_f32_16x16x16bf16(c: list[float], a: list[int], b: list[int],
-                          cbsz: int = 0, abid: int = 0, blgp: int = 0) -> None:
+def mfma_f32_16x16x16bf16(
+    c: list[float],
+    a: list[int],
+    b: list[int],
+    cbsz: int = 0,
+    abid: int = 0,
+    blgp: int = 0,
+) -> None:
     """K16 bf16 MFMA: C[0..3] += A[0..1] × B[0..1] (16×16×16 bf16, acc fp32).
 
     `c` is a list of 4 floats updated in-place.
@@ -279,9 +295,7 @@ def mfma_f32_16x16x16bf16(c: list[float], a: list[int], b: list[int],
     host reference path.
     """
     if len(c) < 4 or len(a) < 2 or len(b) < 2:
-        raise ValueError(
-            "c must have 4 floats; a and b must each have 2 uint32_t"
-        )
+        raise ValueError("c must have 4 floats; a and b must each have 2 uint32_t")
 
     # Unpack a[2] → 4 bf16 values, b[2] → 4 bf16 values.
     def _unpack_bf16(v32: int) -> tuple[float, float]:
@@ -324,12 +338,12 @@ def _ue8m0_to_float(s: int) -> np.float32:
 
 def _bf16_to_float(bits: int) -> np.float32:
     """Reinterpret a bf16 uint16 bit pattern as float32."""
-    return np.frombuffer((bits << 16).to_bytes(4, "little"),
-                         dtype=np.float32)[0]
+    return np.frombuffer((bits << 16).to_bytes(4, "little"), dtype=np.float32)[0]
 
 
-def _dequant_weight_tile(packed, scale, p_base, s_base,
-                         N, K, group_size, stride_packed, stride_scale_n):
+def _dequant_weight_tile(
+    packed, scale, p_base, s_base, N, K, group_size, stride_packed, stride_scale_n
+):
     """Dequant a [N, K] packed fp4 + ue8m0 tile into out[K, N] bf16.
 
     Mirrors ``dequant_weight_tile`` in moe_fused.cpp: the result is rounded
@@ -393,11 +407,30 @@ def moe_align_block_size(topk_ids, M, top_k, block_size, num_experts):
     return sorted_ids, expert_ids, EM
 
 
-def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
-                    expert_ids, act_scratch, out,
-                    M, hidden, ispp, top_k, EM, group_size,
-                    swiglu_limit, activation=0, beta=4.0, linear_beta=25.0,
-                    b13=None, b2=None):
+def fused_moe_mxfp4(
+    A,
+    w13,
+    w13_scale,
+    w2,
+    w2_scale,
+    sorted_ids,
+    topk_w,
+    expert_ids,
+    act_scratch,
+    out,
+    M,
+    hidden,
+    ispp,
+    top_k,
+    EM,
+    group_size,
+    swiglu_limit,
+    activation=0,
+    beta=4.0,
+    linear_beta=25.0,
+    b13=None,
+    b2=None,
+):
     """Fused MXFP4 MoE grouped GEMM (CPU-reference oracle, in place).
 
     Writes the activation intermediate into ``act_scratch`` [EM*ispp] bf16
@@ -446,25 +479,44 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
                     flat = int(sorted_ids[token_base + m])
                     if flat < N:
                         token = flat // top_k
-                        tile_A[m] = A[token * hidden + k_start:
-                                      token * hidden + k_start + BLOCK_K]
+                        tile_A[m] = A[
+                            token * hidden + k_start : token * hidden
+                            + k_start
+                            + BLOCK_K
+                        ]
 
                 # gate half
                 p_gate = expert * w13_expert_bytes + nb * BLOCK_N * (hidden // 2)
-                s_gate = expert * w13s_expert_bytes + nb * BLOCK_N * (hidden // group_size)
+                s_gate = expert * w13s_expert_bytes + nb * BLOCK_N * (
+                    hidden // group_size
+                )
                 tile_gate = _dequant_weight_tile(
-                    w13, w13_scale, p_gate + k_start // 2,
+                    w13,
+                    w13_scale,
+                    p_gate + k_start // 2,
                     s_gate + k_start // group_size,
-                    BLOCK_N, BLOCK_K, group_size, hidden // 2,
-                    hidden // group_size)
+                    BLOCK_N,
+                    BLOCK_K,
+                    group_size,
+                    hidden // 2,
+                    hidden // group_size,
+                )
                 # up half (offset by ispp rows in w13)
                 p_up = expert * w13_expert_bytes + (nb * BLOCK_N + ispp) * (hidden // 2)
-                s_up = expert * w13s_expert_bytes + (nb * BLOCK_N + ispp) * (hidden // group_size)
+                s_up = expert * w13s_expert_bytes + (nb * BLOCK_N + ispp) * (
+                    hidden // group_size
+                )
                 tile_up = _dequant_weight_tile(
-                    w13, w13_scale, p_up + k_start // 2,
+                    w13,
+                    w13_scale,
+                    p_up + k_start // 2,
                     s_up + k_start // group_size,
-                    BLOCK_N, BLOCK_K, group_size, hidden // 2,
-                    hidden // group_size)
+                    BLOCK_N,
+                    BLOCK_K,
+                    group_size,
+                    hidden // 2,
+                    hidden // group_size,
+                )
 
                 for m in range(BLOCK_M):
                     for n in range(BLOCK_N):
@@ -473,9 +525,12 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
                         for k in range(BLOCK_K):
                             a = _bf16_to_float(int(tile_A[m, k]))
                             dg = np.float32(
-                                dg + np.float32(a * _bf16_to_float(int(tile_gate[k, n]))))
+                                dg
+                                + np.float32(a * _bf16_to_float(int(tile_gate[k, n])))
+                            )
                             du = np.float32(
-                                du + np.float32(a * _bf16_to_float(int(tile_up[k, n]))))
+                                du + np.float32(a * _bf16_to_float(int(tile_up[k, n])))
+                            )
                         acc_gate[m, n] = np.float32(acc_gate[m, n] + dg)
                         acc_up[m, n] = np.float32(acc_up[m, n] + du)
 
@@ -494,8 +549,11 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
                         # Kimi-K3 SiTU (situ_and_mul): no clamp.
                         sig = 1.0 / (1.0 + np.exp(-g))
                         gate_out = beta * np.tanh(g / beta) * sig
-                        up_out = (linear_beta * np.tanh(u / linear_beta)
-                                  if linear_beta > 0.0 else u)
+                        up_out = (
+                            linear_beta * np.tanh(u / linear_beta)
+                            if linear_beta > 0.0
+                            else u
+                        )
                         result = gate_out * up_out
                     else:
                         if swiglu_limit > 0.0:
@@ -504,8 +562,7 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
                             u = -min(-u, swiglu_limit)  # max(u, -limit)
                         silu_g = g / (1.0 + np.exp(-g))
                         result = silu_g * u
-                    act[(token_base + m) * ispp + nb * BLOCK_N + n] = \
-                        _f2bf(result)
+                    act[(token_base + m) * ispp + nb * BLOCK_N + n] = _f2bf(result)
 
     # ===== Stage 1: down + combine → out [M, hidden] =====
     w2_expert_bytes = hidden * (ispp // 2)
@@ -526,16 +583,25 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
                 for m in range(BLOCK_M):
                     flat = int(sorted_ids[token_base + m])
                     if flat < N:
-                        tile_A[m] = act[(token_base + m) * ispp + k_start:
-                                        (token_base + m) * ispp + k_start + BLOCK_K]
+                        tile_A[m] = act[
+                            (token_base + m) * ispp + k_start : (token_base + m) * ispp
+                            + k_start
+                            + BLOCK_K
+                        ]
 
                 p_down = expert * w2_expert_bytes + nb * BLOCK_N * (ispp // 2)
                 s_down = expert * w2s_expert_bytes + nb * BLOCK_N * (ispp // group_size)
                 tile_down = _dequant_weight_tile(
-                    w2, w2_scale, p_down + k_start // 2,
+                    w2,
+                    w2_scale,
+                    p_down + k_start // 2,
                     s_down + k_start // group_size,
-                    BLOCK_N, BLOCK_K, group_size, ispp // 2,
-                    ispp // group_size)
+                    BLOCK_N,
+                    BLOCK_K,
+                    group_size,
+                    ispp // 2,
+                    ispp // group_size,
+                )
 
                 for m in range(BLOCK_M):
                     for n in range(BLOCK_N):
@@ -543,7 +609,9 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
                         for k in range(BLOCK_K):
                             a = _bf16_to_float(int(tile_A[m, k]))
                             dot = np.float32(
-                                dot + np.float32(a * _bf16_to_float(int(tile_down[k, n]))))
+                                dot
+                                + np.float32(a * _bf16_to_float(int(tile_down[k, n])))
+                            )
                         acc_down[m, n] = np.float32(acc_down[m, n] + dot)
 
             # Combine: bias + weight + scatter-add
@@ -559,6 +627,192 @@ def fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w,
                         val += float(b2[expert * hidden + nb * BLOCK_N + n])
                     val *= weight
                     out_arr[token * hidden + nb * BLOCK_N + n] += np.float32(val)
+
+
+# ---------------------------------------------------------------------------
+# MoE orchestration (mxfp4_moe_aux): per-block quant, gather, scatter-reduce.
+# Mirrors src/c/vkernels/kernels/moe_aux.cpp byte-for-byte so the pure-Python
+# backend is a faithful oracle for the HIP kernels.
+# ---------------------------------------------------------------------------
+# Largest finite E2M1 value (matches _FP4_NIBBLE_VALUES[5] and moe.cpp).
+_MXFP4_MAX = 3.0
+
+
+def _bf16_to_float_vec(bits: np.ndarray) -> np.ndarray:
+    """Reinterpret a uint16 bf16 array as float32 (zero-extend; exact)."""
+    u = bits.astype(np.uint32) << 16
+    return u.view(np.float32).copy()
+
+
+def _float_to_fp4_nib_vec(x: np.ndarray) -> np.ndarray:
+    """Round (|x| <= MXFP4_MAX) to the nearest E2M1 nibble code.
+
+    Ties round to the LARGER magnitude, exactly like the C++ reference
+    (``float_to_fp4_nib`` in moe_aux.cpp: first matching ``if / else if`` wins).
+      |v| < 0.125 -> 0 (0.0); < 0.625 -> 1 (0.25); < 1.25 -> 2 (1.0);
+      < 1.75 -> 3 (1.5); < 2.5 -> 4 (2.0); else -> 5 (3.0)."""
+    v = np.abs(x)
+    # np.select evaluates conditions left-to-right and returns the first
+    # match, mirroring the C++ if/else-if chain (strict <, ties to larger).
+    mag = np.select(
+        [v < 0.125, v < 0.625, v < 1.25, v < 1.75, v < 2.5, True], [0, 1, 2, 3, 4, 5]
+    ).astype(np.uint8)
+    sign = np.where(x < 0.0, np.uint8(0x8), np.uint8(0))
+    return (mag | sign).astype(np.uint8)
+
+
+def mxfp4_moe_quant(A, M: int, hidden: int, group_size: int = 32):
+    """MXFP4 activation quant — the inverse of the weight decode.
+
+    Args:
+        A: uint16 bf16 array of shape ``(M, hidden)``.
+        M, hidden: dimensions (``hidden`` must be divisible by ``group_size``).
+        group_size: ue8m0 scale group length (default 32).
+
+    Returns:
+        ``(packed, scales)`` where ``packed`` is ``[M, hidden/2]`` uint8 E2M1
+        (low nibble = even K) and ``scales`` is ``[M, hidden/group_size]``
+        uint8 ue8m0 (``2^(s-127)``; ``0xFF`` = zero group).
+    """
+    A_arr = np.ascontiguousarray(A, dtype=np.uint16)
+    if A_arr.shape != (M, hidden):
+        raise ValueError(f"A must be [{M}, {hidden}], got {A_arr.shape}")
+    if group_size <= 0:
+        raise ValueError("group_size must be positive")
+    if hidden % group_size != 0:
+        raise ValueError("hidden must be a multiple of group_size")
+    if hidden % 2 != 0:
+        raise ValueError("hidden must be even")
+
+    n_groups = hidden // group_size
+    x = _bf16_to_float_vec(A_arr).reshape(M, hidden)
+    # Per-group amax (max absolute value over `group_size` consecutive cols).
+    xg = x.reshape(M, n_groups, group_size)
+    amax = np.max(np.abs(xg), axis=2)  # [M, n_groups]
+
+    scales = np.empty((M, n_groups), dtype=np.uint8)
+    packed = np.zeros((M, hidden // 2), dtype=np.uint8)
+
+    finite = np.isfinite(amax) & (amax > 0.0)
+    # e = ceil(log2(amax / MXFP4_MAX)); sb = clamp(e + 127, 0, 254).
+    ratio = np.where(finite, amax / _MXFP4_MAX, 1.0)
+    e = np.ceil(np.log2(ratio)).astype(np.int64)
+    sb = np.clip(e + 127, 1, 254).astype(np.uint8)
+    scales[:] = np.where(finite, sb, np.uint8(0xFF))
+
+    # scale value = 2^(sb - 127); zero groups (0xFF) contribute scale = 0.
+    scale_val = np.where(finite, (2.0 ** (sb.astype(np.int32) - 127)), 0.0)
+    scale_val = scale_val.astype(np.float32)  # [M, n_groups]
+
+    # Quantize each element: nibble = round(x / scale) to nearest E2M1.
+    # Zero-scale groups (0xFF) contribute 0; suppress the divide-by-zero /
+    # invalid-value warnings since np.where masks them anyway.
+    sv = np.broadcast_to(scale_val[:, :, None], (M, n_groups, group_size))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        q = np.where(sv > 0.0, xg / sv, 0.0)
+    nibs = _float_to_fp4_nib_vec(q)  # [M, n_groups, group_size] uint8
+    lo = nibs[:, :, 0::2] & 0x0F
+    hi = nibs[:, :, 1::2] & 0x0F
+    packed = (hi << 4) | lo  # [M, n_groups, group_size/2] -> reshape
+    packed = packed.reshape(M, hidden // 2)
+    return packed, scales
+
+
+def mxfp4_moe_sort(A, sorted_ids, M: int, hidden: int, top_k: int, EM: int):
+    """Gather bf16 A [M, hidden] into sorted row order [EM, hidden]."""
+    A_arr = np.ascontiguousarray(A, dtype=np.uint16)
+    ids = np.ascontiguousarray(sorted_ids, dtype=np.int32).ravel()
+    if A_arr.shape != (M, hidden):
+        raise ValueError(f"A must be [{M}, {hidden}], got {A_arr.shape}")
+    if ids.size != EM:
+        raise ValueError(f"sorted_ids must have EM = {EM} elements")
+    out = np.zeros((EM, hidden), dtype=np.uint16)
+    for r in range(EM):
+        flat = int(ids[r])
+        if 0 <= flat < M * top_k:
+            out[r] = A_arr[flat // top_k]
+    return out.reshape(EM * hidden) if False else out.ravel()
+
+
+def mxfp4_moe_sort_scales(
+    scales, sorted_ids, M: int, n_groups: int, top_k: int, EM: int
+):
+    """Gather per-token ue8m0 scales [M, n_groups] into [EM, n_groups]."""
+    s = np.ascontiguousarray(scales, dtype=np.uint8)
+    ids = np.ascontiguousarray(sorted_ids, dtype=np.int32).ravel()
+    if s.shape != (M, n_groups):
+        raise ValueError(f"scales must be [{M}, {n_groups}], got {s.shape}")
+    if ids.size != EM:
+        raise ValueError(f"sorted_ids must have EM = {EM} elements")
+    out = np.zeros((EM, n_groups), dtype=np.uint8)
+    for r in range(EM):
+        flat = int(ids[r])
+        if 0 <= flat < M * top_k:
+            out[r] = s[flat // top_k]
+    return out.ravel()
+
+
+def mxfp4_moe_scatter_reduce(
+    partial, topk_w, sorted_ids, M: int, width: int, top_k: int, EM: int
+):
+    """Routed combine of float32 partials [EM, width] -> out [M, width]."""
+    p = np.ascontiguousarray(partial, dtype=np.float32).reshape(EM, width)
+    w = np.ascontiguousarray(topk_w, dtype=np.float32).ravel()
+    ids = np.ascontiguousarray(sorted_ids, dtype=np.int32).ravel()
+    if p.shape != (EM, width):
+        raise ValueError(f"partial must be [{EM}, {width}]")
+    if w.size != EM or ids.size != EM:
+        raise ValueError("topk_w and sorted_ids must each have EM elements")
+    out = np.zeros((M, width), dtype=np.float32)
+    for r in range(EM):
+        flat = int(ids[r])
+        if 0 <= flat < M * top_k:
+            np.add.at(out, flat // top_k, p[r] * w[r])
+    return out.ravel()
+
+
+def mxfp4_moe_scatter_reduce_q(
+    partial_q,
+    partial_s,
+    topk_w,
+    sorted_ids,
+    M: int,
+    width: int,
+    top_k: int,
+    EM: int,
+    group_size: int = 32,
+):
+    """Routed combine of a quantized partial (E2M1 + ue8m0) -> out [M, width]."""
+    pq = np.ascontiguousarray(partial_q, dtype=np.uint8).reshape(EM, width // 2)
+    ps = np.ascontiguousarray(partial_s, dtype=np.uint8).reshape(
+        EM, width // group_size
+    )
+    w = np.ascontiguousarray(topk_w, dtype=np.float32).ravel()
+    ids = np.ascontiguousarray(sorted_ids, dtype=np.int32).ravel()
+    if pq.shape != (EM, width // 2):
+        raise ValueError(f"partial_q must be [{EM}, {width // 2}]")
+    if ps.shape != (EM, width // group_size):
+        raise ValueError(f"partial_s must be [{EM}, {width // group_size}]")
+    if w.size != EM or ids.size != EM:
+        raise ValueError("topk_w and sorted_ids must each have EM elements")
+    n_groups = width // group_size
+    out = np.zeros((M, width), dtype=np.float32)
+    for r in range(EM):
+        flat = int(ids[r])
+        if not (0 <= flat < M * top_k):
+            continue
+        token = flat // top_k
+        wr = float(w[r])
+        for g in range(n_groups):
+            sc = _ue8m0_to_float(int(ps[r, g]))
+            base = g * group_size
+            for i in range(0, group_size, 2):
+                byte = int(pq[r, base // 2 + i // 2])
+                lo = float(np.float32(_FP4_NIBBLE_VALUES[byte & 0x0F]) * sc)
+                hi = float(np.float32(_FP4_NIBBLE_VALUES[(byte >> 4) & 0x0F]) * sc)
+                out[token, base + i] += np.float32(lo * wr)
+                out[token, base + i + 1] += np.float32(hi * wr)
+    return out.ravel()
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +832,7 @@ def build_ring_topology(world: int) -> list[Topology]:
     if world <= 0:
         raise ValueError("world must be positive")
     return [ring_rank(r, world) for r in range(world)]
+
 
 class BlockingQueue:
     """Thread-safe blocking queue of float32 chunks (mirrors C++)."""
@@ -631,8 +886,9 @@ def make_ring_channels(world: int) -> list[MockChannel]:
     return [MockChannel(edges[r], edges[(r - 1) % world]) for r in range(world)]
 
 
-def ring_allreduce_rank(local: np.ndarray, rank: int, world: int, next_ch,
-                        prev_ch) -> None:
+def ring_allreduce_rank(
+    local: np.ndarray, rank: int, world: int, next_ch, prev_ch
+) -> None:
     """Run one rank of a ring all-reduce; ``local`` is summed in place."""
     if world <= 0:
         raise ValueError("world must be positive")
@@ -647,10 +903,10 @@ def ring_allreduce_rank(local: np.ndarray, rank: int, world: int, next_ch,
     chunk = n // world
 
     def chunk_of(c: int) -> np.ndarray:
-        return local[c * chunk:(c + 1) * chunk].copy()
+        return local[c * chunk : (c + 1) * chunk].copy()
 
     def replace_chunk(c: int, v: np.ndarray) -> None:
-        local[c * chunk:(c + 1) * chunk] = v
+        local[c * chunk : (c + 1) * chunk] = v
 
     # Phase 1: reduce-scatter (world-1 steps).
     for t in range(world - 1):
@@ -683,8 +939,10 @@ def ring_allreduce(locals_: list[np.ndarray]) -> list[np.ndarray]:
     channels = make_ring_channels(world)
     buffers = [np.array(v, dtype=np.float32, copy=True) for v in locals_]
     threads = [
-        threading.Thread(target=ring_allreduce_rank,
-                         args=(buffers[r], r, world, channels[r], channels[r]))
+        threading.Thread(
+            target=ring_allreduce_rank,
+            args=(buffers[r], r, world, channels[r], channels[r]),
+        )
         for r in range(world)
     ]
     for t in threads:
@@ -789,13 +1047,15 @@ def stage_runs_2d(dst: np.ndarray, runs) -> list[StagedRun2D]:
         row_span = rows * g.dst_stride
         if g.width > capacity - off - row_span:
             raise ValueError("2-D run exceeds dst capacity")
-        out.append(StagedRun2D(g.src, off, g.src_stride, g.dst_stride,
-                               g.width, g.height))
+        out.append(
+            StagedRun2D(g.src, off, g.src_stride, g.dst_stride, g.width, g.height)
+        )
     return out
 
 
-def p2p_gather_runs(dst: np.ndarray, src_ptrs, dst_offsets, lengths,
-                    stream=None) -> None:
+def p2p_gather_runs(
+    dst: np.ndarray, src_ptrs, dst_offsets, lengths, stream=None
+) -> None:
     staged = stage_runs_1d(dst, src_ptrs, dst_offsets, lengths)
     if not staged:
         return  # 0 runs, or every run empty: enqueue nothing
@@ -803,8 +1063,9 @@ def p2p_gather_runs(dst: np.ndarray, src_ptrs, dst_offsets, lengths,
 
     def copy_all() -> None:
         for r in staged:
-            ctypes.memmove(ctypes.byref(buf, r.dst_offset),
-                           ctypes.c_void_p(r.src), r.length)
+            ctypes.memmove(
+                ctypes.byref(buf, r.dst_offset), ctypes.c_void_p(r.src), r.length
+            )
 
     if stream is None:
         copy_all()
@@ -821,9 +1082,11 @@ def p2p_gather_runs_2d(dst: np.ndarray, runs, stream=None) -> None:
     def copy_all() -> None:
         for r in staged:
             for y in range(r.height):
-                ctypes.memmove(ctypes.byref(buf, r.dst_offset + y * r.dst_stride),
-                               ctypes.c_void_p(r.src + y * r.src_stride),
-                               r.width)
+                ctypes.memmove(
+                    ctypes.byref(buf, r.dst_offset + y * r.dst_stride),
+                    ctypes.c_void_p(r.src + y * r.src_stride),
+                    r.width,
+                )
 
     if stream is None:
         copy_all()
@@ -831,16 +1094,18 @@ def p2p_gather_runs_2d(dst: np.ndarray, runs, stream=None) -> None:
         stream.submit(copy_all)
 
 
-def memcpy_peer_batch_async(dst: np.ndarray, src_ptrs, dst_offsets, lengths,
-                            stream=None) -> None:
+def memcpy_peer_batch_async(
+    dst: np.ndarray, src_ptrs, dst_offsets, lengths, stream=None
+) -> None:
     staged = stage_runs_1d(dst, src_ptrs, dst_offsets, lengths)
     if not staged:
         return
     buf = _dst_buffer(dst)
 
     def copy_one(r: StagedRun1D) -> None:
-        ctypes.memmove(ctypes.byref(buf, r.dst_offset),
-                       ctypes.c_void_p(r.src), r.length)
+        ctypes.memmove(
+            ctypes.byref(buf, r.dst_offset), ctypes.c_void_p(r.src), r.length
+        )
 
     if stream is None:
         for r in staged:
