@@ -6,13 +6,13 @@
 // implementation, compiled only with ROCm + RCCL (RcclSupport.cmake sets
 // VKERNELS_HAS_RCCL):
 //
-//   * RcclComm — RAII over an rcclComm_t (make_rccl_comms via
-//     rcclCommInitAll, or make_rccl_comms_from_uniqueid via rcclCommInitRank
+//   * RcclComm — RAII over an ncclComm_t (make_rccl_comms via
+//     ncclCommInitAll, or make_rccl_comms_from_uniqueid via ncclCommInitRank
 //     for the multi-process/multi-node case).
-//   * RcclChannel — the existing Channel interface over rcclSend/rcclRecv, so
+//   * RcclChannel — the existing Channel interface over ncclSend/ncclRecv, so
 //     ring_allreduce_rank runs unmodified over real RCCL point-to-point ops
 //     (correctness over RCCL + A/B against the Socket transport).
-//   * RcclAllreducePlanHip — the optimal path: ONE rcclAllReduce per
+//   * RcclAllreducePlanHip — the optimal path: ONE ncclAllReduce per
 //     execute(), graph-capturable (a captured sequence needs no host
 //     progress between layers). Mirrors the host RcclAllreducePlan API.
 //
@@ -42,7 +42,7 @@
 namespace vkernels::comm::hip {
 namespace {
 
-// Translate an rcclResult_t into a thrown std::runtime_error with the rccl
+// Translate an ncclResult_t into a thrown std::runtime_error with the RCCL
 // error string + context. Every RCCL call that can fail goes through this.
 [[noreturn]] void throw_rccl(const char* ctx, ncclResult_t r) {
   throw std::runtime_error(std::string("vkernels::comm::hip: ") + ctx +
@@ -53,6 +53,22 @@ namespace {
   do {                                                                     \
     ncclResult_t _r = (call);                                              \
     if (_r != ncclSuccess) ::vkernels::comm::hip::throw_rccl(ctx, _r);    \
+  } while (0)
+
+// Translate a hipError_t into a thrown std::runtime_error with the HIP
+// error string + context. HipStream::wait(), the memcpy staging in
+// RcclChannel::send/recv and the blocking tail of execute() all go through
+// this; the HIP runtime marks these calls [[nodiscard]] on ROCm 6.3, and a
+// real failure (a dropped memcpy, a failed sync) must surface, not vanish.
+[[noreturn]] void throw_hip(const char* ctx, hipError_t e) {
+  throw std::runtime_error(std::string("vkernels::comm::hip: ") + ctx +
+                           ": " + hipGetErrorString(e));
+}
+
+#define VK_HIP_CHECK(ctx, call)                                          \
+  do {                                                                    \
+    hipError_t _e = (call);                                              \
+    if (_e != hipSuccess) ::vkernels::comm::hip::throw_hip(ctx, _e);    \
   } while (0)
 
 ncclRedOp_t to_rccl_op(RcclReduceOp op) {
@@ -76,13 +92,14 @@ HipStream::HipStream() {
 }
 
 HipStream::~HipStream() {
-  if (stream_ != nullptr) hipStreamDestroy(stream_);
+  // Destructors must not throw; best-effort free of the stream.
+  if (stream_ != nullptr) { auto _e = hipStreamDestroy(stream_); (void)_e; }
 }
 
 hipStream_t_hip HipStream::raw() const { return stream_; }
 
 void HipStream::wait() {
-  if (stream_ != nullptr) hipStreamSynchronize(stream_);
+  if (stream_ != nullptr) VK_HIP_CHECK("HipStream::wait", hipStreamSynchronize(stream_));
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +114,7 @@ RcclComm::RcclComm(rcclComm_t_hip comm, int device, int rank, int world)
 }
 
 RcclComm::~RcclComm() {
-  if (comm_ != nullptr) rcclCommDestroy(comm_);
+  if (comm_ != nullptr) ncclCommDestroy(comm_);
 }
 
 RcclComm::RcclComm(RcclComm&& o) noexcept
@@ -107,7 +124,7 @@ RcclComm::RcclComm(RcclComm&& o) noexcept
 
 RcclComm& RcclComm::operator=(RcclComm&& o) noexcept {
   if (this != &o) {
-    if (comm_ != nullptr) rcclCommDestroy(comm_);
+    if (comm_ != nullptr) ncclCommDestroy(comm_);
     comm_ = o.comm_; device_ = o.device_; rank_ = o.rank_; world_ = o.world_;
     o.comm_ = nullptr;
   }
@@ -116,18 +133,18 @@ RcclComm& RcclComm::operator=(RcclComm&& o) noexcept {
 
 std::string rccl_unique_id() {
   ncclUniqueId id;
-  VK_RCCL_CHECK("rcclGetUniqueId", rcclGetUniqueId(&id));
+  VK_RCCL_CHECK("ncclGetUniqueId", ncclGetUniqueId(&id));
   return std::string(id.internal, NCCL_UNIQUE_ID_BYTES);
 }
 
 std::vector<RcclComm> make_rccl_comms(int world, int device) {
   VK_EXPECTS(world > 0, "make_rccl_comms: world must be positive");
   VK_EXPECTS(device >= 0, "make_rccl_comms: device must be non-negative");
-  std::vector<rcclComm_t> raw(static_cast<std::size_t>(world));
+  std::vector<ncclComm_t> raw(static_cast<std::size_t>(world));
   std::vector<int> devices(static_cast<std::size_t>(world), device);
-  // rcclCommInitAll initialises all `world` comms on `device` in one call.
-  VK_RCCL_CHECK("rcclCommInitAll",
-                rcclCommInitAll(raw.data(), world, devices.data()));
+  // ncclCommInitAll initialises all `world` comms on `device` in one call.
+  VK_RCCL_CHECK("ncclCommInitAll",
+                ncclCommInitAll(raw.data(), world, devices.data()));
   std::vector<RcclComm> comms;
   comms.reserve(static_cast<std::size_t>(world));
   for (int i = 0; i < world; ++i)
@@ -144,9 +161,9 @@ std::vector<RcclComm> make_rccl_comms_from_uniqueid(const std::string& unique_id
              "make_rccl_comms_from_uniqueid: unique id must be NCCL_UNIQUE_ID_BYTES");
   ncclUniqueId id;
   std::copy_n(unique_id_bytes.data(), NCCL_UNIQUE_ID_BYTES, id.internal);
-  rcclComm_t raw = nullptr;
-  VK_RCCL_CHECK("rcclCommInitRank",
-                rcclCommInitRank(&raw, world, id, rank));
+  ncclComm_t raw = nullptr;
+  VK_RCCL_CHECK("ncclCommInitRank",
+                ncclCommInitRank(&raw, world, id, rank));
   // The other ranks of this process are separate calls; this overload
   // returns the single comm for `rank` (the common single-rank-per-process
   // deployment). Use make_rccl_comms for the multi-rank-per-process case.
@@ -173,29 +190,37 @@ RcclChannel::RcclChannel(RcclComm* comm, int peer, hipStream_t_hip stream,
 }
 
 RcclChannel::~RcclChannel() {
-  if (send_buf_ != nullptr) hipFree(send_buf_);
-  if (recv_buf_ != nullptr) hipFree(recv_buf_);
+  // Destructors must not throw; best-effort free of the staging buffers.
+  if (send_buf_ != nullptr) { auto _e = hipFree(send_buf_); (void)_e; }
+  if (recv_buf_ != nullptr) { auto _e = hipFree(recv_buf_); (void)_e; }
 }
 
 void RcclChannel::send(std::vector<float> chunk) {
   const std::size_t bytes = chunk.size() * sizeof(float);
   VK_EXPECTS(bytes <= chunk_bytes_, "RcclChannel::send: chunk exceeds capacity");
-  hipMemcpyAsync(send_buf_, chunk.data(), bytes, hipMemcpyHostToDevice, stream_);
+  VK_HIP_CHECK("RcclChannel::send",
+               hipMemcpyAsync(send_buf_, chunk.data(), bytes,
+                               hipMemcpyHostToDevice, stream_));
   // count is float elements; ncclFloat keeps the host/RCCL type in lockstep.
-  VK_RCCL_CHECK("rcclSend",
-                rcclSend(send_buf_, chunk.size(), ncclFloat, peer_,
+  VK_RCCL_CHECK("ncclSend",
+                ncclSend(send_buf_, chunk.size(), ncclFloat, peer_,
                          comm_->raw(), stream_));
 }
 
 std::vector<float> RcclChannel::recv() {
   const std::size_t cap_elems = chunk_bytes_ / sizeof(float);
-  VK_RCCL_CHECK("rcclRecv",
-                rcclRecv(recv_buf_, cap_elems, ncclFloat, peer_,
+  VK_RCCL_CHECK("ncclRecv",
+                ncclRecv(recv_buf_, cap_elems, ncclFloat, peer_,
                          comm_->raw(), stream_));
   std::vector<float> out(cap_elems);
-  hipMemcpyAsync(out.data(), recv_buf_, cap_elems * sizeof(float),
-                 hipMemcpyDeviceToHost, stream_);
-  hipStreamSynchronize(stream_);  // match the blocking Channel::recv contract
+  VK_HIP_CHECK("RcclChannel::recv",
+               hipMemcpyAsync(out.data(), recv_buf_, cap_elems * sizeof(float),
+                               hipMemcpyDeviceToHost, stream_));
+  // Match the blocking Channel::recv contract: the caller's next send may
+  // reuse `out`'s host memory before this copy lands otherwise. A null
+  // stream_ enqueues on the default stream, which hipStreamSynchronize(null)
+  // also waits on.
+  VK_HIP_CHECK("RcclChannel::recv", hipStreamSynchronize(stream_));
   return out;
 }
 
@@ -251,15 +276,15 @@ void RcclAllreducePlanHip::execute(float* buf, std::size_t count,
   VK_EXPECTS(count <= capacity_,
              "RcclAllreducePlanHip::execute: count exceeds capacity");
 
-  // Exactly ONE rcclAllReduce. In-place (send == recv) is supported by RCCL,
+  // Exactly ONE ncclAllReduce. In-place (send == recv) is supported by RCCL,
   // so no device scratch is needed and execute() allocates nothing after
   // construction — the graph-capturable contract (a captured replay needs no
   // host progress; this single call is one hipGraph node when captured by
   // the caller between hipStreamBeginCapture/hipStreamEndCapture).
-  VK_RCCL_CHECK("rcclAllReduce",
-                rcclAllReduce(buf, buf, count, ncclFloat, to_rccl_op(op_),
+  VK_RCCL_CHECK("ncclAllReduce",
+                ncclAllReduce(buf, buf, count, ncclFloat, to_rccl_op(op_),
                               comm_->raw(), stream));
-  if (stream == nullptr) hipStreamSynchronize(nullptr);
+  if (stream == nullptr) VK_HIP_CHECK("RcclAllreducePlanHip::execute", hipStreamSynchronize(nullptr));
 }
 
 }  // namespace vkernels::comm::hip
