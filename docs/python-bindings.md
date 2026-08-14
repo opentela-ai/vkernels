@@ -163,6 +163,106 @@ reference (`fused_moe_mxfp4_cpu`), matching the C++ oracle bit-for-bit up to
 float32 operation order; the HIP GPU path is invoked from the C++ API
 (`vkernels::kernels::hip::fused_moe_mxfp4`).
 
+#### bf16 GEMM
+
+`gemm_bf16` is a bf16-storage GEMM that mirrors `gemm_bf16_cpu`: the inputs
+and output are packed bf16 (`uint16`) arrays, the multiply-accumulate runs
+in float32, and the result is rounded back to bf16 with round-to-nearest-even.
+The fallback replicates the C++ triple-loop operation order, so the two
+backends are bit-identical.
+
+```python
+A = np.array([_f2bf(1), _f2bf(2), _f2bf(3), _f2bf(4)],
+             dtype=np.uint16).reshape(2, 2)
+I = np.array([_f2bf(1), _f2bf(0), _f2bf(0), _f2bf(1)],
+             dtype=np.uint16).reshape(2, 2)
+kernels.gemm_bf16(A, I)                       # [[bf16(1), bf16(2)],
+                                             #  [bf16(3), bf16(4)]]
+# C = alpha*A@B + beta*C  (C pre-filled with bf16(1), beta=2)
+C = np.full((2, 2), _f2bf(1), dtype=np.uint16)
+kernels.gemm_bf16(A, I, alpha=1.0, beta=2.0, out=C)
+```
+
+`gemm_bf16_config(M, N, K) -> (block_m, block_n, block_k, threads)` selects the
+serving tile when `M <= 64` (`(16, 16, 64, 64)`) and the warmup/prefill tile
+otherwise (`(64, 64, 64, 256)`), matching `gemm_bf16_config_for`.
+
+#### MLA — Multi-head Latent Attention (absorbed form)
+
+`mla_fwd(q, k_c, k_pe, v_c, *, q_start=0, kv_start=0, scale=None, out=None)`
+implements absorbed-form MLA on the host. `q` is `[B, H, S_q, lr+rhd]`, split
+into the RoPE-routed part `q_pe = q[..., :rhd]` and the content part
+`q_c = q[..., rhd:]`. The per-head query position is `gqi = q_start + i` and a
+key `j` is attended iff `kv_start + j <= gqi` (causal). The attention score is
+
+```
+s_j = scale * (q_c[i] . k_c[j] + q_pe[i] . k_pe[j])
+```
+
+with `scale` defaulting to `1/sqrt(lr+rhd)`. Rows with no attended key yield
+zero. `mla_config(S_q, lr, rhd) -> (block_q, block_n, threads)` mirrors
+`mla_config_for` (`S_q <= 8` -> `(1, 64, 64)`, otherwise `(4, 64, 256)`).
+
+```python
+q = np.array([1,0,0,0, 0,1,1,0], dtype=np.float32).reshape(1,1,2,4)
+k_c  = np.array([1,0, 0,1], dtype=np.float32).reshape(1,2,2)
+k_pe = np.array([0,1, 1,0], dtype=np.float32).reshape(1,2,2)
+v_c  = np.array([5,6, 7,8], dtype=np.float32).reshape(1,2,2)
+kernels.mla_fwd(q, k_c, k_pe, v_c, scale=0.5)
+# [[5., 6.],            # q0 attends only k0
+#  [w0*5+w1*7, w0*6+w1*8]]   # q1 attends k0,k1; w1 = sigmoid(1)
+```
+
+#### KDA — Kimi Delta Attention
+
+The KDA family mirrors `src/c/vkernels/kernels/kda.{cpp,hpp}`. The
+per-token recurrence is
+
+```
+S_t = g_t * S_{t-1} + beta_t * (v_t - a_t) * k_t^T     (a_t = S_{t-1} . k_t)
+o_t = S_t . q_t
+```
+
+with `g` (forgetting) and `beta` in `[B, H, S]`, and `q`/`k`/`v` in
+`[B, H, S, D]`. Two entry points cover the whole compute graph:
+
+| Function | Semantics |
+|---|---|
+| `kda_layer_norm_gated(x, weight, gate, *, eps=1e-6, out=None)` | gated RMSNorm followed by SiLU(gate): `silu(gate) * rmsnorm(x) * weight`. Returns `float32[B,H,S,D]` (infers `(N,D)` for any 2-D `x` with a matching `gate`). |
+| `kda_gate_chunk_cumsum(g) -> (intra, inter)` | log-space cumsum of `g` per chunk and across chunks. `g` is `[B,H,n_chunks,chunk_size]`; returns `intra[B,H,n_chunks,chunk_size]` and `inter[B,H,n_chunks]` (prefix-sum of each chunk's last logit). A `g==0` chunk is clamped to a large negative logit so it contributes nothing. |
+| `kda_naive_delta_rule_fwd(q, k, v, g, beta, out=None)` | per-token oracle (above), sequential. Bit-exact against the C++ kernel. |
+| `kda_delta_rule_intra(q, k, v, g, beta, intra, inter_state, *, u, chunk_size, chunk_idx)` | one chunk's intra-chunk recurrence into `u[B,H,S,D]`, reading `u[j<t]` from the same call. |
+| `kda_delta_rule_inter(k, v, g, beta, intra, u, *, inter_state, chunk_size, chunk_idx)` | one chunk's inter-chunk state update into `inter_state[B,H,n_chunks+1,D,D]` (reads `inter_state[..,chunk_idx]`, the previous chunk's state). |
+| `kda_gla_fwd_o(q, k, g, beta, intra, inter_state, u, *, chunk_size, out=None)` | gated linear-attention output assembly: multiplies the per-chunk outputs by the gate cumsum and sums across chunks. |
+| `kda_delta_rule_fwd(q, k, v, g, beta, *, chunk_size, out=None)` | chunked orchestrator: `gate_chunk_cumsum` -> intra/inter loop -> `gla_fwd_o`. `S` must be divisible by `chunk_size`. |
+| `kda_pack_bitmatrix(bits, n_bits=None) -> uint8` | MSB-first bit packing of a 1-D `uint8` {0,1} array into `ceil(n_bits/8)` bytes (defaults to `bits.size`). |
+
+The standalone intra/inter/gla pieces are stateful: callers supply fresh
+zeroed `u` and `inter_state` buffers (the orchestrator allocates them
+internally). `kda_pack_bitmatrix` is the bit-packing used to store the
+`q @ k^T` sign matrix compactly. On the compiled backend the standalone
+stages compose bit-identically to `kda_delta_rule_fwd`; the chunked forward
+matches the naive oracle to `1e-3*(1+maxabs)` (the same tolerance as the C++
+test in `tests/kernels/attn/test_kda.cpp`).
+
+```python
+B = H = 1; S = 64; D = 16; cs = 16
+rng = np.random.default_rng(0)
+q = rng.standard_normal((B, H, S, D)).astype(np.float32)
+k = rng.standard_normal((B, H, S, D)).astype(np.float32)
+v = rng.standard_normal((B, H, S, D)).astype(np.float32)
+g = (0.3 + 0.7*rng.random((B, H, S))).astype(np.float32)
+beta = (0.3 + 0.7*rng.random((B, H, S))).astype(np.float32)
+
+naive  = kernels.kda_naive_delta_rule_fwd(q, k, v, g, beta)
+chunky = kernels.kda_delta_rule_fwd(q, k, v, g, beta, chunk_size=cs)
+assert np.allclose(naive, chunky, atol=1e-3*(1+np.abs(naive).max()))
+
+# bit packing: 1,0,1,1,0,0,0,1,0,1  ->  0xB1, 0x40
+kernels.kda_pack_bitmatrix(np.array([1,0,1,1,0,0,0,1,0,1], np.uint8), n_bits=10)
+# array([177,  64], dtype=uint8)
+```
+
 ### `vkernels.comm`
 
 | Function / class | Semantics |

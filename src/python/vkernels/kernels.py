@@ -76,6 +76,18 @@ def _as_out_typed(out, dtype, n: int, name: str = "out") -> np.ndarray:
     return out
 
 
+def _as_out_any(out, dtype, n: int, name: str = "out", *, zero: bool = False):
+    """Allocate (when ``out is None``) or validate a non-float32 output.
+
+    ``zero`` requests a zero-initialised buffer (for state that must start
+    at zero, e.g. the KDA inter-state carry); otherwise an uninitialised
+    buffer is allocated, matching :func:`_as_out`.
+    """
+    if out is None:
+        return np.zeros(n, dtype=dtype) if zero else np.empty(n, dtype=dtype)
+    return _as_out_typed(out, dtype, n, name)
+
+
 def add(a, b, out=None) -> np.ndarray:
     """Compute ``out = a + b`` element-wise.
 
@@ -821,3 +833,549 @@ def mxfp4_moe_scatter_reduce_q(
         pq, ps, w, ids, int(M), int(width), int(top_k), int(EM), int(group_size)
     )
     return out.reshape(M, width)
+
+
+# ---------------------------------------------------------------------------
+# bf16 GEMM (gfx942 projection reference, issue #29)
+# ---------------------------------------------------------------------------
+
+
+def gemm_bf16(A, B, alpha: float = 1.0, beta: float = 0.0, out=None):
+    """Compute ``C = alpha * A @ B + beta * C`` (bf16 in/out, fp32 accumulate,
+    single round-to-nearest-even on store).
+
+    This is the Pythonic form of the C++ ``gemm_bf16(M, N, K, alpha, A, B,
+    beta, C)``: ``A``, ``B`` are bf16 (uint16 bit patterns), the inner
+    product accumulates in fp32, and the result is stored back as bf16 with
+    the same RNE as the HIP MFMA kernel. It is the bit-faithful host oracle
+    the gfx942 bf16 GEMM is checked against.
+
+    Args:
+        A: uint16 bf16 matrix of shape ``(M, K)``.
+        B: uint16 bf16 matrix of shape ``(K, N)``.
+        alpha: scalar for the product term (default 1.0).
+        beta: scalar for the accumulator term (default 0.0; ``beta == 0``
+            skips the prior-``C`` read, matching the kernel).
+        out: optional writable uint16 array of shape ``(M, N)`` (or flat
+            ``(M*N,)``); a new ``(M, N)`` uint16 array is allocated when
+            omitted.
+
+    Returns:
+        The output array (``out`` if given, otherwise a new ``(M, N)``
+        uint16 array of bf16 bit patterns).
+
+    Raises:
+        ValueError: if the inner dimensions disagree, or ``out`` has the
+            wrong dtype/length.
+    """
+    a_arr = np.ascontiguousarray(A, dtype=np.uint16)
+    b_arr = np.ascontiguousarray(B, dtype=np.uint16)
+    if a_arr.ndim != 2 or b_arr.ndim != 2:
+        raise ValueError("A and B must be 2-D (MxK and KxN)")
+    M, K = a_arr.shape
+    k2, N = b_arr.shape
+    if K != k2:
+        raise ValueError(f"inner dimensions must match: A is {M}x{K} but B is {k2}x{N}")
+    out_arr = _as_out_any(out, np.uint16, M * N, "out")
+    _impl.gemm_bf16(
+        int(M),
+        int(N),
+        int(K),
+        float(np.float32(alpha)),
+        a_arr,
+        b_arr,
+        float(np.float32(beta)),
+        out_arr,
+    )
+    if out_arr.shape != (M, N):
+        out_arr = out_arr.reshape(M, N)
+    return out_arr
+
+
+def gemm_bf16_config(M, N, K):
+    """Per-shape ``(bm, bn, bk, threads)`` MFMA tile the HIP bf16 GEMM should
+    launch for ``(M, N, K)``.
+
+    ``BK`` is fixed at 64. ``M <= 64`` (serving / decode) selects
+    ``(16, 16, 64, 64)`` (one wavefront per 16-row fragment); larger ``M``
+    (warmup / prefill) selects ``(64, 64, 64, 256)`` (four wavefronts).
+
+    Args:
+        M, N, K: integer matrix dimensions.
+
+    Returns:
+        The ``(bm, bn, bk, threads)`` tuple (all ``int``).
+    """
+    return tuple(int(v) for v in _impl.gemm_bf16_config(int(M), int(N), int(K)))
+
+
+# ---------------------------------------------------------------------------
+# MLA: absorbed-form Multi-head Latent Attention (issue #21)
+# ---------------------------------------------------------------------------
+
+
+def mla_fwd(q, k_c, k_pe, v_c, *, q_start=0, kv_start=0, scale=1.0, out=None):
+    """Absorbed-form Multi-head Latent Attention forward (fp32 two-pass
+    stable softmax, causal via ``(q_start, kv_start)``).
+
+    This is the CPU reference the gfx942 MLA kernel is checked against. The
+    batch / head / sequence / latent dimensions are inferred from the input
+    shapes:
+
+    * ``q``    : ``(B, H, S_q, kv_lora_rank + qk_rope_head_dim)``
+    * ``k_c``  : ``(B, S_kv, kv_lora_rank)``
+    * ``k_pe`` : ``(B, S_kv, qk_rope_head_dim)``
+    * ``v_c``  : ``(B, S_kv, kv_lora_rank)``
+    * ``out``  : ``(B, H, S_q, kv_lora_rank)``
+
+    For query ``i`` (global position ``q_start + i``) the attended keys are
+    those ``j`` with ``kv_start + j <= q_start + i``; every other key is
+    masked to ``-inf``. When all keys are masked the output row is zero.
+
+    Args:
+        q: float32 ``(B, H, S_q, lr+rhd)`` queries (nope prefix then rope).
+        k_c: float32 ``(B, S_kv, lr)`` compressed keys.
+        k_pe: float32 ``(B, S_kv, rhd)`` decoupled RoPE key positions.
+        v_c: float32 ``(B, S_kv, lr)`` compressed values.
+        q_start: global position of the first query row (default 0).
+        kv_start: global position of the first key row (default 0).
+        scale: softmax pre-scale, typically ``1/sqrt(lr+rhd)`` (default 1.0).
+        out: optional writable float32 ``(B, H, S_q, lr)`` buffer; allocated
+            (zero-initialised) when omitted.
+
+    Returns:
+        The output array (``out`` if given, otherwise a new
+        ``(B, H, S_q, kv_lora_rank)`` float32 array).
+
+    Raises:
+        ValueError: on inconsistent shapes or non-positive ranks.
+    """
+    q_arr = _as_input(q, "q")
+    kc_arr = _as_input(k_c, "k_c")
+    kp_arr = _as_input(k_pe, "k_pe")
+    vc_arr = _as_input(v_c, "v_c")
+    if q_arr.ndim != 4:
+        raise ValueError("q must be 4-D [B, H, S_q, lr+rhd]")
+    if kc_arr.ndim != 3:
+        raise ValueError("k_c must be 3-D [B, S_kv, lr]")
+    if kp_arr.ndim != 3:
+        raise ValueError("k_pe must be 3-D [B, S_kv, rhd]")
+    if vc_arr.ndim != 3:
+        raise ValueError("v_c must be 3-D [B, S_kv, lr]")
+    B, H, S_q, D_q = q_arr.shape
+    Bk, S_kv, lr = kc_arr.shape
+    Bp, S_kvp, rhd = kp_arr.shape
+    Bv, S_kv2, lr2 = vc_arr.shape
+    if not (lr > 0 and rhd > 0):
+        raise ValueError("kv_lora_rank and qk_rope_head_dim must be positive")
+    if D_q != lr + rhd:
+        raise ValueError(f"q last dim {D_q} != lr+rhd = {lr+rhd}")
+    if Bk != B or Bp != B or Bv != B:
+        raise ValueError(f"batch mismatch: q={B} k_c={Bk} k_pe={Bp} v_c={Bv}")
+    if S_kv != S_kvp or S_kv != S_kv2:
+        raise ValueError(f"S_kv mismatch: k_c={S_kv} k_pe={S_kvp} v_c={S_kv2}")
+    if lr2 != lr:
+        raise ValueError(f"kv_lora_rank mismatch: k_c={lr} v_c={lr2}")
+    out_arr = _as_out(B * H * S_q * lr, out, "out")
+    _impl.mla_fwd(
+        int(B), int(H), int(S_q), int(S_kv), int(q_start), int(kv_start),
+        int(lr), int(rhd), float(np.float32(scale)), q_arr, kc_arr, kp_arr,
+        vc_arr, out_arr,
+    )
+    if out_arr.shape != (B, H, S_q, lr):
+        out_arr = out_arr.reshape(B, H, S_q, lr)
+    return out_arr
+
+
+def mla_config(S_q, kv_lora_rank, qk_rope_head_dim):
+    """Per-shape ``(bq, bn_kv, threads)`` tile selector for the HIP MLA
+    kernel.
+
+    Decode (``S_q <= 8``) selects ``(1, 64, 64)`` (one query row per block,
+    one wavefront); prefill (``S_q >= 9``) selects ``(4, 64, 256)``. The
+    latent ranks only affect the runtime, not the tile.
+
+    Args:
+        S_q: query sequence length per head.
+        kv_lora_rank: compressed latent rank (unused by the heuristic).
+        qk_rope_head_dim: decoupled RoPE head dim (unused by the heuristic).
+
+    Returns:
+        The ``(bq, bn_kv, threads)`` tuple (all ``int``).
+    """
+    return tuple(
+        int(v)
+        for v in _impl.mla_config(int(S_q), int(kv_lora_rank), int(qk_rope_head_dim))
+    )
+
+
+# ---------------------------------------------------------------------------
+# KDA: Kimi Delta Attention (issue #21)
+# ---------------------------------------------------------------------------
+
+
+def _kda_dims(q, g, name="q"):
+    """Validate ``q`` [B,H,S,D] / ``g`` [B,H,S] and return ``(B, H, S, D)``."""
+    q = np.asarray(q)
+    g = np.asarray(g)
+    if q.ndim != 4:
+        raise ValueError(f"{name} must be 4-D [B, H, S, D]")
+    if g.ndim != 3:
+        raise ValueError("g must be 3-D [B, H, S]")
+    B, H, S, D = q.shape
+    if g.shape != (B, H, S):
+        raise ValueError(f"g must be [{B}, {H}, {S}], got {g.shape}")
+    return int(B), int(H), int(S), int(D)
+
+
+def _kda_dims3(g, beta, name="g"):
+    """Validate ``g`` [B,H,S] (and ``beta``) and return ``(B, H, S)``."""
+    g_arr = np.asarray(g)
+    beta_arr = np.asarray(beta)
+    if g_arr.ndim != 3:
+        raise ValueError(f"{name} must be 3-D [B, H, S]")
+    if beta_arr.shape != g_arr.shape:
+        raise ValueError(f"beta must match g shape {g_arr.shape}, got {beta_arr.shape}")
+    return int(g_arr.shape[0]), int(g_arr.shape[1]), int(g_arr.shape[2])
+
+
+def _require_chunk(S, chunk_size):
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if int(S) % chunk_size != 0:
+        raise ValueError(f"chunk_size ({chunk_size}) must divide S ({int(S)})")
+    return int(S) // chunk_size
+
+
+def kda_layer_norm_gated(x, weight, gate, *, out=None, eps: float = 1e-6):
+    """Gated RMSNorm: ``out[n,d] = (x[n]/rms_n) * weight[d] * silu(gate[n,d])``
+    with ``rms_n = sqrt(mean(x[:]^2) + eps)`` (the K3 layer-normalization).
+
+    Args:
+        x: float32 ``(N, D)`` input.
+        weight: float32 ``(D,)`` scale.
+        gate: float32 ``(N, D)`` gate (silu is applied per element).
+        out: optional writable float32 ``(N, D)`` buffer; a new ``(N, D)``
+            array is allocated when omitted.
+        eps: RMS epsilon (default 1e-6, must be non-negative).
+
+    Returns:
+        The output array (``out`` if given, otherwise a new ``(N, D)``
+        float32 array).
+    """
+    x_arr = _as_input(x, "x")
+    weight_arr = _as_input(weight, "weight")
+    gate_arr = _as_input(gate, "gate")
+    if x_arr.ndim != 2:
+        raise ValueError("x must be 2-D [N, D]")
+    N, D = x_arr.shape
+    if weight_arr.shape != (D,):
+        raise ValueError(f"weight must be ({D},), got {weight_arr.shape}")
+    if gate_arr.shape != (N, D):
+        raise ValueError(f"gate must be ({N}, {D}), got {gate_arr.shape}")
+    out_arr = _as_out(N * D, out, "out")
+    _impl.kda_layer_norm_gated(
+        x_arr, weight_arr, gate_arr, out_arr, int(N), int(D),
+        float(np.float32(eps)),
+    )
+    if out_arr.shape != (N, D):
+        out_arr = out_arr.reshape(N, D)
+    return out_arr
+
+
+def kda_gate_chunk_cumsum(g):
+    """Log-gate cumulative sums (KDA L2).
+
+    ``g`` ``(B, H, n_chunks, chunk_size)`` (normal space, ``g > 0``; ``g == 0``
+    is clamped to ``-1e9`` so a fully-forgotten gate yields ~0 weight) is
+    split into a within-chunk INCLUSIVE log-cumsum and a cross-chunk
+    EXCLUSIVE log-cumsum. Gate products recover as ``exp(L_b - L_{a-1})``
+    (``L_{-1} = 0``).
+
+    Args:
+        g: float32 ``(B, H, n_chunks, chunk_size)`` gates.
+
+    Returns:
+        ``(intra, inter)`` where ``intra`` is float32
+        ``(B, H, n_chunks, chunk_size)`` and ``inter`` is float32
+        ``(B, H, n_chunks)``.
+    """
+    g_arr = _as_input(g, "g")
+    if g_arr.ndim != 4:
+        raise ValueError("g must be 4-D [B, H, n_chunks, chunk_size]")
+    B, H, n_chunks, chunk_size = g_arr.shape
+    intra, inter = _impl.kda_gate_chunk_cumsum(
+        g_arr, int(B), int(H), int(n_chunks), int(chunk_size)
+    )
+    return intra.reshape(B, H, n_chunks, chunk_size), inter.reshape(B, H, n_chunks)
+
+
+def kda_naive_delta_rule_fwd(q, k, v, g, beta, *, out=None):
+    """Per-token delta-rule oracle (O(S*D^2) per head).
+
+    Implements the recurrence ``S_t = g_t S_{t-1} + beta_t (v_t -
+    S_{t-1} k_t) k_t^T`` then ``o_t = S_t q_t`` per token, per head. This is
+    the slow but obviously-correct reference the chunked forward (and the
+    HIP kernel) are checked against.
+
+    Args:
+        q, k, v: float32 ``(B, H, S, D)``.
+        g, beta: float32 ``(B, H, S)``.
+        out: optional writable float32 ``(B, H, S, D)`` buffer; a new
+            ``(B, H, S, D)`` array is allocated when omitted.
+
+    Returns:
+        The output array (``out`` if given, otherwise a new
+        ``(B, H, S, D)`` float32 array).
+    """
+    B, H, S, D = _kda_dims(q, g)
+    q_arr = _as_input(q, "q")
+    k_arr = _as_input(k, "k")
+    v_arr = _as_input(v, "v")
+    g_arr = _as_input(g, "g")
+    beta_arr = _as_input(beta, "beta")
+    out_arr = _as_out(B * H * S * D, out, "out")
+    _impl.kda_naive_delta_rule_fwd(
+        q_arr, k_arr, v_arr, g_arr, beta_arr, int(B), int(H), int(S),
+        int(D), out_arr,
+    )
+    if out_arr.shape != (B, H, S, D):
+        out_arr = out_arr.reshape(B, H, S, D)
+    return out_arr
+
+
+def kda_delta_rule_fwd(q, k, v, g, beta, *, chunk_size, out=None):
+    """Chunked delta-rule forward (KDA L2..L6 pipeline).
+
+    Orchestrates the gate log-cumsum (L2), the within-chunk delta-corrected
+    value solve (L4), the cross-chunk state propagation (L5) and the final
+    intra+inter output combine (L6). ``chunk_size`` must divide ``S``. The
+    result matches :func:`kda_naive_delta_rule_fwd` within fp32 round-off
+    scaled by the sequence length.
+
+    Args:
+        q, k, v: float32 ``(B, H, S, D)``.
+        g, beta: float32 ``(B, H, S)``.
+        chunk_size: per-chunk token count (must divide ``S``).
+        out: optional writable float32 ``(B, H, S, D)`` buffer; a new
+            ``(B, H, S, D)`` array is allocated when omitted.
+
+    Returns:
+        The output array (``out`` if given, otherwise a new
+        ``(B, H, S, D)`` float32 array).
+    """
+    B, H, S, D = _kda_dims(q, g)
+    q_arr = _as_input(q, "q")
+    k_arr = _as_input(k, "k")
+    v_arr = _as_input(v, "v")
+    g_arr = _as_input(g, "g")
+    beta_arr = _as_input(beta, "beta")
+    out_arr = _as_out(B * H * S * D, out, "out")
+    _impl.kda_delta_rule_fwd(
+        q_arr, k_arr, v_arr, g_arr, beta_arr, int(B), int(H), int(S), int(D),
+        int(chunk_size), out_arr,
+    )
+    if out_arr.shape != (B, H, S, D):
+        out_arr = out_arr.reshape(B, H, S, D)
+    return out_arr
+
+
+def kda_delta_rule_intra(
+    q, k, v, g, beta, intra_log, inter_state, *, u=None, chunk_size, chunk_idx
+):
+    """Within-chunk delta-corrected value solve (KDA L4), one chunk.
+
+    For token ``t`` in chunk ``chunk_idx``:
+    ``u_t = v_t - G_{0,t-1}(C_{c-1} k_t) - sum_{j<t} G_{j+1,t-1} b_j (k_j.k_t) u_j``
+    where ``C_{c-1}`` is read from ``inter_state[..., chunk_idx]``.
+
+    This is a low-level stage of the chunked pipeline, exposed so the HIP
+    kernel's per-stage output can be cross-checked. For the full layer use
+    :func:`kda_delta_rule_fwd`; to call the stages manually you must pass the
+    SAME persistent ``u`` and ``inter_state`` buffers across ``chunk_idx``.
+
+    Args:
+        q, k, v: float32 ``(B, H, S, D)``.
+        g, beta: float32 ``(B, H, S)``.
+        intra_log: float32 ``(B, H, n_chunks, chunk_size)`` (from
+            :func:`kda_gate_chunk_cumsum`).
+        inter_state: float32 ``(B, H, n_chunks+1, D, D)``; row ``chunk_idx``
+            (``C_{c-1}``) is read.
+        u: optional writable float32 ``(B, H, S, D)`` buffer; a zeroed array
+            is allocated when omitted (correct for a single chunk).
+        chunk_size: per-chunk token count (must divide ``S``).
+        chunk_idx: which chunk to solve (``0 <= chunk_idx*chunk_size < S``).
+
+    Returns:
+        The ``u`` array (``u`` if given, otherwise a new zeroed
+        ``(B, H, S, D)`` float32 array).
+    """
+    B, H, S, D = _kda_dims(q, g)
+    q_arr = _as_input(q, "q")
+    k_arr = _as_input(k, "k")
+    v_arr = _as_input(v, "v")
+    g_arr = _as_input(g, "g")
+    beta_arr = _as_input(beta, "beta")
+    intra_arr = _as_input(intra_log, "intra_log")
+    inter_arr = _as_input(inter_state, "inter_state")
+    n_chunks = _require_chunk(S, chunk_size)
+    if intra_arr.shape != (B, H, n_chunks, int(chunk_size)):
+        raise ValueError(
+            f"intra_log must be [{B}, {H}, {n_chunks}, {chunk_size}], got {intra_arr.shape}"
+        )
+    if inter_arr.shape != (B, H, n_chunks + 1, D, D):
+        raise ValueError(
+            f"inter_state must be [{B}, {H}, {n_chunks + 1}, {D}, {D}], got {inter_arr.shape}"
+        )
+    if not (0 <= int(chunk_idx) * int(chunk_size) < S):
+        raise ValueError("chunk_idx out of range")
+    u_arr = _as_out_any(u, _F32, B * H * S * D, "u", zero=True)
+    _impl.kda_delta_rule_intra(
+        q_arr, k_arr, v_arr, g_arr, beta_arr, intra_arr, inter_arr, u_arr,
+        int(B), int(H), int(S), int(D), int(chunk_size), int(chunk_idx),
+    )
+    if u_arr.shape != (B, H, S, D):
+        u_arr = u_arr.reshape(B, H, S, D)
+    return u_arr
+
+
+def kda_delta_rule_inter(
+    k, v, g, beta, intra_log, u, *, inter_state=None, chunk_size, chunk_idx
+):
+    """Cross-chunk state propagation (KDA L5), one chunk.
+
+    Fills ``inter_state[..., chunk_idx+1] = C_c`` where
+    ``C_c = G_{0,C-1} C_{c-1} + sum_t G_{t+1,C-1} b_t u_t k_t^T``. The read
+    row ``C_{c-1}`` is ``inter_state[..., chunk_idx]`` (must be zero for
+    ``chunk_idx == 0``).
+
+    Low-level pipeline stage — see :func:`kda_delta_rule_intra` for the
+    buffer-ownership contract and :func:`kda_delta_rule_fwd` for the whole
+    layer.
+
+    Args:
+        k, v: float32 ``(B, H, S, D)`` (``v`` is accepted for signature
+            symmetry but unused by this stage).
+        g, beta: float32 ``(B, H, S)``.
+        intra_log: float32 ``(B, H, n_chunks, chunk_size)``.
+        u: float32 ``(B, H, S, D)`` (from :func:`kda_delta_rule_intra`).
+        inter_state: optional writable float32
+            ``(B, H, n_chunks+1, D, D)`` buffer; a zeroed array is allocated
+            when omitted (correct only for ``chunk_idx == 0``).
+        chunk_size: per-chunk token count (must divide ``S``).
+        chunk_idx: which chunk to propagate (``0 <= chunk_idx*chunk_size < S``).
+
+    Returns:
+        The ``inter_state`` array (``inter_state`` if given, otherwise a new
+        zeroed ``(B, H, n_chunks+1, D, D)`` float32 array).
+    """
+    B, H, S = _kda_dims3(g, beta)
+    D = np.asarray(u).shape[-1]
+    k_arr = _as_input(k, "k")
+    v_arr = _as_input(v, "v")
+    g_arr = _as_input(g, "g")
+    beta_arr = _as_input(beta, "beta")
+    u_arr = _as_input(u, "u")
+    intra_arr = _as_input(intra_log, "intra_log")
+    n_chunks = _require_chunk(S, chunk_size)
+    if u_arr.shape != (B, H, S, D):
+        raise ValueError(f"u must be [{B}, {H}, {S}, {D}], got {u_arr.shape}")
+    if intra_arr.shape != (B, H, n_chunks, int(chunk_size)):
+        raise ValueError(
+            f"intra_log must be [{B}, {H}, {n_chunks}, {chunk_size}], got {intra_arr.shape}"
+        )
+    if not (0 <= int(chunk_idx) * int(chunk_size) < S):
+        raise ValueError("chunk_idx out of range")
+    inter_arr = _as_out_any(
+        inter_state, _F32, B * H * (n_chunks + 1) * D * D, "inter_state", zero=True
+    )
+    _impl.kda_delta_rule_inter(
+        k_arr, v_arr, g_arr, beta_arr, intra_arr, u_arr, inter_arr, int(B),
+        int(H), int(S), int(D), int(chunk_size), int(chunk_idx),
+    )
+    if inter_arr.shape != (B, H, n_chunks + 1, D, D):
+        inter_arr = inter_arr.reshape(B, H, n_chunks + 1, D, D)
+    return inter_arr
+
+
+def kda_gla_fwd_o(q, k, g, beta, intra_log, inter_state, u, *, out=None, chunk_size):
+    """Output (intra + inter) combine (KDA L6).
+
+    ``o_t = G_{0,t}(C_{c-1} q_t) + sum_{j<=t} G_{j+1,t} b_j (k_j.q_t) u_j``
+    where ``C_{c-1}`` is ``inter_state[..., c]`` for ``t`` in chunk ``c``.
+
+    Low-level pipeline stage — see :func:`kda_delta_rule_fwd` for the whole
+    layer.
+
+    Args:
+        q, k: float32 ``(B, H, S, D)``.
+        g, beta: float32 ``(B, H, S)``.
+        intra_log: float32 ``(B, H, n_chunks, chunk_size)``.
+        inter_state: float32 ``(B, H, n_chunks+1, D, D)``.
+        u: float32 ``(B, H, S, D)``.
+        out: optional writable float32 ``(B, H, S, D)`` buffer; a new
+            ``(B, H, S, D)`` array is allocated when omitted.
+        chunk_size: per-chunk token count (must divide ``S``).
+
+    Returns:
+        The output array (``out`` if given, otherwise a new
+        ``(B, H, S, D)`` float32 array).
+    """
+    B, H, S, D = _kda_dims(q, g)
+    q_arr = _as_input(q, "q")
+    k_arr = _as_input(k, "k")
+    g_arr = _as_input(g, "g")
+    beta_arr = _as_input(beta, "beta")
+    intra_arr = _as_input(intra_log, "intra_log")
+    inter_arr = _as_input(inter_state, "inter_state")
+    u_arr = _as_input(u, "u")
+    n_chunks = _require_chunk(S, chunk_size)
+    if intra_arr.shape != (B, H, n_chunks, int(chunk_size)):
+        raise ValueError(
+            f"intra_log must be [{B}, {H}, {n_chunks}, {chunk_size}], got {intra_arr.shape}"
+        )
+    if inter_arr.shape != (B, H, n_chunks + 1, D, D):
+        raise ValueError(
+            f"inter_state must be [{B}, {H}, {n_chunks + 1}, {D}, {D}], got {inter_arr.shape}"
+        )
+    out_arr = _as_out(B * H * S * D, out, "out")
+    _impl.kda_gla_fwd_o(
+        q_arr, k_arr, g_arr, beta_arr, intra_arr, inter_arr, u_arr, int(B),
+        int(H), int(S), int(D), int(chunk_size), out_arr,
+    )
+    if out_arr.shape != (B, H, S, D):
+        out_arr = out_arr.reshape(B, H, S, D)
+    return out_arr
+
+
+def kda_pack_bitmatrix(bits, *, n_bits=None):
+    """Pack a binary bit array into bytes, MSB-first (KDA ``pack_bitmatrix``).
+
+    Bit ``k`` (``0`` or ``1``) is written to byte ``k//8``, bit
+    ``7 - k%8``. The result has ``ceil(n_bits/8)`` bytes; trailing bits of
+    the final byte are zero.
+
+    Args:
+        bits: uint8 array (each element ``0`` or ``1``).
+        n_bits: number of leading bits to pack (default ``bits.size``; must
+            not exceed it).
+
+    Returns:
+        A uint8 array of length ``ceil(n_bits/8)``.
+
+    Raises:
+        ValueError: if ``n_bits`` exceeds ``bits.size``.
+
+    Example:
+        >>> list(kda_pack_bitmatrix(np.array([1, 0, 1, 1, 0, 0, 0, 1],
+        ...                                dtype=np.uint8)))
+        [177]
+    """
+    bits_arr = np.ascontiguousarray(bits, dtype=np.uint8).ravel()
+    n = bits_arr.size if n_bits is None else int(n_bits)
+    if n < 0:
+        raise ValueError("n_bits must be non-negative")
+    if n > bits_arr.size:
+        raise ValueError(f"n_bits ({n}) exceeds bits.size ({bits_arr.size})")
+    return _impl.kda_pack_bitmatrix(bits_arr, n)

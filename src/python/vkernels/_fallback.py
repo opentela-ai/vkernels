@@ -22,6 +22,7 @@ Faithfulness notes
 from __future__ import annotations
 
 import ctypes
+import math
 import threading
 from collections import deque
 
@@ -813,6 +814,476 @@ def mxfp4_moe_scatter_reduce_q(
                 out[token, base + i] += np.float32(lo * wr)
                 out[token, base + i + 1] += np.float32(hi * wr)
     return out.ravel()
+
+
+# ---------------------------------------------------------------------------
+# bf16 GEMM (gfx942 projection reference, issue #29)
+# ---------------------------------------------------------------------------
+
+
+def gemm_bf16(M, N, K, alpha, A, B, beta, C):
+    """C = alpha * A @ B + beta * C, bf16 (uint16) in/out, fp32 accumulate.
+
+    Mirrors ``gemm_bf16_cpu`` exactly: a sequential k-accumulation in
+    float32 and a single round-to-nearest-even on store (``beta == 0`` skips
+    the prior-C read). Intended for small shapes — the O(M*N*K) loop is the
+    bit-faithful reference the K3 HIP MFMA kernel is checked against.
+    """
+    A = np.asarray(A, dtype=np.uint16).ravel()
+    B = np.asarray(B, dtype=np.uint16).ravel()
+    C = np.asarray(C, dtype=np.uint16).ravel()
+    if A.size != M * K:
+        raise ValueError("A must be M*K")
+    if B.size != K * N:
+        raise ValueError("B must be K*N")
+    if C.size != M * N:
+        raise ValueError("C must be M*N")
+    a = np.float32(alpha)
+    b = np.float32(beta)
+    read_prev = b != np.float32(0.0)
+    for i in range(int(M)):
+        for j in range(int(N)):
+            acc = np.float32(0.0)
+            for k in range(int(K)):
+                av = np.float32(_bf16_to_float(int(A[i * K + k])))
+                bv = np.float32(_bf16_to_float(int(B[k * N + j])))
+                acc = np.float32(acc + av * bv)
+            prev = (
+                np.float32(_bf16_to_float(int(C[i * N + j])))
+                if read_prev
+                else np.float32(0.0)
+            )
+            C[i * N + j] = _float_to_bf16_bits(float(np.float32(a * acc + b * prev)))
+    return C
+
+
+def gemm_bf16_config(M, N, K):
+    """Per-shape (bm, bn, bk, threads) MFMA tile selector (mirrors
+    ``gemm_bf16_config_for``; BK is fixed at 64 for the K3 shapes)."""
+    bk = 64
+    if M <= 64:
+        return (16, 16, bk, 64)  # serving / decode: 1 wavefront
+    return (64, 64, bk, 256)  # warmup / prefill: 4 wavefronts
+
+
+# ---------------------------------------------------------------------------
+# MLA: absorbed-form Multi-head Latent Attention (issue #21)
+# ---------------------------------------------------------------------------
+
+
+def mla_fwd(B, H, S_q, S_kv, q_start, kv_start, kv_lora_rank,
+            qk_rope_head_dim, scale, q, k_c, k_pe, v_c, out):
+    """Absorbed-form MLA forward, fp32 two-pass stable softmax (mirrors
+    ``mla_fwd_cpu``). q [B,H,S_q,lr+rhd], k_c [B,S_kv,lr], k_pe [B,S_kv,rhd],
+    v_c [B,S_kv,lr] -> out [B,H,S_q,lr], all float32, written in place.
+    """
+    D_q = kv_lora_rank + qk_rope_head_dim
+    q = np.ascontiguousarray(q, dtype=np.float32).ravel()
+    k_c = np.ascontiguousarray(k_c, dtype=np.float32).ravel()
+    k_pe = np.ascontiguousarray(k_pe, dtype=np.float32).ravel()
+    v_c = np.ascontiguousarray(v_c, dtype=np.float32).ravel()
+    out = np.asarray(out, dtype=np.float32).ravel()
+    if q.size != B * H * S_q * D_q:
+        raise ValueError("q must be B*H*S_q*(lr+rhd)")
+    if k_c.size != B * S_kv * kv_lora_rank:
+        raise ValueError("k_c must be B*S_kv*lr")
+    if k_pe.size != B * S_kv * qk_rope_head_dim:
+        raise ValueError("k_pe must be B*S_kv*rhd")
+    if v_c.size != B * S_kv * kv_lora_rank:
+        raise ValueError("v_c must be B*S_kv*lr")
+    if out.size != B * H * S_q * kv_lora_rank:
+        raise ValueError("out must be B*H*S_q*lr")
+    if B == 0 or H == 0 or S_q == 0 or S_kv == 0:
+        return out
+    sc = np.float32(scale)
+    qr = q.reshape(B, H, S_q, D_q)
+    kc = k_c.reshape(B, S_kv, kv_lora_rank)
+    kp = k_pe.reshape(B, S_kv, qk_rope_head_dim)
+    vc = v_c.reshape(B, S_kv, kv_lora_rank)
+    oh = out.reshape(B, H, S_q, kv_lora_rank)
+    lr = kv_lora_rank
+    rhd = qk_rope_head_dim
+    for b in range(B):
+        for h in range(H):
+            for i in range(S_q):
+                gqi = q_start + i
+                qi = qr[b, h, i]
+                qn = qi[:lr]
+                qrp = qi[lr:]
+                s = np.full(S_kv, -np.inf, dtype=np.float32)
+                mx = -np.inf
+                for j in range(S_kv):
+                    if kv_start + j > gqi:
+                        continue
+                    dot = np.float32(0.0)
+                    for d in range(lr):
+                        dot = np.float32(dot + qn[d] * kc[b, j, d])
+                    for d in range(rhd):
+                        dot = np.float32(dot + qrp[d] * kp[b, j, d])
+                    sj = np.float32(sc * dot)
+                    s[j] = sj
+                    if sj > mx:
+                        mx = sj
+                if mx == -np.inf:  # every key masked
+                    oh[b, h, i, :] = np.float32(0.0)
+                    continue
+                sumv = np.float32(0.0)
+                w = np.empty(S_kv, dtype=np.float32)
+                for j in range(S_kv):
+                    if s[j] == -np.inf:
+                        continue
+                    w[j] = np.float32(math.exp(float(s[j] - mx)))
+                    sumv = np.float32(sumv + w[j])
+                inv = np.float32(1.0 / sumv)
+                oi = np.zeros(lr, dtype=np.float32)
+                for j in range(S_kv):
+                    if s[j] == -np.inf:
+                        continue
+                    a = np.float32(w[j] * inv)
+                    vj = vc[b, j]
+                    for d in range(lr):
+                        oi[d] = np.float32(oi[d] + a * vj[d])
+                oh[b, h, i, :] = oi
+    return out
+
+
+def mla_config(S_q, kv_lora_rank, qk_rope_head_dim):
+    """Per-shape (bq, bn_kv, threads) tile selector (mirrors
+    ``mla_config_for``; decode S_q<=8 -> (1,64,64), prefill -> (4,64,256))."""
+    if S_q <= 8:
+        return (1, 64, 64)
+    return (4, 64, 256)
+
+
+# ---------------------------------------------------------------------------
+# KDA: Kimi Delta Attention (issue #21)
+# ---------------------------------------------------------------------------
+
+_KDA_LOG_FLOOR = np.float32(-1.0e9)  # log(0) clamp (fully forgotten)
+
+
+def _kda_log_gate(g):
+    g = np.float32(g)
+    if g <= np.float32(0.0):
+        return _KDA_LOG_FLOOR
+    return np.float32(math.log(float(g)))
+
+
+def _kda_gate_prod_intra(L, a, b):
+    """G_{a,b} = exp(L_b - L_{a-1}) with L_{-1}=0; 1.0 when a > b."""
+    if a > b:
+        return np.float32(1.0)
+    return np.float32(math.exp(float(L[b] - (L[a - 1] if a > 0 else np.float32(0.0)))))
+
+
+def kda_layer_norm_gated(x, weight, gate, out, N, D, eps):
+    """Gated RMSNorm: out[n,d] = (x[n]/rms_n) * weight[d] * silu(gate[n,d]),
+    rms_n = sqrt(mean(x[:]^2) + eps). Mirrors ``kda_layer_norm_gated_cpu``."""
+    x = np.ascontiguousarray(x, dtype=np.float32).ravel()
+    weight = np.ascontiguousarray(weight, dtype=np.float32).ravel()
+    gate = np.ascontiguousarray(gate, dtype=np.float32).ravel()
+    out = np.asarray(out, dtype=np.float32).ravel()
+    if weight.size != D:
+        raise ValueError("weight must be D")
+    if x.size != N * D:
+        raise ValueError("x must be N*D")
+    if gate.size != N * D:
+        raise ValueError("gate must be N*D")
+    if out.size != N * D:
+        raise ValueError("out must be N*D")
+    if D <= 0:
+        raise ValueError("D must be positive")
+    if eps < 0.0:
+        raise ValueError("eps must be non-negative")
+    for n in range(N):
+        xn = x[n * D : (n + 1) * D]
+        sq = np.float32(0.0)
+        for d in range(D):
+            sq = np.float32(sq + xn[d] * xn[d])
+        inv = np.float32(1.0 / math.sqrt(float(sq / np.float32(D) + np.float32(eps))))
+        for d in range(D):
+            g = np.float32(gate[n * D + d])
+            silu = np.float32(g / (np.float32(1.0) + np.float32(math.exp(-float(g)))))
+            out[n * D + d] = np.float32(xn[d] * inv * weight[d] * silu)
+    return out
+
+
+def kda_gate_chunk_cumsum(g, B, H, n_chunks, chunk_size):
+    """Log-gate cumulative sums (mirrors ``kda_gate_chunk_cumsum_cpu``):
+    g [B,H,n_chunks,chunk_size] -> (intra within-chunk INCLUSIVE log-cumsum,
+    inter cross-chunk EXCLUSIVE log-cumsum)."""
+    g = np.ascontiguousarray(g, dtype=np.float32).ravel()
+    if n_chunks <= 0:
+        raise ValueError("n_chunks must be positive")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if g.size != B * H * n_chunks * chunk_size:
+        raise ValueError("g must be B*H*n_chunks*chunk_size")
+    intra = np.empty(B * H * n_chunks * chunk_size, dtype=np.float32)
+    inter = np.empty(B * H * n_chunks, dtype=np.float32)
+    for b in range(B):
+        for h in range(H):
+            base = (b * H + h) * n_chunks
+            inter_acc = np.float32(0.0)
+            for c in range(n_chunks):
+                Lc = intra[(base + c) * chunk_size : (base + c + 1) * chunk_size]
+                gc = g[(base + c) * chunk_size : (base + c + 1) * chunk_size]
+                acc = np.float32(0.0)
+                for t in range(chunk_size):
+                    acc = np.float32(acc + _kda_log_gate(gc[t]))
+                    Lc[t] = acc
+                inter[base + c] = inter_acc
+                inter_acc = np.float32(inter_acc + acc)
+    return intra, inter
+
+
+def kda_naive_delta_rule_fwd(q, k, v, g, beta, B, H, S, D, out):
+    """Per-token delta-rule oracle (mirrors ``kda_naive_delta_rule_fwd_cpu``,
+    O(S*D^2)). q,k,v [B,H,S,D], g,beta [B,H,S] -> out [B,H,S,D] fp32."""
+    q = np.ascontiguousarray(q, dtype=np.float32).ravel()
+    k = np.ascontiguousarray(k, dtype=np.float32).ravel()
+    v = np.ascontiguousarray(v, dtype=np.float32).ravel()
+    g = np.ascontiguousarray(g, dtype=np.float32).ravel()
+    beta = np.ascontiguousarray(beta, dtype=np.float32).ravel()
+    out = np.asarray(out, dtype=np.float32).ravel()
+    if D <= 0:
+        raise ValueError("D must be positive")
+    for nm, arr, exp in (
+        ("q", q, B * H * S * D),
+        ("k", k, B * H * S * D),
+        ("v", v, B * H * S * D),
+        ("out", out, B * H * S * D),
+        ("g", g, B * H * S),
+        ("beta", beta, B * H * S),
+    ):
+        if arr.size != exp:
+            raise ValueError(f"{nm} has {arr.size}, expected {exp}")
+    if B == 0 or H == 0 or S == 0:
+        return out
+    state = np.zeros(D * D, dtype=np.float32)
+    a = np.zeros(D, dtype=np.float32)
+    for b in range(B):
+        for h in range(H):
+            bh = (b * H + h) * S
+            state[:] = 0.0
+            for t in range(S):
+                kt = k[(bh + t) * D : (bh + t + 1) * D]
+                vt = v[(bh + t) * D : (bh + t + 1) * D]
+                qt = q[(bh + t) * D : (bh + t + 1) * D]
+                gt = g[bh + t]
+                bt = beta[bh + t]
+                for d in range(D):
+                    s = np.float32(0.0)
+                    Srow = state[d * D : (d + 1) * D]
+                    for e in range(D):
+                        s = np.float32(s + Srow[e] * kt[e])
+                    a[d] = s
+                for d in range(D):
+                    ud = np.float32(vt[d] - a[d])
+                    Srow = state[d * D : (d + 1) * D]
+                    for e in range(D):
+                        Srow[e] = np.float32(gt * Srow[e] + bt * ud * kt[e])
+                    s = np.float32(0.0)
+                    for e in range(D):
+                        s = np.float32(s + Srow[e] * qt[e])
+                    out[(bh + t) * D + d] = s
+    return out
+
+
+def kda_delta_rule_intra(q, k, v, g, beta, intra_log, inter_state, u,
+                         B, H, S, D, chunk_size, chunk_idx):
+    """Within-chunk delta-corrected value solve u_t for chunk ``chunk_idx``
+    (mirrors ``kda_delta_rule_intra_cpu``). Writes into ``u`` in place."""
+    q = np.ascontiguousarray(q, dtype=np.float32).ravel()
+    k = np.ascontiguousarray(k, dtype=np.float32).ravel()
+    v = np.ascontiguousarray(v, dtype=np.float32).ravel()
+    g = np.ascontiguousarray(g, dtype=np.float32).ravel()
+    beta = np.ascontiguousarray(beta, dtype=np.float32).ravel()
+    u = np.asarray(u, dtype=np.float32).ravel()
+    intra_log = np.ascontiguousarray(intra_log, dtype=np.float32).ravel()
+    inter_state = np.ascontiguousarray(inter_state, dtype=np.float32).ravel()
+    _kda_check_chunk(S, D, chunk_size)
+    n_chunks = S // chunk_size
+    if not (0 <= chunk_idx * chunk_size < S):
+        raise ValueError("chunk_idx out of range")
+    for b in range(B):
+        for h in range(H):
+            bh = (b * H + h) * S
+            Lc = intra_log[((b * H + h) * n_chunks + chunk_idx) * chunk_size:
+                           ((b * H + h) * n_chunks + chunk_idx + 1) * chunk_size]
+            Cin = inter_state[((b * H + h) * (n_chunks + 1) + chunk_idx) * D * D:
+                              ((b * H + h) * (n_chunks + 1) + chunk_idx + 1) * D * D]
+            for t in range(chunk_size):
+                tau = chunk_idx * chunk_size + t
+                kt = k[(bh + tau) * D : (bh + tau + 1) * D]
+                G0 = _kda_gate_prod_intra(Lc, 0, t - 1)
+                pred = np.zeros(D, dtype=np.float32)
+                for d in range(D):
+                    s = np.float32(0.0)
+                    for e in range(D):
+                        s = np.float32(s + Cin[d * D + e] * kt[e])
+                    pred[d] = np.float32(G0 * s)
+                corr = np.zeros(D, dtype=np.float32)
+                for j in range(t):
+                    tauj = chunk_idx * chunk_size + j
+                    kj = k[(bh + tauj) * D : (bh + tauj + 1) * D]
+                    uj = u[(bh + tauj) * D : (bh + tauj + 1) * D]
+                    Gj = _kda_gate_prod_intra(Lc, j + 1, t - 1)
+                    djk = np.float32(0.0)
+                    for e in range(D):
+                        djk = np.float32(djk + kj[e] * kt[e])
+                    cjk = np.float32(Gj * beta[bh + tauj] * djk)
+                    for d in range(D):
+                        corr[d] = np.float32(corr[d] + cjk * uj[d])
+                ut = u[(bh + tau) * D : (bh + tau + 1) * D]
+                for d in range(D):
+                    ut[d] = np.float32(v[(bh + tau) * D + d] - pred[d] - corr[d])
+    return u
+
+
+def kda_delta_rule_inter(k, v, g, beta, intra_log, u, inter_state,
+                         B, H, S, D, chunk_size, chunk_idx):
+    """Cross-chunk state propagation for chunk ``chunk_idx`` (mirrors
+    ``kda_delta_rule_inter_cpu``): fills inter_state[..,chunk_idx+1] = C_c.
+    Writes into ``inter_state`` in place."""
+    k = np.ascontiguousarray(k, dtype=np.float32).ravel()
+    u = np.ascontiguousarray(u, dtype=np.float32).ravel()
+    beta = np.ascontiguousarray(beta, dtype=np.float32).ravel()
+    intra_log = np.ascontiguousarray(intra_log, dtype=np.float32).ravel()
+    inter_state = np.asarray(inter_state, dtype=np.float32).ravel()
+    _kda_check_chunk(S, D, chunk_size)
+    n_chunks = S // chunk_size
+    if not (0 <= chunk_idx * chunk_size < S):
+        raise ValueError("chunk_idx out of range")
+    for b in range(B):
+        for h in range(H):
+            bh = (b * H + h) * S
+            Lc = intra_log[((b * H + h) * n_chunks + chunk_idx) * chunk_size:
+                           ((b * H + h) * n_chunks + chunk_idx + 1) * chunk_size]
+            Cin = inter_state[((b * H + h) * (n_chunks + 1) + chunk_idx) * D * D:
+                              ((b * H + h) * (n_chunks + 1) + chunk_idx + 1) * D * D]
+            Cout = inter_state[((b * H + h) * (n_chunks + 1) + chunk_idx + 1) * D * D:
+                               ((b * H + h) * (n_chunks + 1) + chunk_idx + 2) * D * D]
+            Gfull = _kda_gate_prod_intra(Lc, 0, chunk_size - 1)
+            for d in range(D):
+                Cinrow = Cin[d * D : (d + 1) * D]
+                Crow = Cout[d * D : (d + 1) * D]
+                for e in range(D):
+                    Crow[e] = np.float32(Gfull * Cinrow[e])
+            for t in range(chunk_size):
+                tau = chunk_idx * chunk_size + t
+                kt = k[(bh + tau) * D : (bh + tau + 1) * D]
+                Gt = _kda_gate_prod_intra(Lc, t + 1, chunk_size - 1)
+                w = np.float32(Gt * beta[bh + tau])
+                ut = u[(bh + tau) * D : (bh + tau + 1) * D]
+                for d in range(D):
+                    Crow = Cout[d * D : (d + 1) * D]
+                    wd = np.float32(w * ut[d])
+                    for e in range(D):
+                        Crow[e] = np.float32(Crow[e] + wd * kt[e])
+    return inter_state
+
+
+def kda_gla_fwd_o(q, k, g, beta, intra_log, inter_state, u,
+                  B, H, S, D, chunk_size, out):
+    """Output (intra + inter) combine (mirrors ``kda_gla_fwd_o_cpu``):
+    o_t = G_{0,t}(C_{c-1} q_t) + sum_{j<=t} G_{j+1,t} b_j (k_j.q_t) u_j.
+    Writes into ``out`` in place."""
+    q = np.ascontiguousarray(q, dtype=np.float32).ravel()
+    k = np.ascontiguousarray(k, dtype=np.float32).ravel()
+    beta = np.ascontiguousarray(beta, dtype=np.float32).ravel()
+    intra_log = np.ascontiguousarray(intra_log, dtype=np.float32).ravel()
+    inter_state = np.ascontiguousarray(inter_state, dtype=np.float32).ravel()
+    u = np.ascontiguousarray(u, dtype=np.float32).ravel()
+    out = np.asarray(out, dtype=np.float32).ravel()
+    _kda_check_chunk(S, D, chunk_size)
+    n_chunks = S // chunk_size
+    inter_out = np.zeros(D, dtype=np.float32)
+    intra_out = np.zeros(D, dtype=np.float32)
+    for b in range(B):
+        for h in range(H):
+            bh = (b * H + h) * S
+            for c in range(n_chunks):
+                Lc = intra_log[((b * H + h) * n_chunks + c) * chunk_size:
+                               ((b * H + h) * n_chunks + c + 1) * chunk_size]
+                Cin = inter_state[((b * H + h) * (n_chunks + 1) + c) * D * D:
+                                  ((b * H + h) * (n_chunks + 1) + c + 1) * D * D]
+                for t in range(chunk_size):
+                    tau = c * chunk_size + t
+                    qt = q[(bh + tau) * D : (bh + tau + 1) * D]
+                    G0t = _kda_gate_prod_intra(Lc, 0, t)
+                    for d in range(D):
+                        s = np.float32(0.0)
+                        for e in range(D):
+                            s = np.float32(s + Cin[d * D + e] * qt[e])
+                        inter_out[d] = np.float32(G0t * s)
+                    for d in range(D):
+                        intra_out[d] = np.float32(0.0)
+                    for j in range(t + 1):
+                        tauj = c * chunk_size + j
+                        kj = k[(bh + tauj) * D : (bh + tauj + 1) * D]
+                        uj = u[(bh + tauj) * D : (bh + tauj + 1) * D]
+                        Gj = _kda_gate_prod_intra(Lc, j + 1, t)
+                        djq = np.float32(0.0)
+                        for e in range(D):
+                            djq = np.float32(djq + kj[e] * qt[e])
+                        cjq = np.float32(Gj * beta[bh + tauj] * djq)
+                        for d in range(D):
+                            intra_out[d] = np.float32(intra_out[d] + cjq * uj[d])
+                    for d in range(D):
+                        out[(bh + tau) * D + d] = np.float32(inter_out[d] + intra_out[d])
+    return out
+
+
+def kda_delta_rule_fwd(q, k, v, g, beta, B, H, S, D, chunk_size, out):
+    """Chunked delta-rule forward (mirrors ``kda_delta_rule_fwd_cpu``, the
+    L2..L6 pipeline). chunk_size must divide S. Writes into ``out`` in place."""
+    q = np.ascontiguousarray(q, dtype=np.float32).ravel()
+    k = np.ascontiguousarray(k, dtype=np.float32).ravel()
+    v = np.ascontiguousarray(v, dtype=np.float32).ravel()
+    g = np.ascontiguousarray(g, dtype=np.float32).ravel()
+    beta = np.ascontiguousarray(beta, dtype=np.float32).ravel()
+    out = np.asarray(out, dtype=np.float32).ravel()
+    _kda_check_chunk(S, D, chunk_size)
+    if q.size != B * H * S * D:
+        raise ValueError("q must be B*H*S*D")
+    if g.size != B * H * S:
+        raise ValueError("g must be B*H*S")
+    if out.size != B * H * S * D:
+        raise ValueError("out must be B*H*S*D")
+    if B == 0 or H == 0 or S == 0:
+        return out
+    n_chunks = S // chunk_size
+    intra_log, inter_log = kda_gate_chunk_cumsum(g, B, H, n_chunks, chunk_size)
+    u = np.zeros(B * H * S * D, dtype=np.float32)
+    inter_state = np.zeros(B * H * (n_chunks + 1) * D * D, dtype=np.float32)
+    for c in range(n_chunks):
+        kda_delta_rule_intra(q, k, v, g, beta, intra_log, inter_state, u,
+                             B, H, S, D, chunk_size, c)
+        kda_delta_rule_inter(k, v, g, beta, intra_log, u, inter_state,
+                             B, H, S, D, chunk_size, c)
+    kda_gla_fwd_o(q, k, g, beta, intra_log, inter_state, u,
+                  B, H, S, D, chunk_size, out)
+    return out
+
+
+def kda_pack_bitmatrix(bits, n_bits):
+    """Pack a binary [n_bits] uint8 array into ceil(n/8) bytes, MSB first
+    (bit k -> byte k/8, bit 7 - k%8). Mirrors ``kda_pack_bitmatrix_cpu``."""
+    bits = np.ascontiguousarray(bits, dtype=np.uint8).ravel()
+    n_bytes = (n_bits + 7) // 8
+    packed = np.zeros(n_bytes, dtype=np.uint8)
+    for k in range(n_bits):
+        if bits[k] != 0:
+            packed[k // 8] |= np.uint8(1 << (7 - (k % 8)))
+    return packed
+
+
+def _kda_check_chunk(S, D, chunk_size):
+    if D <= 0:
+        raise ValueError("D must be positive")
+    if chunk_size <= 0 or S % chunk_size != 0:
+        raise ValueError("chunk_size must divide S")
 
 
 # ---------------------------------------------------------------------------

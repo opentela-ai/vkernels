@@ -43,6 +43,9 @@
 #include "vkernels/core/stream.hpp"
 #include "vkernels/kernels/elementwise.hpp"
 #include "vkernels/kernels/gemm.hpp"
+#include "vkernels/kernels/gemm_bf16.hpp"
+#include "vkernels/kernels/kda.hpp"
+#include "vkernels/kernels/mla.hpp"
 #include "vkernels/kernels/moe.hpp"
 #include "vkernels/kernels/moe_aux.hpp"
 #include "vkernels/kernels/moe_fused.hpp"
@@ -410,6 +413,219 @@ PYBIND11_MODULE(_core, m) {
       "Routed combine of a quantized partial [EM, width/2] uint8 E2M1 + "
       "[EM, width/group] uint8 ue8m0 -> out [M, width] float32 (zero-init), "
       "dequantizing inline: out[token] += dequant(partial[r]) * topk_w[r].");
+
+  // --- bf16 GEMM (gfx942 projection reference, issue #29) ------------------
+  //
+  // C = alpha * A @ B + beta * C, bf16 (uint16) in/out, fp32 accumulate,
+  // single round-to-nearest-even on store. Matches gemm_bf16_cpu (the
+  // oracle the HIP MFMA kernel is checked against) to the bit.
+  kernels.def(
+      "gemm_bf16",
+      [](std::size_t M, std::size_t N, std::size_t K, float alpha,
+         U16Array A, U16Array B, float beta, U16Array C) {
+        require_writeable(C);
+        kernels::gemm_bf16_cpu(M, N, K, alpha, A.data(), B.data(), beta,
+                               C.mutable_data());
+      },
+      py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"),
+      py::arg("A"), py::arg("B"), py::arg("beta"), py::arg("C"),
+      "C = alpha * A @ B + beta * C (bf16 in/out, fp32 accumulate, "
+      "row-major). A is [M,K], B is [K,N], C is [M,N] uint16 bit patterns.");
+
+  kernels.def(
+      "gemm_bf16_config",
+      [](std::size_t M, std::size_t N, std::size_t K) {
+        int bm = 0, bn = 0, bk = 0, threads = 0;
+        kernels::gemm_bf16_config_for(M, N, K, &bm, &bn, &bk, &threads);
+        return py::make_tuple(bm, bn, bk, threads);
+      },
+      py::arg("M"), py::arg("N"), py::arg("K"),
+      "Per-shape tuned (bm, bn, bk, threads) MFMA tile the HIP bf16 GEMM "
+      "should launch for (M, N, K). BK is fixed at 64 for the K3 shapes.");
+
+  // --- MLA: absorbed-form Multi-head Latent Attention (issue #21) ----------
+  //
+  // q      : [B, H, S_q, kv_lora_rank + qk_rope_head_dim]  fp32
+  // k_c    : [B, S_kv, kv_lora_rank]                       fp32
+  // k_pe   : [B, S_kv, qk_rope_head_dim]                   fp32
+  // v_c    : [B, S_kv, kv_lora_rank]                       fp32
+  // out    : [B, H, S_q, kv_lora_rank]                     fp32
+  // Two-pass numerically-stable softmax, causal mask via (q_start, kv_start).
+  kernels.def(
+      "mla_fwd",
+      [](int B, int H, int S_q, int S_kv, int q_start, int kv_start,
+         int kv_lora_rank, int qk_rope_head_dim, float scale, FloatArray q,
+         FloatArray k_c, FloatArray k_pe, FloatArray v_c, FloatArray out) {
+        require_writeable(out);
+        kernels::mla_fwd_cpu(B, H, S_q, S_kv, q_start, kv_start,
+                             kv_lora_rank, qk_rope_head_dim, scale,
+                             q.data(), k_c.data(), k_pe.data(),
+                             v_c.data(), out.mutable_data());
+      },
+      py::arg("B"), py::arg("H"), py::arg("S_q"), py::arg("S_kv"),
+      py::arg("q_start"), py::arg("kv_start"), py::arg("kv_lora_rank"),
+      py::arg("qk_rope_head_dim"), py::arg("scale"), py::arg("q"),
+      py::arg("k_c"), py::arg("k_pe"), py::arg("v_c"), py::arg("out"),
+      "Absorbed-form MLA forward (CPU reference): q [B,H,S_q,lr+rhd], "
+      "k_c [B,S_kv,lr], k_pe [B,S_kv,rhd], v_c [B,S_kv,lr] -> out "
+      "[B,H,S_q,lr] fp32. Two-pass stable softmax, causal via "
+      "(q_start, kv_start).");
+
+  kernels.def(
+      "mla_config",
+      [](int S_q, int kv_lora_rank, int qk_rope_head_dim) {
+        int bq = 0, bn = 0, threads = 0;
+        kernels::mla_config_for(S_q, kv_lora_rank, qk_rope_head_dim, &bq,
+                                &bn, &threads);
+        return py::make_tuple(bq, bn, threads);
+      },
+      py::arg("S_q"), py::arg("kv_lora_rank"), py::arg("qk_rope_head_dim"),
+      "Per-shape (bq, bn_kv, threads) tile selector for the HIP MLA kernel: "
+      "decode (S_q <= 8) -> (1, 64, 64); prefill -> (4, 64, 256).");
+
+  // --- KDA: Kimi Delta Attention (issue #21) -------------------------------
+  //
+  // The per-token oracle (kda_naive_delta_rule_fwd), the chunked forward
+  // (kda_delta_rule_fwd, orchestrating L2..L6) and its four standalone
+  // pieces (L1 layer_norm_gated, L2 gate_chunk_cumsum, L4/L5/L6 intra /
+  // inter / output combine, P pack_bitmatrix). All fp32, CPU references.
+  kernels.def(
+      "kda_layer_norm_gated",
+      [](FloatArray x, FloatArray weight, FloatArray gate, FloatArray out,
+         int N, int D, float eps) {
+        require_writeable(out);
+        kernels::kda_layer_norm_gated_cpu(x.data(), weight.data(),
+                                          gate.data(), out.mutable_data(),
+                                          N, D, eps);
+      },
+      py::arg("x"), py::arg("weight"), py::arg("gate"), py::arg("out"),
+      py::arg("N"), py::arg("D"), py::arg("eps"),
+      "Gated RMSNorm: out[n,d] = (x[n]/rms_n) * weight[d] * silu(gate[n,d]), "
+      "rms_n = sqrt(mean(x[:]^2) + eps). x/gate [N,D], weight [D], out [N].");
+
+  kernels.def(
+      "kda_gate_chunk_cumsum",
+      [](FloatArray g, int B, int H, int n_chunks, int chunk_size) {
+        py::array_t<float> intra(
+            static_cast<std::size_t>(B) * H * n_chunks * chunk_size);
+        py::array_t<float> inter(
+            static_cast<std::size_t>(B) * H * n_chunks);
+        kernels::kda_gate_chunk_cumsum_cpu(g.data(), intra.mutable_data(),
+                                           inter.mutable_data(), B, H,
+                                           n_chunks, chunk_size);
+        return py::make_tuple(intra, inter);
+      },
+      py::arg("g"), py::arg("B"), py::arg("H"), py::arg("n_chunks"),
+      py::arg("chunk_size"),
+      "Log-gate cumulative sums: g [B,H,n_chunks,chunk_size] (normal space, "
+      "g>0; g==0 clamped to ~-1e9) -> (intra [B,H,n_chunks,chunk_size] "
+      "within-chunk INCLUSIVE log-cumsum, inter [B,H,n_chunks] cross-chunk "
+      "EXCLUSIVE log-cumsum). Gate products recover as exp(L_b - L_{a-1}).");
+
+  kernels.def(
+      "kda_naive_delta_rule_fwd",
+      [](FloatArray q, FloatArray k, FloatArray v, FloatArray g,
+         FloatArray beta, int B, int H, int S, int D, FloatArray out) {
+        require_writeable(out);
+        kernels::kda_naive_delta_rule_fwd_cpu(
+            q.data(), k.data(), v.data(), g.data(),
+            beta.data(), out.mutable_data(), B, H, S, D);
+      },
+      py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"),
+      py::arg("beta"), py::arg("B"), py::arg("H"), py::arg("S"),
+      py::arg("D"), py::arg("out"),
+      "Per-token delta-rule oracle (O(S*D^2), the correctness reference): "
+      "q,k,v [B,H,S,D], g,beta [B,H,S] -> out [B,H,S,D] fp32.");
+
+  kernels.def(
+      "kda_delta_rule_fwd",
+      [](FloatArray q, FloatArray k, FloatArray v, FloatArray g,
+         FloatArray beta, int B, int H, int S, int D, int chunk_size,
+         FloatArray out) {
+        require_writeable(out);
+        kernels::kda_delta_rule_fwd_cpu(
+            q.data(), k.data(), v.data(), g.data(),
+            beta.data(), out.mutable_data(), B, H, S, D, chunk_size);
+      },
+      py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"),
+      py::arg("beta"), py::arg("B"), py::arg("H"), py::arg("S"),
+      py::arg("D"), py::arg("chunk_size"), py::arg("out"),
+      "Chunked delta-rule forward (gate cumsum -> intra solve -> inter "
+      "propagation -> output combine). chunk_size must divide S; matches the "
+      "naive oracle to within fp32 round-off.");
+
+  // The L4/L5/L6 pieces kda_delta_rule_fwd_cpu orchestrates, exposed so the
+  // HIP kernel's individual stages can be cross-checked from Python. They
+  // share the [B, H, n_chunks+1, D, D] inter_state scratch (row 0 must be
+  // zero); intra(c) reads inter_state[..,c] (C_{c-1}), inter(c) writes
+  // inter_state[..,c+1] (C_c), so they must be called interleaved.
+  kernels.def(
+      "kda_delta_rule_intra",
+      [](FloatArray q, FloatArray k, FloatArray v, FloatArray g,
+         FloatArray beta, FloatArray intra_log, FloatArray inter_state,
+         FloatArray u, int B, int H, int S, int D, int chunk_size,
+         int chunk_idx) {
+        require_writeable(u);
+        kernels::kda_delta_rule_intra_cpu(
+            q.data(), k.data(), v.data(), g.data(),
+            beta.data(), intra_log.data(), inter_state.data(),
+            u.mutable_data(), B, H, S, D, chunk_size, chunk_idx);
+      },
+      py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"),
+      py::arg("beta"), py::arg("intra_log"), py::arg("inter_state"),
+      py::arg("u"), py::arg("B"), py::arg("H"), py::arg("S"), py::arg("D"),
+      py::arg("chunk_size"), py::arg("chunk_idx"),
+      "Within-chunk delta-corrected value solve u_t for chunk `chunk_idx`: "
+      "u_t = v_t - G_{0,t-1}(C_{c-1} k_t) - sum_{j<t} G_{j+1,t-1} b_j (k_j.k_t) u_j.");
+
+  kernels.def(
+      "kda_delta_rule_inter",
+      [](FloatArray k, FloatArray v, FloatArray g, FloatArray beta,
+         FloatArray intra_log, FloatArray u, FloatArray inter_state,
+         int B, int H, int S, int D, int chunk_size, int chunk_idx) {
+        require_writeable(inter_state);
+        kernels::kda_delta_rule_inter_cpu(
+            k.data(), v.data(), g.data(), beta.data(),
+            intra_log.data(), u.data(), inter_state.mutable_data(),
+            B, H, S, D, chunk_size, chunk_idx);
+      },
+      py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
+      py::arg("intra_log"), py::arg("u"), py::arg("inter_state"),
+      py::arg("B"), py::arg("H"), py::arg("S"), py::arg("D"),
+      py::arg("chunk_size"), py::arg("chunk_idx"),
+      "Cross-chunk state propagation for chunk `chunk_idx`: fills "
+      "inter_state[..,chunk_idx+1] = C_c = G_{0,C-1} C_{c-1} + sum_t G_{t+1,C-1} b_t u_t k_t^T.");
+
+  kernels.def(
+      "kda_gla_fwd_o",
+      [](FloatArray q, FloatArray k, FloatArray g, FloatArray beta,
+         FloatArray intra_log, FloatArray inter_state, FloatArray u,
+         int B, int H, int S, int D, int chunk_size, FloatArray out) {
+        require_writeable(out);
+        kernels::kda_gla_fwd_o_cpu(
+            q.data(), k.data(), g.data(), beta.data(),
+            intra_log.data(), inter_state.data(), u.data(),
+            out.mutable_data(), B, H, S, D, chunk_size);
+      },
+      py::arg("q"), py::arg("k"), py::arg("g"), py::arg("beta"),
+      py::arg("intra_log"), py::arg("inter_state"), py::arg("u"),
+      py::arg("B"), py::arg("H"), py::arg("S"), py::arg("D"),
+      py::arg("chunk_size"), py::arg("out"),
+      "Output (intra + inter) combine: o_t = G_{0,t}(C_{c-1} q_t) + "
+      "sum_{j<=t} G_{j+1,t} b_j (k_j.q_t) u_j.");
+
+  kernels.def(
+      "kda_pack_bitmatrix",
+      [](ByteArray bits, std::size_t n_bits) {
+        const std::size_t bytes = (n_bits + 7) / 8;
+        py::array_t<std::uint8_t> packed(bytes);
+        kernels::kda_pack_bitmatrix_cpu(bits.data(), packed.mutable_data(),
+                                        n_bits);
+        return packed;
+      },
+      py::arg("bits"), py::arg("n_bits"),
+      "Pack a binary [n_bits] uint8 (each 0 or 1) array into ceil(n/8) "
+      "bytes, MSB first (bit k -> byte k/8, bit 7 - k%8).");
 
   auto comm = m.def_submodule("comm", "Communication primitives (src/c/vkernels/comm).");
 
