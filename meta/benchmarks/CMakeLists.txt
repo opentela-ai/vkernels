@@ -6,6 +6,15 @@ if(NOT VKERNELS_BUILD_BENCHMARKS)
   return()
 endif()
 
+# --- Host-only benchmark (no GPU needed): HIP/RCCL transport selection ---
+# The cost model + host ring all-reduce reference run anywhere, so this bench
+# is the CI-verifiable acceptance surface for issue #19 (OFI < Socket at
+# >= 1 MiB over >= 1 edge). The HIP/RCCL A/B is run on a Slingshot node.
+add_executable(rccl_bench bench_rccl.cpp)
+target_link_libraries(rccl_bench PRIVATE vkernels::vkernels)
+target_compile_features(rccl_bench PRIVATE cxx_std_17)
+vkernels_set_warnings(rccl_bench)
+
 if(NOT VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
   message(STATUS "vkernels: benchmarks skipped (no GPU toolkit)")
   return()

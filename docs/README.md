@@ -364,6 +364,30 @@ stream)`.
 - **Python**: `vkernels.comm.OverlapExecutor()`
 - **Rust**: `vkernels::comm::OverlapExecutor::new()`
 
+### HIP/RCCL transport + OFI/CXI net plugin — issue #19
+
+A second HIP/RCCL channel behind the existing `Channel` / all-reduce
+interface, plus a HIP-aware OFI/CXI net plugin for Slingshot RDMA instead
+of Socket, and graph-capturable all-reduce variants. Built on ROCm only.
+
+| Surface | Role |
+|---|---|
+| `RcclChannel` | `Channel` over RCCL send/recv (host→device→host) |
+| `RcclAllreducePlan` | Graph-capturable host plan: single `rcclAllReduce`, no host allocation after construction |
+| `RcclAllreducePlanHip` | HIP path: one `rcclAllReduce` between begin/end graph capture |
+| `resolve_transport(bytes, edges, cfg)` | Adaptive Socket↔Slingshot selection from a cost model |
+| `est_rccl_socket_us` / `est_rccl_ofi_us` | Socket = `max(50, 6.0 us/MiB) + 25 us/edge`; OFI = `max(20, 3.0 us/MiB)` (RDMA, edge-free) |
+| `discover_ofi_cxi` | Detects the `cxi` libfabric provider for the net plugin |
+| `vkernels_rccl_*` | C ABI wrapping the host reference (always compiled) |
+
+- **Host reference**: `src/c/vkernels/comm/rccl.{cpp,hpp}` (always compiled)
+- **HIP/RCCL path**: `src/c/vkernels/comm/rccl.hip`, `rccl_hip.hpp` (`VKERNELS_HAS_RCCL`)
+- **C ABI**: `src/c/vkernels/comm/rccl_c.{h,cpp}`
+- **OFI/CXI net plugin**: `plugins/rccl-net-ofi/` (`librccl-net-ofi.so`, `VKERNELS_HAS_OFI`)
+- **Build discovery**: `meta/cmake/RcclSupport.cmake`
+- **Bench**: `meta/benchmarks/bench_rccl.cpp` (`rccl_bench`)
+- **Docs**: [comm-rccl.md](comm-rccl.md)
+
 ---
 
 ## Core infrastructure
@@ -394,7 +418,11 @@ src/c/vkernels/
 │   ├── p2p_kv_restore.{cpp,cu}  # fused KV restore
 │   ├── overlap.cpp              # compute/comm overlap executor
 │   ├── channel.cpp              # blocking queue & mock channel
-│   └── topology.{cpp,hpp}       # ring topology helpers
+│   ├── topology.{cpp,hpp}       # ring topology helpers
+│   ├── rccl.{cpp,hpp}           # HIP/RCCL transport host reference (#19)
+│   ├── rccl.hip                 # HIP/RCCL all-reduce (VKERNELS_HAS_RCCL)
+│   ├── rccl_hip.hpp             # RcclChannel / plan declarations
+│   └── rccl_c.{h,cpp}           # C ABI for the RCCL transport
 └── core/
     ├── device.cpp               # Device abstraction
     ├── stream.{cpp,cu}          # Stream (async task queue)
