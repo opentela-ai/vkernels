@@ -21,6 +21,8 @@ target_sources(vkernels
     vkernels/kernels/mla.cpp
     vkernels/kernels/kda.cpp
     vkernels/comm/channel.cpp
+    vkernels/comm/rccl.cpp
+    vkernels/comm/rccl_c.cpp
     vkernels/comm/allreduce.cpp
     vkernels/comm/overlap.cpp
     vkernels/comm/p2p_gather.cpp
@@ -75,11 +77,24 @@ if(VKERNELS_HAS_HIP)
   set_target_properties(vkernels PROPERTIES HIP_SEPARABLE_COMPILATION ON)
 endif()
 
+# RCCL transport (issue #19): compile the HIP/RCCL path only when a usable
+# librccl was found (RcclSupport.cmake). The host reference (rccl.cpp) and
+# the full test suite build and pass without RCCL, exactly as the CI host
+# job does; this block only adds the performance implementation.
+if(VKERNELS_HAS_RCCL)
+  target_sources(vkernels PRIVATE vkernels/comm/rccl.hip)
+  target_include_directories(vkernels PRIVATE ${VKERNELS_RCCL_INCLUDE_DIRS})
+  target_link_libraries(vkernels PRIVATE ${VKERNELS_RCCL_LIBRARIES})
+  set_target_properties(vkernels PROPERTIES HIP_SEPARABLE_COMPILATION ON)
+endif()
+
 # Propagate the CUDA and HIP availability flags to consumers and to the
 # library's own translation units.
 target_compile_definitions(vkernels PUBLIC
   $<$<BOOL:${VKERNELS_HAS_CUDA}>:VKERNELS_HAS_CUDA=1>
-  $<$<BOOL:${VKERNELS_HAS_HIP}>:VKERNELS_HAS_HIP=1>)
+  $<$<BOOL:${VKERNELS_HAS_HIP}>:VKERNELS_HAS_HIP=1>
+  $<$<BOOL:${VKERNELS_HAS_RCCL}>:VKERNELS_HAS_RCCL=1>
+  $<$<BOOL:${VKERNELS_HAS_OFI}>:VKERNELS_HAS_OFI=1>)
 
 target_link_libraries(vkernels PUBLIC Threads::Threads)
 
