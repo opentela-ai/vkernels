@@ -45,10 +45,15 @@ foreach(_root
   endif()
 endforeach()
 
+# RCCL ships its public header either at <rocm>/include/rccl.h (the
+# conventional layout) or, as on CSCS beverin (ROCm 6.3), at
+# <rocm>/include/rccl/rccl.h with code including <rccl.h>. List both
+# suffixes so find_path returns the directory that makes `#include <rccl.h>`
+# resolve on either install (the rccl/ dir on beverin, include/ elsewhere).
 find_path(VKERNELS_RCCL_INCLUDE_DIR
   NAMES rccl.h
   HINTS ${_rccl_roots} ENV RCCL_ROOT ENV RCCL_DIR
-  PATH_SUFFIXES include)
+  PATH_SUFFIXES include/rccl include)
 find_library(VKERNELS_RCCL_LIBRARY
   NAMES rccl
   HINTS ${_rccl_roots} ENV RCCL_ROOT ENV RCCL_DIR
@@ -59,7 +64,11 @@ find_package_handle_standard_args(Rccl
   "RCCL (rccl.h / librccl) not found; building the comm layer without the HIP/RCCL transport (issue #19)."
   VKERNELS_RCCL_LIBRARY VKERNELS_RCCL_INCLUDE_DIR)
 
-if(VKERNELS_RCCL_FOUND)
+# Drive VKERNELS_HAS_RCCL off the concrete required variables rather than
+# the *_FOUND name emitted by find_package_handle_standard_args (which is
+# derived from the first argument's case and is brittle across CMake
+# versions). Both rccl.h and librccl must be present.
+if(VKERNELS_RCCL_INCLUDE_DIR AND VKERNELS_RCCL_LIBRARY)
   set(VKERNELS_HAS_RCCL ON CACHE BOOL "Whether a usable RCCL installation was found" FORCE)
   set(VKERNELS_RCCL_INCLUDE_DIRS "${VKERNELS_RCCL_INCLUDE_DIR}")
   set(VKERNELS_RCCL_LIBRARIES "${VKERNELS_RCCL_LIBRARY}")
@@ -89,7 +98,9 @@ find_package_handle_standard_args(Ofi
   "libfabric (rdma/fabric.h / libfabric) not found; the OFI/CXI net plugin will not be built (issue #19)."
   VKERNELS_OFI_LIBRARY VKERNELS_OFI_INCLUDE_DIR)
 
-if(VKERNELS_OFI_FOUND)
+# Same rationale as RCCL above: avoid the *_FOUND case-name and gate on the
+# concrete required variables (rdma/fabric.h + libfabric).
+if(VKERNELS_OFI_INCLUDE_DIR AND VKERNELS_OFI_LIBRARY)
   set(VKERNELS_HAS_OFI ON CACHE BOOL "Whether a usable libfabric/OFI installation was found" FORCE)
   set(VKERNELS_OFI_INCLUDE_DIRS "${VKERNELS_OFI_INCLUDE_DIR}")
   set(VKERNELS_OFI_LIBRARIES "${VKERNELS_OFI_LIBRARY}")
