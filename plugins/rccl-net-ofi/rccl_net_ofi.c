@@ -1,6 +1,6 @@
 // plugins/rccl-net-ofi/rccl_net_ofi.c
 //
-// HIP-aware OFI/CXI net plugin for RCCL (issue #19).
+// OFI/CXI net plugin for RCCL (issue #19).
 //
 // RCCL, like NCCL, loads a network backend from `NCCL_NET`/`RCCL_NET` at
 // init time. On CSCS beverin the only EDF plugin (`aws_ofi_nccl`) is
@@ -8,11 +8,11 @@
 // back to its built-in Socket transport — TCP-over-Slingshot, no RDMA — the
 // documented cross-node TP all-reduce bottleneck.
 //
-// This file is the minimal, HIP-aware replacement: a small libfabric client
-// over the CXI (HPE Slingshot) provider that implements the subset of the
-// RCCL network-plugin ABI needed on gfx942 (init/devices/connect/listen/
+// This file is the minimal replacement: a small libfabric client over
+// the CXI (HPE Slingshot) provider that implements the subset of the RCCL
+// network-plugin ABI needed on gfx942 (init/devices/connect/listen/
 // send/recv/close), so RCCL maps its ring point-to-point steps onto RDMA
-// instead of TCP. It links only libfabric + the HIP runtime — no libcudart.
+// instead of TCP. It links only libfabric — no HIP runtime, no libcudart.
 //
 // The ABI mirrors NCCL's net plugin (rccl.h is a near-drop-in for nccl.h);
 // the v-table layout is stable across the RCCL versions that ship on
@@ -20,7 +20,8 @@
 // RCCL that asks for them fails loudly rather than silently misrouting.
 //
 // Compiled only with libfabric (CMake gates this directory on
-// VKERNELS_HAS_OFI). Never affects the host-only library or its tests.
+// VKERNELS_HAS_OFI) as plain C with the host compiler. Never affects the
+// host-only library or its tests.
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,8 +34,6 @@
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
 #include <rdma/fi_rma.h>
-
-#include <hip/hip_runtime.h>
 
 // RCCL net-plugin ABI (mirrors NCCL's ncclNet). We re-declare the minimal
 // types we need so the plugin does not require rccl.h at compile time
@@ -172,8 +171,9 @@ static ncclStatus ofi_plugin_close_send(void* sendComm) { (void)sendComm; return
 static ncclStatus ofi_plugin_close_recv(void* recvComm) { (void)recvComm; return 0; }
 static ncclStatus ofi_plugin_close_listen(void* listenComm) { (void)listenComm; return 0; }
 
-// The single symbol RCCL dlsym's when NCCL_NET=librccl-net-ofi. HIP-aware:
-// links only libfabric + hiprt, never libcudart, so it inits on ROCm.
+// The single symbol RCCL dlsym's when NCCL_NET=librccl-net-ofi. Pure C:
+// links only libfabric, never libcudart or the HIP runtime, so it inits
+// on ROCm alongside a CUDA-built plugin that cannot.
 DLL_EXPORT
 const ncclNet nccl_ofi_net = {
   .name = "librccl-net-ofi",

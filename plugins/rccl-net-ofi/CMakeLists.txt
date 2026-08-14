@@ -1,14 +1,14 @@
-# plugins/rccl-net-ofi — HIP-aware OFI/CXI net plugin for RCCL (issue #19)
+# plugins/rccl-net-ofi — OFI/CXI net plugin for RCCL (issue #19)
 #
-# Builds `librccl-net-ofi.so` against libfabric + the HIP runtime, gated by
-# VKERNELS_HAS_OFI (libfabric found by RcclSupport.cmake). Never affects the
-# host-only library or its tests: the top-level CMakeLists adds this
-# subdirectory only when HIP + libfabric are both present.
+# Builds `librccl-net-ofi.so` against libfabric, gated by VKERNELS_HAS_OFI
+# (libfabric found by RcclSupport.cmake). Never affects the host-only library
+# or its tests: the top-level CMakeLists adds this subdirectory only when
+# HIP + libfabric are both present.
 #
 # The plugin is a single C translation unit (the standard aws_ofi_nccl layout
-# is C). The top-level project is CXX-only, so this directory explicitly
-# enables C; the source includes <hip/hip_runtime.h> only for ABI types, so
-# it needs the ROCm include dir and links libamdhip64 (the HIP runtime).
+# is C) compiled with the host C compiler. Its v-table uses only `void*`
+# request handles (the RCCL net-plugin ABI never takes a hipStream_t), so it
+# links libfabric alone — no HIP runtime, no libcudart.
 cmake_minimum_required(VERSION 3.18)
 
 if(NOT VKERNELS_HAS_HIP)
@@ -21,18 +21,6 @@ if(NOT VKERNELS_HAS_OFI)
 endif()
 
 enable_language(C)
-
-# HIP runtime headers (hip/hip_runtime.h) + libamdhip64 (the loader-visible
-# RCCL plugin links the HIP runtime alongside libfabric). Found from the same
-# ROCm root the HIP compiler lives under (ROCM_PATH / _ROCM_PATH_FROM_HIP).
-find_path(VKERNELS_HIP_INCLUDE_DIR
-  NAMES hip/hip_runtime.h
-  HINTS ${ROCM_PATH} ${_ROCM_PATH_FROM_HIP} $ENV{ROCM_PATH} $ENV{ROCM_ROOT} /opt/rocm
-  PATH_SUFFIXES include)
-find_library(VKERNELS_AMDHIP64_LIBRARY
-  NAMES amdhip64
-  HINTS ${ROCM_PATH} ${_ROCM_PATH_FROM_HIP} $ENV{ROCM_PATH} $ENV{ROCM_ROOT} /opt/rocm
-  PATH_SUFFIXES lib lib64)
 
 add_library(rccl-net-ofi SHARED rccl_net_ofi.c)
 add_library(vkernels::rccl-net-ofi ALIAS rccl-net-ofi)
@@ -47,10 +35,8 @@ else()
   target_compile_options(rccl-net-ofi PRIVATE -fvisibility=hidden)
 endif()
 
-target_include_directories(rccl-net-ofi PRIVATE
-  ${VKERNELS_OFI_INCLUDE_DIRS} ${VKERNELS_HIP_INCLUDE_DIR})
-target_link_libraries(rccl-net-ofi PRIVATE
-  ${VKERNELS_OFI_LIBRARIES} ${VKERNELS_AMDHIP64_LIBRARY})
+target_include_directories(rccl-net-ofi PRIVATE ${VKERNELS_OFI_INCLUDE_DIRS})
+target_link_libraries(rccl-net-ofi PRIVATE ${VKERNELS_OFI_LIBRARIES})
 set_target_properties(rccl-net-ofi PROPERTIES
   OUTPUT_NAME "rccl-net-ofi"
   LINKER_LANGUAGE C
