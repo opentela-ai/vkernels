@@ -24,7 +24,8 @@ vkernels/
 │           ├── topology.{hpp,cpp}   #   rank/world/peer discovery
 │           ├── channel.{hpp,cpp}    #   transport abstraction + mock backend
 │           ├── allreduce.{hpp,cpp,cu}#  ring all-reduce
-│           └── overlap.{hpp,cpp}    #   compute/communication overlap
+│           ├── overlap.{hpp,cpp}    #   compute/communication overlap
+│           └── pipeline_boundary.{hpp,cpp,cu} # graph-capturable PP boundary (#10)
 ├── tests/                    # C++ unit tests mirroring src/c/ (100% line coverage target)
 │   ├── python/               #   Python tests (vkl CLI + bindings)
 │   └── third_party/minitest.hpp     # dependency-free test harness

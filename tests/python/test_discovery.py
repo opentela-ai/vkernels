@@ -107,6 +107,14 @@ EXPECTED_COMM = [
     ("from_device_slots_t", "struct"),
     ("from_device_slots_int64_t", "struct"),
     ("P2PKvRestorePlan", "class"),
+    # --- graph-capturable PP-boundary transfer (issue #10) ---
+    ("pipeline_transport_name", "function"),
+    ("PipelineBoundaryConfig", "struct"),
+    ("classify_boundary", "function"),
+    ("is_graph_capturable", "function"),
+    ("eager_break_during_capture", "function"),
+    ("GraphCapture", "class"),
+    ("PipelineBoundaryPlan", "class"),
     # --- HIP/RCCL transport + OFI/CXI plugin (issue #19) ---
     # Host reference (rccl.hpp, always compiled) then the HIP-gated
     # declarations (rccl_hip.hpp); discovery pins both since it scans every
