@@ -15,6 +15,8 @@ vkernels_add_test(NAME elementwise SOURCES kernels/elementwise/test_elementwise.
 vkernels_add_test(NAME reduce      SOURCES kernels/reduce/test_reduce.cpp)
 vkernels_add_test(NAME gemm        SOURCES kernels/gemm/test_gemm.cpp)
 vkernels_add_test(NAME gemm_bf16   SOURCES kernels/gemm/test_gemm_bf16.cpp)
+vkernels_add_test(NAME mla         SOURCES kernels/attn/test_mla.cpp)
+vkernels_add_test(NAME kda         SOURCES kernels/attn/test_kda.cpp)
 vkernels_add_test(NAME moe         SOURCES kernels/moe/test_moe.cpp)
 vkernels_add_test(NAME moe_fused   SOURCES kernels/moe/test_moe_fused.cpp)
 vkernels_add_test(NAME moe_aux     SOURCES kernels/moe/test_moe_aux.cpp)
