@@ -174,6 +174,34 @@ The acceptance criterion is `ofi_us < socket_us` at the cross-node payloads
 tests (`vkernels_test_rccl`, `vkernels_test_rccl_c`) must pass under ROCm
 unmodified — they exercise the same host planning surface as the bench.
 
+### Verified on beverin (MI300A / gfx942)
+
+The `hip` preset builds end-to-end on a CSCS beverin compute node
+(ROCm 6.3, `librccl.so.1.0.60300`, Cray libfabric 2.3.1 with the CXI
+provider) and the comm unit tests pass under ROCm unmodified:
+
+```bash
+export PATH=/opt/rocm/bin:$PATH ROCM_PATH=/opt/rocm OFI_ROOT=/opt/cray/libfabric/2.3.1
+cmake --preset hip                # CMAKE_HIP_ARCHITECTURES=gfx942
+#   RCCL enabled (include=/opt/rocm/include/rccl lib=/opt/rocm/lib/librccl.so)
+#   libfabric/OFI enabled (include=.../libfabric/2.3.1/include lib=.../libfabric.so)
+cmake --build build/hip -j8       # libvkernels.a + librccl-net-ofi.so + tests
+ctest --test-dir build/hip -R 'topology|channel|allreduce|^rccl$|rccl_c|overlap'
+#   100% tests passed, 0 tests failed out of 6  (CTEST_RC=0)
+```
+
+`librccl-net-ofi.so` is pure C (host compiler), exports exactly one dynamic
+symbol — `nccl_ofi_net`, the v-table RCCL dlsym's when
+`NCCL_NET=librccl-net-ofi` — and links only `libfabric.so.1` (no HIP
+runtime, no libcudart). The transport-selection / cost-model / ring /
+plan surfaces are exercised by `rccl` (39 tests) and `rccl_c` (11 tests).
+
+The remaining hardware acceptance — cross-node `rcclAllReduce` over
+Slingshot (OFI/CXI) faster than Socket on gfx942 — needs a multi-node
+reservation and the OFI/CXI net plugin's transport hooks filled in
+(`plugins/rccl-net-ofi/rccl_net_ofi.c` is currently a build-verified
+skeleton that returns `ncclInvalidUsage` for the unimplemented hooks).
+
 ---
 
 ## 7. C ABI
