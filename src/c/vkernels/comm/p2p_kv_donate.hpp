@@ -55,6 +55,8 @@
 //    IPC mappings, not the metadata, must persist.
 //  * When `stream == nullptr` the work runs to completion before returning.
 
+#pragma once
+
 #include <cstddef>
 #include <cstdint>
 #include <utility>
