@@ -388,6 +388,29 @@ of Socket, and graph-capturable all-reduce variants. Built on ROCm only.
 - **Bench**: `meta/benchmarks/bench_rccl.cpp` (`rccl_bench`)
 - **Docs**: [comm-rccl.md](comm-rccl.md)
 
+### Pipeline-parallel boundary transfer — issue #10
+
+A graph-capturable primitive for the hidden-state transfer at a PP
+(pipeline-parallel) boundary, plus an eager-break path that mirrors vLLM's
+`eager_break_during_capture`. The host reference is the correctness oracle;
+the CUDA path is the device realization.
+
+| Surface | Role |
+|---|---|
+| `PipelineBoundaryConfig` | Deployment facts: `same_node`, `nccl_graph_supported`, `gloo_fallback` |
+| `classify_boundary(cfg)` | `same_node`→peer copy, `gloo_fallback`→host-staged, `nccl_graph_supported`→cross-node NCCL, else host-staged |
+| `is_graph_capturable(t)` | A boundary is capturable on a device path (same-node peer, cross-node NCCL) |
+| `eager_break_during_capture(cfg)` | 1 when the host send/recv must be excluded from the captured segment (host-staged), 0 otherwise |
+| `PipelineBoundaryPlan` (host) | Directed boundary transfer over the ring `Channel`; device path enqueues a `memcpy` (no host progress on replay), eager-break path runs the `Channel` between `GraphCapture::end`/`begin` |
+| `GraphCapture` | RAII begin/end capture + submit/replay, with eager (no-graph) and multi-segment support |
+| `PipelineBoundaryPlan` (CUDA) | `vkernels::comm::cuda::PipelineBoundaryPlan` — one `cudaMemcpyAsync` (peer) or `ncclSend`/`ncclRecv` (cross-node) on a `cudaStream_t` |
+| `vkernels_pp_*` | C ABI: classification (always compiled) + device plan (CUDA-only) |
+
+- **Host reference**: `src/c/vkernels/comm/pipeline_boundary.{cpp,hpp}` (always compiled, 100% line-covered CI gate)
+- **CUDA device path**: `src/c/vkernels/comm/pipeline_boundary.cu`, `pipeline_boundary_cuda.hpp` (`VKERNELS_HAS_CUDA`)
+- **C ABI**: `src/c/vkernels/comm/pipeline_boundary_c.{h,cpp}` (always compiled) + `pipeline_boundary_c.cu` (CUDA-only)
+- **Docs**: [comm-pipeline-boundary.md](comm-pipeline-boundary.md)
+
 ---
 
 ## Core infrastructure
@@ -416,13 +439,16 @@ src/c/vkernels/
 │   ├── allreduce.{cpp,cu}       # ring all-reduce
 │   ├── p2p_gather.{cpp,cu}      # single-launch peer gather
 │   ├── p2p_kv_restore.{cpp,cu}  # fused KV restore
+│   ├── pipeline_boundary.{cpp,cu} # graph-capturable PP boundary (#10)
 │   ├── overlap.cpp              # compute/comm overlap executor
 │   ├── channel.cpp              # blocking queue & mock channel
 │   ├── topology.{cpp,hpp}       # ring topology helpers
 │   ├── rccl.{cpp,hpp}           # HIP/RCCL transport host reference (#19)
 │   ├── rccl.hip                 # HIP/RCCL all-reduce (VKERNELS_HAS_RCCL)
 │   ├── rccl_hip.hpp             # RcclChannel / plan declarations
-│   └── rccl_c.{h,cpp}           # C ABI for the RCCL transport
+│   ├── rccl_c.{h,cpp}           # C ABI for the RCCL transport
+│   ├── pipeline_boundary_cuda.hpp # CUDA plan declarations
+│   └── pipeline_boundary_c.{h,cpp,cu} # C ABI for the PP boundary
 └── core/
     ├── device.cpp               # Device abstraction
     ├── stream.{cpp,cu}          # Stream (async task queue)

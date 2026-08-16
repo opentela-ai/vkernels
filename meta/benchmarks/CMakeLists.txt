@@ -15,6 +15,16 @@ target_link_libraries(rccl_bench PRIVATE vkernels::vkernels)
 target_compile_features(rccl_bench PRIVATE cxx_std_17)
 vkernels_set_warnings(rccl_bench)
 
+# --- Host-only benchmark (no GPU needed): graph-capturable PP boundary ---
+# The transport classification + GraphCapture + host plan run anywhere, so
+# this bench is the CI-verifiable surface for issue #10 (per-decode-iteration
+# host coordination overhead: device-capture vs eager-break). The CUDA path
+# (pipeline_boundary.cu) is A/B'd on a multi-node + NCCL node.
+add_executable(pipeline_boundary_bench bench_pipeline_boundary.cpp)
+target_link_libraries(pipeline_boundary_bench PRIVATE vkernels::vkernels)
+target_compile_features(pipeline_boundary_bench PRIVATE cxx_std_17)
+vkernels_set_warnings(pipeline_boundary_bench)
+
 if(NOT VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
   message(STATUS "vkernels: benchmarks skipped (no GPU toolkit)")
   return()
@@ -31,6 +41,16 @@ if(VKERNELS_HAS_CUDA)
   target_link_libraries(p2p_kv_restore_bench PRIVATE vkernels::vkernels)
   target_compile_features(p2p_kv_restore_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(p2p_kv_restore_bench)
+
+  # Graph-capturable PP-boundary transfer (issue #10). Measures the actual
+  # NVLink peer copy the device path enqueues per decode iteration, and the
+  # graph-replay vs eager-re-issue round trip (the host progress the graph
+  # removes). H100 NVL real peer path; single-GPU box falls back to a
+  # same-device simulation.
+  add_executable(pipeline_boundary_bench_c bench_pipeline_boundary.cu)
+  target_link_libraries(pipeline_boundary_bench_c PRIVATE vkernels::vkernels)
+  target_compile_features(pipeline_boundary_bench_c PRIVATE cxx_std_17)
+  vkernels_set_warnings(pipeline_boundary_bench_c)
 endif()
 
 # --- HIP benchmarks ---
