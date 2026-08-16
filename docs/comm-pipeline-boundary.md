@@ -32,7 +32,7 @@ captured segment, running it between `GraphCapture::end` and the next
    │   same_node │ nccl_graph_supported │ gloo_fallback │
    └────────────────────────────────────────────────┘
         │
-        ├─ kSameNodePeer  ─▶ device path: one cudaMemcpyAsync(D2D)  ─┐
+        ├─ kSameNodePeer  ─▶ device path: one peer-copy kernel     ─┐
         ├─ kCrossNodeNccl ─▶ device path: one ncclSend / ncclRecv     ├─ capturable
         └─ kHostStaged    ─▶ eager-break path: Channel send/recv      ┘   run between
                                                                               graph segments
@@ -47,7 +47,7 @@ captured segment, running it between `GraphCapture::end` and the next
 | Layer | File | Compiled when | Coverage |
 |---|---|---|---|
 | Host reference (classification, eager-break decision, `GraphCapture`, host plan over `Channel`) | `src/c/vkernels/comm/pipeline_boundary.{cpp,hpp}` | **always** | 100% line (CI gate) |
-| CUDA device plan (one `cudaMemcpyAsync` / `ncclSend`-`ncclRecv` over `cudaStream_t`) | `src/c/vkernels/comm/pipeline_boundary.cu`, `pipeline_boundary_cuda.hpp` | `VKERNELS_HAS_CUDA` | on-device |
+| CUDA device plan (one peer-copy kernel / `ncclSend`-`ncclRecv` over `cudaStream_t`) | `src/c/vkernels/comm/pipeline_boundary.cu`, `pipeline_boundary_cuda.hpp` | `VKERNELS_HAS_CUDA` | on-device |
 | C ABI — classification + eager-break | `src/c/vkernels/comm/pipeline_boundary_c.{h,cpp}` | **always** | 100% line (CI gate) |
 | C ABI — device plan (create / execute / destroy over `cudaStream_t`) | `src/c/vkernels/comm/pipeline_boundary_c.cu` | `VKERNELS_C_HAS_CUDA` | on-device |
 
@@ -65,7 +65,7 @@ and `p2p_kv_restore` (host `.cpp` + CUDA `.cu`) pattern.
 
 | Config | Transport | Capturable? |
 |---|---|---|
-| `same_node` | `kSameNodePeer` — one `cudaMemcpyAsync(D2D)` over NVLink/HBM | yes |
+| `same_node` | `kSameNodePeer` — one peer-copy kernel over NVLink/HBM | yes |
 | `gloo_fallback` (and not same-node) | `kHostStaged` — gloo `recv_object`/`send_object` or a host bounce | **no** |
 | `nccl_graph_supported` (and not same-node, not gloo) | `kCrossNodeNccl` — `ncclSend`/`ncclRecv` whose graph-capture API is available | yes |
 | otherwise | `kHostStaged` — NCCL without the graph API, or no NCCL | **no** |
@@ -83,12 +83,24 @@ for `kHostStaged`.
 `PipelineBoundaryPlan` (host) over a `Channel` enqueues **one** `std::memcpy`
 (`send`: `my_buf → peer_buf`; `recv`: `peer_buf → my_buf`) into the
 `GraphCapture` supplied to `execute`. The CUDA `PipelineBoundaryPlan`
-(`vkernels::comm::cuda`) is the device realization: one `cudaMemcpyAsync(...,
-cudaMemcpyDeviceToDevice, stream)` for the same-node peer, or one
-`ncclSend`/`ncclRecv` on `stream` for cross-node. Either is captured
-verbatim between `cudaStreamBeginCapture` / `cudaStreamEndCapture` and
-replayed every iteration with **no host participation** — no `Channel` touch,
-no validation, no allocation after construction.
+(`vkernels::comm::cuda`) is the device realization. For the same-node peer
+it issues a small **copy kernel** (`peer_copy_kernel`) that reads peer UVA
+over NVLink/HBM and writes the destination — *not* `cudaMemcpyAsync(...,
+cudaMemcpyDeviceToWorld)`, which is **not** stream-capturable across two
+*different* GPUs on Hopper / CUDA 13 ("operation not permitted when stream
+is capturing" / "legacy stream depend on a capturing blocking stream");
+`cudaMemcpyPeerAsync` fails identically. A kernel reading peer UVA IS
+capturable in both the same-device and cross-device cases (peer access
+enabled by the caller, exactly as `p2p_gather_bench` and `p2p_kv_restore`
+document), which is why the boundary uses it. For cross-node the plan issues
+one `ncclSend`/`ncclRecv` on `stream`. Either is captured verbatim between
+`cudaStreamBeginCapture` / `cudaStreamEndCapture` and replayed every
+iteration with **no host participation** — no `Channel` touch, no
+validation, no allocation after construction. (Launch errors surface at
+`cudaStreamEndCapture` on the graph path and at the next sync on the eager
+path; `cudaGetLastError()` is intentionally *not* checked after the launch,
+since during capture it can report a stale/warning status that aborts a
+capture `endCapture` would otherwise accept.)
 
 `PipelineBoundaryPlan::execute` is read-only after construction, so one plan
 may be executed concurrently on several streams; the caller guarantees
@@ -179,3 +191,53 @@ Every C++ exception thrown by the wrapped reference is caught and folded
 into a `vkernels_pp_status_t`; nothing is ever thrown across the ABI
 boundary. The always-compiled classification surface is 100% line-covered
 by the host CI job (`tests/comm/test_pipeline_boundary_c.cpp`).
+
+---
+
+## 8. Device micro-benchmark (sgs-gpu07, 4× H100 NVL, CUDA 13)
+
+`meta/benchmarks/bench_pipeline_boundary.cu` (built only with a CUDA
+toolkit) is the device realization. It runs on a real NVLink pair
+(CUDA_VISIBLE_DEVICES=2,3, 12× NVLink, ~600 GB/s bidirectional roof) and
+reports four sections:
+
+- **[0-correctness]** a 4100 B pattern (256 `uint4` + 4 B tail) sent
+  A→B then received B→A, captured once into a graph and replayed 8×; both
+  buffers are asserted to hold the pattern afterward. This exercises the
+  cross-device + `<16 B` tail path the same-device unit test cannot.
+- **[1-peer-copy]** the raw `cudaMemcpyAsync(D2D)` bandwidth floor the
+  boundary kernel matches: NVLink saturates at ~265 GB/s unidirectional
+  (44 % of the 600 GB/s roof), launch-bound below ~1 MiB.
+- **[2-round-trip]** a directed boundary pair (send A→B, recv B→A)
+  captured once vs. re-issued eagerly every iteration. The graph replays
+  in a single `cudaGraphLaunch` (~3.3 µs, **payload-independent**) while
+  the eager path re-enqueues both copies (~5.5 µs) — a **1.6–1.7× host-
+  launch reduction** per boundary round trip. Device time is ≈ eager
+  (the graph removes host coordination, not copy time — the honest
+  result; the copy itself is NVLink-bound at ~265 GB/s).
+- **[3-pp>1-one-graph]** PP=2 (one boundary, 2 copies) and PP=3 (two
+  boundaries, 4 copies) captured into **one** graph and replayed `N`
+  times with no host enqueue of the boundary copies on replay — the
+  issue's acceptance #2 (a graph segment held across the boundary
+  without deadlock).
+
+Sample run (2025-05, sgs-gpu07, `--iters 300 --dst-device 1`):
+
+```
+[0-correctness] captured cross-device round trip (4100 B, 4 B tail, 8 replays): OK
+[1-peer-copy]    1048576  0.0090  3.3   117.0 GB/s  0.195
+[1-peer-copy]    67108864 0.2576  3.7   260.5 GB/s  0.434
+[2-round-trip]    1048576 0.0156  0.0033  0.0171  0.0055  1.67x
+[2-round-trip]    67108864 0.5416  0.0037  0.5436  0.0062  1.66x
+[3-pp2-one-graph] eager: dev=0.0082 host=0.0055 ms/iter (2 copies)
+[3-pp2-one-graph] graph: dev=0.0065 host=0.0033 ms/replay  (host/iter ZERO copy enqueue)
+[3-pp2-one-graph] speedup=1.68x  (eager_host/graph_host host-launch ratio)
+```
+
+The host-side `bench_pipeline_boundary.cpp` is the always-runnable CPU
+analog (no GPU needed): it measures the one-time planning overhead
+(`classify_boundary` ~19 ns, plan construction ~29 ns) and the
+per-decode host coordination cost of the device path (flat ~60 ns,
+graph-captured) vs. the eager-break path (grows linearly in payload,
+~1 µs→47 µs across 1 K→128 K elements) — a 19×→618× ratio, the
+coordination work the graph removes.

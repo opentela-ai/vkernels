@@ -41,6 +41,16 @@ if(VKERNELS_HAS_CUDA)
   target_link_libraries(p2p_kv_restore_bench PRIVATE vkernels::vkernels)
   target_compile_features(p2p_kv_restore_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(p2p_kv_restore_bench)
+
+  # Graph-capturable PP-boundary transfer (issue #10). Measures the actual
+  # NVLink peer copy the device path enqueues per decode iteration, and the
+  # graph-replay vs eager-re-issue round trip (the host progress the graph
+  # removes). H100 NVL real peer path; single-GPU box falls back to a
+  # same-device simulation.
+  add_executable(pipeline_boundary_bench_c bench_pipeline_boundary.cu)
+  target_link_libraries(pipeline_boundary_bench_c PRIVATE vkernels::vkernels)
+  target_compile_features(pipeline_boundary_bench_c PRIVATE cxx_std_17)
+  vkernels_set_warnings(pipeline_boundary_bench_c)
 endif()
 
 # --- HIP benchmarks ---
