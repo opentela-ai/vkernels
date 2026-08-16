@@ -42,6 +42,17 @@ if(VKERNELS_HAS_CUDA)
   target_compile_features(p2p_kv_restore_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(p2p_kv_restore_bench)
 
+  # Fused indexed-KV-to-peer donation (issue #36): the donation-side mirror
+  # of p2p_kv_restore. Reads scattered local K/V slots and writes
+  # contiguous peer pages; measures the fused direct-store kernel vs the
+  # two-stage fallback and the prepared-plan sweep across all 40 model
+  # layers. H100 NVL real peer path; single-GPU box falls back to a
+  # same-device simulation.
+  add_executable(p2p_kv_donate_bench p2p_kv_donate_bench.cu)
+  target_link_libraries(p2p_kv_donate_bench PRIVATE vkernels::vkernels)
+  target_compile_features(p2p_kv_donate_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(p2p_kv_donate_bench)
+
   # Graph-capturable PP-boundary transfer (issue #10). Measures the actual
   # NVLink peer copy the device path enqueues per decode iteration, and the
   # graph-replay vs eager-re-issue round trip (the host progress the graph

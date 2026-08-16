@@ -353,6 +353,61 @@ The C ABI mirrors all three (`vkernels_p2p_kv_restore_plan_create`,
 `vkernels_p2p_kv_restore_plan_execute_offset(plan, k_dst, v_dst, offset,
 stream)`.
 
+### P2P KV donate (fused) — issue #36
+
+The donation-side mirror of `p2p_kv_restore` — the data flow is reversed:
+fuses an indexed gather of local paged-KV slots with the peer store into
+one kernel. KVAAS today materializes a full all-layer packed scratch
+tensor before peer DMA (`pack_pages`: a PyTorch advanced-index gather of
+K/V per layer into `[pages, layers, page_size, 2, heads, dim]`, then
+scratch-to-peer copies, with the scratch pinned until the completion ACK).
+The donate skips the scratch entirely: it reads arbitrary local K/V slots
+and writes directly into the layer-major peer-page destination through
+peer-accessible UVA pointers, eliminating the scratch allocation, the
+extra local-HBM read/write pass, and the separate peer copy.
+
+| Function | Computation |
+|---|---|
+| `p2p_kv_donate_layer(k_src, v_src, slot_ids, peer_dst_ptrs, dst_page_offsets, ...)` | Reads indexed local K/V slots and writes KV data directly into peer UVA page destinations (adaptive: fused kernel or two-stage) |
+| `p2p_kv_donate_layer_twostage(...)` | Gather into a per-call scratch + one `cudaMemcpyAsync` per page (the copy-engine reference, byte-identical output) |
+| `kv_gather(scratch, k_src, v_src, slot_ids, ...)` | Indexed gather of local slots into a contiguous scratch — the first stage, exposed so the plan fallback can gather once |
+
+- Unlike the restore (a scatter, requiring UNIQUE destination slots), the
+  donate is a gather: source slots may repeat and be non-monotonic.
+- CUDA one-shot dispatch is ADAPTIVE — `prefer_direct_store(...)` picks the
+  direct SM store or the two-stage fallback from a cost model fitted on
+  H100 NVL peer-write measurements (the restore's mirror path); tunable at
+  runtime via `set_donate_dispatch(mode, min_pages_for_direct)` (C++ only,
+  not exposed through the C ABI). The host one-shot is always fused.
+- **File**: `src/c/vkernels/comm/p2p_kv_donate.cpp` (CPU), `.cu` (CUDA)
+- **Bench**: `meta/benchmarks/p2p_kv_donate_bench.cu`
+- **Performance**: [performance/p2p-kv-donate/](performance/p2p-kv-donate/)
+
+**Prepared plan (issue #36)** — `P2PKvDonatePlan` (host + CUDA) and the C
+ABI `vkernels_p2p_kv_donate_plan_t` validate the slot map and upload the
+page descriptors ONCE; `execute(k_src, v_src,
+destination_layer_offset_bytes, stream)` then launches ONE
+page-by-token-group kernel that adds the scalar offset to every peer page
+base before writing. The per-layer SOURCE pair is taken per call because
+KVAAS keeps a distinct K/V buffer per model layer — one prepared run list
+fans out across all 40 layers with no per-layer allocation, D2H sync, or
+H2D descriptor upload. `execute_via_scratch(...)` is the documented
+fallback for systems where direct peer stores are unsupported or lose to
+the copy engine: one kv_gather into a caller-owned scratch plus per-page
+`cudaMemcpyAsync`, no per-call allocation, byte-identical output. The
+three creation modes mirror the restore — host `slot_ids` (validated at
+create: non-negative and `< num_slots`; repeats allowed),
+`from_device_slots` (borrows the device pointer, no D2H sync, no content
+validation), and `from_device_slots_int64` (converted device-side at
+create into an owned int32 buffer so the caller may free the int64 buffer
+immediately).
+
+The C ABI mirrors all three (`vkernels_p2p_kv_donate_plan_create`,
+`..._create_device_slots`, `..._create_device_slots_int64`) plus
+`vkernels_p2p_kv_donate_plan_execute_offset(plan, k_src, v_src, offset,
+stream)` and `vkernels_p2p_kv_donate_plan_execute_via_scratch(plan, k_src,
+v_src, scratch, offset, stream)`.
+
 ### Compute/communication overlap
 
 | Class / Function | Computation |
@@ -439,6 +494,7 @@ src/c/vkernels/
 │   ├── allreduce.{cpp,cu}       # ring all-reduce
 │   ├── p2p_gather.{cpp,cu}      # single-launch peer gather
 │   ├── p2p_kv_restore.{cpp,cu}  # fused KV restore
+│   ├── p2p_kv_donate.{cpp,cu}   # fused KV donate (#36)
 │   ├── pipeline_boundary.{cpp,cu} # graph-capturable PP boundary (#10)
 │   ├── overlap.cpp              # compute/comm overlap executor
 │   ├── channel.cpp              # blocking queue & mock channel
