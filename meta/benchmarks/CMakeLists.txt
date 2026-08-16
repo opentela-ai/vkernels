@@ -15,6 +15,16 @@ target_link_libraries(rccl_bench PRIVATE vkernels::vkernels)
 target_compile_features(rccl_bench PRIVATE cxx_std_17)
 vkernels_set_warnings(rccl_bench)
 
+# --- Host-only benchmark (no GPU needed): graph-capturable PP boundary ---
+# The transport classification + GraphCapture + host plan run anywhere, so
+# this bench is the CI-verifiable surface for issue #10 (per-decode-iteration
+# host coordination overhead: device-capture vs eager-break). The CUDA path
+# (pipeline_boundary.cu) is A/B'd on a multi-node + NCCL node.
+add_executable(pipeline_boundary_bench bench_pipeline_boundary.cpp)
+target_link_libraries(pipeline_boundary_bench PRIVATE vkernels::vkernels)
+target_compile_features(pipeline_boundary_bench PRIVATE cxx_std_17)
+vkernels_set_warnings(pipeline_boundary_bench)
+
 if(NOT VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
   message(STATUS "vkernels: benchmarks skipped (no GPU toolkit)")
   return()
