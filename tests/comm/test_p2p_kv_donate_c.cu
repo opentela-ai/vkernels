@@ -273,8 +273,10 @@ TEST(P2pKvDonateCAbi, PageOffsetIsHonoured) {
   for (size_t i = 0; i < kSlotBytes; ++i) {
     ASSERT_EQ(got_k[i], h_k[1 * kSlotBytes + i]);
     ASSERT_EQ(got_v[i], h_v[1 * kSlotBytes + i]);
-    ASSERT_EQ(h_out[i], 0x21);                   // token 0 K untouched
-    ASSERT_EQ(h_out[kSlotBytes + i], 0x21);      // token 0 V untouched
+    // token 0 untouched: keeps its original patterned() contents (note:
+    // patterned() is seed + (i % 251), NOT a constant fill)
+    ASSERT_EQ(h_out[i], h_buf[i]);
+    ASSERT_EQ(h_out[kSlotBytes + i], h_buf[kSlotBytes + i]);
   }
 
   cudaFree(d_buf); cudaFree(d_k); cudaFree(d_v);
@@ -380,8 +382,13 @@ TEST(P2pKvDonateCAbi, ZeroPagesIsNoOp) {
   ASSERT_EQ(st, VKERNELS_OK);
   ASSERT_TRUE(cudaDeviceSynchronize() == cudaSuccess);
 
-  // Page buffer must be untouched.
-  ASSERT_TRUE(device_equal(d_page, h_page.data(), h_page.size()));
+  // Page buffer must be untouched. Copy D2H and memcmp against the
+  // original host pattern (device_equal expects both sides to be device
+  // buffers; h_page is a host pointer).
+  std::vector<uint8_t> h_out(h_page.size());
+  ASSERT_TRUE(cudaMemcpy(h_out.data(), d_page, h_out.size(),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+  ASSERT_TRUE(h_out == h_page);
 
   cudaFree(d_page); cudaFree(d_k); cudaFree(d_v);
 }
