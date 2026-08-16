@@ -53,6 +53,33 @@ bool device_capturable(PipelineTransport t) {
   return is_graph_capturable(t);
 }
 
+// Graph-capturable peer copy. On Hopper / CUDA 13 neither
+// `cudaMemcpyAsync(..., cudaMemcpyDeviceToDevice)` nor `cudaMemcpyPeerAsync`
+// is capturable across two DIFFERENT devices ("operation not permitted when
+// stream is capturing" / "legacy stream depend on a capturing blocking
+// stream"). A kernel that reads peer UVA over NVLink and writes the
+// destination IS capturable in both the same-device and cross-device cases
+// (peer access enabled by the caller, exactly as p2p_gather_bench and
+// p2p_kv_restore document), so this is the graph-capturable same-node-peer
+// path the boundary issues every decode iteration. Vectorized 16-byte
+// (uint4) body with a byte-tail; grid-stride so one launch covers any
+// payload.
+__global__ void peer_copy_kernel(uint4* __restrict__ dst,
+                                 const uint4* __restrict__ src,
+                                 std::size_t n4, std::size_t tail_bytes,
+                                 unsigned char* dst_tail,
+                                 const unsigned char* src_tail) {
+  std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (; i < n4; i += stride) dst[i] = src[i];
+  // Residual bytes (< 16) via a fresh grid-stride so the index is
+  // unambiguous regardless of where each thread left the main loop.
+  for (std::size_t b = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+       b < tail_bytes; b += stride)
+    dst_tail[b] = src_tail[b];
+}
+
 }  // namespace
 
 void pipeline_boundary_layer(void* my_buf, void* peer_buf,
@@ -70,10 +97,29 @@ void pipeline_boundary_layer(void* my_buf, void* peer_buf,
   const void* const src = (dir == BoundaryDirection::kSend) ? my_buf : peer_buf;
 
   if (transport == PipelineTransport::kSameNodePeer) {
-    // Peer copy over NVLink / HBM — pure device, graph-capturable.
-    cudaError_t err = cudaMemcpyAsync(dst, src, payload_bytes,
-                                       cudaMemcpyDeviceToDevice, stream);
-    VK_ENSURES(err == cudaSuccess, "cudaMemcpyAsync D2D failed");
+    // Peer copy over NVLink / HBM via a graph-capturable kernel that reads
+    // peer UVA directly (see peer_copy_kernel). Pure device, no host ring
+    // I/O; one launch moves the whole payload and replays in the graph.
+    constexpr std::size_t kBlock = 256;
+    const std::size_t n4 = payload_bytes / sizeof(uint4);
+    const std::size_t tail = payload_bytes % sizeof(uint4);
+    auto* dst4 = reinterpret_cast<uint4*>(dst);
+    const auto* src4 = reinterpret_cast<const uint4*>(src);
+    auto* dst_tail = reinterpret_cast<unsigned char*>(dst) + n4 * sizeof(uint4);
+    const auto* src_tail = reinterpret_cast<const unsigned char*>(src) + n4 * sizeof(uint4);
+    const std::size_t need = (n4 > 0 ? n4 : tail);
+    const int grid = static_cast<int>(
+        std::min<std::size_t>((need + kBlock - 1) / kBlock,
+                              65535));  // cap for very large payloads;
+                                        // grid-stride covers the rest.
+    if (grid > 0)
+      peer_copy_kernel<<<grid, static_cast<int>(kBlock), 0, stream>>>(
+          dst4, src4, n4, tail, dst_tail, src_tail);
+    // Do NOT call cudaGetLastError() here: during stream capture it can
+    // return a stale or warning status even though the launch was queued
+    // (empirically it aborts capture that endCapture would otherwise
+    // accept). Launch failures surface at cudaStreamEndCapture (graph path,
+    // which the caller checks) or at the next sync (eager path).
     return;
   }
 
