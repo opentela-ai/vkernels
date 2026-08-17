@@ -85,6 +85,7 @@ EXPECTED_COMM = [
     ("BlockingQueue", "class"),
     ("MockChannel", "class"),
     ("make_ring_channels", "function"),
+    ("kv_gather_layer", "function"),
     ("OverlapExecutor", "class"),
     ("p2p_gather_runs", "function"),
     ("Gather2DRun", "struct"),

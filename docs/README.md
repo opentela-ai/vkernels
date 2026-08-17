@@ -408,6 +408,40 @@ The C ABI mirrors all three (`vkernels_p2p_kv_donate_plan_create`,
 stream)` and `vkernels_p2p_kv_donate_plan_execute_via_scratch(plan, k_src,
 v_src, scratch, offset, stream)`.
 
+### Fused indexed K/V layer gather — issue #2
+
+The donation-side building block KVAAS performs today as two separate
+advanced-index gathers (one for K, one for V) into the packed
+`[num_pages, page_size, 2, num_kv_heads, head_dim]` destination. This
+primitive fuses both gathers (and the K/V interleave) into a SINGLE launch
+— the reverse of `p2p_kv_restore` (which scatters) and the gather the
+donate plan's two-stage fallback exposes as `kv_gather`.
+
+| Function | Computation |
+|---|---|
+| `kv_gather_layer(dst, k_src, v_src, slot_ids, slot_ids_int64, num_slots, num_pages, page_size, num_kv_heads, head_dim, elem_size, stream)` | `dst[:, :, 0] = k_src[slot_ids]` and `dst[:, :, 1] = v_src[slot_ids]` in one operation |
+| `kv_gather_layer_device_slots(...)` | CUDA-only: caller-owned DEVICE `slot_ids` (no D2H sync, no content validation) |
+
+- **Contract**: `k_src`/`v_src` are `[num_slots, num_kv_heads, head_dim]`,
+  BF16 or FP16 (`elem_size == 2`); `slot_ids` is `[num_pages, page_size]`,
+  int32 or int64, arbitrary non-monotonic source slots that MAY REPEAT
+  (gather semantics, unlike the restore's unique-destination scatter).
+  Only the range `[0, num_slots)` is enforced; `num_pages == 0` is a valid
+  no-op.
+- **Lifetime**: for the host-input `kv_gather_layer` the slot map is copied
+  into owned storage before the function returns (the caller may free it
+  immediately); `k_src`, `v_src` and `dst` must outlive `stream`. Async on
+  the caller's stream with NO device-wide synchronization.
+- **File**: `src/c/vkernels/comm/kv_gather.cpp` (CPU oracle), `.cu` (CUDA
+  kernel), `kv_gather_c.{h,cu}` (C ABI)
+- **Bench**: `meta/benchmarks/kv_gather_bench.cu` — fused vs the two-gather
+  PyTorch reference, 64 through 8,192 tokens.
+- **Python**: `vkernels.kv_gather_layer(k_src, v_src, slot_ids, dst, *,
+  stream=None)` (also `vkernels.comm.kv_gather_layer`); non-default strides
+  are rejected explicitly (a silent copy would write into a throwaway
+  buffer). The pure-Python reference in `_fallback.py` is byte-exact for
+  both BF16 (passed as a `uint16` view) and FP16.
+
 ### Compute/communication overlap
 
 | Class / Function | Computation |
@@ -495,6 +529,9 @@ src/c/vkernels/
 │   ├── p2p_gather.{cpp,cu}      # single-launch peer gather
 │   ├── p2p_kv_restore.{cpp,cu}  # fused KV restore
 │   ├── p2p_kv_donate.{cpp,cu}   # fused KV donate (#36)
+│   ├── kv_gather.{hpp,cpp,cu}   # fused indexed K/V layer gather (#2)
+│   ├── kv_gather_cuda.hpp       # CUDA entry points (issue #2)
+│   ├── kv_gather_c.{h,cu}       # C ABI for the fused K/V gather (#2)
 │   ├── pipeline_boundary.{cpp,cu} # graph-capturable PP boundary (#10)
 │   ├── overlap.cpp              # compute/comm overlap executor
 │   ├── channel.cpp              # blocking queue & mock channel
