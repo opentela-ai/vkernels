@@ -53,6 +53,17 @@ if(VKERNELS_HAS_CUDA)
   target_compile_features(p2p_kv_donate_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(p2p_kv_donate_bench)
 
+  # Fused indexed K/V layer gather (issue #2): the donation-side building
+  # block that packs arbitrary KV-pool slots into a contiguous per-layer
+  # page buffer. Measures the single fused kernel vs the two-gather
+  # PyTorch reference (two separate advanced-index gather kernels, one per
+  # tensor) across 64..8192 tokens, plus effective bandwidth and the
+  # one-launch-vs-two saving. Single-GPU box reads/writes device 0.
+  add_executable(kv_gather_bench kv_gather_bench.cu)
+  target_link_libraries(kv_gather_bench PRIVATE vkernels::vkernels)
+  target_compile_features(kv_gather_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(kv_gather_bench)
+
   # Graph-capturable PP-boundary transfer (issue #10). Measures the actual
   # NVLink peer copy the device path enqueues per decode iteration, and the
   # graph-replay vs eager-re-issue round trip (the host progress the graph

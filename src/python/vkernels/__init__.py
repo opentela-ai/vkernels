@@ -41,12 +41,24 @@ backend: str = _backend.backend_name()
 
 _Lazy = ("core", "kernels", "comm")
 
+# Functions re-exported at the top level (lazily, to keep ``import vkernels``
+# dependency-free). Each maps to ``vkernels.<submodule>.<name>``.
+_TopLevelFuncs = {
+    "kv_gather_layer": "comm",
+}
+
 
 def __getattr__(name: str):
-    """Lazily import the binding submodules so ``import vkernels`` stays
-    dependency-free (the discovery/CLI layer needs no numpy)."""
+    """Lazily import the binding submodules (and a few top-level functions)
+    so ``import vkernels`` stays dependency-free (the discovery/CLI layer
+    needs no numpy)."""
     if name in _Lazy:
         module = importlib.import_module(f"vkernels.{name}")
         globals()[name] = module
         return module
+    if name in _TopLevelFuncs:
+        module = importlib.import_module(f"vkernels.{_TopLevelFuncs[name]}")
+        func = getattr(module, name)
+        globals()[name] = func
+        return func
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

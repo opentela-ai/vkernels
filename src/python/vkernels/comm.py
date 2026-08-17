@@ -57,6 +57,7 @@ __all__ = [
     "p2p_gather_runs",
     "p2p_gather_runs_2d",
     "memcpy_peer_batch_async",
+    "kv_gather_layer",
 ]
 
 
@@ -515,3 +516,59 @@ def memcpy_peer_batch_async(dst, src_ptrs: Sequence[int],
     impl_stream = _impl_stream(stream)
     _impl.memcpy_peer_batch_async(dst, src_ptrs, dst_offsets, lengths,
                                   impl_stream)
+
+
+def kv_gather_layer(k_src, v_src, slot_ids, dst, *, stream=None) -> None:
+    """Fused indexed K/V gather for one layer (issue #2).
+
+    Reads ``num_pages * page_size`` indexed source slots from ``k_src`` /
+    ``v_src`` and writes the packed ``[num_pages, page_size, 2, num_kv_heads,
+    head_dim]`` destination, exactly:
+
+        dst[:, :, 0] = k_src[slot_ids]
+        dst[:, :, 1] = v_src[slot_ids]
+
+    This fuses the two separate advanced-index gathers the KVAAS
+    ``pack_pages`` path performs today into a single operation, the reverse
+    of :func:`p2p_kv_restore` (issue #4) and the building block of the
+    peer-KV donation/eviction paths (issue #36).
+
+    Args:
+        k_src, v_src: ``[num_slots, num_kv_heads, head_dim]`` C-contiguous
+            arrays with ``itemsize == 2``. BF16 is passed as a ``uint16``
+            view (numpy has no native BF16); FP16 as ``np.float16``. The
+            gather is a raw-byte copy, so the bit pattern is preserved
+            exactly for both dtypes.
+        slot_ids: ``[num_pages, page_size]`` C-contiguous ``int32`` or
+            ``int64`` array of source slots in ``[0, num_slots)``. Slots may
+            repeat (gather semantics, unlike the restore's unique-destination
+            scatter) and be in any order (non-monotonic).
+        dst: ``[num_pages, page_size, 2, num_kv_heads, head_dim]``
+            C-contiguous writable array of the same dtype as ``k_src``/
+            ``v_src``. Non-default strides are rejected explicitly (a silent
+            copy would write into a throwaway buffer).
+        stream: optional :class:`~vkernels.core.Stream`. When omitted the
+            gather runs to completion before returning; otherwise it is
+            enqueued as a single task and the call returns immediately (no
+            device-wide synchronization).
+
+    Raises:
+        TypeError: if any array has the wrong dtype.
+        ValueError: if shapes/strides are inconsistent, ``slot_ids`` is out
+            of range, or ``dst`` is not writable.
+
+    Example:
+        >>> import numpy as np
+        >>> k = np.arange(2*1*4, dtype=np.float16).reshape(2, 1, 4)
+        >>> v = np.full((2, 1, 4), 99, dtype=np.float16)
+        >>> slot_ids = np.array([[0, 1]], dtype=np.int32)
+        >>> dst = np.zeros((1, 2, 2, 1, 4), dtype=np.float16)
+        >>> kv_gather_layer(k, v, slot_ids, dst)
+        >>> dst[0, 0, 0].tolist(), dst[0, 1, 1].tolist()
+        ([0.0, 1.0, 2.0, 3.0], [99.0, 99.0, 99.0, 99.0])
+    """
+    impl_stream = _impl_stream(stream)
+    if _COMPILED:
+        _impl.kv_gather_layer(k_src, v_src, slot_ids, dst, impl_stream)
+    else:
+        _impl.kv_gather_layer(k_src, v_src, slot_ids, dst, stream=impl_stream)
