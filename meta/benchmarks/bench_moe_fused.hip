@@ -147,6 +147,14 @@ int main(int argc, char** argv) {
   std::printf("%6s %8s %10s %10s %9s %9s\n", "M", "EM", "lat(us)", "TFLOP/s",
               "cpu-rel", "status");
 
+  // Persistent scratch for the gathered routing weights, reused across every
+  // forward pass in the sweep (issue #41, item 1): the caller owns this
+  // buffer, so the host launcher performs no per-call hipMalloc/hipFree.
+  // Sized to the largest EM this configuration can produce (E * BLOCK_M),
+  // the same bound that backs the h_sids host buffer below.
+  float* dSw = nullptr;
+  CK(hipMalloc(&dSw, E * BLOCK_M * 4), "sw");
+
   for (int M : Ms) {
     int N = M * top_k;
     int EM_max = E * BLOCK_M;
@@ -183,7 +191,7 @@ int main(int argc, char** argv) {
 
     auto launch = [&]() {
       vkernels::kernels::hip::fused_moe_mxfp4(
-          dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
+          dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dSw, dOut,
           M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
           linear_beta, db13, db2);
     };
@@ -231,6 +239,7 @@ int main(int argc, char** argv) {
   }
 
   hipEventDestroy(start); hipEventDestroy(stop);
+  hipFree(dSw);
   hipFree(dw13); hipFree(dw13s); hipFree(dw2); hipFree(dw2s);
   hipFree(db13); hipFree(db2);
   std::printf("Done.\n");

@@ -163,10 +163,11 @@ int main(int argc, char** argv) {
           h_tids.data(), M, top_k, block_size, E, h_sids.data(), h_eids.data());
 
       uint16_t *dA, *dAct;
-      float *dOut, *dTw;
+      float *dOut, *dTw, *dSw;
       int32_t *dTids, *dSids, *dEids;
       CK(hipMalloc(&dA, M * hidden * 2), "A");
       CK(hipMalloc(&dAct, EM * ispp * 2), "act");
+      CK(hipMalloc(&dSw, EM * 4), "sw");
       CK(hipMalloc(&dOut, M * hidden * 4), "out");
       CK(hipMalloc(&dTw, N * 4), "tw");
       CK(hipMalloc(&dTids, N * 4), "tids");
@@ -181,7 +182,7 @@ int main(int argc, char** argv) {
 
       auto launch = [&]() {
         vkernels::kernels::hip::fused_moe_mxfp4(
-            dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
+            dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dSw, dOut,
             M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
             linear_beta, db13, db2, block_size);
       };
@@ -220,7 +221,7 @@ int main(int argc, char** argv) {
       out_us = r.median_us;
       out_tf = (6.0 * M * (double)ispp * hidden) / (r.median_us / 1e6) / 1e12;
 
-      hipFree(dA); hipFree(dAct); hipFree(dOut);
+      hipFree(dA); hipFree(dAct); hipFree(dSw); hipFree(dOut);
       hipFree(dTw); hipFree(dTids); hipFree(dSids); hipFree(dEids);
     };
 

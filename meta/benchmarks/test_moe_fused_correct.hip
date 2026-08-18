@@ -150,7 +150,7 @@ int main(int argc, char** argv) {
   // --- Device ---
   uint16_t *dA, *dAct;
   uint8_t *dw13, *dw13s, *dw2, *dw2s;
-  float *dOut, *dTw, *db13, *db2;
+  float *dOut, *dTw, *db13, *db2, *dSw;
   int32_t *dTids, *dSids, *dEids;
   CK(hipMalloc(&dA, M * hidden * 2), "A");
   CK(hipMalloc(&dw13, w13_sz), "w13");
@@ -160,6 +160,7 @@ int main(int argc, char** argv) {
   CK(hipMalloc(&db13, E * 2 * ispp * 4), "b13");
   CK(hipMalloc(&db2, E * hidden * 4), "b2");
   CK(hipMalloc(&dAct, EM_p * ispp * 2), "act");
+  CK(hipMalloc(&dSw, EM_p * 4), "sw");
   CK(hipMalloc(&dOut, M * hidden * 4), "out");
   CK(hipMalloc(&dTw, M * top_k * 4), "tw");
   CK(hipMalloc(&dTids, M * top_k * 4), "tids");
@@ -181,7 +182,7 @@ int main(int argc, char** argv) {
   CK(hipMemset(dAct, 0, EM_p * ispp * 2), "zAct");
 
   vkernels::kernels::hip::fused_moe_mxfp4(
-      dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
+      dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dSw, dOut,
       M, hidden, ispp, top_k, dSids, dEids, EM_p, LIMIT, activation, beta,
       linear_beta, db13, db2);
   CK(hipDeviceSynchronize(), "sync");
@@ -215,7 +216,7 @@ int main(int argc, char** argv) {
   std::printf("%s\n", pass ? "PASS" : "FAIL");
 
   hipFree(dA); hipFree(dw13); hipFree(dw13s); hipFree(dw2); hipFree(dw2s);
-  hipFree(db13); hipFree(db2); hipFree(dAct); hipFree(dOut);
+  hipFree(db13); hipFree(db2); hipFree(dAct); hipFree(dSw); hipFree(dOut);
   hipFree(dTw); hipFree(dTids); hipFree(dSids); hipFree(dEids);
   return pass ? 0 : 1;
 }

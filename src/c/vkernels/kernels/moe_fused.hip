@@ -635,6 +635,7 @@ void fused_moe_mxfp4(
     const int32_t*  topk_ids,
     const float*    topk_w,
     uint16_t*       act_scratch,
+    float*          sorted_w_scratch,
     float*          out,
     int M, int hidden, int ispp, int top_k,
     const int32_t* sorted_ids, const int32_t* expert_ids,
@@ -642,8 +643,13 @@ void fused_moe_mxfp4(
     int activation, float beta, float linear_beta,
     const float* b13, const float* b2, int block_size) {
 
-  float* sorted_w = nullptr;
-  (void)hipMalloc(&sorted_w, EM * sizeof(float));
+  // `sorted_w_scratch` is a caller-provided, persistent EM-float buffer for
+  // the gathered routing weights (issue #41, item 1).  Reusing it across
+  // forward passes — as the xkernels Triton kernel and the AITER CK
+  // workspace do — eliminates the per-call hipMalloc/hipFree that cost 122
+  // allocator round-trips per generated token on a 61-layer model.  The
+  // launcher therefore performs no device allocation of its own.
+  float* sorted_w = sorted_w_scratch;
   {
     int nb = (EM + 255) / 256;
     gather_weights_kernel<<<nb, 256>>>(sorted_w, topk_w, sorted_ids, EM, M * top_k);
@@ -683,7 +689,8 @@ void fused_moe_mxfp4(
     }
   }
 
-  (void)hipFree(sorted_w);
+  // No hipFree(sorted_w): the caller owns `sorted_w_scratch` and reuses it
+  // across forward passes (see the comment at the top of this function).
 }
 
 // ======================================================================

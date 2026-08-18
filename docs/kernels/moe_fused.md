@@ -227,6 +227,14 @@ tiny `gather_weights_kernel` reorders it into `sorted_w[EM]` matching
 sorted_w[i] = (sorted_ids[i] in [0, M*top_k)) ? topk_w[sorted_ids[i]] : 0
 ```
 
+`sorted_w` lives in a **caller-provided scratch buffer** (`sorted_w_scratch`,
+`EM` floats), not a per-call `hipMalloc`. A backend serving a 61-layer model
+allocates `act_scratch` and `sorted_w_scratch` once and reuses them across
+every forward pass, eliminating the 122 allocator round-trips per generated
+token that a per-call allocation cost (issue #41, item 1). The
+`hip::fused_moe_mxfp4` launcher therefore performs no device allocation of
+its own.
+
 ---
 
 ## Expert alignment: `moe_align_block_size`
@@ -285,6 +293,7 @@ form.
 | `b13 == nullptr` / `b2 == nullptr` | Bias skipped for that stage |
 | `swiglu_limit <= 0` | No clamping |
 | `out` not zero-initialised | Undefined (stage 1 accumulates into it) |
+| `act_scratch`/`sorted_w_scratch` not caller-owned | Undefined — the launcher does no per-call allocation (issue #41, item 1); both scratch buffers are owned and reused by the caller |
 
 ---
 
@@ -345,6 +354,16 @@ accumulator VGPRs and ~1.5× slower).
 
 ## Current limitations / future work
 
+- **Persistent scratch buffer (issue #41, item 1 — done)**: `act_scratch`
+  and `sorted_w_scratch` are now caller-provided; the `hip::fused_moe_mxfp4`
+  launcher performs no `hipMalloc`/`hipFree` of its own, so a 61-layer model
+  no longer pays 122 allocator round-trips per generated token. Items 2–5 of
+  issue #41 (warp-level segmented combine replacing `atomicAdd`, an
+  occupancy-first tile sweep with `__launch_bounds__`, a K-major weight
+  layout study, and a wavefront-specialized producer/consumer prefill)
+  remain open — all are GPU-kernel changes that require gfx942 (MI300A)
+  hardware to implement and verify, which is unavailable in this tree's
+  CPU-only build.
 - **Occupancy-bound, not barrier-bound** (measured on gfx90a): LDS
   double-buffering was implemented and **reverted** — doubling the decode
   LDS (6→12 KB) halved blocks/CU and slowed decode by ~50%, because the
