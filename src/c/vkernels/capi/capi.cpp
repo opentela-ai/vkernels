@@ -25,6 +25,12 @@
 #include "vkernels/core/stream.hpp"
 #include "vkernels/kernels/elementwise.hpp"
 #include "vkernels/kernels/gemm.hpp"
+#include "vkernels/kernels/gemm_bf16.hpp"
+#include "vkernels/kernels/kda.hpp"
+#include "vkernels/kernels/mla.hpp"
+#include "vkernels/kernels/moe.hpp"
+#include "vkernels/kernels/moe_aux.hpp"
+#include "vkernels/kernels/moe_fused.hpp"
 #include "vkernels/kernels/reduce.hpp"
 #include "vkernels/util/version.hpp"
 
@@ -222,6 +228,300 @@ int32_t vk_gemm(size_t M, size_t N, size_t K, float alpha, const float* A,
   vkernels::kernels::gemm(M, N, K, alpha, vkernels::Span<const float>(A, A_len),
                           vkernels::Span<const float>(B, B_len), beta,
                           vkernels::Span<float>(C, C_len));
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+/* ------------------------------------------------------------------ */
+/* kernels: gfx942 primitives (moe.hpp)                                 */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_direct_lds_fill_bf16(void* lds_dst, const void* global_src,
+                                size_t elements) {
+  VK_CAPI_TRY
+  vkernels::kernels::direct_lds_fill_bf16(lds_dst, global_src, elements);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_fp4_to_bf16_dequant(const uint8_t* packed, size_t packed_len,
+                               uint16_t* out, size_t out_len, float scale) {
+  VK_CAPI_TRY
+  vkernels::kernels::fp4_to_bf16_dequant(
+      vkernels::Span<const std::uint8_t>(packed, packed_len),
+      vkernels::Span<std::uint16_t>(out, out_len), scale);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int vk_use_async_copy_default(void) {
+  return vkernels::kernels::use_async_copy_default() ? 1 : 0;
+}
+
+int32_t vk_mfma_f32_16x16x16bf16(float* c, const uint32_t* a,
+                                 const uint32_t* b, int cbsz, int abid,
+                                 int blgp) {
+  VK_CAPI_TRY
+  vkernels::kernels::mfma_f32_16x16x16bf16(c, a, b, cbsz, abid, blgp);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+/* ------------------------------------------------------------------ */
+/* kernels: bf16 GEMM (gemm_bf16.hpp, issue #29)                        */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_gemm_bf16(size_t M, size_t N, size_t K, float alpha,
+                     const uint16_t* A, const uint16_t* B, float beta,
+                     uint16_t* C) {
+  VK_CAPI_TRY
+  vkernels::kernels::gemm_bf16_cpu(M, N, K, alpha, A, B, beta, C);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+void vk_gemm_bf16_config(size_t M, size_t N, size_t K, int* bm, int* bn,
+                         int* bk, int* threads) {
+  vkernels::kernels::gemm_bf16_config_for(M, N, K, bm, bn, bk, threads);
+}
+
+/* ------------------------------------------------------------------ */
+/* kernels: MLA — absorbed-form Multi-head Latent Attention (mla.hpp)   */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_mla_fwd(int B, int H, int S_q, int S_kv, int q_start,
+                   int kv_start, int kv_lora_rank, int qk_rope_head_dim,
+                   float scale, const float* q, const float* k_c,
+                   const float* k_pe, const float* v_c, float* out) {
+  VK_CAPI_TRY
+  vkernels::kernels::mla_fwd_cpu(B, H, S_q, S_kv, q_start, kv_start,
+                                 kv_lora_rank, qk_rope_head_dim, scale, q,
+                                 k_c, k_pe, v_c, out);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+void vk_mla_config(int S_q, int kv_lora_rank, int qk_rope_head_dim,
+                   int* bq, int* bn, int* threads) {
+  vkernels::kernels::mla_config_for(S_q, kv_lora_rank, qk_rope_head_dim, bq,
+                                    bn, threads);
+}
+
+/* ------------------------------------------------------------------ */
+/* kernels: KDA — Kimi Delta Attention (kda.hpp)                        */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_kda_layer_norm_gated(const float* x, const float* weight,
+                                const float* gate, float* out, int N,
+                                int D, float eps) {
+  VK_CAPI_TRY
+  vkernels::kernels::kda_layer_norm_gated_cpu(x, weight, gate, out, N, D,
+                                              eps);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_kda_gate_chunk_cumsum(const float* g, float* intra_log,
+                                 float* inter_log, int B, int H,
+                                 int n_chunks, int chunk_size) {
+  VK_CAPI_TRY
+  vkernels::kernels::kda_gate_chunk_cumsum_cpu(g, intra_log, inter_log, B,
+                                               H, n_chunks, chunk_size);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_kda_naive_delta_rule_fwd(const float* q, const float* k,
+                                    const float* v, const float* g,
+                                    const float* beta, float* out, int B,
+                                    int H, int S, int D) {
+  VK_CAPI_TRY
+  vkernels::kernels::kda_naive_delta_rule_fwd_cpu(q, k, v, g, beta, out, B,
+                                                  H, S, D);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_kda_delta_rule_fwd(const float* q, const float* k,
+                              const float* v, const float* g,
+                              const float* beta, float* out, int B, int H,
+                              int S, int D, int chunk_size) {
+  VK_CAPI_TRY
+  vkernels::kernels::kda_delta_rule_fwd_cpu(q, k, v, g, beta, out, B, H,
+                                            S, D, chunk_size);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_kda_delta_rule_intra(const float* q, const float* k,
+                                const float* v, const float* g,
+                                const float* beta, const float* intra_log,
+                                const float* inter_state, float* u, int B,
+                                int H, int S, int D, int chunk_size,
+                                int chunk_idx) {
+  VK_CAPI_TRY
+  vkernels::kernels::kda_delta_rule_intra_cpu(q, k, v, g, beta, intra_log,
+                                              inter_state, u, B, H, S, D,
+                                              chunk_size, chunk_idx);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_kda_delta_rule_inter(const float* k, const float* v,
+                                const float* g, const float* beta,
+                                const float* intra_log, const float* u,
+                                float* inter_state, int B, int H, int S,
+                                int D, int chunk_size, int chunk_idx) {
+  VK_CAPI_TRY
+  vkernels::kernels::kda_delta_rule_inter_cpu(k, v, g, beta, intra_log, u,
+                                              inter_state, B, H, S, D,
+                                              chunk_size, chunk_idx);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_kda_gla_fwd_o(const float* q, const float* k, const float* g,
+                         const float* beta, const float* intra_log,
+                         const float* inter_state, const float* u,
+                         float* out, int B, int H, int S, int D,
+                         int chunk_size) {
+  VK_CAPI_TRY
+  vkernels::kernels::kda_gla_fwd_o_cpu(q, k, g, beta, intra_log,
+                                       inter_state, u, out, B, H, S, D,
+                                       chunk_size);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_kda_pack_bitmatrix(const uint8_t* bits, uint8_t* packed,
+                              size_t n_bits) {
+  VK_CAPI_TRY
+  vkernels::kernels::kda_pack_bitmatrix_cpu(bits, packed, n_bits);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+/* ------------------------------------------------------------------ */
+/* kernels: MoE orchestration (moe_aux.hpp, issue #22)                  */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_mxfp4_moe_quant(const uint16_t* A, uint8_t* packed,
+                           uint8_t* scales, int M, int hidden,
+                           int group_size) {
+  VK_CAPI_TRY
+  vkernels::kernels::mxfp4_moe_quant(A, packed, scales, M, hidden,
+                                     group_size);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_mxfp4_moe_sort(const uint16_t* A, const int32_t* sorted_ids,
+                          uint16_t* A_sorted, int M, int hidden, int top_k,
+                          int EM) {
+  VK_CAPI_TRY
+  vkernels::kernels::mxfp4_moe_sort(A, sorted_ids, A_sorted, M, hidden,
+                                    top_k, EM);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_mxfp4_moe_sort_scales(const uint8_t* scales,
+                                 const int32_t* sorted_ids,
+                                 uint8_t* scales_sorted, int M,
+                                 int n_groups, int top_k, int EM) {
+  VK_CAPI_TRY
+  vkernels::kernels::mxfp4_moe_sort_scales(scales, sorted_ids, scales_sorted,
+                                           M, n_groups, top_k, EM);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_mxfp4_moe_scatter_reduce(const float* partial,
+                                    const float* topk_w,
+                                    const int32_t* sorted_ids, float* out,
+                                    int M, int width, int top_k, int EM) {
+  VK_CAPI_TRY
+  vkernels::kernels::mxfp4_moe_scatter_reduce(partial, topk_w, sorted_ids,
+                                              out, M, width, top_k, EM);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_mxfp4_moe_scatter_reduce_q(const uint8_t* partial_q,
+                                      const uint8_t* partial_s,
+                                      const float* topk_w,
+                                      const int32_t* sorted_ids, float* out,
+                                      int M, int width, int top_k, int EM,
+                                      int group_size) {
+  VK_CAPI_TRY
+  vkernels::kernels::mxfp4_moe_scatter_reduce_q(partial_q, partial_s,
+                                                topk_w, sorted_ids, out, M,
+                                                width, top_k, EM, group_size);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+/* ------------------------------------------------------------------ */
+/* kernels: fused MXFP4 MoE grouped GEMM (moe_fused.hpp)               */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_fused_moe_mxfp4(const uint16_t* A, const uint8_t* w13,
+                           const uint8_t* w13_scale, const uint8_t* w2,
+                           const uint8_t* w2_scale, const int32_t* sorted_ids,
+                           const float* topk_w_sorted,
+                           const int32_t* expert_ids, uint16_t* act_scratch,
+                           float* out, int M, int hidden, int ispp, int top_k,
+                           int EM, int group_size, float swiglu_limit,
+                           int activation, float beta, float linear_beta,
+                           const float* b13, const float* b2) {
+  VK_CAPI_TRY
+  // The C++ reference (fused_moe_mxfp4_cpu) does no length checks of its
+  // own (BLAS-style); the safe bindings validate shapes before calling.
+  // Guard the primary buffers here so a C consumer cannot dereference null.
+  if (M > 0 && EM > 0) {
+    if (A == nullptr || w13 == nullptr || w13_scale == nullptr ||
+        w2 == nullptr || w2_scale == nullptr || sorted_ids == nullptr ||
+        topk_w_sorted == nullptr || expert_ids == nullptr ||
+        act_scratch == nullptr || out == nullptr) {
+      throw std::invalid_argument("fused_moe_mxfp4: buffers must not be null");
+    }
+  }
+  vkernels::kernels::fused_moe_mxfp4_cpu(
+      A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w_sorted, expert_ids,
+      act_scratch, out, M, hidden, ispp, top_k, EM, group_size, swiglu_limit,
+      activation, beta, linear_beta, b13, b2);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+size_t vk_moe_align_block_size_max_em(int32_t M, int32_t top_k,
+                                      int32_t block_size,
+                                      int32_t num_experts) {
+  if (block_size <= 0) return 0;
+  int32_t N = M * top_k;
+  int32_t max_em = ((N + block_size - 1) / block_size + num_experts) * block_size;
+  return max_em > 0 ? static_cast<size_t>(max_em) : 0;
+}
+
+int32_t vk_moe_align_block_size(const int32_t* topk_ids, int32_t M,
+                                int32_t top_k, int32_t block_size,
+                                int32_t num_experts, int32_t* sorted_ids,
+                                int32_t* expert_ids, int32_t* out_EM) {
+  VK_CAPI_TRY
+  // The C++ (moe_align_block_size) does no contract checks of its own; the
+  // safe bindings validate shapes before calling. Guard the buffers here so
+  // a C consumer cannot dereference null. (M == 0 is a valid no-op that
+  // writes one all-padding block when num_experts > 0.)
+  if (block_size <= 0) throw std::invalid_argument("block_size must be positive");
+  if (num_experts < 0) throw std::invalid_argument("num_experts must be non-negative");
+  if (M < 0 || top_k < 0) throw std::invalid_argument("M and top_k must be non-negative");
+  if (out_EM == nullptr) throw std::invalid_argument("out_EM must not be null");
+  if (M > 0 && (topk_ids == nullptr || sorted_ids == nullptr || expert_ids == nullptr)) {
+    throw std::invalid_argument("topk_ids/sorted_ids/expert_ids must not be null");
+  }
+  const int32_t EM = vkernels::kernels::moe_align_block_size(
+      topk_ids, M, top_k, block_size, num_experts, sorted_ids, expert_ids);
+  *out_EM = EM;
   return VK_OK;
   VK_CAPI_CATCH_RETURN_CODE()
 }

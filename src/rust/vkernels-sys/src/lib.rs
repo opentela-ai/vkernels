@@ -109,6 +109,249 @@ extern "C" {
         c_len: usize,
     ) -> i32;
 
+    // -- kernels: gfx942 primitives (moe.hpp) -----------------------------
+    pub fn vk_direct_lds_fill_bf16(lds_dst: *mut c_void, global_src: *const c_void, elements: usize)
+        -> i32;
+    pub fn vk_fp4_to_bf16_dequant(
+        packed: *const u8,
+        packed_len: usize,
+        out: *mut u16,
+        out_len: usize,
+        scale: f32,
+    ) -> i32;
+    pub fn vk_use_async_copy_default() -> c_int;
+    pub fn vk_mfma_f32_16x16x16bf16(
+        c: *mut f32,
+        a: *const u32,
+        b: *const u32,
+        cbsz: c_int,
+        abid: c_int,
+        blgp: c_int,
+    ) -> i32;
+
+    // -- kernels: bf16 GEMM (gemm_bf16.hpp, issue #29) --------------------
+    pub fn vk_gemm_bf16(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: *const u16,
+        b: *const u16,
+        beta: f32,
+        c: *mut u16,
+    ) -> i32;
+    pub fn vk_gemm_bf16_config(m: usize, n: usize, k: usize, bm: *mut c_int, bn: *mut c_int, bk: *mut c_int, threads: *mut c_int);
+
+    // -- kernels: MLA (mla.hpp, issue #21) --------------------------------
+    pub fn vk_mla_fwd(
+        b: c_int,
+        h: c_int,
+        s_q: c_int,
+        s_kv: c_int,
+        q_start: c_int,
+        kv_start: c_int,
+        kv_lora_rank: c_int,
+        qk_rope_head_dim: c_int,
+        scale: f32,
+        q: *const f32,
+        k_c: *const f32,
+        k_pe: *const f32,
+        v_c: *const f32,
+        out: *mut f32,
+    ) -> i32;
+    pub fn vk_mla_config(
+        s_q: c_int,
+        kv_lora_rank: c_int,
+        qk_rope_head_dim: c_int,
+        bq: *mut c_int,
+        bn: *mut c_int,
+        threads: *mut c_int,
+    );
+
+    // -- kernels: KDA (kda.hpp, issue #21) --------------------------------
+    pub fn vk_kda_layer_norm_gated(
+        x: *const f32,
+        weight: *const f32,
+        gate: *const f32,
+        out: *mut f32,
+        n: c_int,
+        d: c_int,
+        eps: f32,
+    ) -> i32;
+    pub fn vk_kda_gate_chunk_cumsum(
+        g: *const f32,
+        intra_log: *mut f32,
+        inter_log: *mut f32,
+        b: c_int,
+        h: c_int,
+        n_chunks: c_int,
+        chunk_size: c_int,
+    ) -> i32;
+    pub fn vk_kda_naive_delta_rule_fwd(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        out: *mut f32,
+        b: c_int,
+        h: c_int,
+        s: c_int,
+        d: c_int,
+    ) -> i32;
+    pub fn vk_kda_delta_rule_fwd(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        out: *mut f32,
+        b: c_int,
+        h: c_int,
+        s: c_int,
+        d: c_int,
+        chunk_size: c_int,
+    ) -> i32;
+    pub fn vk_kda_delta_rule_intra(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        intra_log: *const f32,
+        inter_state: *const f32,
+        u: *mut f32,
+        b: c_int,
+        h: c_int,
+        s: c_int,
+        d: c_int,
+        chunk_size: c_int,
+        chunk_idx: c_int,
+    ) -> i32;
+    pub fn vk_kda_delta_rule_inter(
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        intra_log: *const f32,
+        u: *const f32,
+        inter_state: *mut f32,
+        b: c_int,
+        h: c_int,
+        s: c_int,
+        d: c_int,
+        chunk_size: c_int,
+        chunk_idx: c_int,
+    ) -> i32;
+    pub fn vk_kda_gla_fwd_o(
+        q: *const f32,
+        k: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        intra_log: *const f32,
+        inter_state: *const f32,
+        u: *const f32,
+        out: *mut f32,
+        b: c_int,
+        h: c_int,
+        s: c_int,
+        d: c_int,
+        chunk_size: c_int,
+    ) -> i32;
+    pub fn vk_kda_pack_bitmatrix(bits: *const u8, packed: *mut u8, n_bits: usize) -> i32;
+
+    // -- kernels: MoE orchestration (moe_aux.hpp, issue #22) --------------
+    pub fn vk_mxfp4_moe_quant(
+        a: *const u16,
+        packed: *mut u8,
+        scales: *mut u8,
+        m: c_int,
+        hidden: c_int,
+        group_size: c_int,
+    ) -> i32;
+    pub fn vk_mxfp4_moe_sort(
+        a: *const u16,
+        sorted_ids: *const i32,
+        a_sorted: *mut u16,
+        m: c_int,
+        hidden: c_int,
+        top_k: c_int,
+        em: c_int,
+    ) -> i32;
+    pub fn vk_mxfp4_moe_sort_scales(
+        scales: *const u8,
+        sorted_ids: *const i32,
+        scales_sorted: *mut u8,
+        m: c_int,
+        n_groups: c_int,
+        top_k: c_int,
+        em: c_int,
+    ) -> i32;
+    pub fn vk_mxfp4_moe_scatter_reduce(
+        partial: *const f32,
+        topk_w: *const f32,
+        sorted_ids: *const i32,
+        out: *mut f32,
+        m: c_int,
+        width: c_int,
+        top_k: c_int,
+        em: c_int,
+    ) -> i32;
+    pub fn vk_mxfp4_moe_scatter_reduce_q(
+        partial_q: *const u8,
+        partial_s: *const u8,
+        topk_w: *const f32,
+        sorted_ids: *const i32,
+        out: *mut f32,
+        m: c_int,
+        width: c_int,
+        top_k: c_int,
+        em: c_int,
+        group_size: c_int,
+    ) -> i32;
+
+    // -- kernels: fused MXFP4 MoE (moe_fused.hpp) -------------------------
+    pub fn vk_fused_moe_mxfp4(
+        a: *const u16,
+        w13: *const u8,
+        w13_scale: *const u8,
+        w2: *const u8,
+        w2_scale: *const u8,
+        sorted_ids: *const i32,
+        topk_w_sorted: *const f32,
+        expert_ids: *const i32,
+        act_scratch: *mut u16,
+        out: *mut f32,
+        m: c_int,
+        hidden: c_int,
+        ispp: c_int,
+        top_k: c_int,
+        em: c_int,
+        group_size: c_int,
+        swiglu_limit: f32,
+        activation: c_int,
+        beta: f32,
+        linear_beta: f32,
+        b13: *const f32,
+        b2: *const f32,
+    ) -> i32;
+    pub fn vk_moe_align_block_size(
+        topk_ids: *const i32,
+        m: c_int,
+        top_k: c_int,
+        block_size: c_int,
+        num_experts: c_int,
+        sorted_ids: *mut i32,
+        expert_ids: *mut i32,
+        out_em: *mut c_int,
+    ) -> i32;
+    pub fn vk_moe_align_block_size_max_em(
+        m: c_int,
+        top_k: c_int,
+        block_size: c_int,
+        num_experts: c_int,
+    ) -> usize;
+
     // -- core: device + stream ----------------------------------------------
     pub fn vk_device_new(index: c_int) -> *mut vk_device;
     pub fn vk_device_delete(d: *mut vk_device);
