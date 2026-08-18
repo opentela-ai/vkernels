@@ -82,6 +82,26 @@ if(VKERNELS_HAS_HIP)
       vkernels/kernels/mla.hip
       vkernels/kernels/kda.hip)
   set_target_properties(vkernels PROPERTIES HIP_SEPARABLE_COMPILATION ON)
+
+  # C ABI shared library: `extern "C"` entry points over the HIP compute
+  # kernels, for non-C++ consumers (vLLM, ctypes, torch.ops.load_library,
+  # Rust). The wrapper (capi/hip_capi.cpp) is the sole source; it links the
+  # static `vkernels` for the C++ host launchers (the device kernels are
+  # compiled there under VKERNELS_HAS_HIP). See capi/hip_capi.hpp.
+  #
+  # Built as a plain shared lib — no pybind11, no -fvisibility=hidden, no
+  # LTO. pybind11 v3.1.0 auto-enables -flto=auto (pybind11Common.cmake:
+  # 379-389) and HIP_SEPARABLE_COMPILATION propagates the same flag; both
+  # prune the extern "C" entry points from the final .so. -fno-lto on both
+  # compile and link keeps them (issue #43).
+  add_library(vkernels_hip SHARED vkernels/capi/hip_capi.cpp)
+  add_library(vkernels::vkernels_hip ALIAS vkernels_hip)
+  target_link_libraries(vkernels_hip PRIVATE vkernels)
+  target_include_directories(vkernels_hip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_features(vkernels_hip PRIVATE cxx_std_17)
+  target_compile_options(vkernels_hip PRIVATE -fno-lto)
+  target_link_options(vkernels_hip PRIVATE -fno-lto)
+  vkernels_set_warnings(vkernels_hip)
 endif()
 
 # RCCL transport (issue #19): compile the HIP/RCCL path only when a usable

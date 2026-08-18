@@ -9,7 +9,10 @@
 #include "minitest.hpp"
 
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "vkernels/capi/capi.hpp"
@@ -32,6 +35,54 @@ void overlap_comm(size_t, int value, void* ctx) {
   int* total = static_cast<int*>(ctx);
   *total += value;
 }
+
+// --- K3-family helpers (mirror tests/kernels/* independent refs) ------
+
+float bf16_to_f32(uint16_t b) {
+  uint32_t u = static_cast<uint32_t>(b) << 16;
+  float f;
+  std::memcpy(&f, &u, sizeof(float));
+  return f;
+}
+
+uint16_t f32_to_bf16(float f) {
+  uint32_t bits;
+  std::memcpy(&bits, &f, sizeof(float));
+  uint32_t lsb = (bits >> 16) & 1;
+  bits += 0x7FFFu + lsb;
+  return static_cast<uint16_t>(bits >> 16);
+}
+
+// E2M1 nibble → float (matches moe.cpp fp4_nibble_to_float).
+// Used by Fp4ToBf16DequantRoundTrip to validate the C ABI dequant
+// against the same nibble table.
+float e2m1_nibble_to_f32(uint8_t n) {
+  int s = (n >> 3) & 1, e = (n >> 1) & 3, m = n & 1;
+  if (e == 0) return m ? (s ? -0.25f : 0.25f) : 0.0f;
+  if (e == 3) return m ? std::nanf("") : (s ? -INFINITY : INFINITY);
+  float v = (1.0f + static_cast<float>(m) * 0.5f) *
+            static_cast<float>(1 << (e - 1));
+  return s ? -v : v;
+}
+
+// Nearest E2M1 nibble for a float value (matches test_moe_fused).
+uint8_t float_to_e2m1_nibble(float f) {
+  bool neg = f < 0;
+  float af = std::fabs(f);
+  if (af == 0.0f || std::isnan(af)) return neg ? 0x8 : 0x0;
+  if (std::isinf(af)) return neg ? 0xE : 0x6;
+  static const float vals[5] = {0.25f, 1.0f, 1.5f, 2.0f, 3.0f};
+  static const uint8_t nibs[5] = {1, 2, 3, 4, 5};
+  float best_d = std::fabs(af - vals[0]);
+  uint8_t best_n = nibs[0];
+  for (int i = 1; i < 5; ++i) {
+    float d = std::fabs(af - vals[i]);
+    if (d < best_d) { best_d = d; best_n = nibs[i]; }
+  }
+  return neg ? static_cast<uint8_t>(best_n | 0x8) : best_n;
+}
+
+float sigmoid_f(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 }  // namespace
 
@@ -500,4 +551,711 @@ TEST(Capi, MemcpyPeerBatchAsync) {
   EXPECT_EQ(dst[4], 3);
   EXPECT_EQ(dst[5], 4);
   vk_stream_delete(s);
+}
+
+// ===========================================================================
+// K3-family C ABI wrappers (added by the Rust-bindings commit).
+// These exercise every new vk_* entry point through the C ABI boundary,
+// mirroring the independent refs in tests/kernels/* so the coverage gate
+// (100% on the host build) is satisfied.
+// ===========================================================================
+
+// --- gfx942 primitives (moe.hpp) ------------------------------------------
+
+TEST(CapiGfx942, DirectLdsFillBf16) {
+  const uint16_t src[4] = {0x3C00, 0x4000, 0x4040, 0x4080};  // 1,2,3,4
+  uint16_t dst[4] = {0, 0, 0, 0};
+  EXPECT_EQ(vk_direct_lds_fill_bf16(dst, src, 4), VK_OK);
+  EXPECT_EQ(dst[0], 0x3C00);
+  EXPECT_EQ(dst[3], 0x4080);
+}
+
+TEST(CapiGfx942, DirectLdsFillBf16EmptyIsNoop) {
+  uint16_t dst[1] = {0xFFFF};
+  EXPECT_EQ(vk_direct_lds_fill_bf16(dst, nullptr, 0), VK_OK);
+  EXPECT_EQ(dst[0], 0xFFFF);  // untouched
+}
+
+TEST(CapiGfx942, DirectLdsFillBf16NullThrows) {
+  EXPECT_NE(vk_direct_lds_fill_bf16(nullptr, (const uint16_t*)"x", 1), VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+TEST(CapiGfx942, Fp4ToBf16Dequant) {
+  // Byte 0x12: low nibble 2 (1.0), high nibble 1 (0.25), scale=1
+  uint8_t packed[1] = {0x12};
+  uint16_t out[2];
+  EXPECT_EQ(vk_fp4_to_bf16_dequant(packed, 1, out, 2, 1.0f), VK_OK);
+  EXPECT_NEAR(bf16_to_f32(out[0]), e2m1_nibble_to_f32(2), 1e-2f);
+  EXPECT_NEAR(bf16_to_f32(out[1]), e2m1_nibble_to_f32(1), 1e-2f);
+}
+
+TEST(CapiGfx942, Fp4ToBf16DequantScale) {
+  // Byte 0x22: low nibble 2 (1.0), high nibble 2 (1.0), scale=2.0
+  uint8_t packed[1] = {0x22};
+  uint16_t out[2];
+  EXPECT_EQ(vk_fp4_to_bf16_dequant(packed, 1, out, 2, 2.0f), VK_OK);
+  EXPECT_NEAR(bf16_to_f32(out[0]), e2m1_nibble_to_f32(2) * 2.0f, 1e-1f);
+  EXPECT_NEAR(bf16_to_f32(out[1]), e2m1_nibble_to_f32(2) * 2.0f, 1e-1f);
+}
+
+TEST(CapiGfx942, Fp4ToBf16DequantRoundTrip) {
+  // Quantize known floats to E2M1 nibbles, pack, dequant via C ABI,
+  // and check the values match e2m1_nibble_to_f32.
+  float vals[4] = {0.25f, 1.0f, 1.5f, 3.0f};
+  uint8_t packed[2];
+  packed[0] = float_to_e2m1_nibble(vals[0]) |
+              (float_to_e2m1_nibble(vals[1]) << 4);
+  packed[1] = float_to_e2m1_nibble(vals[2]) |
+              (float_to_e2m1_nibble(vals[3]) << 4);
+  uint16_t out[4];
+  EXPECT_EQ(vk_fp4_to_bf16_dequant(packed, 2, out, 4, 1.0f), VK_OK);
+  for (int i = 0; i < 4; ++i)
+    EXPECT_NEAR(bf16_to_f32(out[i]), vals[i], 1e-2f);
+}
+
+TEST(CapiGfx942, Fp4ToBf16DequantLengthMismatch) {
+  uint8_t packed[1] = {0};
+  uint16_t out[3];  // should be 2
+  EXPECT_NE(vk_fp4_to_bf16_dequant(packed, 1, out, 3, 1.0f), VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+TEST(CapiGfx942, UseAsyncCopyDefault) {
+  int r = vk_use_async_copy_default();
+  EXPECT_TRUE(r == 0 || r == 1);
+}
+
+TEST(CapiGfx942, MfmaF32_16x16x16bf16) {
+  // Pack 1.0 and 2.0 into each uint32 (lo=1.0, hi=2.0)
+  uint32_t a[2] = {
+      static_cast<uint32_t>(f32_to_bf16(1.0f)) |
+          (static_cast<uint32_t>(f32_to_bf16(2.0f)) << 16),
+      static_cast<uint32_t>(f32_to_bf16(3.0f)) |
+          (static_cast<uint32_t>(f32_to_bf16(4.0f)) << 16)};
+  uint32_t b[2] = {
+      static_cast<uint32_t>(f32_to_bf16(1.0f)) |
+          (static_cast<uint32_t>(f32_to_bf16(1.0f)) << 16),
+      static_cast<uint32_t>(f32_to_bf16(1.0f)) |
+          (static_cast<uint32_t>(f32_to_bf16(1.0f)) << 16)};
+  float c[4] = {0, 0, 0, 0};
+  EXPECT_EQ(vk_mfma_f32_16x16x16bf16(c, a, b, 0, 0, 0), VK_OK);
+  // c[i] += a_f32[i] * b_f32[i] = a_f32[i] * 1.0
+  EXPECT_NEAR(c[0], 1.0f, 1e-5f);
+  EXPECT_NEAR(c[1], 2.0f, 1e-5f);
+  EXPECT_NEAR(c[2], 3.0f, 1e-5f);
+  EXPECT_NEAR(c[3], 4.0f, 1e-5f);
+}
+
+TEST(CapiGfx942, MfmaF32Accumulates) {
+  uint32_t a[2] = {
+      static_cast<uint32_t>(f32_to_bf16(1.0f)) |
+          (static_cast<uint32_t>(f32_to_bf16(1.0f)) << 16),
+      static_cast<uint32_t>(f32_to_bf16(1.0f)) |
+          (static_cast<uint32_t>(f32_to_bf16(1.0f)) << 16)};
+  uint32_t b[2] = {
+      static_cast<uint32_t>(f32_to_bf16(2.0f)) |
+          (static_cast<uint32_t>(f32_to_bf16(2.0f)) << 16),
+      static_cast<uint32_t>(f32_to_bf16(2.0f)) |
+          (static_cast<uint32_t>(f32_to_bf16(2.0f)) << 16)};
+  float c[4] = {10, 20, 30, 40};  // pre-existing, beta-style accumulate
+  EXPECT_EQ(vk_mfma_f32_16x16x16bf16(c, a, b, 0, 0, 0), VK_OK);
+  EXPECT_NEAR(c[0], 12.0f, 1e-5f);  // 10 + 1*2
+  EXPECT_NEAR(c[1], 22.0f, 1e-5f);
+  EXPECT_NEAR(c[2], 32.0f, 1e-5f);
+  EXPECT_NEAR(c[3], 42.0f, 1e-5f);
+}
+
+TEST(CapiGfx942, MfmaF32NullThrows) {
+  uint32_t a[2] = {0, 0}, b[2] = {0, 0};
+  EXPECT_NE(vk_mfma_f32_16x16x16bf16(nullptr, a, b, 0, 0, 0), VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+// --- bf16 GEMM (gemm_bf16.hpp, issue #29) ---------------------------------
+
+TEST(CapiGemmBf16, IdentityAlphaOneBetaZero) {
+  // A = [[1,2],[3,4]], B = identity, C should = A
+  uint16_t A[4] = {f32_to_bf16(1), f32_to_bf16(2), f32_to_bf16(3),
+                   f32_to_bf16(4)};
+  uint16_t B[4] = {f32_to_bf16(1), f32_to_bf16(0), f32_to_bf16(0),
+                   f32_to_bf16(1)};
+  uint16_t C[4] = {0, 0, 0, 0};
+  EXPECT_EQ(vk_gemm_bf16(2, 2, 2, 1.0f, A, B, 0.0f, C), VK_OK);
+  EXPECT_NEAR(bf16_to_f32(C[0]), 1.0f, 1e-2f);
+  EXPECT_NEAR(bf16_to_f32(C[1]), 2.0f, 1e-2f);
+  EXPECT_NEAR(bf16_to_f32(C[2]), 3.0f, 1e-2f);
+  EXPECT_NEAR(bf16_to_f32(C[3]), 4.0f, 1e-2f);
+}
+
+TEST(CapiGemmBf16, BetaAccumulation) {
+  // A=[[1]], B=[[1]], C starts at 10, alpha=2 beta=1 -> 2*1+10=12
+  uint16_t A[1] = {f32_to_bf16(1)};
+  uint16_t B[1] = {f32_to_bf16(1)};
+  uint16_t C[1] = {f32_to_bf16(10)};
+  EXPECT_EQ(vk_gemm_bf16(1, 1, 1, 2.0f, A, B, 1.0f, C), VK_OK);
+  EXPECT_NEAR(bf16_to_f32(C[0]), 12.0f, 1e-1f);
+}
+
+TEST(CapiGemmBf16, Config) {
+  int bm = 0, bn = 0, bk = 0, threads = 0;
+  vk_gemm_bf16_config(256, 7168, 33792, &bm, &bn, &bk, &threads);
+  EXPECT_GT(bm, 0);
+  EXPECT_GT(bn, 0);
+  EXPECT_GT(bk, 0);
+  EXPECT_GT(threads, 0);
+}
+
+// --- MLA forward (mla.hpp, issue #21) -------------------------------------
+
+TEST(CapiMla, HandCheckedTwoQuery) {
+  // B=1 H=1 S_q=2 S_kv=2, lr=2 rhd=2, scale=0.5
+  // Matches test_mla.cpp::MlaFwd::HandChecked
+  const float scale = 0.5f;
+  std::vector<float> q = {1, 0, 0, 0, 0, 1, 1, 0};
+  std::vector<float> k_c = {1, 0, 0, 1};
+  std::vector<float> k_pe = {0, 1, 1, 0};
+  std::vector<float> v_c = {1, 2, 3, 4};
+  std::vector<float> out(2 * 2, -1.0f);
+
+  EXPECT_EQ(vk_mla_fwd(1, 1, 2, 2, 0, 0, 2, 2, scale, q.data(),
+                        k_c.data(), k_pe.data(), v_c.data(), out.data()),
+            VK_OK);
+  // q0 attends only to kv0 (causal): score=0.5*(1*1+0*0+0*0+0*1)=0.5,
+  // softmax=1.0, out0 = 1*v_c[0..1] = [1,2]
+  EXPECT_NEAR(out[0], 1.0f, 1e-5f);
+  EXPECT_NEAR(out[1], 2.0f, 1e-5f);
+  // q1 attends to both kv0 and kv1; this is a known-good case from
+  // test_mla.cpp — just check no NaN and positive.
+  EXPECT_FALSE(std::isnan(out[2]));
+  EXPECT_FALSE(std::isnan(out[3]));
+}
+
+TEST(CapiMla, ConfigDecode) {
+  int bq = 0, bn = 0, threads = 0;
+  vk_mla_config(1, 512, 64, &bq, &bn, &threads);  // decode
+  EXPECT_GT(bq, 0);
+  EXPECT_GT(bn, 0);
+  EXPECT_GT(threads, 0);
+}
+
+TEST(CapiMla, ConfigPrefill) {
+  int bq = 0, bn = 0, threads = 0;
+  vk_mla_config(64, 512, 64, &bq, &bn, &threads);  // prefill
+  EXPECT_GT(bq, 0);
+  EXPECT_GT(bn, 0);
+  EXPECT_GT(threads, 0);
+}
+
+TEST(CapiMla, NullArgsThrow) {
+  EXPECT_NE(vk_mla_fwd(1, 1, 1, 1, 0, 0, 2, 2, 0.5f, nullptr, nullptr,
+                        nullptr, nullptr, nullptr),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+// --- KDA — Kimi Delta Attention (kda.hpp, issue #21) ----------------------
+
+TEST(CapiKda, LayerNormGatedIdentityWeightUnitGate) {
+  // weight=1, gate=5 -> silu(5)≈4.966, x all ones, rms=1 -> out≈4.966
+  constexpr int N = 1, D = 4;
+  std::vector<float> x(D, 1.0f), w(D, 1.0f), gate(D, 5.0f), out(D, -1);
+  EXPECT_EQ(vk_kda_layer_norm_gated(x.data(), w.data(), gate.data(),
+                                     out.data(), N, D, 1e-6f),
+            VK_OK);
+  const float silu5 = 5.0f * sigmoid_f(5.0f);
+  for (int d = 0; d < D; ++d) EXPECT_NEAR(out[d], silu5, 1e-4f);
+}
+
+TEST(CapiKda, LayerNormGatedZeroGate) {
+  // gate=0 -> silu(0)=0 -> output is zero
+  constexpr int N = 2, D = 3;
+  std::vector<float> x(N * D, 7.0f), w(D, 2.0f), gate(N * D, 0.0f),
+      out(N * D, -1);
+  EXPECT_EQ(vk_kda_layer_norm_gated(x.data(), w.data(), gate.data(),
+                                     out.data(), N, D, 1e-6f),
+            VK_OK);
+  for (float v : out) EXPECT_NEAR(v, 0.0f, 1e-6f);
+}
+
+TEST(CapiKda, GateChunkCumsum) {
+  constexpr int B = 1, H = 1, nc = 2, cs = 3;
+  std::vector<float> g(nc * cs, 0.5f);  // all 0.5
+  std::vector<float> intra(nc * cs), inter(nc);
+  EXPECT_EQ(vk_kda_gate_chunk_cumsum(g.data(), intra.data(), inter.data(),
+                                      B, H, nc, cs),
+            VK_OK);
+  // intra[c,t] = sum_{l<=t} log(0.5) = (t+1)*log(0.5)
+  float lg = std::log(0.5f);
+  for (int c = 0; c < nc; ++c)
+    for (int t = 0; t < cs; ++t)
+      EXPECT_NEAR(intra[c * cs + t], lg * (t + 1), 1e-5f);
+  // inter[0] = 0, inter[1] = intra[0, cs-1] = cs*log(0.5)
+  EXPECT_NEAR(inter[0], 0.0f, 1e-6f);
+  EXPECT_NEAR(inter[1], lg * cs, 1e-5f);
+}
+
+TEST(CapiKda, NaiveDeltaRuleFwd) {
+  // Simple case: B=1 H=1 S=2 D=2, q=k=v=ones, g=0.5, beta=0.5
+  constexpr int B = 1, H = 1, S = 2, D = 2;
+  std::vector<float> q(B * H * S * D, 1.0f), k(B * H * S * D, 1.0f),
+      v(B * H * S * D, 1.0f), g(B * H * S, 0.5f), beta(B * H * S, 0.5f),
+      out(B * H * S * D, 0.0f);
+  EXPECT_EQ(vk_kda_naive_delta_rule_fwd(q.data(), k.data(), v.data(),
+                                          g.data(), beta.data(), out.data(),
+                                          B, H, S, D),
+            VK_OK);
+  // First token: state = g0 * v0 * k0^T = 0.5 * [[1,1],[1,1]]
+  // o0 = state * q0 = 0.5 * [2, 2] = [1, 1]
+  EXPECT_NEAR(out[0], 1.0f, 1e-5f);
+  EXPECT_NEAR(out[1], 1.0f, 1e-5f);
+  EXPECT_FALSE(std::isnan(out[2]));
+  EXPECT_FALSE(std::isnan(out[3]));
+}
+
+TEST(CapiKda, DeltaRuleFwdMatchesNaive) {
+  // Cross-check chunked forward against the naive oracle
+  constexpr int B = 1, H = 1, S = 8, D = 4, chunk = 4;
+  std::vector<float> q(B * H * S * D), k(B * H * S * D), v(B * H * S * D),
+      g(B * H * S), beta(B * H * S);
+  for (int i = 0; i < B * H * S * D; ++i) {
+    q[i] = 0.1f * static_cast<float>((i * 7 + 1) % 17);
+    k[i] = 0.1f * static_cast<float>((i * 5 + 3) % 13);
+    v[i] = 0.1f * static_cast<float>((i * 3 + 7) % 11);
+  }
+  for (int i = 0; i < B * H * S; ++i) {
+    g[i] = 0.3f + 0.5f * static_cast<float>((i + 1) % 10) / 10.0f;
+    beta[i] = 0.3f + 0.4f * static_cast<float>((i + 2) % 7) / 7.0f;
+  }
+  std::vector<float> out_naive(B * H * S * D, 0), out_chunk(B * H * S * D, 0);
+  EXPECT_EQ(vk_kda_naive_delta_rule_fwd(q.data(), k.data(), v.data(),
+                                          g.data(), beta.data(),
+                                          out_naive.data(), B, H, S, D),
+            VK_OK);
+  EXPECT_EQ(vk_kda_delta_rule_fwd(q.data(), k.data(), v.data(), g.data(),
+                                   beta.data(), out_chunk.data(), B, H, S,
+                                   D, chunk),
+            VK_OK);
+  float max_abs = 0;
+  for (int i = 0; i < B * H * S * D; ++i)
+    max_abs = std::max(max_abs, std::fabs(out_naive[i] - out_chunk[i]));
+  EXPECT_LT(max_abs, 1e-4f);
+}
+
+TEST(CapiKda, DeltaRuleIntraInterOutput) {
+  // Exercise the chunked intra/inter/output combine pipeline
+  constexpr int B = 1, H = 1, S = 8, D = 4, chunk = 4;
+  constexpr int nc = S / chunk;
+  std::vector<float> q(B * H * S * D, 0.5f), k(B * H * S * D, 0.5f),
+      v(B * H * S * D, 0.5f), g(B * H * S, 0.8f), beta(B * H * S, 0.5f);
+  std::vector<float> intra(B * H * nc * chunk), inter(B * H * (nc + 1) * D * D,
+                                                       0.0f),
+      u(B * H * nc * chunk * D), out(B * H * S * D, 0.0f);
+
+  // gate cumsum
+  EXPECT_EQ(vk_kda_gate_chunk_cumsum(g.data(), intra.data(), inter.data(),
+                                      B, H, nc, chunk),
+            VK_OK);
+
+  // intra for each chunk
+  for (int c = 0; c < nc; ++c) {
+    EXPECT_EQ(vk_kda_delta_rule_intra(q.data(), k.data(), v.data(),
+                                       g.data(), beta.data(), intra.data(),
+                                       inter.data(), u.data(), B, H, S, D,
+                                       chunk, c),
+              VK_OK);
+    EXPECT_EQ(vk_kda_delta_rule_inter(k.data(), v.data(), g.data(),
+                                       beta.data(), intra.data(), u.data(),
+                                       inter.data(), B, H, S, D, chunk, c),
+              VK_OK);
+  }
+
+  // output combine
+  EXPECT_EQ(vk_kda_gla_fwd_o(q.data(), k.data(), g.data(), beta.data(),
+                              intra.data(), inter.data(), u.data(),
+                              out.data(), B, H, S, D, chunk),
+            VK_OK);
+
+  // Check no NaN and some non-zero
+  bool any_nonzero = false;
+  for (float v : out) {
+    EXPECT_FALSE(std::isnan(v));
+    if (v != 0.0f) any_nonzero = true;
+  }
+  EXPECT_TRUE(any_nonzero);
+}
+
+TEST(CapiKda, PackBitmatrix) {
+  // 8 bits -> 1 byte, MSB first: bit 0 -> bit 7, bit 7 -> bit 0
+  uint8_t bits[8] = {1, 0, 0, 0, 0, 0, 0, 0};  // only bit 0 set
+  uint8_t packed[1] = {0};
+  EXPECT_EQ(vk_kda_pack_bitmatrix(bits, packed, 8), VK_OK);
+  // bit 0 -> byte 0, bit 7-0%8 = bit 7
+  EXPECT_EQ(packed[0], 0x80);
+}
+
+TEST(CapiKda, PackBitmatrixMultipleBytes) {
+  // 12 bits: bits[0]=1, bits[8]=1 -> byte 0 = 0x80, byte 1 = 0x80
+  uint8_t bits[12] = {};
+  bits[0] = 1;
+  bits[8] = 1;
+  uint8_t packed[2] = {0, 0};
+  EXPECT_EQ(vk_kda_pack_bitmatrix(bits, packed, 12), VK_OK);
+  EXPECT_EQ(packed[0], 0x80);
+  EXPECT_EQ(packed[1], 0x80);
+}
+
+// --- MoE orchestration (moe_aux.hpp, issue #22) ---------------------------
+
+TEST(CapiMoeAux, Mxfp4QuantRoundTrip) {
+  // Mirror test_moe_aux::QuantRoundTrip: quantize a representative set,
+  // dequant via the same nibble table, and check each element is within
+  // one fp4 step of the input (the quantizer is nearest-value).
+  constexpr int M = 2, hidden = 32, gs = 32;
+  const float repr[] = {0.f, 0.25f, -0.25f, 1.f, -1.f, 1.5f,
+                        -1.5f, 2.f, -2.f, 3.f, -3.f, 0.7f,
+                        -0.7f, 2.3f, -2.3f, 0.125f};
+  std::vector<uint16_t> A(M * hidden);
+  for (size_t i = 0; i < A.size(); ++i)
+    A[i] = f32_to_bf16(repr[i % (sizeof(repr) / sizeof(repr[0]))]);
+  std::vector<uint8_t> packed(M * hidden / 2), scales(M);
+  EXPECT_EQ(vk_mxfp4_moe_quant(A.data(), packed.data(), scales.data(),
+                                M, hidden, gs),
+            VK_OK);
+  // Dequant each group and check proximity + sign preservation.
+  for (int m = 0; m < M; ++m) {
+    // ue8m0: s == 0xFF -> 0.0, else 2^(s - 127).
+    float sc = 0.0f;
+    uint32_t sb = static_cast<uint32_t>(scales[m]) << 23;
+    std::memcpy(&sc, &sb, sizeof(float));
+    for (int i = 0; i < hidden; ++i) {
+      uint8_t byte = packed[m * (hidden / 2) + i / 2];
+      uint8_t nib = (i & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
+      float d = e2m1_nibble_to_f32(nib) * sc;
+      float a = bf16_to_f32(A[m * hidden + i]);
+      EXPECT_TRUE(std::isfinite(d));
+      float step = (std::fabs(a) <= 0.25f) ? 0.25f : 0.5f;
+      EXPECT_NEAR(std::fabs(a), std::fabs(d), step + 1e-6f);
+      if (a != 0.0f) EXPECT_TRUE((a < 0) == (d < 0));
+    }
+  }
+}
+
+TEST(CapiMoeAux, Mxfp4QuantZeroGroup) {
+  constexpr int M = 2, hidden = 32, gs = 32;
+  std::vector<uint16_t> A(M * hidden, 0);  // all zero
+  std::vector<uint8_t> packed(M * hidden / 2), scales(M);
+  EXPECT_EQ(vk_mxfp4_moe_quant(A.data(), packed.data(), scales.data(),
+                                M, hidden, gs),
+            VK_OK);
+  for (uint8_t s : scales) EXPECT_EQ(s, 0xFF);
+  for (uint8_t b : packed) EXPECT_EQ(b, 0);
+}
+
+TEST(CapiMoeAux, Mxfp4QuantBadGroupSizeThrows) {
+  constexpr int M = 1, hidden = 30;  // not divisible by 32
+  std::vector<uint16_t> A(M * hidden, 0);
+  std::vector<uint8_t> p(M * hidden / 2), s(M);
+  EXPECT_NE(vk_mxfp4_moe_quant(A.data(), p.data(), s.data(), M, hidden,
+                                32),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+TEST(CapiMoeAux, Mxfp4Sort) {
+  // sorted_ids[r] is a FLAT index in [0, M*top_k); token = flat / top_k.
+  // Row r of A_sorted = A[token * hidden .. (token+1)*hidden] (or zero).
+  constexpr int M = 3, hidden = 4, top_k = 2;
+  std::vector<int32_t> sids = {2, 6, 1};  // flat0=tok1, flat1=pad, flat2=tok0
+  constexpr int EM = 3;
+  std::vector<uint16_t> A(M * hidden);
+  for (int i = 0; i < M; ++i)
+  for (int j = 0; j < hidden; ++j) A[i * hidden + j] = f32_to_bf16(i + 1);
+  std::vector<uint16_t> As(EM * hidden);
+  EXPECT_EQ(vk_mxfp4_moe_sort(A.data(), sids.data(), As.data(), M, hidden,
+                               top_k, EM),
+            VK_OK);
+  // r=0: flat=2, token=1 -> As[0..3] = A[4..7] = 2.0
+  EXPECT_NEAR(bf16_to_f32(As[0]), 2.0f, 1e-5f);
+  EXPECT_NEAR(bf16_to_f32(As[3]), 2.0f, 1e-5f);
+  // r=1: flat=6 >= 6 (M*top_k) -> padding, all zero
+  for (int j = 0; j < hidden; ++j)
+  EXPECT_EQ(As[hidden + j], static_cast<uint16_t>(0));
+  // r=2: flat=1, token=0 -> As[8..11] = A[0..3] = 1.0
+  EXPECT_NEAR(bf16_to_f32(As[2 * hidden + 0]), 1.0f, 1e-5f);
+  EXPECT_NEAR(bf16_to_f32(As[2 * hidden + 3]), 1.0f, 1e-5f);
+}
+
+TEST(CapiMoeAux, Mxfp4SortScales) {
+  // sorted_ids[r] flat in [0, M*top_k); token = flat / top_k.
+  constexpr int M = 2, n_groups = 3, top_k = 1, EM = 3;
+  std::vector<int32_t> sids = {1, 1, 2};  // row2 = padding (>= 2)
+  std::vector<uint8_t> scales = {100, 101, 102,   // token 0
+                                 110, 111, 112};  // token 1
+  std::vector<uint8_t> ss(EM * n_groups);
+  EXPECT_EQ(vk_mxfp4_moe_sort_scales(scales.data(), sids.data(),
+                                      ss.data(), M, n_groups, top_k, EM),
+            VK_OK);
+  // r=0,1: token=1 -> [110,111,112] both rows
+  EXPECT_EQ(ss[0], 110); EXPECT_EQ(ss[1], 111); EXPECT_EQ(ss[2], 112);
+  EXPECT_EQ(ss[3], 110); EXPECT_EQ(ss[4], 111); EXPECT_EQ(ss[5], 112);
+  // r=2: flat=2 >= 2 -> padding, all zero
+  for (int j = 0; j < n_groups; ++j) EXPECT_EQ(ss[2 * n_groups + j], 0);
+}
+
+TEST(CapiMoeAux, ScatterReduce) {
+  // Mirror test_moe_aux::ScatterReduce: out[token] += partial[r] * topk_w[r],
+  // token = sorted_ids[r] / top_k, padding rows (flat >= M*top_k) skipped.
+  constexpr int M = 3, width = 5, top_k = 2, EM = 4;
+  std::vector<int32_t> sids = {0, 1, 2, 6};  // r0,r1->tok0; r2->tok1; r3->pad
+  std::vector<float> partial = {1,2,3,4,5,   10,20,30,40,50,
+                                100,200,300,400,500,  9,9,9,9,9};
+  std::vector<float> w = {0.5f, 0.5f, 1.0f, 0.0f};
+  std::vector<float> out(M * width, 0.0f);
+  EXPECT_EQ(vk_mxfp4_moe_scatter_reduce(partial.data(), w.data(),
+                                         sids.data(), out.data(), M, width,
+                                         top_k, EM),
+            VK_OK);
+  // token0 = 0.5*[1..5] + 0.5*[10..50] = [5.5, 11, 16.5, 22, 27.5]
+  EXPECT_NEAR(out[0], 5.5f, 1e-5f);
+  EXPECT_NEAR(out[4], 27.5f, 1e-5f);
+  // token1 = 1.0*[100..500]
+  EXPECT_NEAR(out[5], 100.0f, 1e-5f);
+  EXPECT_NEAR(out[9], 500.0f, 1e-5f);
+  // token2 untouched (padding row skipped) -> 0
+  EXPECT_EQ(out[10], 0.0f);
+}
+
+TEST(CapiMoeAux, ScatterReduceQ) {
+  // Mirror test_moe_aux::ScatterReduceQ: quantize a fp4-representable
+  // partial, then scatter-reduce both the quantized (C ABI q path) and
+  // dequantized (float path) forms — they must agree bit-for-bit.
+  constexpr int M = 2, width = 32, top_k = 1, EM = 2, gs = 32;
+  std::vector<int32_t> ids = {0, 1};
+  const float repr[] = {0.f, 0.25f, -0.25f, 1.f, -1.f, 1.5f,
+                        2.f, 3.f};
+  std::vector<float> partial_f(EM * width);
+  for (size_t i = 0; i < partial_f.size(); ++i)
+    partial_f[i] = repr[i % (sizeof(repr) / sizeof(repr[0]))];
+  std::vector<float> w = {2.0f, 0.5f};
+
+  // Quantize the partial (one group per row).
+  std::vector<uint8_t> pq(EM * width / 2), ps(EM);
+  std::vector<uint16_t> bf16(EM * width);
+  for (size_t i = 0; i < bf16.size(); ++i) bf16[i] = f32_to_bf16(partial_f[i]);
+  EXPECT_EQ(vk_mxfp4_moe_quant(bf16.data(), pq.data(), ps.data(), EM,
+                                width, gs),
+            VK_OK);
+
+  std::vector<float> out_q(M * width, 0.0f);
+  EXPECT_EQ(vk_mxfp4_moe_scatter_reduce_q(pq.data(), ps.data(), w.data(),
+                                           ids.data(), out_q.data(), M,
+                                           width, top_k, EM, gs),
+            VK_OK);
+
+  // Dequant the quantized partial back to float and scatter-reduce it.
+  std::vector<float> out_f(M * width, 0.0f);
+  std::vector<uint16_t> dq(EM * width);
+  EXPECT_EQ(vk_fp4_to_bf16_dequant(pq.data(), EM * width / 2, dq.data(),
+                                    EM * width, 1.0f),
+            VK_OK);  // raw dequant (scale 1); re-scale per row below
+  // Re-implement dequant_act with the per-row scale (single group/row).
+  std::vector<float> dqf(EM * width);
+  for (int r = 0; r < EM; ++r) {
+    uint32_t sb = static_cast<uint32_t>(ps[r]) << 23;
+    float sc;
+    std::memcpy(&sc, &sb, sizeof(float));
+    for (int i = 0; i < width; ++i)
+      dqf[r * width + i] = bf16_to_f32(dq[r * width + i]) * sc;
+  }
+  // fp4 values are exactly representable so the two paths agree.
+  EXPECT_EQ(vk_mxfp4_moe_scatter_reduce(dqf.data(), w.data(), ids.data(),
+                                         out_f.data(), M, width, top_k, EM),
+            VK_OK);
+  for (size_t i = 0; i < out_q.size(); ++i) EXPECT_EQ(out_q[i], out_f[i]);
+}
+
+TEST(CapiMoeAux, ScatterReduceQNanInf) {
+  // fp4 nibble codes 6=+inf, 7=NaN, 14=-inf, 15=NaN propagate untouched.
+  constexpr int M = 1, width = 4, top_k = 1, EM = 1, gs = 4;
+  std::vector<uint8_t> pq = {0x76, 0xFE};
+  std::vector<uint8_t> ps = {127};  // scale 2^0 = 1.0
+  std::vector<int32_t> ids = {0};
+  std::vector<float> w = {1.0f};
+  std::vector<float> out(M * width, 0.0f);
+  EXPECT_EQ(vk_mxfp4_moe_scatter_reduce_q(pq.data(), ps.data(), w.data(),
+                                           ids.data(), out.data(), M, width,
+                                           top_k, EM, gs),
+            VK_OK);
+  EXPECT_EQ(out[0], std::numeric_limits<float>::infinity());
+  EXPECT_TRUE(std::isnan(out[1]));
+  EXPECT_EQ(out[2], -std::numeric_limits<float>::infinity());
+  EXPECT_TRUE(std::isnan(out[3]));
+}
+
+// --- fused MXFP4 MoE (moe_fused.hpp) + moe_align_block_size ---------------
+
+TEST(CapiMoeFused, AlignBlockSize) {
+  // M=4, top_k=2, block_size=16, E=4
+  constexpr int M = 4, top_k = 2, BLOCK = 16, E = 4;
+  int32_t max_EM = static_cast<int32_t>(
+      vk_moe_align_block_size_max_em(M, top_k, BLOCK, E));
+  ASSERT_TRUE(max_EM >= M * top_k);
+  std::vector<int32_t> topk_ids = {0, 1, 1, 2, 2, 3, 3, 0};
+  std::vector<int32_t> sids(max_EM), eids(max_EM / BLOCK), EM_out(1);
+  EXPECT_EQ(vk_moe_align_block_size(topk_ids.data(), M, top_k, BLOCK, E,
+                                     sids.data(), eids.data(), EM_out.data()),
+            VK_OK);
+  // EM should be M*top_k = 8 (no padding needed if < BLOCK)
+  // Actually EM is padded to multiple of block_size
+  EXPECT_GE(EM_out[0], M * top_k);
+  EXPECT_EQ(EM_out[0] % BLOCK, 0);
+}
+
+TEST(CapiMoeFused, AlignBlockSizeMaxEm) {
+  // Just verify it returns a positive value
+  size_t em = vk_moe_align_block_size_max_em(8, 2, 16, 4);
+  EXPECT_GT(em, 0u);
+}
+
+TEST(CapiMoeFused, AlignBlockSizeNullThrows) {
+  int32_t EM_out;
+  EXPECT_NE(vk_moe_align_block_size(nullptr, 1, 1, 16, 4, nullptr, nullptr,
+                                     &EM_out),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+TEST(CapiMoeFused, TinySanity) {
+  // All weights = 1.0, M=16, hidden=128, ispp=64, top_k=1, E=1
+  // gate = up = 128, act = silu(128)*128 ≈ 16384,
+  // out = act * 64 ≈ 1,048,576
+  constexpr int M = 16, hidden = 128, ispp = 64, top_k = 1, E = 1;
+  constexpr int BLOCK = 16, gs = 32;
+
+  std::vector<uint16_t> A(M * hidden, f32_to_bf16(1.0f));
+  // w13: [E, 2*ispp, hidden/2] = [1, 128, 64] uint8 (all 1.0 -> nibble 2)
+  std::vector<uint8_t> w13(E * 2 * ispp * (hidden / 2), 0x22);
+  // w13_scale: [E, 2*ispp, hidden/32] = [1, 128, 4] uint8 (all 0x7F = 1.0)
+  std::vector<uint8_t> w13s(E * 2 * ispp * (hidden / 32), 0x7F);
+  // w2: [E, hidden, ispp/2] = [1, 128, 32] uint8 (all 1.0 -> nibble 2)
+  std::vector<uint8_t> w2(E * hidden * (ispp / 2), 0x22);
+  // w2_scale: [E, hidden, ispp/32] = [1, 128, 4] uint8 (all 0x7F)
+  std::vector<uint8_t> w2s(E * hidden * (ispp / 32), 0x7F);
+
+  // routing: all tokens go to expert 0
+  std::vector<int32_t> topk_ids(M * top_k, 0);
+  std::vector<float> topk_w(M * top_k, 1.0f);
+
+  int32_t max_EM = static_cast<int32_t>(
+      vk_moe_align_block_size_max_em(M, top_k, BLOCK, E));
+  std::vector<int32_t> sids(max_EM), eids(max_EM / BLOCK), EM_out(1);
+  vk_moe_align_block_size(topk_ids.data(), M, top_k, BLOCK, E, sids.data(),
+                          eids.data(), EM_out.data());
+  int EM = EM_out[0];
+
+  std::vector<uint16_t> act_scratch(EM * ispp, 0);
+  std::vector<float> out(M * hidden, 0.0f);
+
+  EXPECT_EQ(vk_fused_moe_mxfp4(A.data(), w13.data(), w13s.data(), w2.data(),
+                                w2s.data(), sids.data(), topk_w.data(),
+                                eids.data(), act_scratch.data(), out.data(),
+                                M, hidden, ispp, top_k, EM, gs, 0.0f,
+                                0 /*SwiGLU*/, 0.0f, 0.0f, nullptr, nullptr),
+            VK_OK);
+
+  // All outputs should be the same (all weights=1, all inputs=1)
+  // and should be large positive (silu(128)*128*64 ≈ 1M)
+  EXPECT_FALSE(std::isnan(out[0]));
+  EXPECT_GT(out[0], 100000.0f);
+  for (int i = 1; i < M * hidden; ++i) {
+    EXPECT_FALSE(std::isnan(out[i]));
+    EXPECT_NEAR(out[i], out[0], std::fabs(out[0]) * 0.01f);
+  }
+}
+
+TEST(CapiMoeFused, SituActivation) {
+  // Mirror test_moe_fused::SiTU: A=1, w=1 (E2M1 byte 0x22), scale=127,
+  // activation=kSiTU(1), beta=4, linear_beta=25. gate=up=128, unclamped.
+  constexpr int M = 16, hidden = 128, ispp = 64, top_k = 1, E = 1;
+  constexpr int BLOCK = 16, gs = 32, EM = M;
+
+  std::vector<uint16_t> A(M * hidden, f32_to_bf16(1.0f));
+  uint8_t one_byte = static_cast<uint8_t>(
+      float_to_e2m1_nibble(1.0f) | (float_to_e2m1_nibble(1.0f) << 4));
+  std::vector<uint8_t> w13(E * 2 * ispp * (hidden / 2), one_byte);
+  std::vector<uint8_t> w13s(E * 2 * ispp * (hidden / gs), 127);
+  std::vector<uint8_t> w2(E * hidden * (ispp / 2), one_byte);
+  std::vector<uint8_t> w2s(E * hidden * (ispp / gs), 127);
+
+  std::vector<int32_t> sids(EM), eids(EM / BLOCK, 0);
+  for (int i = 0; i < EM; ++i) sids[i] = i;
+  std::vector<float> topk_w(EM, 1.0f);
+
+  std::vector<uint16_t> act_scratch(EM * ispp, 0);
+  std::vector<float> out(M * hidden, 0.0f);
+
+  EXPECT_EQ(vk_fused_moe_mxfp4(A.data(), w13.data(), w13s.data(), w2.data(),
+                                w2s.data(), sids.data(), topk_w.data(),
+                                eids.data(), act_scratch.data(), out.data(),
+                                M, hidden, ispp, top_k, EM, gs,
+                                1.0f /* clamp ignored */, 1 /*kSiTU*/,
+                                4.0f /*beta*/, 25.0f /*linear_beta*/,
+                                nullptr, nullptr),
+            VK_OK);
+
+  // situ_and_mul reference (vLLM): gate=up=128, unclamped.
+  const float gate = 128.0f, up = 128.0f;
+  const float sig = 1.0f / (1.0f + std::exp(-gate));
+  const float expected_act = (4.0f * std::tanh(gate / 4.0f) * sig) *
+                             (25.0f * std::tanh(up / 25.0f));
+  const float expected_out = expected_act * static_cast<float>(ispp);
+
+  float max_rel = 0.0f;
+  for (int i = 0; i < M * hidden; ++i) {
+    EXPECT_FALSE(std::isnan(out[i]));
+    float err = std::fabs(out[i] - expected_out);
+    if (expected_out != 0.0f) max_rel = std::max(max_rel, err / expected_out);
+  }
+  EXPECT_LT(max_rel, 1e-2f);
+}
+
+TEST(CapiMoeFused, NullBuffersThrow) {
+  // The vk_fused_moe_mxfp4 null-guard (M>0, EM>0) must raise
+  // VK_ERROR_INVALID_ARGUMENT when any primary buffer is null.
+  constexpr int M = 1, hidden = 8, ispp = 4, top_k = 1, EM = 1, gs = 8;
+  std::vector<uint8_t> w(1), ws(1);
+  std::vector<int32_t> sids(1, 0), eids(1, 0);
+  std::vector<float> tw(1, 1.0f);
+  std::vector<uint16_t> act(1, 0);
+  std::vector<float> out(M * hidden, 0.0f);
+  // A is null -> guard fires.
+  EXPECT_NE(vk_fused_moe_mxfp4(nullptr, w.data(), ws.data(), w.data(),
+                                ws.data(), sids.data(), tw.data(),
+                                eids.data(), act.data(), out.data(),
+                                M, hidden, ispp, top_k, EM, gs, 0.0f, 0,
+                                0.0f, 0.0f, nullptr, nullptr),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+  // w13 null -> guard fires.
+  std::vector<uint16_t> A(M * hidden, f32_to_bf16(1.0f));
+  EXPECT_NE(vk_fused_moe_mxfp4(A.data(), nullptr, ws.data(), w.data(),
+                                ws.data(), sids.data(), tw.data(),
+                                eids.data(), act.data(), out.data(),
+                                M, hidden, ispp, top_k, EM, gs, 0.0f, 0,
+                                0.0f, 0.0f, nullptr, nullptr),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+TEST(CapiMoeFused, EmptyIsNoop) {
+  // M=0 or EM=0 skips the null-guard (a no-op), returns VK_OK even with
+  // null buffers — matching the BLAS-style contract.
+  std::vector<float> out(1, 99.0f);
+  EXPECT_EQ(vk_fused_moe_mxfp4(nullptr, nullptr, nullptr, nullptr, nullptr,
+                                nullptr, nullptr, nullptr, nullptr, out.data(),
+                                0, 8, 4, 1, 0, 8, 0.0f, 0, 0.0f, 0.0f,
+                                nullptr, nullptr),
+            VK_OK);
+  EXPECT_EQ(out[0], 99.0f);  // untouched
 }
