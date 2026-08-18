@@ -20,6 +20,8 @@
 
 #include <cstdint>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 #include "vkernels/kernels/moe_fused.hpp"
 #include "vkernels/kernels/moe.hpp"
@@ -178,6 +180,40 @@ __device__ __forceinline__ void dequant_b_16cols(
   }
 }
 
+// Dequant a packed fp4 weight column slice → sB[kBK][16], K-MAJOR layout.
+// packed is [E, 2, hidden/2, ispp] and scale is [E, 2, hidden/kGroupSize,
+// ispp]: the N (column) dimension is the FAST, contiguous one, so the 16
+// columns owned by this block (lane % 16) read ONE coalesced 16-byte cache
+// line per (kp) instead of 16 scattered cache lines in the N-major layout
+// above (issue #41, item 4).  `stride_k` = ispp (the number of columns).
+__device__ __forceinline__ void dequant_b_16cols_kmajor(
+    uint16_t sB[kBK][16],
+    const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scale,
+    int k_start, int stride_k, int stride_scale_k, int lane) {
+  int n = lane % 16;
+  int kp_base = lane / 16;
+  constexpr int kPackedK = kBK/2, kKpStep = kWhreads/16;
+  constexpr int kBytesPerThread = (kPackedK * 16) / kWhreads;
+  int kp_off = k_start / 2;
+  int sc_off = k_start / kGroupSize;
+  for (int it = 0; it < kBytesPerThread; ++it) {
+    int kp = kp_base + it * kKpStep;
+    if (kp >= kPackedK) break;
+    uint8_t pb = packed[(kp_off + kp) * stride_k + n];
+    int gi = (kp * 2) / kGroupSize;
+    uint8_t sval = scale[(sc_off + gi) * stride_scale_k + n];
+    float s = ue8m0_decode(sval);
+    uint32_t flo = fp4nib_to_f32bits(pb & 0x0F);
+    float vlo; __builtin_memcpy(&vlo, &flo, sizeof(float));
+    vlo *= s; __builtin_memcpy(&flo, &vlo, sizeof(float));
+    sB[kp*2][n] = f32bits_to_bf16(flo);
+    uint32_t fhi = fp4nib_to_f32bits((pb>>4) & 0x0F);
+    float vhi; __builtin_memcpy(&vhi, &fhi, sizeof(float));
+    vhi *= s; __builtin_memcpy(&fhi, &vhi, sizeof(float));
+    sB[kp*2+1][n] = f32bits_to_bf16(fhi);
+  }
+}
+
 // Run the K=64 MFMA loop (4 steps of K=16), accumulating into acc.
 __device__ __forceinline__ void mfma_k64(
     v4f& acc, const uint16_t sA[kBM][kBK], const uint16_t sB[kBK][16],
@@ -316,7 +352,12 @@ __device__ __forceinline__ void mfma_k64_pf(
 // ======================================================================
 //  Stage 0: gate_up GEMM + SwiGLU → act [EM, ispp] bf16
 // ======================================================================
-__global__ void gateup_swiglu_kernel(
+// kKM selects the B-weight packing: N-major [E,2,ispp,hidden/2] (default,
+// stride hidden/2 per column, scattered reads) or K-major
+// [E,2,hidden/2,ispp] (issue #41, item 4, coalesced 16-byte column reads).
+template <bool kKM = false>
+__global__ __launch_bounds__(kWhreads, 10)
+void gateup_swiglu_kernel(
     const uint16_t* __restrict__ A,
     const uint8_t*  __restrict__ w13,
     const uint8_t*  __restrict__ w13_scale,
@@ -337,19 +378,29 @@ __global__ void gateup_swiglu_kernel(
   if (expert < 0) return;
 
   int tk_base = pid_m * kBM;
-  int w13_bytes = 2 * ispp * (hidden / 2);
-  int w13s_bytes = 2 * ispp * (hidden / kGroupSize);
   int lane = threadIdx.x;
   int n_global = pid_n * kBN + warp_n * 16;
 
-  const uint8_t* bp_gate = w13 + expert * w13_bytes
-      + n_global * (hidden / 2);
-  const uint8_t* sc_gate = w13_scale + expert * w13s_bytes
-      + n_global * (hidden / kGroupSize);
-  const uint8_t* bp_up = w13 + expert * w13_bytes
-      + (n_global + ispp) * (hidden / 2);
-  const uint8_t* sc_up = w13_scale + expert * w13s_bytes
-      + (n_global + ispp) * (hidden / kGroupSize);
+  const uint8_t* bp_gate;
+  const uint8_t* sc_gate;
+  const uint8_t* bp_up;
+  const uint8_t* sc_up;
+  if constexpr (kKM) {
+    // K-major [E,2,hidden/2,ispp]: gate/up are dim-1, N is fast/contiguous.
+    int slab = (hidden / 2) * ispp;
+    int slab_s = (hidden / kGroupSize) * ispp;
+    bp_gate = w13 + (size_t)(expert * 2 + 0) * slab + n_global;
+    sc_gate = w13_scale + (size_t)(expert * 2 + 0) * slab_s + n_global;
+    bp_up   = w13 + (size_t)(expert * 2 + 1) * slab + n_global;
+    sc_up   = w13_scale + (size_t)(expert * 2 + 1) * slab_s + n_global;
+  } else {
+    int w13_bytes = 2 * ispp * (hidden / 2);
+    int w13s_bytes = 2 * ispp * (hidden / kGroupSize);
+    bp_gate = w13 + expert * w13_bytes + n_global * (hidden / 2);
+    sc_gate = w13_scale + expert * w13s_bytes + n_global * (hidden / kGroupSize);
+    bp_up   = w13 + expert * w13_bytes + (n_global + ispp) * (hidden / 2);
+    sc_up   = w13_scale + expert * w13s_bytes + (n_global + ispp) * (hidden / kGroupSize);
+  }
 
   v4f acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
   v4f acc_u = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -359,10 +410,15 @@ __global__ void gateup_swiglu_kernel(
     // sA load and sB dequant write different LDS buffers, so no barrier is
     // needed between them; the barrier before MFMA orders both.
     load_a_tile(sA, A, sorted_ids, tk_base, ks, hidden, M, top_k, lane);
-    dequant_b_16cols(sB_gate, bp_gate, sc_gate, ks,
-                     hidden / 2, hidden / kGroupSize, lane);
-    dequant_b_16cols(sB_up, bp_up, sc_up, ks,
-                     hidden / 2, hidden / kGroupSize, lane);
+    if constexpr (kKM) {
+      dequant_b_16cols_kmajor(sB_gate, bp_gate, sc_gate, ks, ispp, ispp, lane);
+      dequant_b_16cols_kmajor(sB_up,   bp_up,   sc_up,   ks, ispp, ispp, lane);
+    } else {
+      dequant_b_16cols(sB_gate, bp_gate, sc_gate, ks,
+                       hidden / 2, hidden / kGroupSize, lane);
+      dequant_b_16cols(sB_up, bp_up, sc_up, ks,
+                       hidden / 2, hidden / kGroupSize, lane);
+    }
     __syncthreads();
 
     mfma_k64(acc_g, sA, sB_gate, lane);
@@ -393,7 +449,8 @@ __global__ void gateup_swiglu_kernel(
 // ======================================================================
 //  Stage 1: down GEMM + routed combine → out
 // ======================================================================
-__global__ void down_combine_kernel(
+__global__ __launch_bounds__(kWhreads, 16)
+void down_combine_kernel(
     const uint16_t* __restrict__ act,
     const uint8_t*  __restrict__ w2,
     const uint8_t*  __restrict__ w2_scale,
@@ -445,7 +502,7 @@ __global__ void down_combine_kernel(
       float v = acc[i];
       if (has_bias)
         v += b2[(size_t)expert*hidden + n_global + col];
-      v *= topk_ws[tk_base + row_base + i];
+      v *= topk_ws[flat];
       int oc = n_global + col;
       if (oc < hidden)
         atomicAdd(&out[(size_t)token * hidden + oc], v);
@@ -459,7 +516,8 @@ __global__ void down_combine_kernel(
 //  caller must align with block_size=64).
 // ======================================================================
 template <int kBN>
-__global__ void gateup_swiglu_kernel_prefill(
+__global__ __launch_bounds__(kThreads_pf, 4)
+void gateup_swiglu_kernel_prefill(
     const uint16_t* __restrict__ A,
     const uint8_t*  __restrict__ w13,
     const uint8_t*  __restrict__ w13_scale,
@@ -545,7 +603,8 @@ __global__ void gateup_swiglu_kernel_prefill(
 //  Prefill: Stage 1 — down GEMM + routed combine → out (BM=64, BN=64)
 // ======================================================================
 template <int kBN>
-__global__ void down_combine_kernel_prefill(
+__global__ __launch_bounds__(kThreads_pf, 4)
+void down_combine_kernel_prefill(
     const uint16_t* __restrict__ act,
     const uint8_t*  __restrict__ w2,
     const uint8_t*  __restrict__ w2_scale,
@@ -603,7 +662,7 @@ __global__ void down_combine_kernel_prefill(
         float v = acc[nf][i];
         if (has_bias)
           v += b2[(size_t)expert * hidden + n_global + nf * 16 + col];
-        v *= topk_ws[tk_base + row_base + i];
+        v *= topk_ws[flat];
         int oc = n_global + nf * 16 + col;
         if (oc < hidden)
           atomicAdd(&out[(size_t)token * hidden + oc], v);
@@ -615,16 +674,10 @@ __global__ void down_combine_kernel_prefill(
 // ======================================================================
 //  Gather topk weights into sorted order
 // ======================================================================
-__global__ void gather_weights_kernel(
-    float* __restrict__ sw, const float* __restrict__ tw,
-    const int32_t* __restrict__ sid, int n, int nflat) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) {
-    int f = sid[i];
-    sw[i] = (f >= 0 && f < nflat) ? tw[f] : 0.0f;
-  }
-}
-
+// The former `gather_weights_kernel` (reorder topk_w → sorted_w[EM]) has
+// been removed: the down-combine epilogue reads `topk_w[flat]` directly,
+// so no separate sorted_w buffer or gather launch is needed (issue #41,
+// items 1 + 2).
 // ======================================================================
 //  Host launcher
 // ======================================================================
@@ -635,62 +688,89 @@ void fused_moe_mxfp4(
     const int32_t*  topk_ids,
     const float*    topk_w,
     uint16_t*       act_scratch,
-    float*          sorted_w_scratch,
     float*          out,
     int M, int hidden, int ispp, int top_k,
     const int32_t* sorted_ids, const int32_t* expert_ids,
     int EM, float swiglu_limit,
     int activation, float beta, float linear_beta,
-    const float* b13, const float* b2, int block_size) {
+    const float* b13, const float* b2, int block_size, bool kmajor) {
 
-  // `sorted_w_scratch` is a caller-provided, persistent EM-float buffer for
-  // the gathered routing weights (issue #41, item 1).  Reusing it across
-  // forward passes — as the xkernels Triton kernel and the AITER CK
-  // workspace do — eliminates the per-call hipMalloc/hipFree that cost 122
-  // allocator round-trips per generated token on a 61-layer model.  The
-  // launcher therefore performs no device allocation of its own.
-  float* sorted_w = sorted_w_scratch;
-  {
-    int nb = (EM + 255) / 256;
-    gather_weights_kernel<<<nb, 256>>>(sorted_w, topk_w, sorted_ids, EM, M * top_k);
-  }
+  // The combine epilogue reads `topk_w[flat]` directly (where
+  // `flat = sorted_ids[...]` is already guarded by `flat < M*top_k`),
+  // so no separate `sorted_w` buffer or gather kernel is needed: the
+  // launcher performs no device allocation of its own and launches one
+  // fewer kernel per forward (issue #41, items 1 + 2).
+  //
+  // Optional per-kernel timing (VK_MOE_KTIME=1) emits gateup/down
+  // elapsed microseconds to stderr.  The hipEventSynchronize after each
+  // launch serialises the two stages, so the bench's end-to-end timing is
+  // only meaningful when this env var is unset.
+  const bool ktime = (std::getenv("VK_MOE_KTIME") != nullptr);
+  hipEvent_t ks = nullptr, ke = nullptr;
+  if (ktime) { hipEventCreate(&ks); hipEventCreate(&ke); }
+#define VK_TBEGIN() do { if (ktime) hipEventRecord(ks); } while (0)
+#define VK_TEND(name) do {                                                     \
+    if (ktime) {                                                               \
+      hipEventRecord(ke);                                                      \
+      hipEventSynchronize(ke);                                                 \
+      float ms = 0.f; hipEventElapsedTime(&ms, ks, ke);                        \
+      std::fprintf(stderr, "[ktime] %-8s %8.3f us\n", name, ms * 1000.f);      \
+    }                                                                          \
+  } while (0)
 
   if (block_size >= kBM_pf) {
     // Prefill regime: 64x64 tiles, 256 threads.  The caller must have
     // aligned expert_ids per 64-row block (EM % 64 == 0).
     {
       dim3 g(EM / kBM_pf, ispp / kBN_pf);
+      VK_TBEGIN();
       gateup_swiglu_kernel_prefill<kBN_pf><<<g, kThreads_pf>>>(
           A, w13, w13_scale, b13, act_scratch,
           sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
           activation, beta, linear_beta, b13 != nullptr);
+      VK_TEND("gateup");
     }
     {
       dim3 g(EM / kBM_pf, hidden / kBN_pf);
+      VK_TBEGIN();
       down_combine_kernel_prefill<kBN_pf><<<g, kThreads_pf>>>(
-          act_scratch, w2, w2_scale, b2, out, sorted_w,
+          act_scratch, w2, w2_scale, b2, out, topk_w,
           sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
+      VK_TEND("down");
     }
   } else {
     // Decode regime: 16x64 tiles, 64 threads (1 wavefront), blockIdx.z
     // splits the N dimension into 4 warps of 16 columns.
     {
       dim3 g(EM / kBM, ispp / kBN, kWarps);
-      gateup_swiglu_kernel<<<g, kWhreads>>>(
-          A, w13, w13_scale, b13, act_scratch,
-          sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
-          activation, beta, linear_beta, b13 != nullptr);
+      VK_TBEGIN();
+      if (kmajor)
+        gateup_swiglu_kernel<true><<<g, kWhreads>>>(
+            A, w13, w13_scale, b13, act_scratch,
+            sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
+            activation, beta, linear_beta, b13 != nullptr);
+      else
+        gateup_swiglu_kernel<false><<<g, kWhreads>>>(
+            A, w13, w13_scale, b13, act_scratch,
+            sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
+            activation, beta, linear_beta, b13 != nullptr);
+      VK_TEND("gateup");
     }
     {
       dim3 g(EM / kBM, hidden / kBN, kWarps);
+      VK_TBEGIN();
       down_combine_kernel<<<g, kWhreads>>>(
-          act_scratch, w2, w2_scale, b2, out, sorted_w,
+          act_scratch, w2, w2_scale, b2, out, topk_w,
           sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
+      VK_TEND("down");
     }
   }
+#undef VK_TBEGIN
+#undef VK_TEND
+  if (ktime) { hipEventDestroy(ks); hipEventDestroy(ke); }
 
-  // No hipFree(sorted_w): the caller owns `sorted_w_scratch` and reuses it
-  // across forward passes (see the comment at the top of this function).
+  // No device allocation is performed or freed by this launcher; the
+  // caller owns `act_scratch` and reuses it across forward passes.
 }
 
 // ======================================================================

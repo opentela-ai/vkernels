@@ -273,23 +273,31 @@ void moe_combine(
 #if VKERNELS_HAS_HIP
 namespace vkernels::kernels::hip {
 
-// Same interface as the CPU reference, but the topk_w here is the RAW
-// [M, top_k] matrix: the HIP host launcher gathers into sorted order
-// internally via `gather_weights_kernel`, writing the sorted routing
-// weights into `sorted_w_scratch`.
+// Same interface as the CPU reference.  The HIP host launcher takes the
+// RAW [M, top_k] routing-weight matrix directly: the down-combine epilogue
+// reads `topk_w[flat]` (where `flat = sorted_ids[...]` is already guarded
+// by `flat < M*top_k`), so no separate `sorted_w` gather buffer or
+// `gather_weights_kernel` is needed.  This removes one kernel launch and
+// one per-call device allocation per forward (issue #41, items 1 + 2).
 //
-// `act_scratch` [EM, ispp] bf16 and `sorted_w_scratch` [EM] float are BOTH
-// caller-provided, persistent scratch buffers (issue #41, item 1).  The
-// launcher performs no device allocation of its own: a backend serving a
-// 61-layer model allocates these once and reuses them across every forward
-// pass, instead of paying 122 allocator round-trips per generated token.
-// `sorted_w_scratch` must hold at least `EM` float32 elements.
+// `act_scratch` [EM, ispp] bf16 is a caller-provided, persistent scratch
+// buffer (issue #41, item 1).  The launcher performs no device allocation
+// of its own: a backend serving a 61-layer model allocates this once and
+// reuses it across every forward pass, instead of paying 122 allocator
+// round-trips per generated token.
 //
 // block_size selects the tile config:
 //   16  — decode regime (16x64 tiles, 64 threads); sorted_ids/expert_ids
 //         must be aligned with block_size=16.
 //   64  — prefill regime (64x64 tiles, 256 threads); the caller must align
 //         with block_size=64 (EM % 64 == 0, expert_ids per 64-row block).
+//
+// kmajor (decode only, issue #41 item 4): when true, the stage-0 gate/up
+// weights must be packed K-major as [E,2,hidden/2,ispp] (and scales as
+// [E,2,hidden/kGroupSize,ispp]) instead of the default N-major
+// [E,2,ispp,hidden/2].  The 16 columns owned by each block then read one
+// coalesced cache line per K-step rather than 16 scattered lines, which
+// cuts the dominant decode latency at low concurrency.
 
 void fused_moe_mxfp4(
     const uint16_t* A,
@@ -300,7 +308,6 @@ void fused_moe_mxfp4(
     const int32_t*  topk_ids,
     const float*    topk_w,
     uint16_t*       act_scratch,
-    float*          sorted_w_scratch,
     float*          out,
     int M, int hidden, int ispp, int top_k,
     const int32_t* sorted_ids,
@@ -312,7 +319,8 @@ void fused_moe_mxfp4(
     float linear_beta = 25.0f,
     const float* b13 = nullptr,
     const float* b2 = nullptr,
-    int block_size = 16);
+    int block_size = 16,
+    bool kmajor = false);
 
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP

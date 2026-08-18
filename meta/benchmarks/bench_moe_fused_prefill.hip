@@ -65,7 +65,7 @@ struct BenchResult { double median_us; };
 
 static BenchResult bench_kernel_us(const std::function<void()>& launch,
                                    hipEvent_t start, hipEvent_t stop,
-                                   int warmup = 5, int iters = 20) {
+                                   int warmup = 200, int iters = 100) {
   (void)hipDeviceSynchronize();
   for (int i = 0; i < warmup; ++i) launch();
   (void)hipDeviceSynchronize();
@@ -138,6 +138,48 @@ int main(int argc, char** argv) {
   hipEventCreate(&start); hipEventCreate(&stop);
 
   const int Ms[] = {128, 256, 512, 1024, 2048};
+
+  // Heavy GPU clock warmup (issue #41): run the largest-M prefill kernel
+  // (BM=64) a bounded number of times (32 x ~2 ms at M=2048 = ~64 ms) with
+  // a single hipDeviceSynchronize so the MI300A SM clock reaches maximum
+  // before any timing below.  A wall-clock loop is avoided because it
+  // floods the launch queue and leaves a multi-second sync tail.  See
+  // bench_moe_fused for rationale.
+  {
+    int wm = Ms[sizeof(Ms) / sizeof(Ms[0]) - 1];
+    int wn = wm * top_k;
+    std::vector<int32_t> wt(wn), ws(wn + E * 64), we((wn + E * 64) / 64);
+    for (int i = 0; i < wn; ++i) wt[i] = (i + 3) % E;
+    int wem = vkernels::kernels::moe_align_block_size(
+        wt.data(), wm, top_k, 64, E, ws.data(), we.data());
+    uint16_t *wA, *wAct; float *wO, *wTw; int32_t *wT, *wS, *wE2;
+    CK(hipMalloc(&wA, wm * hidden * 2), "wa");
+    CK(hipMalloc(&wAct, wem * ispp * 2), "wact");
+    CK(hipMalloc(&wO, wm * hidden * 4), "wo");
+    CK(hipMalloc(&wTw, wn * 4), "wtw");
+    CK(hipMalloc(&wT, wn * 4), "wt");
+    CK(hipMalloc(&wS, wem * 4), "ws");
+    CK(hipMalloc(&wE2, (wem / 64) * 4), "we2");
+    CK(hipMemcpy(wS, ws.data(), wem * 4, hipMemcpyHostToDevice), "cpws");
+    CK(hipMemcpy(wE2, we.data(), (wem / 64) * 4, hipMemcpyHostToDevice), "cpwe");
+    CK(hipMemcpy(wT, wt.data(), wn * 4, hipMemcpyHostToDevice), "cpwt");
+    CK(hipMemset(wA, 0, wm * hidden * 2), "za");
+    CK(hipMemset(wAct, 127, wem * ispp * 2), "zact");
+    CK(hipMemset(wO, 0, wm * hidden * 4), "zo");
+    CK(hipMemset(wTw, 0x3c, wn * 4), "ztw");
+    auto wlaunch = [&]() {
+      vkernels::kernels::hip::fused_moe_mxfp4(
+          wA, dw13, dw13s, dw2, dw2s, wT, wTw, wAct, wO,
+          wm, hidden, ispp, top_k, wS, wE2, wem, LIMIT, activation, beta,
+          linear_beta, db13, db2, 64);
+    };
+    for (int i = 0; i < 32; ++i) wlaunch();
+    CK(hipDeviceSynchronize(), "wsync");
+    CK(hipFree(wA), "fa"); CK(hipFree(wAct), "fact"); CK(hipFree(wO), "fo");
+    CK(hipFree(wTw), "ftw"); CK(hipFree(wT), "ft"); CK(hipFree(wS), "fs");
+    CK(hipFree(wE2), "fe2");
+  }
+
   std::printf("E=%d hidden=%d ispp=%d top_k=%d activation=%s\n", E, hidden, ispp,
               top_k, situ ? "situ" : "swiglu");
   std::printf("%6s %8s | %10s %10s | %10s %10s | %6s\n",
@@ -163,11 +205,10 @@ int main(int argc, char** argv) {
           h_tids.data(), M, top_k, block_size, E, h_sids.data(), h_eids.data());
 
       uint16_t *dA, *dAct;
-      float *dOut, *dTw, *dSw;
+      float *dOut, *dTw;
       int32_t *dTids, *dSids, *dEids;
       CK(hipMalloc(&dA, M * hidden * 2), "A");
       CK(hipMalloc(&dAct, EM * ispp * 2), "act");
-      CK(hipMalloc(&dSw, EM * 4), "sw");
       CK(hipMalloc(&dOut, M * hidden * 4), "out");
       CK(hipMalloc(&dTw, N * 4), "tw");
       CK(hipMalloc(&dTids, N * 4), "tids");
@@ -182,7 +223,7 @@ int main(int argc, char** argv) {
 
       auto launch = [&]() {
         vkernels::kernels::hip::fused_moe_mxfp4(
-            dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dSw, dOut,
+            dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
             M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
             linear_beta, db13, db2, block_size);
       };
@@ -221,7 +262,7 @@ int main(int argc, char** argv) {
       out_us = r.median_us;
       out_tf = (6.0 * M * (double)ispp * hidden) / (r.median_us / 1e6) / 1e12;
 
-      hipFree(dA); hipFree(dAct); hipFree(dSw); hipFree(dOut);
+      hipFree(dA); hipFree(dAct); hipFree(dOut);
       hipFree(dTw); hipFree(dTids); hipFree(dSids); hipFree(dEids);
     };
 

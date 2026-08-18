@@ -142,7 +142,7 @@ bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E,
   // --- Device ---
   uint16_t *dA, *dAct;
   uint8_t *dw13, *dw13s, *dw2, *dw2s;
-  float *dOut, *dTw, *db13, *db2, *dSw;
+  float *dOut, *dTw, *db13, *db2;
   int32_t *dTids, *dSids, *dEids;
   CK(hipMalloc(&dA, M * hidden * 2), "A");
   CK(hipMalloc(&dw13, w13_sz), "w13");
@@ -152,7 +152,6 @@ bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E,
   CK(hipMalloc(&db13, E * 2 * ispp * 4), "b13");
   CK(hipMalloc(&db2, E * hidden * 4), "b2");
   CK(hipMalloc(&dAct, EM_gpu * ispp * 2), "act");
-  CK(hipMalloc(&dSw, EM_gpu * 4), "sw");
   CK(hipMalloc(&dOut, M * hidden * 4), "out");
   CK(hipMalloc(&dTw, N * 4), "tw");
   CK(hipMalloc(&dTids, N * 4), "tids");
@@ -173,7 +172,7 @@ bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E,
   CK(hipMemset(dOut, 0, M * hidden * 4), "zOut");
 
   vkernels::kernels::hip::fused_moe_mxfp4(
-      dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dSw, dOut,
+      dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
       M, hidden, ispp, top_k, dSids, dEids, EM_gpu, LIMIT, activation, 4.0f,
       25.0f, db13, db2,
       GPU_BLOCK_M);
@@ -194,7 +193,7 @@ bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E,
   std::printf("  OUT max_rel=%.6f %s\n", max_rel, max_rel < 0.02 ? "PASS" : "FAIL");
 
   hipFree(dA); hipFree(dw13); hipFree(dw13s); hipFree(dw2); hipFree(dw2s);
-  hipFree(db13); hipFree(db2); hipFree(dAct); hipFree(dSw); hipFree(dOut);
+  hipFree(db13); hipFree(db2); hipFree(dAct); hipFree(dOut);
   hipFree(dTw); hipFree(dTids); hipFree(dSids); hipFree(dEids);
   return max_rel < 0.02;
 }
