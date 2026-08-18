@@ -101,6 +101,8 @@ s.wait();
 
 ### `vkernels::kernels`
 
+#### Element-wise, reduction, GEMM
+
 | Function | Semantics | Notes |
 |---|---|---|
 | `add(a, b, out) -> Result<()>` | `out = a + b` | `a.len() == b.len() == out.len()` |
@@ -113,6 +115,94 @@ s.wait();
 Buffers are `&[f32]` / `&mut [f32]`; `out` is always written in place (never
 silently copied). Contract violations return
 `Err(Error::InvalidArgument)`.
+
+#### bf16 helpers (`kernels::bf16`)
+
+There is no `half` crate dependency: all bf16 / MXFP4 APIs below take and
+return raw `u16` bit patterns. Convert to/from `f32` with
+[`kernels::bf16`](https://docs.rs/vkernels/latest/vkernels/kernels/bf16/index.html):
+
+| Function | Semantics |
+|---|---|
+| `bf16::to_f32(bits: u16) -> f32` | lossless zero-extend |
+| `bf16::from_f32(v: f32) -> u16` | round to nearest-even (mirrors `float_to_bf16`) |
+| `bf16::to_f32_slice(bits) -> Vec<f32>` | vectorised `to_f32` |
+| `bf16::from_f32_slice(v) -> Vec<u16>` | vectorised `from_f32` |
+
+#### gfx942 primitives
+
+| Function | Semantics | Notes |
+|---|---|---|
+| `use_async_copy_default() -> bool` | host: `false` if `K3_NO_ASYNC=1` | reads the env once |
+| `mfma_f32_16x16x16bf16(c, a, b)` | 16×16×16 MFMA, `c:&mut [f32;4]`, `a,b:&[u32;2]` | `a`/`b` are 2×bf16 packed in a `u32` |
+| `fp4_to_bf16_dequant(packed, out, scale) -> Result<()>` | E2M1 → bf16 dequant | `out.len() == 2*packed.len()` |
+| `unsafe direct_lds_fill_bf16(lds, m, n, lda, rs)` | raw `void*` memcpy | caller guarantees `lds`/`rs` validity |
+
+#### bf16 GEMM & MLA attention
+
+| Function | Semantics | Notes |
+|---|---|---|
+| `gemm_bf16(M, N, K, a, b, c) -> Result<()>` | `C = A@B`, bf16 in → bf16 out | `a`=`M*K`, `b`=`K*N`, `c`=`M*N` bit patterns |
+| `gemm_bf16_config(M, N, K) -> (i32,i32,i32,i32)` | `(bm,bn,bk,rstep)` tile config | `bk==64`; `M<=64`→`(16,16,64,64)` |
+| `mla_fwd(b,h,q,k_c,k_pe,v_c,s_q,s_kv,q_s,kv_s,l,rhd,scale,out) -> Result<()>` | MLA attention, causal from `q_s`/`kv_s` | `q`=`b*h*s_q*(l+rhd)`, etc. |
+| `mla_config(s_q, kv_lora_rank, qk_rope_head_dim) -> (i32,i32,i32)` | `(wg_s_q,bm_kv,rstep_kv)` | `s_q<=8`→`(1,64,64)` |
+
+#### KDA (gated delta attention)
+
+| Function | Semantics | Notes |
+|---|---|---|
+| `kda_layer_norm_gated(x, w, gate, out, N, D, eps) -> Result<()>` | gated RMSNorm × SiLU(gate) | `x/gate`=`N*D`, `w`=`D` |
+| `kda_gate_chunk_cumsum(g, B,H,n_chunks,chunk_size, intra, inter) -> Result<()>` | intra inclusive, inter **exclusive** log-cumsum | `n_chunks,chunk_size>0` |
+| `kda_naive_delta_rule_fwd(q,k,v,g,beta,B,H,S,D,out) -> Result<()>` | full O(S²) delta-rule forward | `D>0` |
+| `kda_delta_rule_fwd(q,k,v,g,beta,B,H,S,D,chunk_size,out) -> Result<()>` | chunked forward, `S%chunk_size==0` | drives intra+inter |
+| `kda_delta_rule_intra(q,k,v,g,beta,intra_log,inter_state,B,H,S,D,chunk_size,chunk_idx,u) -> Result<()>` | within-chunk solve `u` for chunk `chunk_idx` | `inter_state`=`B*H*(n_chunks+1)*D*D`, read-only |
+| `kda_delta_rule_inter(intra_log,inter_state,B,H,S,D,chunk_size,chunk_idx) -> Result<()>` | cross-chunk state update `C_c += u_c C_{c-1}ᵀ` | writes `inter_state[...,chunk_idx+1]` |
+| `kda_gla_fwd_o(q,k,v,g,beta,B,H,S,D,out) -> Result<()>` | gated-linear-attention output only | `D>0` |
+| `kda_pack_bitmatrix(bits, packed, n_bits) -> Result<()>` | MSB-first bit packing | `n_bits<=bits.len()`, `packed>=(n_bits+7)/8` |
+
+#### MoE orchestration (MXFP4)
+
+| Function | Semantics | Notes |
+|---|---|---|
+| `mxfp4_moe_quant(a, packed, scales, M, hidden, group_size) -> Result<()>` | bf16→MXFP4 per-group quant | `hidden%group_size==0`, `%2==0` |
+| `mxfp4_moe_sort(a, sorted_ids, M, hidden, top_k, a_sorted) -> Result<()>` | gather + zero-pad padding rows | padding rows have `sorted_ids[r] >= M*top_k` |
+| `mxfp4_moe_sort_scales(scales, sorted_ids, M, n_groups, top_k, scales_sorted) -> Result<()>` | gather + zero-pad scales | `EM = sorted_ids.len()` |
+| `mxfp4_moe_scatter_reduce(partial, topk_w, M, width, top_k, out) -> Result<()>` | weighted scatter-reduce | `out`=`M*width`, caller zero-inits |
+| `mxfp4_moe_scatter_reduce_q(partial_q, partial_s, topk_w, M, width, top_k, group_size, out) -> Result<()>` | scatter-reduce + per-group dequant | `width%2==0`, `%group_size==0` |
+| `moe_align_block_size(topk_ids, M, top_k, block_size, num_experts) -> Result<(Vec<i32>, Vec<i32>, usize)>` | block-aligned sort (allocates output) | returns `(sorted_ids, expert_ids, em)` |
+| `moe_align_block_size_max_em(M, top_k, block_size, num_experts) -> usize` | upper bound on `em` (pure) | `((M+BS-1)/BS + num_experts) * BS` |
+| `fused_moe_mxfp4(a, w13, b13, w2, b2, a_scales, topk_ids, topk_scales, act_scratch, out, M, hidden, ispp, group_size, activation) -> Result<()>` | end-to-end MXFP4 MoE | `EM%16==0`; `b13`/`b2` optional via `Option<&[f32]>` |
+
+`MoeActivation` is `pub enum MoeActivation { SwiGLU, SiTU }` (`#[derive(Clone,Copy,PartialEq,Eq,Debug)]`);
+`fused_moe_mxfp4` infers `num_experts` from `w13.len() / (2*ispp*(hidden/2))`, and `em` from `topk_ids.len() / top_k`.
+
+Example — a tiny MXFP4 MoE:
+
+```rust
+use vkernels::kernels::{self, MoeActivation};
+
+let (m, hidden, ispp, gs, e, top_k) = (16, 128, 64, 32, 1, 1);
+let a = vec![1.0_f32; m * hidden];
+let w13 = vec![1.0_f32; e * 2 * ispp * (hidden / 2)];
+let w2 = vec![1.0_f32; e * ispp * hidden];
+let a_scales = vec![127u8; m * hidden / gs];
+let topk_ids = vec![0i32; m * top_k];
+let topk_scales = vec![1.0_f32; m * top_k];
+let mut act_scratch = vec![0.0_f32; m * ispp];
+let mut out = vec![0.0_f32; m * hidden];
+kernels::fused_moe_mxfp4(
+    &a, &w13, None, &w2, None, &a_scales,
+    &topk_ids, &topk_scales, &mut act_scratch, &mut out,
+    m, hidden, ispp, gs, MoeActivation::SwiGLU,
+)?;
+# Ok::<(), vkernels::Error>(())
+```
+
+All K3-family functions take flat slices with explicit dimension parameters
+(Rust cannot infer shapes from a `numpy` array the way the Python bindings
+do) and mirror the `VK_EXPECTS` contracts of the C++ kernels as
+`Err(Error::InvalidArgument)`. `moe_align_block_size` is the sole function
+that allocates internally and returns an owned `Vec`.
 
 ### `vkernels::comm`
 

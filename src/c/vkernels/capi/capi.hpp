@@ -92,6 +92,219 @@ int32_t vk_gemm(size_t M, size_t N, size_t K, float alpha, const float* A,
                 float* C, size_t C_len);
 
 /* ------------------------------------------------------------------ */
+/* kernels: gfx942 primitives (src/c/vkernels/kernels/moe.hpp)          */
+/*                                                                       */
+/* Software fallbacks for the CDNA4-only instructions on gfx942/MI300A.  */
+/* direct_lds_fill_bf16 and fp4_to_bf16_dequant take raw pointers; the  */
+/* mfma entry takes fixed-size arrays (c: 4 floats, a/b: 2 uint32 each). */
+/* ------------------------------------------------------------------ */
+
+/* Copy `elements` bf16 values from global memory to LDS (host: memcpy). */
+int32_t vk_direct_lds_fill_bf16(void* lds_dst, const void* global_src,
+                                size_t elements);
+
+/* Convert packed fp4 (E2M1, two per byte, low nibble first) to bf16.
+ * `out` must have exactly 2*packed_len elements (raises
+ * VK_ERROR_INVALID_ARGUMENT otherwise). */
+int32_t vk_fp4_to_bf16_dequant(const uint8_t* packed, size_t packed_len,
+                               uint16_t* out, size_t out_len, float scale);
+
+/* 1 if async copy should be used by default (gfx942: OFF; host: ON).
+ * The K3_NO_ASYNC env var overrides: "0"=ON, "1"=OFF. Never throws. */
+int vk_use_async_copy_default(void);
+
+/* K16 bf16 MFMA: c[0..3] += a[0..1] x b[0..1] (16x16x16 bf16, acc fp32).
+ * `c` is 4 floats updated in-place; `a` and `b` are 2 packed bf16 uint32_t
+ * each. cbsz/abid/blgp are MFMA control flags (ignored on host). */
+int32_t vk_mfma_f32_16x16x16bf16(float* c, const uint32_t* a,
+                                 const uint32_t* b, int cbsz, int abid,
+                                 int blgp);
+
+/* ------------------------------------------------------------------ */
+/* kernels: bf16 GEMM (src/c/vkernels/kernels/gemm_bf16.hpp, issue #29)  */
+/*                                                                       */
+/* C = alpha * A @ B + beta * C, bf16 (uint16) in/out, fp32 accumulate,  */
+/* single round-to-nearest-even on store. A is [M,K], B is [K,N],       */
+/* C is [M,N] uint16 bit patterns (no length checks in C++; validate in  */
+/* the safe bindings, like the Python kernels.py layer).                 */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_gemm_bf16(size_t M, size_t N, size_t K, float alpha,
+                     const uint16_t* A, const uint16_t* B, float beta,
+                     uint16_t* C);
+
+/* Per-shape tuned (bm, bn, bk, threads) MFMA tile the HIP bf16 GEMM
+ * should launch for (M, N, K). BK is fixed at 64 for the K3 shapes.
+ * Never throws. */
+void vk_gemm_bf16_config(size_t M, size_t N, size_t K, int* bm, int* bn,
+                         int* bk, int* threads);
+
+/* ------------------------------------------------------------------ */
+/* kernels: MLA — absorbed-form Multi-head Latent Attention              */
+/* (src/c/vkernels/kernels/mla.hpp, issue #21)                           */
+/*                                                                       */
+/* q  : [B, H, S_q, kv_lora_rank + qk_rope_head_dim]  fp32              */
+/* k_c: [B, S_kv, kv_lora_rank]                       fp32              */
+/* k_pe:[B, S_kv, qk_rope_head_dim]                   fp32              */
+/* v_c: [B, S_kv, kv_lora_rank]                       fp32              */
+/* out: [B, H, S_q, kv_lora_rank]                     fp32              */
+/* Two-pass stable softmax, causal mask via (q_start, kv_start).          */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_mla_fwd(int B, int H, int S_q, int S_kv, int q_start,
+                   int kv_start, int kv_lora_rank, int qk_rope_head_dim,
+                   float scale, const float* q, const float* k_c,
+                   const float* k_pe, const float* v_c, float* out);
+
+/* Per-shape (bq, bn_kv, threads) tile selector for the HIP MLA kernel.
+ * decode (S_q <= 8) -> (1, 64, 64); prefill -> (4, 64, 256). Never throws. */
+void vk_mla_config(int S_q, int kv_lora_rank, int qk_rope_head_dim,
+                    int* bq, int* bn, int* threads);
+
+/* ------------------------------------------------------------------ */
+/* kernels: KDA — Kimi Delta Attention                                    */
+/* (src/c/vkernels/kernels/kda.hpp, issue #21)                           */
+/*                                                                       */
+/* q,k,v : [B, H, S, D] float; g,beta : [B, H, S] float (k L2-normalised  */
+/* by the caller). chunk_size must divide S. All fp32 CPU references.     */
+/* ------------------------------------------------------------------ */
+
+/* Gated RMSNorm: out[n,d] = (x[n]/rms_n) * weight[d] * silu(gate[n,d]).
+ * x/gate [N,D], weight [D], out [N,D]. */
+int32_t vk_kda_layer_norm_gated(const float* x, const float* weight,
+                                const float* gate, float* out, int N,
+                                int D, float eps);
+
+/* Log-gate cumsum: g [B,H,n_chunks,chunk_size] -> (intra_log
+ * [B,H,n_chunks,chunk_size] within-chunk INCLUSIVE, inter_log [B,H,n_chunks]
+ * cross-chunk EXCLUSIVE). */
+int32_t vk_kda_gate_chunk_cumsum(const float* g, float* intra_log,
+                                 float* inter_log, int B, int H,
+                                 int n_chunks, int chunk_size);
+
+/* Per-token delta-rule oracle (O(S*D^2), the correctness reference). */
+int32_t vk_kda_naive_delta_rule_fwd(const float* q, const float* k,
+                                    const float* v, const float* g,
+                                    const float* beta, float* out, int B,
+                                    int H, int S, int D);
+
+/* Chunked delta-rule forward (gate cumsum -> intra -> inter -> output).
+ * chunk_size must divide S. */
+int32_t vk_kda_delta_rule_fwd(const float* q, const float* k,
+                              const float* v, const float* g,
+                              const float* beta, float* out, int B, int H,
+                              int S, int D, int chunk_size);
+
+/* Within-chunk delta-corrected value solve u_t for chunk `chunk_idx`.
+ * inter_state[..,chunk_idx] is C_{c-1} (read; row 0 must be zero). */
+int32_t vk_kda_delta_rule_intra(const float* q, const float* k,
+                                const float* v, const float* g,
+                                const float* beta, const float* intra_log,
+                                const float* inter_state, float* u, int B,
+                                int H, int S, int D, int chunk_size,
+                                int chunk_idx);
+
+/* Cross-chunk state propagation for chunk `chunk_idx`: fills
+ * inter_state[..,chunk_idx+1] = C_c. */
+int32_t vk_kda_delta_rule_inter(const float* k, const float* v,
+                                const float* g, const float* beta,
+                                const float* intra_log, const float* u,
+                                float* inter_state, int B, int H, int S,
+                                int D, int chunk_size, int chunk_idx);
+
+/* Output (intra + inter) combine: o_t = G_{0,t}(C_{c-1} q_t) +
+ * sum_{j<=t} G_{j+1,t} beta_j (k_j . q_t) u_j. */
+int32_t vk_kda_gla_fwd_o(const float* q, const float* k, const float* g,
+                         const float* beta, const float* intra_log,
+                         const float* inter_state, const float* u,
+                         float* out, int B, int H, int S, int D,
+                         int chunk_size);
+
+/* Pack a binary [n_bits] uint8 (each 0 or 1) array into ceil(n/8) bytes,
+ * MSB first (bit k -> byte k/8, bit 7 - k%8). */
+int32_t vk_kda_pack_bitmatrix(const uint8_t* bits, uint8_t* packed,
+                              size_t n_bits);
+
+/* ------------------------------------------------------------------ */
+/* kernels: MoE orchestration (mxfp4 quant / sort / scatter-reduce)      */
+/* (src/c/vkernels/kernels/moe_aux.hpp, issue #22)                       */
+/* ------------------------------------------------------------------ */
+
+/* MXFP4 activation quant: bf16 A [M, hidden] -> (packed [M, hidden/2]
+ * uint8 E2M1, scales [M, hidden/group_size] uint8 ue8m0). hidden must be
+ * even and divisible by group_size (>= 1). */
+int32_t vk_mxfp4_moe_quant(const uint16_t* A, uint8_t* packed,
+                           uint8_t* scales, int M, int hidden,
+                           int group_size);
+
+/* Gather bf16 A [M, hidden] into sorted row order [EM, hidden] by
+ * sorted_ids (>= M*top_k = padding row, zeroed). */
+int32_t vk_mxfp4_moe_sort(const uint16_t* A, const int32_t* sorted_ids,
+                          uint16_t* A_sorted, int M, int hidden, int top_k,
+                          int EM);
+
+/* Gather per-token ue8m0 scales [M, n_groups] into sorted row order
+ * [EM, n_groups] by sorted_ids (padding rows zeroed). */
+int32_t vk_mxfp4_moe_sort_scales(const uint8_t* scales,
+                                 const int32_t* sorted_ids,
+                                 uint8_t* scales_sorted, int M,
+                                 int n_groups, int top_k, int EM);
+
+/* Routed combine of float32 partials [EM, width] -> out [M, width]
+ * (zero-initialised by caller): out[token] += partial[r] * topk_w[r]. */
+int32_t vk_mxfp4_moe_scatter_reduce(const float* partial,
+                                    const float* topk_w,
+                                    const int32_t* sorted_ids, float* out,
+                                    int M, int width, int top_k, int EM);
+
+/* Routed combine of a quantized partial [EM, width/2] uint8 E2M1 +
+ * [EM, width/group_size] uint8 ue8m0 -> out [M, width] float32 (zero-init),
+ * dequantizing inline. width must be divisible by group_size and by 2. */
+int32_t vk_mxfp4_moe_scatter_reduce_q(const uint8_t* partial_q,
+                                      const uint8_t* partial_s,
+                                      const float* topk_w,
+                                      const int32_t* sorted_ids, float* out,
+                                      int M, int width, int top_k, int EM,
+                                      int group_size);
+
+/* ------------------------------------------------------------------ */
+/* kernels: fused MXFP4 MoE grouped GEMM                                */
+/* (src/c/vkernels/kernels/moe_fused.hpp, issues #22/#23/#28)            */
+/*                                                                       */
+/* act_scratch [EM, ispp] bf16 and out [M, hidden] fp32 (caller zero-     */
+/* inits out, which accumulates). b13/b2 are nullable (nullptr = skip    */
+/* bias). activation: 0 = kSwiGLU, 1 = kSiTU. The C++ reference does no  */
+/* length checks of its own (BLAS-style); validate shapes in the safe    */
+/* bindings (as Python's kernels.py does).                               */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_fused_moe_mxfp4(const uint16_t* A, const uint8_t* w13,
+                           const uint8_t* w13_scale, const uint8_t* w2,
+                           const uint8_t* w2_scale, const int32_t* sorted_ids,
+                           const float* topk_w_sorted,
+                           const int32_t* expert_ids, uint16_t* act_scratch,
+                           float* out, int M, int hidden, int ispp, int top_k,
+                           int EM, int group_size, float swiglu_limit,
+                           int activation, float beta, float linear_beta,
+                           const float* b13, const float* b2);
+
+/* Map the [M, top_k] token->expert routing table to the block-aligned
+ * sorted layout. `sorted_ids` must hold max_EM entries and `expert_ids`
+ * max_EM/block_size entries (see vk_moe_align_block_size_max_em). On
+ * success *out_EM is the padded row count (a multiple of block_size);
+ * padding entries in sorted_ids are M*top_k and in expert_ids are -1. */
+int32_t vk_moe_align_block_size(const int32_t* topk_ids, int32_t M,
+                                int32_t top_k, int32_t block_size,
+                                int32_t num_experts, int32_t* sorted_ids,
+                                int32_t* expert_ids, int32_t* out_EM);
+
+/* Upper bound on EM for (M, top_k, block_size, num_experts) — the size to
+ * allocate `sorted_ids` (and EM/block_size for `expert_ids`). Never throws. */
+size_t vk_moe_align_block_size_max_em(int32_t M, int32_t top_k,
+                                      int32_t block_size,
+                                      int32_t num_experts);
+
+/* ------------------------------------------------------------------ */
 /* core: device + stream (src/c/vkernels/core)                          */
 /* ------------------------------------------------------------------ */
 

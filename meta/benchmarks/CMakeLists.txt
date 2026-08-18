@@ -6,6 +6,25 @@ if(NOT VKERNELS_BUILD_BENCHMARKS)
   return()
 endif()
 
+# --- Host-only benchmark (no GPU needed): HIP/RCCL transport selection ---
+# The cost model + host ring all-reduce reference run anywhere, so this bench
+# is the CI-verifiable acceptance surface for issue #19 (OFI < Socket at
+# >= 1 MiB over >= 1 edge). The HIP/RCCL A/B is run on a Slingshot node.
+add_executable(rccl_bench bench_rccl.cpp)
+target_link_libraries(rccl_bench PRIVATE vkernels::vkernels)
+target_compile_features(rccl_bench PRIVATE cxx_std_17)
+vkernels_set_warnings(rccl_bench)
+
+# --- Host-only benchmark (no GPU needed): graph-capturable PP boundary ---
+# The transport classification + GraphCapture + host plan run anywhere, so
+# this bench is the CI-verifiable surface for issue #10 (per-decode-iteration
+# host coordination overhead: device-capture vs eager-break). The CUDA path
+# (pipeline_boundary.cu) is A/B'd on a multi-node + NCCL node.
+add_executable(pipeline_boundary_bench bench_pipeline_boundary.cpp)
+target_link_libraries(pipeline_boundary_bench PRIVATE vkernels::vkernels)
+target_compile_features(pipeline_boundary_bench PRIVATE cxx_std_17)
+vkernels_set_warnings(pipeline_boundary_bench)
+
 if(NOT VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
   message(STATUS "vkernels: benchmarks skipped (no GPU toolkit)")
   return()
@@ -22,6 +41,38 @@ if(VKERNELS_HAS_CUDA)
   target_link_libraries(p2p_kv_restore_bench PRIVATE vkernels::vkernels)
   target_compile_features(p2p_kv_restore_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(p2p_kv_restore_bench)
+
+  # Fused indexed-KV-to-peer donation (issue #36): the donation-side mirror
+  # of p2p_kv_restore. Reads scattered local K/V slots and writes
+  # contiguous peer pages; measures the fused direct-store kernel vs the
+  # two-stage fallback and the prepared-plan sweep across all 40 model
+  # layers. H100 NVL real peer path; single-GPU box falls back to a
+  # same-device simulation.
+  add_executable(p2p_kv_donate_bench p2p_kv_donate_bench.cu)
+  target_link_libraries(p2p_kv_donate_bench PRIVATE vkernels::vkernels)
+  target_compile_features(p2p_kv_donate_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(p2p_kv_donate_bench)
+
+  # Fused indexed K/V layer gather (issue #2): the donation-side building
+  # block that packs arbitrary KV-pool slots into a contiguous per-layer
+  # page buffer. Measures the single fused kernel vs the two-gather
+  # PyTorch reference (two separate advanced-index gather kernels, one per
+  # tensor) across 64..8192 tokens, plus effective bandwidth and the
+  # one-launch-vs-two saving. Single-GPU box reads/writes device 0.
+  add_executable(kv_gather_bench kv_gather_bench.cu)
+  target_link_libraries(kv_gather_bench PRIVATE vkernels::vkernels)
+  target_compile_features(kv_gather_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(kv_gather_bench)
+
+  # Graph-capturable PP-boundary transfer (issue #10). Measures the actual
+  # NVLink peer copy the device path enqueues per decode iteration, and the
+  # graph-replay vs eager-re-issue round trip (the host progress the graph
+  # removes). H100 NVL real peer path; single-GPU box falls back to a
+  # same-device simulation.
+  add_executable(pipeline_boundary_bench_c bench_pipeline_boundary.cu)
+  target_link_libraries(pipeline_boundary_bench_c PRIVATE vkernels::vkernels)
+  target_compile_features(pipeline_boundary_bench_c PRIVATE cxx_std_17)
+  vkernels_set_warnings(pipeline_boundary_bench_c)
 endif()
 
 # --- HIP benchmarks ---

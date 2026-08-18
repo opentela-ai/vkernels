@@ -21,10 +21,16 @@ target_sources(vkernels
     vkernels/kernels/mla.cpp
     vkernels/kernels/kda.cpp
     vkernels/comm/channel.cpp
+    vkernels/comm/rccl.cpp
+    vkernels/comm/rccl_c.cpp
     vkernels/comm/allreduce.cpp
     vkernels/comm/overlap.cpp
     vkernels/comm/p2p_gather.cpp
     vkernels/comm/p2p_kv_restore.cpp
+    vkernels/comm/p2p_kv_donate.cpp
+    vkernels/comm/kv_gather.cpp
+    vkernels/comm/pipeline_boundary.cpp
+    vkernels/comm/pipeline_boundary_c.cpp
     vkernels/dist/dist_moe.cpp
     vkernels/capi/capi.cpp
 )
@@ -44,7 +50,10 @@ if(VKERNELS_HAS_CUDA)
       vkernels/kernels/gemm.cu
       vkernels/comm/allreduce.cu
       vkernels/comm/p2p_gather.cu
-      vkernels/comm/p2p_kv_restore.cu)
+      vkernels/comm/p2p_kv_restore.cu
+      vkernels/comm/p2p_kv_donate.cu
+      vkernels/comm/kv_gather.cu
+      vkernels/comm/pipeline_boundary.cu)
   set_target_properties(vkernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
   # C ABI shared library: `extern "C"` entry points over the CUDA primitive,
@@ -53,7 +62,7 @@ if(VKERNELS_HAS_CUDA)
   # folds every C++ exception into a status code so nothing is thrown across
   # the boundary. Built only with a CUDA toolkit — the entry points take a
   # raw cudaStream_t.
-  add_library(vkernels_c SHARED vkernels/comm/p2p_gather_c.cu vkernels/comm/p2p_kv_restore_c.cu)
+  add_library(vkernels_c SHARED vkernels/comm/p2p_gather_c.cu vkernels/comm/p2p_kv_restore_c.cu vkernels/comm/p2p_kv_donate_c.cu vkernels/comm/kv_gather_c.cu vkernels/comm/pipeline_boundary_c.cu)
   add_library(vkernels::vkernels_c ALIAS vkernels_c)
   target_link_libraries(vkernels_c PRIVATE vkernels)
   target_include_directories(vkernels_c PRIVATE
@@ -75,11 +84,24 @@ if(VKERNELS_HAS_HIP)
   set_target_properties(vkernels PROPERTIES HIP_SEPARABLE_COMPILATION ON)
 endif()
 
+# RCCL transport (issue #19): compile the HIP/RCCL path only when a usable
+# librccl was found (RcclSupport.cmake). The host reference (rccl.cpp) and
+# the full test suite build and pass without RCCL, exactly as the CI host
+# job does; this block only adds the performance implementation.
+if(VKERNELS_HAS_RCCL)
+  target_sources(vkernels PRIVATE vkernels/comm/rccl.hip)
+  target_include_directories(vkernels PRIVATE ${VKERNELS_RCCL_INCLUDE_DIRS})
+  target_link_libraries(vkernels PRIVATE ${VKERNELS_RCCL_LIBRARIES})
+  set_target_properties(vkernels PROPERTIES HIP_SEPARABLE_COMPILATION ON)
+endif()
+
 # Propagate the CUDA and HIP availability flags to consumers and to the
 # library's own translation units.
 target_compile_definitions(vkernels PUBLIC
   $<$<BOOL:${VKERNELS_HAS_CUDA}>:VKERNELS_HAS_CUDA=1>
-  $<$<BOOL:${VKERNELS_HAS_HIP}>:VKERNELS_HAS_HIP=1>)
+  $<$<BOOL:${VKERNELS_HAS_HIP}>:VKERNELS_HAS_HIP=1>
+  $<$<BOOL:${VKERNELS_HAS_RCCL}>:VKERNELS_HAS_RCCL=1>
+  $<$<BOOL:${VKERNELS_HAS_OFI}>:VKERNELS_HAS_OFI=1>)
 
 target_link_libraries(vkernels PUBLIC Threads::Threads)
 

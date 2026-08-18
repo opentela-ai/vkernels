@@ -353,6 +353,95 @@ The C ABI mirrors all three (`vkernels_p2p_kv_restore_plan_create`,
 `vkernels_p2p_kv_restore_plan_execute_offset(plan, k_dst, v_dst, offset,
 stream)`.
 
+### P2P KV donate (fused) — issue #36
+
+The donation-side mirror of `p2p_kv_restore` — the data flow is reversed:
+fuses an indexed gather of local paged-KV slots with the peer store into
+one kernel. KVAAS today materializes a full all-layer packed scratch
+tensor before peer DMA (`pack_pages`: a PyTorch advanced-index gather of
+K/V per layer into `[pages, layers, page_size, 2, heads, dim]`, then
+scratch-to-peer copies, with the scratch pinned until the completion ACK).
+The donate skips the scratch entirely: it reads arbitrary local K/V slots
+and writes directly into the layer-major peer-page destination through
+peer-accessible UVA pointers, eliminating the scratch allocation, the
+extra local-HBM read/write pass, and the separate peer copy.
+
+| Function | Computation |
+|---|---|
+| `p2p_kv_donate_layer(k_src, v_src, slot_ids, peer_dst_ptrs, dst_page_offsets, ...)` | Reads indexed local K/V slots and writes KV data directly into peer UVA page destinations (adaptive: fused kernel or two-stage) |
+| `p2p_kv_donate_layer_twostage(...)` | Gather into a per-call scratch + one `cudaMemcpyAsync` per page (the copy-engine reference, byte-identical output) |
+| `kv_gather(scratch, k_src, v_src, slot_ids, ...)` | Indexed gather of local slots into a contiguous scratch — the first stage, exposed so the plan fallback can gather once |
+
+- Unlike the restore (a scatter, requiring UNIQUE destination slots), the
+  donate is a gather: source slots may repeat and be non-monotonic.
+- CUDA one-shot dispatch is ADAPTIVE — `prefer_direct_store(...)` picks the
+  direct SM store or the two-stage fallback from a cost model fitted on
+  H100 NVL peer-write measurements (the restore's mirror path); tunable at
+  runtime via `set_donate_dispatch(mode, min_pages_for_direct)` (C++ only,
+  not exposed through the C ABI). The host one-shot is always fused.
+- **File**: `src/c/vkernels/comm/p2p_kv_donate.cpp` (CPU), `.cu` (CUDA)
+- **Bench**: `meta/benchmarks/p2p_kv_donate_bench.cu`
+- **Performance**: [performance/p2p-kv-donate/](performance/p2p-kv-donate/)
+
+**Prepared plan (issue #36)** — `P2PKvDonatePlan` (host + CUDA) and the C
+ABI `vkernels_p2p_kv_donate_plan_t` validate the slot map and upload the
+page descriptors ONCE; `execute(k_src, v_src,
+destination_layer_offset_bytes, stream)` then launches ONE
+page-by-token-group kernel that adds the scalar offset to every peer page
+base before writing. The per-layer SOURCE pair is taken per call because
+KVAAS keeps a distinct K/V buffer per model layer — one prepared run list
+fans out across all 40 layers with no per-layer allocation, D2H sync, or
+H2D descriptor upload. `execute_via_scratch(...)` is the documented
+fallback for systems where direct peer stores are unsupported or lose to
+the copy engine: one kv_gather into a caller-owned scratch plus per-page
+`cudaMemcpyAsync`, no per-call allocation, byte-identical output. The
+three creation modes mirror the restore — host `slot_ids` (validated at
+create: non-negative and `< num_slots`; repeats allowed),
+`from_device_slots` (borrows the device pointer, no D2H sync, no content
+validation), and `from_device_slots_int64` (converted device-side at
+create into an owned int32 buffer so the caller may free the int64 buffer
+immediately).
+
+The C ABI mirrors all three (`vkernels_p2p_kv_donate_plan_create`,
+`..._create_device_slots`, `..._create_device_slots_int64`) plus
+`vkernels_p2p_kv_donate_plan_execute_offset(plan, k_src, v_src, offset,
+stream)` and `vkernels_p2p_kv_donate_plan_execute_via_scratch(plan, k_src,
+v_src, scratch, offset, stream)`.
+
+### Fused indexed K/V layer gather — issue #2
+
+The donation-side building block KVAAS performs today as two separate
+advanced-index gathers (one for K, one for V) into the packed
+`[num_pages, page_size, 2, num_kv_heads, head_dim]` destination. This
+primitive fuses both gathers (and the K/V interleave) into a SINGLE launch
+— the reverse of `p2p_kv_restore` (which scatters) and the gather the
+donate plan's two-stage fallback exposes as `kv_gather`.
+
+| Function | Computation |
+|---|---|
+| `kv_gather_layer(dst, k_src, v_src, slot_ids, slot_ids_int64, num_slots, num_pages, page_size, num_kv_heads, head_dim, elem_size, stream)` | `dst[:, :, 0] = k_src[slot_ids]` and `dst[:, :, 1] = v_src[slot_ids]` in one operation |
+| `kv_gather_layer_device_slots(...)` | CUDA-only: caller-owned DEVICE `slot_ids` (no D2H sync, no content validation) |
+
+- **Contract**: `k_src`/`v_src` are `[num_slots, num_kv_heads, head_dim]`,
+  BF16 or FP16 (`elem_size == 2`); `slot_ids` is `[num_pages, page_size]`,
+  int32 or int64, arbitrary non-monotonic source slots that MAY REPEAT
+  (gather semantics, unlike the restore's unique-destination scatter).
+  Only the range `[0, num_slots)` is enforced; `num_pages == 0` is a valid
+  no-op.
+- **Lifetime**: for the host-input `kv_gather_layer` the slot map is copied
+  into owned storage before the function returns (the caller may free it
+  immediately); `k_src`, `v_src` and `dst` must outlive `stream`. Async on
+  the caller's stream with NO device-wide synchronization.
+- **File**: `src/c/vkernels/comm/kv_gather.cpp` (CPU oracle), `.cu` (CUDA
+  kernel), `kv_gather_c.{h,cu}` (C ABI)
+- **Bench**: `meta/benchmarks/kv_gather_bench.cu` — fused vs the two-gather
+  PyTorch reference, 64 through 8,192 tokens.
+- **Python**: `vkernels.kv_gather_layer(k_src, v_src, slot_ids, dst, *,
+  stream=None)` (also `vkernels.comm.kv_gather_layer`); non-default strides
+  are rejected explicitly (a silent copy would write into a throwaway
+  buffer). The pure-Python reference in `_fallback.py` is byte-exact for
+  both BF16 (passed as a `uint16` view) and FP16.
+
 ### Compute/communication overlap
 
 | Class / Function | Computation |
@@ -363,6 +452,53 @@ stream)`.
 - **File**: `src/c/vkernels/comm/overlap.cpp`
 - **Python**: `vkernels.comm.OverlapExecutor()`
 - **Rust**: `vkernels::comm::OverlapExecutor::new()`
+
+### HIP/RCCL transport + OFI/CXI net plugin — issue #19
+
+A second HIP/RCCL channel behind the existing `Channel` / all-reduce
+interface, plus a HIP-aware OFI/CXI net plugin for Slingshot RDMA instead
+of Socket, and graph-capturable all-reduce variants. Built on ROCm only.
+
+| Surface | Role |
+|---|---|
+| `RcclChannel` | `Channel` over RCCL send/recv (host→device→host) |
+| `RcclAllreducePlan` | Graph-capturable host plan: single `rcclAllReduce`, no host allocation after construction |
+| `RcclAllreducePlanHip` | HIP path: one `rcclAllReduce` between begin/end graph capture |
+| `resolve_transport(bytes, edges, cfg)` | Adaptive Socket↔Slingshot selection from a cost model |
+| `est_rccl_socket_us` / `est_rccl_ofi_us` | Socket = `max(50, 6.0 us/MiB) + 25 us/edge`; OFI = `max(20, 3.0 us/MiB)` (RDMA, edge-free) |
+| `discover_ofi_cxi` | Detects the `cxi` libfabric provider for the net plugin |
+| `vkernels_rccl_*` | C ABI wrapping the host reference (always compiled) |
+
+- **Host reference**: `src/c/vkernels/comm/rccl.{cpp,hpp}` (always compiled)
+- **HIP/RCCL path**: `src/c/vkernels/comm/rccl.hip`, `rccl_hip.hpp` (`VKERNELS_HAS_RCCL`)
+- **C ABI**: `src/c/vkernels/comm/rccl_c.{h,cpp}`
+- **OFI/CXI net plugin**: `plugins/rccl-net-ofi/` (`librccl-net-ofi.so`, `VKERNELS_HAS_OFI`)
+- **Build discovery**: `meta/cmake/RcclSupport.cmake`
+- **Bench**: `meta/benchmarks/bench_rccl.cpp` (`rccl_bench`)
+- **Docs**: [comm-rccl.md](comm-rccl.md)
+
+### Pipeline-parallel boundary transfer — issue #10
+
+A graph-capturable primitive for the hidden-state transfer at a PP
+(pipeline-parallel) boundary, plus an eager-break path that mirrors vLLM's
+`eager_break_during_capture`. The host reference is the correctness oracle;
+the CUDA path is the device realization.
+
+| Surface | Role |
+|---|---|
+| `PipelineBoundaryConfig` | Deployment facts: `same_node`, `nccl_graph_supported`, `gloo_fallback` |
+| `classify_boundary(cfg)` | `same_node`→peer copy, `gloo_fallback`→host-staged, `nccl_graph_supported`→cross-node NCCL, else host-staged |
+| `is_graph_capturable(t)` | A boundary is capturable on a device path (same-node peer, cross-node NCCL) |
+| `eager_break_during_capture(cfg)` | 1 when the host send/recv must be excluded from the captured segment (host-staged), 0 otherwise |
+| `PipelineBoundaryPlan` (host) | Directed boundary transfer over the ring `Channel`; device path enqueues a `memcpy` (no host progress on replay), eager-break path runs the `Channel` between `GraphCapture::end`/`begin` |
+| `GraphCapture` | RAII begin/end capture + submit/replay, with eager (no-graph) and multi-segment support |
+| `PipelineBoundaryPlan` (CUDA) | `vkernels::comm::cuda::PipelineBoundaryPlan` — one `cudaMemcpyAsync` (peer) or `ncclSend`/`ncclRecv` (cross-node) on a `cudaStream_t` |
+| `vkernels_pp_*` | C ABI: classification (always compiled) + device plan (CUDA-only) |
+
+- **Host reference**: `src/c/vkernels/comm/pipeline_boundary.{cpp,hpp}` (always compiled, 100% line-covered CI gate)
+- **CUDA device path**: `src/c/vkernels/comm/pipeline_boundary.cu`, `pipeline_boundary_cuda.hpp` (`VKERNELS_HAS_CUDA`)
+- **C ABI**: `src/c/vkernels/comm/pipeline_boundary_c.{h,cpp}` (always compiled) + `pipeline_boundary_c.cu` (CUDA-only)
+- **Docs**: [comm-pipeline-boundary.md](comm-pipeline-boundary.md)
 
 ---
 
@@ -392,9 +528,20 @@ src/c/vkernels/
 │   ├── allreduce.{cpp,cu}       # ring all-reduce
 │   ├── p2p_gather.{cpp,cu}      # single-launch peer gather
 │   ├── p2p_kv_restore.{cpp,cu}  # fused KV restore
+│   ├── p2p_kv_donate.{cpp,cu}   # fused KV donate (#36)
+│   ├── kv_gather.{hpp,cpp,cu}   # fused indexed K/V layer gather (#2)
+│   ├── kv_gather_cuda.hpp       # CUDA entry points (issue #2)
+│   ├── kv_gather_c.{h,cu}       # C ABI for the fused K/V gather (#2)
+│   ├── pipeline_boundary.{cpp,cu} # graph-capturable PP boundary (#10)
 │   ├── overlap.cpp              # compute/comm overlap executor
 │   ├── channel.cpp              # blocking queue & mock channel
-│   └── topology.{cpp,hpp}       # ring topology helpers
+│   ├── topology.{cpp,hpp}       # ring topology helpers
+│   ├── rccl.{cpp,hpp}           # HIP/RCCL transport host reference (#19)
+│   ├── rccl.hip                 # HIP/RCCL all-reduce (VKERNELS_HAS_RCCL)
+│   ├── rccl_hip.hpp             # RcclChannel / plan declarations
+│   ├── rccl_c.{h,cpp}           # C ABI for the RCCL transport
+│   ├── pipeline_boundary_cuda.hpp # CUDA plan declarations
+│   └── pipeline_boundary_c.{h,cpp,cu} # C ABI for the PP boundary
 └── core/
     ├── device.cpp               # Device abstraction
     ├── stream.{cpp,cu}          # Stream (async task queue)

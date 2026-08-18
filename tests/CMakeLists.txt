@@ -24,9 +24,15 @@ vkernels_add_test(NAME dist_moe    SOURCES kernels/moe/test_dist_moe.cpp)
 vkernels_add_test(NAME topology    SOURCES comm/test_topology.cpp)
 vkernels_add_test(NAME channel     SOURCES comm/test_channel.cpp)
 vkernels_add_test(NAME allreduce   SOURCES comm/test_allreduce.cpp)
+vkernels_add_test(NAME rccl        SOURCES comm/test_rccl.cpp)
+vkernels_add_test(NAME rccl_c      SOURCES comm/test_rccl_c.cpp)
 vkernels_add_test(NAME overlap     SOURCES comm/test_overlap.cpp)
 vkernels_add_test(NAME p2p_gather SOURCES comm/test_p2p_gather.cpp)
 vkernels_add_test(NAME p2p_kv_restore SOURCES comm/test_p2p_kv_restore.cpp)
+vkernels_add_test(NAME p2p_kv_donate SOURCES comm/test_p2p_kv_donate.cpp)
+vkernels_add_test(NAME kv_gather SOURCES comm/test_kv_gather.cpp)
+vkernels_add_test(NAME pipeline_boundary SOURCES comm/test_pipeline_boundary.cpp)
+vkernels_add_test(NAME pipeline_boundary_c SOURCES comm/test_pipeline_boundary_c.cpp)
 vkernels_add_test(NAME capi         SOURCES capi/test_capi.cpp)
 
 # The `extern "C"` ABI is CUDA-only (the entry points take a raw
@@ -38,6 +44,16 @@ if(VKERNELS_HAS_CUDA)
                     INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
                     LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
   vkernels_add_test(NAME p2p_kv_restore_c SOURCES comm/test_p2p_kv_restore_c.cu
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
+                    LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
+  vkernels_add_test(NAME p2p_kv_donate_c SOURCES comm/test_p2p_kv_donate_c.cu
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
+                    LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
+  vkernels_add_test(NAME kv_gather_c SOURCES comm/test_kv_gather_c.cu
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
+                    LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
+  vkernels_add_test(NAME pipeline_boundary_cuda_c
+                    SOURCES comm/test_pipeline_boundary_cuda_c.cu
                     INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
                     LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
 endif()

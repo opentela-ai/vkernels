@@ -1585,3 +1585,168 @@ def memcpy_peer_batch_async(
         # Legacy seam: one stream task per run.
         for r in staged:
             stream.submit(lambda r=r: copy_one(r))
+
+
+# ---------------------------------------------------------------------------
+# comm: fused indexed K/V layer gather (issue #2)
+# ---------------------------------------------------------------------------
+#
+# Packs arbitrary SGLang KV-pool slots into a contiguous per-layer page
+# buffer before peer donation/eviction, fusing the two separate advanced-
+# index gathers (one for K, one for V) into a single operation. The
+# reference is byte-exact:
+#
+#     dst[:, :, 0] = k_src[slot_ids]
+#     dst[:, :, 1] = v_src[slot_ids]
+#
+# Because the operation is a raw-byte copy (no type-specific arithmetic),
+# the same implementation is correct for both BF16 and FP16: numpy has no
+# native BF16, so callers pass a ``uint16`` view of BF16 storage and FP16
+# as ``np.float16``. Both have ``itemsize == 2``.
+_KV_DTYPES = (np.dtype(np.float16), np.dtype(np.uint16), np.dtype(np.int16))
+
+
+def _as_kv_array(x, name: str) -> np.ndarray:
+    """Coerce ``x`` to a C-contiguous 2-byte, 3-D KV source array."""
+    if isinstance(x, np.ndarray):
+        arr = x
+    else:
+        arr = np.asarray(x)
+    if arr.dtype not in _KV_DTYPES:
+        raise TypeError(
+            f"{name} must be a BF16 (uint16 view) or FP16 array, "
+            f"got dtype={arr.dtype}"
+        )
+    if arr.itemsize != 2:
+        raise TypeError(f"{name} must have itemsize 2, got {arr.itemsize}")
+    if arr.ndim != 3:
+        raise ValueError(
+            f"{name} must be [num_slots, num_kv_heads, head_dim] (3-D), "
+            f"got shape {arr.shape}"
+        )
+    if not arr.flags.c_contiguous:
+        raise ValueError(f"{name} must be C-contiguous")
+    return arr
+
+
+def _as_slot_ids(x, name: str = "slot_ids") -> np.ndarray:
+    """Coerce ``x`` to a C-contiguous int32/int64 2-D slot map."""
+    if isinstance(x, np.ndarray):
+        arr = x
+    else:
+        arr = np.asarray(x)
+    if arr.dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+        raise TypeError(
+            f"{name} must be int32 or int64, got dtype={arr.dtype}"
+        )
+    if arr.ndim != 2:
+        raise ValueError(
+            f"{name} must be [num_pages, page_size] (2-D), got shape {arr.shape}"
+        )
+    if not arr.flags.c_contiguous:
+        raise ValueError(f"{name} must be C-contiguous")
+    return arr
+
+
+def kv_gather_layer(k_src, v_src, slot_ids, dst, *, stream=None) -> None:
+    """Fused indexed K/V gather for one layer (issue #2).
+
+    Reads ``num_pages * page_size`` indexed source slots from ``k_src`` /
+    ``v_src`` and writes the packed ``[num_pages, page_size, 2, num_kv_heads,
+    head_dim]`` destination, exactly:
+
+        dst[:, :, 0] = k_src[slot_ids]
+        dst[:, :, 1] = v_src[slot_ids]
+
+    Replaces the two separate advanced-index gathers the KVAAS ``pack_pages``
+    path performs today. ``num_pages == 0`` is a valid no-op. ``slot_ids`` may
+    repeat (gather semantics) and be in any order (non-monotonic); only the
+    range ``[0, num_slots)`` is enforced. Enqueued on ``stream`` (one task)
+    and returns without synchronising.
+
+    Args:
+        k_src, v_src: ``[num_slots, num_kv_heads, head_dim]`` C-contiguous
+            arrays with ``itemsize == 2`` (BF16 as a ``uint16`` view, FP16 as
+            ``np.float16``).
+        slot_ids: ``[num_pages, page_size]`` C-contiguous ``int32`` or
+            ``int64`` array of source slots in ``[0, num_slots)``.
+        dst: ``[num_pages, page_size, 2, num_kv_heads, head_dim]``
+            C-contiguous writable array of the same dtype as ``k_src``/
+            ``v_src``.
+        stream: optional :class:`~vkernels.core.Stream`; when given the
+            gather runs as a single asynchronous task.
+
+    Raises:
+        TypeError: if any array has the wrong dtype.
+        ValueError: if shapes/strides are inconsistent, ``slot_ids`` is out
+            of range, or ``dst`` is not writable.
+    """
+    k = _as_kv_array(k_src, "k_src")
+    v = _as_kv_array(v_src, "v_src")
+    slots = _as_slot_ids(slot_ids, "slot_ids")
+    if isinstance(dst, np.ndarray):
+        d = dst
+    else:
+        d = np.asarray(dst)
+    if d.dtype != k.dtype:
+        raise TypeError(
+            f"dst must have the same dtype as k_src/v_src, got {d.dtype} vs {k.dtype}"
+        )
+    if d.ndim != 5:
+        raise ValueError(
+            f"dst must be [num_pages, page_size, 2, num_kv_heads, head_dim] "
+            f"(5-D), got shape {d.shape}"
+        )
+    if not d.flags.c_contiguous:
+        raise ValueError("dst must be C-contiguous")
+    if not d.flags.writeable:
+        raise ValueError("dst must be writable")
+    if k.shape != v.shape:
+        raise ValueError(
+            f"k_src and v_src must have the same shape, got {k.shape} vs {v.shape}"
+        )
+    if k.dtype != v.dtype:
+        raise TypeError(
+            f"k_src and v_src must have the same dtype, got {k.dtype} vs {v.dtype}"
+        )
+
+    num_slots, num_kv_heads, head_dim = k.shape
+    num_pages, page_size = slots.shape
+    if d.shape != (num_pages, page_size, 2, num_kv_heads, head_dim):
+        raise ValueError(
+            f"dst shape {d.shape} does not match (num_pages={num_pages}, "
+            f"page_size={page_size}, 2, num_kv_heads={num_kv_heads}, "
+            f"head_dim={head_dim})"
+        )
+
+    if num_pages == 0:
+        return  # valid no-op (also covers page_size == 0)
+
+    if page_size == 0:
+        return
+    if num_slots == 0:
+        raise ValueError("num_slots must be positive when num_pages > 0")
+    if num_kv_heads == 0 or head_dim == 0:
+        raise ValueError("num_kv_heads and head_dim must be positive")
+
+    if slots.size and (slots.min() < 0 or slots.max() >= num_slots):
+        raise ValueError(f"slot_ids must be in [0, {num_slots})")
+
+    slot_bytes = num_kv_heads * head_dim * 2  # elem_size == 2
+    k_flat = k.view(np.uint8).reshape(num_slots, slot_bytes)
+    v_flat = v.view(np.uint8).reshape(num_slots, slot_bytes)
+    d_flat = d.view(np.uint8).reshape(num_pages * page_size, 2, slot_bytes)
+    flat_ids = slots.reshape(num_pages * page_size)
+
+    def gather() -> None:
+        gathered_k = k_flat[flat_ids]  # [N, slot_bytes]
+        gathered_v = v_flat[flat_ids]
+        # Copy into the destination; assignment is a byte-exact memmove for
+        # matching dtypes (uint8 views here).
+        d_flat[:, 0, :] = gathered_k
+        d_flat[:, 1, :] = gathered_v
+
+    if stream is None:
+        gather()
+    else:
+        stream.submit(gather)

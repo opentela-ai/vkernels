@@ -1,0 +1,47 @@
+# plugins/rccl-net-ofi — OFI/CXI net plugin for RCCL (issue #19)
+#
+# Builds `librccl-net-ofi.so` against libfabric, gated by VKERNELS_HAS_OFI
+# (libfabric found by RcclSupport.cmake). Never affects the host-only library
+# or its tests: the top-level CMakeLists adds this subdirectory only when
+# HIP + libfabric are both present.
+#
+# The plugin is a single C translation unit (the standard aws_ofi_nccl layout
+# is C) compiled with the host C compiler. Its v-table uses only `void*`
+# request handles (the RCCL net-plugin ABI never takes a hipStream_t), so it
+# links libfabric alone — no HIP runtime, no libcudart.
+cmake_minimum_required(VERSION 3.18)
+
+if(NOT VKERNELS_HAS_HIP)
+  message(STATUS "vkernels/net-ofi: HIP not enabled; plugin not built")
+  return()
+endif()
+if(NOT VKERNELS_HAS_OFI)
+  message(STATUS "vkernels/net-ofi: libfabric not found; plugin not built")
+  return()
+endif()
+
+enable_language(C)
+
+add_library(rccl-net-ofi SHARED rccl_net_ofi.c)
+add_library(vkernels::rccl-net-ofi ALIAS rccl-net-ofi)
+
+# The export attribute is applied directly on `nccl_ofi_net` in the source;
+# -fvisibility=hidden (or -exported_symbol on macOS) hides every other symbol
+# so the RCCL loader only resolves `nccl_ofi_net`.
+if(APPLE)
+  set_property(TARGET rccl-net-ofi APPEND PROPERTY
+    LINK_FLAGS "-Wl,-exported_symbol,_nccl_ofi_net")
+else()
+  target_compile_options(rccl-net-ofi PRIVATE -fvisibility=hidden)
+endif()
+
+target_include_directories(rccl-net-ofi PRIVATE ${VKERNELS_OFI_INCLUDE_DIRS})
+target_link_libraries(rccl-net-ofi PRIVATE ${VKERNELS_OFI_LIBRARIES})
+set_target_properties(rccl-net-ofi PROPERTIES
+  OUTPUT_NAME "rccl-net-ofi"
+  LINKER_LANGUAGE C
+  POSITION_INDEPENDENT_CODE ON)
+
+# Install the .so next to the RCCL loader's search path on a Slingshot node.
+include(GNUInstallDirs)
+install(TARGETS rccl-net-ofi LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
