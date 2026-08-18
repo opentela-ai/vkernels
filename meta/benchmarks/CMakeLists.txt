@@ -102,6 +102,14 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_moe_fused_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_moe_fused_correct)
 
+  # C ABI correctness: same data as test_moe_fused_correct, exercised
+  # through the extern "C" boundary (vkernels::vkernels_hip) that ctypes /
+  # torch.ops.load_library / Rust consumers use.
+  add_executable(test_capi_moe test_capi_moe.hip)
+  target_link_libraries(test_capi_moe PRIVATE vkernels::vkernels vkernels::vkernels_hip)
+  target_compile_features(test_capi_moe PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_capi_moe)
+
   add_executable(test_moe_aux_correct test_moe_aux_correct.hip)
   target_link_libraries(test_moe_aux_correct PRIVATE vkernels::vkernels)
   target_compile_features(test_moe_aux_correct PRIVATE cxx_std_17)
