@@ -1,0 +1,160 @@
++ export TMPDIR=/tmp/vk41
++ TMPDIR=/tmp/vk41
++ mkdir -p /tmp/vk41
++ SRC=/users/xyao/vkernels-issue41
++ B=/tmp/vk41-build
++ echo '===== node + GPU + mem ====='
+===== node + GPU + mem =====
++ hostname
+nid003018
++ nproc
+192
++ rocm-smi --showproductname --showmeminfo vram
++ head -16 /tmp/vk41/rs.txt
+
+
+============================ ROCm System Management Interface ============================
+================================== Memory Usage (Bytes) ==================================
+GPU[0]		: VRAM Total Memory (B): 137438953472
+GPU[0]		: VRAM Total Used Memory (B): 32616448
+GPU[1]		: VRAM Total Memory (B): 137438953472
+GPU[1]		: VRAM Total Used Memory (B): 32616448
+GPU[2]		: VRAM Total Memory (B): 137438953472
+GPU[2]		: VRAM Total Used Memory (B): 32616448
+GPU[3]		: VRAM Total Memory (B): 137438953472
+GPU[3]		: VRAM Total Used Memory (B): 32616448
+==========================================================================================
+====================================== Product Info ======================================
+GPU[0]		: Card Series: 		Aqua Vanjaram [Instinct MI300A]
+GPU[0]		: Card Model: 		0x74a0
++ df -h /tmp
++ tail -1
+tmpfs           352G   40M  352G   1% /tmp
++ echo '===== configure (HIP, gfx942, benchmarks ON) ====='
+===== configure (HIP, gfx942, benchmarks ON) =====
++ tail -20
++ cmake -S /users/xyao/vkernels-issue41 -B /tmp/vk41-build -DVKERNELS_BUILD_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx942 -DCMAKE_BUILD_TYPE=Release -DVKERNELS_BUILD_BENCHMARKS=ON
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE  
+-- 
+-- ==== vkernels 0.1.0 ====
+--   C++ standard  : 17
+--   CUDA kernels  : OFF (requested ON)
+--   HIP kernels   : ON (requested ON)
+--   RCCL transport: OFF (issue #19)
+--   OFI/CXI plugin: OFF (issue #19)
+--   Tests         : ON (minitest)
+--   Benchmarks    : ON
+--   Python bindings: OFF
+--   Rust bindings  : OFF
+--   Coverage      : OFF
+--   ASan/UBSan    : OFF/OFF
+-- =================================
+-- Configuring done (4.7s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/vk41-build
++ echo 'CONFIGURE rc=0'
+CONFIGURE rc=0
++ echo '===== build (moe_fused_bench GPU + moe_fused_oracle_bench host) ====='
+===== build (moe_fused_bench GPU + moe_fused_oracle_bench host) =====
++ tail -12
++ cmake --build /tmp/vk41-build --target moe_fused_bench moe_fused_oracle_bench -j 64
++ grep -E 'error:|warning:|Built target'
+/users/xyao/vkernels-issue41/meta/benchmarks/bench_moe_fused.hip:374:51: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels-issue41/meta/benchmarks/bench_moe_fused.hip:377:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels-issue41/meta/benchmarks/bench_moe_fused.hip:377:27: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels-issue41/meta/benchmarks/bench_moe_fused.hip:378:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels-issue41/meta/benchmarks/bench_moe_fused.hip:378:18: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels-issue41/meta/benchmarks/bench_moe_fused.hip:378:34: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels-issue41/meta/benchmarks/bench_moe_fused.hip:378:48: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels-issue41/meta/benchmarks/bench_moe_fused.hip:379:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels-issue41/meta/benchmarks/bench_moe_fused.hip:379:18: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+[100%] Built target moe_fused_bench
+[ 92%] Built target vkernels
+[100%] Built target moe_fused_oracle_bench
++ echo 'BUILD rc=0'
+BUILD rc=0
++ ORACLE=/tmp/vk41-build/meta/benchmarks/moe_fused_oracle_bench
++ GPU=/tmp/vk41-build/meta/benchmarks/moe_fused_bench
++ test -x /tmp/vk41-build/meta/benchmarks/moe_fused_oracle_bench
++ test -x /tmp/vk41-build/meta/benchmarks/moe_fused_bench
++ echo
+
++ echo '############################################################'
+############################################################
++ echo '# 1. HOST ORACLE BENCH — my dequant-LUT + padding-skip win  #'
+# 1. HOST ORACLE BENCH — my dequant-LUT + padding-skip win  #
++ echo '############################################################'
+############################################################
++ /tmp/vk41-build/meta/benchmarks/moe_fused_oracle_bench --ms 1,2,4,8 --hidden 512 --ispp 1024 --topk 16 --E 256 --iters 5
+fused-MoE CPU oracle  E=256 hidden=512 ispp=1024 top_k=16 act=SiTU  iters=5
+     M       EM       real        pad      pad%  oracle_us
+     1      256         16        240     93.8%    39323.9
+     2      512         32        480     93.8%    80581.7
+     4      880         64        816     92.7%   143888.0
+     8     1328        128       1200     90.4%   223498.4
++ /tmp/vk41-build/meta/benchmarks/moe_fused_oracle_bench --ms 1 --hidden 7168 --ispp 128 --topk 16 --E 256 --iters 5
+fused-MoE CPU oracle  E=256 hidden=7168 ispp=128 top_k=16 act=SiTU  iters=5
+     M       EM       real        pad      pad%  oracle_us
+     1      256         16        240     93.8%    67244.1
++ echo
+
++ echo '############################################################'
+############################################################
++ echo '# 2. GPU BENCH — default harness (E256 h4096 i512 k6)        #'
+# 2. GPU BENCH — default harness (E256 h4096 i512 k6)        #
++ echo '#    includes CPU-oracle correctness check (M<=8)            #'
+#    includes CPU-oracle correctness check (M<=8)            #
++ echo '############################################################'
+############################################################
++ /tmp/vk41-build/meta/benchmarks/moe_fused_bench --ms 1,2,4,8,16,32,48 --ispp 512 --topk 6
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=256 hidden=4096 ispp=512 top_k=6 activation=swiglu
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1       96      398.4      394.0     0.032  0.000149        ok
+     2      192      439.1      436.5     0.057  0.000528        ok
+     4      384      559.1      556.2     0.090  0.000854        ok
+     8      768      827.9      826.3     0.122  0.000893        ok
+    16     1408     2096.7     2094.2     0.096         -      skip
+    32     2432     3167.3     3195.4     0.127         -      skip
+    48     3456     3997.7     4003.7     0.151         -      skip
+Done.
++ echo
+
++ echo '############################################################'
+############################################################
++ echo '# 3. GPU BENCH — K3 ROUTING (E256 h7168 i512 k16) + oracle   #'
+# 3. GPU BENCH — K3 ROUTING (E256 h7168 i512 k16) + oracle   #
++ echo '#    acceptance #1: validate GPU vs CPU at K3 routing shape  #'
+#    acceptance #1: validate GPU vs CPU at K3 routing shape  #
++ echo '############################################################'
+############################################################
++ /tmp/vk41-build/meta/benchmarks/moe_fused_bench situ --E 256 --hidden 7168 --ispp 512 --topk 16 --ms 1,2,4 --kmajor
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=256 hidden=7168 ispp=512 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     1107.7     1103.0     0.020   0.00157        ok
+     2      512     1250.8     1244.6     0.035     0.029        ok
+     4     1024     1824.1     1817.3     0.048    0.0292        ok
+Done.
++ echo
+
++ echo '############################################################'
+############################################################
++ echo '# 4. GPU BENCH — full K3 decode latency (i33792 M1 dummy)    #'
+# 4. GPU BENCH — full K3 decode latency (i33792 M1 dummy)    #
++ echo '#    acceptance #2: single-decode latency (~0.45 -> <=0.30)  #'
+#    acceptance #2: single-decode latency (~0.45 -> <=0.30)  #
++ echo '############################################################'
+############################################################
++ /tmp/vk41-build/meta/benchmarks/moe_fused_bench situ --E 256 --hidden 7168 --ispp 33792 --topk 16 --ms 1 --dummy --no-cpu --kmajor
+w13s: out of memory
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
++ echo
+
++ echo '===== ALL DONE ====='
+===== ALL DONE =====

@@ -170,10 +170,15 @@ int main(int argc, char** argv) {
   const int BLOCK_M = 16, group_size = 32;
   const float LIMIT = 10.0f;
 
-  const int w13_sz = E * 2 * ispp * (hidden / 2);
-  const int w13s_sz = E * 2 * ispp * (hidden / group_size);
-  const int w2_sz = E * hidden * (ispp / 2);
-  const int w2s_sz = E * hidden * (ispp / group_size);
+  // size_t: at K3 shapes (E=256, hidden=7168, ispp=33792) these products
+  // exceed INT_MAX (e.g. w13_sz = 61.9 GB) and overflow `int`, which then
+  // promoted to a bogus huge size_t threw length_error (real weights) or a
+  // spurious hipMalloc OOM (--dummy).  Cast the first operand so the whole
+  // product is computed in size_t.
+  const std::size_t w13_sz = static_cast<std::size_t>(E) * 2 * ispp * (hidden / 2);
+  const std::size_t w13s_sz = static_cast<std::size_t>(E) * 2 * ispp * (hidden / group_size);
+  const std::size_t w2_sz = static_cast<std::size_t>(E) * hidden * (ispp / 2);
+  const std::size_t w2s_sz = static_cast<std::size_t>(E) * hidden * (ispp / group_size);
 
   std::vector<uint8_t> hw13, hw13s, hw2, hw2s;
   std::vector<float> hb13, hb2;

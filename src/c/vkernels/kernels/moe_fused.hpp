@@ -214,6 +214,26 @@ int moe_align_block_size(
     int32_t* sorted_ids,
     int32_t* expert_ids);
 
+// ---------------------------------------------------------------------------
+// dequant_weight_tile / dequant_weight_tile_ref
+// ---------------------------------------------------------------------------
+// MXFP4 → bf16 weight-tile dequant.  `dequant_weight_tile` is the optimized
+// path (LUT nibble/scale decode + per-group scale hoisting); `dequant_weight_tile_ref`
+// is the original per-byte golden reference.  The two are bit-identical
+// (asserted by test_moe_fused's Fp4DequantLUTBitExact over every byte × scale).
+//
+// out_bf16: [K][N] uint16_t — K rows of N bf16 each (transposed)
+// stride_packed/stride_scale_n/stride_scale_k: byte/entry strides of the
+// [N,K/2] packed and [N,K/group] scale sources.
+void dequant_weight_tile(const uint8_t* packed, const uint8_t* scale,
+                         uint16_t* out_bf16,
+                         int N, int K, int group_size,
+                         int stride_packed, int stride_scale_n, int stride_scale_k);
+void dequant_weight_tile_ref(const uint8_t* packed, const uint8_t* scale,
+                             uint16_t* out_bf16,
+                             int N, int K, int group_size,
+                             int stride_packed, int stride_scale_n, int stride_scale_k);
+
 }  // namespace vkernels::kernels
 
 

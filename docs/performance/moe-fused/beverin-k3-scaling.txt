@@ -1,0 +1,8 @@
+ispp scaling (E=256, hidden=7168, top_k=16, --kmajor), MI300A gfx942:
+  ispp= 512 (CPU oracle ON):  M=1 825us(0.027TF rel0.0017 ok) M=2 1058us(0.042 rel0.029) M=4 1697us(0.052 rel0.029)  [reproduced x2]
+  ispp=1024 (--dummy):        M=1 1289us(0.034) M=2 1896us(0.046) M=4 3659us(0.048) M=8 7389us(0.048)
+  ispp=2048 (--dummy):        M=1 2249us(0.039) M=2 3980us(0.044) M=4 7916us(0.045)
+  ispp=4096 (--dummy):        GPU memory access fault (E=256)
+  ispp=33792 E=32  (--dummy): GPU memory access fault (per-GPU TP-shard shape)
+  ispp=33792 E=256 (--dummy): GPU memory access fault (full model)
+Default harness (E=256 h4096 i512 k6, swiglu): M=1 398us(0.032 rel0.00015 ok) — matches issue's ~0.45ms baseline
