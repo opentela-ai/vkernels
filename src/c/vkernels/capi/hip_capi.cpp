@@ -34,13 +34,14 @@ extern "C" void vk_hip_fused_moe_mxfp4(
     const int32_t* sorted_ids, const int32_t* expert_ids,
     int EM, float swiglu_limit,
     int activation, float beta, float linear_beta,
-    const float* b13, const float* b2, int block_size) {
+    const float* b13, const float* b2, int block_size, void* stream) {
   vkernels::kernels::hip::fused_moe_mxfp4(
       A, w13, w13_scale, w2, w2_scale,
       topk_ids, topk_w, act_scratch, out,
       M, hidden, ispp, top_k,
       sorted_ids, expert_ids, EM, swiglu_limit,
-      activation, beta, linear_beta, b13, b2, block_size);
+      activation, beta, linear_beta, b13, b2, block_size, /*kmajor=*/false,
+      stream);
 }
 
 // --- MLA forward (absorbed form) ---
