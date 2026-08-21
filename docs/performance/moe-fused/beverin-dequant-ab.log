@@ -1,0 +1,35 @@
+dequant A/B on beverin (MI300A / gfx942 node CPU), bench_dequant_ab
+=================================================================
+Times dequant_weight_tile (optimized: LUT nibble/scale decode + per-group
+ue8m0 scale hoisting) vs dequant_weight_tile_ref (original per-byte loop)
+over the exact tile grid the oracle walks for one real expert's gate+up
+weights, after re-asserting bit-identical output on the bench's own data.
+
+Node: AMD Instinct MI300A Accelerator (192 CPUs), gfx942.
+
+############ K3 shape h7168 i512 ############
+bit-exact check: PASS (7340032 bf16 values across 1792 tiles)
+dequant A/B  hidden=7168 ispp=512  tiles/expert=1792  iters=9
+impl              gate_us      up_us     tot_us
+ref (orig)        13656.4    13654.1    27310.4
+opt (LUT)          4842.1     4836.3     9678.3
+speedup opt/ref = 2.82x   (opt 5.40 us/tile, ref 15.24 us/tile)
+
+############ h7168 i128 ############
+bit-exact check: PASS (1835008 bf16 values across 448 tiles)
+dequant A/B  hidden=7168 ispp=128  tiles/expert=448  iters=9
+impl              gate_us      up_us     tot_us
+ref (orig)         3400.9     3411.8     6812.7
+opt (LUT)          1199.7     1198.4     2398.0
+speedup opt/ref = 2.84x   (opt 5.35 us/tile, ref 15.21 us/tile)
+
+############ default harness h4096 i512 ############
+bit-exact check: PASS (4194304 bf16 values across 1024 tiles)
+dequant A/B  hidden=4096 ispp=512  tiles/expert=1024  iters=9
+impl              gate_us      up_us     tot_us
+ref (orig)         7788.3     7796.7    15585.0
+opt (LUT)          2759.4     2759.0     5518.3
+speedup opt/ref = 2.82x   (opt 5.39 us/tile, ref 15.22 us/tile)
+
+Summary: ~2.8x across all shapes (median-of-9).  The dequant is the
+dominant cost in the CPU oracle, so the oracle sees ~2.8x on this hardware.

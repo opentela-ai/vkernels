@@ -217,15 +217,27 @@ row. `expert_ids[block] == -1` (pure-padding blocks) return immediately.
 
 ---
 
-## Weight gather
+## Routing-weight gather (eliminated)
 
-The xkernels host API takes the raw `[M, top_k]` routing weight matrix. A
-tiny `gather_weights_kernel` reorders it into `sorted_w[EM]` matching
-`sorted_ids` before stage 1:
+The xkernels host API takes the **raw `[M, top_k]` routing-weight
+matrix**. The down-combine epilogue reads `topk_w[flat]` directly, where
+`flat = sorted_ids[...]` is already guarded by `flat < M*top_k`:
 
 ```
-sorted_w[i] = (sorted_ids[i] in [0, M*top_k)) ? topk_w[sorted_ids[i]] : 0
+v *= topk_w[flat];          // in the (flat < M*top_k) branch
 ```
+
+Because `moe_align_block_size` pads `sorted_ids` with the out-of-bounds
+flat index `N = M*top_k` (never negative), `topk_w[flat]` is provably
+in bounds inside the guard. This removes the former
+`gather_weights_kernel` and the per-call `sorted_w[EM]` buffer entirely:
+the launcher performs no device allocation of its own and launches one
+fewer kernel per forward (issue #41, items 1 + 2).
+
+`act_scratch` `[EM, ispp]` bf16 remains a **caller-provided scratch
+buffer**: a backend serving a 61-layer model allocates it once and reuses
+it across every forward pass, instead of paying 122 allocator round-trips
+per generated token (issue #41, item 1).
 
 ---
 
@@ -285,6 +297,7 @@ form.
 | `b13 == nullptr` / `b2 == nullptr` | Bias skipped for that stage |
 | `swiglu_limit <= 0` | No clamping |
 | `out` not zero-initialised | Undefined (stage 1 accumulates into it) |
+| `act_scratch` not caller-owned | Undefined — the launcher does no per-call allocation (issue #41, item 1); the scratch buffer is owned and reused by the caller. No `sorted_w` scratch is required (the combine reads `topk_w` directly, items 1+2). |
 
 ---
 
@@ -301,10 +314,17 @@ heavily padding-dominated (e.g. M=1 has 6 real rows but 96 padded rows).
 
 | M | vkernels HIP (MI250X) | vkernels HIP (MI300A) | xkernels torch (MI250X) | xkernels torch (MI300A) |
 |---|---:|---:|---:|---:|
-| 1  | 0.66 | 0.45 | 6.0  | 4.4  |
-| 8  | 3.4  | 0.89 | ~30  | ~15  |
-| 16 | 4.1  | 2.2  | ~40  | ~30  |
-| 48 | 10.4 | 4.0  | 162.2 | 127.2 |
+| 1  | 0.66 | 0.39 | 6.0  | 4.4  |
+| 8  | 3.4  | 0.81 | ~30  | ~15  |
+| 16 | 4.1  | 2.03 | ~40  | ~30  |
+| 48 | 10.4 | 3.96 | 162.2 | 127.2 |
+
+The MI300A `vkernels HIP` column above is the post-issue-41 figure
+(no per-call allocation + gather removed, items 1-2), measured as
+batched steady-state latency (100 launches, one `hipDeviceSynchronize`,
+divided).  It is ~8-12% lower than the pre-item-1 baseline at small M
+(was 0.45 / 0.89 / 2.2 / 4.0 ms); the MI250X and xkernels columns are
+unchanged from the original cross-check.
 
 GPU results are exact matches against the CPU reference
 (`max_rel < 0.00001` decode, `< 0.02` prefill) on both gfx90a and gfx942.
@@ -345,6 +365,44 @@ accumulator VGPRs and ~1.5× slower).
 
 ## Current limitations / future work
 
+- **No per-call allocation + gather eliminated (issue #41, items 1+2 —
+  done)**: `act_scratch` is caller-provided; the `hip::fused_moe_mxfp4`
+  launcher performs no `hipMalloc`/`hipFree` of its own, so a 61-layer model
+  no longer pays 122 allocator round-trips per generated token. Item 2 also
+  removed the per-forward `gather_weights_kernel` and the `sorted_w[EM]`
+  buffer: the down-combine epilogue reads `topk_w[flat]` directly (the
+  `flat < M*top_k` guard already makes `topk_w[flat]` in bounds), so the
+  atomic-add scatter is the only remaining combine cost. Items 3-4 of
+  issue #41 are also done (see below); item 5 (wavefront-specialized
+  producer/consumer prefill) remains open.
+- **`__launch_bounds__` for decode + prefill (issue #41, item 3 - done)**:
+  Both prefill kernels carry `__launch_bounds__(256, 4)` and both decode
+  kernels carry `__launch_bounds__(64, 10/16)`.  On gfx942 the prefill
+  kernels are **LDS-limited at 4 blocks/CU** (16 KB x 4 = 64 KB, the full
+  CU scratch); `__launch_bounds__` reduced gateup-prefill VGPRs 112->107
+  and down-prefill 81->75 but did not change occupancy because VGPRs were
+  never the binding resource.  The decode kernels are **grid-limited**, not
+  occupancy-limited: at M=1 the gateup grid is only 192 blocks for 228 CUs
+  (0.84/CU), so no amount of register reduction can raise concurrency.
+- **K-major weight layout study (issue #41, item 4 - done)**: an
+  alternative gate/up weight packing `[E,2,hidden/2,ispp]` (K-major, N
+  contiguous) was implemented behind a `kmajor` launcher flag and the
+  bench's `--kmajor` repack.  It makes the 16 dequant columns owned by each
+  decode block read **one coalesced cache line** per K-step instead of 16
+  scattered lines (N-major stride `hidden/2`).  Measured at the harness
+  shapes (E=256, hidden=4096, ispp=512, top_k=6, gfx942): K-major is
+  **slower at M=1-4** (e.g. 479 vs 395 µs at M=1) because fewer outstanding
+  memory requests reduce memory-level parallelism when the grid is below
+  1 block/CU, **even at M=8** (813 vs 813 µs), and **faster at
+  M>=16** (1688 vs 2034 µs at M=16) once bandwidth dominates.  The
+  crossover is ~M=8.  Conclusion: K-major is a throughput optimization for
+  larger M, not a decode-latency optimization; the default remains N-major.
+  (Numbers are batched steady-state latency — 100 kernel launches with
+  no per-launch sync, then a single `hipDeviceSynchronize`, divided by
+  100 — which the per-iteration `hipEvent` timing of this bench agrees
+  with to within ~1% at every M, confirming both are faithful.  An
+  earlier session reported a spurious ~4.5 µs at M=1 that did not
+  reproduce under this methodology; the current numbers supersede it.)
 - **Occupancy-bound, not barrier-bound** (measured on gfx90a): LDS
   double-buffering was implemented and **reverted** — doubling the decode
   LDS (6→12 KB) halved blocks/CU and slowed decode by ~50%, because the
@@ -380,3 +438,23 @@ src/c/vkernels/kernels/
 ├── moe_fused.hip       # 2 HIP kernels + gather + hip::fused_moe_mxfp4 launcher
 └── moe_device.hip      # shared device helpers (E2M1/ue8m0 decode, bf16 rounding)
 ```
+
+## Caller contract: persistent, capture-safe scratch
+
+Issue #41, item 1 requires the **caller** to own and reuse the scratch
+buffers (`act_scratch`, `out`, `sorted_ids`, `expert_ids`) — the launcher
+performs no device allocation of its own. A naive ctypes wrapper that
+does `torch.empty()` per call **faults under CUDA-graph capture/replay**:
+the fresh caching-allocator storage is not replay-stable, so when the
+captured graph replays the C kernel runs against memory the allocator has
+recycled (`Memory access fault by GPU node-X`).
+
+The validated, reusable fix lives in
+[`vkernels.vllm_experts`](../python-bindings.md#vllm-integration-optional-vkernelsvllm_experts):
+`CaptureSafeScratch` sizes each `(device, key)` buffer ONCE (on the eager
+profile/warmup run, before capture) and slices into it forever after,
+refusing to grow while a capture session is active — so any ctypes caller
+(whether or not it uses vLLM) should reuse it instead of allocating per
+call. The accompanying `VkernelFusedExperts` is the drop-in vLLM
+`FusedMoE` expert layer (gfx942 / Kimi-K3) that backs all C-ABI scratch
+this way and launches on the caller's stream.

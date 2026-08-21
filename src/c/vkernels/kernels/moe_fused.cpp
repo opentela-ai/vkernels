@@ -7,6 +7,7 @@
 // Always compiled; independent of GPU toolkit presence.
 #include "vkernels/kernels/moe_fused.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -20,7 +21,7 @@ namespace {
 // ======================================================================
 //  E2M1 nibble decode (replicated from moe.cpp / moe.hip for CPU reference)
 // ======================================================================
-uint32_t fp4nib_to_f32bits_local(int nibble) {
+constexpr uint32_t fp4nib_to_f32bits_local(int nibble) {
   int s = (nibble >> 3) & 1;
   int e = (nibble >> 1) & 3;
   int m = nibble & 1;
@@ -63,6 +64,36 @@ float ue8m0_to_float(uint8_t s) {
 }
 
 // ======================================================================
+//  Pre-decoded LUTs (bit-identical to fp4nib_to_f32bits_local / ue8m0_to_float)
+// ======================================================================
+// dequant_weight_tile reads these flat arrays instead of re-running the
+// branchy nibble decode twice per packed byte, and hoists the per-group
+// ue8m0 scale out of the per-byte loop (the scale is shared across
+// `group_size` consecutive K elements).  The nibble table is a compile-
+// time constant; the 256-entry scale table is built once from
+// ue8m0_to_float, so both LUTs are bit-identical to the functions they
+// replace by construction (no hand-maintained magic numbers).
+static constexpr uint32_t kFp4NibF32[16] = {
+    fp4nib_to_f32bits_local(0),  fp4nib_to_f32bits_local(1),
+    fp4nib_to_f32bits_local(2),  fp4nib_to_f32bits_local(3),
+    fp4nib_to_f32bits_local(4),  fp4nib_to_f32bits_local(5),
+    fp4nib_to_f32bits_local(6),  fp4nib_to_f32bits_local(7),
+    fp4nib_to_f32bits_local(8),  fp4nib_to_f32bits_local(9),
+    fp4nib_to_f32bits_local(10), fp4nib_to_f32bits_local(11),
+    fp4nib_to_f32bits_local(12), fp4nib_to_f32bits_local(13),
+    fp4nib_to_f32bits_local(14), fp4nib_to_f32bits_local(15)};
+
+const float* ue8m0_scale_table() {
+  static const std::array<float, 256> lut = []() {
+    std::array<float, 256> a{};
+    for (int i = 0; i < 256; ++i)
+      a[static_cast<std::size_t>(i)] = ue8m0_to_float(static_cast<uint8_t>(i));
+    return a;
+  }();
+  return lut.data();
+}
+
+// ======================================================================
 //  Dequant one packed byte → two bf16 values
 // ======================================================================
 // Returns two fp32 values (dequantized); the caller rounds to bf16.
@@ -81,39 +112,6 @@ void dequant_byte(uint8_t packed_byte, uint8_t scale_byte,
 }
 
 // ======================================================================
-//  Dequant a [N, K] tile of packed weights into bf16 buffer
-// ======================================================================
-// packed:   [N, K/2]        uint8  — src, row-major, N rows of K/2 bytes each
-// scale:    [N, K/group]    uint8  — per-group ue8m0 scale
-// out_bf16: [K][N]          uint16_t — dst, K rows of N bf16 each (transposed)
-// N, K, group_size: dimensions
-// stride_packed:   stride in bytes from row n to row n+1 (= K/2)
-// stride_scale_n:  stride in bytes from scale[n] to scale[n+1] (= K/group)
-// stride_scale_k:  stride in scale entries along K (= 1)
-void dequant_weight_tile(const uint8_t* packed, const uint8_t* scale,
-                         uint16_t* out_bf16,
-                         int N, int K, int group_size,
-                         int stride_packed, int stride_scale_n, int stride_scale_k) {
-  for (int n = 0; n < N; ++n) {
-    for (int kp = 0; kp < K / 2; ++kp) {
-      uint8_t pb = packed[n * stride_packed + kp];
-      int gi = (kp * 2) / group_size;
-      uint8_t sc = scale[n * stride_scale_n + gi * stride_scale_k];
-
-      float v[2];
-      dequant_byte(pb, sc, v);
-
-      // Round to bf16
-      for (int i = 0; i < 2; ++i) {
-        uint32_t bits;
-        std::memcpy(&bits, &v[i], sizeof(float));
-        out_bf16[(kp * 2 + i) * N + n] = f32bits_to_bf16_local(bits);
-      }
-    }
-  }
-}
-
-// ======================================================================
 //  bf16 → float
 // ======================================================================
 float bf16_to_float(uint16_t v) {
@@ -124,6 +122,83 @@ float bf16_to_float(uint16_t v) {
 }
 
 }  // namespace
+
+// ======================================================================
+//  Dequant a [N, K] tile of packed weights into bf16 buffer (optimized)
+// ======================================================================
+// packed:   [N, K/2]        uint8  — src, row-major, N rows of K/2 bytes each
+// scale:    [N, K/group]    uint8  — per-group ue8m0 scale
+// out_bf16: [K][N]          uint16_t — dst, K rows of N bf16 each (transposed)
+//
+// Optimized vs the golden reference (dequant_weight_tile_ref) in two
+// bit-exact ways: (1) the 16-entry fp4-nibble decode and the 256-entry
+// ue8m0 scale are read from LUTs built once from fp4nib_to_f32bits_local /
+// ue8m0_to_float instead of re-running the branchy decode twice per byte;
+// (2) the per-group ue8m0 scale (shared across `group_size` consecutive K
+// elements) is hoisted out of the per-byte inner loop.  Output is
+// bit-identical to dequant_weight_tile_ref (see test_moe_fused's
+// Fp4DequantLUTBitExact).
+void dequant_weight_tile(const uint8_t* packed, const uint8_t* scale,
+                         uint16_t* out_bf16,
+                         int N, int K, int group_size,
+                         int stride_packed, int stride_scale_n, int stride_scale_k) {
+  const float* scale_tab = ue8m0_scale_table();
+  for (int n = 0; n < N; ++n) {
+    const uint8_t* row_packed =
+        packed + static_cast<std::size_t>(n) * stride_packed;
+    const uint8_t* row_scale =
+        scale + static_cast<std::size_t>(n) * stride_scale_n;
+    float sc_f = 0.0f;
+    int prev_gi = -1;
+    for (int kp = 0; kp < K / 2; ++kp) {
+      int gi = (kp * 2) / group_size;
+      if (gi != prev_gi) {
+        sc_f = scale_tab[row_scale[gi * stride_scale_k]];
+        prev_gi = gi;
+      }
+      uint8_t pb = row_packed[kp];
+      uint32_t bl = kFp4NibF32[pb & 0x0F];
+      uint32_t bh = kFp4NibF32[(pb >> 4) & 0x0F];
+      float flo, fhi;
+      std::memcpy(&flo, &bl, sizeof(float));
+      std::memcpy(&fhi, &bh, sizeof(float));
+      float v0 = flo * sc_f;
+      float v1 = fhi * sc_f;
+      uint32_t b0, b1;
+      std::memcpy(&b0, &v0, sizeof(float));
+      std::memcpy(&b1, &v1, sizeof(float));
+      out_bf16[(kp * 2)     * N + n] = f32bits_to_bf16_local(b0);
+      out_bf16[(kp * 2 + 1) * N + n] = f32bits_to_bf16_local(b1);
+    }
+  }
+}
+
+// ======================================================================
+//  dequant_weight_tile_ref — golden reference (original per-byte loop)
+// ======================================================================
+// The original per-byte dequant (one ue8m0 decode and two branchy fp4
+// nibble decodes per byte, no scale hoisting).  Kept so test_moe_fused's
+// Fp4DequantLUTBitExact can assert dequant_weight_tile is bit-identical to
+// it across every packed-byte × scale combination.
+void dequant_weight_tile_ref(const uint8_t* packed, const uint8_t* scale,
+                             uint16_t* out_bf16,
+                             int N, int K, int group_size,
+                             int stride_packed, int stride_scale_n, int stride_scale_k) {
+  for (int n = 0; n < N; ++n) {
+    for (int kp = 0; kp < K / 2; ++kp) {
+      uint8_t pb = packed[n * stride_packed + kp];
+      int gi = (kp * 2) / group_size;
+      uint8_t sc = scale[n * stride_scale_n + gi * stride_scale_k];
+      float v[2];
+      dequant_byte(pb, sc, v);
+      for (int i = 0; i < 2; ++i) {
+        uint32_t bits;
+        std::memcpy(&bits, &v[i], sizeof(float));
+        out_bf16[(kp * 2 + i) * N + n] = f32bits_to_bf16_local(bits);
+      }
+    }
+  }
+}
 
 // ======================================================================
 //  Epilogue: SwiGLU or SiTU over one (gate, up) pair
@@ -231,8 +306,9 @@ void moe_gateup_cpu(
                               hidden_k / 2, hidden_k / group_size, 1);
         }
 
-        // GEMM: acc_gate += A × gate^T
+        // GEMM: acc_gate += A × gate^T (skip padding rows: zeroed-A → 0)
         for (int m = 0; m < BLOCK_M; ++m) {
+          if (sorted_ids[token_base + m] >= N) continue;  // padding contributes 0
           for (int n = 0; n < BLOCK_N; ++n) {
             float dot = 0.0f;
             for (int k = 0; k < BLOCK_K; ++k) {
@@ -256,8 +332,9 @@ void moe_gateup_cpu(
                               hidden_k / 2, hidden_k / group_size, 1);
         }
 
-        // GEMM: acc_up += A × up^T
+        // GEMM: acc_up += A × up^T (skip padding rows: zeroed-A → 0)
         for (int m = 0; m < BLOCK_M; ++m) {
+          if (sorted_ids[token_base + m] >= N) continue;  // padding contributes 0
           for (int n = 0; n < BLOCK_N; ++n) {
             float dot = 0.0f;
             for (int k = 0; k < BLOCK_K; ++k) {
@@ -406,8 +483,9 @@ void moe_down_cpu(
                               ispp_k / 2, ispp_k / group_size, 1);
         }
 
-        // GEMM: acc += A × down^T
+        // GEMM: acc += A × down^T (skip padding rows: zeroed-A → 0)
         for (int m = 0; m < BLOCK_M; ++m) {
+          if (sorted_ids[token_base + m] >= N) continue;  // padding contributes 0
           for (int n = 0; n < BLOCK_N; ++n) {
             float dot = 0.0f;
             for (int k = 0; k < BLOCK_K; ++k) {

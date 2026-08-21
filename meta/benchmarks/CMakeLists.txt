@@ -25,6 +25,35 @@ target_link_libraries(pipeline_boundary_bench PRIVATE vkernels::vkernels)
 target_compile_features(pipeline_boundary_bench PRIVATE cxx_std_17)
 vkernels_set_warnings(pipeline_boundary_bench)
 
+# --- Host-only benchmark (no GPU needed): MXFP4 fused-MoE CPU oracle ---
+# The CPU reference (fused_moe_mxfp4_cpu) is the golden oracle the gfx942/
+# gfx90a HIP kernels are validated against (issue #41, acceptance criterion
+# #1: "validated against the CPU oracle at K3 shapes").  The HIP bench marks
+# the device kernel but notes "the CPU oracle is impractical at ispp=33792"
+# (its --no-cpu flag skips correctness there for exactly that reason).  This
+# bench isolates the time the oracle spends on padding rows (zeroed-A tiles
+# that contribute exactly zero) and is the CI-verifiable surface for the
+# oracle-speed work that makes K3-shape validation feasible.  K3 decode
+# (M=1, top_k=16) pads each 16-row block to ~94% padding.
+add_executable(moe_fused_oracle_bench bench_moe_fused_oracle.cpp)
+target_link_libraries(moe_fused_oracle_bench PRIVATE vkernels::vkernels)
+target_compile_features(moe_fused_oracle_bench PRIVATE cxx_std_17)
+vkernels_set_warnings(moe_fused_oracle_bench)
+
+# --- Host-only A/B for the MXFP4 weight-tile dequant (issue #41) ---
+# Times dequant_weight_tile (optimized: LUT nibble/scale decode +
+# per-group scale hoisting) vs dequant_weight_tile_ref (the original
+# per-byte loop) over the exact tile grid the oracle walks for one real
+# expert's gate+up weights, after re-asserting the two are bit-identical
+# on the bench's own data.  The dequant is the dominant oracle cost, so
+# the ratio here is the speedup the oracle sees.  Run anywhere; run on a
+# beverin compute node for the on-MI300A-CPU number (closes the gap that
+# the 4.6x dev-host measurement was never saved as a log).
+add_executable(bench_dequant_ab bench_dequant_ab.cpp)
+target_link_libraries(bench_dequant_ab PRIVATE vkernels::vkernels)
+target_compile_features(bench_dequant_ab PRIVATE cxx_std_17)
+vkernels_set_warnings(bench_dequant_ab)
+
 if(NOT VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
   message(STATUS "vkernels: benchmarks skipped (no GPU toolkit)")
   return()
@@ -101,6 +130,14 @@ if(VKERNELS_HAS_HIP)
   target_link_libraries(test_moe_fused_correct PRIVATE vkernels::vkernels)
   target_compile_features(test_moe_fused_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_moe_fused_correct)
+
+  # C ABI correctness: same data as test_moe_fused_correct, exercised
+  # through the extern "C" boundary (vkernels::vkernels_hip) that ctypes /
+  # torch.ops.load_library / Rust consumers use.
+  add_executable(test_capi_moe test_capi_moe.hip)
+  target_link_libraries(test_capi_moe PRIVATE vkernels::vkernels vkernels::vkernels_hip)
+  target_compile_features(test_capi_moe PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_capi_moe)
 
   add_executable(test_moe_aux_correct test_moe_aux_correct.hip)
   target_link_libraries(test_moe_aux_correct PRIVATE vkernels::vkernels)

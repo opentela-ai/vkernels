@@ -340,7 +340,51 @@ pyproject.toml                # uv-managed Python project (src-layout, numpy dep
 │   │       ├── kernels.py    # public elementwise/reduce/gemm API
 │   │       ├── comm.py       # public collectives/overlap/p2p API
 │   │       ├── discovery.py  # C++/CUDA source scanner (no deps)
+│   │       ├── vllm_experts.py # OPTIONAL vLLM integration (torch + vLLM)
 │   │       └── cli/          # the `vkl` command
 │   └── rust/                 # Rust bindings (workspace: vkernels-sys FFI + vkernels)
 └── tests/python/             # unittest suites (CTest, uv, make py-test)
 ```
+
+## vLLM integration (optional): `vkernels.vllm_experts`
+
+`vkernels.vllm_experts` is an **opt-in** integration that drives the gfx942
+HIP C ABI (`vk_hip_fused_moe_mxfp4`, PR #44) from a vLLM `FusedMoE` expert
+layer, replacing the broken AITER/Triton MoE path for Kimi-K3 on MI300A.
+It is **not** imported by `import vkernels` (which stays numpy-only); pull
+it in explicitly:
+
+```python
+from vkernels.vllm_experts import VkernelFusedExperts, CaptureSafeScratch
+```
+
+The module has two layers:
+
+* **`CaptureSafeScratch`** — the reusable, torch-only persistent-scratch
+  manager (issue #41, item 1). The HIP launcher performs **no device
+  allocation of its own**; every scratch buffer (`act_scratch`, `out`,
+  `sorted_ids`, `expert_ids`) is caller-provided and **reused** across
+  calls. `CaptureSafeScratch` enforces that contract: each
+  `(device, key)` buffer is sized ONCE (on the eager profile/warmup run,
+  before any CUDA-graph capture) and sliced into forever after, so the
+  storage address is stable and a captured graph replays correctly.
+  **Growing a buffer while a capture session is active is refused**
+  (the freed storage is referenced by the captured graph and would fault
+  on replay — the root cause of the "Memory access fault by GPU node-X"
+  crashes on the per-call `torch.empty()` wrapper). Usable without vLLM:
+  any callable `capture_probe` can be injected (defaults to
+  `torch.cuda.is_current_stream_capturing()`).
+
+* **`VkernelFusedExperts`** — the vLLM `UnfusedOAITritonExperts` subclass
+  that issues the kernels on PyTorch's *current* stream (no per-launch
+  device sync, so each MoE layer is no longer a cross-stream TP barrier)
+  and backs all C-ABI scratch with `CaptureSafeScratch`. Built lazily:
+  `from vkernels.vllm_experts import VkernelFusedExperts` imports vLLM on
+  first use (use the `_vllm_capture_probe` to also cover the breakable
+  cudagraph eager-break window, issue #42).
+
+`find_libvkernels_hip` resolves the shared library via `VKERNELS_LIB`,
+`$K3/home/pylib/`, `$VKERNELS_DIR/build/...`, then
+`ctypes.util.find_library`. `moe_align_block_size_with_map` is the
+`expert_map`-aware (TP-sharded) CPU helper that matches
+`vkernels.kernels.moe_align_block_size` for the no-map case.

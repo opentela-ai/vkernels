@@ -16,6 +16,8 @@
 
 using vkernels::kernels::fused_moe_mxfp4_cpu;
 using vkernels::kernels::moe_align_block_size;
+using vkernels::kernels::dequant_weight_tile;
+using vkernels::kernels::dequant_weight_tile_ref;
 
 namespace {
 
@@ -576,4 +578,159 @@ TEST(MoeAlign, Basic8x4) {
   }
   EXPECT_EQ(cnt16, 1);
   EXPECT_EQ(cnt31, 1);
+}
+
+// ======================================================================
+//  Fp4DequantLUTBitExact — optimized dequant must be bit-identical to the
+//  golden per-byte reference (dequant_weight_tile_ref) across EVERY
+//  packed-byte × ue8m0-scale combination.  This is the regression guard
+//  for the LUT + scale-hoisting optimization (issue #41): the CPU oracle
+//  is the golden reference the gfx942 kernel is validated against, so the
+//  dequant must change zero output bits.
+// ======================================================================
+TEST(FusedMoe, Fp4DequantLUTBitExact) {
+  constexpr int N = 64, K = 64, group_size = 32;
+  constexpr int stride_packed = K / 2;          // 32
+  constexpr int stride_scale_n = K / group_size;  // 2
+  constexpr int stride_scale_k = 1;
+
+  // packed[n][kp] = (n*stride_packed + kp) & 0xFF → every byte 0..255
+  // appears (n=0..7 covers kp-indices 0..255).
+  uint8_t packed[N * stride_packed];
+  for (int n = 0; n < N; ++n)
+    for (int kp = 0; kp < stride_packed; ++kp)
+      packed[n * stride_packed + kp] =
+          static_cast<uint8_t>((n * stride_packed + kp) & 0xFF);
+
+  uint8_t scale[N * stride_scale_n];
+  uint16_t out_new[K * N], out_ref[K * N];
+
+  // Sweep every ue8m0 scale value (uniform within a call).  Because packed
+  // contains every byte 0..255, this exercises all 256×256 byte×scale pairs.
+  for (int s = 0; s < 256; ++s) {
+    for (int i = 0; i < N * stride_scale_n; ++i)
+      scale[i] = static_cast<uint8_t>(s);
+    std::memset(out_new, 0xA5, sizeof(out_new));
+    std::memset(out_ref, 0x5A, sizeof(out_ref));
+    dequant_weight_tile(packed, scale, out_new, N, K, group_size,
+                        stride_packed, stride_scale_n, stride_scale_k);
+    dequant_weight_tile_ref(packed, scale, out_ref, N, K, group_size,
+                            stride_packed, stride_scale_n, stride_scale_k);
+    EXPECT_EQ(std::memcmp(out_new, out_ref, sizeof(out_new)), 0);
+  }
+}
+
+// ======================================================================
+//  Fp4DequantLUTHoistVaryingScale — the scale-hoisting path (which
+//  recomputes the ue8m0 scale only at group boundaries) must stay
+//  bit-identical to the per-byte reference when the scale varies across
+//  the two K-groups of a tile.
+// ======================================================================
+TEST(FusedMoe, Fp4DequantLUTHoistVaryingScale) {
+  constexpr int N = 64, K = 64, group_size = 32;
+  constexpr int stride_packed = K / 2;
+  constexpr int stride_scale_n = K / group_size;  // 2 (gi 0 then 1)
+  constexpr int stride_scale_k = 1;
+
+  uint64_t rng = 0x9E3779B97F4A7C15ULL;  // fixed seed
+  auto next = [&]() {
+    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+    return rng;
+  };
+
+  uint8_t packed[N * stride_packed], scale[N * stride_scale_n];
+  uint16_t out_new[K * N], out_ref[K * N];
+  for (int trial = 0; trial < 300; ++trial) {
+    for (int i = 0; i < N * stride_packed; ++i)
+      packed[i] = static_cast<uint8_t>(next());
+    for (int i = 0; i < N * stride_scale_n; ++i)
+      scale[i] = static_cast<uint8_t>(next());
+    std::memset(out_new, 0, sizeof(out_new));
+    std::memset(out_ref, 0, sizeof(out_ref));
+    dequant_weight_tile(packed, scale, out_new, N, K, group_size,
+                        stride_packed, stride_scale_n, stride_scale_k);
+    dequant_weight_tile_ref(packed, scale, out_ref, N, K, group_size,
+                            stride_packed, stride_scale_n, stride_scale_k);
+    EXPECT_EQ(std::memcmp(out_new, out_ref, sizeof(out_new)), 0);
+  }
+}
+
+// ======================================================================
+//  K3RoutingTopK16 — the acceptance-criterion-#1 routing structure for
+//  issue #41: E=256, top_k=16, M=1 (one decode token fans out to 16
+//  distinct experts).  Every 16-row block then holds 1 real row and 15
+//  padding rows (93.8% padding) — exactly the path the padding-skip GEMM
+//  optimizes and that the bench measures.  With all weights = 1.0 and
+//  A = 1.0: gate = up = hidden, act = SwiGLU(hidden) = silu(hidden)*hidden,
+//  and out = top_k * act * ispp, so the full oracle (gate/up GEMM + SiTU
+//  epilogue + down GEMM + combine) is validated against analytically-known
+//  values at the K3 routing shape the GPU kernel must match.
+// ======================================================================
+TEST(FusedMoe, K3RoutingTopK16) {
+  constexpr int M = 1, hidden = 128, ispp = 64;
+  constexpr int group_size = 32, BLOCK_M = 16, top_k = 16, E = 256;
+  constexpr int N = M * top_k;
+
+  std::vector<uint16_t> A_bf16(static_cast<std::size_t>(M) * hidden);
+  for (auto& v : A_bf16) v = f2bf(1.0f);
+
+  uint8_t one_byte = pack_e2m1_pair(1.0f, 1.0f);
+  std::vector<uint8_t> w13(static_cast<std::size_t>(E) * 2 * ispp * hidden / 2, one_byte);
+  std::vector<uint8_t> w13_scale(static_cast<std::size_t>(E) * 2 * ispp * hidden / group_size, 127);
+  std::vector<uint8_t> w2(static_cast<std::size_t>(E) * hidden * ispp / 2, one_byte);
+  std::vector<uint8_t> w2_scale(static_cast<std::size_t>(E) * hidden * ispp / group_size, 127);
+
+  // Route token 0 to experts 0..15 (K3 decode: 16 distinct experts).
+  std::vector<int32_t> topk_ids(N);
+  for (int s = 0; s < top_k; ++s) topk_ids[s] = s;
+  std::vector<float> topk_w(N, 1.0f);
+
+  int EM_max = ((N + E * BLOCK_M) / BLOCK_M) * BLOCK_M + BLOCK_M;
+  std::vector<int32_t> sorted_ids(EM_max, -1);
+  std::vector<int32_t> expert_ids(EM_max / BLOCK_M, -1);
+  int EM = moe_align_block_size(topk_ids.data(), M, top_k, BLOCK_M, E,
+                                sorted_ids.data(), expert_ids.data());
+  sorted_ids.resize(static_cast<std::size_t>(EM));
+  expert_ids.resize(static_cast<std::size_t>(EM / BLOCK_M));
+
+  // Gather routing weights into the sorted order the oracle consumes
+  // (the HIP launcher reads topk_w[flat] directly — item 2).
+  std::vector<float> topk_w_sorted(static_cast<std::size_t>(EM), 0.0f);
+  int real = 0;
+  for (int i = 0; i < EM; ++i)
+    if (sorted_ids[i] >= 0 && sorted_ids[i] < N) {
+      topk_w_sorted[i] = topk_w[sorted_ids[i]]; ++real;
+    }
+  EXPECT_EQ(real, top_k);  // exactly the top_k real rows
+
+  std::vector<uint16_t> act_h(static_cast<std::size_t>(EM) * ispp, 0);
+  std::vector<float> out_h(static_cast<std::size_t>(M) * hidden, 0.0f);
+
+  fused_moe_mxfp4_cpu(
+      A_bf16.data(), w13.data(), w13_scale.data(),
+      w2.data(), w2_scale.data(),
+      sorted_ids.data(), topk_w_sorted.data(), expert_ids.data(),
+      act_h.data(), out_h.data(),
+      M, hidden, ispp, top_k, EM, group_size,
+      0.0f, 0, 4.0f, 25.0f, nullptr, nullptr);
+
+  float silu_h = static_cast<float>(hidden) / (1.0f + std::exp(-static_cast<float>(hidden)));
+  float expected_act = silu_h * static_cast<float>(hidden);
+  float expected_out = static_cast<float>(top_k) * expected_act * static_cast<float>(ispp);
+
+  // act: real rows produce expected_act; padding rows stay zero.
+  for (int i = 0; i < EM * ispp; ++i) {
+    int row = i / ispp;
+    if (sorted_ids[row] >= 0 && sorted_ids[row] < N)
+      EXPECT_LT(std::fabs(bf2f(act_h[i]) - expected_act), 0.5f);
+    else
+      EXPECT_EQ(bf2f(act_h[i]), 0.0f);
+  }
+
+  float max_rel = 0.0f;
+  for (int i = 0; i < M * hidden; ++i) {
+    float err = std::fabs(out_h[i] - expected_out);
+    if (expected_out != 0) max_rel = std::max(max_rel, err / expected_out);
+  }
+  EXPECT_LT(max_rel, 1e-2f);
 }

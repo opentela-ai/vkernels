@@ -61,6 +61,11 @@ template <typename T>
 std::string to_string_val(const T& v) {
   if constexpr (std::is_same_v<std::decay_t<T>, bool>) {
     return v ? "true" : "false";
+  } else if constexpr (std::is_same_v<std::decay_t<T>, std::nullptr_t>) {
+    // Avoid `os << nullptr`: on older libstdc++ (e.g. g++ 7.5) the
+    // nullptr_t -> const void* / function-pointer conversion makes the
+    // `operator<<` overload set ambiguous and fails to compile.
+    return "nullptr";
   } else if constexpr (std::is_arithmetic_v<std::decay_t<T>>) {
     std::ostringstream os;
     os << v;
