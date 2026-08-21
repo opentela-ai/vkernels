@@ -448,20 +448,23 @@ def load_libvkernels_hip():
 
 
 def resolve_moe_fn(lib):
-    """Return the fused-MoE C ABI function from ``lib``.
+    """Return the HIP fused-MoE C ABI function from ``lib``.
 
-    Upstream PR #44 names it ``vk_hip_fused_moe_mxfp4`` (namespaced away
-    from the CPU reference ``vk_fused_moe_mxfp4``). Older local builds used
-    the bare name from the since-removed ``hip_api.cpp``; try the new name
-    first and fall back.
+    PR #44 names it ``vk_hip_fused_moe_mxfp4`` (namespaced away from the
+    CPU reference). Note the CPU reference ``vk_fused_moe_mxfp4`` is a
+    *live* symbol in ``libvkernels`` with a materially different signature
+    (it returns ``int32`` and takes ``sorted_ids``/``topk_w_sorted``/
+    ``group_size`` rather than ``topk_ids``/``topk_w``/``block_size``), so
+    it must NOT be used as a fallback — calling it with the HIP arg layout
+    would be a silent ABI mismatch. Raise clearly if the HIP symbol is
+    absent instead.
     """
     fn = getattr(lib, "vk_hip_fused_moe_mxfp4", None)
     if fn is None:
-        fn = getattr(lib, "vk_fused_moe_mxfp4", None)
-    if fn is None:
         raise RuntimeError(
-            "neither vk_hip_fused_moe_mxfp4 nor vk_fused_moe_mxfp4 found in "
-            "libvkernels_hip.so — rebuild with PR #44"
+            "vk_hip_fused_moe_mxfp4 not found in libvkernels_hip.so — "
+            "rebuild with PR #44 (the CPU vk_fused_moe_mxfp4 has a "
+            "different signature and must not be used here)."
         )
     return fn
 
@@ -645,19 +648,30 @@ def _build_vllm_experts():
                     local_n = _local_n(E, global_num_experts)
                 cap_em = max_em_count(max_M, top_k, local_n)
                 d_sids = _scratch.get(
-                    "sids", EM, dtype=torch.int32, device=dev,
+                    ("sids", top_k, local_n), EM, dtype=torch.int32, device=dev,
                     capacity=cap_em, name="sids",
                 )
                 d_eids = _scratch.get(
-                    "eids", EM, dtype=torch.int32, device=dev,
+                    ("eids", top_k, local_n), EM, dtype=torch.int32, device=dev,
                     capacity=cap_em, name="eids",
                 )
                 d_sids.copy_(torch.from_numpy(sids_np))
                 d_eids[: EM // block_size].copy_(torch.from_numpy(eids_np))
 
-            # Routing weights: if already applied on input, use ones.
+            # Routing weights: if already applied on input, use a
+            # persistent ones buffer (sized once at MAX_NUM_BATCHED_TOKENS
+            # * top_k on the eager warmup). A per-call torch.ones_like()
+            # would allocate fresh caching-allocator storage that - during
+            # the breakable cudagraph eager-break window (issue #42), where
+            # is_current_stream_capturing() is False but a session is live
+            # - is not replay-stable and faults like the old
+            # torch.empty() out_fp32 wrapper did.
             if apply_router_weight_on_input:
-                topk_w = torch.ones_like(topk_weights).contiguous().view(-1)
+                ones_buf = _scratch.get(
+                    ("ones", top_k), M * top_k, dtype=torch.float32, device=dev,
+                    capacity=max_M * top_k, name="topk_ones",
+                )
+                topk_w = ones_buf[: M * top_k].fill_(1.0)
             else:
                 topk_w = topk_weights.contiguous().view(-1)
 
@@ -705,12 +719,27 @@ def _build_vllm_experts():
                     name="act_scratch",
                 )
 
-            # --- out_fp32 [M, K] fp32 — persistent (the per-call
-            # torch.empty() here was the primary capture/replay fault). -
+            # --- out_fp32 [M, K] fp32 - persistent, keyed by ("out", K)
+            # so MoE layers with different hidden dimensions on a rank
+            # do not collide on a single buffer sized by the first
+            # layer's K (which would then RuntimeError during capture
+            # for a larger-K layer, or silently truncate). The per-call
+            # torch.empty() here was the primary capture/replay fault. -
             out_fp32 = _scratch.get(
-                "out", M * K, dtype=torch.float32, device=dev,
+                ("out", K), M * K, dtype=torch.float32, device=dev,
                 capacity=max_M * K, name="out_fp32",
             )
+            # The down/combine kernels accumulate into ``out`` via
+            # atomicAdd (see moe_fused.hip: down_combine_kernel,
+            # down_combine_kernel_prefill, combine_kernel), so the buffer
+            # MUST be zeroed before every launch - otherwise this call's
+            # result accumulates onto the previous pass's residuals (the
+            # documented caller contract; cf. test_capi_moe.hip's
+            # hipMemset(dOut, 0, ...) before each call). The zero runs on
+            # torch.cuda.current_stream() - the same stream the kernels
+            # launch on below - so under cudagraph capture the memset is
+            # recorded into the graph and replays correctly.
+            out_fp32.zero_()
 
             # Launch on PyTorch's *current* compute stream so the
             # out_fp32 (and act_scratch) writes are ordered with the
