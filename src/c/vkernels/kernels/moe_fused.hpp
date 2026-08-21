@@ -340,7 +340,8 @@ void fused_moe_mxfp4(
     const float* b13 = nullptr,
     const float* b2 = nullptr,
     int block_size = 16,
-    bool kmajor = false);
+    bool kmajor = false,
+    void* stream = nullptr);
 
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP

@@ -83,6 +83,12 @@ extern "C" {
  *   b2          [E, hidden]            down bias (NULL = skip)
  *   block_size    tile config: 16 = decode, 64 = prefill
  */
+// The device stream to launch the MoE kernels on. Pass the caller's
+// current stream (e.g. PyTorch's torch.cuda.current_stream().cuda_stream,
+// or hipStreamGetCurrent()) so the device kernels are ordered with respect
+// to the buffers the caller allocated / will read on that same stream —
+// which removes the device-wide synchronize the caller previously needed.
+// NULL (default) launches on the HIP default stream (legacy behaviour).
 void vk_hip_fused_moe_mxfp4(
     const uint16_t* A, const uint8_t* w13, const uint8_t* w13_scale,
     const uint8_t* w2, const uint8_t* w2_scale,
@@ -92,7 +98,7 @@ void vk_hip_fused_moe_mxfp4(
     const int32_t* sorted_ids, const int32_t* expert_ids,
     int EM, float swiglu_limit,
     int activation, float beta, float linear_beta,
-    const float* b13, const float* b2, int block_size);
+    const float* b13, const float* b2, int block_size, void* stream);
 
 /* ------------------------------------------------------------------ */
 /* MLA forward — absorbed form (src/c/vkernels/kernels/mla.hip, #21)   */

@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
   std::printf("calling vk_hip_fused_moe_mxfp4 (with biases) ...\n");
   vk_hip_fused_moe_mxfp4(dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
       M, hidden, ispp, top_k, dSids, dEids, EM_p, LIMIT, activation,
-      beta, linear_beta, db13, db2, BLOCK_M);
+      beta, linear_beta, db13, db2, BLOCK_M, /*stream=*/nullptr);
   CK(hipDeviceSynchronize(), "sync");
 
   std::vector<float> out(M * hidden);
@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
   std::printf("calling vk_hip_fused_moe_mxfp4 (without biases) ...\n");
   vk_hip_fused_moe_mxfp4(dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
       M, hidden, ispp, top_k, dSids, dEids, EM_p, LIMIT, activation,
-      beta, linear_beta, nullptr, nullptr, BLOCK_M);
+      beta, linear_beta, nullptr, nullptr, BLOCK_M, /*stream=*/nullptr);
   CK(hipDeviceSynchronize(), "sync2");
 
   std::vector<float> out2(M * hidden);

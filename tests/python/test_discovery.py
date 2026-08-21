@@ -68,6 +68,8 @@ EXPECTED_KERNELS = [
     ("moe_down_cpu", "moe_fused"),
     ("moe_combine_cpu", "moe_fused"),
     ("moe_align_block_size", "moe_fused"),
+    ("dequant_weight_tile", "moe_fused"),
+    ("dequant_weight_tile_ref", "moe_fused"),
     ("moe_gateup_preact", "moe_fused"),
     ("moe_act_epilogue", "moe_fused"),
     ("moe_down_preact", "moe_fused"),

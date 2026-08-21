@@ -693,7 +693,17 @@ void fused_moe_mxfp4(
     const int32_t* sorted_ids, const int32_t* expert_ids,
     int EM, float swiglu_limit,
     int activation, float beta, float linear_beta,
-    const float* b13, const float* b2, int block_size, bool kmajor) {
+    const float* b13, const float* b2, int block_size, bool kmajor, void* stream) {
+
+  // The device kernels below launch on `stream` (the caller's current
+  // stream, e.g. PyTorch's compute stream) rather than the HIP default
+  // stream. This orders the MoE writes with respect to the buffers the
+  // caller allocated (act_scratch, out) and will read (out -> bf16 copy)
+  // on that same stream, removing the device-wide synchronize the
+  // caller previously needed (issue: per-step MoE became a TP barrier
+  // because a device-wide drain serialised every all-to-all).
+  // `stream == nullptr` reproduces the legacy default-stream launch.
+  hipStream_t hipstream = static_cast<hipStream_t>(stream);
 
   // The combine epilogue reads `topk_w[flat]` directly (where
   // `flat = sorted_ids[...]` is already guarded by `flat < M*top_k`),
@@ -708,10 +718,10 @@ void fused_moe_mxfp4(
   const bool ktime = (std::getenv("VK_MOE_KTIME") != nullptr);
   hipEvent_t ks = nullptr, ke = nullptr;
   if (ktime) { hipEventCreate(&ks); hipEventCreate(&ke); }
-#define VK_TBEGIN() do { if (ktime) hipEventRecord(ks); } while (0)
+#define VK_TBEGIN() do { if (ktime) hipEventRecord(ks, hipstream); } while (0)
 #define VK_TEND(name) do {                                                     \
     if (ktime) {                                                               \
-      hipEventRecord(ke);                                                      \
+      hipEventRecord(ke, hipstream);                                                      \
       hipEventSynchronize(ke);                                                 \
       float ms = 0.f; hipEventElapsedTime(&ms, ks, ke);                        \
       std::fprintf(stderr, "[ktime] %-8s %8.3f us\n", name, ms * 1000.f);      \
@@ -724,7 +734,7 @@ void fused_moe_mxfp4(
     {
       dim3 g(EM / kBM_pf, ispp / kBN_pf);
       VK_TBEGIN();
-      gateup_swiglu_kernel_prefill<kBN_pf><<<g, kThreads_pf>>>(
+      gateup_swiglu_kernel_prefill<kBN_pf><<<g, kThreads_pf, 0, hipstream>>>(
           A, w13, w13_scale, b13, act_scratch,
           sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
           activation, beta, linear_beta, b13 != nullptr);
@@ -733,7 +743,7 @@ void fused_moe_mxfp4(
     {
       dim3 g(EM / kBM_pf, hidden / kBN_pf);
       VK_TBEGIN();
-      down_combine_kernel_prefill<kBN_pf><<<g, kThreads_pf>>>(
+      down_combine_kernel_prefill<kBN_pf><<<g, kThreads_pf, 0, hipstream>>>(
           act_scratch, w2, w2_scale, b2, out, topk_w,
           sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
       VK_TEND("down");
@@ -745,12 +755,12 @@ void fused_moe_mxfp4(
       dim3 g(EM / kBM, ispp / kBN, kWarps);
       VK_TBEGIN();
       if (kmajor)
-        gateup_swiglu_kernel<true><<<g, kWhreads>>>(
+        gateup_swiglu_kernel<true><<<g, kWhreads, 0, hipstream>>>(
             A, w13, w13_scale, b13, act_scratch,
             sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
             activation, beta, linear_beta, b13 != nullptr);
       else
-        gateup_swiglu_kernel<false><<<g, kWhreads>>>(
+        gateup_swiglu_kernel<false><<<g, kWhreads, 0, hipstream>>>(
             A, w13, w13_scale, b13, act_scratch,
             sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
             activation, beta, linear_beta, b13 != nullptr);
@@ -759,7 +769,7 @@ void fused_moe_mxfp4(
     {
       dim3 g(EM / kBM, hidden / kBN, kWarps);
       VK_TBEGIN();
-      down_combine_kernel<<<g, kWhreads>>>(
+      down_combine_kernel<<<g, kWhreads, 0, hipstream>>>(
           act_scratch, w2, w2_scale, b2, out, topk_w,
           sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
       VK_TEND("down");

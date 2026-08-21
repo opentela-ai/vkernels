@@ -41,6 +41,14 @@ backend: str = _backend.backend_name()
 
 _Lazy = ("core", "kernels", "comm")
 
+# Optional integration submodules that require extra dependencies (e.g.
+# torch, vLLM). Listed in ``_LazyIntegration`` so ``vkernels.<name>`` is
+# importable on demand, but ``import vkernels`` stays dependency-free.
+# Each entry maps to a submodule under ``vkernels``.
+_LazyIntegration = {
+    "vllm_experts": "vllm_experts",  # torch (+vLLM for the expert layer)
+}
+
 # Functions re-exported at the top level (lazily, to keep ``import vkernels``
 # dependency-free). Each maps to ``vkernels.<submodule>.<name>``.
 _TopLevelFuncs = {
@@ -54,6 +62,11 @@ def __getattr__(name: str):
     needs no numpy)."""
     if name in _Lazy:
         module = importlib.import_module(f"vkernels.{name}")
+        globals()[name] = module
+        return module
+    if name in _LazyIntegration:
+        submodule = _LazyIntegration[name]
+        module = importlib.import_module(f"vkernels.{submodule}")
         globals()[name] = module
         return module
     if name in _TopLevelFuncs:
