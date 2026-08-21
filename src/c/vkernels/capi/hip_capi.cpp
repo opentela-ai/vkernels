@@ -20,6 +20,7 @@
 
 #include "vkernels/capi/hip_capi.hpp"
 
+#include "vkernels/capi/capi.hpp"  // VK_OK / VK_ERROR_* status codes
 #include "vkernels/kernels/moe_fused.hpp"
 #include "vkernels/kernels/mla.hpp"
 #include "vkernels/kernels/dsa.hpp"
@@ -46,7 +47,43 @@ extern "C" void vk_hip_fused_moe_mxfp4(
       stream);
 }
 
-// --- MLA forward (absorbed form) ---
+// --- GPU moe_align_block_size (decode; issue #46 follow-up) ---
+// Reads topk_ids on-device on `stream` (ordered after the expert-dispatch
+// all-to-all) and writes the block-aligned sorted_ids / expert_ids consumed
+// by vk_hip_fused_moe_mxfp4, WITHOUT the topk_ids.cpu() host round-trip.
+// Returns a status code (not void) so the ctypes caller can pick the
+// CPU fallback when M*top_k > 1024. Host-side validation only; the kernel
+// is enqueued and the wrapper returns immediately (no sync).
+extern "C" int vk_hip_moe_align_block_size(
+    const int32_t* topk_ids, const int32_t* expert_map,
+    int32_t M, int32_t top_k, int32_t block_size,
+    int32_t num_experts, int32_t local_n, int32_t max_EM,
+    int32_t* sorted_ids, int32_t* expert_ids, int32_t* out_EM,
+    void* stream) {
+  if (block_size <= 0)
+    return VK_ERROR_INVALID_ARGUMENT;
+  if (M < 0 || top_k < 0 || num_experts < 0 || local_n < 0 || max_EM < 0)
+    return VK_ERROR_INVALID_ARGUMENT;
+  if (max_EM == 0 || (max_EM % block_size) != 0)
+    return VK_ERROR_INVALID_ARGUMENT;
+  if (local_n > num_experts)  // local shard never larger than the global set
+    return VK_ERROR_INVALID_ARGUMENT;
+  // out_EM is always written (even for M==0 the kernel emits one padding
+  // block), and the routing buffers are required for any non-trivial batch.
+  if (out_EM == nullptr)
+    return VK_ERROR_INVALID_ARGUMENT;
+  if (M > 0 && (topk_ids == nullptr || sorted_ids == nullptr ||
+                expert_ids == nullptr)) {
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  const long Nl = (long)M * (long)top_k;
+  if (Nl > 1024)  // single-block shared memory; caller falls back to CPU
+    return VK_ERROR_UNSUPPORTED;
+  vkernels::kernels::hip::moe_align_block_size_hip(
+      topk_ids, expert_map, M, top_k, block_size, num_experts, local_n,
+      max_EM, sorted_ids, expert_ids, out_EM, stream);
+  return VK_OK;
+}
 extern "C" void vk_hip_mla_fwd(
     int B, int H, int S_q, int S_kv, int q_start, int kv_start,
     int kv_lora_rank, int qk_rope_head_dim, float scale,

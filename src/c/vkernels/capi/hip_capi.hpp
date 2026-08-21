@@ -42,6 +42,13 @@
 
 #include <stdint.h>
 
+// The VK_OK / VK_ERROR_* status codes are shared with the CPU ABI
+// (vk_moe_align_block_size). Including capi.hpp here makes them part of
+// the HIP ABI surface for every consumer (ctypes uses the numeric values;
+// C/Rust FFI consumers need the enum). The CPU vk_* declarations it also
+// brings in are extern "C" and disjoint from the vk_hip_* names below.
+#include "vkernels/capi/capi.hpp"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -99,6 +106,51 @@ void vk_hip_fused_moe_mxfp4(
     int EM, float swiglu_limit,
     int activation, float beta, float linear_beta,
     const float* b13, const float* b2, int block_size, void* stream);
+
+/* ------------------------------------------------------------------ */
+/* moe_align_block_size — device, decode (issue #46 follow-up)         */
+/* ------------------------------------------------------------------ */
+/*
+ * GPU counterpart of `vk_moe_align_block_size` (CPU, capi.hpp). Reads
+ * `topk_ids` on-device on `stream` — ordered after the expert-dispatch
+ * all-to-all — and writes the block-aligned `sorted_ids` / `expert_ids`
+ * consumed by `vk_hip_fused_moe_mxfp4`, WITHOUT the `topk_ids.cpu()` host
+ * round-trip that dominated PP0's MoE (97-100% of its per-call
+ * `moe:vkernel_apply`; see docs/performance/moe-fused/gfx942-pp-pipeline.md).
+ *
+ * `expert_map` [num_experts] (global->local, -1 = skip) or NULL (1:1).
+ * `max_EM` is the host-computed high-water bound (a constant for a given
+ * batch shape, so the GEMM grid `max_EM/block_size` is capture-safe and
+ * the kernels early-out padding blocks/rows). `*out_EM` receives the
+ * actual padded EM — a device write; the capture-safe fast path does NOT
+ * read it (it launches the GEMM with `max_EM/block_size` blocks).
+ *
+ * Limit: `M*top_k` must be `<= 1024` (single-block shared memory, decode).
+ * Larger N returns VK_ERROR_UNSUPPORTED; the caller falls back to the CPU
+ * `vk_moe_align_block_size`.
+ *
+ * Returns VK_OK, or VK_ERROR_INVALID_ARGUMENT on null/bad params,
+ * VK_ERROR_UNSUPPORTED if M*top_k > 1024. Note: unlike the void HIP
+ * compute launchers, this wrapper returns a status code (matches the CPU
+ * ABI and lets the ctypes caller pick the fallback path) — it performs
+ * only host-side validation and returns immediately after launch.
+ *
+ *   topk_ids    [N]            int32  global expert ids (M*top_k)
+ *   expert_map  [num_experts]  int32  global->local (-1 = skip), or NULL
+ *   block_size                16 (decode) or 64 (prefill)
+ *   local_n                   number of local experts on this rank
+ *   max_EM                    host high-water bound on EM
+ *   sorted_ids  [max_EM]            int32  flat indices, padded with N
+ *   expert_ids  [max_EM/block_size] int32  local expert per block, -1 pad
+ *   out_EM      [1]                 int32  actual padded EM (device write)
+ *   stream                     caller's current stream, or NULL (default)
+ */
+int vk_hip_moe_align_block_size(
+    const int32_t* topk_ids, const int32_t* expert_map,
+    int32_t M, int32_t top_k, int32_t block_size,
+    int32_t num_experts, int32_t local_n, int32_t max_EM,
+    int32_t* sorted_ids, int32_t* expert_ids, int32_t* out_EM,
+    void* stream);
 
 /* ------------------------------------------------------------------ */
 /* MLA forward — absorbed form (src/c/vkernels/kernels/mla.hip, #21)   */

@@ -199,6 +199,15 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_capi_moe PRIVATE cxx_std_17)
   vkernels_set_warnings(test_capi_moe)
 
+  # C ABI correctness for the on-device moe_align_block_size (issue #46
+  # follow-up): parity between vk_hip_moe_align_block_size (no topk_ids.cpu()
+  # host round-trip) and the CPU reference across several routings, plus an
+  # end-to-end check that GPU-aligned routing feeds the GEMM identically.
+  add_executable(test_capi_moe_align test_capi_moe_align.hip)
+  target_link_libraries(test_capi_moe_align PRIVATE vkernels::vkernels vkernels::vkernels_hip)
+  target_compile_features(test_capi_moe_align PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_capi_moe_align)
+
   add_executable(test_moe_aux_correct test_moe_aux_correct.hip)
   target_link_libraries(test_moe_aux_correct PRIVATE vkernels::vkernels)
   target_compile_features(test_moe_aux_correct PRIVATE cxx_std_17)

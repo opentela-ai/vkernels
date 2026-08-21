@@ -343,5 +343,51 @@ void fused_moe_mxfp4(
     bool kmajor = false,
     void* stream = nullptr);
 
+// ----------------------------------------------------------------------
+// moe_align_block_size (device) — issue #46 follow-up
+// ----------------------------------------------------------------------
+//
+// The GPU counterpart of :cpp:func:`moe_align_block_size` (CPU, moe_fused.cpp)
+// and the Python ``moe_align_block_size_with_map`` (vllm_experts.py). Reads
+// ``topk_ids`` *on-device* on ``stream`` — ordered after the expert-dispatch
+// all-to-all that produced it — and writes the block-aligned ``sorted_ids`` /
+// ``expert_ids`` layout consumed by :cpp:func:`fused_moe_mxfp4`, **without the
+// ``topk_ids.cpu()`` host round-trip** that dominated PP0's MoE (97-100% of
+// its per-call ``moe:vkernel_apply``; see
+// ``docs/performance/moe-fused/gfx942-pp-pipeline.md``).
+//
+//   topk_ids    [N]            int32  global expert ids (M*top_k)
+//   expert_map  [num_experts]  int32  global->local (-1 = skip/unmapped), or null (1:1)
+//   block_size                16 (decode) or 64 (prefill)
+//   local_n                   number of local experts on this rank (TP sharding)
+//   max_EM                    host-computed high-water bound on EM (e.g.
+//                              ``min(N, local_n)*block_size +`` rounded-up
+//                              remainder) — a *constant* for a given batch
+//                              shape, so the GEMM grid (max_EM/block_size)
+//                              is capture-safe and the kernels early-out the
+//                              padding blocks/rows.
+//
+// Outputs (caller-allocated, sized at ``max_EM`` / ``max_EM/block_size``):
+//   sorted_ids  [max_EM]            int32  flat token indices (ascending per
+//                                        expert), padded with ``N``
+//   expert_ids  [max_EM/block_size] int32  local expert per real block,
+//                                        ``-1`` for pure-padding blocks
+//   out_em      [1]                 int32  actual padded EM (device write;
+//                                        the capture-safe fast path does NOT
+//                                        read it — it launches the GEMM with
+//                                        ``max_EM/block_size`` blocks)
+//
+// Limit: ``N = M*top_k`` must be ``<= 1024`` (single-block shared memory).
+// Larger ``N`` (prefill) must fall back to the CPU path in the caller.
+void moe_align_block_size_hip(
+    const int32_t* topk_ids,
+    const int32_t* expert_map,
+    int M, int top_k, int block_size, int num_experts, int local_n,
+    int max_EM,
+    int32_t* sorted_ids,
+    int32_t* expert_ids,
+    int32_t* out_em,
+    void* stream = nullptr);
+
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP
