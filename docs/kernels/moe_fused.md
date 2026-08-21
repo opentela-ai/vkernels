@@ -438,3 +438,23 @@ src/c/vkernels/kernels/
 ├── moe_fused.hip       # 2 HIP kernels + gather + hip::fused_moe_mxfp4 launcher
 └── moe_device.hip      # shared device helpers (E2M1/ue8m0 decode, bf16 rounding)
 ```
+
+## Caller contract: persistent, capture-safe scratch
+
+Issue #41, item 1 requires the **caller** to own and reuse the scratch
+buffers (`act_scratch`, `out`, `sorted_ids`, `expert_ids`) — the launcher
+performs no device allocation of its own. A naive ctypes wrapper that
+does `torch.empty()` per call **faults under CUDA-graph capture/replay**:
+the fresh caching-allocator storage is not replay-stable, so when the
+captured graph replays the C kernel runs against memory the allocator has
+recycled (`Memory access fault by GPU node-X`).
+
+The validated, reusable fix lives in
+[`vkernels.vllm_experts`](../python-bindings.md#vllm-integration-optional-vkernelsvllm_experts):
+`CaptureSafeScratch` sizes each `(device, key)` buffer ONCE (on the eager
+profile/warmup run, before capture) and slices into it forever after,
+refusing to grow while a capture session is active — so any ctypes caller
+(whether or not it uses vLLM) should reuse it instead of allocating per
+call. The accompanying `VkernelFusedExperts` is the drop-in vLLM
+`FusedMoE` expert layer (gfx942 / Kimi-K3) that backs all C-ABI scratch
+this way and launches on the caller's stream.
