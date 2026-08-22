@@ -1750,3 +1750,131 @@ def kv_gather_layer(k_src, v_src, slot_ids, dst, *, stream=None) -> None:
         gather()
     else:
         stream.submit(gather)
+
+
+
+# ---------------------------------------------------------------------------
+# Fused indexed K/V layer scatter (issue #1)
+# ---------------------------------------------------------------------------
+#
+# The restore-side reverse of kv_gather (issue #2): scatters a contiguous,
+# already-gathered per-layer scratch buffer back into the paged KV pool at
+# arbitrary, non-contiguous destination slots. The current fallback performs
+# two PyTorch advanced-index writes (one for K, one for V); this primitive
+# fuses both writes (and the K/V split) into a single operation, byte-exact
+# against:
+#
+#     k_dst[slot_ids] = src[:, :, 0]
+#     v_dst[slot_ids] = src[:, :, 1]
+#
+# Because the destination slots are DISJOINT (uniqueness is enforced, unlike
+# the gather's repeatable sources), every byte is written exactly once and
+# the write order is irrelevant. Same raw-byte-copy reasoning as kv_gather:
+# correct for both BF16 (uint16 view) and FP16.
+
+def kv_scatter_layer(k_dst, v_dst, slot_ids, src, *, stream=None) -> None:
+    """Fused indexed K/V scatter for one layer (issue #1).
+
+    Reads a contiguous ``[num_pages, page_size, 2, num_kv_heads, head_dim]``
+    ``src`` and writes K and V into the indexed destination slots of
+    ``k_dst`` / ``v_dst``, exactly:
+
+        k_dst[slot_ids] = src[:, :, 0]
+        v_dst[slot_ids] = src[:, :, 1]
+
+    Replaces the two separate advanced-index writes the KVAAS ``scatter_layer``
+    path performs today. ``num_pages == 0`` is a valid no-op. ``slot_ids``
+    must be UNIQUE (scatter writes disjoint destinations; duplicates are a
+    contract violation) and in range ``[0, num_slots)``; any order is allowed
+    (non-monotonic).
+
+    Args:
+        k_dst, v_dst: ``[num_slots, num_kv_heads, head_dim]`` C-contiguous
+            writable arrays with ``itemsize == 2`` (BF16 as a ``uint16``
+            view, FP16 as ``np.float16``).
+        slot_ids: ``[num_pages, page_size]`` C-contiguous ``int32`` or
+            ``int64`` array of UNIQUE destination slots in ``[0, num_slots)``.
+        src: ``[num_pages, page_size, 2, num_kv_heads, head_dim]``
+            C-contiguous array of the same dtype as ``k_dst``/``v_dst``.
+        stream: optional :class:`~vkernels.core.Stream`; when given the
+            scatter runs as a single asynchronous task.
+
+    Raises:
+        TypeError: if any array has the wrong dtype.
+        ValueError: if shapes/strides are inconsistent, ``slot_ids`` is out
+            of range or non-unique, or ``k_dst``/``v_dst`` is not writable.
+    """
+    k = _as_kv_array(k_dst, "k_dst")
+    v = _as_kv_array(v_dst, "v_dst")
+    slots = _as_slot_ids(slot_ids, "slot_ids")
+    if isinstance(src, np.ndarray):
+        s = src
+    else:
+        s = np.asarray(src)
+    if s.dtype != k.dtype:
+        raise TypeError(
+            f"src must have the same dtype as k_dst/v_dst, got {s.dtype} vs {k.dtype}"
+        )
+    if s.ndim != 5:
+        raise ValueError(
+            f"src must be [num_pages, page_size, 2, num_kv_heads, head_dim] "
+            f"(5-D), got shape {s.shape}"
+        )
+    if not s.flags.c_contiguous:
+        raise ValueError("src must be C-contiguous")
+    if not k.flags.writeable:
+        raise ValueError("k_dst must be writable")
+    if not v.flags.writeable:
+        raise ValueError("v_dst must be writable")
+    if k.shape != v.shape:
+        raise ValueError(
+            f"k_dst and v_dst must have the same shape, got {k.shape} vs {v.shape}"
+        )
+    if k.dtype != v.dtype:
+        raise TypeError(
+            f"k_dst and v_dst must have the same dtype, got {k.dtype} vs {v.dtype}"
+        )
+
+    num_slots, num_kv_heads, head_dim = k.shape
+    num_pages, page_size = slots.shape
+    if s.shape != (num_pages, page_size, 2, num_kv_heads, head_dim):
+        raise ValueError(
+            f"src shape {s.shape} does not match (num_pages={num_pages}, "
+            f"page_size={page_size}, 2, num_kv_heads={num_kv_heads}, "
+            f"head_dim={head_dim})"
+        )
+
+    if num_pages == 0:
+        return  # valid no-op (also covers page_size == 0)
+
+    if page_size == 0:
+        return
+    if num_slots == 0:
+        raise ValueError("num_slots must be positive when num_pages > 0")
+    if num_kv_heads == 0 or head_dim == 0:
+        raise ValueError("num_kv_heads and head_dim must be positive")
+
+    # Scatter writes disjoint destinations: uniqueness is required (unlike
+    # the gather, which may repeat source slots). Range is also enforced.
+    flat_ids = slots.reshape(num_pages * page_size)
+    if flat_ids.size:
+        if flat_ids.min() < 0 or flat_ids.max() >= num_slots:
+            raise ValueError(f"slot_ids must be in [0, {num_slots})")
+        if np.unique(flat_ids).size != flat_ids.size:
+            raise ValueError("slot_ids must be unique (scatter writes disjoint destinations)")
+
+    slot_bytes = num_kv_heads * head_dim * 2  # elem_size == 2
+    k_flat = k.view(np.uint8).reshape(num_slots, slot_bytes)
+    v_flat = v.view(np.uint8).reshape(num_slots, slot_bytes)
+    s_flat = s.view(np.uint8).reshape(num_pages * page_size, 2, slot_bytes)
+
+    def scatter() -> None:
+        # Byte-exact memmove into the indexed destinations (matching dtypes
+        # via uint8 views). Uniqueness guarantees no two writes alias.
+        k_flat[flat_ids] = s_flat[:, 0, :]
+        v_flat[flat_ids] = s_flat[:, 1, :]
+
+    if stream is None:
+        scatter()
+    else:
+        stream.submit(scatter)
