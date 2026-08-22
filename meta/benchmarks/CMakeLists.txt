@@ -93,6 +93,20 @@ if(VKERNELS_HAS_CUDA)
   target_compile_features(kv_gather_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(kv_gather_bench)
 
+  # Fused indexed K/V layer scatter (issue #1): the restore-side mirror of
+  # kv_gather. Scatters a contiguous per-layer scratch buffer into
+  # arbitrary, non-contiguous paged-KV destination slots; measures the
+  # single fused kernel vs the two-write PyTorch reference (two separate
+  # advanced-index scatter kernels, one per tensor) across 64..8192
+  # tokens, plus effective bandwidth and the one-launch-vs-two saving.
+  # Issue #1 acceptance: >= 10% faster at >= 2048 tokens, <= 2% slower
+  # below (or a documented dispatch threshold) -- judged on H100-class
+  # hardware. Single-GPU box reads/writes device 0.
+  add_executable(kv_scatter_bench kv_scatter_bench.cu)
+  target_link_libraries(kv_scatter_bench PRIVATE vkernels::vkernels)
+  target_compile_features(kv_scatter_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(kv_scatter_bench)
+
   # Graph-capturable PP-boundary transfer (issue #10). Measures the actual
   # NVLink peer copy the device path enqueues per decode iteration, and the
   # graph-replay vs eager-re-issue round trip (the host progress the graph

@@ -39,6 +39,7 @@
 #include "vkernels/comm/overlap.hpp"
 #include "vkernels/comm/p2p_gather.hpp"
 #include "vkernels/comm/kv_gather.hpp"
+#include "vkernels/comm/kv_scatter.hpp"
 #include "vkernels/comm/topology.hpp"
 #include "vkernels/core/device.hpp"
 #include "vkernels/core/stream.hpp"
@@ -914,6 +915,97 @@ PYBIND11_MODULE(_core, m) {
       "in a single operation. slot_ids may repeat (gather semantics) and "
       "be in any order; only the range [0, num_slots) is enforced. "
       "num_pages == 0 is a valid no-op.");
+
+  // --- fused indexed K/V layer scatter (issue #1) ------------------------
+  //
+  // k_dst/v_dst are [num_slots, num_kv_heads, head_dim] with itemsize == 2
+  // (BF16 as a uint16 view, FP16 as np.float16) and must be writable.
+  // slot_ids is [num_pages, page_size], int32 or int64, UNIQUE destination
+  // slots in [0, num_slots). src is [num_pages, page_size, 2, num_kv_heads,
+  // head_dim], same dtype as k_dst/v_dst. Non-default strides are rejected
+  // explicitly (no silent forcecast copy, which would write into a
+  // throwaway buffer).
+  comm.def(
+      "kv_scatter_layer",
+      [](py::object kd_obj, py::object vd_obj, py::object s_obj,
+         py::object src_obj, Stream* stream) {
+        auto as_array = [](const py::object& o,
+                           const char* name) -> py::array {
+          if (!py::isinstance<py::array>(o))
+            throw py::type_error(std::string(name) + " must be a numpy array");
+          return py::reinterpret_borrow<py::array>(o);
+        };
+        py::array k = as_array(kd_obj, "k_dst");
+        py::array v = as_array(vd_obj, "v_dst");
+        py::array s = as_array(s_obj, "slot_ids");
+        py::array src = as_array(src_obj, "src");
+
+        auto require_contig = [](const py::array& a, const char* name) {
+          if (!(a.flags() & py::array::c_style))
+            throw py::value_error(std::string(name) +
+                                  " must be C-contiguous");
+        };
+        require_contig(k, "k_dst");
+        require_contig(v, "v_dst");
+        require_contig(s, "slot_ids");
+        require_contig(src, "src");
+        if (!k.writeable())
+          throw py::value_error("k_dst must be writable");
+        if (!v.writeable())
+          throw py::value_error("v_dst must be writable");
+
+        if (k.ndim() != 3)
+          throw py::value_error("k_dst must be [num_slots, num_kv_heads, "
+                                "head_dim] (3-D)");
+        if (v.ndim() != 3 || !v.dtype().equal(k.dtype()))
+          throw py::value_error("v_dst must match k_dst dtype and be 3-D");
+        if (k.itemsize() != 2)
+          throw py::type_error("k_dst must have itemsize 2 (BF16/FP16)");
+        if (k.shape(1) != v.shape(1) || k.shape(2) != v.shape(2) ||
+            k.shape(0) != v.shape(0))
+          throw py::value_error("k_dst and v_dst must have the same shape");
+
+        if (s.dtype().kind() != 'i')
+          throw py::type_error("slot_ids must be int32 or int64");
+        const bool slot_ids_int64 = (s.itemsize() == 8);
+        if (!(s.itemsize() == 4 || s.itemsize() == 8))
+          throw py::type_error("slot_ids must be int32 or int64");
+        if (s.ndim() != 2)
+          throw py::value_error("slot_ids must be [num_pages, page_size] (2-D)");
+
+        if (!src.dtype().equal(k.dtype()))
+          throw py::type_error("src must have the same dtype as k_dst/v_dst");
+        if (src.ndim() != 5)
+          throw py::value_error("src must be [num_pages, page_size, 2, "
+                                "num_kv_heads, head_dim] (5-D)");
+
+        const std::size_t num_slots = static_cast<std::size_t>(k.shape(0));
+        const std::size_t num_kv_heads = static_cast<std::size_t>(k.shape(1));
+        const std::size_t head_dim = static_cast<std::size_t>(k.shape(2));
+        const std::size_t num_pages = static_cast<std::size_t>(s.shape(0));
+        const std::size_t page_size = static_cast<std::size_t>(s.shape(1));
+        if (src.shape(0) != static_cast<ssize_t>(num_pages) ||
+            src.shape(1) != static_cast<ssize_t>(page_size) ||
+            src.shape(2) != 2 ||
+            src.shape(3) != static_cast<ssize_t>(num_kv_heads) ||
+            src.shape(4) != static_cast<ssize_t>(head_dim))
+          throw py::value_error("src shape does not match "
+                                "(num_pages, page_size, 2, "
+                                "num_kv_heads, head_dim)");
+
+        comm::kv_scatter_layer(k.mutable_data(), v.mutable_data(),
+                               s.data(), slot_ids_int64, num_slots,
+                               src.data(), num_pages, page_size,
+                               num_kv_heads, head_dim,
+                               /*elem_size=*/2, stream);
+      },
+      py::arg("k_dst"), py::arg("v_dst"), py::arg("slot_ids"),
+      py::arg("src"), py::arg("stream") = nullptr,
+      "Fused indexed K/V scatter for one layer: writes "
+      "k_dst[slot_ids] = src[:, :, 0] and v_dst[slot_ids] = src[:, :, 1] "
+      "in a single operation. slot_ids must be UNIQUE (scatter writes "
+      "disjoint destinations) and in range [0, num_slots); any order is "
+      "allowed. num_pages == 0 is a valid no-op.");
 
   comm.def(
       "stage_runs_1d",

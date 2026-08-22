@@ -29,6 +29,7 @@ target_sources(vkernels
     vkernels/comm/p2p_kv_restore.cpp
     vkernels/comm/p2p_kv_donate.cpp
     vkernels/comm/kv_gather.cpp
+    vkernels/comm/kv_scatter.cpp
     vkernels/comm/pipeline_boundary.cpp
     vkernels/comm/pipeline_boundary_c.cpp
     vkernels/dist/dist_moe.cpp
@@ -53,6 +54,7 @@ if(VKERNELS_HAS_CUDA)
       vkernels/comm/p2p_kv_restore.cu
       vkernels/comm/p2p_kv_donate.cu
       vkernels/comm/kv_gather.cu
+      vkernels/comm/kv_scatter.cu
       vkernels/comm/pipeline_boundary.cu)
   set_target_properties(vkernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
@@ -62,7 +64,7 @@ if(VKERNELS_HAS_CUDA)
   # folds every C++ exception into a status code so nothing is thrown across
   # the boundary. Built only with a CUDA toolkit — the entry points take a
   # raw cudaStream_t.
-  add_library(vkernels_c SHARED vkernels/comm/p2p_gather_c.cu vkernels/comm/p2p_kv_restore_c.cu vkernels/comm/p2p_kv_donate_c.cu vkernels/comm/kv_gather_c.cu vkernels/comm/pipeline_boundary_c.cu)
+  add_library(vkernels_c SHARED vkernels/comm/p2p_gather_c.cu vkernels/comm/p2p_kv_restore_c.cu vkernels/comm/p2p_kv_donate_c.cu vkernels/comm/kv_gather_c.cu vkernels/comm/kv_scatter_c.cu vkernels/comm/pipeline_boundary_c.cu)
   add_library(vkernels::vkernels_c ALIAS vkernels_c)
   target_link_libraries(vkernels_c PRIVATE vkernels)
   target_include_directories(vkernels_c PRIVATE
