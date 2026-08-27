@@ -31,12 +31,14 @@
 // CUDA path (cross_node_kv.cu, guarded by VKERNELS_HAS_CUDA) mirrors.
 #include "minitest.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
