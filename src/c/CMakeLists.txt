@@ -32,6 +32,9 @@ target_sources(vkernels
     vkernels/comm/kv_scatter.cpp
     vkernels/comm/pipeline_boundary.cpp
     vkernels/comm/pipeline_boundary_c.cpp
+    vkernels/comm/fabric_import_c.cpp
+    vkernels/comm/fabric_import.cpp
+    vkernels/comm/cross_node_kv.cpp
     vkernels/dist/dist_moe.cpp
     vkernels/capi/capi.cpp
 )
@@ -55,8 +58,21 @@ if(VKERNELS_HAS_CUDA)
       vkernels/comm/p2p_kv_donate.cu
       vkernels/comm/kv_gather.cu
       vkernels/comm/kv_scatter.cu
-      vkernels/comm/pipeline_boundary.cu)
+      vkernels/comm/pipeline_boundary.cu
+      vkernels/comm/fabric_import.cu
+      vkernels/comm/cross_node_kv.cu)
   set_target_properties(vkernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+  # fabric_import.cu is the only translation unit using the CUDA *driver*
+  # API (cuMemAddressReserve / cuMemImportFromShareableHandle / cuMemMap /
+  # cuMemSetAccess / cuMemUnmap / cuCtx*). Those symbols live in libcuda
+  # (the CUDA::cuda_driver imported target from CUDAToolkit), not the
+  # runtime that enable_language(CUDA) links automatically. Make the link
+  # PUBLIC so every test / bench executable that links libvkernels.a also
+  # pulls in libcuda and resolves the driver symbols.
+  if(TARGET CUDA::cuda_driver)
+    target_link_libraries(vkernels PUBLIC CUDA::cuda_driver)
+  endif()
 
   # C ABI shared library: `extern "C"` entry points over the CUDA primitive,
   # for non-C++ consumers (e.g. a serving runtime). The wrapper is the sole
@@ -64,7 +80,7 @@ if(VKERNELS_HAS_CUDA)
   # folds every C++ exception into a status code so nothing is thrown across
   # the boundary. Built only with a CUDA toolkit — the entry points take a
   # raw cudaStream_t.
-  add_library(vkernels_c SHARED vkernels/comm/p2p_gather_c.cu vkernels/comm/p2p_kv_restore_c.cu vkernels/comm/p2p_kv_donate_c.cu vkernels/comm/kv_gather_c.cu vkernels/comm/kv_scatter_c.cu vkernels/comm/pipeline_boundary_c.cu)
+  add_library(vkernels_c SHARED vkernels/comm/p2p_gather_c.cu vkernels/comm/p2p_kv_restore_c.cu vkernels/comm/p2p_kv_donate_c.cu vkernels/comm/kv_gather_c.cu vkernels/comm/kv_scatter_c.cu vkernels/comm/pipeline_boundary_c.cu vkernels/comm/fabric_import_c.cu vkernels/comm/cross_node_kv_c.cu)
   add_library(vkernels::vkernels_c ALIAS vkernels_c)
   target_link_libraries(vkernels_c PRIVATE vkernels)
   target_include_directories(vkernels_c PRIVATE
