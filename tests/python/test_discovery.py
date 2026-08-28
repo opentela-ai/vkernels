@@ -87,6 +87,28 @@ EXPECTED_COMM = [
     ("BlockingQueue", "class"),
     ("MockChannel", "class"),
     ("make_ring_channels", "function"),
+    # --- cross-node KV transfer plans + fabric import (issue #49) ---
+    # cross_node_kv.hpp: the byte channel the host-bounce path runs over
+    # (discovery scans *.hpp in comm/ sorted by filename, so this block
+    # lands between channel.hpp and overlap.hpp).
+    ("ByteBlockingQueue", "class"),
+    ("ByteChannel", "class"),
+    ("MockByteChannel", "class"),
+    ("make_byte_link", "function"),
+    ("CrossNodeKvRestorePlan", "class"),
+    ("CrossNodeKvDonatePlan", "class"),
+    # fabric_import.hpp: the transport classification + FabricHandle /
+    # FabricImport + the per-hop cost model.
+    ("fabric_import_transport_name", "function"),
+    ("FabricImportConfig", "struct"),
+    ("classify_fabric_import", "function"),
+    ("is_import_graph_capturable", "function"),
+    ("eager_break_fabric_import", "function"),
+    ("FabricHandle", "class"),
+    ("FabricImport", "class"),
+    ("CrossNodeHopCost", "struct"),
+    ("cross_node_kv_throughput", "function"),
+    ("same_node_fabric_roof_gbps", "function"),
     ("kv_gather_layer", "function"),
     ("kv_scatter_layer", "function"),
     ("OverlapExecutor", "class"),
