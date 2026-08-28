@@ -276,8 +276,97 @@ host-`.cpp`-+-CUDA-`.cu` split every other CUDA C ABI in the module uses.
 
 ---
 
-## 8. References
+## 8. On-site measurement (JSC, InfiniBand HDR)
 
+The real-RDMA-fabric per-hop number acceptance #2 names — the step
+the cost model in §6 only estimates and no container can run — was
+measured on JSC by `meta/benchmarks/bench_cross_node_nccl.cu`, a
+standalone 2-rank NCCL program (CUDA-native, no MPI; the transport
+vLLM / real serving use over IB). Built and run only when NCCL is
+found (`VKERNELS_HAS_NCCL`, see `meta/cmake/NcclSupport.cmake`).
+
+**Setup.** 2 distinct GH200 120 GB nodes (SM 9.0, 97280 MiB HBM,
+CUDA driver 13020) via InfiniBand HDR, 1 GPU/rank, NCCL 2.29.7+cuda13.0.
+NCCL autodetected all four mlx5 HCAs (`NET/IB : Using
+[0]mlx5_0:1/IB [1]mlx5_1:1/IB [2]mlx5_2:1/IB [3]mlx5_3:1/IB`) with
+GPUDirect RDMA — the same GIN/GDR path vLLM uses, not a loopback.
+Bootstrap is the standard non-MPI file exchange (rank 0 writes the
+`ncclUniqueId` to shared GPFS, rank 1 reads it).
+
+**What was measured** (8 sizes, 256→65536 tok = 1→256 MiB layers,
+iters=101 after 5 warmups, per-call `cudaEvent` sync, all 32 rows
+byte-verified by an NCCL allreduce of the ok flag):
+
+```
+ toks       path  us/min  us/med  us/std  cv%   usefGB   %hbm   %p25   check
+  256  nccl-xfer    37.8    68.4     5.4   7.8    27.7    0.8  110.9   ok
+  256  nccl-pipe    56.6    56.6     0.0   0.0    18.5    0.6   74.1   ok
+  256 nccl-allred  137.7   137.7     0.0   0.0     7.6    0.2   30.5   ok
+  256  d2d-local     3.4     4.2     0.4   9.2   612.5   18.3 2449.9   ok
+ [...]
+16384  nccl-xfer  2801.9  3460.8    86.4   2.5    24.0    0.7   95.8   ok
+16384  nccl-pipe  2827.8  2827.8     0.0   0.0    23.7    0.7   94.9   ok
+16384 nccl-allred 2788.8  2788.8     0.0   0.0    24.1    0.7   96.3   ok
+16384  d2d-local    40.8    42.6     0.9   2.2   3292.2   98.3 3292.2   ok
+32768  nccl-xfer  5594.8  6903.9   363.1   5.3    24.0    0.7   96.0   ok
+32768  nccl-pipe  5650.3  5650.3     0.0   0.0    23.8    0.7   95.0   ok
+32768 nccl-allred 5533.6  5533.6     0.0   0.0    24.3    0.7   97.0   ok
+32768  d2d-local    76.6    79.3     1.0   1.2   3504.0  104.6 3504.0   ok
+65536  nccl-xfer 11120.2 13787.9   952.2   7.1    24.1    0.7   96.6   ok
+65536  nccl-pipe 11156.9 11156.9     0.0   0.0    24.1    0.7   96.2   ok
+65536 nccl-allred10984.9 10984.9     0.0   0.0    24.4    0.7   97.7   ok
+65536  d2d-local   149.5   151.3     1.2   0.8   3591.0  107.2 3591.0   ok
+```
+(`%p25` = useful / one HDR-200 port (25 GB/s); `usefGB` & `%` from MIN.
+`d2d-local` `usefGB` is `2*bytes`/min — a copy reads+writes — graded
+against HBM, and `%p25` there is shown as its own useful figure, not
+a cross-node comparison.)
+
+**Finding — the cross-node hop caps at ONE HDR-200 port, not the
+4-port aggregate, regardless of operation type.** All three cross-node
+rows converge to ~24 GB/s = ~96% of a single HDR-200 port (200 Gb/s ÷ 8):
+
+- `nccl-xfer` (isolated point-to-point send‖recv) settles to ~24 GB/s.
+- `nccl-pipe` (N back-to-back send‖recv, one sync — added to test whether
+  the per-call `cudaEvent` sync was the limiter) **does not beat `nccl-xfer`**:
+  the sync was *not* the cap. The 2-rank point-to-point relationship is.
+- `nccl-allred` (an NCCL *collective* across the same 2 ranks) **also caps
+  at ~24 GB/s** — the smoking gun. With only 2 ranks NCCL builds a
+  1-peer ring/tree; it cannot stripe a single point-to-point relationship
+  across all four HCAs the way a ≥3-rank ring does. Reaching the
+  4-port aggregate (100 GB/s) needs ≥3 ranks.
+
+**Same-node ceiling confirmed.** `d2d-local` at ≥16384 tok (past the
+GH200 L2) runs at 3292–3591 GB/s = **~98–107% of the 3350 GB/s HBM roof**
+— the local-copy ceiling a cross-node hop is graded against and can
+never exceed. The cross-node hop is therefore **~75× slower** than
+same-node at the largest size (24 vs 3591 GB/s): a KV layer reused over
+the fabric pays a 75× latency tax versus the NVLink peer.
+
+**Cost-model calibration (§6).** The host model estimated the
+fabric-mapped hop at `min(fabric 50, kernel 88.5)` GB/s, assuming
+HDR-400 (400 Gb/s = 50 GB/s/port). JSC is **HDR-200** (200 Gb/s =
+25 GB/s/port); the measured ~24 GB/s is one HDR-200 port at full
+utilization — so the model's per-port roof should be parameterized by
+the actual HDR generation (25 GB/s for HDR-200, 50 for HDR-400), and
+the 2-rank ceiling is one port, not the `min(fabric, kernel)` aggregate.
+
+**VRAM-direct fabric export** (`cuMemExportToShareableHandle(
+CU_MEM_HANDLE_TYPE_FABRIC)`, the raw import path `fabric_import.cu`
+implements) is **opt-in** (`--probe-vram`): it segfaults inside the
+NVIDIA driver on this GH200 / CUDA-13 combo, consistent with the
+DRAM-only concern in `fabric_import.hpp`. NCCL's GIN/GDR path works
+regardless and is what the numbers above measured.
+
+Reproduce: `sbatch` a 2-node, 1-GPU/rank job running
+`srun --mpi=pmix -N2 -n2 ./cross_node_nccl_bench --iters 101`
+(see the header of `bench_cross_node_nccl.cu`).
+
+---
+
+## 9. References
+
+- Cross-node NCCL bench (issue #49 on-site, JSC HDR): `meta/benchmarks/bench_cross_node_nccl.cu`, `meta/cmake/NcclSupport.cmake`.
 - Same-node prepared fused kernels: `src/c/vkernels/comm/p2p_kv_restore.{hpp,cpp}`, `src/c/vkernels/comm/p2p_kv_donate.{hpp,cpp}` (issues #27, #36).
 - Graph-capturable boundary (the eager-break contract this ties into): `src/c/vkernels/comm/pipeline_boundary.{hpp,cpp}`, `docs/comm-pipeline-boundary.md` (issue #10).
 - kvaas FFI inventory: `src/crates/kvaas-py/src/vkernels_ffi.rs` ("Kernel inventory" section).

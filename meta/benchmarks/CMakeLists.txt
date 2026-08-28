@@ -132,6 +132,27 @@ if(VKERNELS_HAS_CUDA)
   target_compile_features(cross_node_kv_cuda_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(cross_node_kv_cuda_bench)
 
+  # Cross-node KV transfer over REAL InfiniBand (issue #49 on-site step):
+  # the per-hop number bench_cross_node_kv_cuda.cu explicitly defers. A
+  # 2-rank NCCL send||recv (+ an allreduce collective) between two DISTINCT
+  # GPU nodes over IB, the transport vLLM/serving use -- vs the
+  # same-device stand-in above. Built only when NCCL is found
+  # (VKERNELS_HAS_NCCL). Standalone: uses NCCL + raw CUDA only (no
+  # vkernels headers), so link vkernels::nccl + the CUDA driver stub
+  # (for the optional --probe-vram cuMemExportToShareableHandle path).
+  if(VKERNELS_HAS_NCCL)
+    add_executable(cross_node_nccl_bench bench_cross_node_nccl.cu)
+    target_link_libraries(cross_node_nccl_bench PRIVATE vkernels::nccl)
+    # cuMemExportToShareableHandle (the optional --probe-vram path)
+    # lives in libcuda. CudaSupport.cmake's find_package(CUDAToolkit)
+    # exposes it as CUDA::cuda_driver; link that when available.
+    if(TARGET CUDA::cuda_driver)
+      target_link_libraries(cross_node_nccl_bench PRIVATE CUDA::cuda_driver)
+    endif()
+    target_compile_features(cross_node_nccl_bench PRIVATE cxx_std_17)
+    vkernels_set_warnings(cross_node_nccl_bench)
+  endif()
+
   # Graph-capturable PP-boundary transfer (issue #10). Measures the actual
   # NVLink peer copy the device path enqueues per decode iteration, and the
   # graph-replay vs eager-re-issue round trip (the host progress the graph
