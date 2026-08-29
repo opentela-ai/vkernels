@@ -117,6 +117,21 @@ cmake --build --preset cuda
 ctest --preset cuda
 ```
 
+For GPU hosts that should not carry CUDA/NCCL development packages, build the
+NVIDIA image instead. It contains the CUDA toolkit plus pinned NCCL runtime and
+headers; the host only needs a compatible NVIDIA driver and NVIDIA Container
+Toolkit:
+
+```bash
+docker build -t vkernels:cuda -f meta/docker/Dockerfile.nv .
+docker run --rm --gpus all --ipc=host vkernels:cuda
+```
+
+Override `NCCL_PACKAGE_VERSION` at image build time when coordinating a CUDA or
+NCCL upgrade. The image build fails if CMake does not detect NCCL.
+To validate only the reusable CUDA/NCCL toolchain layer, build with
+`--target toolchain`.
+
 ## vkl — listing the implemented kernels
 
 `vkl` (Python, under `src/python/`) answers "what is implemented in this

@@ -85,6 +85,37 @@ typedef struct {
   int gh200_dram_only_caveat;      // 1 when the host-bounce caveat applies
 } vkernels_cross_node_kv_cost_t;
 
+// Communication primitive selected for a remote KV operation.  Point-to-point
+// is used for a KVAAS-style single-consumer cache miss.  All-gather is eligible
+// only when every rank consumes an evenly sharded value and the caller has a
+// collective implementation available.
+typedef enum {
+  VKERNELS_CROSS_NODE_KV_POINT_TO_POINT = 0,
+  VKERNELS_CROSS_NODE_KV_ALL_GATHER = 1,
+} vkernels_cross_node_kv_transfer_kind_t;
+
+typedef struct {
+  size_t world_size;
+  size_t receiver_count;
+  int evenly_sharded;
+  int collective_available;
+  int collective_graph_supported;
+} vkernels_cross_node_kv_access_t;
+
+typedef struct {
+  int kind;                       // vkernels_cross_node_kv_transfer_kind_t
+  int point_to_point_transport;   // vkernels_fi_transport_t
+  int graph_capturable;
+} vkernels_cross_node_kv_route_t;
+
+// Pure access-pattern router.  `fabric` classifies the P2P edge used directly
+// or as the fallback.  Returns INVALID_ARGUMENT for null pointers, zero world
+// or receiver counts, or receiver_count > world_size.
+vkernels_fi_status_t vkernels_cross_node_kv_select_route(
+    const vkernels_cross_node_kv_access_t* access,
+    const vkernels_fi_config_t* fabric,
+    vkernels_cross_node_kv_route_t* out);
+
 // Classify the fabric import transport from the deployment facts. On
 // success returns one of VKERNELS_FI_TRANSPORT_* and, when status_out is
 // non-null, sets it to VKERNELS_FI_OK. On a null config sets *status_out

@@ -49,6 +49,21 @@ VKERNELS_RUST_CUDA=ON cargo test --manifest-path src/rust/Cargo.toml
 
 `vkernels::has_cuda()` reports how the linked library was built.
 
+### Serving-runtime CUDA ABI
+
+The CUDA serving boundary (`libvkernels_c.so`) is exposed separately from the
+host/static `vk_*` API. Raw declarations live in
+`vkernels_sys::serving` behind the `serving-c-abi` feature. Downstream serving
+runtimes should enable `external-c-abi`, which implies those declarations,
+skips the bundled CMake build, and links a prebuilt `libvkernels_c.so` from
+`VKERNELS_LIB_DIR` (or the system linker path). `KVAAS_VKERNELS_LIB_DIR` is
+accepted temporarily as a migration alias.
+
+`vkernels_serving_abi_version()` must equal
+`VKERNELS_SERVING_ABI_VERSION` before a runtime uses serving structs or opaque
+handles. The raw crate owns ABI layout; consumers own higher-level stream,
+allocation, and completion lifetimes.
+
 ## Usage
 
 ```rust

@@ -63,10 +63,27 @@ extern "C" void vkernels_cross_node_kv_restore_plan_destroy(
   delete reinterpret_cast<vkernels::comm::cuda::CrossNodeKvRestorePlan*>(plan);
 }
 
+extern "C" size_t vkernels_cross_node_kv_restore_plan_total_bytes(
+    const vkernels_cross_node_kv_restore_plan_t* plan) {
+  if (plan == nullptr) return 0;
+  return reinterpret_cast<const vkernels::comm::cuda::CrossNodeKvRestorePlan*>(
+             plan)
+      ->total_bytes();
+}
+
+extern "C" size_t vkernels_cross_node_kv_restore_plan_bounce_bytes(
+    const vkernels_cross_node_kv_restore_plan_t* plan) {
+  if (plan == nullptr) return 0;
+  return reinterpret_cast<const vkernels::comm::cuda::CrossNodeKvRestorePlan*>(
+             plan)
+      ->bounce_bytes();
+}
+
 extern "C" vkernels_fi_status_t vkernels_cross_node_kv_restore_plan_execute(
     vkernels_cross_node_kv_restore_plan_t* plan,
     void* k_dst, void* v_dst, size_t source_layer_offset_bytes,
     const void* pinned, cudaStream_t stream) {
+  if (plan == nullptr) return VKERNELS_FI_ERR_INVALID_ARGUMENT;
   try {
     reinterpret_cast<vkernels::comm::cuda::CrossNodeKvRestorePlan*>(plan)
         ->execute(k_dst, v_dst, source_layer_offset_bytes, pinned, stream);
@@ -111,11 +128,36 @@ extern "C" void vkernels_cross_node_kv_donate_plan_destroy(
   delete reinterpret_cast<vkernels::comm::cuda::CrossNodeKvDonatePlan*>(plan);
 }
 
+extern "C" size_t vkernels_cross_node_kv_donate_plan_total_bytes(
+    const vkernels_cross_node_kv_donate_plan_t* plan) {
+  if (plan == nullptr) return 0;
+  return reinterpret_cast<const vkernels::comm::cuda::CrossNodeKvDonatePlan*>(
+             plan)
+      ->total_bytes();
+}
+
+extern "C" size_t vkernels_cross_node_kv_donate_plan_scratch_bytes(
+    const vkernels_cross_node_kv_donate_plan_t* plan) {
+  if (plan == nullptr) return 0;
+  return reinterpret_cast<const vkernels::comm::cuda::CrossNodeKvDonatePlan*>(
+             plan)
+      ->scratch_bytes();
+}
+
+extern "C" size_t vkernels_cross_node_kv_donate_plan_bounce_bytes(
+    const vkernels_cross_node_kv_donate_plan_t* plan) {
+  if (plan == nullptr) return 0;
+  return reinterpret_cast<const vkernels::comm::cuda::CrossNodeKvDonatePlan*>(
+             plan)
+      ->bounce_bytes();
+}
+
 extern "C" vkernels_fi_status_t vkernels_cross_node_kv_donate_plan_execute(
     vkernels_cross_node_kv_donate_plan_t* plan,
     const void* k_src, const void* v_src,
     size_t destination_layer_offset_bytes,
     void** out_pinned, cudaStream_t stream) {
+  if (plan == nullptr) return VKERNELS_FI_ERR_INVALID_ARGUMENT;
   try {
     reinterpret_cast<vkernels::comm::cuda::CrossNodeKvDonatePlan*>(plan)
         ->execute(k_src, v_src, destination_layer_offset_bytes, out_pinned,

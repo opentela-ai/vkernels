@@ -110,6 +110,26 @@ make_byte_link() {
   return {std::move(a), std::move(b)};
 }
 
+CrossNodeKvRoute select_cross_node_kv_route(
+    const CrossNodeKvAccess& access, const FabricImportConfig& fabric) {
+  VK_EXPECTS(access.world_size > 0, "world_size must be positive");
+  VK_EXPECTS(access.receiver_count > 0, "receiver_count must be positive");
+  VK_EXPECTS(access.receiver_count <= access.world_size,
+             "receiver_count must not exceed world_size");
+
+  CrossNodeKvRoute route;
+  route.point_to_point_transport = classify_fabric_import(fabric);
+  const bool all_gather =
+      access.world_size > 1 && access.receiver_count == access.world_size &&
+      access.evenly_sharded && access.collective_available;
+  route.kind = all_gather ? CrossNodeKvTransferKind::kAllGather
+                          : CrossNodeKvTransferKind::kPointToPoint;
+  route.graph_capturable =
+      all_gather ? access.collective_graph_supported
+                 : is_import_graph_capturable(route.point_to_point_transport);
+  return route;
+}
+
 // ---------------------------------------------------------------------------
 // CrossNodeKvRestorePlan
 // ---------------------------------------------------------------------------

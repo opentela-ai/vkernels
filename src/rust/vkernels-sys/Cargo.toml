@@ -3,7 +3,9 @@
 # build.rs configures the repository's own CMake build (the single source of
 # truth for the library) with the cmake crate, then this crate declares the
 # C ABI from src/c/vkernels/capi/capi.hpp as `extern "C"` functions. The safe
-# layer in the `vkernels` crate builds on top of these declarations.
+# layer in the `vkernels` crate builds on top of these declarations. The
+# optional serving module binds the separate CUDA `libvkernels_c.so` ABI used
+# by serving runtimes.
 #
 # CUDA: by default the library is built host-only (CPU reference path), so
 # this crate builds and tests on any machine. Set VKERNELS_RUST_CUDA=ON to
@@ -22,3 +24,10 @@ cmake = "0.1"
 
 [dependencies]
 libc = "0.2"
+
+[features]
+default = []
+serving-c-abi = []
+# Link the serving declarations against a prebuilt `libvkernels_c.so` instead
+# of building the host/static library. This implies the declarations feature.
+external-c-abi = ["serving-c-abi"]

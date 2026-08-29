@@ -153,6 +153,49 @@ make_byte_link();
 enum class CrossNodeKvDirection { kRestore = 0, kDonate = 1 };
 
 // ---------------------------------------------------------------------------
+// Access-pattern routing -- choose P2P vs a collective before building a plan
+// ---------------------------------------------------------------------------
+//
+// This decision is deliberately separate from FabricImportTransport.  The
+// latter answers *how one peer edge is reached*; this enum answers *whether
+// the workload is one peer edge at all*.  A remote cache miss in KVAAS has one
+// consumer and must remain point-to-point.  All-gather is selected only when
+// every rank needs the complete rank-sharded value, the shards are even (the
+// ncclAllGather contract), and the caller has an executable collective.
+enum class CrossNodeKvTransferKind {
+  kPointToPoint = 0,
+  kAllGather = 1,
+};
+
+struct CrossNodeKvAccess {
+  std::size_t world_size = 1;
+  std::size_t receiver_count = 1;
+  bool evenly_sharded = false;
+  bool collective_available = false;
+  bool collective_graph_supported = false;
+};
+
+struct CrossNodeKvRoute {
+  CrossNodeKvTransferKind kind = CrossNodeKvTransferKind::kPointToPoint;
+  // The edge transport used directly for kPointToPoint and the safe fallback
+  // when a collective is not eligible.  It remains useful to callers that
+  // want to log or pre-create the fallback while using kAllGather.
+  FabricImportTransport point_to_point_transport =
+      FabricImportTransport::kHostBounce;
+  bool graph_capturable = false;
+};
+
+// Select the communication primitive from the access pattern, then classify
+// the P2P edge from `fabric`.  Throws std::invalid_argument when world_size is
+// zero, receiver_count is zero, or receiver_count exceeds world_size.
+//
+// All-gather eligibility is intentionally strict:
+//   receiver_count == world_size > 1 && evenly_sharded && collective_available
+// Any other shape uses the byte-correct point-to-point restore/donate plans.
+CrossNodeKvRoute select_cross_node_kv_route(const CrossNodeKvAccess& access,
+                                             const FabricImportConfig& fabric);
+
+// ---------------------------------------------------------------------------
 // CrossNodeKvRestorePlan -- remote peer pages -> local K/V layers, cross-node
 // ---------------------------------------------------------------------------
 //

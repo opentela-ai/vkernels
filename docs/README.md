@@ -532,6 +532,9 @@ src/c/vkernels/
 │   ├── kv_gather.{hpp,cpp,cu}   # fused indexed K/V layer gather (#2)
 │   ├── kv_gather_cuda.hpp       # CUDA entry points (issue #2)
 │   ├── kv_gather_c.{h,cu}       # C ABI for the fused K/V gather (#2)
+│   ├── cross_node_kv_allgather.cu # equal-shard NCCL KV all-gather
+│   ├── cross_node_kv_allgather_cuda.hpp # communicator + prepared plan
+│   ├── cross_node_kv_allgather_c.{h,cu} # stable serving-runtime C ABI
 │   ├── pipeline_boundary.{cpp,cu} # graph-capturable PP boundary (#10)
 │   ├── overlap.cpp              # compute/comm overlap executor
 │   ├── channel.cpp              # blocking queue & mock channel

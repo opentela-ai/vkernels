@@ -10,13 +10,13 @@
 # Results exposed to the rest of the build:
 #   * VKERNELS_HAS_NCCL -- a usable NCCL installation was found.
 #   * VKERNELS_NCCL_INCLUDE_DIRS / VKERNELS_NCCL_LIBRARIES
-#   * vkernels::nccl -- an imported target the cross-node bench links to.
+#   * vkernels::nccl -- an imported target the cross-node KV all-gather plan
+#     and the on-site benchmark link to.
 #
 # Nothing here is fatal when absent: the host-only library, the full test
-# suite, and every other benchmark build and pass without NCCL, exactly as
-# the CI host job does. The real-RDMA-fabric per-hop number is an opt-in
-# on-site step (bench_cross_node_nccl.cu); the cost model in
-# bench_cross_node_kv.cpp is the CI-verifiable surface.
+# suite, and every other benchmark build and pass without NCCL. The CUDA C ABI
+# remains present and reports UNSUPPORTED for communicator creation. The
+# real-RDMA-fabric number is an opt-in on-site step.
 
 set(VKERNELS_HAS_NCCL OFF CACHE BOOL "Whether a usable NCCL installation was found" FORCE)
 

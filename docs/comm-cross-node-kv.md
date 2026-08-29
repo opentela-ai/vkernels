@@ -326,6 +326,12 @@ a cross-node comparison.)
 4-port aggregate, regardless of operation type.** All three cross-node
 rows converge to ~24 GB/s = ~96% of a single HDR-200 port (200 Gb/s ÷ 8):
 
+> A follow-up — [`docs/comm-cross-node-kv-allgather-draft.md`](comm-cross-node-kv-allgather-draft.md)
+> — proposes an **all-gather** plan as the primitive that *does* use the
+> N−1 edges a ≥3-node ring provides (climbing toward the 4-port
+> aggregate a single donate cannot reach), for the case where every node
+>> needs the full KV. Draft only; the multi-port result is unmeasured.
+
 - `nccl-xfer` (isolated point-to-point send‖recv) settles to ~24 GB/s.
 - `nccl-pipe` (N back-to-back send‖recv, one sync — added to test whether
   the per-call `cudaEvent` sync was the limiter) **does not beat `nccl-xfer`**:

@@ -65,6 +65,14 @@ vkernels_cross_node_kv_restore_plan_t* vkernels_cross_node_kv_restore_plan_creat
 void vkernels_cross_node_kv_restore_plan_destroy(
     vkernels_cross_node_kv_restore_plan_t* plan);
 
+// Bytes transferred by one execute call.  `bounce_bytes` is the pinned-host
+// receive capacity required by VKERNELS_FI_TRANSPORT_HOST_BOUNCE.  Both return
+// zero for a null plan.
+size_t vkernels_cross_node_kv_restore_plan_total_bytes(
+    const vkernels_cross_node_kv_restore_plan_t* plan);
+size_t vkernels_cross_node_kv_restore_plan_bounce_bytes(
+    const vkernels_cross_node_kv_restore_plan_t* plan);
+
 // kFabricMapped / kSameNodePeer: ONE kernel over the imported pointer.
 // kHostBounce: scatter `pinned` (one [num_pages, page_size, 2, heads,
 // head_dim] layer, caller-supplied) into local slots. Returns
@@ -94,6 +102,15 @@ vkernels_cross_node_kv_donate_plan_t* vkernels_cross_node_kv_donate_plan_create(
 
 void vkernels_cross_node_kv_donate_plan_destroy(
     vkernels_cross_node_kv_donate_plan_t* plan);
+
+// Per-execute payload and fallback capacities.  All are equal for the current
+// packed [page, token, K/V, head, dim] layout and return zero for a null plan.
+size_t vkernels_cross_node_kv_donate_plan_total_bytes(
+    const vkernels_cross_node_kv_donate_plan_t* plan);
+size_t vkernels_cross_node_kv_donate_plan_scratch_bytes(
+    const vkernels_cross_node_kv_donate_plan_t* plan);
+size_t vkernels_cross_node_kv_donate_plan_bounce_bytes(
+    const vkernels_cross_node_kv_donate_plan_t* plan);
 
 // kFabricMapped / kSameNodePeer: ONE kernel over the imported pointer.
 // kHostBounce: gather into *out_pinned (caller frees with

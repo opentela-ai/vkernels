@@ -88,6 +88,44 @@ TEST(FabricImportCABI, ClassifyNullStatusOut) {
             VKERNELS_FI_TRANSPORT_SAME_NODE_PEER);
 }
 
+TEST(FabricImportCABI, RouteSingleConsumerToFabricPointToPoint) {
+  vkernels_cross_node_kv_access_t access{4, 1, 1, 1, 1};
+  vkernels_fi_config_t fabric = FI_CFG(0, 1, 0);
+  vkernels_cross_node_kv_route_t route{};
+  EXPECT_EQ(vkernels_cross_node_kv_select_route(&access, &fabric, &route),
+            VKERNELS_FI_OK);
+  EXPECT_EQ(route.kind, VKERNELS_CROSS_NODE_KV_POINT_TO_POINT);
+  EXPECT_EQ(route.point_to_point_transport,
+            VKERNELS_FI_TRANSPORT_FABRIC_MAPPED);
+  EXPECT_EQ(route.graph_capturable, 1);
+}
+
+TEST(FabricImportCABI, RouteFullEvenShardToCollective) {
+  vkernels_cross_node_kv_access_t access{4, 4, 1, 1, 1};
+  vkernels_fi_config_t fabric = FI_CFG(0, 0, 1);
+  vkernels_cross_node_kv_route_t route{};
+  EXPECT_EQ(vkernels_cross_node_kv_select_route(&access, &fabric, &route),
+            VKERNELS_FI_OK);
+  EXPECT_EQ(route.kind, VKERNELS_CROSS_NODE_KV_ALL_GATHER);
+  EXPECT_EQ(route.point_to_point_transport,
+            VKERNELS_FI_TRANSPORT_HOST_BOUNCE);
+  EXPECT_EQ(route.graph_capturable, 1);
+}
+
+TEST(FabricImportCABI, RouteRejectsNullAndInvalidInputs) {
+  vkernels_cross_node_kv_access_t access{2, 3, 1, 1, 1};
+  vkernels_fi_config_t fabric = FI_CFG(0, 0, 0);
+  vkernels_cross_node_kv_route_t route{};
+  EXPECT_EQ(vkernels_cross_node_kv_select_route(nullptr, &fabric, &route),
+            VKERNELS_FI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(vkernels_cross_node_kv_select_route(&access, nullptr, &route),
+            VKERNELS_FI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(vkernels_cross_node_kv_select_route(&access, &fabric, nullptr),
+            VKERNELS_FI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(vkernels_cross_node_kv_select_route(&access, &fabric, &route),
+            VKERNELS_FI_ERR_INVALID_ARGUMENT);
+}
+
 // ---------------------------------------------------------------------------
 // eager_break -- 1 only for kHostBounce (dram_only or no-fabric)
 // ---------------------------------------------------------------------------

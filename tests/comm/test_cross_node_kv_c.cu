@@ -105,6 +105,23 @@ int* ints_to_device(const int* h, size_t n) {
 
 }  // namespace
 
+TEST(CrossNodeKvRouteCAbi, SharedLibraryExportsAccessPatternSelector) {
+  vkernels_cross_node_kv_access_t access{/*world_size=*/4,
+                                         /*receiver_count=*/1,
+                                         /*evenly_sharded=*/1,
+                                         /*collective_available=*/1,
+                                         /*collective_graph_supported=*/1};
+  vkernels_fi_config_t fabric{/*same_node=*/0,
+                              /*has_gpudirect_rdma=*/1,
+                              /*dram_only_libfabric=*/0};
+  vkernels_cross_node_kv_route_t route{};
+  ASSERT_EQ(vkernels_cross_node_kv_select_route(&access, &fabric, &route),
+            VKERNELS_FI_OK);
+  ASSERT_EQ(route.kind, VKERNELS_CROSS_NODE_KV_POINT_TO_POINT);
+  ASSERT_EQ(route.point_to_point_transport,
+            VKERNELS_FI_TRANSPORT_FABRIC_MAPPED);
+}
+
 // ---------------------------------------------------------------------------
 // Restore: the cross-node plan (direct over an imported device pointer)
 // must produce the same local K/V as the one-shot kv_scatter_layer oracle.
@@ -139,6 +156,10 @@ TEST(CrossNodeKvRestoreCAbi, DirectMatchesOneShot) {
           VKERNELS_FI_TRANSPORT_FABRIC_MAPPED, d_src, &st);
   ASSERT_TRUE(plan != nullptr);
   ASSERT_EQ(st, VKERNELS_FI_OK);
+  ASSERT_EQ(vkernels_cross_node_kv_restore_plan_total_bytes(plan),
+            h_src.size());
+  ASSERT_EQ(vkernels_cross_node_kv_restore_plan_bounce_bytes(plan),
+            h_src.size());
   ASSERT_EQ(vkernels_cross_node_kv_restore_plan_execute(
                 plan, dk_plan, dv_plan, 0, nullptr, 0),
             VKERNELS_FI_OK);
@@ -260,6 +281,9 @@ TEST(CrossNodeKvDonateCAbi, DirectMatchesOneShot) {
           VKERNELS_FI_TRANSPORT_FABRIC_MAPPED, d_dst, &st);
   ASSERT_TRUE(plan != nullptr);
   ASSERT_EQ(st, VKERNELS_FI_OK);
+  ASSERT_EQ(vkernels_cross_node_kv_donate_plan_total_bytes(plan), total);
+  ASSERT_EQ(vkernels_cross_node_kv_donate_plan_scratch_bytes(plan), total);
+  ASSERT_EQ(vkernels_cross_node_kv_donate_plan_bounce_bytes(plan), total);
   ASSERT_EQ(vkernels_cross_node_kv_donate_plan_execute(
                 plan, d_k, d_v, 0, nullptr, 0),
             VKERNELS_FI_OK);

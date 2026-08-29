@@ -87,6 +87,7 @@ class CrossNodeKvRestorePlan {
   std::size_t head_dim() const { return head_dim_; }
   std::size_t elem_size() const { return elem_size_; }
   std::size_t total_bytes() const { return total_bytes_; }
+  std::size_t bounce_bytes() const { return total_bytes_; }
   FabricImportTransport transport() const { return transport_; }
   bool is_graph_capturable() const { return is_import_graph_capturable(transport_); }
 
@@ -148,6 +149,8 @@ class CrossNodeKvDonatePlan {
   std::size_t head_dim() const { return head_dim_; }
   std::size_t elem_size() const { return elem_size_; }
   std::size_t total_bytes() const { return total_bytes_; }
+  std::size_t scratch_bytes() const { return total_bytes_; }
+  std::size_t bounce_bytes() const { return total_bytes_; }
   FabricImportTransport transport() const { return transport_; }
   bool is_graph_capturable() const { return is_import_graph_capturable(transport_); }
 

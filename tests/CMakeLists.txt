@@ -37,6 +37,12 @@ vkernels_add_test(NAME cross_node_kv SOURCES comm/test_cross_node_kv.cpp)
 vkernels_add_test(NAME pipeline_boundary_c SOURCES comm/test_pipeline_boundary_c.cpp)
 vkernels_add_test(NAME fabric_import_c SOURCES comm/test_fabric_import_c.cpp)
 vkernels_add_test(NAME capi         SOURCES capi/test_capi.cpp)
+vkernels_add_test(
+  NAME serving_c
+  SOURCES capi/test_serving_c.cpp
+          ${CMAKE_SOURCE_DIR}/src/c/vkernels/capi/serving_c.cpp
+  INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
+  NO_VKERNELS_LIB)
 
 # The `extern "C"` ABI is CUDA-only (the entry points take a raw
 # cudaStream_t); its runtime test is a .cu compiled when a toolkit is
@@ -66,6 +72,10 @@ if(VKERNELS_HAS_CUDA)
                     INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
                     LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
   vkernels_add_test(NAME cross_node_kv_c SOURCES comm/test_cross_node_kv_c.cu
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
+                    LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
+  vkernels_add_test(NAME cross_node_kv_allgather_c
+                    SOURCES comm/test_cross_node_kv_allgather_c.cu
                     INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
                     LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
 endif()

@@ -14,15 +14,30 @@
 //!     to `ON`/`1` to compile the CUDA kernels too. When CUDA is enabled the
 //!     CUDA runtime is linked from the toolkit found by CMake (the
 //!     `VKERNELS_CUDA_ROOT` env var or `/usr/local/cuda`).
+//!
+//! With the `external-c-abi` Cargo feature, skip the bundled host build and
+//! link a prebuilt `libvkernels_c.so` from `VKERNELS_LIB_DIR`. The legacy
+//! `KVAAS_VKERNELS_LIB_DIR` name remains a temporary migration alias.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    if env::var_os("CARGO_FEATURE_EXTERNAL_C_ABI").is_some() {
+        link_external_c_abi();
+        return;
+    }
+
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     // src/rust/vkernels-sys -> repository root.
-    let repo_root = manifest_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+    let repo_root = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
 
     let cuda_requested = env::var("VKERNELS_RUST_CUDA")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
@@ -103,6 +118,20 @@ fn main() {
         repo_root.join("CMakeLists.txt").display()
     );
     println!("cargo:rerun-if-env-changed=VKERNELS_RUST_CUDA");
+}
+
+fn link_external_c_abi() {
+    println!("cargo:rerun-if-env-changed=VKERNELS_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=KVAAS_VKERNELS_LIB_DIR");
+    if let Some(directory) =
+        env::var_os("VKERNELS_LIB_DIR").or_else(|| env::var_os("KVAAS_VKERNELS_LIB_DIR"))
+    {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            PathBuf::from(directory).display()
+        );
+    }
+    println!("cargo:rustc-link-lib=dylib=vkernels_c");
 }
 
 /// The vkernels static library is CUDA-enabled but the CUDA runtime is a

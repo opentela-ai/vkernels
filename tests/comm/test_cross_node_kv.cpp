@@ -59,6 +59,8 @@ using vkernels::comm::cross_node_kv_throughput;
 using vkernels::comm::CrossNodeHopCost;
 using vkernels::comm::CrossNodeKvDonatePlan;
 using vkernels::comm::CrossNodeKvRestorePlan;
+using vkernels::comm::CrossNodeKvAccess;
+using vkernels::comm::CrossNodeKvTransferKind;
 using vkernels::comm::eager_break_fabric_import;
 using vkernels::comm::FabricHandle;
 using vkernels::comm::FabricImport;
@@ -71,6 +73,7 @@ using vkernels::comm::make_byte_link;
 using vkernels::comm::MockByteChannel;
 using vkernels::comm::P2PKvDonatePlan;
 using vkernels::comm::P2PKvRestorePlan;
+using vkernels::comm::select_cross_node_kv_route;
 
 namespace {
 
@@ -163,6 +166,56 @@ std::vector<std::uint8_t> handle_bytes(const FabricHandle& h) {
 }
 
 }  // namespace
+
+TEST(CrossNodeKvRoute, SingleConsumerAlwaysUsesPointToPoint) {
+  CrossNodeKvAccess access{4, 1, true, true, true};
+  FabricImportConfig fabric;
+  fabric.has_gpudirect_rdma = true;
+  const auto route = select_cross_node_kv_route(access, fabric);
+  EXPECT_TRUE(route.kind == CrossNodeKvTransferKind::kPointToPoint);
+  EXPECT_EQ(route.point_to_point_transport,
+            FabricImportTransport::kFabricMapped);
+  EXPECT_TRUE(route.graph_capturable);
+}
+
+TEST(CrossNodeKvRoute, FullEvenShardUsesAvailableCollective) {
+  CrossNodeKvAccess access{4, 4, true, true, true};
+  FabricImportConfig fabric;
+  const auto route = select_cross_node_kv_route(access, fabric);
+  EXPECT_TRUE(route.kind == CrossNodeKvTransferKind::kAllGather);
+  EXPECT_EQ(route.point_to_point_transport,
+            FabricImportTransport::kHostBounce);
+  EXPECT_TRUE(route.graph_capturable);
+}
+
+TEST(CrossNodeKvRoute, RaggedOrUnavailableCollectiveFallsBackToP2P) {
+  FabricImportConfig fabric;
+  CrossNodeKvAccess ragged{4, 4, false, true, true};
+  CrossNodeKvAccess unavailable{4, 4, true, false, true};
+  EXPECT_TRUE(select_cross_node_kv_route(ragged, fabric).kind ==
+              CrossNodeKvTransferKind::kPointToPoint);
+  EXPECT_TRUE(select_cross_node_kv_route(unavailable, fabric).kind ==
+              CrossNodeKvTransferKind::kPointToPoint);
+  EXPECT_FALSE(select_cross_node_kv_route(ragged, fabric).graph_capturable);
+}
+
+TEST(CrossNodeKvRoute, RejectsInvalidAccessShape) {
+  FabricImportConfig fabric;
+  EXPECT_THROW(select_cross_node_kv_route({0, 1, true, true, true}, fabric),
+               std::invalid_argument);
+  EXPECT_THROW(select_cross_node_kv_route({2, 0, true, true, true}, fabric),
+               std::invalid_argument);
+  EXPECT_THROW(select_cross_node_kv_route({2, 3, true, true, true}, fabric),
+               std::invalid_argument);
+}
+
+TEST(CrossNodeKvRoute, CollectiveGraphCapabilityIsIndependent) {
+  FabricImportConfig fabric;
+  CrossNodeKvAccess access{4, 4, true, true, false};
+  const auto route = select_cross_node_kv_route(access, fabric);
+  EXPECT_TRUE(route.kind == CrossNodeKvTransferKind::kAllGather);
+  EXPECT_FALSE(route.graph_capturable);
+}
 
 // ---------------------------------------------------------------------------
 // ByteChannel + make_byte_link (the byte-capable transport)

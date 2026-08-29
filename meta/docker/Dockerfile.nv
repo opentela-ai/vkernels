@@ -2,16 +2,19 @@
 #
 # Build container for vkernels with NVIDIA CUDA support.
 # Uses nvcr.io/nvidia/pytorch:26.07-py3, which bundles:
-#   - CUDA toolkit + drivers
+#   - CUDA toolkit (the host supplies the NVIDIA kernel driver)
 #   - PyTorch with CUDA backend
 #   - Python 3.12+
 #   - Ubuntu 24.04 base
+# The base image includes NCCL runtime + development packages. This Dockerfile
+# verifies their exact version so vkernels can compile and run collective code
+# without a host NCCL install.
 #
 # Build (from vkernels repo root):
 #   podman build -t vkernels:cuda -f meta/docker/Dockerfile.nv .
 #
 # Run tests + benchmarks:
-#   podman run --rm --gpus all vkernels:cuda
+#   podman run --rm --gpus all --ipc=host vkernels:cuda
 #
 # Run interactively:
 #   podman run --gpus all -it vkernels:cuda bash
@@ -25,12 +28,13 @@
 #   podman build --build-arg CUDA_ARCHS="80;86;90" \
 #       -t vkernels:cuda -f meta/docker/Dockerfile.nv .
 
-FROM nvcr.io/nvidia/pytorch:26.07-py3
+FROM nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c AS toolchain
 
 # Build-time arguments
-ARG CUDA_ARCHS=native
-ARG NSIGHT_SYSTEMS_VER=2025.6
-ARG NSIGHT_COMPUTE_VER=2025.4
+ARG CUDA_ARCHS=90
+ARG NCCL_PACKAGE_VERSION=2.30.7-1+cuda13.3
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 # ------------------------------------------------------------------
 # System dependencies
@@ -40,25 +44,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
 
-# ------------------------------------------------------------------
-# Nsight Systems (nsys) — timeline profiler
-# ------------------------------------------------------------------
-RUN wget -q --show-progress \
-    "https://developer.download.nvidia.com/compute/nsight-systems/${NSIGHT_SYSTEMS_VER}/nsight-systems-${NSIGHT_SYSTEMS_VER}_${NSIGHT_SYSTEMS_VER}-1_amd64.deb" \
-    -O /tmp/nsys.deb \
-    && apt-get update && apt-get install -y --no-install-recommends /tmp/nsys.deb \
-    && rm /tmp/nsys.deb \
-    && rm -rf /var/lib/apt/lists/*
+RUN test "$(dpkg-query -W -f='${Version}' libnccl2)" = "${NCCL_PACKAGE_VERSION}" \
+    && test "$(dpkg-query -W -f='${Version}' libnccl-dev)" = "${NCCL_PACKAGE_VERSION}" \
+    && dpkg-query -W libnccl2 libnccl-dev \
+    && test -f /usr/include/nccl.h \
+    && ldconfig -p | grep -q 'libnccl\.so' \
+    && nvcc --version \
+    && test -f /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so \
+    && ln -sf libcuda.so /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so.1
 
-# ------------------------------------------------------------------
-# Nsight Compute (ncu) — kernel profiler
-# ------------------------------------------------------------------
-RUN wget -q --show-progress \
-    "https://developer.download.nvidia.com/compute/nsight-compute/${NSIGHT_COMPUTE_VER}/nsight-compute_${NSIGHT_COMPUTE_VER}-1_amd64.deb" \
-    -O /tmp/ncu.deb \
-    && apt-get update && apt-get install -y --no-install-recommends /tmp/ncu.deb \
-    && rm /tmp/ncu.deb \
-    && rm -rf /var/lib/apt/lists/*
+FROM toolchain AS vkernels
+
+ARG CUDA_ARCHS=90
 
 # ------------------------------------------------------------------
 # vkernels: build library + benchmarks + tests
@@ -74,16 +71,22 @@ RUN rm -rf build-cuda && \
     -DVKERNELS_BUILD_TESTS=ON \
     -DVKERNELS_BUILD_BENCHMARKS=ON \
     -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build-cuda -j$(nproc)
+    && env \
+       LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib/stubs \
+       LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib/stubs \
+       cmake --build build-cuda -j$(nproc) \
+    && grep -q '^VKERNELS_HAS_NCCL:BOOL=ON$' build-cuda/CMakeCache.txt
 
 # ------------------------------------------------------------------
 # Verify toolchain
 # ------------------------------------------------------------------
 RUN python3 -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())" \
+    && dpkg-query -W libnccl2 libnccl-dev \
+    && test -f /usr/include/nccl.h \
+    && ldconfig -p | grep -q 'libnccl\.so' \
     && nvcc --version \
     && nsys --version \
-    && ncu --version \
-    && nvidia-smi
+    && ncu --version
 
 CMD ["bash", "-c", "\
 echo '=== vkernels tests ===' && \

@@ -60,7 +60,8 @@ if(VKERNELS_HAS_CUDA)
       vkernels/comm/kv_scatter.cu
       vkernels/comm/pipeline_boundary.cu
       vkernels/comm/fabric_import.cu
-      vkernels/comm/cross_node_kv.cu)
+      vkernels/comm/cross_node_kv.cu
+      vkernels/comm/cross_node_kv_allgather.cu)
   set_target_properties(vkernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
   # fabric_import.cu is the only translation unit using the CUDA *driver*
@@ -80,13 +81,36 @@ if(VKERNELS_HAS_CUDA)
   # folds every C++ exception into a status code so nothing is thrown across
   # the boundary. Built only with a CUDA toolkit — the entry points take a
   # raw cudaStream_t.
-  add_library(vkernels_c SHARED vkernels/comm/p2p_gather_c.cu vkernels/comm/p2p_kv_restore_c.cu vkernels/comm/p2p_kv_donate_c.cu vkernels/comm/kv_gather_c.cu vkernels/comm/kv_scatter_c.cu vkernels/comm/pipeline_boundary_c.cu vkernels/comm/fabric_import_c.cu vkernels/comm/cross_node_kv_c.cu)
+  add_library(vkernels_c SHARED
+    vkernels/capi/serving_c.cpp
+    vkernels/comm/p2p_gather_c.cu
+    vkernels/comm/p2p_kv_restore_c.cu
+    vkernels/comm/p2p_kv_donate_c.cu
+    vkernels/comm/kv_gather_c.cu
+    vkernels/comm/kv_scatter_c.cu
+    vkernels/comm/pipeline_boundary_c.cu
+    # Pure planning symbols (transport/access-pattern routing) must be part of
+    # the shared ABI directly.  Merely linking the static archive does not pull
+    # an unreferenced C wrapper object into libvkernels_c.so.
+    vkernels/comm/fabric_import_c.cpp
+    vkernels/comm/fabric_import_c.cu
+    vkernels/comm/cross_node_kv_c.cu
+    vkernels/comm/cross_node_kv_allgather_c.cu)
   add_library(vkernels::vkernels_c ALIAS vkernels_c)
   target_link_libraries(vkernels_c PRIVATE vkernels)
   target_include_directories(vkernels_c PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_compile_features(vkernels_c PRIVATE cxx_std_17)
   vkernels_set_warnings(vkernels_c)
+endif()
+
+# The all-gather translation unit always builds with CUDA so the stable C ABI
+# can report UNSUPPORTED when NCCL is absent. When NCCL is present, link the
+# real communicator/collective implementation into both static and shared
+# consumers through vkernels' public dependency.
+if(VKERNELS_HAS_NCCL)
+  target_include_directories(vkernels PRIVATE ${VKERNELS_NCCL_INCLUDE_DIRS})
+  target_link_libraries(vkernels PUBLIC vkernels::nccl)
 endif()
 
 # HIP sources compile only when ROCm is present.
@@ -137,6 +161,7 @@ endif()
 # library's own translation units.
 target_compile_definitions(vkernels PUBLIC
   $<$<BOOL:${VKERNELS_HAS_CUDA}>:VKERNELS_HAS_CUDA=1>
+  $<$<BOOL:${VKERNELS_HAS_NCCL}>:VKERNELS_HAS_NCCL=1>
   $<$<BOOL:${VKERNELS_HAS_HIP}>:VKERNELS_HAS_HIP=1>
   $<$<BOOL:${VKERNELS_HAS_RCCL}>:VKERNELS_HAS_RCCL=1>
   $<$<BOOL:${VKERNELS_HAS_OFI}>:VKERNELS_HAS_OFI=1>)

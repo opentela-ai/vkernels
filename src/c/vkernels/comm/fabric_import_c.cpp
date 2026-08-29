@@ -11,6 +11,8 @@
 // nothing is ever thrown across the ABI boundary.
 #include "vkernels/comm/fabric_import_c.h"
 
+#include "vkernels/comm/cross_node_kv.hpp"
+
 #include "vkernels/comm/fabric_import.hpp"
 
 namespace {
@@ -119,4 +121,36 @@ extern "C" vkernels_fi_status_t vkernels_cross_node_kv_throughput(
   if (status_out != nullptr)
     *status_out = VKERNELS_FI_OK;
   return VKERNELS_FI_OK;
+}
+
+extern "C" vkernels_fi_status_t vkernels_cross_node_kv_select_route(
+    const vkernels_cross_node_kv_access_t* access,
+    const vkernels_fi_config_t* fabric,
+    vkernels_cross_node_kv_route_t* out) {
+  if (access == nullptr || fabric == nullptr || out == nullptr)
+    return VKERNELS_FI_ERR_INVALID_ARGUMENT;
+  try {
+    vkernels::comm::CrossNodeKvAccess cpp_access;
+    cpp_access.world_size = access->world_size;
+    cpp_access.receiver_count = access->receiver_count;
+    cpp_access.evenly_sharded = access->evenly_sharded != 0;
+    cpp_access.collective_available = access->collective_available != 0;
+    cpp_access.collective_graph_supported =
+        access->collective_graph_supported != 0;
+    vkernels::comm::FabricImportConfig cpp_fabric;
+    cpp_fabric.same_node = fabric->same_node != 0;
+    cpp_fabric.has_gpudirect_rdma = fabric->has_gpudirect_rdma != 0;
+    cpp_fabric.dram_only_libfabric = fabric->dram_only_libfabric != 0;
+    const auto route =
+        vkernels::comm::select_cross_node_kv_route(cpp_access, cpp_fabric);
+    out->kind = static_cast<int>(route.kind);
+    out->point_to_point_transport =
+        static_cast<int>(route.point_to_point_transport);
+    out->graph_capturable = route.graph_capturable ? 1 : 0;
+    return VKERNELS_FI_OK;
+  } catch (const std::invalid_argument&) {
+    return VKERNELS_FI_ERR_INVALID_ARGUMENT;
+  } catch (...) {  // LCOV_EXCL_LINE (pure value conversion cannot throw otherwise)
+    return VKERNELS_FI_ERR_INTERNAL;  // LCOV_EXCL_LINE
+  }
 }
