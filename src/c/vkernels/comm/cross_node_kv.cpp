@@ -26,75 +26,17 @@
 //     synchronous bulk-copy fallback (fabric_import.cpp), with the GH200
 //     DRAM-only / host-bounce caveat called out.
 #include "vkernels/comm/cross_node_kv.hpp"
+#include "vkernels/comm/slot_map.hpp"
 
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <utility>
-#include <unordered_set>
 #include <vector>
 
 #include "vkernels/util/error.hpp"
 
 namespace vkernels::comm {
-
-namespace {
-
-// One page's worth of ONE layer: [page_size, 2, num_kv_heads, head_dim].
-inline std::size_t per_slot_bytes(std::size_t num_kv_heads, std::size_t head_dim,
-                                  std::size_t elem_size) {
-  return num_kv_heads * head_dim * elem_size;
-}
-
-inline std::size_t token_stride_bytes(std::size_t num_kv_heads, std::size_t head_dim,
-                                      std::size_t elem_size) {
-  return 2 * per_slot_bytes(num_kv_heads, head_dim, elem_size);
-}
-
-// Shared geometry validation, mirroring P2PKvRestorePlan::validate_shape and
-// P2PKvDonatePlan::validate_shape: `num_pages == 0` is a valid no-op that
-// relaxes the "positive dimensions" checks (otherwise every dimension must
-// be positive and elem_size must be 2 for BF16/FP16).
-void validate_plan_shape(std::size_t num_slots, std::size_t num_kv_heads,
-                         std::size_t head_dim, std::size_t elem_size,
-                         std::size_t num_pages, std::size_t page_size) {
-  VK_EXPECTS(num_slots > 0 || num_pages == 0, "num_slots must be positive");
-  VK_EXPECTS(page_size > 0 || num_pages == 0, "page_size must be positive");
-  VK_EXPECTS(num_kv_heads > 0 || num_pages == 0, "num_kv_heads must be positive");
-  VK_EXPECTS(head_dim > 0 || num_pages == 0, "head_dim must be positive");
-  VK_EXPECTS(elem_size == 2, "elem_size must be 2 for BF16/FP16");
-}
-
-// Validate a slot map for the RESTORE (scatter -> UNIQUE destination slots,
-// non-negative, in [0, num_slots)). Mirrors P2PKvRestorePlan's host-input
-// validation so the cross-node plan validates once, at construction.
-void validate_restore_slots(const int* slot_ids, std::size_t total_tokens,
-                            std::size_t num_slots) {
-  std::unordered_set<int> seen;
-  seen.reserve(total_tokens);
-  for (std::size_t i = 0; i < total_tokens; ++i) {
-    int slot = slot_ids[i];
-    VK_EXPECTS(slot >= 0, "slot_ids must be non-negative");
-    VK_EXPECTS(static_cast<std::size_t>(slot) < num_slots,
-               "slot_ids must be < num_slots");
-    VK_EXPECTS(seen.insert(slot).second, "slot_ids must be unique");
-  }
-}
-
-// Validate a slot map for the DONATE (gather -> repeats allowed, only
-// non-negativity and bounds). Mirrors P2PKvDonatePlan's host-input
-// validation.
-void validate_donate_slots(const int* slot_ids, std::size_t total_tokens,
-                           std::size_t num_slots) {
-  for (std::size_t i = 0; i < total_tokens; ++i) {
-    int slot = slot_ids[i];
-    VK_EXPECTS(slot >= 0, "slot_ids must be non-negative");
-    VK_EXPECTS(static_cast<std::size_t>(slot) < num_slots,
-               "slot_ids must be < num_slots");
-  }
-}
-
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // ByteChannel link -- mirrors make_ring_channels(2) but for arbitrary bytes
@@ -156,8 +98,8 @@ CrossNodeKvRestorePlan::CrossNodeKvRestorePlan(std::size_t num_slots,
                  transport == FabricImportTransport::kSameNodePeer ||
                  transport == FabricImportTransport::kHostBounce,
              "unknown fabric import transport");
-  validate_plan_shape(num_slots, num_kv_heads, head_dim, elem_size,
-                      num_pages, page_size);
+  validate_kv_plan_shape(num_slots, num_kv_heads, head_dim, elem_size,
+                          num_pages, page_size);
   if (num_pages_ == 0) return;  // valid no-op plan
 
   VK_EXPECTS(slot_ids != nullptr, "slot_ids must be non-null");
@@ -169,13 +111,16 @@ CrossNodeKvRestorePlan::CrossNodeKvRestorePlan(std::size_t num_slots,
                "graph-capturable cross-node restore needs a FabricImport "
                "with a device pointer");
 
-  const std::size_t total_tokens = num_pages_ * page_size_;
-  validate_restore_slots(slot_ids, total_tokens, num_slots_);
+  const std::size_t total_tokens = checked_mul(
+      num_pages_, page_size_, "cross-node restore token count");
+  validate_unique_slots(slot_ids, total_tokens, num_slots_);
   owned_slots_.assign(slot_ids, slot_ids + total_tokens);
 
-  const std::size_t page_layer_bytes = page_size_ * token_stride_bytes(
-      num_kv_heads_, head_dim_, elem_size_);
-  total_bytes_ = num_pages_ * page_layer_bytes;  // one layer per execute()
+  const std::size_t page_layer_bytes = checked_mul(
+      page_size_, token_stride_bytes(num_kv_heads_, head_dim_, elem_size_),
+      "cross-node restore page bytes");
+  total_bytes_ = checked_mul(num_pages_, page_layer_bytes,
+                             "cross-node restore total bytes");
 
   if (is_import_graph_capturable(transport_)) {
     // Lay the per-page peer bases out exactly as the same-node path:
@@ -283,8 +228,8 @@ CrossNodeKvDonatePlan::CrossNodeKvDonatePlan(std::size_t num_slots,
                  transport == FabricImportTransport::kSameNodePeer ||
                  transport == FabricImportTransport::kHostBounce,
              "unknown fabric import transport");
-  validate_plan_shape(num_slots, num_kv_heads, head_dim, elem_size,
-                      num_pages, page_size);
+  validate_kv_plan_shape(num_slots, num_kv_heads, head_dim, elem_size,
+                          num_pages, page_size);
   if (num_pages_ == 0) return;  // valid no-op plan
 
   VK_EXPECTS(slot_ids != nullptr, "slot_ids must be non-null");
@@ -293,13 +238,16 @@ CrossNodeKvDonatePlan::CrossNodeKvDonatePlan(std::size_t num_slots,
                "graph-capturable cross-node donate needs a FabricImport "
                "with a device pointer");
 
-  const std::size_t total_tokens = num_pages_ * page_size_;
-  validate_donate_slots(slot_ids, total_tokens, num_slots_);
+  const std::size_t total_tokens = checked_mul(
+      num_pages_, page_size_, "cross-node donate token count");
+  validate_slot_bounds(slot_ids, total_tokens, num_slots_);
   owned_slots_.assign(slot_ids, slot_ids + total_tokens);
 
-  const std::size_t page_layer_bytes = page_size_ * token_stride_bytes(
-      num_kv_heads_, head_dim_, elem_size_);
-  total_bytes_ = num_pages_ * page_layer_bytes;  // one layer per execute()
+  const std::size_t page_layer_bytes = checked_mul(
+      page_size_, token_stride_bytes(num_kv_heads_, head_dim_, elem_size_),
+      "cross-node donate page bytes");
+  total_bytes_ = checked_mul(num_pages_, page_layer_bytes,
+                             "cross-node donate total bytes");
 
   if (is_import_graph_capturable(transport_)) {
     // Per-page peer destination bases, exactly as the same-node path:

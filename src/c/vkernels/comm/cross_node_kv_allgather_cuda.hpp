@@ -80,8 +80,6 @@ class CrossNodeKvAllGatherPlan {
   CrossNodeKvAllGatherPlan(const CrossNodeKvAllGatherPlan&) = delete;
   CrossNodeKvAllGatherPlan& operator=(const CrossNodeKvAllGatherPlan&) = delete;
 
-  int world() const { return world_; }
-  int rank() const { return rank_; }
   std::size_t num_pages() const { return num_pages_; }
   std::size_t local_num_pages() const { return local_num_pages_; }
   std::size_t page_size() const { return page_size_; }
@@ -104,8 +102,6 @@ class CrossNodeKvAllGatherPlan {
   void release_device_state() noexcept;
 
   NcclCommunicator* comm_ = nullptr;  // borrowed
-  int world_ = 0;
-  int rank_ = 0;
   std::size_t num_slots_ = 0;
   std::size_t num_kv_heads_ = 0;
   std::size_t head_dim_ = 0;

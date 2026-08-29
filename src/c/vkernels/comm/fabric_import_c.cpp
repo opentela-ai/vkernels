@@ -41,6 +41,31 @@ int to_c_transport(vkernels::comm::FabricImportTransport t) {
   return VKERNELS_FI_TRANSPORT_HOST_BOUNCE;  // LCOV_EXCL_LINE (exhaustive)
 }
 
+// Build the C++ FabricImportConfig from its C mirror. The same three-field
+// copy appeared in classify / eager_break / select_route; factored out so a
+// future field on vkernels_fi_config_t is propagated in exactly one place.
+vkernels::comm::FabricImportConfig cpp_fabric_config(
+    const vkernels_fi_config_t* cfg) {
+  vkernels::comm::FabricImportConfig cpp;
+  cpp.same_node = cfg->same_node != 0;
+  cpp.has_gpudirect_rdma = cfg->has_gpudirect_rdma != 0;
+  cpp.dram_only_libfabric = cfg->dram_only_libfabric != 0;
+  return cpp;
+}
+
+// Mirror of to_c_transport for the transfer-kind enum, so route.kind is
+// translated by an exhaustive switch (not a raw static_cast<int> that only
+// works while the C and C++ enumerators stay value-aligned).
+int to_c_kind(vkernels::comm::CrossNodeKvTransferKind k) {
+  switch (k) {
+    case vkernels::comm::CrossNodeKvTransferKind::kPointToPoint:
+      return VKERNELS_CROSS_NODE_KV_POINT_TO_POINT;
+    case vkernels::comm::CrossNodeKvTransferKind::kAllGather:
+      return VKERNELS_CROSS_NODE_KV_ALL_GATHER;
+  }
+  return VKERNELS_CROSS_NODE_KV_POINT_TO_POINT;  // LCOV_EXCL_LINE (exhaustive)
+}
+
 }  // namespace
 
 extern "C" int vkernels_fabric_import_classify(
@@ -50,10 +75,7 @@ extern "C" int vkernels_fabric_import_classify(
       *status_out = VKERNELS_FI_ERR_INVALID_ARGUMENT;
     return VKERNELS_FI_TRANSPORT_HOST_BOUNCE;
   }
-  vkernels::comm::FabricImportConfig cpp;
-  cpp.same_node = cfg->same_node != 0;
-  cpp.has_gpudirect_rdma = cfg->has_gpudirect_rdma != 0;
-  cpp.dram_only_libfabric = cfg->dram_only_libfabric != 0;
+  vkernels::comm::FabricImportConfig cpp = cpp_fabric_config(cfg);
   const int t = to_c_transport(vkernels::comm::classify_fabric_import(cpp));
   if (status_out != nullptr)
     *status_out = VKERNELS_FI_OK;
@@ -67,10 +89,7 @@ extern "C" int vkernels_fabric_import_eager_break(
       *status_out = VKERNELS_FI_ERR_INVALID_ARGUMENT;
     return 0;
   }
-  vkernels::comm::FabricImportConfig cpp;
-  cpp.same_node = cfg->same_node != 0;
-  cpp.has_gpudirect_rdma = cfg->has_gpudirect_rdma != 0;
-  cpp.dram_only_libfabric = cfg->dram_only_libfabric != 0;
+  const vkernels::comm::FabricImportConfig cpp = cpp_fabric_config(cfg);
   const int eager = vkernels::comm::eager_break_fabric_import(cpp) ? 1 : 0;
   if (status_out != nullptr)
     *status_out = VKERNELS_FI_OK;
@@ -137,15 +156,12 @@ extern "C" vkernels_fi_status_t vkernels_cross_node_kv_select_route(
     cpp_access.collective_available = access->collective_available != 0;
     cpp_access.collective_graph_supported =
         access->collective_graph_supported != 0;
-    vkernels::comm::FabricImportConfig cpp_fabric;
-    cpp_fabric.same_node = fabric->same_node != 0;
-    cpp_fabric.has_gpudirect_rdma = fabric->has_gpudirect_rdma != 0;
-    cpp_fabric.dram_only_libfabric = fabric->dram_only_libfabric != 0;
+    const vkernels::comm::FabricImportConfig cpp_fabric =
+        cpp_fabric_config(fabric);
     const auto route =
         vkernels::comm::select_cross_node_kv_route(cpp_access, cpp_fabric);
-    out->kind = static_cast<int>(route.kind);
-    out->point_to_point_transport =
-        static_cast<int>(route.point_to_point_transport);
+    out->kind = to_c_kind(route.kind);
+    out->point_to_point_transport = to_c_transport(route.point_to_point_transport);
     out->graph_capturable = route.graph_capturable ? 1 : 0;
     return VKERNELS_FI_OK;
   } catch (const std::invalid_argument&) {

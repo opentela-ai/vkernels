@@ -6,26 +6,19 @@
 #include <cuda_runtime.h>
 
 #include <cstring>
-#include <limits>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
 
 #if defined(VKERNELS_HAS_NCCL) && VKERNELS_HAS_NCCL
 #include <nccl.h>
 #endif
 
+#include "vkernels/comm/slot_map.hpp"
 #include "vkernels/util/error.hpp"
 
 namespace vkernels::comm::cuda {
 
 namespace {
-
-std::size_t checked_mul(std::size_t a, std::size_t b, const char* name) {
-  if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b)
-    throw std::invalid_argument(std::string(name) + " overflows size_t");
-  return a * b;
-}
 
 void check_cuda(cudaError_t status, const char* operation) {
   if (status != cudaSuccess)
@@ -171,37 +164,32 @@ CrossNodeKvAllGatherPlan::CrossNodeKvAllGatherPlan(
   check_cuda(cudaGetDevice(&current_device), "cudaGetDevice");
   VK_EXPECTS(current_device == comm_->device(),
              "all-gather plan must be created on its communicator device");
-  world_ = comm_->world();
-  rank_ = comm_->rank();
-  VK_EXPECTS(world_ > 1, "all-gather plan needs at least two ranks");
-  VK_EXPECTS(num_pages_ % static_cast<std::size_t>(world_) == 0,
+  // world/rank are consumed only in this constructor (world divides
+  // num_pages, rank offsets the local slot window); execute() reaches the
+  // communicator through comm_, so they stay locals, not members.
+  const int world = comm_->world();
+  const int rank = comm_->rank();
+  VK_EXPECTS(world > 1, "all-gather plan needs at least two ranks");
+  VK_EXPECTS(num_pages_ % static_cast<std::size_t>(world) == 0,
              "all-gather num_pages must divide evenly by world");
-  VK_EXPECTS(elem_size_ == 2, "elem_size must be 2 for BF16/FP16");
+  // Shared shape contract (elem_size always checked; the positive-dim
+  // checks relax for the num_pages == 0 no-op, exactly as the restore /
+  // donate plans), and the shared UNIQUE slot map (scatter -> each
+  // destination written once).
+  validate_kv_plan_shape(num_slots_, num_kv_heads_, head_dim_, elem_size_,
+                         num_pages_, page_size_);
   if (num_pages_ == 0) return;
-  VK_EXPECTS(num_slots_ > 0, "num_slots must be positive");
-  VK_EXPECTS(num_kv_heads_ > 0, "num_kv_heads must be positive");
-  VK_EXPECTS(head_dim_ > 0, "head_dim must be positive");
-  VK_EXPECTS(page_size_ > 0, "page_size must be positive");
   VK_EXPECTS(global_slot_ids != nullptr, "global_slot_ids must be non-null");
 
   const std::size_t total_tokens =
       checked_mul(num_pages_, page_size_, "all-gather token count");
-  std::unordered_set<int> seen;
-  seen.reserve(total_tokens);
-  for (std::size_t i = 0; i < total_tokens; ++i) {
-    const int slot = global_slot_ids[i];
-    VK_EXPECTS(slot >= 0, "global_slot_ids must be non-negative");
-    VK_EXPECTS(static_cast<std::size_t>(slot) < num_slots_,
-               "global_slot_ids must be < num_slots");
-    VK_EXPECTS(seen.insert(slot).second, "global_slot_ids must be unique");
-  }
+  validate_unique_slots(global_slot_ids, total_tokens, num_slots_);
 
-  local_num_pages_ = num_pages_ / static_cast<std::size_t>(world_);
+  local_num_pages_ = num_pages_ / static_cast<std::size_t>(world);
   const std::size_t local_tokens =
       checked_mul(local_num_pages_, page_size_, "all-gather local token count");
-  std::size_t token_bytes = checked_mul(2, num_kv_heads_, "KV token bytes");
-  token_bytes = checked_mul(token_bytes, head_dim_, "KV token bytes");
-  token_bytes = checked_mul(token_bytes, elem_size_, "KV token bytes");
+  const std::size_t token_bytes =
+      token_stride_bytes(num_kv_heads_, head_dim_, elem_size_);
   total_bytes_ = checked_mul(total_tokens, token_bytes, "all-gather bytes");
   local_shard_bytes_ =
       checked_mul(local_tokens, token_bytes, "all-gather local bytes");
@@ -211,7 +199,7 @@ CrossNodeKvAllGatherPlan::CrossNodeKvAllGatherPlan(
   const std::size_t local_slot_bytes =
       checked_mul(local_tokens, sizeof(int), "local slot bytes");
   const int* local_slots =
-      global_slot_ids + static_cast<std::size_t>(rank_) * local_tokens;
+      global_slot_ids + static_cast<std::size_t>(rank) * local_tokens;
 
   try {
     check_cuda(cudaMalloc(&dev_global_slots_, global_slot_bytes),
