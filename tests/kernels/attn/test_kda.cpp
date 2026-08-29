@@ -1,11 +1,14 @@
 // tests/kernels/attn/test_kda.cpp
 //
-// Host tests for the Kimi Delta Attention layer (issue #21): hand-checked
-// cases for the supporting ops (gated RMSNorm, gate cumsum, pack_bitmatrix),
-// and a cross-check of the full chunked forward (kda_delta_rule_fwd_cpu,
-// the L2..L6 pipeline) against the per-token naive oracle
-// (kda_naive_delta_rule_fwd_cpu) at K3 head shapes with random gates and
-// delta gates.
+// Host tests for the Kimi Delta Attention layer (issue #21, #45). The
+// naive oracle (kda_naive_delta_rule_fwd_cpu) implements the K3 per-key-dim
+// recurrence and is checked two ways: a hand-computed case (NaivePerKeyDim
+// HandChecked) and the zero-gate independence property (NaiveZeroGateIndep
+// endence). The chunked forward (kda_delta_rule_fwd_cpu, the L2..L6
+// pipeline) implements the OLD standard gated delta rule (scalar gate
+// [B,H,S], pre-gate prediction) -- a DIFFERENT recurrence -- and is cross-
+// checked against an inline standard-rule oracle (kda_standard_delta_rule_fwd
+// below) at random gates and at full-history (g==1) accumulation.
 #include "minitest.hpp"
 
 #include <cmath>
@@ -21,6 +24,51 @@ using namespace vkernels::kernels;
 namespace {
 
 float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+
+float dot(const float* x, const float* y, int D) {
+  float s = 0.0f;
+  for (int d = 0; d < D; ++d) s += x[d] * y[d];
+  return s;
+}
+
+// The STANDARD gated delta rule (scalar gate [B,H,S], pre-gate prediction) --
+// exactly the recurrence the chunked CPU (L4-L7) implements, spelled inline
+// so the chunked path stays cross-checked after the naive oracle was
+// repurposed for the K3 per-key-dim rule (issue #45). Mirrors the pre-#45
+// kda_naive_delta_rule_fwd_cpu bit-for-bit.
+//
+//   S_0 = 0
+//   for t: a_t = S_{t-1} k_t            (predict from PRE-gate state)
+//          S_t = g_t S_{t-1} + b_t (v_t - a_t) k_t^T
+//          o_t = S_t q_t
+void kda_standard_delta_rule_fwd(const float* q, const float* k,
+                                 const float* v, const float* g,
+                                 const float* beta, float* out,
+                                 int B, int H, int S, int D) {
+  std::vector<float> state((size_t)D * D, 0.0f);
+  std::vector<float> a(D);
+  for (int b = 0; b < B; ++b)
+    for (int h = 0; h < H; ++h) {
+      std::fill(state.begin(), state.end(), 0.0f);
+      const size_t bh = (size_t)(b * H + h) * S;
+      for (int t = 0; t < S; ++t) {
+        const float* kt = k + (bh + t) * D;
+        const float* vt = v + (bh + t) * D;
+        const float* qt = q + (bh + t) * D;
+        const float gt = g[bh + t];        // scalar gate [B,H,S]
+        const float bt = beta[bh + t];
+        for (int d = 0; d < D; ++d)
+          a[d] = dot(state.data() + (size_t)d * D, kt, D);
+        for (int d = 0; d < D; ++d) {
+          const float ud = vt[d] - a[d];
+          float* Srow = state.data() + (size_t)d * D;
+          for (int e = 0; e < D; ++e)
+            Srow[e] = gt * Srow[e] + bt * ud * kt[e];
+          out[(bh + t) * D + d] = dot(Srow, qt, D);
+        }
+      }
+    }
+}
 
 }  // namespace
 
@@ -101,12 +149,11 @@ TEST(KdaGateChunkCumsum, ZeroGateClamped) {
   EXPECT_NEAR(inter[1], 0.0f, 1e-6f);
 }
 
-// --- #L7 chunked forward vs naive oracle (the core correctness check) -------
-// --- #L3 naive oracle: K3 gated-delta-rule (per-key-dim gate, post-gate  ---
-// prediction). The chunked CPU (L4-L7) implements the OLD standard
-// delta-rule (scalar gate, pre-gate prediction) and is no longer the
-// oracle; the hand-checked test + the zero-gate independence property
-// below validate the new per-key-dim recurrence directly.
+// --- #L3 naive oracle: K3 per-key-dim gated delta rule (post-gate  ---
+// prediction). The hand-checked case + the zero-gate independence
+// property below validate the K3 recurrence directly; the chunked CPU
+// (L4-L7) implements a DIFFERENT recurrence (standard, scalar gate) and
+// is cross-checked against the inline oracle further down.
 TEST(KdaDeltaRuleFwd, NaivePerKeyDimHandChecked) {
   // B=1, H=1, S=2, D=2. Inputs chosen so the expected output is computable
   // by hand (see the derivation in kda.hpp).
@@ -162,6 +209,66 @@ TEST(KdaDeltaRuleFwd, NaiveZeroGateIndependence) {
           EXPECT_NEAR(out[(bh + t) * D + d], bt * kq * vt[d], 1e-4f);
       }
     }
+}
+
+// --- #L7 chunked forward vs standard-rule oracle (the core correctness check) --
+// The chunked pipeline (L2..L6) implements the standard gated delta rule
+// (scalar gate [B,H,S], pre-gate prediction) -- a different recurrence from
+// the K3 naive oracle above. It is cross-checked against the inline
+// kda_standard_delta_rule_fwd (NOT kda_naive_delta_rule_fwd_cpu), at random
+// gates across configs and at full-history (g==1) accumulation.
+struct ChunkConfig { int B, H, S, D, chunk; };
+TEST(KdaDeltaRuleFwd, ChunkedMatchesStandardOracle) {
+  const ChunkConfig configs[] = {
+      {1, 1, 8, 2, 4},
+      {1, 2, 8, 4, 4},
+      {2, 1, 8, 2, 2},
+      {1, 1, 12, 4, 4},  // S not a power of two
+  };
+  std::mt19937 rng(7);
+  auto rf = [&]() { return static_cast<float>(rng() % 2000) / 1000.0f - 1.0f; };
+  for (const auto& c : configs) {
+    std::vector<float> q((size_t)c.B * c.H * c.S * c.D);
+    std::vector<float> k(q.size()), v(q.size());
+    std::vector<float> g((size_t)c.B * c.H * c.S);   // scalar gate [B,H,S]
+    std::vector<float> beta(g.size());
+    for (auto& x : q) x = rf();
+    for (auto& x : k) x = rf();
+    for (auto& x : v) x = rf();
+    for (auto& x : g) x = 0.3f + 0.7f * (rng() % 1000) / 1000.0f;
+    for (auto& x : beta) x = 0.3f + 0.7f * (rng() % 1000) / 1000.0f;
+    std::vector<float> oracle(q.size(), 0), chunked(q.size(), 0);
+    kda_standard_delta_rule_fwd(q.data(), k.data(), v.data(), g.data(),
+                                beta.data(), oracle.data(),
+                                c.B, c.H, c.S, c.D);
+    kda_delta_rule_fwd_cpu(q.data(), k.data(), v.data(), g.data(),
+                           beta.data(), chunked.data(),
+                           c.B, c.H, c.S, c.D, c.chunk);
+    for (size_t i = 0; i < oracle.size(); ++i)
+      EXPECT_NEAR(chunked[i], oracle[i], 1e-4f);
+  }
+}
+
+TEST(KdaDeltaRuleFwd, ZeroForgettingMatchesStandardOracle) {
+  // g == 1 everywhere -> no forgetting -> the state accumulates the full
+  // delta history; a strong test of inter-chunk accumulation. beta = 0.5.
+  constexpr int B = 1, H = 1, S = 12, D = 4, chunk = 4;
+  std::mt19937 rng(123);
+  auto rf = [&]() { return static_cast<float>(rng() % 2000) / 1000.0f - 1.0f; };
+  std::vector<float> q((size_t)B * H * S * D);
+  std::vector<float> k(q.size()), v(q.size());
+  std::vector<float> g((size_t)B * H * S, 1.0f);
+  std::vector<float> beta(g.size(), 0.5f);
+  for (auto& x : q) x = rf();
+  for (auto& x : k) x = rf();
+  for (auto& x : v) x = rf();
+  std::vector<float> oracle(q.size(), 0), chunked(q.size(), 0);
+  kda_standard_delta_rule_fwd(q.data(), k.data(), v.data(), g.data(),
+                              beta.data(), oracle.data(), B, H, S, D);
+  kda_delta_rule_fwd_cpu(q.data(), k.data(), v.data(), g.data(),
+                         beta.data(), chunked.data(), B, H, S, D, chunk);
+  for (size_t i = 0; i < oracle.size(); ++i)
+    EXPECT_NEAR(chunked[i], oracle[i], 1e-3f);
 }
 
 // --- #P pack_bitmatrix: hand-checked + round-trip ---------------------------

@@ -25,12 +25,15 @@
 //  per (token, head, key-dim) — in normal space (0, 1]. The delta gate β
 //  is [B,H,S] — scalar per (token, head).)
 //
-// Chunking (L2..L6 below) parallelises the same recurrence but currently
-// implements the OLD *standard* gated delta rule (scalar gate, pre-gate
-// prediction). It is kept as a standalone reference for non-K3 models but
-// is NOT the K3 oracle; the K3 serving path (issue #45) replaces the
-// faulting Triton chunked kernels with the naive-sequential HIP kernel
-// (kda_delta_rule_fwd_with_scratch), which IS the K3 oracle.
+// The chunked path (L2..L6 below) implements the OLD *standard* gated
+// delta rule (scalar gate [B,H,S], pre-gate prediction) -- a DIFFERENT
+// recurrence from the per-key-dim oracle above. It is kept as a standalone
+// reference for non-K3 models and is cross-checked against an inline
+// standard-rule oracle in test_kda.cpp (NOT against
+// kda_naive_delta_rule_fwd_cpu, which is the K3 per-key-dim oracle). The
+// K3 serving path (issue #45) replaces the faulting Triton chunked kernels
+// with the naive-sequential HIP kernel (kda_delta_rule_fwd_with_scratch),
+// which IS the K3 oracle.
 //
 // Chunking. The naive recurrence is O(S · D²) per head — correct but too
 // slow for production. The chunked algorithm (Yang et al., "Parallelizing
@@ -58,14 +61,19 @@
 //                + Σ_{j<=t} G_{j+1,t} β_j (k_j · q_t) u_j
 //      The inter call propagates C_c across chunks and produces the
 //      inter output term; kda_gla_fwd_o adds the intra output term. Both
-//      equal the per-token oracle (kda_naive_delta_rule_fwd_cpu) to within
-//      fp32 round-off, verified by the host tests.
+//      equal the STANDARD-RULE per-token oracle (spelled inline in
+//      test_kda.cpp) to within fp32 round-off, verified by the host tests
+//      -- NOT kda_naive_delta_rule_fwd_cpu, which implements the K3
+//      per-key-dim recurrence (a different gate shape).
 //
 // Two-implementation model:
 //   kda.cpp  -- CPU reference (oracle), always compiled, in vkernels::kernels.
-//               kda_naive_delta_rule_fwd_cpu is the per-token oracle; the
-//               chunked pieces (gate cumsum / intra / inter / output) are
-//               exposed separately and cross-checked against it.
+//               kda_naive_delta_rule_fwd_cpu is the K3 per-key-dim oracle
+//               (cross-checked by hand + the zero-gate independence
+//               property). The chunked pieces (gate cumsum / intra /
+//               inter / output) implement the standard gated delta rule
+//               (scalar gate) and are cross-checked against an inline
+//               standard-rule oracle in test_kda.cpp.
 //   kda.hip  -- HIP kernels (gfx942), compiled with VKERNELS_HAS_HIP, in
 //               vkernels::kernels::hip. Each mirrors its CPU counterpart.
 #include <cstddef>
@@ -202,8 +210,11 @@ void kda_gla_fwd_o_cpu(const float* q, const float* k, const float* g,
 //   chunk_size  must divide S.
 //
 // Runs the gate cumsum → intra solve → inter propagation → output combine
-// pipeline and writes `out`. Matches kda_naive_delta_rule_fwd_cpu to within
-// fp32 round-off (verified by the host tests at K3 head shapes).
+// pipeline and writes `out`. Implements the STANDARD gated delta rule
+// (scalar gate [B,H,S], pre-gate prediction) and matches the inline
+// standard-rule oracle in test_kda.cpp to within fp32 round-off. It does
+// NOT match kda_naive_delta_rule_fwd_cpu, which implements the K3
+// per-key-dim recurrence (a different gate shape).
 void kda_delta_rule_fwd_cpu(const float* q, const float* k, const float* v,
                             const float* g, const float* beta, float* out,
                             int B, int H, int S, int D, int chunk_size);
