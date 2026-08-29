@@ -130,17 +130,25 @@ void kda_naive_delta_rule_fwd_cpu(const float* q, const float* k,
         const float* kt = k + (bh + t) * D;
         const float* vt = v + (bh + t) * D;
         const float* qt = q + (bh + t) * D;
-        const float gt = g[bh + t];
-        const float bt = beta[bh + t];
-        // a = S_{t-1} k_t  (uses the pre-update state)
-        for (int d = 0; d < D; ++d) a[d] = dot(state.data() + (size_t)d * D, kt, D);
-        // S_t = g_t S_{t-1} + beta_t (v_t - a) k_t^T ; o_t = S_t q_t
-        for (int d = 0; d < D; ++d) {
-          const float ud = vt[d] - a[d];
-          float* Srow = state.data() + (size_t)d * D;
-          for (int e = 0; e < D; ++e) Srow[e] = gt * Srow[e] + bt * ud * kt[e];
-          out[(bh + t) * D + d] = dot(Srow, qt, D);
+        const float* gt = g + (bh + t) * D;   // per-key-dim forget gate [D]
+        const float bt = beta[bh + t];         // scalar delta gate
+        // (1) gate: S'[v,k] *= g_t[k]   (per-key-dim, normal space)
+        for (int v = 0; v < D; ++v) {
+          float* Srow = state.data() + (size_t)v * D;
+          for (int k = 0; k < D; ++k) Srow[k] *= gt[k];
         }
+        // (2) predict: a[v] = S'[v,:] . k_t   (from GATED state)
+        for (int v = 0; v < D; ++v)
+          a[v] = dot(state.data() + (size_t)v * D, kt, D);
+        // (3) update: S_t[v,k] += beta_t * (v_t[v] - a[v]) * k_t[k]
+        for (int v = 0; v < D; ++v) {
+          const float ud = vt[v] - a[v];
+          float* Srow = state.data() + (size_t)v * D;
+          for (int k = 0; k < D; ++k) Srow[k] += bt * ud * kt[k];
+        }
+        // (4) output: o_t[v] = S_t[v,:] . q_t
+        for (int v = 0; v < D; ++v)
+          out[(bh + t) * D + v] = dot(state.data() + (size_t)v * D, qt, D);
       }
     }
 }

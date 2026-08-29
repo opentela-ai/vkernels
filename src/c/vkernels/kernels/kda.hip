@@ -126,13 +126,13 @@ void kda_gate_chunk_cumsum(const float* g, float* intra_log, float* inter_log,
 // (b,h), zero-initialized by the launcher) so the kernel is correct for any
 // head dim (K3 KDA head_dim = 128 → 64 KB state, above the 64 KB default
 // work-group LDS cap). Only the length-D prediction `a = S k` is staged in
-// LDS (≤ 512 B for D ≤ 128). Each token runs three barrier-separated
-// phases — (1) a = S k, (2) S = g S + β (v−a) kᵀ, (3) o = S q — grid-strided
+// LDS (≤ 512 B for D ≤ 128). Each token runs FOUR barrier-separated phases —
+// (1) GATE: S' = g ⊙ S (per-key-dim), (2) PREDICT: a = S' k (from gated
+// state), (3) UPDATE: S = S' + β (v−a) kᵀ, (4) OUTPUT: o = S q — grid-strided
 // over the D / D² work items, so the only cross-thread dependency is the
 // per-token barrier, never a data race. The recurrence order is identical
-// to the oracle (kda_naive_delta_rule_fwd_cpu), so the only divergence is
-// fp round-off. (Moving the state to LDS for D ≤ 64 is a measured follow-on
-// tuning step; the chunked intra/inter passes are a parallelism follow-on.)
+// to the oracle (kda_naive_delta_rule_fwd_cpu) and the FLA/vLLM K3
+// gated-delta-rule (IS_KDA=True), so the only divergence is fp round-off.
 template <int D, int Db>
 __global__ void kda_delta_rule_fwd_kernel(const float* __restrict__ q,
                                           const float* __restrict__ k,
@@ -169,10 +169,19 @@ __global__ void kda_delta_rule_fwd_kernel(const float* __restrict__ q,
     const float* kt = k + off * D;
     const float* vt = v + off * D;
     const float* qt = q + off * D;
-    const float gt = g[off];
-    const float bt = beta[off];
+    const float* gt = g + off * D;       // per-key-dim forget gate [D]
+    const float bt = beta[off];          // scalar delta gate
 
-    // (1) a[d] = S[d,:] · k_t  (this block's Db rows; rows in parallel).
+    // (1) GATE: S'[d,e] *= g_t[e]   (per-key-dim, this block's Db*D entries)
+    for (int idx = tid; idx < Db * D; idx += kTh) {
+      const int j = idx / D;              // local row index in [0,Db)
+      const int e = idx % D;
+      const int d = row0 + j;             // global state row
+      Sstate[(size_t)d * D + e] *= gt[e];
+    }
+    __syncthreads();
+
+    // (2) PREDICT: a[d] = S'[d,:] . k_t   (from GATED state; this block's Db rows)
     for (int j = tid; j < Db; j += kTh) {
       const int d = row0 + j;
       const float* Srow = Sstate + (size_t)d * D;
@@ -182,17 +191,17 @@ __global__ void kda_delta_rule_fwd_kernel(const float* __restrict__ q,
     }
     __syncthreads();
 
-    // (2) S = g S + β (v − a) kᵀ  (grid-stride over this block's Db*D cols).
+    // (3) UPDATE: S[d,e] += beta_t * (v_t[d] - a[d]) * k_t[e]
     for (int idx = tid; idx < Db * D; idx += kTh) {
       const int j = idx / D;              // local row index in [0,Db)
       const int e = idx % D;
       const int d = row0 + j;             // global state row
       const float ud = vt[d] - sa[j];
-      Sstate[(size_t)d * D + e] = gt * Sstate[(size_t)d * D + e] + bt * ud * kt[e];
+      Sstate[(size_t)d * D + e] += bt * ud * kt[e];
     }
     __syncthreads();
 
-    // (3) o_t = S q_t  (this block's Db rows; rows in parallel).
+    // (4) OUTPUT: o_t[d] = S_t[d,:] . q_t   (this block's Db rows)
     for (int j = tid; j < Db; j += kTh) {
       const int d = row0 + j;
       const float* Srow = Sstate + (size_t)d * D;

@@ -64,3 +64,12 @@ extern "C" void vk_hip_kda_delta_rule_fwd(
   vkernels::kernels::hip::kda_delta_rule_fwd(
       q, k, v, g, beta, out, B, H, S, D, chunk_size);
 }
+
+// --- KDA delta-rule forward (caller-owned state scratch) ---
+extern "C" void vk_hip_kda_delta_rule_fwd_with_scratch(
+    const float* q, const float* k, const float* v,
+    const float* g, const float* beta, float* state,
+    float* out, int B, int H, int S, int D) {
+  vkernels::kernels::hip::kda_delta_rule_fwd_with_scratch(
+      q, k, v, g, beta, state, out, B, H, S, D);
+}

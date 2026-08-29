@@ -124,19 +124,22 @@ void vk_hip_mla_fwd(
     const float* v_c, float* out);
 
 /* ------------------------------------------------------------------ */
-/* KDA delta-rule forward (src/c/vkernels/kernels/kda.hip, #21)        */
+/* KDA delta-rule forward (src/c/vkernels/kernels/kda.hip, #21, #45)   */
 /* ------------------------------------------------------------------ */
 /*
  * Kimi Delta Attention: a gated delta-rule linear-attention layer. A
- * per-head state matrix S_t (D x D) is updated each token by a delta
- * correction β_t (v_t - S_{t-1} k_t) k_t^T and decayed by a forget gate
- * g_t; the output is o_t = S_t q_t. This is the portable gfx942
- * replacement for the AITER / Triton chunked kernels, which GPU-fault on
- * gfx942.
+ * per-head state matrix S_t (D x D) is decayed each token by a
+ * per-key-dim forget gate g_t[k] and then updated by a delta correction
+ * beta_t (v_t - a_t) k_t^T (prediction a_t from the GATED state).
+ * This is the portable gfx942 replacement for the AITER / Triton
+ * chunked kernels, which GPU-fault on gfx942.
  *
  *   q, k, v     [B, H, S, D]  float32 queries/keys/values
- *   g           [B, H, S]     float32 forget gate
- *   beta        [B, H, S]     float32 delta rate
+ *                                     (k L2-normalised, q L2-norm +
+ *                                      scaled by D^{-1/2} by the caller)
+ *   g           [B, H, S, D]  float32 per-key-dim forget gate
+ *                                     (normal space, (0, 1])
+ *   beta        [B, H, S]     float32 scalar delta rate per (token, head)
  *   out         [B, H, S, D]  float32 output
  *   chunk_size  tiles the S dimension (e.g. 64)
  */
@@ -144,6 +147,16 @@ void vk_hip_kda_delta_rule_fwd(
     const float* q, const float* k, const float* v,
     const float* g, const float* beta, float* out,
     int B, int H, int S, int D, int chunk_size);
+
+/* Same as vk_hip_kda_delta_rule_fwd but the caller owns the state
+ * scratch [B, H, D, D] float32 -- pre-fill with the gathered initial
+ * state (zeros for first-turn prefill); the final state S_S is written
+ * back into the SAME buffer (read it after the call for multi-turn
+ * decode). No internal allocation; the caller reuses one buffer. */
+void vk_hip_kda_delta_rule_fwd_with_scratch(
+    const float* q, const float* k, const float* v,
+    const float* g, const float* beta, float* state,
+    float* out, int B, int H, int S, int D);
 
 #ifdef __cplusplus
 }

@@ -102,73 +102,66 @@ TEST(KdaGateChunkCumsum, ZeroGateClamped) {
 }
 
 // --- #L7 chunked forward vs naive oracle (the core correctness check) -------
-TEST(KdaDeltaRuleFwd, ChunkedMatchesNaive) {
-  struct Cfg { int B, H, S, D, chunk; };
-  const Cfg cfgs[] = {
-      {1, 1, 4, 2, 2},     // tiniest: two chunks
-      {1, 1, 8, 4, 4},     // two chunks, D=4
-      {1, 2, 8, 3, 4},     // D=3 (odd), H=2
-      {2, 1, 12, 4, 4},    // three chunks, B=2
-      {1, 1, 16, 4, 8},    // two larger chunks
-      {1, 1, 64, 8, 16},   // K3-ish: D=8, 4 chunks
-  };
-  std::mt19937 rng(123);
-  auto rf = [&]() { return static_cast<float>(rng() % 2000) / 1000.0f - 1.0f; };
-  auto rg = [&]() { return 0.3f + 0.7f * (rng() % 1000) / 1000.0f; };
-
-  for (const auto& c : cfgs) {
-    std::vector<float> q((size_t)c.B * c.H * c.S * c.D);
-    std::vector<float> k(q.size()), v(q.size());
-    std::vector<float> g((size_t)c.B * c.H * c.S);
-    std::vector<float> beta((size_t)c.B * c.H * c.S);
-    for (auto& x : q) x = rf();
-    for (auto& x : k) x = rf();
-    for (auto& x : v) x = rf();
-    for (auto& x : g) x = rg();
-    for (auto& x : beta) x = rg();  // delta gate in (0.3, 1.0]
-
-    std::vector<float> naive(q.size(), 0), chunked(q.size(), 0);
-    kda_naive_delta_rule_fwd_cpu(q.data(), k.data(), v.data(), g.data(),
-                                 beta.data(), naive.data(),
-                                 c.B, c.H, c.S, c.D);
-    kda_delta_rule_fwd_cpu(q.data(), k.data(), v.data(), g.data(),
-                           beta.data(), chunked.data(),
-                           c.B, c.H, c.S, c.D, c.chunk);
-
-    // The chunked recurrence accumulates the same products as the naive one,
-    // so agreement is within fp32 round-off scaled by the sequence length.
-    float maxd = 0.0f, maxabs = 0.0f;
-    for (size_t i = 0; i < naive.size(); ++i) {
-      maxd = std::max(maxd, std::fabs(naive[i] - chunked[i]));
-      maxabs = std::max(maxabs, std::fabs(naive[i]));
-    }
-    EXPECT_NEAR(maxd, 0.0f, 1e-3f * (1.0f + maxabs));
-  }
+// --- #L3 naive oracle: K3 gated-delta-rule (per-key-dim gate, post-gate  ---
+// prediction). The chunked CPU (L4-L7) implements the OLD standard
+// delta-rule (scalar gate, pre-gate prediction) and is no longer the
+// oracle; the hand-checked test + the zero-gate independence property
+// below validate the new per-key-dim recurrence directly.
+TEST(KdaDeltaRuleFwd, NaivePerKeyDimHandChecked) {
+  // B=1, H=1, S=2, D=2. Inputs chosen so the expected output is computable
+  // by hand (see the derivation in kda.hpp).
+  //   q_t0=[.6,.8] k_t0=[.8,.6] v_t0=[1,.5]  g_t0=[.9,.8] beta_t0=.5
+  //   q_t1=[0,1]   k_t1=[1,0]   v_t1=[.3,.7] g_t1=[.7,.6] beta_t1=.4
+  //
+  // t=0: S0=0 -> a=0 -> S0=beta v⊗k -> o0 = S0 q0 = [0.48, 0.24]
+  // t=1: S'=g1⊙S0 -> a=S'·k1 -> S1=S'+beta(v-a)⊗k1 -> o1=S1·q1=[0.18,0.09]
+  constexpr int B = 1, H = 1, S = 2, D = 2;
+  std::vector<float> q = {.6f, .8f,  0.f, 1.f};
+  std::vector<float> k = {.8f, .6f,  1.f, 0.f};
+  std::vector<float> v = {1.f, .5f,  .3f, .7f};
+  std::vector<float> g = {.9f, .8f,  .7f, .6f};  // [B,H,S,D] per-key-dim
+  std::vector<float> beta = {.5f, .4f};            // [B,H,S] scalar
+  std::vector<float> out(q.size(), 0);
+  kda_naive_delta_rule_fwd_cpu(q.data(), k.data(), v.data(), g.data(),
+                               beta.data(), out.data(), B, H, S, D);
+  EXPECT_NEAR(out[0], 0.48f, 1e-5f);   // o_t0[0]
+  EXPECT_NEAR(out[1], 0.24f, 1e-5f);   // o_t0[1]
+  EXPECT_NEAR(out[2], 0.18f, 1e-5f);   // o_t1[0]
+  EXPECT_NEAR(out[3], 0.09f, 1e-5f);   // o_t1[1]
 }
 
-TEST(KdaDeltaRuleFwd, ZeroForgettingMatchesNaive) {
-  // g==1 everywhere (no forgetting) stresses the inter recurrence: the state
-  // accumulates across all chunks, so the chunked combine must keep the full
-  // history (no decay) and still match the oracle.
-  constexpr int B = 1, H = 1, S = 12, D = 4, chunk = 4;
-  std::mt19937 rng(7);
+TEST(KdaDeltaRuleFwd, NaiveZeroGateIndependence) {
+  // Per-key-dim g=0 everywhere -> S'=0 each token -> a=0 ->
+  // S_t = beta_t v_t⊗k_t -> o_t = beta_t (k_t·q_t) v_t.  Each output
+  // depends ONLY on its own token (no cross-token history); a strong
+  // property that catches gate-shape / prediction-order regressions.
+  constexpr int B = 1, H = 2, S = 8, D = 4;
+  std::mt19937 rng(42);
   auto rf = [&]() { return static_cast<float>(rng() % 2000) / 1000.0f - 1.0f; };
-  std::vector<float> q((size_t)S * D), k(q.size()), v(q.size());
-  std::vector<float> g(S, 1.0f), beta(S, 0.5f);
+  std::vector<float> q((size_t)B * H * S * D), k(q.size()), v(q.size());
+  std::vector<float> g(q.size(), 0.0f);               // per-key-dim, all zero
+  std::vector<float> beta((size_t)B * H * S);
   for (auto& x : q) x = rf();
   for (auto& x : k) x = rf();
   for (auto& x : v) x = rf();
-  std::vector<float> naive(q.size(), 0), chunked(q.size(), 0);
+  for (auto& x : beta) x = 0.3f + 0.7f * (rng() % 1000) / 1000.0f;
+  std::vector<float> out(q.size(), 0);
   kda_naive_delta_rule_fwd_cpu(q.data(), k.data(), v.data(), g.data(),
-                               beta.data(), naive.data(), B, H, S, D);
-  kda_delta_rule_fwd_cpu(q.data(), k.data(), v.data(), g.data(),
-                         beta.data(), chunked.data(), B, H, S, D, chunk);
-  float maxd = 0, maxabs = 0;
-  for (size_t i = 0; i < naive.size(); ++i) {
-    maxd = std::max(maxd, std::fabs(naive[i] - chunked[i]));
-    maxabs = std::max(maxabs, std::fabs(naive[i]));
-  }
-  EXPECT_NEAR(maxd, 0.0f, 1e-3f * (1.0f + maxabs));
+                               beta.data(), out.data(), B, H, S, D);
+  for (int b = 0; b < B; ++b)
+    for (int h = 0; h < H; ++h) {
+      const size_t bh = (size_t)(b * H + h) * S;
+      for (int t = 0; t < S; ++t) {
+        const float* kt = k.data() + (bh + t) * D;
+        const float* vt = v.data() + (bh + t) * D;
+        const float* qt = q.data() + (bh + t) * D;
+        const float bt = beta[bh + t];
+        float kq = 0;
+        for (int e = 0; e < D; ++e) kq += kt[e] * qt[e];
+        for (int d = 0; d < D; ++d)
+          EXPECT_NEAR(out[(bh + t) * D + d], bt * kq * vt[d], 1e-4f);
+      }
+    }
 }
 
 // --- #P pack_bitmatrix: hand-checked + round-trip ---------------------------
