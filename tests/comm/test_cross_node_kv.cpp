@@ -699,6 +699,21 @@ TEST(CrossNodeRestore, ZeroPagesIsNoOp) {
   EXPECT_EQ(out.k.front(), 0x42);  // untouched
 }
 
+TEST(CrossNodeRestore, HugeNumPagesPageSizeOverflows) {
+  // slot_map.hpp::checked_mul (issue #49): num_pages * page_size exceeds
+  // size_t -> std::invalid_argument instead of silent wraparound. Validated
+  // geometry (positive dims, elem_size == 2) with a non-graph-capturable
+  // transport so the import is never touched; the throw happens before
+  // slot_ids is read, so a dangling pointer is safe here.
+  constexpr std::size_t kHuge = ~std::size_t{0};  // SIZE_MAX
+  int dummy = 0;
+  EXPECT_THROW(CrossNodeKvRestorePlan(kSlots, kHeads, kHeadDim, kElem,
+                                      &dummy, kHuge, 2,
+                                      FabricImportTransport::kHostBounce,
+                                      nullptr),
+               std::invalid_argument);
+}
+
 // ---------------------------------------------------------------------------
 // CrossNodeKvDonatePlan -- byte-identical to the same-node NVLink path
 // ---------------------------------------------------------------------------
