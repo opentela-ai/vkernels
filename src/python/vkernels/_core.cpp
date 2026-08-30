@@ -48,6 +48,8 @@
 #include "vkernels/kernels/gemm_bf16.hpp"
 #include "vkernels/kernels/kda.hpp"
 #include "vkernels/kernels/mla.hpp"
+#include "vkernels/kernels/dsa.hpp"
+#include "vkernels/kernels/mhc.hpp"
 #include "vkernels/kernels/moe.hpp"
 #include "vkernels/kernels/moe_aux.hpp"
 #include "vkernels/kernels/moe_fused.hpp"
@@ -484,6 +486,94 @@ PYBIND11_MODULE(_core, m) {
       py::arg("S_q"), py::arg("kv_lora_rank"), py::arg("qk_rope_head_dim"),
       "Per-shape (bq, bn_kv, threads) tile selector for the HIP MLA kernel: "
       "decode (S_q <= 8) -> (1, 64, 64); prefill -> (4, 64, 256).");
+
+  // --- DSA: DeepseekSparseAttn sparse-MLA forward (issue #51) -------------
+  //
+  // GLM-5.3-Flash (tail_dim == 0) and DeepSeek-V3 (tail_dim > 0) sparse-MLA
+  // forward, CPU reference (always compiled). bf16 is the device ABI; the
+  // host reference is fp32 end-to-end (the integrator converts).
+  kernels.def(
+      "dsa_sparse_fwd",
+      [](int S_q, int S_kv, int H, int dim, int tail_dim, int topk,
+         int kv_group, int block_I, int inner_iter, float sm_scale,
+         bool return_lse, FloatArray q, FloatArray kv, I32Array indices,
+         FloatArray out, FloatArray lse) {
+        require_writeable(out);
+        if (return_lse) require_writeable(lse);
+        kernels::dsa_sparse_fwd_cpu(
+            S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+            sm_scale, return_lse, q.data(), kv.data(), indices.data(),
+            out.mutable_data(), return_lse ? lse.mutable_data() : nullptr);
+        return out;
+      },
+      py::arg("S_q"), py::arg("S_kv"), py::arg("H"), py::arg("dim"),
+      py::arg("tail_dim"), py::arg("topk"), py::arg("kv_group"),
+      py::arg("block_I"), py::arg("inner_iter"), py::arg("sm_scale"),
+      py::arg("return_lse"), py::arg("q"), py::arg("kv"),
+      py::arg("indices"), py::arg("out"), py::arg("lse"),
+      "DeepseekSparseAttn sparse-MLA forward (CPU reference): "
+      "q [1,S_q,H,dim+tail], kv [1,S_kv,kv_group,dim+tail], "
+      "indices [1,S_q,kv_group,topk] int32 (<0/>=S_kv masked) -> "
+      "out [1,S_q,H,dim-tail] fp32, optional lse [1,S_q,H] base-2. "
+      "sm_scale folds log2(e); tail_dim==0 skips the rope-tail dot.");
+
+  kernels.def(
+      "dsa_config",
+      [](int S_q, int H, int dim, int topk) {
+        int bq = 0, threads = 0, block_I = 0, inner_iter = 0;
+        kernels::dsa_config_for(S_q, H, dim, topk, &bq, &threads, &block_I,
+                                &inner_iter);
+        return py::make_tuple(bq, threads, block_I, inner_iter);
+      },
+      py::arg("S_q"), py::arg("H"), py::arg("dim"), py::arg("topk"),
+      "Per-shape (bq, threads, block_I, inner_iter) tile selector for the "
+      "HIP DSA kernel: decode (S_q <= 8) -> (1, 64, 64, i); prefill -> "
+      "(4, 256, 64, i). inner_iter grows while topk stays divisible by "
+      "block_I*inner_iter.");
+
+  // --- MHC: multi-head hybrid-attention pre-norm (issue #51, part 2) ------
+  //
+  // The two MHC kernels (mhc_pre_gemm_sqrsum + mhc_post), fp32 CPU
+  // references (always compiled). The HIP device path (mhc.hip) is bf16
+  // and is checked against these references (test_mhc_correct.hip).
+  kernels.def(
+      "mhc_pre_gemm_sqrsum",
+      [](int num_tokens, int hc_mult, int hidden_size, FloatArray x,
+         FloatArray fn, FloatArray out, FloatArray sqrsum) {
+        require_writeable(out);
+        require_writeable(sqrsum);
+        kernels::mhc_pre_gemm_sqrsum_cpu(num_tokens, hc_mult, hidden_size,
+                                         x.data(), fn.data(),
+                                         out.mutable_data(),
+                                         sqrsum.mutable_data());
+        return out;
+      },
+      py::arg("num_tokens"), py::arg("hc_mult"), py::arg("hidden_size"),
+      py::arg("x"), py::arg("fn"), py::arg("out"), py::arg("sqrsum"),
+      "MHC pre-norm GEMM + squared-sum (CPU reference): "
+      "x [num_tokens, hc_mult*hidden] fp32, "
+      "fn [hc_mult*(2+hc_mult), hc_mult*hidden] fp32 "
+      "-> out [num_tokens, hc_mult*(2+hc_mult)] fp32 (= x @ fn^T), "
+      "sqrsum [num_tokens] fp32 (= sum_h x[n,h]^2).");
+
+  kernels.def(
+      "mhc_post",
+      [](int num_tokens, int hc, int hidden, FloatArray a, FloatArray b,
+         FloatArray c, FloatArray d, FloatArray out) {
+        require_writeable(out);
+        kernels::mhc_post_cpu(num_tokens, hc, hidden, a.data(), b.data(),
+                             c.data(), d.data(), out.mutable_data());
+        return out;
+      },
+      py::arg("num_tokens"), py::arg("hc"), py::arg("hidden"),
+      py::arg("a"), py::arg("b"), py::arg("c"), py::arg("d"),
+      py::arg("out"),
+      "MHC post-attention combine (CPU reference): "
+      "a [num_tokens, hc, hc] fp32 (comb_res_mix), "
+      "b [num_tokens, hc, hidden] fp32 (residual), "
+      "c [num_tokens, hc] fp32 (post_layer_mix), "
+      "d [num_tokens, hidden] fp32 (x bypass) -> "
+      "out[n,j,h] = c[n,j]*d[n,h] + sum_k a[n,k,j]*b[n,k,h] fp32.");
 
   // --- KDA: Kimi Delta Attention (issue #21) -------------------------------
   //

@@ -22,7 +22,9 @@
 
 #include "vkernels/kernels/moe_fused.hpp"
 #include "vkernels/kernels/mla.hpp"
+#include "vkernels/kernels/dsa.hpp"
 #include "vkernels/kernels/kda.hpp"
+#include "vkernels/kernels/mhc.hpp"
 
 // --- fused MXFP4 MoE (Kimi-K3 SiTU via activation=1) ---
 extern "C" void vk_hip_fused_moe_mxfp4(
@@ -54,6 +56,39 @@ extern "C" void vk_hip_mla_fwd(
       B, H, S_q, S_kv, q_start, kv_start,
       kv_lora_rank, qk_rope_head_dim, scale,
       q, k_c, k_pe, v_c, out);
+}
+
+// --- DSA sparse-MLA forward (GLM-5.3-Flash / DeepSeek-V3) ---
+extern "C" void vk_hip_dsa_sparse_fwd(
+    int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
+    int block_I, int inner_iter, float sm_scale, int return_lse,
+    const void* q, const void* kv, const void* indices, void* out, void* lse) {
+  vkernels::kernels::hip::dsa_sparse_fwd(
+      S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+      sm_scale, return_lse != 0, q, kv, indices, out, lse);
+}
+
+// --- DSA per-shape tile selector ---
+extern "C" void vk_hip_dsa_config(int S_q, int H, int dim, int topk, int* bq,
+                                 int* threads, int* block_I, int* inner_iter) {
+  vkernels::kernels::dsa_config_for(S_q, H, dim, topk, bq, threads, block_I,
+                                    inner_iter);
+}
+
+// --- MHC multi-head hybrid-attention pre-norm (GLM-5.3-Flash) ---
+extern "C" void vk_hip_mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3,
+                                        int hc_hidden_size,
+                                        const void* x, const void* fn,
+                                        void* out, void* sqrsum) {
+  vkernels::kernels::hip::mhc_pre_gemm_sqrsum(num_tokens, hc_mult3,
+                                              hc_hidden_size, x, fn, out,
+                                              sqrsum);
+}
+
+extern "C" void vk_hip_mhc_post(int num_tokens, int hc, int hidden,
+                               const void* a, const void* b, const void* c,
+                               const void* d, void* out) {
+  vkernels::kernels::hip::mhc_post(num_tokens, hc, hidden, a, b, c, d, out);
 }
 
 // --- KDA delta-rule forward ---

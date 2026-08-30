@@ -956,6 +956,130 @@ def mla_config(S_q, kv_lora_rank, qk_rope_head_dim):
 
 
 # ---------------------------------------------------------------------------
+# DSA: DeepseekSparseAttn sparse-MLA forward (issue #51)
+# ---------------------------------------------------------------------------
+
+_LOG2E = np.float32(math.log2(math.e))
+_DSA_NEG_INF = np.float32(-np.inf)
+
+
+def dsa_sparse_fwd(S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I,
+                   inner_iter, sm_scale, return_lse, q, kv, indices, out,
+                   lse):
+    """Pure-Python (numpy) DSA sparse-MLA forward; mirrors
+    ``dsa_sparse_fwd_cpu`` exactly (two-pass BASE-2 stable softmax over the
+    ``topk`` selected keys, fp32 throughout). ``q`` ``(1,S_q,H,W)``,
+    ``kv`` ``(1,S_kv,1,W)``, ``indices`` ``(1,S_q,1,topk)`` int32
+    (``<0/>=S_kv`` masked), ``W = dim + tail_dim``, ``d_v = dim - tail_dim``.
+    """
+    W = dim + tail_dim
+    d_v = dim - tail_dim
+    q = np.ascontiguousarray(q, dtype=np.float32).reshape(S_q, H, W)
+    kv = np.ascontiguousarray(kv, dtype=np.float32).reshape(S_kv, W)
+    idx = np.ascontiguousarray(indices, dtype=np.int32).reshape(S_q, topk)
+    out = np.ascontiguousarray(out, dtype=np.float32).reshape(S_q, H, d_v)
+    lse = (
+        np.ascontiguousarray(lse, dtype=np.float32).reshape(S_q, H)
+        if return_lse
+        else None
+    )
+    for i in range(S_q):
+        idx_i = idx[i]  # (topk,)
+        valid = (idx_i >= 0) & (idx_i < S_kv)  # (topk,)
+        sel = np.where(valid, idx_i, 0)  # safe gather index
+        kv_sel = kv[sel]  # (topk, W)
+        v_sel = kv_sel[:, :d_v]  # (topk, d_v)
+        k_main = kv_sel[:, :dim]  # (topk, dim)
+        q_i = q[i]  # (H, W)
+        q_main = q_i[:, :dim]  # (H, dim)
+        s = q_main @ k_main.T  # (H, topk)
+        if tail_dim > 0:
+            k_tail = kv_sel[:, dim:dim + tail_dim]  # (topk, tail_dim)
+            q_tail = q_i[:, dim:dim + tail_dim]  # (H, tail_dim)
+            s = s + q_tail @ k_tail.T
+        s = s * np.float32(sm_scale)
+        s = np.where(valid[None, :], s, _DSA_NEG_INF)
+        # kv_group == 1: every H head shares the same selected keys, so the
+        # all-masked condition is a single scalar for this query row.
+        row_valid = bool(valid.any())
+        mx = s.max(axis=1, keepdims=True)  # (H, 1)
+        safe_mx = np.where(row_valid, mx, np.float32(0.0))
+        e = np.where(
+            valid[None, :],
+            np.power(np.float32(2.0), s - safe_mx),
+            np.float32(0.0),
+        )
+        sm = e.sum(axis=1, keepdims=True)  # (H, 1)
+        sm_safe = np.where(sm > 0, sm, np.float32(1.0))
+        w = e / sm_safe  # (H, topk)
+        out_i = (w @ v_sel).astype(np.float32)  # (H, d_v)
+        out[i] = np.where(row_valid, out_i, np.float32(0.0)).astype(np.float32)
+        if return_lse:
+            row_lse = safe_mx[:, 0] + np.log2(np.where(sm[:, 0] > 0, sm[:, 0], np.float32(1.0)))
+            lse[i] = np.where(row_valid, row_lse.astype(np.float32), _DSA_NEG_INF).astype(np.float32)
+    return out
+
+
+def dsa_config(S_q, H, dim, topk):
+    """Per-shape (bq, threads, block_I, inner_iter) tile selector (mirrors
+    ``dsa_config_for``; decode S_q<=8 -> (1,64,64,i), prefill ->
+    (4,256,64,i); inner_iter grows while topk % (block_I*inner_iter) == 0)."""
+    bq = 1 if S_q <= 8 else 4
+    threads = 64 if S_q <= 8 else 256
+    block_I = 64
+    inner_iter = 1
+    while inner_iter < 8 and topk % (block_I * (inner_iter * 2)) == 0:
+        inner_iter *= 2
+    return (bq, threads, block_I, inner_iter)
+
+
+# ---------------------------------------------------------------------------
+# MHC: multi-head hybrid-attention pre-norm (issue #51, part 2)
+# ---------------------------------------------------------------------------
+
+
+def mhc_pre_gemm_sqrsum(num_tokens, hc_mult, hidden_size, x, fn, out,
+                        sqrsum):
+    """Pure-Python (numpy) MHC pre-norm GEMM + squared-sum; mirrors
+    ``mhc_pre_gemm_sqrsum_cpu`` exactly (fp32 throughout). ``x``
+    ``(num_tokens, hc_hidden)`` with ``hc_hidden = hc_mult*hidden``,
+    ``fn`` `(hc_mult3, hc_hidden)` with ``hc_mult3 = hc_mult*(2+hc_mult)``. """
+    hc_hidden = hc_mult * hidden_size
+    hc_mult3 = hc_mult * (2 + hc_mult)
+    x = np.ascontiguousarray(x, dtype=np.float32).reshape(num_tokens,
+                                                          hc_hidden)
+    fn = np.ascontiguousarray(fn, dtype=np.float32).reshape(hc_mult3,
+                                                           hc_hidden)
+    out = np.ascontiguousarray(out, dtype=np.float32).reshape(num_tokens,
+                                                              hc_mult3)
+    sqrsum = np.ascontiguousarray(sqrsum, dtype=np.float32).reshape(
+        num_tokens
+    )
+    np.dot(x, fn.T, out=out)
+    np.einsum("nh,nh->n", x, x, out=sqrsum)
+    return out, sqrsum
+
+
+def mhc_post(num_tokens, hc, hidden, a, b, c, d, out):
+    """Pure-Python (numpy) MHC post-attention combine; mirrors
+    ``mhc_post_cpu`` exactly (fp32 throughout). ``a`` `(n,hc,hc)`,
+    ``b`` `(n,hc,hidden)`, ``c`` `(n,hc)`, ``d`` `(n,hidden)` ->
+    ``out[n,j,h] = c[n,j]*d[n,h] + sum_k a[n,k,j]*b[n,k,h]``. """
+    a = np.ascontiguousarray(a, dtype=np.float32).reshape(num_tokens, hc, hc)
+    b = np.ascontiguousarray(b, dtype=np.float32).reshape(num_tokens, hc,
+                                                           hidden)
+    c = np.ascontiguousarray(c, dtype=np.float32).reshape(num_tokens, hc)
+    d = np.ascontiguousarray(d, dtype=np.float32).reshape(num_tokens, hidden)
+    out = np.ascontiguousarray(out, dtype=np.float32).reshape(
+        num_tokens, hc, hidden
+    )
+    # a[n,k,j] * b[n,k,h] summed over k -> (n, j, h); then + c[n,j]*d[n,h].
+    mixed = np.einsum("nkj,nkh->njh", a, b)
+    out[:] = (mixed + c[:, :, None] * d[:, None, :]).astype(np.float32)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # KDA: Kimi Delta Attention (issue #21)
 # ---------------------------------------------------------------------------
 

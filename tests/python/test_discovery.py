@@ -29,6 +29,10 @@ ROOT = discovery.find_repo_root(_SRC / "vkernels")
 # Exact contract for the kernels/ headers (files sorted alphabetically,
 # declarations in file order): name -> category.
 EXPECTED_KERNELS = [
+    ("dsa_sparse_fwd_cpu", "dsa"),
+    ("dsa_config_for", "dsa"),
+    ("dsa_sparse_fwd", "dsa"),
+    ("dsa_sparse_fwd_with_tile", "dsa"),
     ("add", "elementwise"),
     ("scale", "elementwise"),
     ("relu", "elementwise"),
@@ -49,6 +53,10 @@ EXPECTED_KERNELS = [
     ("kda_delta_rule_fwd", "kda"),
     ("kda_delta_rule_fwd_with_scratch", "kda"),
     ("kda_pack_bitmatrix", "kda"),
+    ("mhc_pre_gemm_sqrsum_cpu", "mhc"),
+    ("mhc_post_cpu", "mhc"),
+    ("mhc_pre_gemm_sqrsum", "mhc"),
+    ("mhc_post", "mhc"),
     ("mla_fwd_cpu", "mla"),
     ("mla_config_for", "mla"),
     ("mla_fwd", "mla"),

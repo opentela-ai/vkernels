@@ -162,6 +162,56 @@ void vk_mla_config(int S_q, int kv_lora_rank, int qk_rope_head_dim,
                     int* bq, int* bn, int* threads);
 
 /* ------------------------------------------------------------------ */
+/* kernels: DSA — DeepseekSparseAttn sparse-MLA forward (dsa.hpp)   */
+/*                                                                     */
+/* q       : [1, S_q,  H,  dim + tail_dim]  fp32                      */
+/* kv      : [1, S_kv, kv_group, dim + tail_dim] fp32 (kv_group==1)   */
+/* indices : [1, S_q, kv_group, topk]  int32 (<0/>=S_kv = masked)     */
+/* out     : [1, S_q, H, dim - tail_dim]   fp32                       */
+/* lse     : [1, S_q, H]   fp32, nullable (when return_lse == false). */
+/* Two-pass stable BASE-2 softmax (sm_scale folds log2(e)).            */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
+                          int topk, int kv_group, int block_I,
+                          int inner_iter, float sm_scale, int return_lse,
+                          const float* q, const float* kv,
+                          const int32_t* indices, float* out, float* lse);
+
+/* Per-shape (bq, threads, block_I, inner_iter) tile selector for the HIP
+ * DSA kernel. decode (S_q <= 8) -> (1, 64, 64, i); prefill -> (4, 256, ...).
+ * Never throws. */
+void vk_dsa_config(int S_q, int H, int dim, int topk, int* bq,
+                   int* threads, int* block_I, int* inner_iter);
+
+/* ------------------------------------------------------------------ */
+/* kernels: MHC — multi-head hybrid-attention pre-norm (mhc.hpp, #51)  */
+/*                                                                       */
+/* mhc_pre_gemm_sqrsum:                                                   */
+/*   x       : [num_tokens, hc_hidden_size]  bf16 (hc_hidden=hc_mult*hidden)*/
+/*   fn      : [hc_mult3,    hc_hidden_size] fp32 (hc_mult3=hc_mult*(2+hc_mult))*/
+/*   out     : [num_tokens, hc_mult3]        fp32  (= x @ fn^T)          */
+/*   sqrsum  : [num_tokens]                  fp32  (= sum_h x[n,h]^2)    */
+/*   hc_mult3 <= 32.                                                        */
+/*                                                                         */
+/* mhc_post:                                                              */
+/*   a (comb_res_mix) [num_tokens, hc, hc]  fp32                          */
+/*   b (residual)     [num_tokens, hc, hidden] bf16                       */
+/*   c (post_layer_mix)[num_tokens, hc]     fp32                         */
+/*   d (x)            [num_tokens, hidden]  bf16                         */
+/*   out[n,j,h] = c[n,j]*d[n,h] + sum_k a[n,k,j]*b[n,k,h]   (bf16)        */
+/*   hc <= 63.                                                             */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult, int hidden_size,
+                               const float* x, const float* fn,
+                               float* out, float* sqrsum);
+
+int32_t vk_mhc_post(int num_tokens, int hc, int hidden,
+                    const float* a, const float* b, const float* c,
+                    const float* d, float* out);
+
+/* ------------------------------------------------------------------ */
 /* kernels: KDA — Kimi Delta Attention                                    */
 /* (src/c/vkernels/kernels/kda.hpp, issue #21)                           */
 /*                                                                       */

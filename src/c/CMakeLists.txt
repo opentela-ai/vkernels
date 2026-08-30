@@ -19,6 +19,8 @@ target_sources(vkernels
     vkernels/kernels/moe_fused.cpp
     vkernels/kernels/moe_aux.cpp
     vkernels/kernels/mla.cpp
+    vkernels/kernels/dsa.cpp
+    vkernels/kernels/mhc.cpp
     vkernels/kernels/kda.cpp
     vkernels/comm/channel.cpp
     vkernels/comm/rccl.cpp
@@ -122,6 +124,8 @@ if(VKERNELS_HAS_HIP)
       vkernels/kernels/moe_aux.hip
       vkernels/kernels/gemm_bf16.hip
       vkernels/kernels/mla.hip
+      vkernels/kernels/dsa.hip
+      vkernels/kernels/mhc.hip
       vkernels/kernels/kda.hip)
   set_target_properties(vkernels PROPERTIES HIP_SEPARABLE_COMPILATION ON)
 

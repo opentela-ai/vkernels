@@ -243,4 +243,26 @@ if(VKERNELS_HAS_HIP)
   target_link_libraries(kda_bench PRIVATE vkernels::vkernels)
   target_compile_features(kda_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(kda_bench)
+
+  # DeepseekSparseAttn sparse-MLA forward (issue #51).
+  add_executable(test_dsa_correct test_dsa_correct.hip)
+  target_link_libraries(test_dsa_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_dsa_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_dsa_correct)
+
+  add_executable(dsa_bench bench_dsa.hip)
+  target_link_libraries(dsa_bench PRIVATE vkernels::vkernels)
+  target_compile_features(dsa_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(dsa_bench)
+
+  # MHC multi-head hybrid-attention pre-norm (issue #51, part 2).
+  add_executable(test_mhc_correct test_mhc_correct.hip)
+  target_link_libraries(test_mhc_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_mhc_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_mhc_correct)
+
+  add_executable(mhc_bench bench_mhc.hip)
+  target_link_libraries(mhc_bench PRIVATE vkernels::vkernels)
+  target_compile_features(mhc_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(mhc_bench)
 endif()

@@ -17,6 +17,8 @@ except ImportError:  # pragma: no cover
 from vkernels import _backend, kernels
 from vkernels.kernels import (
     add,
+    dsa_config,
+    dsa_sparse_fwd,
     fused_moe_mxfp4,
     gemm,
     gemm_bf16,
@@ -32,6 +34,8 @@ from vkernels.kernels import (
     max as vk_max,
     mla_fwd,
     mla_config,
+    mhc_post,
+    mhc_pre_gemm_sqrsum,
     moe_align_block_size,
     mxfp4_moe_quant,
     mxfp4_moe_scatter_reduce,
@@ -1164,6 +1168,276 @@ class MlaFwdTest(unittest.TestCase):
             f = _run_under(fb, lambda q=q, kc=k_c, kp=k_pe, vc=v_c, sc=sc:
                            mla_fwd(q, kc, kp, vc, scale=sc).copy())
             np.testing.assert_allclose(c, f, rtol=1e-5, atol=1e-6)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class DsaFwdTest(unittest.TestCase):
+    def test_hand_checked_tail_dim_zero(self):
+        # GLM-5.3-Flash (tail_dim == 0). q=[1,1], 2 keys, sm_scale=1:
+        # scores {1,1} -> base-2 weights {1,1}/2 -> out {0.5,0.5}, lse=2.
+        q = np.array([1, 1], dtype=_F32).reshape(1, 1, 1, 2)
+        kv = np.array([1, 0, 0, 1], dtype=_F32).reshape(1, 2, 1, 2)
+        idx = np.array([0, 1], dtype=np.int32).reshape(1, 1, 1, 2)
+        out, lse = dsa_sparse_fwd(q, kv, idx, dim=2, tail_dim=0,
+                                  sm_scale=1.0, return_lse=True)
+        self.assertEqual(out.shape, (1, 1, 1, 2))
+        self.assertEqual(out.dtype, _F32)
+        np.testing.assert_allclose(out[0, 0, 0], [0.5, 0.5], atol=1e-6)
+        np.testing.assert_allclose(lse[0, 0, 0], 2.0, atol=1e-6)
+
+    def test_hand_checked_tail_dim_positive(self):
+        # DeepSeek-V3 (tail_dim > 0): dim=2 tail=1 d_v=1.
+        #   q=[1,0|0]  kv0=[v=2,km_x=1,kt=1]  kv1=[v=3,km_x=0,kt=1]
+        #   scores {2,3} -> w0=0.5,w1=1,sum=1.5 -> out=4/1.5, lse=3+log2(1.5).
+        import math
+        q = np.array([1, 0, 0], dtype=_F32).reshape(1, 1, 1, 3)
+        kv = np.array([2, 1, 1, 3, 0, 1], dtype=_F32).reshape(1, 2, 1, 3)
+        idx = np.array([0, 1], dtype=np.int32).reshape(1, 1, 1, 2)
+        out, lse = dsa_sparse_fwd(q, kv, idx, dim=2, tail_dim=1,
+                                  sm_scale=1.0, return_lse=True)
+        np.testing.assert_allclose(out[0, 0, 0], [4.0 / 1.5], atol=1e-6)
+        np.testing.assert_allclose(lse[0, 0, 0], 3.0 + math.log2(1.5), atol=1e-6)
+
+    def test_masked_index_is_zero(self):
+        # A -1 entry (kpool tail) contributes zero weight -> out=[1,0].
+        q = np.array([1, 1], dtype=_F32).reshape(1, 1, 1, 2)
+        kv = np.array([1, 0, 0, 1], dtype=_F32).reshape(1, 2, 1, 2)
+        idx = np.array([0, -1], dtype=np.int32).reshape(1, 1, 1, 2)
+        out, lse = dsa_sparse_fwd(q, kv, idx, dim=2, tail_dim=0,
+                                  sm_scale=1.0, return_lse=True)
+        np.testing.assert_allclose(out[0, 0, 0], [1.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(lse[0, 0, 0], 1.0, atol=1e-6)
+
+    def test_all_masked_is_zero_and_neg_inf_lse(self):
+        q = np.array([1, 1], dtype=_F32).reshape(1, 1, 1, 2)
+        kv = np.array([9, 9, 9, 9], dtype=_F32).reshape(1, 2, 1, 2)
+        idx = np.array([-1, -1], dtype=np.int32).reshape(1, 1, 1, 2)
+        out, lse = dsa_sparse_fwd(q, kv, idx, dim=2, tail_dim=0,
+                                  sm_scale=1.0, return_lse=True)
+        np.testing.assert_array_equal(out, np.zeros((1, 1, 1, 2), dtype=_F32))
+        self.assertTrue(np.isneginf(lse[0, 0, 0]))
+
+    def test_default_sm_scale(self):
+        # sm_scale defaults to (1/sqrt(W)) * log2(e).
+        import math
+        q = np.ones((1, 1, 1, 4), dtype=_F32)
+        kv = np.eye(2, 4, dtype=_F32).reshape(1, 2, 1, 4)
+        idx = np.array([0, 1], dtype=np.int32).reshape(1, 1, 1, 2)
+        out_def = dsa_sparse_fwd(q, kv, idx, dim=4, tail_dim=0)
+        out_exp = dsa_sparse_fwd(q, kv, idx, dim=4, tail_dim=0,
+                                 sm_scale=(1.0 / math.sqrt(4)) * math.log2(math.e))
+        np.testing.assert_allclose(out_def, out_exp, atol=1e-6)
+
+    def test_config_selector(self):
+        self.assertEqual(dsa_config(1, 64, 256, 128), (1, 64, 64, 2))
+        self.assertEqual(dsa_config(8, 64, 256, 128), (1, 64, 64, 2))
+        self.assertEqual(dsa_config(9, 64, 256, 128), (4, 256, 64, 2))
+        # inner_iter grows while topk stays divisible by block_I*inner_iter.
+        self.assertEqual(dsa_config(1, 64, 256, 512), (1, 64, 64, 8))
+        self.assertEqual(dsa_config(1, 64, 256, 2048), (1, 64, 64, 8))
+
+    def test_shape_validation(self):
+        q = np.ones((1, 1, 1, 4), dtype=_F32)
+        kv = np.ones((1, 2, 1, 4), dtype=_F32)
+        idx = np.array([0, 1], dtype=np.int32).reshape(1, 1, 1, 2)
+        out = dsa_sparse_fwd(q, kv, idx, dim=4, tail_dim=0)
+        self.assertEqual(out.shape, (1, 1, 1, 4))
+        # q last dim != dim + tail_dim
+        with self.assertRaises(ValueError):
+            dsa_sparse_fwd(np.ones((1, 1, 1, 5), dtype=_F32), kv, idx,
+                           dim=4, tail_dim=0)
+        # d_v <= 0 (tail_dim == dim)
+        with self.assertRaises(ValueError):
+            dsa_sparse_fwd(q, kv, idx, dim=2, tail_dim=2)
+        # kv_group != 1
+        with self.assertRaises(ValueError):
+            dsa_sparse_fwd(q, np.ones((1, 2, 2, 4), dtype=_F32),
+                           np.array([0, 1], dtype=np.int32).reshape(1, 1, 2, 2),
+                           dim=4, tail_dim=0, kv_group=2)
+        # wrong ndim
+        with self.assertRaises(ValueError):
+            dsa_sparse_fwd(np.ones(4, dtype=_F32), kv, idx, dim=4, tail_dim=0)
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(51)
+        for (S_q, S_kv, H, dim, td, tk) in [
+            (1, 256, 64, 256, 0, 128),   # GLM-5.3-Flash decode
+            (1, 512, 64, 256, 0, 256),
+            (4, 256, 8, 256, 0, 128),   # prefill
+            (1, 256, 16, 576, 64, 256), # DeepSeek-V3 decode
+            (1, 128, 8, 576, 64, 128),
+            (1, 16, 2, 8, 2, 16),
+        ]:
+            W = dim + td
+            d_v = dim - td
+            q = rng.standard_normal((1, S_q, H, W)).astype(_F32)
+            kv = rng.standard_normal((1, S_kv, 1, W)).astype(_F32)
+            idx = rng.integers(0, S_kv, size=(1, S_q, 1, tk),
+                               dtype=np.int32)
+            idx[idx % 10 == 9] = -1
+            sc = np.float32((1.0 / np.sqrt(W)) * np.log2(np.e))
+
+            def run(impl, q=q, kv=kv, idx=idx, sc=sc, return_lse=True):
+                prev = kernels._impl
+                kernels._impl = impl
+                try:
+                    o, l = dsa_sparse_fwd(q, kv, idx, dim=dim, tail_dim=td,
+                                          sm_scale=sc, return_lse=return_lse)
+                    return (o.copy(), l.copy()) if return_lse else o.copy()
+                finally:
+                    kernels._impl = prev
+
+            c_o, c_l = run(core)
+            f_o, f_l = run(fb)
+            np.testing.assert_allclose(c_o, f_o, rtol=1e-5, atol=1e-6)
+            cl = np.where(np.isfinite(c_l), c_l, 0.0)
+            fl = np.where(np.isfinite(f_l), f_l, 0.0)
+            np.testing.assert_allclose(cl, fl, rtol=1e-5, atol=1e-6)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class MhcPreGemmSqrsumTest(unittest.TestCase):
+    def test_hand_checked_identity_extended(self):
+        # hc_mult=2, hidden=2 -> hc_hidden=4, hc_mult3=8. fn is identity in
+        # the first 4 rows, zero after (hc_mult3 > hc_hidden). x=[1,2,3,4]
+        # -> out=[1,2,3,4,0,0,0,0], sqrsum=30.
+        x = np.array([1, 2, 3, 4], dtype=_F32)
+        fn = np.zeros((8, 4), dtype=_F32)
+        for o in range(4):
+            fn[o, o] = 1.0
+        out, sqrsum = mhc_pre_gemm_sqrsum(x, fn, hc_mult=2, hidden_size=2)
+        self.assertEqual(out.shape, (1, 8))
+        self.assertEqual(sqrsum.shape, (1,))
+        np.testing.assert_allclose(out[0], [1, 2, 3, 4, 0, 0, 0, 0], atol=1e-6)
+        np.testing.assert_allclose(sqrsum[0], 30.0, atol=1e-6)
+
+    def test_hand_checked_constant_rows(self):
+        # fn[o,:] = (o+1) -> out[n,o] = (o+1)*sum(x[n,:]).
+        hc_mult, hidden = 3, 2
+        hc_mult3 = hc_mult * (2 + hc_mult)  # 15
+        hc_hidden = hc_mult * hidden          # 6
+        x = np.array([1, 2, 3, 4, 5, 6,   # token 0, sum = 21
+                      0, -1, 2, -3, 4, 0], dtype=_F32)  # token 1, sum = 2
+        fn = np.tile(np.arange(1, hc_mult3 + 1,
+                     dtype=_F32)[:, None], (1, hc_hidden))
+        out, sqrsum = mhc_pre_gemm_sqrsum(x, fn, hc_mult=hc_mult,
+                                         hidden_size=hidden)
+        self.assertEqual(out.shape, (2, hc_mult3))
+        np.testing.assert_allclose(out[0], np.arange(1, hc_mult3 + 1) * 21,
+                                    atol=1e-5)
+        np.testing.assert_allclose(out[1], np.arange(1, hc_mult3 + 1) * 2,
+                                    atol=1e-5)
+        np.testing.assert_allclose(sqrsum, [91.0, 30.0], atol=1e-5)
+
+    def test_shape_validation(self):
+        x = np.ones((1, 4), dtype=_F32)
+        fn = np.eye(8, 4, dtype=_F32)
+        # hc_mult <= 0
+        with self.assertRaises(ValueError):
+            mhc_pre_gemm_sqrsum(x, fn, hc_mult=0, hidden_size=2)
+        # hidden_size <= 0
+        with self.assertRaises(ValueError):
+            mhc_pre_gemm_sqrsum(x, fn, hc_mult=2, hidden_size=0)
+        # fn wrong size (expect hc_mult3*hc_hidden = 8*4 = 32)
+        with self.assertRaises(ValueError):
+            mhc_pre_gemm_sqrsum(x, np.ones((7, 4), dtype=_F32),
+                                hc_mult=2, hidden_size=2)
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(51)
+        for (num_tokens, hc_mult, hidden) in [
+            (1, 2, 2), (3, 2, 4), (7, 3, 3), (2, 4, 4), (5, 4, 8),
+        ]:
+            hc_hidden = hc_mult * hidden
+            hc_mult3 = hc_mult * (2 + hc_mult)
+            x = rng.standard_normal((num_tokens, hc_hidden)).astype(_F32)
+            fn = rng.standard_normal((hc_mult3, hc_hidden)).astype(_F32)
+
+            def run(impl, x=x, fn=fn):
+                prev = kernels._impl
+                kernels._impl = impl
+                try:
+                    o, s = mhc_pre_gemm_sqrsum(x, fn, hc_mult=hc_mult,
+                                               hidden_size=hidden)
+                    return o.copy(), s.copy()
+                finally:
+                    kernels._impl = prev
+
+            c_o, c_s = run(core)
+            f_o, f_s = run(fb)
+            np.testing.assert_allclose(c_o, f_o, rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(c_s, f_s, rtol=1e-5, atol=1e-6)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class MhcPostTest(unittest.TestCase):
+    def test_hand_checked_identity_a(self):
+        # hc=2, hidden=2. a = identity (2x2), b = [[1,2],[3,4]],
+        # c=[10,20], d=[1,1] -> out=[11,12,23,24].
+        a = np.array([1, 0, 0, 1], dtype=_F32)
+        b = np.array([1, 2, 3, 4], dtype=_F32)
+        c = np.array([10, 20], dtype=_F32)
+        d = np.array([1, 1], dtype=_F32)
+        out = mhc_post(a, b, c, d, hc=2, hidden=2)
+        self.assertEqual(out.shape, (1, 2, 2))
+        np.testing.assert_allclose(out[0].ravel(), [11, 12, 23, 24], atol=1e-6)
+
+    def test_zero_a_broadcasts_c(self):
+        # a == 0 -> out[n,j,h] = c[n,j] * d[n,h].
+        hc, hidden = 2, 3
+        a = np.zeros((1, hc, hc), dtype=_F32)
+        b = np.full((1, hc, hidden), 7.0, dtype=_F32)  # ignored
+        c = np.array([2, 5], dtype=_F32)
+        d = np.array([10, 100, 1000], dtype=_F32)
+        out = mhc_post(a, b, c, d, hc=hc, hidden=hidden)
+        np.testing.assert_allclose(out[0, 0], [20, 200, 2000], atol=1e-6)
+        np.testing.assert_allclose(out[0, 1], [50, 500, 5000], atol=1e-6)
+
+    def test_shape_validation(self):
+        a = np.ones((1, 2, 2), dtype=_F32)
+        b = np.ones((1, 2, 2), dtype=_F32)
+        c = np.ones((1, 2), dtype=_F32)
+        d = np.ones((1, 2), dtype=_F32)
+        # hc <= 0
+        with self.assertRaises(ValueError):
+            mhc_post(a, b, c, d, hc=0, hidden=2)
+        # hidden <= 0
+        with self.assertRaises(ValueError):
+            mhc_post(a, b, c, d, hc=2, hidden=0)
+        # d wrong size (expect 1*2 = 2)
+        with self.assertRaises(ValueError):
+            mhc_post(a, b, c, np.ones(3, dtype=_F32), hc=2, hidden=2)
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(77)
+        for (num_tokens, hc, hidden) in [
+            (1, 2, 2), (2, 3, 4), (4, 2, 8), (3, 4, 5), (2, 4, 16),
+        ]:
+            a = rng.standard_normal((num_tokens, hc, hc)).astype(_F32)
+            b = rng.standard_normal((num_tokens, hc, hidden)).astype(_F32)
+            c = rng.standard_normal((num_tokens, hc)).astype(_F32)
+            d = rng.standard_normal((num_tokens, hidden)).astype(_F32)
+
+            def run(impl, a=a, b=b, c=c, d=d):
+                prev = kernels._impl
+                kernels._impl = impl
+                try:
+                    return mhc_post(a, b, c, d, hc=hc, hidden=hidden).copy()
+                finally:
+                    kernels._impl = prev
+
+            c_o = run(core)
+            f_o = run(fb)
+            np.testing.assert_allclose(c_o, f_o, rtol=1e-4, atol=1e-5)
 
 
 @unittest.skipIf(np is None, "numpy is required for these tests")

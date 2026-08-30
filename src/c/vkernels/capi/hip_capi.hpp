@@ -124,6 +124,71 @@ void vk_hip_mla_fwd(
     const float* v_c, float* out);
 
 /* ------------------------------------------------------------------ */
+/* DSA sparse-MLA forward (src/c/vkernels/kernels/dsa.hip, #51)      */
+/* ------------------------------------------------------------------ */
+/*
+ * DeepseekSparseAttn (GLM-5.3-Flash / DeepSeek-V3) sparse-MLA forward.
+ * The indexer has already selected, per query token, the top-`topk` KV
+ * tiles (`indices`); this kernel scores each query against those keys and
+ * produces the combined attention output.
+ *
+ *   q       [1, S_q,  H,  dim + tail_dim]      bf16
+ *   kv      [1, S_kv, kv_group, dim + tail_dim] bf16  (kv_group == 1)
+ *   indices [1, S_q, kv_group, topk]           int32 (<0/>=S_kv masked)
+ *   out     [1, S_q, H, dim - tail_dim]        bf16
+ *   lse     [1, S_q, H]                         fp32 (nullable; set when
+ *                                                    return_lse != 0)
+ *   sm_scale = (1/sqrt(dim + tail_dim)) * log2(e)   (folds log2(e))
+ *
+ * tail_dim == 0 (GLM-5.3) is handled by skipping the rope-tail dot at
+ * runtime -- no zero-size GEMM, the exact case the tilelang code path
+ * cannot compile. Online base-2 softmax, fp32 accumulation.
+ */
+void vk_hip_dsa_sparse_fwd(
+    int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
+    int block_I, int inner_iter, float sm_scale, int return_lse,
+    const void* q, const void* kv, const void* indices, void* out, void* lse);
+
+/* Per-shape (bq, threads, block_I, inner_iter) tile selector for the HIP
+ * DSA kernel (mirrors vk_dsa_config). Never throws. */
+void vk_hip_dsa_config(int S_q, int H, int dim, int topk, int* bq,
+                       int* threads, int* block_I, int* inner_iter);
+
+/* ------------------------------------------------------------------ */
+/* MHC multi-head hybrid-attention pre-norm (src/c/vkernels/kernels/    */
+/* mhc.hip, #51 part 2)                                                 */
+/* ------------------------------------------------------------------ */
+/*
+ * Two gfx942 HIP kernels re-implementing the tilelang MHC kernels that
+ * fault/abort on MI300A (dynamic-shared > 64 KB non-optin cap). This is
+ * the "vkernels HIP MHC path" that runs WITHOUT the hidden_block 256->128
+ * workaround: static shared memory, no pipelining, no hipFuncSetAttribute
+ * opt-in.
+ *
+ *   mhc_pre_gemm_sqrsum:
+ *     x      [num_tokens, hc_hidden_size]  bf16   (hc_hidden=hc_mult*hidden)
+ *     fn     [hc_mult3,    hc_hidden_size] fp32   (hc_mult3=hc_mult*(2+hc_mult))
+ *     out    [num_tokens, hc_mult3]        fp32   (= x @ fn^T)
+ *     sqrsum [num_tokens]                  fp32   (= sum_h x[n,h]^2)
+ *     hc_mult3 <= 32; hc_hidden_size <= 28672.
+ *
+ *   mhc_post:
+ *     a (comb_res_mix)[num_tokens, hc, hc]    fp32
+ *     b (residual)   [num_tokens, hc, hidden] bf16
+ *     c (post_layer_mix)[num_tokens, hc]      fp32
+ *     d (x)          [num_tokens, hidden]     bf16
+ *     out[n,j,h] = c[n,j]*d[n,h] + sum_k a[n,k,j]*b[n,k,h]   (bf16)
+ *     hc <= 63.
+ */
+void vk_hip_mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
+                                const void* x, const void* fn,
+                                void* out, void* sqrsum);
+
+void vk_hip_mhc_post(int num_tokens, int hc, int hidden,
+                     const void* a, const void* b, const void* c,
+                     const void* d, void* out);
+
+/* ------------------------------------------------------------------ */
 /* KDA delta-rule forward (src/c/vkernels/kernels/kda.hip, #21, #45)   */
 /* ------------------------------------------------------------------ */
 /*

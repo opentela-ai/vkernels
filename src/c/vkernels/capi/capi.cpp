@@ -28,6 +28,8 @@
 #include "vkernels/kernels/gemm_bf16.hpp"
 #include "vkernels/kernels/kda.hpp"
 #include "vkernels/kernels/mla.hpp"
+#include "vkernels/kernels/dsa.hpp"
+#include "vkernels/kernels/mhc.hpp"
 #include "vkernels/kernels/moe.hpp"
 #include "vkernels/kernels/moe_aux.hpp"
 #include "vkernels/kernels/moe_fused.hpp"
@@ -305,6 +307,52 @@ void vk_mla_config(int S_q, int kv_lora_rank, int qk_rope_head_dim,
                    int* bq, int* bn, int* threads) {
   vkernels::kernels::mla_config_for(S_q, kv_lora_rank, qk_rope_head_dim, bq,
                                     bn, threads);
+}
+
+/* ------------------------------------------------------------------ */
+/* kernels: DSA — DeepseekSparseAttn sparse-MLA forward (dsa.hpp)   */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
+                          int topk, int kv_group, int block_I,
+                          int inner_iter, float sm_scale, int return_lse,
+                          const float* q, const float* kv,
+                          const int32_t* indices, float* out, float* lse) {
+  VK_CAPI_TRY
+  vkernels::kernels::dsa_sparse_fwd_cpu(
+      S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+      sm_scale, return_lse != 0, q, kv, indices, out, lse);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+void vk_dsa_config(int S_q, int H, int dim, int topk, int* bq,
+                   int* threads, int* block_I, int* inner_iter) {
+  vkernels::kernels::dsa_config_for(S_q, H, dim, topk, bq, threads, block_I,
+                                    inner_iter);
+}
+
+/* ------------------------------------------------------------------ */
+/* kernels: MHC — multi-head hybrid-attention pre-norm (mhc.hpp, #51)  */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult, int hidden_size,
+                               const float* x, const float* fn,
+                               float* out, float* sqrsum) {
+  VK_CAPI_TRY
+  vkernels::kernels::mhc_pre_gemm_sqrsum_cpu(num_tokens, hc_mult, hidden_size,
+                                             x, fn, out, sqrsum);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_mhc_post(int num_tokens, int hc, int hidden,
+                    const float* a, const float* b, const float* c,
+                    const float* d, float* out) {
+  VK_CAPI_TRY
+  vkernels::kernels::mhc_post_cpu(num_tokens, hc, hidden, a, b, c, d, out);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
 }
 
 /* ------------------------------------------------------------------ */
