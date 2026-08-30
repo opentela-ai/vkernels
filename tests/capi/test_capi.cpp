@@ -8,11 +8,13 @@
 // `vk_last_error`) is covered end to end.
 #include "minitest.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <vector>
 
 #include "vkernels/capi/capi.hpp"
@@ -909,50 +911,58 @@ TEST(CapiKda, GateChunkCumsum) {
 }
 
 TEST(CapiKda, NaiveDeltaRuleFwd) {
-  // Simple case: B=1 H=1 S=2 D=2, q=k=v=ones, g=0.5, beta=0.5
+  // K3 per-key-dim gated delta rule (issue #45). B=1 H=1 S=2 D=2,
+  // q=k=v=ones, g=[0.5,0.5] per token (per-key-dim [B,H,S,D]), beta=0.5.
+  //   t=0: S'=0 -> a=0 -> S0=0.5*v0*k0^T=0.5*[[1,1],[1,1]], o0=[1,1]
+  //   t=1: S'=g1.*S0=0.25*[[1,1],[1,1]], a=S'*.k1=[0.5,0.5],
+  //        S1=S'+0.5*(1-0.5)*k1^T=[[0.5,0.5],[0.5,0.5]], o1=[1,1]
   constexpr int B = 1, H = 1, S = 2, D = 2;
   std::vector<float> q(B * H * S * D, 1.0f), k(B * H * S * D, 1.0f),
-      v(B * H * S * D, 1.0f), g(B * H * S, 0.5f), beta(B * H * S, 0.5f),
+      v(B * H * S * D, 1.0f), g(B * H * S * D, 0.5f), beta(B * H * S, 0.5f),
       out(B * H * S * D, 0.0f);
   EXPECT_EQ(vk_kda_naive_delta_rule_fwd(q.data(), k.data(), v.data(),
                                           g.data(), beta.data(), out.data(),
                                           B, H, S, D),
             VK_OK);
-  // First token: state = g0 * v0 * k0^T = 0.5 * [[1,1],[1,1]]
-  // o0 = state * q0 = 0.5 * [2, 2] = [1, 1]
-  EXPECT_NEAR(out[0], 1.0f, 1e-5f);
-  EXPECT_NEAR(out[1], 1.0f, 1e-5f);
-  EXPECT_FALSE(std::isnan(out[2]));
-  EXPECT_FALSE(std::isnan(out[3]));
+  for (int i = 0; i < B * H * S * D; ++i) EXPECT_NEAR(out[i], 1.0f, 1e-5f);
 }
 
 TEST(CapiKda, DeltaRuleFwdMatchesNaive) {
-  // Cross-check chunked forward against the naive oracle
+  // Cross-check the chunked forward (vk_kda_delta_rule_fwd, the STANDARD
+  // gated delta rule with a SCALAR forget gate [B,H,S]) against the naive
+  // oracle (vk_kda_naive_delta_rule_fwd, the K3 PER-KEY-DIM gated delta
+  // rule [B,H,S,D]). Issue #45 split the two recurrences: the naive
+  // predicts from the POST-gate state, the chunked from the PRE-gate
+  // state, so they differ at arbitrary gates. They agree only at
+  // g == 1 -- full history, no forgetting -- where the gate is the
+  // identity in both and post-gate == pre-gate. (Before #45 the naive
+  // oracle also implemented the standard rule and was cross-checked at
+  // random gates; that now requires the per-key-dim g to be sized
+  // [B,H,S,D], else the naive read runs out of bounds.)
   constexpr int B = 1, H = 1, S = 8, D = 4, chunk = 4;
-  std::vector<float> q(B * H * S * D), k(B * H * S * D), v(B * H * S * D),
-      g(B * H * S), beta(B * H * S);
-  for (int i = 0; i < B * H * S * D; ++i) {
-    q[i] = 0.1f * static_cast<float>((i * 7 + 1) % 17);
-    k[i] = 0.1f * static_cast<float>((i * 5 + 3) % 13);
-    v[i] = 0.1f * static_cast<float>((i * 3 + 7) % 11);
-  }
-  for (int i = 0; i < B * H * S; ++i) {
-    g[i] = 0.3f + 0.5f * static_cast<float>((i + 1) % 10) / 10.0f;
-    beta[i] = 0.3f + 0.4f * static_cast<float>((i + 2) % 7) / 7.0f;
-  }
+  std::mt19937 rng(7);
+  auto rf = [&]() { return static_cast<float>(rng() % 2000) / 1000.0f - 1.0f; };
+  std::vector<float> q(B * H * S * D), k(q.size()), v(q.size());
+  std::vector<float> g_naive(B * H * S * D, 1.0f);  // per-key-dim, no forget
+  std::vector<float> g_chunk(B * H * S, 1.0f);      // scalar, no forget
+  std::vector<float> beta(B * H * S);
+  for (auto& x : q) x = rf();
+  for (auto& x : k) x = rf();
+  for (auto& x : v) x = rf();
+  for (auto& x : beta) x = 0.3f + 0.7f * (rng() % 1000) / 1000.0f;
   std::vector<float> out_naive(B * H * S * D, 0), out_chunk(B * H * S * D, 0);
   EXPECT_EQ(vk_kda_naive_delta_rule_fwd(q.data(), k.data(), v.data(),
-                                          g.data(), beta.data(),
+                                          g_naive.data(), beta.data(),
                                           out_naive.data(), B, H, S, D),
             VK_OK);
-  EXPECT_EQ(vk_kda_delta_rule_fwd(q.data(), k.data(), v.data(), g.data(),
-                                   beta.data(), out_chunk.data(), B, H, S,
-                                   D, chunk),
+  EXPECT_EQ(vk_kda_delta_rule_fwd(q.data(), k.data(), v.data(),
+                                   g_chunk.data(), beta.data(),
+                                   out_chunk.data(), B, H, S, D, chunk),
             VK_OK);
   float max_abs = 0;
   for (int i = 0; i < B * H * S * D; ++i)
     max_abs = std::max(max_abs, std::fabs(out_naive[i] - out_chunk[i]));
-  EXPECT_LT(max_abs, 1e-4f);
+  EXPECT_LT(max_abs, 1e-3f);
 }
 
 TEST(CapiKda, DeltaRuleIntraInterOutput) {

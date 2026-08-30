@@ -232,13 +232,18 @@ int32_t vk_kda_gate_chunk_cumsum(const float* g, float* intra_log,
                                  float* inter_log, int B, int H,
                                  int n_chunks, int chunk_size);
 
-/* Per-token delta-rule oracle (O(S*D^2), the correctness reference). */
+/* Per-token delta-rule oracle (O(S*D^2), the K3 correctness reference).
+ * q,k,v [B,H,S,D]; g [B,H,S,D] per-key-dim forget gate (g_t[k] in
+ * (0,1]); beta [B,H,S] scalar.  Different recurrence from the chunked
+ * forward below -- cross-check only at g == 1 (see CapiKda tests). */
 int32_t vk_kda_naive_delta_rule_fwd(const float* q, const float* k,
                                     const float* v, const float* g,
                                     const float* beta, float* out, int B,
                                     int H, int S, int D);
 
-/* Chunked delta-rule forward (gate cumsum -> intra -> inter -> output).
+/* Chunked delta-rule forward (gate cumsum -> intra -> inter -> output):
+ * the STANDARD gated delta rule with a SCALAR forget gate.  q,k,v
+ * [B,H,S,D]; g [B,H,S] scalar forget gate; beta [B,H,S].
  * chunk_size must divide S. */
 int32_t vk_kda_delta_rule_fwd(const float* q, const float* k,
                               const float* v, const float* g,
