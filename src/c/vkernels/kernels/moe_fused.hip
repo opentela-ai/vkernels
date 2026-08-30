@@ -28,7 +28,7 @@
 
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
-#  include "vkernels/kernels/moe_device.hip"
+#  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 
 namespace vkernels::kernels::hip {
 
@@ -58,11 +58,6 @@ __device__ __forceinline__ float ue8m0_decode(uint8_t s) {
   uint32_t bits = static_cast<uint32_t>(s) << 23;
   __builtin_memcpy(&f, &bits, sizeof(float));
   return f;
-}
-
-__device__ __forceinline__ uint16_t f2bf(float v) {
-  uint32_t b; __builtin_memcpy(&b, &v, sizeof(float));
-  return f32bits_to_bf16(b);
 }
 
 // Apply the gate/up epilogue. `g`/`u` are the bias-adjusted accumulators;

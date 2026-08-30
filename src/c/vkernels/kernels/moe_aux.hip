@@ -16,20 +16,12 @@
 
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
-#  include "vkernels/kernels/moe_device.hip"
+#  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 #  include "vkernels/util/error.hpp"
 
 namespace vkernels::kernels::hip {
 
 namespace {
-
-// bf16 (uint16) → float32 (exact; shared bias/high bits).
-__device__ __forceinline__ float bf16_to_f32(uint16_t b) {
-  float f;
-  uint32_t u = static_cast<uint32_t>(b) << 16;
-  __builtin_memcpy(&f, &u, sizeof(f));
-  return f;
-}
 
 // E2M1 nibble → float32, via the shared bit-pattern decode in moe_device.hip
 // (identical to fp4_nibble_to_float in moe.cpp: 0/±0.25/±1.0/±1.5/±2.0/±3.0/±inf/NaN).

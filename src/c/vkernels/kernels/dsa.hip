@@ -56,7 +56,7 @@
 #include "vkernels/kernels/dsa.hpp"
 
 #if VKERNELS_HAS_HIP
-#  include "vkernels/kernels/moe_device.hip"  // f32bits_to_bf16 (shared RNE)
+#  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 #  include <hip/hip_runtime.h>
 
 namespace vkernels::kernels::hip {
@@ -65,20 +65,6 @@ namespace vkernels::kernels::hip {
 static constexpr int kMaxW = 1024;
 static constexpr int kPerLane = (kMaxW + 63) / 64;  // head elements per lane
 
-// bf16 -> float (top 16 bits of fp32, low 17 mantissa bits zero). Identical
-// to the helper in gemm_bf16.hip / moe_aux.hip and to the CPU oracle.
-__device__ __forceinline__ float bf16_to_f32(uint16_t b) {
-  float f;
-  uint32_t u = static_cast<uint32_t>(b) << 16;
-  __builtin_memcpy(&f, &u, sizeof(f));
-  return f;
-}
-// float -> bf16 (RNE), via the shared f32bits_to_bf16 (moe_device.hip).
-__device__ __forceinline__ uint16_t f2bf(float v) {
-  uint32_t b;
-  __builtin_memcpy(&b, &v, sizeof(float));
-  return f32bits_to_bf16(b);
-}
 
 template <int BQ>
 __global__ void dsa_sparse_fwd_kernel(
