@@ -1016,5 +1016,149 @@ void moe_combine(
       M, hidden, top_k, EM, b2 != nullptr);
 }
 
+// ======================================================================
+// moe_align_block_size (device) — issue #46 follow-up
+//
+// The GPU counterpart of moe_align_block_size (CPU, moe_fused.cpp) and the
+// Python moe_align_block_size_with_map (vllm_experts.py). Reads topk_ids
+// *on-device* on `stream` (ordered after the expert-dispatch all-to-all
+// that produced it) and writes the block-aligned sorted_ids / expert_ids
+// layout consumed by fused_moe_mxfp4 — WITHOUT the topk_ids.cpu() host
+// round-trip that dominated PP0's MoE (97-100% of its per-call
+// moe:vkernel_apply; see docs/performance/moe-fused/gfx942-pp-pipeline.md).
+//
+// Single block, N = M*top_k <= 1024 (decode). The histogram is parallel
+// (one thread per flat index, atomicAdd into shared s_count[local_e]);
+// the padded-count prefix + ordered scatter are serial in thread 0 to
+// match the CPU/Python reference exactly (experts ascending, flat indices
+// ascending within each expert). For N <= ~64 (the K3 decode case) the
+// serial tail is a handful of microseconds — negligible next to the 4 ms
+// host sync this removes, and never the bottleneck (the GEMM launch is).
+//
+// expert_map[ge] < 0 (or ge out of [0, num_experts)) skips that routing
+// entry, matching moe_align_block_size_with_map. max_EM is the host's
+// constant high-water bound; sorted_ids/expert_ids beyond the real EM are
+// written as the padding sentinels (N / -1) so the GEMM grid can be sized
+// at max_EM/block_size and early-out the padding blocks/rows (the kernels
+// already guard `flat < N` and `expert_ids[b] < 0`).
+// ======================================================================
+__global__ void moe_align_block_size_kernel(
+    const int32_t* __restrict__ topk_ids,
+    const int32_t* __restrict__ expert_map,
+    int M, int top_k, int block_size, int num_experts,
+    int N, int max_EM, int local_n,
+    int32_t* __restrict__ sorted_ids,
+    int32_t* __restrict__ expert_ids_out,
+    int32_t* __restrict__ out_em) {
+  extern __shared__ int32_t smem[];
+  int32_t* s_ids    = smem;                  // [N]
+  int32_t* s_le     = s_ids + N;             // [N]  local expert per flat i
+  int32_t* s_count  = s_le + N;              // [local_n]
+  int32_t* s_offset = s_count + local_n;     // [local_n]  exclusive prefix
+  int32_t* s_rank   = s_offset + local_n;    // [local_n]  running scatter idx
+
+  const int tid  = threadIdx.x;
+  const int nthr = blockDim.x;  // >= max(N, local_n) (rounded to a warp)
+
+  // Phase 0 — init (parallel): zero counts/ranks, pad buffers with the
+  // padding sentinels (N for sorted_ids, -1 for expert_ids).
+  for (int i = tid; i < local_n; i += nthr) { s_count[i] = 0; s_rank[i] = 0; }
+  for (int i = tid; i < max_EM; i += nthr) sorted_ids[i] = N;
+  const int max_blocks = max_EM / block_size;
+  for (int i = tid; i < max_blocks; i += nthr) expert_ids_out[i] = -1;
+  __syncthreads();
+
+  // Phase A (parallel) — load topk_ids, compute local expert, histogram.
+  int my_le = -1;
+  if (tid < N) {
+    int ge = topk_ids[tid];
+    s_ids[tid] = ge;
+    int le;
+    if (ge < 0 || ge >= num_experts) {
+      le = -1;                                  // bad routing -> skip
+    } else if (expert_map != nullptr) {
+      le = expert_map[ge];                       // global -> local (-1 = unmapped)
+    } else {
+      le = ge;                                   // no sharding: 1:1
+    }
+    if (le < 0 || le >= local_n) le = -1;        // bounds / invalid -> skip
+    s_le[tid] = le;
+    my_le = le;
+  }
+  __syncthreads();
+  if (my_le >= 0) atomicAdd(&s_count[my_le], 1);
+  __syncthreads();
+
+  // Phase B (serial, thread 0) — padded counts + exclusive prefix, EM.
+  if (tid == 0) {
+    int EM = 0;
+    for (int e = 0; e < local_n; ++e) {
+      int cnt = s_count[e];
+      int padded = (cnt == 0) ? 0
+                                : ((cnt + block_size - 1) / block_size) * block_size;
+      s_offset[e] = EM;
+      EM += padded;
+    }
+    if (EM == 0) EM = block_size;               // min one block (matches Python)
+    if (EM > max_EM) EM = max_EM;               // guard (shouldn't trigger)
+    *out_em = EM;
+  }
+  __syncthreads();
+
+  // Phase C (serial, thread 0) — scatter sorted_ids in ascending
+  // (local_expert, flat_index) order, then expert_ids per real block.
+  if (tid == 0) {
+    for (int i = 0; i < N; ++i) {
+      int le = s_le[i];
+      if (le < 0) continue;                     // expert_map == -1 / bad -> skip
+      int pos = s_offset[le] + s_rank[le];
+      if (pos < max_EM) sorted_ids[pos] = i;
+      s_rank[le] += 1;
+    }
+    int blk_idx = 0;
+    for (int e = 0; e < local_n; ++e) {
+      int cnt = s_count[e];
+      if (cnt == 0) continue;
+      int padded = ((cnt + block_size - 1) / block_size) * block_size;
+      int nblocks = padded / block_size;
+      for (int b = 0; b < nblocks && blk_idx < max_blocks; ++b) {
+        // Real block iff it contains >= 1 real token (matches CPU:
+        // expert_ids[b] = e iff b*block_size < cnt); padding blocks
+        // within an expert are already -1 from Phase 0.
+        if (b * block_size < cnt) expert_ids_out[blk_idx] = e;
+        blk_idx += 1;
+      }
+    }
+  }
+}
+
+void moe_align_block_size_hip(
+    const int32_t* topk_ids,
+    const int32_t* expert_map,
+    int M, int top_k, int block_size, int num_experts, int local_n,
+    int max_EM,
+    int32_t* sorted_ids,
+    int32_t* expert_ids,
+    int32_t* out_em,
+    void* stream) {
+  const int N = M * top_k;
+  // Single block; threads cover N and local_n (both <= 1024). Round up to
+  // a multiple of 64 (wavefront) and never below 64 so the warp/coop loop
+  // has at least one wave to run.
+  int need = (N > local_n) ? N : local_n;
+  need = ((need + 63) / 64) * 64;
+  if (need < 64) need = 64;
+  if (need > 1024) need = 1024;  // caller guards N <= 1024
+  const int nthr = need;
+  // Shared: s_ids[N] + s_le[N] + s_count[local_n] + s_offset[local_n]
+  //       + s_rank[local_n]   (<= (2*1024 + 3*1024) ints = 20 KiB).
+  const int shared_ints = 2 * N + 3 * local_n;
+  const size_t shared_bytes = (size_t)shared_ints * sizeof(int32_t);
+  hipStream_t s = static_cast<hipStream_t>(stream);
+  moe_align_block_size_kernel<<<1, nthr, shared_bytes, s>>>(
+      topk_ids, expert_map, M, top_k, block_size, num_experts,
+      N, max_EM, local_n, sorted_ids, expert_ids, out_em);
+}
+
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP

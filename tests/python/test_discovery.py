@@ -83,6 +83,10 @@ EXPECTED_KERNELS = [
     ("moe_down_preact", "moe_fused"),
     ("moe_combine", "moe_fused"),
     ("fused_moe_mxfp4", "moe_fused"),
+    # on-device moe_align_block_size (issue #46 follow-up): declared after
+    # fused_moe_mxfp4 in the VKERNELS_HAS_HIP block at the end of
+    # moe_fused.hpp, so discovery emits it as the last moe_fused entry.
+    ("moe_align_block_size_hip", "moe_fused"),
     ("sum", "reduce"),
     ("max", "reduce"),
 ]
@@ -239,6 +243,7 @@ class DiscoveryTest(unittest.TestCase):
             "mfma_f32_16x16x16bf16",
             "fused_moe_mxfp4_cpu",
             "moe_align_block_size",
+            "moe_align_block_size_hip",
             "fused_moe_mxfp4",
             "mxfp4_moe_quant",
             "mxfp4_moe_sort",
