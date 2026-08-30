@@ -103,6 +103,12 @@ EXPECTED_COMM = [
     ("ByteChannel", "class"),
     ("MockByteChannel", "class"),
     ("make_byte_link", "function"),
+    # cross_node_kv.hpp (issue #49, all-gather + access-pattern routing):
+    # the access pattern + route selection are declared ABOVE the
+    # restore/donate plans in the header, so discovery reports them first.
+    ("CrossNodeKvAccess", "struct"),
+    ("CrossNodeKvRoute", "struct"),
+    ("select_cross_node_kv_route", "function"),
     ("CrossNodeKvRestorePlan", "class"),
     ("CrossNodeKvDonatePlan", "class"),
     # fabric_import.hpp: the transport classification + FabricHandle /
@@ -188,6 +194,16 @@ EXPECTED_COMM = [
     ("make_rccl_ring_channels", "function"),
     ("HipStream", "class"),
     ("RcclAllreducePlanHip", "class"),
+    # --- shared slot-map validators + byte accounting (issue #49) ---
+    # slot_map.hpp (lifted in 181d9f9 to dedup the restore/donate/all-gather
+    # plan contracts) sorts after rccl_hip.hpp and before topology.hpp, so
+    # its six inline helpers land here.
+    ("per_slot_bytes", "function"),
+    ("token_stride_bytes", "function"),
+    ("checked_mul", "function"),
+    ("validate_kv_plan_shape", "function"),
+    ("validate_unique_slots", "function"),
+    ("validate_slot_bounds", "function"),
     ("Topology", "struct"),
     ("ring_rank", "function"),
     ("build_ring_topology", "function"),
