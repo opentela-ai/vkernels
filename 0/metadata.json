@@ -1,0 +1,91 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M1A37EMW5H4BRFBGXK3V14C4",
+  "session_id": "01a0539f-6b01-7565-81d6-ac84b06bdef3",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-30T19:44:31.997309219Z",
+  "branch": "feat/issue-51-dsa-topk",
+  "checkpoints_count": 2,
+  "save_step_count": 3,
+  "files_touched": [],
+  "agent": "Pi",
+  "model": "CSCS-Inference/zai-org/GLM-5.2",
+  "turn_id": "1adefdab5f2b",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 493127,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 7207680,
+    "output_tokens": 150386,
+    "api_call_count": 124
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "pi-skill-thermo-nuclear-code-quality-review-2026-08-30T17:02:39.495Z-0",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "thermo-nuclear-code-quality-review"
+      },
+      "source": {
+        "agent": "pi",
+        "signal": "input_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "829e7192756d",
+      "timestamp": "2026-08-30T17:02:39.495Z",
+      "native": {
+        "command": "/skill:thermo-nuclear-code-quality-review"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/skill:thermo-nuclear-code-quality-review",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 11
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 281,
+      "user_lines_removed": 0,
+      "agent_lines_added": 4751,
+      "agent_lines_removed": 51,
+      "user_added_per_file": {
+        ".codex/hooks.json": 88,
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/state/native-stop-state.json": 14,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".pi/extensions/entire/index.ts": 147,
+        ".pi/kb-binding.json": 9
+      }
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 281,
+      "user_lines_removed": 0,
+      "agent_lines_added": 4751,
+      "agent_lines_removed": 51,
+      "user_added_per_file": {
+        ".codex/hooks.json": 88,
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/state/native-stop-state.json": 14,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".pi/extensions/entire/index.ts": 147,
+        ".pi/kb-binding.json": 9
+      }
+    }
+  ]
+}
