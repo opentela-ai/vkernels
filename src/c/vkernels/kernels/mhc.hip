@@ -42,7 +42,7 @@
 #include "vkernels/kernels/mhc.hpp"
 
 #if VKERNELS_HAS_HIP
-#  include "vkernels/kernels/moe_device.hip"  // f32bits_to_bf16 (shared RNE)
+#  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 #  include <hip/hip_runtime.h>
 
 namespace vkernels::kernels::hip {
@@ -53,19 +53,6 @@ namespace vkernels::kernels::hip {
 // hidden=4096; 28672 = hidden=7168).
 static constexpr int kMaxHcHidden = 28672;
 
-// bf16 -> float (top 16 bits of fp32). Identical to gemm_bf16.hip / dsa.hip.
-__device__ __forceinline__ float bf16_to_f32(uint16_t b) {
-  float f;
-  uint32_t u = static_cast<uint32_t>(b) << 16;
-  __builtin_memcpy(&f, &u, sizeof(f));
-  return f;
-}
-// float -> bf16 (RNE), via the shared f32bits_to_bf16 (moe_device.hip).
-__device__ __forceinline__ uint16_t f2bf(float v) {
-  uint32_t b;
-  __builtin_memcpy(&b, &v, sizeof(float));
-  return f32bits_to_bf16(b);
-}
 
 // ---------------------------------------------------------------------------
 //  mhc_pre_gemm_sqrsum
