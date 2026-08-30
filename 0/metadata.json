@@ -1,0 +1,142 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M1AF9PHX41JYXFYSTP4PXHPB",
+  "session_id": "01a0543b-e180-7b50-bbb5-4b1861d2b716",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-30T23:15:40.939067925Z",
+  "branch": "feat/issue-56-dsa-topk-transform",
+  "checkpoints_count": 2,
+  "save_step_count": 2,
+  "files_touched": [
+    "meta/benchmarks/CMakeLists.txt",
+    "meta/benchmarks/bench_dsa_topk.hip",
+    "meta/benchmarks/test_capi_dsa_topk.hip",
+    "src/c/CMakeLists.txt",
+    "src/c/vkernels/capi/capi.cpp",
+    "src/c/vkernels/capi/capi.hpp",
+    "src/c/vkernels/capi/hip_capi.cpp",
+    "src/c/vkernels/capi/hip_capi.hpp",
+    "src/c/vkernels/kernels/dsa_topk.cpp",
+    "src/c/vkernels/kernels/dsa_topk.hip",
+    "src/c/vkernels/kernels/dsa_topk.hpp",
+    "src/python/vkernels/_core.cpp",
+    "src/python/vkernels/_fallback.py",
+    "src/python/vkernels/kernels.py",
+    "tests/CMakeLists.txt",
+    "tests/capi/test_capi.cpp",
+    "tests/kernels/attn/test_dsa_topk.cpp",
+    "tests/python/test_discovery.py",
+    "tests/python/test_kernels.py"
+  ],
+  "agent": "Codex",
+  "model": "gpt-5.6-sol",
+  "turn_id": "613b6e647d8a",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 945612,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 25964288,
+    "output_tokens": 67025,
+    "api_call_count": 171
+  },
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-08-30T23:15:40.531933615Z",
+    "agent_lines": 611,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 611,
+    "total_lines_changed": 611,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 6072,
+      "user_lines_removed": 51,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".codex/hooks.json": 88,
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 14,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".pi/extensions/entire/index.ts": 147,
+        ".pi/kb-binding.json": 9,
+        ".rcc/config.toml": 40,
+        ".rcc/rccignore": 11,
+        "docs/README.md": 254,
+        "docs/kernels/dsa.md": 57,
+        "docs/python-bindings.md": 91,
+        "docs/rust-bindings.md": 40,
+        "meta/benchmarks/CMakeLists.txt": 8,
+        "meta/benchmarks/test_capi_dsa_topk.hip": 147,
+        "src/c/CMakeLists.txt": 2,
+        "src/c/vkernels/capi/capi.cpp": 23,
+        "src/c/vkernels/capi/capi.hpp": 18,
+        "src/c/vkernels/capi/hip_capi.cpp": 15,
+        "src/c/vkernels/capi/hip_capi.hpp": 20,
+        "src/c/vkernels/kernels/dsa_topk.cpp": 132,
+        "src/c/vkernels/kernels/dsa_topk.hip": 319,
+        "src/c/vkernels/kernels/dsa_topk.hpp": 50,
+        "src/python/vkernels/_core.cpp": 40,
+        "src/python/vkernels/_fallback.py": 71,
+        "src/python/vkernels/kernels.py": 62,
+        "tests/CMakeLists.txt": 1,
+        "tests/kernels/attn/test_dsa_topk.cpp": 131,
+        "work/k45/vllm/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py": 637,
+        "work/k45/vllm/usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/amd/linear.py": 1064,
+        "work/k45/vllm/usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/amd/ops/third_party/kda/chunk.py": 935,
+        "work/k45/vllm/usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py": 621,
+        "work/k45/vllm/usr/local/lib/python3.12/dist-packages/vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py": 382,
+        "work/k45/vllm/usr/local/lib/python3.12/dist-packages/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py": 619
+      },
+      "user_removed_per_file": {
+        "docs/README.md": 34,
+        "docs/python-bindings.md": 5,
+        "docs/rust-bindings.md": 12
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 292,
+      "user_lines_removed": 0,
+      "agent_lines_added": 6187,
+      "agent_lines_removed": 51,
+      "user_added_per_file": {
+        ".codex/hooks.json": 88,
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".pi/extensions/entire/index.ts": 147,
+        ".pi/kb-binding.json": 9
+      }
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 292,
+      "user_lines_removed": 0,
+      "agent_lines_added": 6401,
+      "agent_lines_removed": 51,
+      "user_added_per_file": {
+        ".codex/hooks.json": 88,
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".pi/extensions/entire/index.ts": 147,
+        ".pi/kb-binding.json": 9
+      }
+    }
+  ]
+}

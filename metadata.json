@@ -1,0 +1,44 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M1AF9PHX41JYXFYSTP4PXHPB",
+  "strategy": "manual-commit",
+  "branch": "feat/issue-56-dsa-topk-transform",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "meta/benchmarks/CMakeLists.txt",
+    "meta/benchmarks/bench_dsa_topk.hip",
+    "meta/benchmarks/test_capi_dsa_topk.hip",
+    "src/c/CMakeLists.txt",
+    "src/c/vkernels/capi/capi.cpp",
+    "src/c/vkernels/capi/capi.hpp",
+    "src/c/vkernels/capi/hip_capi.cpp",
+    "src/c/vkernels/capi/hip_capi.hpp",
+    "src/c/vkernels/kernels/dsa_topk.cpp",
+    "src/c/vkernels/kernels/dsa_topk.hip",
+    "src/c/vkernels/kernels/dsa_topk.hpp",
+    "src/python/vkernels/_core.cpp",
+    "src/python/vkernels/_fallback.py",
+    "src/python/vkernels/kernels.py",
+    "tests/CMakeLists.txt",
+    "tests/capi/test_capi.cpp",
+    "tests/kernels/attn/test_dsa_topk.cpp",
+    "tests/python/test_discovery.py",
+    "tests/python/test_kernels.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 945612,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 25964288,
+    "output_tokens": 67025,
+    "api_call_count": 171
+  }
+}
