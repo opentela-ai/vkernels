@@ -192,3 +192,7 @@ If those conditions are not met, leave explicit, actionable feedback and push fo
 ---
 
 yes please
+
+---
+
+Yes commit and create a PR for that
