@@ -754,6 +754,119 @@ TEST(CapiMla, NullArgsThrow) {
   EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
 }
 
+// --- DSA sparse-MLA forward (dsa.hpp, issue #51) -------------------------
+
+TEST(CapiDsa, HandCheckedTailDimZero) {
+  // GLM-5.3-Flash layout (tail_dim == 0). q=[1,1], 2 keys, sm_scale=1.
+  // Matches test_dsa.cpp::DsaFwd::HandCheckedTailDimZero: scores {1,1}
+  // -> base-2 weights {1,1}/2 -> out {0.5,0.5}, lse=2.
+  const float sm_scale = 1.0f;
+  std::vector<float> q = {1, 1};
+  std::vector<float> kv = {1, 0, 0, 1};
+  std::vector<int32_t> idx = {0, 1};
+  std::vector<float> out(2, -1.0f), lse(1, 7.0f);
+  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 0, 2, 1, 64, 1, sm_scale, /*lse=*/1,
+                              q.data(), kv.data(), idx.data(), out.data(),
+                              lse.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 0.5f, 1e-6f);
+  EXPECT_NEAR(out[1], 0.5f, 1e-6f);
+  EXPECT_NEAR(lse[0], 2.0f, 1e-6f);
+}
+
+TEST(CapiDsa, HandCheckedTailDimPositive) {
+  // DeepSeek-V3 layout (tail_dim > 0): dim=2 tail=1 d_v=1.
+  // Matches test_dsa.cpp::DsaFwd::HandCheckedTailDimPositive: scores {2,3}
+  // -> out = 4/1.5, lse = 3 + log2(1.5).
+  const float sm_scale = 1.0f;
+  std::vector<float> q = {1, 0, 0};            // main=[1,0] tail=[0]
+  std::vector<float> kv = {2, 1, 1, 3, 0, 1}; // 2 keys, dim+tail=3
+  std::vector<int32_t> idx = {0, 1};
+  std::vector<float> out(1, -1.0f), lse(1, 7.0f);
+  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 1, 2, 1, 64, 1, sm_scale, 1,
+                              q.data(), kv.data(), idx.data(), out.data(),
+                              lse.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 4.0f / 1.5f, 1e-6f);
+  EXPECT_NEAR(lse[0], 3.0f + std::log2(1.5f), 1e-6f);
+}
+
+TEST(CapiDsa, ConfigDecode) {
+  int bq = 0, threads = 0, bi = 0, ii = 0;
+  vk_dsa_config(1, 64, 256, 128, &bq, &threads, &bi, &ii);  // decode
+  EXPECT_GT(bq, 0);
+  EXPECT_GT(threads, 0);
+  EXPECT_GT(bi, 0);
+  EXPECT_GT(ii, 0);
+}
+
+TEST(CapiDsa, ConfigPrefill) {
+  int bq = 0, threads = 0, bi = 0, ii = 0;
+  vk_dsa_config(16, 64, 256, 128, &bq, &threads, &bi, &ii);  // prefill
+  EXPECT_GT(bq, 0);
+  EXPECT_GT(threads, 0);
+  EXPECT_GT(bi, 0);
+  EXPECT_GT(ii, 0);
+}
+
+TEST(CapiDsa, NullArgsThrow) {
+  std::vector<float> q(4, 1), kv(4, 1), out(2, 1);
+  std::vector<int32_t> idx(2, 0);
+  EXPECT_NE(vk_dsa_sparse_fwd(1, 1, 1, 2, 0, 2, 1, 64, 1, 1.0f, 0, nullptr,
+                              kv.data(), idx.data(), out.data(), nullptr),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+// --- MHC — multi-head hybrid-attention pre-norm (mhc.hpp, issue #51) ----
+
+TEST(CapiMhc, PreGemmSqrsumHandChecked) {
+  // hc_mult=2, hidden=2 -> hc_hidden_size=4, hc_mult3=8. fn is identity in
+  // the first 4 rows, zero after (hc_mult3 > hc_hidden_size). x=[1,2,3,4]
+  // -> out=[1,2,3,4,0,0,0,0], sqrsum=30. Mirrors test_mhc.cpp.
+  std::vector<float> x = {1, 2, 3, 4};
+  std::vector<float> fn(8 * 4, 0.0f);
+  for (int o = 0; o < 4; ++o) fn[o * 4 + o] = 1.0f;
+  std::vector<float> out(8, -1.0f), sqrsum(1, -1.0f);
+  EXPECT_EQ(vk_mhc_pre_gemm_sqrsum(1, 2, 2, x.data(), fn.data(), out.data(),
+                                   sqrsum.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 1.0f, 1e-6f); EXPECT_NEAR(out[1], 2.0f, 1e-6f);
+  EXPECT_NEAR(out[2], 3.0f, 1e-6f); EXPECT_NEAR(out[3], 4.0f, 1e-6f);
+  EXPECT_NEAR(out[4], 0.0f, 1e-6f); EXPECT_NEAR(out[5], 0.0f, 1e-6f);
+  EXPECT_NEAR(out[6], 0.0f, 1e-6f); EXPECT_NEAR(out[7], 0.0f, 1e-6f);
+  EXPECT_NEAR(sqrsum[0], 30.0f, 1e-6f);
+}
+
+TEST(CapiMhc, PostHandChecked) {
+  // hc=2, hidden=2. a = identity (2x2), b = [[1,2],[3,4]], c=[10,20],
+  // d=[1,1] -> out = [11,12,23,24]. Mirrors test_mhc.cpp.
+  std::vector<float> a = {1, 0, 0, 1};
+  std::vector<float> b = {1, 2, 3, 4};
+  std::vector<float> c = {10, 20};
+  std::vector<float> d = {1, 1};
+  std::vector<float> out(4, -1.0f);
+  EXPECT_EQ(vk_mhc_post(1, 2, 2, a.data(), b.data(), c.data(), d.data(),
+                        out.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 11.0f, 1e-6f); EXPECT_NEAR(out[1], 12.0f, 1e-6f);
+  EXPECT_NEAR(out[2], 23.0f, 1e-6f); EXPECT_NEAR(out[3], 24.0f, 1e-6f);
+}
+
+TEST(CapiMhc, NullArgsThrow) {
+  std::vector<float> x(4, 1), fn(8, 1), out(8, 1), sq(1, 1);
+  EXPECT_NE(vk_mhc_pre_gemm_sqrsum(1, 2, 2, nullptr, fn.data(), out.data(),
+                                   sq.data()),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+
+  std::vector<float> a(4, 1), b(4, 1), c(2, 1), dd(2, 1), oo(4, 1);
+  EXPECT_NE(vk_mhc_post(1, 2, 2, a.data(), b.data(), nullptr, dd.data(),
+                        oo.data()),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
 // --- KDA — Kimi Delta Attention (kda.hpp, issue #21) ----------------------
 
 TEST(CapiKda, LayerNormGatedIdentityWeightUnitGate) {
