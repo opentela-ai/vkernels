@@ -7,3 +7,7 @@ can you ssh beverin, and use the mi300 partition to compile and run the code?
 ---
 
 can you test and benchmark on beverin
+
+---
+
+ok can we squash merge the PR into main?
