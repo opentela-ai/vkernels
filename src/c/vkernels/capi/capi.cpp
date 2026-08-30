@@ -29,6 +29,7 @@
 #include "vkernels/kernels/kda.hpp"
 #include "vkernels/kernels/mla.hpp"
 #include "vkernels/kernels/dsa.hpp"
+#include "vkernels/kernels/dsa_topk.hpp"
 #include "vkernels/kernels/mhc.hpp"
 #include "vkernels/kernels/moe.hpp"
 #include "vkernels/kernels/moe_aux.hpp"
@@ -324,6 +325,28 @@ int32_t vk_dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
       sm_scale, return_lse != 0, q, kv, indices, out, lse);
   return VK_OK;
   VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_dsa_topk_transform(
+    int32_t batch_size, const float* score, const int32_t* lengths,
+    int32_t* dst_token_indices, int64_t score_stride, int32_t pool_size,
+    int32_t token_topk, int32_t out_cols, const int32_t* page_table,
+    int64_t page_table_stride, const int32_t* page_table_row_index,
+    const int32_t* topk_indices_offset, const int32_t* row_starts,
+    const int32_t* seq_lens) {
+  VK_CAPI_TRY
+  vkernels::kernels::dsa_topk_transform_cpu(
+      batch_size, score, lengths, dst_token_indices, score_stride, pool_size,
+      token_topk, out_cols, page_table, page_table_stride, page_table_row_index,
+      topk_indices_offset, row_starts, seq_lens);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int vk_dsa_topk_group_topk_supported(int32_t group_topk) {
+  return vkernels::kernels::dsa_topk_transform_group_topk_supported(group_topk)
+             ? 1
+             : 0;
 }
 
 void vk_dsa_config(int S_q, int H, int dim, int topk, int* bq,

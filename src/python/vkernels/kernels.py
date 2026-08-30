@@ -1148,6 +1148,73 @@ def dsa_config(S_q, H, dim, topk):
     )
 
 
+def dsa_topk_transform(score, lengths, *, pool_size, token_topk,
+                       out_cols=None, page_table=None,
+                       page_table_row_index=None, topk_indices_offset=None,
+                       row_starts=None, seq_lens=None, out=None):
+    """DeepseekSparseAttn pool-level top-k transform.
+
+    ``score`` is ``(B, score_stride)`` float32 pool-group logits and
+    ``lengths`` is ``(B,)`` int32 valid group counts. The transform selects
+    ``token_topk / pool_size`` pool groups per row, expands each winner to
+    ``pool_size`` token ids, optionally remaps them through ``page_table`` or
+    adds a ragged ``topk_indices_offset``, and optionally appends the
+    ``seq_len % pool_size`` tail tokens.
+    """
+    score_arr = _as_input(score, "score")
+    if score_arr.ndim != 2:
+        raise ValueError("score must be 2-D [batch_size, score_stride]")
+    batch_size, score_stride = (int(v) for v in score_arr.shape)
+    lengths_arr = np.ascontiguousarray(lengths, dtype=np.int32)
+    if lengths_arr.ndim != 1 or lengths_arr.size != batch_size:
+        raise ValueError("lengths must be 1-D with one entry per score row")
+    if pool_size <= 1:
+        raise ValueError("pool_size must be greater than one")
+    if token_topk <= 0 or token_topk % pool_size != 0:
+        raise ValueError("token_topk must be a positive multiple of pool_size")
+    group_topk = int(token_topk) // int(pool_size)
+    if not bool(_impl.dsa_topk_group_topk_supported(group_topk)):
+        raise ValueError("unsupported pool-level top-k")
+    if page_table is not None and topk_indices_offset is not None:
+        raise ValueError("page_table and topk_indices_offset are mutually exclusive")
+
+    def _opt_i32(name, value):
+        if value is None:
+            return None
+        arr = np.ascontiguousarray(value, dtype=np.int32)
+        if arr.ndim != 1 or arr.size != batch_size:
+            raise ValueError(f"{name} must be 1-D with {batch_size} elements")
+        return arr
+
+    page_table_arr = None
+    page_table_stride = 0
+    if page_table is not None:
+        page_table_arr = np.ascontiguousarray(page_table, dtype=np.int32)
+        if page_table_arr.ndim != 2:
+            raise ValueError("page_table must be 2-D [rows, page_table_stride]")
+        if page_table_arr.shape[0] != batch_size:
+            raise ValueError("page_table must have one row per score row")
+        page_table_stride = int(page_table_arr.shape[1])
+    page_row_arr = _opt_i32("page_table_row_index", page_table_row_index)
+    if page_table_arr is not None and page_row_arr is not None:
+        if np.any(page_row_arr < 0) or np.any(page_row_arr >= page_table_arr.shape[0]):
+            raise ValueError("page_table_row_index entries must address a page-table row")
+    offsets_arr = _opt_i32("topk_indices_offset", topk_indices_offset)
+    row_starts_arr = _opt_i32("row_starts", row_starts)
+    seq_lens_arr = _opt_i32("seq_lens", seq_lens)
+    if out_cols is None:
+        out_cols = int(token_topk) + (int(pool_size) - 1 if seq_lens_arr is not None else 0)
+    out_arr = _as_out_typed(out, np.int32, batch_size * int(out_cols), "out") if out is not None else np.empty((batch_size, int(out_cols)), dtype=np.int32)
+    out_flat = out_arr.reshape(batch_size * int(out_cols))
+    _impl.dsa_topk_transform(
+        int(batch_size), int(score_stride), int(pool_size), int(token_topk),
+        int(out_cols), score_arr, lengths_arr, out_flat,
+        page_table_arr, page_row_arr, offsets_arr, row_starts_arr,
+        seq_lens_arr, int(page_table_stride),
+    )
+    return out_flat.reshape(batch_size, int(out_cols))
+
+
 # ---------------------------------------------------------------------------
 # MHC: multi-head hybrid-attention pre-norm (issue #51, part 2)
 # ---------------------------------------------------------------------------

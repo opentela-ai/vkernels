@@ -208,6 +208,19 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_capi_moe_align PRIVATE cxx_std_17)
   vkernels_set_warnings(test_capi_moe_align)
 
+  # DSA pool-level radix top-k transform (issue #56): exercise the exported
+  # C ABI against the host oracle for every supported group-top-k, including
+  # the short-row guard, page-table/ragged modes, row starts, and tail append.
+  add_executable(test_capi_dsa_topk test_capi_dsa_topk.hip)
+  target_link_libraries(test_capi_dsa_topk PRIVATE vkernels::vkernels vkernels::vkernels_hip)
+  target_compile_features(test_capi_dsa_topk PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_capi_dsa_topk)
+
+  add_executable(dsa_topk_bench bench_dsa_topk.hip)
+  target_link_libraries(dsa_topk_bench PRIVATE vkernels::vkernels)
+  target_compile_features(dsa_topk_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(dsa_topk_bench)
+
   add_executable(test_moe_aux_correct test_moe_aux_correct.hip)
   target_link_libraries(test_moe_aux_correct PRIVATE vkernels::vkernels)
   target_compile_features(test_moe_aux_correct PRIVATE cxx_std_17)

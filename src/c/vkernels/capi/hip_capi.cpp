@@ -24,6 +24,7 @@
 #include "vkernels/kernels/moe_fused.hpp"
 #include "vkernels/kernels/mla.hpp"
 #include "vkernels/kernels/dsa.hpp"
+#include "vkernels/kernels/dsa_topk.hpp"
 #include "vkernels/kernels/kda.hpp"
 #include "vkernels/kernels/mhc.hpp"
 
@@ -103,6 +104,20 @@ extern "C" void vk_hip_dsa_sparse_fwd(
   vkernels::kernels::hip::dsa_sparse_fwd(
       S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
       sm_scale, return_lse != 0, q, kv, indices, out, lse);
+}
+
+// --- DSA pool-level radix top-k transform ---
+extern "C" void vk_hip_dsa_topk_transform(
+    int32_t batch_size, const float* score, const int32_t* lengths,
+    int32_t* dst_token_indices, int64_t score_stride, int32_t pool_size,
+    int32_t token_topk, int32_t out_cols, const int32_t* page_table,
+    int64_t page_table_stride, const int32_t* page_table_row_index,
+    const int32_t* topk_indices_offset, const int32_t* row_starts,
+    const int32_t* seq_lens) {
+  vkernels::kernels::hip::dsa_topk_transform(
+      batch_size, score, lengths, dst_token_indices, score_stride, pool_size,
+      token_topk, out_cols, page_table, page_table_stride,
+      page_table_row_index, topk_indices_offset, row_starts, seq_lens);
 }
 
 // --- DSA per-shape tile selector ---

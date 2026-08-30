@@ -49,6 +49,7 @@
 #include "vkernels/kernels/kda.hpp"
 #include "vkernels/kernels/mla.hpp"
 #include "vkernels/kernels/dsa.hpp"
+#include "vkernels/kernels/dsa_topk.hpp"
 #include "vkernels/kernels/mhc.hpp"
 #include "vkernels/kernels/moe.hpp"
 #include "vkernels/kernels/moe_aux.hpp"
@@ -530,6 +531,45 @@ PYBIND11_MODULE(_core, m) {
       "HIP DSA kernel: decode (S_q <= 8) -> (1, 64, 64, i); prefill -> "
       "(4, 256, 64, i). inner_iter grows while topk stays divisible by "
       "block_I*inner_iter.");
+
+  kernels.def(
+      "dsa_topk_transform",
+      [](int batch_size, int64_t score_stride, int pool_size, int token_topk,
+         int out_cols, FloatArray score, I32Array lengths, I32Array out,
+         std::optional<I32Array> page_table,
+         std::optional<I32Array> page_table_row_index,
+         std::optional<I32Array> topk_indices_offset,
+         std::optional<I32Array> row_starts,
+         std::optional<I32Array> seq_lens, int64_t page_table_stride) {
+        require_writeable(out);
+        kernels::dsa_topk_transform_cpu(
+            batch_size, score.data(), lengths.data(), out.mutable_data(),
+            score_stride, pool_size, token_topk, out_cols,
+            page_table ? page_table->data() : nullptr, page_table_stride,
+            page_table_row_index ? page_table_row_index->data() : nullptr,
+            topk_indices_offset ? topk_indices_offset->data() : nullptr,
+            row_starts ? row_starts->data() : nullptr,
+            seq_lens ? seq_lens->data() : nullptr);
+        return out;
+      },
+      py::arg("batch_size"), py::arg("score_stride"), py::arg("pool_size"),
+      py::arg("token_topk"), py::arg("out_cols"), py::arg("score"),
+      py::arg("lengths"), py::arg("out"), py::arg("page_table") = py::none(),
+      py::arg("page_table_row_index") = py::none(),
+      py::arg("topk_indices_offset") = py::none(),
+      py::arg("row_starts") = py::none(), py::arg("seq_lens") = py::none(),
+      py::arg("page_table_stride") = 0,
+      "DeepseekSparseAttn pool-level top-k transform (CPU reference): "
+      "score [B,S] fp32 + lengths [B] -> dst [B,out_cols] int32 with "
+      "optional page-table remap, ragged offsets, row starts, and seq tail.");
+
+  kernels.def(
+      "dsa_topk_group_topk_supported",
+      [](int group_topk) {
+        return kernels::dsa_topk_transform_group_topk_supported(group_topk);
+      },
+      py::arg("group_topk"),
+      "True when the DSA radix top-k transform supports group_topk.");
 
   // --- MHC: multi-head hybrid-attention pre-norm (issue #51, part 2) ------
   //

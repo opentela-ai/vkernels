@@ -19,6 +19,7 @@ from vkernels.kernels import (
     add,
     dsa_config,
     dsa_sparse_fwd,
+    dsa_topk_transform,
     fused_moe_mxfp4,
     gemm,
     gemm_bf16,
@@ -1296,6 +1297,148 @@ class DsaFwdTest(unittest.TestCase):
             cl = np.where(np.isfinite(c_l), c_l, 0.0)
             fl = np.where(np.isfinite(f_l), f_l, 0.0)
             np.testing.assert_allclose(cl, fl, rtol=1e-5, atol=1e-6)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class DsaTopkTransformTest(unittest.TestCase):
+    @staticmethod
+    def _sorted_history_tokens(actual, history_len):
+        return np.sort(np.asarray(actual[:history_len], dtype=np.int32))
+
+    @staticmethod
+    def _expected_history_tokens(group_ids, pool_size):
+        tokens = []
+        for group_id in group_ids:
+            tokens.extend(group_id * pool_size + lane for lane in range(pool_size))
+        return np.array(sorted(tokens), dtype=np.int32)
+
+    def test_length_not_exceeding_group_topk_returns_contiguous_history(self):
+        score = np.arange(12, dtype=_F32).reshape(1, 12)
+        out = dsa_topk_transform(
+            score,
+            np.array([3], dtype=np.int32),
+            pool_size=2,
+            token_topk=256,
+        )
+        np.testing.assert_array_equal(
+            out[0, :6], np.array([0, 1, 2, 3, 4, 5], dtype=np.int32)
+        )
+        np.testing.assert_array_equal(out[0, 6:], np.full(250, -1, dtype=np.int32))
+
+    def test_page_table_row_index_remaps_selected_tokens(self):
+        score = np.arange(12, dtype=_F32).reshape(1, 12)
+        page_table = (100 + np.arange(32, dtype=np.int32)).reshape(1, 32)
+        out = dsa_topk_transform(
+            score,
+            np.array([2], dtype=np.int32),
+            pool_size=2,
+            token_topk=256,
+            page_table=page_table,
+            page_table_row_index=np.array([0], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            out[0, :4], np.array([100, 101, 102, 103], dtype=np.int32)
+        )
+
+    def test_ragged_offset_is_added_to_raw_tokens(self):
+        score = np.arange(16, dtype=_F32).reshape(1, 16)
+        out = dsa_topk_transform(
+            score,
+            np.array([2], dtype=np.int32),
+            pool_size=4,
+            token_topk=512,
+            topk_indices_offset=np.array([9], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(out[0, :8], np.arange(9, 17, dtype=np.int32))
+
+    def test_row_starts_select_from_the_valid_score_window(self):
+        score = np.concatenate(
+            [np.array([1000.0, 999.0], dtype=_F32), np.arange(130, dtype=_F32)]
+        ).reshape(1, 132)
+        out = dsa_topk_transform(
+            score,
+            np.array([130], dtype=np.int32),
+            pool_size=2,
+            token_topk=256,
+            row_starts=np.array([2], dtype=np.int32),
+        )
+        expected = self._expected_history_tokens(range(2, 130), 2)
+        actual = self._sorted_history_tokens(out[0], 256)
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_seq_lens_appends_tail_after_history(self):
+        score = np.arange(16, dtype=_F32).reshape(1, 16)
+        out = dsa_topk_transform(
+            score,
+            np.array([2], dtype=np.int32),
+            pool_size=4,
+            token_topk=512,
+            seq_lens=np.array([10], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(out[0, :8], np.arange(8, dtype=np.int32))
+        np.testing.assert_array_equal(out[0, 8:10], np.array([8, 9], dtype=np.int32))
+        np.testing.assert_array_equal(out[0, 10:], np.full(505, -1, dtype=np.int32))
+
+    def test_invalid_mapping_combination_raises(self):
+        score = np.arange(16, dtype=_F32).reshape(1, 16)
+        with self.assertRaises(ValueError):
+            dsa_topk_transform(
+                score,
+                np.array([2], dtype=np.int32),
+                pool_size=4,
+                token_topk=512,
+                page_table=np.arange(32, dtype=np.int32).reshape(1, 32),
+                topk_indices_offset=np.array([1], dtype=np.int32),
+            )
+
+    def test_out_of_range_page_table_row_raises(self):
+        score = np.arange(16, dtype=_F32).reshape(1, 16)
+        with self.assertRaises(ValueError):
+            dsa_topk_transform(
+                score,
+                np.array([2], dtype=np.int32),
+                pool_size=4,
+                token_topk=512,
+                page_table=np.arange(32, dtype=np.int32).reshape(1, 32),
+                page_table_row_index=np.array([1], dtype=np.int32),
+            )
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        score = np.concatenate(
+            [np.array([1000.0, 999.0], dtype=_F32), np.arange(130, dtype=_F32)]
+        ).reshape(1, 132)
+        lengths = np.array([130], dtype=np.int32)
+        page_table = (200 + np.arange(400, dtype=np.int32)).reshape(1, 400)
+        row_starts = np.array([2], dtype=np.int32)
+        seq_lens = np.array([261], dtype=np.int32)
+
+        def run(impl):
+            prev = kernels._impl
+            kernels._impl = impl
+            try:
+                return dsa_topk_transform(
+                    score,
+                    lengths,
+                    pool_size=2,
+                    token_topk=256,
+                    page_table=page_table,
+                    page_table_row_index=np.array([0], dtype=np.int32),
+                    row_starts=row_starts,
+                    seq_lens=seq_lens,
+                ).copy()
+            finally:
+                kernels._impl = prev
+
+        compiled = run(core)
+        fallback = run(fb)
+        np.testing.assert_array_equal(
+            self._sorted_history_tokens(compiled[0], 256),
+            self._sorted_history_tokens(fallback[0], 256),
+        )
+        np.testing.assert_array_equal(compiled[0, 256:257], fallback[0, 256:257])
 
 
 @unittest.skipIf(np is None, "numpy is required for these tests")
