@@ -18,6 +18,9 @@
 
 use std::os::raw::{c_char, c_int, c_void};
 
+#[cfg(feature = "serving-c-abi")]
+pub mod serving;
+
 pub const VK_OK: i32 = 0;
 pub const VK_ERROR_INVALID_ARGUMENT: i32 = 1;
 pub const VK_ERROR_OUT_OF_RANGE: i32 = 2;

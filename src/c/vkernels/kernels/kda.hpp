@@ -1,24 +1,39 @@
 // vkernels/kernels/kda.hpp
 //
 // Kimi Delta Attention (KDA) — the delta-rule hybrid layer of Kimi-K3
-// (issue #21). KDA is a gated delta-rule linear-attention layer: a state
-// matrix S_t (head_dim × head_dim, per head) is updated each token by a
-// *delta correction* (β_t (v_t − S_{t−1} k_t) k_tᵀ) and decayed by a forget
-// gate g_t, and the output is o_t = S_t q_t. On gfx942 today the AITER /
-// Triton chunked kernels GPU-fault (job 586165), so K3 serving disables
-// KDA (K3_DISABLE_KDA=1). vkernels re-implements the seven faulting kernels
-// as portable host references + HIP kernels so the KDA path is correct on
-// MI300A without that flag.
+// (issue #21, #45). KDA is a gated delta-rule linear-attention layer: a
+// state matrix S_t (head_dim × head_dim, per head) is decayed each token by
+// a *per-key-dim forget gate* g_t[k] and then updated by a delta correction
+// (β_t (v_t − a_t) ⊗ k_t), and the output is o_t = S_t q_t.
 //
-//   per-token oracle (the math the chunked kernels parallelise):
-//     S_0 = 0
+// The recurrence matches the FLA gated-delta-rule (IS_KDA=True) reference
+// and the vLLM K3 AMD decode kernel (fused_recurrent_kda_fwd_kernel): the
+// gate is applied BEFORE the prediction (post-gate prediction), and the
+// gate is per-key-dim (column-scaled), not a scalar broadcast.
+//
+//   per-token oracle (the math the HIP kernel + chunked path parallelise):
+//     S_0 = 0  (or the gathered initial state for multi-turn decode)
 //     for t = 0 .. S-1:
-//       a_t = S_{t-1} · k_t                       # prediction from prior state
-//       S_t = g_t · S_{t-1} + β_t (v_t - a_t) ⊗ k_t   # forget + delta update
-//       o_t = S_t · q_t
+//       S'_t      = g_t ⊙ S_{t-1}               # per-key-dim forget gate
+//                                              # g_t[k] = exp(gate_log[t,h,k])
+//       a_t       = S'_t · k_t                   # prediction from GATED state
+//       S_t       = S'_t + β_t (v_t - a_t) ⊗ k_t # delta update
+//       o_t       = S_t · q_t                    # output from final state
 //
-// (k is L2-normalised by the caller, as in delta-net; the gate g and the
-//  delta gate β are scalar per token, broadcast across the head dim.)
+// (k is L2-normalised and q is L2-normalised + scaled by D^{-1/2} by the
+//  CALLER, as in delta-net. The gate g is [B,H,S,D] — one forget factor
+//  per (token, head, key-dim) — in normal space (0, 1]. The delta gate β
+//  is [B,H,S] — scalar per (token, head).)
+//
+// The chunked path (L2..L6 below) implements the OLD *standard* gated
+// delta rule (scalar gate [B,H,S], pre-gate prediction) -- a DIFFERENT
+// recurrence from the per-key-dim oracle above. It is kept as a standalone
+// reference for non-K3 models and is cross-checked against an inline
+// standard-rule oracle in test_kda.cpp (NOT against
+// kda_naive_delta_rule_fwd_cpu, which is the K3 per-key-dim oracle). The
+// K3 serving path (issue #45) replaces the faulting Triton chunked kernels
+// with the naive-sequential HIP kernel (kda_delta_rule_fwd_with_scratch),
+// which IS the K3 oracle.
 //
 // Chunking. The naive recurrence is O(S · D²) per head — correct but too
 // slow for production. The chunked algorithm (Yang et al., "Parallelizing
@@ -46,14 +61,19 @@
 //                + Σ_{j<=t} G_{j+1,t} β_j (k_j · q_t) u_j
 //      The inter call propagates C_c across chunks and produces the
 //      inter output term; kda_gla_fwd_o adds the intra output term. Both
-//      equal the per-token oracle (kda_naive_delta_rule_fwd_cpu) to within
-//      fp32 round-off, verified by the host tests.
+//      equal the STANDARD-RULE per-token oracle (spelled inline in
+//      test_kda.cpp) to within fp32 round-off, verified by the host tests
+//      -- NOT kda_naive_delta_rule_fwd_cpu, which implements the K3
+//      per-key-dim recurrence (a different gate shape).
 //
 // Two-implementation model:
 //   kda.cpp  -- CPU reference (oracle), always compiled, in vkernels::kernels.
-//               kda_naive_delta_rule_fwd_cpu is the per-token oracle; the
-//               chunked pieces (gate cumsum / intra / inter / output) are
-//               exposed separately and cross-checked against it.
+//               kda_naive_delta_rule_fwd_cpu is the K3 per-key-dim oracle
+//               (cross-checked by hand + the zero-gate independence
+//               property). The chunked pieces (gate cumsum / intra /
+//               inter / output) implement the standard gated delta rule
+//               (scalar gate) and are cross-checked against an inline
+//               standard-rule oracle in test_kda.cpp.
 //   kda.hip  -- HIP kernels (gfx942), compiled with VKERNELS_HAS_HIP, in
 //               vkernels::kernels::hip. Each mirrors its CPU counterpart.
 #include <cstddef>
@@ -104,12 +124,16 @@ void kda_gate_chunk_cumsum_cpu(const float* g, float* intra_log,
 // ---------------------------------------------------------------------------
 // #L3 — kda_naive_delta_rule_fwd: per-token oracle (O(S·D²), reference)
 // ---------------------------------------------------------------------------
-//   q, k, v : [B, H, S, D]   float (k L2-normalised by the caller)
-//   g, β    : [B, H, S]       float (forget gate g, delta gate β)
+//   q, k, v : [B, H, S, D]   float (k L2-normalised, q L2-norm + scaled by
+//                              the caller — both received pre-normalised)
+//   g       : [B, H, S, D]   float, per-key-dim forget gate in NORMAL space
+//                              (0, 1]; g_t[k] multiplies state column k.
+//   β       : [B, H, S]       float, scalar delta gate per (token, head).
 //   out     : [B, H, S, D]   float
 //
-// Implements the per-token recurrence in the file header exactly. This is
-// the correctness oracle for the chunked kernels; it is too slow for
+// Implements the K3/FLA gated-delta-rule (IS_KDA=True) recurrence in the
+// file header exactly: gate BEFORE prediction (post-gate), per-key-dim.
+// This is the correctness oracle for the HIP kernel; it is too slow for
 // production but unambiguous and verifiable by hand.
 void kda_naive_delta_rule_fwd_cpu(const float* q, const float* k,
                                   const float* v, const float* g,
@@ -120,6 +144,12 @@ void kda_naive_delta_rule_fwd_cpu(const float* q, const float* k,
 // #L4 — kda_delta_rule_intra: within-chunk delta-corrected value solve
 //   (one chunk at a time; the orchestrator interleaves L4 and L5 because
 //    chunk c's intra solve needs C_{c-1} produced by inter(c-1).)
+//
+//   NOTE: L4–L7 below implement the OLD *standard* gated delta rule (scalar
+//   gate [B,H,S], pre-gate prediction). They are kept as a standalone
+//   reference for non-K3 models but are NOT the K3 oracle (see #L3 above).
+//   The K3 serving path (issue #45) replaces the faulting Triton chunked
+//   kernels with the naive-sequential HIP kda_delta_rule_fwd_with_scratch.
 // ---------------------------------------------------------------------------
 //   q, k, v : [B, H, S, D]   float (the chunk's keys/values/queries)
 //   g, β    : [B, H, S]       float (gate / delta gate, chunk slice)
@@ -180,8 +210,11 @@ void kda_gla_fwd_o_cpu(const float* q, const float* k, const float* g,
 //   chunk_size  must divide S.
 //
 // Runs the gate cumsum → intra solve → inter propagation → output combine
-// pipeline and writes `out`. Matches kda_naive_delta_rule_fwd_cpu to within
-// fp32 round-off (verified by the host tests at K3 head shapes).
+// pipeline and writes `out`. Implements the STANDARD gated delta rule
+// (scalar gate [B,H,S], pre-gate prediction) and matches the inline
+// standard-rule oracle in test_kda.cpp to within fp32 round-off. It does
+// NOT match kda_naive_delta_rule_fwd_cpu, which implements the K3
+// per-key-dim recurrence (a different gate shape).
 void kda_delta_rule_fwd_cpu(const float* q, const float* k, const float* v,
                             const float* g, const float* beta, float* out,
                             int B, int H, int S, int D, int chunk_size);
@@ -203,10 +236,12 @@ void kda_pack_bitmatrix_cpu(const uint8_t* bits, uint8_t* packed,
 namespace vkernels::kernels::hip {
 
 // HIP kernels (gfx942), one per CPU counterpart above. The cooperative
-// forward (kda_delta_rule_fwd) is the correctness-first baseline matching
-// the naive oracle; kda_delta_rule_fwd_with_scratch lets the caller own the
-// B*H*D*D zero-initialized state scratch (one allocation, reused across
-// timed iterations) for benchmarking.
+// forward (kda_delta_rule_fwd) implements the K3/FLA gated-delta-rule
+// (IS_KDA=True): per-key-dim gate [B,H,S,D], post-gate prediction. It IS
+// the K3 oracle (matches kda_naive_delta_rule_fwd_cpu). The
+// kda_delta_rule_fwd_with_scratch variant lets the caller own the
+// B*H*D*D state scratch (pre-filled with the gathered initial state for
+// multi-turn decode; the final state is read back from the same buffer).
 void kda_layer_norm_gated(const float* x, const float* weight,
                           const float* gate, float* out,
                           int N, int D, float eps);
@@ -214,10 +249,16 @@ void kda_layer_norm_gated(const float* x, const float* weight,
 void kda_gate_chunk_cumsum(const float* g, float* intra, float* inter,
                            int B, int H, int n_chunks, int chunk_size);
 
+// g : [B, H, S, D] per-key-dim forget gate (normal space). q/k are
+// pre-normalised by the caller. S_0 = 0 (own alloc, zeroed).
 void kda_delta_rule_fwd(const float* q, const float* k, const float* v,
                         const float* g, const float* beta, float* out,
                         int B, int H, int S, int D, int chunk_size);
 
+// g : [B, H, S, D] per-key-dim forget gate (normal space). q/k are
+// pre-normalised. state : [B, H, D, D] caller-owned scratch — pre-fill with
+// the gathered initial state (zeros for first-turn prefill); the final
+// state S_S is written back into the SAME buffer (read it after the call).
 void kda_delta_rule_fwd_with_scratch(const float* q, const float* k,
                                      const float* v, const float* g,
                                      const float* beta, float* state,

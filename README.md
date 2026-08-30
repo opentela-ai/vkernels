@@ -117,6 +117,21 @@ cmake --build --preset cuda
 ctest --preset cuda
 ```
 
+For GPU hosts that should not carry CUDA/NCCL development packages, build the
+NVIDIA image instead. It contains the CUDA toolkit plus pinned NCCL runtime and
+headers; the host only needs a compatible NVIDIA driver and NVIDIA Container
+Toolkit:
+
+```bash
+docker build -t vkernels:cuda -f meta/docker/Dockerfile.nv .
+docker run --rm --gpus all --ipc=host vkernels:cuda
+```
+
+Override `NCCL_PACKAGE_VERSION` at image build time when coordinating a CUDA or
+NCCL upgrade. The image build fails if CMake does not detect NCCL.
+To validate only the reusable CUDA/NCCL toolchain layer, build with
+`--target toolchain`.
+
 ## vkl — listing the implemented kernels
 
 `vkl` (Python, under `src/python/`) answers "what is implemented in this
@@ -205,3 +220,23 @@ and the reference implementations are wired up with passing, fully-covered tests
 
 A K3-shaped forward (MLA + KDA layers) runs on gfx942 and matches the
 CPU/torch reference; `K3_DISABLE_KDA=1` is no longer required.
+
+### GLM-5.3-Flash / DeepSeek-V3 sparse attention (issue #51)
+
+- **DSA** — DeepseekSparseAttn sparse-MLA forward (absorbed form, online
+  softmax, bf16-tolerant vs the CPU oracle). Replaces the tilelang
+  `sparse_mla_fwd_decode_partial` (+`_combine`) decode kernels and the
+  `_v1`/`_v2` prefill kernels, which GPU-fault on gfx942; the
+  GLM-5.3-Flash `tail_dim == 0` shape tilelang cannot compile is a
+  first-class, hand-checked case (the rope-tail dot is skipped at runtime).
+  See [`docs/kernels/dsa.md`](docs/kernels/dsa.md).
+- **MHC** — the two GLM-5.3-Flash / DeepSeek-V3 multi-head hybrid-attention
+  pre/post kernels (`mhc_pre_gemm_sqrsum`, `mhc_post`) whose tilelang
+  forms JIT-abort on gfx942 (dynamic shared > 64 KB non-optin cap). The
+  HIP kernels use static shared memory sized to fit MI300A's non-optin
+  cap (no `hipFuncSetAttribute` opt-in, no `hidden_block 256 -> 128`
+  patch), bf16-tolerant vs the CPU oracle. See
+  [`docs/kernels/mhc.md`](docs/kernels/mhc.md).
+
+GLM-5.3-Flash serves on gfx942 with `--dsa-prefill-backend vkernels
+--dsa-decode-backend vkernels` and no custom tilelang overlay.

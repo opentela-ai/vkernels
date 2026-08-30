@@ -25,6 +25,18 @@ target_link_libraries(pipeline_boundary_bench PRIVATE vkernels::vkernels)
 target_compile_features(pipeline_boundary_bench PRIVATE cxx_std_17)
 vkernels_set_warnings(pipeline_boundary_bench)
 
+# --- Host-only benchmark (no GPU needed): cross-node KV transfer ---
+# The fabric-import classification + the per-hop cost model run anywhere, so
+# this bench is the CI-verifiable surface for issue #49 acceptance #2
+# (per-hop throughput vs the same-node roofline and the synchronous
+# bulk-copy fallback, with the GH200 DRAM-only / host-bounce caveat). The
+# real-RDMA-fabric per-hop number on H-CLARIDEN / H-JSC is the on-site step
+# (no real RDMA fabric is in any container today).
+add_executable(cross_node_kv_bench bench_cross_node_kv.cpp)
+target_link_libraries(cross_node_kv_bench PRIVATE vkernels::vkernels)
+target_compile_features(cross_node_kv_bench PRIVATE cxx_std_17)
+vkernels_set_warnings(cross_node_kv_bench)
+
 # --- Host-only benchmark (no GPU needed): MXFP4 fused-MoE CPU oracle ---
 # The CPU reference (fused_moe_mxfp4_cpu) is the golden oracle the gfx942/
 # gfx90a HIP kernels are validated against (issue #41, acceptance criterion
@@ -92,6 +104,54 @@ if(VKERNELS_HAS_CUDA)
   target_link_libraries(kv_gather_bench PRIVATE vkernels::vkernels)
   target_compile_features(kv_gather_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(kv_gather_bench)
+
+  # Fused indexed K/V layer scatter (issue #1): the restore-side mirror of
+  # kv_gather. Scatters a contiguous per-layer scratch buffer into
+  # arbitrary, non-contiguous paged-KV destination slots; measures the
+  # single fused kernel vs the two-write PyTorch reference (two separate
+  # advanced-index scatter kernels, one per tensor) across 64..8192
+  # tokens, plus effective bandwidth and the one-launch-vs-two saving.
+  # Issue #1 acceptance: >= 10% faster at >= 2048 tokens, <= 2% slower
+  # below (or a documented dispatch threshold) -- judged on H100-class
+  # hardware. Single-GPU box reads/writes device 0.
+  add_executable(kv_scatter_bench kv_scatter_bench.cu)
+  target_link_libraries(kv_scatter_bench PRIVATE vkernels::vkernels)
+  target_compile_features(kv_scatter_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(kv_scatter_bench)
+
+  # Cross-node KV plan execute() (issue #49): measures the four C ABI plan
+  # paths (restore/donate x direct/host-bounce) over a same-device stand-in
+  # for imported remote VRAM and a cudaMallocHost stand-in for the host
+  # transport -- the kernel-level surface for the issue, just as
+  # bench_pipeline_boundary.cu is for #10. The C ABI symbols live in the
+  # separate vkernels_c shared boundary (see Testing.cmake), so link that
+  # instead of the static vkernels to avoid two copies of the CUDA kernels.
+  add_executable(cross_node_kv_cuda_bench bench_cross_node_kv_cuda.cu)
+  target_include_directories(cross_node_kv_cuda_bench PRIVATE ${CMAKE_SOURCE_DIR}/src/c)
+  target_link_libraries(cross_node_kv_cuda_bench PRIVATE vkernels::vkernels_c)
+  target_compile_features(cross_node_kv_cuda_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(cross_node_kv_cuda_bench)
+
+  # Cross-node KV transfer over REAL InfiniBand (issue #49 on-site step):
+  # the per-hop number bench_cross_node_kv_cuda.cu explicitly defers. A
+  # 2-rank NCCL send||recv (+ an allreduce collective) between two DISTINCT
+  # GPU nodes over IB, the transport vLLM/serving use -- vs the
+  # same-device stand-in above. Built only when NCCL is found
+  # (VKERNELS_HAS_NCCL). Standalone: uses NCCL + raw CUDA only (no
+  # vkernels headers), so link vkernels::nccl + the CUDA driver stub
+  # (for the optional --probe-vram cuMemExportToShareableHandle path).
+  if(VKERNELS_HAS_NCCL)
+    add_executable(cross_node_nccl_bench bench_cross_node_nccl.cu)
+    target_link_libraries(cross_node_nccl_bench PRIVATE vkernels::nccl)
+    # cuMemExportToShareableHandle (the optional --probe-vram path)
+    # lives in libcuda. CudaSupport.cmake's find_package(CUDAToolkit)
+    # exposes it as CUDA::cuda_driver; link that when available.
+    if(TARGET CUDA::cuda_driver)
+      target_link_libraries(cross_node_nccl_bench PRIVATE CUDA::cuda_driver)
+    endif()
+    target_compile_features(cross_node_nccl_bench PRIVATE cxx_std_17)
+    vkernels_set_warnings(cross_node_nccl_bench)
+  endif()
 
   # Graph-capturable PP-boundary transfer (issue #10). Measures the actual
   # NVLink peer copy the device path enqueues per decode iteration, and the
@@ -183,4 +243,26 @@ if(VKERNELS_HAS_HIP)
   target_link_libraries(kda_bench PRIVATE vkernels::vkernels)
   target_compile_features(kda_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(kda_bench)
+
+  # DeepseekSparseAttn sparse-MLA forward (issue #51).
+  add_executable(test_dsa_correct test_dsa_correct.hip)
+  target_link_libraries(test_dsa_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_dsa_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_dsa_correct)
+
+  add_executable(dsa_bench bench_dsa.hip)
+  target_link_libraries(dsa_bench PRIVATE vkernels::vkernels)
+  target_compile_features(dsa_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(dsa_bench)
+
+  # MHC multi-head hybrid-attention pre-norm (issue #51, part 2).
+  add_executable(test_mhc_correct test_mhc_correct.hip)
+  target_link_libraries(test_mhc_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_mhc_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_mhc_correct)
+
+  add_executable(mhc_bench bench_mhc.hip)
+  target_link_libraries(mhc_bench PRIVATE vkernels::vkernels)
+  target_compile_features(mhc_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(mhc_bench)
 endif()

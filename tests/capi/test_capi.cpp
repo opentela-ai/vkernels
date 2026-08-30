@@ -8,11 +8,13 @@
 // `vk_last_error`) is covered end to end.
 #include "minitest.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <vector>
 
 #include "vkernels/capi/capi.hpp"
@@ -754,6 +756,119 @@ TEST(CapiMla, NullArgsThrow) {
   EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
 }
 
+// --- DSA sparse-MLA forward (dsa.hpp, issue #51) -------------------------
+
+TEST(CapiDsa, HandCheckedTailDimZero) {
+  // GLM-5.3-Flash layout (tail_dim == 0). q=[1,1], 2 keys, sm_scale=1.
+  // Matches test_dsa.cpp::DsaFwd::HandCheckedTailDimZero: scores {1,1}
+  // -> base-2 weights {1,1}/2 -> out {0.5,0.5}, lse=2.
+  const float sm_scale = 1.0f;
+  std::vector<float> q = {1, 1};
+  std::vector<float> kv = {1, 0, 0, 1};
+  std::vector<int32_t> idx = {0, 1};
+  std::vector<float> out(2, -1.0f), lse(1, 7.0f);
+  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 0, 2, 1, 64, 1, sm_scale, /*lse=*/1,
+                              q.data(), kv.data(), idx.data(), out.data(),
+                              lse.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 0.5f, 1e-6f);
+  EXPECT_NEAR(out[1], 0.5f, 1e-6f);
+  EXPECT_NEAR(lse[0], 2.0f, 1e-6f);
+}
+
+TEST(CapiDsa, HandCheckedTailDimPositive) {
+  // DeepSeek-V3 layout (tail_dim > 0): dim=2 tail=1 d_v=1.
+  // Matches test_dsa.cpp::DsaFwd::HandCheckedTailDimPositive: scores {2,3}
+  // -> out = 4/1.5, lse = 3 + log2(1.5).
+  const float sm_scale = 1.0f;
+  std::vector<float> q = {1, 0, 0};            // main=[1,0] tail=[0]
+  std::vector<float> kv = {2, 1, 1, 3, 0, 1}; // 2 keys, dim+tail=3
+  std::vector<int32_t> idx = {0, 1};
+  std::vector<float> out(1, -1.0f), lse(1, 7.0f);
+  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 1, 2, 1, 64, 1, sm_scale, 1,
+                              q.data(), kv.data(), idx.data(), out.data(),
+                              lse.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 4.0f / 1.5f, 1e-6f);
+  EXPECT_NEAR(lse[0], 3.0f + std::log2(1.5f), 1e-6f);
+}
+
+TEST(CapiDsa, ConfigDecode) {
+  int bq = 0, threads = 0, bi = 0, ii = 0;
+  vk_dsa_config(1, 64, 256, 128, &bq, &threads, &bi, &ii);  // decode
+  EXPECT_GT(bq, 0);
+  EXPECT_GT(threads, 0);
+  EXPECT_GT(bi, 0);
+  EXPECT_GT(ii, 0);
+}
+
+TEST(CapiDsa, ConfigPrefill) {
+  int bq = 0, threads = 0, bi = 0, ii = 0;
+  vk_dsa_config(16, 64, 256, 128, &bq, &threads, &bi, &ii);  // prefill
+  EXPECT_GT(bq, 0);
+  EXPECT_GT(threads, 0);
+  EXPECT_GT(bi, 0);
+  EXPECT_GT(ii, 0);
+}
+
+TEST(CapiDsa, NullArgsThrow) {
+  std::vector<float> q(4, 1), kv(4, 1), out(2, 1);
+  std::vector<int32_t> idx(2, 0);
+  EXPECT_NE(vk_dsa_sparse_fwd(1, 1, 1, 2, 0, 2, 1, 64, 1, 1.0f, 0, nullptr,
+                              kv.data(), idx.data(), out.data(), nullptr),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+// --- MHC — multi-head hybrid-attention pre-norm (mhc.hpp, issue #51) ----
+
+TEST(CapiMhc, PreGemmSqrsumHandChecked) {
+  // hc_mult=2, hidden=2 -> hc_hidden_size=4, hc_mult3=8. fn is identity in
+  // the first 4 rows, zero after (hc_mult3 > hc_hidden_size). x=[1,2,3,4]
+  // -> out=[1,2,3,4,0,0,0,0], sqrsum=30. Mirrors test_mhc.cpp.
+  std::vector<float> x = {1, 2, 3, 4};
+  std::vector<float> fn(8 * 4, 0.0f);
+  for (int o = 0; o < 4; ++o) fn[o * 4 + o] = 1.0f;
+  std::vector<float> out(8, -1.0f), sqrsum(1, -1.0f);
+  EXPECT_EQ(vk_mhc_pre_gemm_sqrsum(1, 2, 2, x.data(), fn.data(), out.data(),
+                                   sqrsum.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 1.0f, 1e-6f); EXPECT_NEAR(out[1], 2.0f, 1e-6f);
+  EXPECT_NEAR(out[2], 3.0f, 1e-6f); EXPECT_NEAR(out[3], 4.0f, 1e-6f);
+  EXPECT_NEAR(out[4], 0.0f, 1e-6f); EXPECT_NEAR(out[5], 0.0f, 1e-6f);
+  EXPECT_NEAR(out[6], 0.0f, 1e-6f); EXPECT_NEAR(out[7], 0.0f, 1e-6f);
+  EXPECT_NEAR(sqrsum[0], 30.0f, 1e-6f);
+}
+
+TEST(CapiMhc, PostHandChecked) {
+  // hc=2, hidden=2. a = identity (2x2), b = [[1,2],[3,4]], c=[10,20],
+  // d=[1,1] -> out = [11,12,23,24]. Mirrors test_mhc.cpp.
+  std::vector<float> a = {1, 0, 0, 1};
+  std::vector<float> b = {1, 2, 3, 4};
+  std::vector<float> c = {10, 20};
+  std::vector<float> d = {1, 1};
+  std::vector<float> out(4, -1.0f);
+  EXPECT_EQ(vk_mhc_post(1, 2, 2, a.data(), b.data(), c.data(), d.data(),
+                        out.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 11.0f, 1e-6f); EXPECT_NEAR(out[1], 12.0f, 1e-6f);
+  EXPECT_NEAR(out[2], 23.0f, 1e-6f); EXPECT_NEAR(out[3], 24.0f, 1e-6f);
+}
+
+TEST(CapiMhc, NullArgsThrow) {
+  std::vector<float> x(4, 1), fn(8, 1), out(8, 1), sq(1, 1);
+  EXPECT_NE(vk_mhc_pre_gemm_sqrsum(1, 2, 2, nullptr, fn.data(), out.data(),
+                                   sq.data()),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+
+  std::vector<float> a(4, 1), b(4, 1), c(2, 1), dd(2, 1), oo(4, 1);
+  EXPECT_NE(vk_mhc_post(1, 2, 2, a.data(), b.data(), nullptr, dd.data(),
+                        oo.data()),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
 // --- KDA — Kimi Delta Attention (kda.hpp, issue #21) ----------------------
 
 TEST(CapiKda, LayerNormGatedIdentityWeightUnitGate) {
@@ -796,50 +911,58 @@ TEST(CapiKda, GateChunkCumsum) {
 }
 
 TEST(CapiKda, NaiveDeltaRuleFwd) {
-  // Simple case: B=1 H=1 S=2 D=2, q=k=v=ones, g=0.5, beta=0.5
+  // K3 per-key-dim gated delta rule (issue #45). B=1 H=1 S=2 D=2,
+  // q=k=v=ones, g=[0.5,0.5] per token (per-key-dim [B,H,S,D]), beta=0.5.
+  //   t=0: S'=0 -> a=0 -> S0=0.5*v0*k0^T=0.5*[[1,1],[1,1]], o0=[1,1]
+  //   t=1: S'=g1.*S0=0.25*[[1,1],[1,1]], a=S'*.k1=[0.5,0.5],
+  //        S1=S'+0.5*(1-0.5)*k1^T=[[0.5,0.5],[0.5,0.5]], o1=[1,1]
   constexpr int B = 1, H = 1, S = 2, D = 2;
   std::vector<float> q(B * H * S * D, 1.0f), k(B * H * S * D, 1.0f),
-      v(B * H * S * D, 1.0f), g(B * H * S, 0.5f), beta(B * H * S, 0.5f),
+      v(B * H * S * D, 1.0f), g(B * H * S * D, 0.5f), beta(B * H * S, 0.5f),
       out(B * H * S * D, 0.0f);
   EXPECT_EQ(vk_kda_naive_delta_rule_fwd(q.data(), k.data(), v.data(),
                                           g.data(), beta.data(), out.data(),
                                           B, H, S, D),
             VK_OK);
-  // First token: state = g0 * v0 * k0^T = 0.5 * [[1,1],[1,1]]
-  // o0 = state * q0 = 0.5 * [2, 2] = [1, 1]
-  EXPECT_NEAR(out[0], 1.0f, 1e-5f);
-  EXPECT_NEAR(out[1], 1.0f, 1e-5f);
-  EXPECT_FALSE(std::isnan(out[2]));
-  EXPECT_FALSE(std::isnan(out[3]));
+  for (int i = 0; i < B * H * S * D; ++i) EXPECT_NEAR(out[i], 1.0f, 1e-5f);
 }
 
 TEST(CapiKda, DeltaRuleFwdMatchesNaive) {
-  // Cross-check chunked forward against the naive oracle
+  // Cross-check the chunked forward (vk_kda_delta_rule_fwd, the STANDARD
+  // gated delta rule with a SCALAR forget gate [B,H,S]) against the naive
+  // oracle (vk_kda_naive_delta_rule_fwd, the K3 PER-KEY-DIM gated delta
+  // rule [B,H,S,D]). Issue #45 split the two recurrences: the naive
+  // predicts from the POST-gate state, the chunked from the PRE-gate
+  // state, so they differ at arbitrary gates. They agree only at
+  // g == 1 -- full history, no forgetting -- where the gate is the
+  // identity in both and post-gate == pre-gate. (Before #45 the naive
+  // oracle also implemented the standard rule and was cross-checked at
+  // random gates; that now requires the per-key-dim g to be sized
+  // [B,H,S,D], else the naive read runs out of bounds.)
   constexpr int B = 1, H = 1, S = 8, D = 4, chunk = 4;
-  std::vector<float> q(B * H * S * D), k(B * H * S * D), v(B * H * S * D),
-      g(B * H * S), beta(B * H * S);
-  for (int i = 0; i < B * H * S * D; ++i) {
-    q[i] = 0.1f * static_cast<float>((i * 7 + 1) % 17);
-    k[i] = 0.1f * static_cast<float>((i * 5 + 3) % 13);
-    v[i] = 0.1f * static_cast<float>((i * 3 + 7) % 11);
-  }
-  for (int i = 0; i < B * H * S; ++i) {
-    g[i] = 0.3f + 0.5f * static_cast<float>((i + 1) % 10) / 10.0f;
-    beta[i] = 0.3f + 0.4f * static_cast<float>((i + 2) % 7) / 7.0f;
-  }
+  std::mt19937 rng(7);
+  auto rf = [&]() { return static_cast<float>(rng() % 2000) / 1000.0f - 1.0f; };
+  std::vector<float> q(B * H * S * D), k(q.size()), v(q.size());
+  std::vector<float> g_naive(B * H * S * D, 1.0f);  // per-key-dim, no forget
+  std::vector<float> g_chunk(B * H * S, 1.0f);      // scalar, no forget
+  std::vector<float> beta(B * H * S);
+  for (auto& x : q) x = rf();
+  for (auto& x : k) x = rf();
+  for (auto& x : v) x = rf();
+  for (auto& x : beta) x = 0.3f + 0.7f * (rng() % 1000) / 1000.0f;
   std::vector<float> out_naive(B * H * S * D, 0), out_chunk(B * H * S * D, 0);
   EXPECT_EQ(vk_kda_naive_delta_rule_fwd(q.data(), k.data(), v.data(),
-                                          g.data(), beta.data(),
+                                          g_naive.data(), beta.data(),
                                           out_naive.data(), B, H, S, D),
             VK_OK);
-  EXPECT_EQ(vk_kda_delta_rule_fwd(q.data(), k.data(), v.data(), g.data(),
-                                   beta.data(), out_chunk.data(), B, H, S,
-                                   D, chunk),
+  EXPECT_EQ(vk_kda_delta_rule_fwd(q.data(), k.data(), v.data(),
+                                   g_chunk.data(), beta.data(),
+                                   out_chunk.data(), B, H, S, D, chunk),
             VK_OK);
   float max_abs = 0;
   for (int i = 0; i < B * H * S * D; ++i)
     max_abs = std::max(max_abs, std::fabs(out_naive[i] - out_chunk[i]));
-  EXPECT_LT(max_abs, 1e-4f);
+  EXPECT_LT(max_abs, 1e-3f);
 }
 
 TEST(CapiKda, DeltaRuleIntraInterOutput) {

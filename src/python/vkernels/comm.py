@@ -58,6 +58,7 @@ __all__ = [
     "p2p_gather_runs_2d",
     "memcpy_peer_batch_async",
     "kv_gather_layer",
+    "kv_scatter_layer",
 ]
 
 
@@ -572,3 +573,60 @@ def kv_gather_layer(k_src, v_src, slot_ids, dst, *, stream=None) -> None:
         _impl.kv_gather_layer(k_src, v_src, slot_ids, dst, impl_stream)
     else:
         _impl.kv_gather_layer(k_src, v_src, slot_ids, dst, stream=impl_stream)
+
+
+def kv_scatter_layer(k_dst, v_dst, slot_ids, src, *, stream=None) -> None:
+    """Fused indexed K/V scatter for one layer (issue #1).
+
+    Reads a contiguous ``[num_pages, page_size, 2, num_kv_heads, head_dim]``
+    ``src`` and writes K and V into the indexed destination slots of
+    ``k_dst`` / ``v_dst``, exactly:
+
+        k_dst[slot_ids] = src[:, :, 0]
+        v_dst[slot_ids] = src[:, :, 1]
+
+    This fuses the two separate advanced-index writes the KVAAS
+    ``scatter_layer`` path performs today into a single operation, the
+    reverse of :func:`kv_gather_layer` (issue #2) and the building block of
+    the peer-KV restore paths.
+
+    Args:
+        k_dst, v_dst: ``[num_slots, num_kv_heads, head_dim]`` C-contiguous
+            writable arrays with ``itemsize == 2``. BF16 is passed as a
+            ``uint16`` view (numpy has no native BF16); FP16 as
+            ``np.float16``. The scatter is a raw-byte copy, so the bit
+            pattern is preserved exactly for both dtypes.
+        slot_ids: ``[num_pages, page_size]`` C-contiguous ``int32`` or
+            ``int64`` array of UNIQUE destination slots in ``[0, num_slots)``.
+            Slots may be in any order (non-monotonic) but must NOT repeat
+            (scatter writes disjoint destinations, unlike the gather's
+            repeatable sources).
+        src: ``[num_pages, page_size, 2, num_kv_heads, head_dim]``
+            C-contiguous array of the same dtype as ``k_dst``/``v_dst``.
+            Non-default strides are rejected explicitly (a silent copy would
+            read from a throwaway buffer).
+        stream: optional :class:`~vkernels.core.Stream`. When omitted the
+            scatter runs to completion before returning; otherwise it is
+            enqueued as a single task and the call returns immediately (no
+            device-wide synchronization).
+
+    Raises:
+        TypeError: if any array has the wrong dtype.
+        ValueError: if shapes/strides are inconsistent, ``slot_ids`` is out
+            of range or non-unique, or ``k_dst``/``v_dst`` is not writable.
+
+    Example:
+        >>> import numpy as np
+        >>> k = np.zeros((4, 1, 4), dtype=np.float16)
+        >>> v = np.zeros((4, 1, 4), dtype=np.float16)
+        >>> slot_ids = np.array([[3, 1]], dtype=np.int32)  # unique, non-monotonic
+        >>> src = np.arange(2*2*4, dtype=np.float16).reshape(1, 2, 2, 1, 4)
+        >>> kv_scatter_layer(k, v, slot_ids, src)
+        >>> k[3].tolist(), k[1].tolist()
+        ([0.0, 1.0, 2.0, 3.0], [8.0, 9.0, 10.0, 11.0])
+    """
+    impl_stream = _impl_stream(stream)
+    if _COMPILED:
+        _impl.kv_scatter_layer(k_dst, v_dst, slot_ids, src, impl_stream)
+    else:
+        _impl.kv_scatter_layer(k_dst, v_dst, slot_ids, src, stream=impl_stream)

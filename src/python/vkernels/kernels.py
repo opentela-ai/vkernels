@@ -1010,6 +1010,280 @@ def mla_config(S_q, kv_lora_rank, qk_rope_head_dim):
 
 
 # ---------------------------------------------------------------------------
+# DSA: DeepseekSparseAttn sparse-MLA forward (issue #51)
+# ---------------------------------------------------------------------------
+
+
+# log2(e): the DSA softmax scale folds this so the weights are the standard
+# natural-exp softmax expressed in base-2 (FlashAttention's log2 trick).
+_LOG2E = float(np.log2(np.e))
+
+
+def dsa_sparse_fwd(q, kv, indices, *, dim, tail_dim, topk=None,
+                   kv_group=1, block_I=64, inner_iter=1, sm_scale=None,
+                   return_lse=False, out=None, lse=None):
+    """DeepseekSparseAttn sparse-MLA forward (GLM-5.3-Flash / DeepSeek-V3),
+    fp32 two-pass BASE-2 stable softmax over the ``topk`` indexer-selected
+    keys. This is the CPU reference the gfx942 HIP kernel is checked
+    against; the device ABI is bf16 (the integrator converts).
+
+    The indexer has already selected, per query token, the ``topk`` most
+    relevant KV tiles (``indices``); this kernel scores each query against
+    those keys and produces the combined attention output.
+
+    * ``q``       : ``(1, S_q,  H,  dim + tail_dim)`` float32 —
+                   ``[q_main (dim) | q_tail (tail_dim)]`` (tail may be 0).
+    * ``kv``      : ``(1, S_kv, kv_group, dim + tail_dim)`` float32 (kv_group==1)
+                   ``kv[j] = [v (d_v) | k_nope_extra (tail_dim) | k_rope (tail_dim)]``
+                   so ``v = kv[j][0:d_v]``, ``k_main = kv[j][0:dim]``,
+                   ``k_tail = kv[j][dim:dim+tail_dim]``, with ``d_v = dim - tail_dim``.
+    * ``indices`` : ``(1, S_q, kv_group, topk)`` int32 — selected key ids;
+                   entries ``< 0`` or ``>= S_kv`` are masked kpool tails.
+    * ``out``     : ``(1, S_q, H, d_v)`` float32 (combined).
+    * ``lse``     : ``(1, S_q, H)`` float32 (base-2 log-sum-exp; optional).
+
+    ``dim`` and ``tail_dim`` are passed explicitly (they are not separately
+    recoverable from ``W = dim + tail_dim``). ``d_v = dim - tail_dim`` must be
+    positive. ``sm_scale`` defaults to ``(1/sqrt(dim + tail_dim)) * log2(e)``
+    (the base-2 fold); ``tail_dim == 0`` skips the rope-tail dot entirely —
+    the exact case the tilelang code path cannot compile.
+
+    Args:
+        q: float32 ``(1, S_q, H, dim + tail_dim)`` queries.
+        kv: float32 ``(1, S_kv, kv_group, dim + tail_dim)`` keys/values.
+        indices: int32 ``(1, S_q, kv_group, topk)`` selected key ids.
+        dim: the main key/query width (``qk_nope_head_dim + qk_rope_head_dim``
+            in the absorbed form).
+        tail_dim: the decoupled RoPE tail width (may be 0).
+        topk: number of selected keys per query. Inferred from ``indices``
+            when omitted.
+        kv_group: number of key/value heads (must be 1).
+        block_I, inner_iter: kernel group-tiling configuration (the indexer
+            pads ``topk`` to a multiple of ``block_I`` in the sglang layout).
+        sm_scale: softmax pre-scale (folds ``log2(e)``); defaults to
+            ``(1/sqrt(dim + tail_dim)) * log2(e)``.
+        return_lse: when True, also compute the base-2 log-sum-exp.
+        out: optional writable float32 ``(1, S_q, H, d_v)`` buffer.
+        lse: optional writable float32 ``(1, S_q, H)`` buffer (required
+            only when ``return_lse=True``).
+
+    Returns:
+        ``out`` when ``return_lse=False``, otherwise ``(out, lse)``.
+
+    Raises:
+        ValueError: on inconsistent shapes, ``d_v <= 0``, or ``kv_group != 1``.
+    """
+    q_arr = _as_input(q, "q")
+    kv_arr = _as_input(kv, "kv")
+    idx_arr = np.ascontiguousarray(indices, dtype=np.int32)
+    if idx_arr.dtype != np.int32:
+        raise TypeError("indices must be an integer array")
+    if q_arr.ndim != 4:
+        raise ValueError("q must be 4-D [1, S_q, H, dim + tail_dim]")
+    if kv_arr.ndim != 4:
+        raise ValueError("kv must be 4-D [1, S_kv, kv_group, dim + tail_dim]")
+    if idx_arr.ndim != 4:
+        raise ValueError("indices must be 4-D [1, S_q, kv_group, topk]")
+    B, S_q, H, W = (int(v) for v in q_arr.shape)
+    Bk, S_kv, kvg, W2 = (int(v) for v in kv_arr.shape)
+    Bi, S_q2, kvg2, tk = (int(v) for v in idx_arr.shape)
+    if B != 1:
+        raise ValueError(f"DSA forward is batch-1 (got B={B})")
+    if not (dim > 0 and tail_dim >= 0):
+        raise ValueError("dim must be > 0 and tail_dim >= 0")
+    d_v = dim - tail_dim
+    if d_v <= 0:
+        raise ValueError(f"dim - tail_dim must be > 0 (got d_v={d_v})")
+    if W != dim + tail_dim or W2 != dim + tail_dim:
+        raise ValueError(
+            f"q/kv last dim {W}/{W2} != dim + tail_dim = {dim + tail_dim}"
+        )
+    if kvg != kv_group or kvg2 != kv_group:
+        raise ValueError(f"kv_group mismatch: kv={kvg} indices={kvg2} arg={kv_group}")
+    if kv_group != 1:
+        raise ValueError("kv_group must be 1 (a single shared head_kv)")
+    if S_q != S_q2:
+        raise ValueError(f"S_q mismatch: q={S_q} indices={S_q2}")
+    if topk is None:
+        topk = tk
+    elif int(topk) != tk:
+        raise ValueError(f"topk mismatch: arg={topk} indices={tk}")
+    if block_I <= 0 or inner_iter <= 0:
+        raise ValueError("block_I and inner_iter must be positive")
+    if sm_scale is None:
+        sm_scale = (1.0 / float(np.sqrt(float(dim + tail_dim)))) * _LOG2E
+
+    out_arr = _as_out(S_q * H * d_v, out, "out")
+    if return_lse:
+        lse_arr = _as_out(S_q * H, lse, "lse")
+    else:
+        lse_arr = np.empty(0, dtype=_F32)  # placeholder (never written)
+    _impl.dsa_sparse_fwd(
+        int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
+        int(kv_group), int(block_I), int(inner_iter), float(np.float32(sm_scale)),
+        bool(return_lse), q_arr, kv_arr, idx_arr, out_arr, lse_arr,
+    )
+    out_arr = out_arr.reshape(1, S_q, H, d_v)
+    if return_lse:
+        return out_arr, lse_arr.reshape(1, S_q, H)
+    return out_arr
+
+
+def dsa_config(S_q, H, dim, topk):
+    """Per-shape ``(bq, threads, block_I, inner_iter)`` tile selector for
+    the HIP DSA kernel.
+
+    Decode (``S_q <= 8``) selects ``(1, 64, 64, inner_iter)`` (one query row
+    per block, one wavefront); prefill (``S_q >= 9``) selects
+    ``(4, 256, 64, inner_iter)``. ``inner_iter`` grows while ``topk`` stays
+    divisible by ``block_I * inner_iter`` (so the group tiling aligns with
+    the indexer's padded-`topk` layout).
+
+    Returns:
+        The ``(bq, threads, block_I, inner_iter)`` tuple (all ``int``).
+    """
+    return tuple(
+        int(v)
+        for v in _impl.dsa_config(int(S_q), int(H), int(dim), int(topk))
+    )
+
+
+# ---------------------------------------------------------------------------
+# MHC: multi-head hybrid-attention pre-norm (issue #51, part 2)
+# ---------------------------------------------------------------------------
+
+
+def mhc_pre_gemm_sqrsum(x, fn, *, hc_mult, hidden_size, out=None,
+                        sqrsum=None):
+    """MHC pre-norm GEMM + squared-sum (GLM-5.3-Flash), fp32 CPU reference.
+
+    Computes, per token ``n`` over ``hc_hidden_size = hc_mult * hidden_size``
+    hidden units,
+
+    * ``out[n, o]     = sum_h x[n, h] * fn[o, h]``  for ``o`` in
+      ``[0, hc_mult3)``  with ``hc_mult3 = hc_mult * (2 + hc_mult)``, and
+    * ``sqrsum[n]     = sum_h x[n, h] ** 2``.
+
+    This is the first half of the tilelang
+    ``mhc_pre_gemm_sqrsum_splitk_kernel`` (a GEMM against the MHC reshape
+    weight plus the per-token squared-sum fed to the RMS-norm); the HIP
+    device path (``vk_hip_mhc_pre_gemm_sqrsum``) is bf16 and is checked
+    against this fp32 reference.
+
+    Args:
+        x: float32 ``(num_tokens, hc_mult * hidden_size)`` activations.
+        fn: float32 ``(hc_mult * (2 + hc_mult), hc_mult * hidden_size)``
+            reshape weights (the `hc_mult3` per-token output channels).
+        hc_mult: MHC head-count multiplier (``hc = hc_mult``).
+        hidden_size: per-head hidden width (``hc_hidden_size = hc_mult *
+            hidden_size``).
+        out: optional writable float32 ``(num_tokens, hc_mult3)`` buffer.
+        sqrsum: optional writable float32 ``(num_tokens,)`` buffer.
+
+    Returns:
+        ``(out, sqrsum)`` reshaped to ``(num_tokens, hc_mult3)`` and
+        ``(num_tokens,)``.
+
+    Raises:
+        ValueError: on inconsistent shapes or ``hc_mult/hidden_size <= 0``.
+    """
+    if hc_mult <= 0:
+        raise ValueError(f"hc_mult must be > 0 (got {hc_mult})")
+    if hidden_size <= 0:
+        raise ValueError(f"hidden_size must be > 0 (got {hidden_size})")
+    hc_hidden_size = int(hc_mult) * int(hidden_size)
+    hc_mult3 = int(hc_mult) * (2 + int(hc_mult))
+    x_arr = _as_input(x, "x")
+    fn_arr = _as_input(fn, "fn")
+    if x_arr.size % hc_hidden_size != 0:
+        raise ValueError(
+            f"x has {x_arr.size} elements, not a multiple of "
+            f"hc_mult*hidden_size = {hc_hidden_size}"
+        )
+    num_tokens = x_arr.size // hc_hidden_size
+    if fn_arr.size != hc_mult3 * hc_hidden_size:
+        raise ValueError(
+            f"fn has {fn_arr.size} elements, expected "
+            f"hc_mult3*hc_hidden_size = {hc_mult3}*{hc_hidden_size} = "
+            f"{hc_mult3 * hc_hidden_size}"
+        )
+    out_arr = _as_out(num_tokens * hc_mult3, out, "out")
+    sqrsum_arr = _as_out(num_tokens, sqrsum, "sqrsum")
+    _impl.mhc_pre_gemm_sqrsum(
+        int(num_tokens), int(hc_mult), int(hidden_size),
+        x_arr, fn_arr, out_arr, sqrsum_arr,
+    )
+    return out_arr.reshape(num_tokens, hc_mult3), sqrsum_arr.reshape(num_tokens)
+
+
+def mhc_post(a, b, c, d, *, hc, hidden, out=None):
+    """MHC post-attention combine (GLM-5.3-Flash), fp32 CPU reference.
+
+    Computes, per token ``n`` and output head ``j`` over hidden dim
+    ``hidden``,
+
+    .. code-block::
+
+        out[n, j, h] = c[n, j] * d[n, h] + sum_k a[n, k, j] * b[n, k, h]
+
+    where ``a`` is the (post-attention) ``comb_res_mix`` mixing matrix
+    ``(num_tokens, hc, hc)``, ``b`` the residual `(num_tokens, hc,
+    hidden)` (the ``x`` going into the next sub-layer), ``c`` the scalar
+    ``post_layer_mix`` gate `(num_tokens, hc)`, and ``d`` the bypassed
+    ``x` `(num_tokens, hidden)``. The HIP device path
+    (``vk_hip_mhc_post``) is bf16 (``b``/``d`` in, ``out`` out) and is
+    checked against this fp32 reference.
+
+    Args:
+        a: float32 `(num_tokens, hc, hc)`` mixing matrix (flat).
+        b: float32 `(num_tokens, hc, hidden)`` residual (flat).
+        c: float32 `(num_tokens, hc)`` per-head scalar gate (flat).
+        d: float32 `(num_tokens, hidden)`` bypass input (flat).
+        hc: number of MHC heads (the matrix head dimension).
+        hidden: per-head hidden width.
+        out: optional writable float32 `(num_tokens, hc, hidden)`` buffer.
+
+    Returns:
+        The output array reshaped to `(num_tokens, hc, hidden)``.
+
+    Raises:
+        ValueError: on inconsistent shapes or ``hc/hidden <= 0``.
+    """
+    if hc <= 0:
+        raise ValueError(f"hc must be > 0 (got {hc})")
+    if hidden <= 0:
+        raise ValueError(f"hidden must be > 0 (got {hidden})")
+    a_arr = _as_input(a, "a")
+    b_arr = _as_input(b, "b")
+    c_arr = _as_input(c, "c")
+    d_arr = _as_input(d, "d")
+    if a_arr.size % (hc * hc) != 0:
+        raise ValueError(
+            f"a has {a_arr.size} elements, not a multiple of hc*hc = {hc * hc}"
+        )
+    num_tokens = a_arr.size // (hc * hc)
+    if b_arr.size != num_tokens * hc * hidden:
+        raise ValueError(
+            f"b has {b_arr.size} elements, expected "
+            f"{num_tokens}*{hc}*{hidden} = {num_tokens * hc * hidden}"
+        )
+    if c_arr.size != num_tokens * hc:
+        raise ValueError(
+            f"c has {c_arr.size} elements, expected {num_tokens * hc}"
+        )
+    if d_arr.size != num_tokens * hidden:
+        raise ValueError(
+            f"d has {d_arr.size} elements, expected {num_tokens * hidden}"
+        )
+    out_arr = _as_out(num_tokens * hc * hidden, out, "out")
+    _impl.mhc_post(
+        int(num_tokens), int(hc), int(hidden),
+        a_arr, b_arr, c_arr, d_arr, out_arr,
+    )
+    return out_arr.reshape(num_tokens, hc, hidden)
+
+
+# ---------------------------------------------------------------------------
 # KDA: Kimi Delta Attention (issue #21)
 # ---------------------------------------------------------------------------
 

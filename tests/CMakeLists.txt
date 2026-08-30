@@ -16,6 +16,8 @@ vkernels_add_test(NAME reduce      SOURCES kernels/reduce/test_reduce.cpp)
 vkernels_add_test(NAME gemm        SOURCES kernels/gemm/test_gemm.cpp)
 vkernels_add_test(NAME gemm_bf16   SOURCES kernels/gemm/test_gemm_bf16.cpp)
 vkernels_add_test(NAME mla         SOURCES kernels/attn/test_mla.cpp)
+vkernels_add_test(NAME dsa         SOURCES kernels/attn/test_dsa.cpp)
+vkernels_add_test(NAME mhc         SOURCES kernels/attn/test_mhc.cpp)
 vkernels_add_test(NAME kda         SOURCES kernels/attn/test_kda.cpp)
 vkernels_add_test(NAME moe         SOURCES kernels/moe/test_moe.cpp)
 vkernels_add_test(NAME moe_fused   SOURCES kernels/moe/test_moe_fused.cpp)
@@ -31,9 +33,18 @@ vkernels_add_test(NAME p2p_gather SOURCES comm/test_p2p_gather.cpp)
 vkernels_add_test(NAME p2p_kv_restore SOURCES comm/test_p2p_kv_restore.cpp)
 vkernels_add_test(NAME p2p_kv_donate SOURCES comm/test_p2p_kv_donate.cpp)
 vkernels_add_test(NAME kv_gather SOURCES comm/test_kv_gather.cpp)
+vkernels_add_test(NAME kv_scatter SOURCES comm/test_kv_scatter.cpp)
 vkernels_add_test(NAME pipeline_boundary SOURCES comm/test_pipeline_boundary.cpp)
+vkernels_add_test(NAME cross_node_kv SOURCES comm/test_cross_node_kv.cpp)
 vkernels_add_test(NAME pipeline_boundary_c SOURCES comm/test_pipeline_boundary_c.cpp)
+vkernels_add_test(NAME fabric_import_c SOURCES comm/test_fabric_import_c.cpp)
 vkernels_add_test(NAME capi         SOURCES capi/test_capi.cpp)
+vkernels_add_test(
+  NAME serving_c
+  SOURCES capi/test_serving_c.cpp
+          ${CMAKE_SOURCE_DIR}/src/c/vkernels/capi/serving_c.cpp
+  INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
+  NO_VKERNELS_LIB)
 
 # The `extern "C"` ABI is CUDA-only (the entry points take a raw
 # cudaStream_t); its runtime test is a .cu compiled when a toolkit is
@@ -52,8 +63,21 @@ if(VKERNELS_HAS_CUDA)
   vkernels_add_test(NAME kv_gather_c SOURCES comm/test_kv_gather_c.cu
                     INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
                     LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
+  vkernels_add_test(NAME kv_scatter_c SOURCES comm/test_kv_scatter_c.cu
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
+                    LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
   vkernels_add_test(NAME pipeline_boundary_cuda_c
                     SOURCES comm/test_pipeline_boundary_cuda_c.cu
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
+                    LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
+  vkernels_add_test(NAME fabric_import_cuda_c SOURCES comm/test_fabric_import_cuda_c.cu
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
+                    LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
+  vkernels_add_test(NAME cross_node_kv_c SOURCES comm/test_cross_node_kv_c.cu
+                    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
+                    LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
+  vkernels_add_test(NAME cross_node_kv_allgather_c
+                    SOURCES comm/test_cross_node_kv_allgather_c.cu
                     INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
                     LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
 endif()

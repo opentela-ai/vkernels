@@ -38,6 +38,14 @@ typedef enum {
 // Fused peer-to-indexed-KV restore for one layer. See p2p_kv_restore.hpp
 // for the full contract.
 //
+// `slot_ids` may be a host or a CUDA device pointer (UVA): the one-shot
+// validates non-negative, unique slots on the host each call via a
+// synchronous cudaMemcpy (cudaMemcpyDefault). Callers that want zero
+// validation on the hot path (or device slot_ids that stay resident)
+// should use vkernels_p2p_kv_restore_plan_create / _create_device_slots,
+// which validate ONCE at create (or skip slot validation entirely for the
+// device-slot variants) and enqueue a single kernel per execute().
+//
 // Returns VKERNELS_OK on success. On contract violation (null pointers,
 // zero dimensions, non-unique slots) returns VKERNELS_ERR_INVALID_ARGUMENT.
 // On device allocation or launch failure returns VKERNELS_ERR_INTERNAL.

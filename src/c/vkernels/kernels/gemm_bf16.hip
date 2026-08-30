@@ -39,7 +39,7 @@
 
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
-#  include "vkernels/kernels/moe_device.hip"  // f32bits_to_bf16
+#  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 
 namespace vkernels::kernels::hip {
 
@@ -49,20 +49,6 @@ typedef short v4s __attribute__((ext_vector_type(4)));
 static constexpr int kMfmaK = 16;   // one bf16 MFMA reduces K=16
 static constexpr int BK     = 64;   // K-tile (fixed); every K3 K is a multiple of 64
 
-// bf16 -> float (top 16 bits of fp32, low 17 mantissa bits zero).
-__device__ __forceinline__ float bf16_to_f32(uint16_t b) {
-  float f;
-  uint32_t u = static_cast<uint32_t>(b) << 16;
-  __builtin_memcpy(&f, &u, sizeof(f));
-  return f;
-}
-// float -> bf16 (RNE, identical to f32bits_to_bf16 in moe_device.hip and to
-// the host oracle in gemm_bf16.cpp).
-__device__ __forceinline__ uint16_t f2bf(float v) {
-  uint32_t b;
-  __builtin_memcpy(&b, &v, sizeof(float));
-  return f32bits_to_bf16(b);
-}
 
 // ======================================================================
 //  Tiled bf16 MFMA GEMM kernel

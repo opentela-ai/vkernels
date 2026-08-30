@@ -29,6 +29,10 @@ ROOT = discovery.find_repo_root(_SRC / "vkernels")
 # Exact contract for the kernels/ headers (files sorted alphabetically,
 # declarations in file order): name -> category.
 EXPECTED_KERNELS = [
+    ("dsa_sparse_fwd_cpu", "dsa"),
+    ("dsa_config_for", "dsa"),
+    ("dsa_sparse_fwd", "dsa"),
+    ("dsa_sparse_fwd_with_tile", "dsa"),
     ("add", "elementwise"),
     ("scale", "elementwise"),
     ("relu", "elementwise"),
@@ -49,6 +53,10 @@ EXPECTED_KERNELS = [
     ("kda_delta_rule_fwd", "kda"),
     ("kda_delta_rule_fwd_with_scratch", "kda"),
     ("kda_pack_bitmatrix", "kda"),
+    ("mhc_pre_gemm_sqrsum_cpu", "mhc"),
+    ("mhc_post_cpu", "mhc"),
+    ("mhc_pre_gemm_sqrsum", "mhc"),
+    ("mhc_post", "mhc"),
     ("mla_fwd_cpu", "mla"),
     ("mla_config_for", "mla"),
     ("mla_fwd", "mla"),
@@ -87,7 +95,36 @@ EXPECTED_COMM = [
     ("BlockingQueue", "class"),
     ("MockChannel", "class"),
     ("make_ring_channels", "function"),
+    # --- cross-node KV transfer plans + fabric import (issue #49) ---
+    # cross_node_kv.hpp: the byte channel the host-bounce path runs over
+    # (discovery scans *.hpp in comm/ sorted by filename, so this block
+    # lands between channel.hpp and overlap.hpp).
+    ("ByteBlockingQueue", "class"),
+    ("ByteChannel", "class"),
+    ("MockByteChannel", "class"),
+    ("make_byte_link", "function"),
+    # cross_node_kv.hpp (issue #49, all-gather + access-pattern routing):
+    # the access pattern + route selection are declared ABOVE the
+    # restore/donate plans in the header, so discovery reports them first.
+    ("CrossNodeKvAccess", "struct"),
+    ("CrossNodeKvRoute", "struct"),
+    ("select_cross_node_kv_route", "function"),
+    ("CrossNodeKvRestorePlan", "class"),
+    ("CrossNodeKvDonatePlan", "class"),
+    # fabric_import.hpp: the transport classification + FabricHandle /
+    # FabricImport + the per-hop cost model.
+    ("fabric_import_transport_name", "function"),
+    ("FabricImportConfig", "struct"),
+    ("classify_fabric_import", "function"),
+    ("is_import_graph_capturable", "function"),
+    ("eager_break_fabric_import", "function"),
+    ("FabricHandle", "class"),
+    ("FabricImport", "class"),
+    ("CrossNodeHopCost", "struct"),
+    ("cross_node_kv_throughput", "function"),
+    ("same_node_fabric_roof_gbps", "function"),
     ("kv_gather_layer", "function"),
+    ("kv_scatter_layer", "function"),
     ("OverlapExecutor", "class"),
     ("p2p_gather_runs", "function"),
     ("Gather2DRun", "struct"),
@@ -157,6 +194,16 @@ EXPECTED_COMM = [
     ("make_rccl_ring_channels", "function"),
     ("HipStream", "class"),
     ("RcclAllreducePlanHip", "class"),
+    # --- shared slot-map validators + byte accounting (issue #49) ---
+    # slot_map.hpp (lifted in 181d9f9 to dedup the restore/donate/all-gather
+    # plan contracts) sorts after rccl_hip.hpp and before topology.hpp, so
+    # its six inline helpers land here.
+    ("per_slot_bytes", "function"),
+    ("token_stride_bytes", "function"),
+    ("checked_mul", "function"),
+    ("validate_kv_plan_shape", "function"),
+    ("validate_unique_slots", "function"),
+    ("validate_slot_bounds", "function"),
     ("Topology", "struct"),
     ("ring_rank", "function"),
     ("build_ring_topology", "function"),

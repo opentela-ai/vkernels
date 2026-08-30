@@ -39,6 +39,7 @@
 #include "vkernels/comm/overlap.hpp"
 #include "vkernels/comm/p2p_gather.hpp"
 #include "vkernels/comm/kv_gather.hpp"
+#include "vkernels/comm/kv_scatter.hpp"
 #include "vkernels/comm/topology.hpp"
 #include "vkernels/core/device.hpp"
 #include "vkernels/core/stream.hpp"
@@ -47,6 +48,8 @@
 #include "vkernels/kernels/gemm_bf16.hpp"
 #include "vkernels/kernels/kda.hpp"
 #include "vkernels/kernels/mla.hpp"
+#include "vkernels/kernels/dsa.hpp"
+#include "vkernels/kernels/mhc.hpp"
 #include "vkernels/kernels/moe.hpp"
 #include "vkernels/kernels/moe_aux.hpp"
 #include "vkernels/kernels/moe_fused.hpp"
@@ -484,6 +487,94 @@ PYBIND11_MODULE(_core, m) {
       "Per-shape (bq, bn_kv, threads) tile selector for the HIP MLA kernel: "
       "decode (S_q <= 8) -> (1, 64, 64); prefill -> (4, 64, 256).");
 
+  // --- DSA: DeepseekSparseAttn sparse-MLA forward (issue #51) -------------
+  //
+  // GLM-5.3-Flash (tail_dim == 0) and DeepSeek-V3 (tail_dim > 0) sparse-MLA
+  // forward, CPU reference (always compiled). bf16 is the device ABI; the
+  // host reference is fp32 end-to-end (the integrator converts).
+  kernels.def(
+      "dsa_sparse_fwd",
+      [](int S_q, int S_kv, int H, int dim, int tail_dim, int topk,
+         int kv_group, int block_I, int inner_iter, float sm_scale,
+         bool return_lse, FloatArray q, FloatArray kv, I32Array indices,
+         FloatArray out, FloatArray lse) {
+        require_writeable(out);
+        if (return_lse) require_writeable(lse);
+        kernels::dsa_sparse_fwd_cpu(
+            S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+            sm_scale, return_lse, q.data(), kv.data(), indices.data(),
+            out.mutable_data(), return_lse ? lse.mutable_data() : nullptr);
+        return out;
+      },
+      py::arg("S_q"), py::arg("S_kv"), py::arg("H"), py::arg("dim"),
+      py::arg("tail_dim"), py::arg("topk"), py::arg("kv_group"),
+      py::arg("block_I"), py::arg("inner_iter"), py::arg("sm_scale"),
+      py::arg("return_lse"), py::arg("q"), py::arg("kv"),
+      py::arg("indices"), py::arg("out"), py::arg("lse"),
+      "DeepseekSparseAttn sparse-MLA forward (CPU reference): "
+      "q [1,S_q,H,dim+tail], kv [1,S_kv,kv_group,dim+tail], "
+      "indices [1,S_q,kv_group,topk] int32 (<0/>=S_kv masked) -> "
+      "out [1,S_q,H,dim-tail] fp32, optional lse [1,S_q,H] base-2. "
+      "sm_scale folds log2(e); tail_dim==0 skips the rope-tail dot.");
+
+  kernels.def(
+      "dsa_config",
+      [](int S_q, int H, int dim, int topk) {
+        int bq = 0, threads = 0, block_I = 0, inner_iter = 0;
+        kernels::dsa_config_for(S_q, H, dim, topk, &bq, &threads, &block_I,
+                                &inner_iter);
+        return py::make_tuple(bq, threads, block_I, inner_iter);
+      },
+      py::arg("S_q"), py::arg("H"), py::arg("dim"), py::arg("topk"),
+      "Per-shape (bq, threads, block_I, inner_iter) tile selector for the "
+      "HIP DSA kernel: decode (S_q <= 8) -> (1, 64, 64, i); prefill -> "
+      "(4, 256, 64, i). inner_iter grows while topk stays divisible by "
+      "block_I*inner_iter.");
+
+  // --- MHC: multi-head hybrid-attention pre-norm (issue #51, part 2) ------
+  //
+  // The two MHC kernels (mhc_pre_gemm_sqrsum + mhc_post), fp32 CPU
+  // references (always compiled). The HIP device path (mhc.hip) is bf16
+  // and is checked against these references (test_mhc_correct.hip).
+  kernels.def(
+      "mhc_pre_gemm_sqrsum",
+      [](int num_tokens, int hc_mult, int hidden_size, FloatArray x,
+         FloatArray fn, FloatArray out, FloatArray sqrsum) {
+        require_writeable(out);
+        require_writeable(sqrsum);
+        kernels::mhc_pre_gemm_sqrsum_cpu(num_tokens, hc_mult, hidden_size,
+                                         x.data(), fn.data(),
+                                         out.mutable_data(),
+                                         sqrsum.mutable_data());
+        return out;
+      },
+      py::arg("num_tokens"), py::arg("hc_mult"), py::arg("hidden_size"),
+      py::arg("x"), py::arg("fn"), py::arg("out"), py::arg("sqrsum"),
+      "MHC pre-norm GEMM + squared-sum (CPU reference): "
+      "x [num_tokens, hc_mult*hidden] fp32, "
+      "fn [hc_mult*(2+hc_mult), hc_mult*hidden] fp32 "
+      "-> out [num_tokens, hc_mult*(2+hc_mult)] fp32 (= x @ fn^T), "
+      "sqrsum [num_tokens] fp32 (= sum_h x[n,h]^2).");
+
+  kernels.def(
+      "mhc_post",
+      [](int num_tokens, int hc, int hidden, FloatArray a, FloatArray b,
+         FloatArray c, FloatArray d, FloatArray out) {
+        require_writeable(out);
+        kernels::mhc_post_cpu(num_tokens, hc, hidden, a.data(), b.data(),
+                             c.data(), d.data(), out.mutable_data());
+        return out;
+      },
+      py::arg("num_tokens"), py::arg("hc"), py::arg("hidden"),
+      py::arg("a"), py::arg("b"), py::arg("c"), py::arg("d"),
+      py::arg("out"),
+      "MHC post-attention combine (CPU reference): "
+      "a [num_tokens, hc, hc] fp32 (comb_res_mix), "
+      "b [num_tokens, hc, hidden] fp32 (residual), "
+      "c [num_tokens, hc] fp32 (post_layer_mix), "
+      "d [num_tokens, hidden] fp32 (x bypass) -> "
+      "out[n,j,h] = c[n,j]*d[n,h] + sum_k a[n,k,j]*b[n,k,h] fp32.");
+
   // --- KDA: Kimi Delta Attention (issue #21) -------------------------------
   //
   // The per-token oracle (kda_naive_delta_rule_fwd), the chunked forward
@@ -914,6 +1005,97 @@ PYBIND11_MODULE(_core, m) {
       "in a single operation. slot_ids may repeat (gather semantics) and "
       "be in any order; only the range [0, num_slots) is enforced. "
       "num_pages == 0 is a valid no-op.");
+
+  // --- fused indexed K/V layer scatter (issue #1) ------------------------
+  //
+  // k_dst/v_dst are [num_slots, num_kv_heads, head_dim] with itemsize == 2
+  // (BF16 as a uint16 view, FP16 as np.float16) and must be writable.
+  // slot_ids is [num_pages, page_size], int32 or int64, UNIQUE destination
+  // slots in [0, num_slots). src is [num_pages, page_size, 2, num_kv_heads,
+  // head_dim], same dtype as k_dst/v_dst. Non-default strides are rejected
+  // explicitly (no silent forcecast copy, which would write into a
+  // throwaway buffer).
+  comm.def(
+      "kv_scatter_layer",
+      [](py::object kd_obj, py::object vd_obj, py::object s_obj,
+         py::object src_obj, Stream* stream) {
+        auto as_array = [](const py::object& o,
+                           const char* name) -> py::array {
+          if (!py::isinstance<py::array>(o))
+            throw py::type_error(std::string(name) + " must be a numpy array");
+          return py::reinterpret_borrow<py::array>(o);
+        };
+        py::array k = as_array(kd_obj, "k_dst");
+        py::array v = as_array(vd_obj, "v_dst");
+        py::array s = as_array(s_obj, "slot_ids");
+        py::array src = as_array(src_obj, "src");
+
+        auto require_contig = [](const py::array& a, const char* name) {
+          if (!(a.flags() & py::array::c_style))
+            throw py::value_error(std::string(name) +
+                                  " must be C-contiguous");
+        };
+        require_contig(k, "k_dst");
+        require_contig(v, "v_dst");
+        require_contig(s, "slot_ids");
+        require_contig(src, "src");
+        if (!k.writeable())
+          throw py::value_error("k_dst must be writable");
+        if (!v.writeable())
+          throw py::value_error("v_dst must be writable");
+
+        if (k.ndim() != 3)
+          throw py::value_error("k_dst must be [num_slots, num_kv_heads, "
+                                "head_dim] (3-D)");
+        if (v.ndim() != 3 || !v.dtype().equal(k.dtype()))
+          throw py::value_error("v_dst must match k_dst dtype and be 3-D");
+        if (k.itemsize() != 2)
+          throw py::type_error("k_dst must have itemsize 2 (BF16/FP16)");
+        if (k.shape(1) != v.shape(1) || k.shape(2) != v.shape(2) ||
+            k.shape(0) != v.shape(0))
+          throw py::value_error("k_dst and v_dst must have the same shape");
+
+        if (s.dtype().kind() != 'i')
+          throw py::type_error("slot_ids must be int32 or int64");
+        const bool slot_ids_int64 = (s.itemsize() == 8);
+        if (!(s.itemsize() == 4 || s.itemsize() == 8))
+          throw py::type_error("slot_ids must be int32 or int64");
+        if (s.ndim() != 2)
+          throw py::value_error("slot_ids must be [num_pages, page_size] (2-D)");
+
+        if (!src.dtype().equal(k.dtype()))
+          throw py::type_error("src must have the same dtype as k_dst/v_dst");
+        if (src.ndim() != 5)
+          throw py::value_error("src must be [num_pages, page_size, 2, "
+                                "num_kv_heads, head_dim] (5-D)");
+
+        const std::size_t num_slots = static_cast<std::size_t>(k.shape(0));
+        const std::size_t num_kv_heads = static_cast<std::size_t>(k.shape(1));
+        const std::size_t head_dim = static_cast<std::size_t>(k.shape(2));
+        const std::size_t num_pages = static_cast<std::size_t>(s.shape(0));
+        const std::size_t page_size = static_cast<std::size_t>(s.shape(1));
+        if (src.shape(0) != static_cast<ssize_t>(num_pages) ||
+            src.shape(1) != static_cast<ssize_t>(page_size) ||
+            src.shape(2) != 2 ||
+            src.shape(3) != static_cast<ssize_t>(num_kv_heads) ||
+            src.shape(4) != static_cast<ssize_t>(head_dim))
+          throw py::value_error("src shape does not match "
+                                "(num_pages, page_size, 2, "
+                                "num_kv_heads, head_dim)");
+
+        comm::kv_scatter_layer(k.mutable_data(), v.mutable_data(),
+                               s.data(), slot_ids_int64, num_slots,
+                               src.data(), num_pages, page_size,
+                               num_kv_heads, head_dim,
+                               /*elem_size=*/2, stream);
+      },
+      py::arg("k_dst"), py::arg("v_dst"), py::arg("slot_ids"),
+      py::arg("src"), py::arg("stream") = nullptr,
+      "Fused indexed K/V scatter for one layer: writes "
+      "k_dst[slot_ids] = src[:, :, 0] and v_dst[slot_ids] = src[:, :, 1] "
+      "in a single operation. slot_ids must be UNIQUE (scatter writes "
+      "disjoint destinations) and in range [0, num_slots); any order is "
+      "allowed. num_pages == 0 is a valid no-op.");
 
   comm.def(
       "stage_runs_1d",

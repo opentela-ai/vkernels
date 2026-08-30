@@ -956,6 +956,130 @@ def mla_config(S_q, kv_lora_rank, qk_rope_head_dim):
 
 
 # ---------------------------------------------------------------------------
+# DSA: DeepseekSparseAttn sparse-MLA forward (issue #51)
+# ---------------------------------------------------------------------------
+
+_LOG2E = np.float32(math.log2(math.e))
+_DSA_NEG_INF = np.float32(-np.inf)
+
+
+def dsa_sparse_fwd(S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I,
+                   inner_iter, sm_scale, return_lse, q, kv, indices, out,
+                   lse):
+    """Pure-Python (numpy) DSA sparse-MLA forward; mirrors
+    ``dsa_sparse_fwd_cpu`` exactly (two-pass BASE-2 stable softmax over the
+    ``topk`` selected keys, fp32 throughout). ``q`` ``(1,S_q,H,W)``,
+    ``kv`` ``(1,S_kv,1,W)``, ``indices`` ``(1,S_q,1,topk)`` int32
+    (``<0/>=S_kv`` masked), ``W = dim + tail_dim``, ``d_v = dim - tail_dim``.
+    """
+    W = dim + tail_dim
+    d_v = dim - tail_dim
+    q = np.ascontiguousarray(q, dtype=np.float32).reshape(S_q, H, W)
+    kv = np.ascontiguousarray(kv, dtype=np.float32).reshape(S_kv, W)
+    idx = np.ascontiguousarray(indices, dtype=np.int32).reshape(S_q, topk)
+    out = np.ascontiguousarray(out, dtype=np.float32).reshape(S_q, H, d_v)
+    lse = (
+        np.ascontiguousarray(lse, dtype=np.float32).reshape(S_q, H)
+        if return_lse
+        else None
+    )
+    for i in range(S_q):
+        idx_i = idx[i]  # (topk,)
+        valid = (idx_i >= 0) & (idx_i < S_kv)  # (topk,)
+        sel = np.where(valid, idx_i, 0)  # safe gather index
+        kv_sel = kv[sel]  # (topk, W)
+        v_sel = kv_sel[:, :d_v]  # (topk, d_v)
+        k_main = kv_sel[:, :dim]  # (topk, dim)
+        q_i = q[i]  # (H, W)
+        q_main = q_i[:, :dim]  # (H, dim)
+        s = q_main @ k_main.T  # (H, topk)
+        if tail_dim > 0:
+            k_tail = kv_sel[:, dim:dim + tail_dim]  # (topk, tail_dim)
+            q_tail = q_i[:, dim:dim + tail_dim]  # (H, tail_dim)
+            s = s + q_tail @ k_tail.T
+        s = s * np.float32(sm_scale)
+        s = np.where(valid[None, :], s, _DSA_NEG_INF)
+        # kv_group == 1: every H head shares the same selected keys, so the
+        # all-masked condition is a single scalar for this query row.
+        row_valid = bool(valid.any())
+        mx = s.max(axis=1, keepdims=True)  # (H, 1)
+        safe_mx = np.where(row_valid, mx, np.float32(0.0))
+        e = np.where(
+            valid[None, :],
+            np.power(np.float32(2.0), s - safe_mx),
+            np.float32(0.0),
+        )
+        sm = e.sum(axis=1, keepdims=True)  # (H, 1)
+        sm_safe = np.where(sm > 0, sm, np.float32(1.0))
+        w = e / sm_safe  # (H, topk)
+        out_i = (w @ v_sel).astype(np.float32)  # (H, d_v)
+        out[i] = np.where(row_valid, out_i, np.float32(0.0)).astype(np.float32)
+        if return_lse:
+            row_lse = safe_mx[:, 0] + np.log2(np.where(sm[:, 0] > 0, sm[:, 0], np.float32(1.0)))
+            lse[i] = np.where(row_valid, row_lse.astype(np.float32), _DSA_NEG_INF).astype(np.float32)
+    return out
+
+
+def dsa_config(S_q, H, dim, topk):
+    """Per-shape (bq, threads, block_I, inner_iter) tile selector (mirrors
+    ``dsa_config_for``; decode S_q<=8 -> (1,64,64,i), prefill ->
+    (4,256,64,i); inner_iter grows while topk % (block_I*inner_iter) == 0)."""
+    bq = 1 if S_q <= 8 else 4
+    threads = 64 if S_q <= 8 else 256
+    block_I = 64
+    inner_iter = 1
+    while inner_iter < 8 and topk % (block_I * (inner_iter * 2)) == 0:
+        inner_iter *= 2
+    return (bq, threads, block_I, inner_iter)
+
+
+# ---------------------------------------------------------------------------
+# MHC: multi-head hybrid-attention pre-norm (issue #51, part 2)
+# ---------------------------------------------------------------------------
+
+
+def mhc_pre_gemm_sqrsum(num_tokens, hc_mult, hidden_size, x, fn, out,
+                        sqrsum):
+    """Pure-Python (numpy) MHC pre-norm GEMM + squared-sum; mirrors
+    ``mhc_pre_gemm_sqrsum_cpu`` exactly (fp32 throughout). ``x``
+    ``(num_tokens, hc_hidden)`` with ``hc_hidden = hc_mult*hidden``,
+    ``fn`` `(hc_mult3, hc_hidden)` with ``hc_mult3 = hc_mult*(2+hc_mult)``. """
+    hc_hidden = hc_mult * hidden_size
+    hc_mult3 = hc_mult * (2 + hc_mult)
+    x = np.ascontiguousarray(x, dtype=np.float32).reshape(num_tokens,
+                                                          hc_hidden)
+    fn = np.ascontiguousarray(fn, dtype=np.float32).reshape(hc_mult3,
+                                                           hc_hidden)
+    out = np.ascontiguousarray(out, dtype=np.float32).reshape(num_tokens,
+                                                              hc_mult3)
+    sqrsum = np.ascontiguousarray(sqrsum, dtype=np.float32).reshape(
+        num_tokens
+    )
+    np.dot(x, fn.T, out=out)
+    np.einsum("nh,nh->n", x, x, out=sqrsum)
+    return out, sqrsum
+
+
+def mhc_post(num_tokens, hc, hidden, a, b, c, d, out):
+    """Pure-Python (numpy) MHC post-attention combine; mirrors
+    ``mhc_post_cpu`` exactly (fp32 throughout). ``a`` `(n,hc,hc)`,
+    ``b`` `(n,hc,hidden)`, ``c`` `(n,hc)`, ``d`` `(n,hidden)` ->
+    ``out[n,j,h] = c[n,j]*d[n,h] + sum_k a[n,k,j]*b[n,k,h]``. """
+    a = np.ascontiguousarray(a, dtype=np.float32).reshape(num_tokens, hc, hc)
+    b = np.ascontiguousarray(b, dtype=np.float32).reshape(num_tokens, hc,
+                                                           hidden)
+    c = np.ascontiguousarray(c, dtype=np.float32).reshape(num_tokens, hc)
+    d = np.ascontiguousarray(d, dtype=np.float32).reshape(num_tokens, hidden)
+    out = np.ascontiguousarray(out, dtype=np.float32).reshape(
+        num_tokens, hc, hidden
+    )
+    # a[n,k,j] * b[n,k,h] summed over k -> (n, j, h); then + c[n,j]*d[n,h].
+    mixed = np.einsum("nkj,nkh->njh", a, b)
+    out[:] = (mixed + c[:, :, None] * d[:, None, :]).astype(np.float32)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # KDA: Kimi Delta Attention (issue #21)
 # ---------------------------------------------------------------------------
 
@@ -1750,3 +1874,131 @@ def kv_gather_layer(k_src, v_src, slot_ids, dst, *, stream=None) -> None:
         gather()
     else:
         stream.submit(gather)
+
+
+
+# ---------------------------------------------------------------------------
+# Fused indexed K/V layer scatter (issue #1)
+# ---------------------------------------------------------------------------
+#
+# The restore-side reverse of kv_gather (issue #2): scatters a contiguous,
+# already-gathered per-layer scratch buffer back into the paged KV pool at
+# arbitrary, non-contiguous destination slots. The current fallback performs
+# two PyTorch advanced-index writes (one for K, one for V); this primitive
+# fuses both writes (and the K/V split) into a single operation, byte-exact
+# against:
+#
+#     k_dst[slot_ids] = src[:, :, 0]
+#     v_dst[slot_ids] = src[:, :, 1]
+#
+# Because the destination slots are DISJOINT (uniqueness is enforced, unlike
+# the gather's repeatable sources), every byte is written exactly once and
+# the write order is irrelevant. Same raw-byte-copy reasoning as kv_gather:
+# correct for both BF16 (uint16 view) and FP16.
+
+def kv_scatter_layer(k_dst, v_dst, slot_ids, src, *, stream=None) -> None:
+    """Fused indexed K/V scatter for one layer (issue #1).
+
+    Reads a contiguous ``[num_pages, page_size, 2, num_kv_heads, head_dim]``
+    ``src`` and writes K and V into the indexed destination slots of
+    ``k_dst`` / ``v_dst``, exactly:
+
+        k_dst[slot_ids] = src[:, :, 0]
+        v_dst[slot_ids] = src[:, :, 1]
+
+    Replaces the two separate advanced-index writes the KVAAS ``scatter_layer``
+    path performs today. ``num_pages == 0`` is a valid no-op. ``slot_ids``
+    must be UNIQUE (scatter writes disjoint destinations; duplicates are a
+    contract violation) and in range ``[0, num_slots)``; any order is allowed
+    (non-monotonic).
+
+    Args:
+        k_dst, v_dst: ``[num_slots, num_kv_heads, head_dim]`` C-contiguous
+            writable arrays with ``itemsize == 2`` (BF16 as a ``uint16``
+            view, FP16 as ``np.float16``).
+        slot_ids: ``[num_pages, page_size]`` C-contiguous ``int32`` or
+            ``int64`` array of UNIQUE destination slots in ``[0, num_slots)``.
+        src: ``[num_pages, page_size, 2, num_kv_heads, head_dim]``
+            C-contiguous array of the same dtype as ``k_dst``/``v_dst``.
+        stream: optional :class:`~vkernels.core.Stream`; when given the
+            scatter runs as a single asynchronous task.
+
+    Raises:
+        TypeError: if any array has the wrong dtype.
+        ValueError: if shapes/strides are inconsistent, ``slot_ids`` is out
+            of range or non-unique, or ``k_dst``/``v_dst`` is not writable.
+    """
+    k = _as_kv_array(k_dst, "k_dst")
+    v = _as_kv_array(v_dst, "v_dst")
+    slots = _as_slot_ids(slot_ids, "slot_ids")
+    if isinstance(src, np.ndarray):
+        s = src
+    else:
+        s = np.asarray(src)
+    if s.dtype != k.dtype:
+        raise TypeError(
+            f"src must have the same dtype as k_dst/v_dst, got {s.dtype} vs {k.dtype}"
+        )
+    if s.ndim != 5:
+        raise ValueError(
+            f"src must be [num_pages, page_size, 2, num_kv_heads, head_dim] "
+            f"(5-D), got shape {s.shape}"
+        )
+    if not s.flags.c_contiguous:
+        raise ValueError("src must be C-contiguous")
+    if not k.flags.writeable:
+        raise ValueError("k_dst must be writable")
+    if not v.flags.writeable:
+        raise ValueError("v_dst must be writable")
+    if k.shape != v.shape:
+        raise ValueError(
+            f"k_dst and v_dst must have the same shape, got {k.shape} vs {v.shape}"
+        )
+    if k.dtype != v.dtype:
+        raise TypeError(
+            f"k_dst and v_dst must have the same dtype, got {k.dtype} vs {v.dtype}"
+        )
+
+    num_slots, num_kv_heads, head_dim = k.shape
+    num_pages, page_size = slots.shape
+    if s.shape != (num_pages, page_size, 2, num_kv_heads, head_dim):
+        raise ValueError(
+            f"src shape {s.shape} does not match (num_pages={num_pages}, "
+            f"page_size={page_size}, 2, num_kv_heads={num_kv_heads}, "
+            f"head_dim={head_dim})"
+        )
+
+    if num_pages == 0:
+        return  # valid no-op (also covers page_size == 0)
+
+    if page_size == 0:
+        return
+    if num_slots == 0:
+        raise ValueError("num_slots must be positive when num_pages > 0")
+    if num_kv_heads == 0 or head_dim == 0:
+        raise ValueError("num_kv_heads and head_dim must be positive")
+
+    # Scatter writes disjoint destinations: uniqueness is required (unlike
+    # the gather, which may repeat source slots). Range is also enforced.
+    flat_ids = slots.reshape(num_pages * page_size)
+    if flat_ids.size:
+        if flat_ids.min() < 0 or flat_ids.max() >= num_slots:
+            raise ValueError(f"slot_ids must be in [0, {num_slots})")
+        if np.unique(flat_ids).size != flat_ids.size:
+            raise ValueError("slot_ids must be unique (scatter writes disjoint destinations)")
+
+    slot_bytes = num_kv_heads * head_dim * 2  # elem_size == 2
+    k_flat = k.view(np.uint8).reshape(num_slots, slot_bytes)
+    v_flat = v.view(np.uint8).reshape(num_slots, slot_bytes)
+    s_flat = s.view(np.uint8).reshape(num_pages * page_size, 2, slot_bytes)
+
+    def scatter() -> None:
+        # Byte-exact memmove into the indexed destinations (matching dtypes
+        # via uint8 views). Uniqueness guarantees no two writes alias.
+        k_flat[flat_ids] = s_flat[:, 0, :]
+        v_flat[flat_ids] = s_flat[:, 1, :]
+
+    if stream is None:
+        scatter()
+    else:
+        stream.submit(scatter)

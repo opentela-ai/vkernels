@@ -36,4 +36,13 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 enable_language(CUDA)
 set(VKERNELS_HAS_CUDA ON CACHE BOOL "Whether a usable CUDA toolkit was found" FORCE)
 
+# The CUDA driver API (cuMem*, cuCtx*, ... used by the fabric-import VMM
+# path in src/c/vkernels/comm/fabric_import.cu) lives in libcuda. The
+# CUDAToolkit package exposes it as the CUDA::cuda_driver imported
+# target, which src/c/CMakeLists.txt links to vkernels so the driver
+# symbols resolve at the final link of vkernels and its consumers.
+# (enable_language(CUDA) alone sets the nvcc/cudart toolchain but does
+# not create the CUDA:: imported targets.)
+find_package(CUDAToolkit QUIET)
+
 message(STATUS "vkernels: CUDA enabled (nvcc=${VKERNELS_NVCC_EXECUTABLE}, archs=${CMAKE_CUDA_ARCHITECTURES})")

@@ -38,6 +38,26 @@ __host__ __device__ __forceinline__ uint16_t f32bits_to_bf16(uint32_t bits) {
   return static_cast<uint16_t>(bits >> 16);
 }
 
+// bf16 (uint16, IEEE-754 top-16 bits) → float (zero-extend the low 17
+// mantissa bits). The inverse of f32bits_to_bf16's round; every bf16 device
+// kernel (gemm_bf16, moe_aux, moe_fused, dsa, mhc) loads weights/activations
+// through this single definition.
+__host__ __device__ __forceinline__ float bf16_to_f32(uint16_t b) {
+  float f;
+  uint32_t u = static_cast<uint32_t>(b) << 16;
+  __builtin_memcpy(&f, &u, sizeof(f));
+  return f;
+}
+
+// Round a float value → bf16 (uint16_t, RNE). Convenience wrapper around
+// f32bits_to_bf16 for the common "I have a float, not raw uint32 bits" call
+// site (the device kernels' store epilogue).
+__host__ __device__ __forceinline__ uint16_t f2bf(float v) {
+  uint32_t b;
+  __builtin_memcpy(&b, &v, sizeof(float));
+  return f32bits_to_bf16(b);
+}
+
 // ======================================================================
 //  K16 bf16 MFMA (device-only, inline asm)
 //  NOTE: Uses generic "v" constraints (no hardcoded VGPRs).

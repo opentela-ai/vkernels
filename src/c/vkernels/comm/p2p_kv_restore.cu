@@ -356,6 +356,35 @@ void p2p_kv_restore_layer(void* k_dst, void* v_dst,
 
   if (num_pages == 0) return;
 
+  // Validate slot contents on the host, mirroring the host reference
+  // p2p_kv_restore_layer: every slot must be non-negative and unique, the
+  // fused kernel's disjoint-destination assumption. `slot_ids` may be a
+  // host OR a device pointer (the device C ABI tests pass a device
+  // buffer), so mirror it into a host staging buffer with the synchronous
+  // cudaMemcpy (cudaMemcpyDefault auto-detects the source kind under
+  // UVA) before the kernel launch. This is the same per-call validation
+  // the host one-shot performs; the prepared plan
+  // (vkernels_p2p_kv_restore_plan_create) validates ONCE at create and
+  // stays sync-free on execute(). The synchronous copy runs on the same
+  // stream as the async ops below when `stream` is the default stream,
+  // and otherwise reads only the caller's read-only `slot_ids`.
+  const std::size_t total_tokens = num_pages * page_size;
+  {
+    std::vector<int> h_slots(total_tokens);
+    cudaError_t val_err = cudaMemcpy(
+        h_slots.data(), slot_ids, total_tokens * sizeof(int),
+        cudaMemcpyDefault);
+    VK_ENSURES(val_err == cudaSuccess,
+               "cudaMemcpy for cross-node slot validation failed");
+    std::unordered_set<int> seen;
+    seen.reserve(total_tokens);
+    for (std::size_t i = 0; i < total_tokens; ++i) {
+      int slot = h_slots[i];
+      VK_EXPECTS(slot >= 0, "slot_ids must be non-negative");
+      VK_EXPECTS(seen.insert(slot).second, "slot_ids must be unique");
+    }
+  }
+
   const int slot_bytes = static_cast<int>(num_kv_heads * head_dim * elem_size);
   const int token_stride = 2 * slot_bytes;
 
@@ -369,7 +398,6 @@ void p2p_kv_restore_layer(void* k_dst, void* v_dst,
   }
 
   // Upload slot_ids to the device (one contiguous buffer).
-  const std::size_t total_tokens = num_pages * page_size;
   const std::size_t slot_bytes_dev = total_tokens * sizeof(int);
   int* d_slot_ids = nullptr;
   cudaError_t err = cudaMallocAsync(&d_slot_ids, slot_bytes_dev, stream);

@@ -53,6 +53,7 @@ _LazyIntegration = {
 # dependency-free). Each maps to ``vkernels.<submodule>.<name>``.
 _TopLevelFuncs = {
     "kv_gather_layer": "comm",
+    "kv_scatter_layer": "comm",
 }
 
 
