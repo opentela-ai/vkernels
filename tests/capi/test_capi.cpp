@@ -793,6 +793,42 @@ TEST(CapiDsa, HandCheckedTailDimPositive) {
   EXPECT_NEAR(lse[0], 3.0f + std::log2(1.5f), 1e-6f);
 }
 
+TEST(CapiDsa, TopkGroupSupportHelper) {
+  EXPECT_EQ(vk_dsa_topk_group_topk_supported(128), 1);
+  EXPECT_EQ(vk_dsa_topk_group_topk_supported(64), 0);
+}
+
+TEST(CapiDsa, TopkTransformPageTableAndTail) {
+  std::vector<float> score(16);
+  for (int i = 0; i < 16; ++i) score[i] = static_cast<float>(i);
+  std::vector<int32_t> lengths = {2};
+  std::vector<int32_t> page_table(64);
+  for (int32_t i = 0; i < 64; ++i) page_table[i] = 300 + i;
+  std::vector<int32_t> page_row = {0};
+  std::vector<int32_t> seq_lens = {10};
+  std::vector<int32_t> out(515, -1);
+  EXPECT_EQ(vk_dsa_topk_transform(1, score.data(), lengths.data(), out.data(),
+                                  16, 4, 512, 515, page_table.data(), 64,
+                                  page_row.data(), nullptr, nullptr,
+                                  seq_lens.data()),
+            VK_OK);
+  for (int32_t i = 0; i < 10; ++i) EXPECT_EQ(out[i], 300 + i);
+  for (int32_t i = 10; i < 515; ++i) EXPECT_EQ(out[i], -1);
+}
+
+TEST(CapiDsa, TopkTransformConflictingMappingsSetError) {
+  std::vector<float> score(16, 0.0f);
+  std::vector<int32_t> lengths = {2};
+  std::vector<int32_t> page_table(64, 0);
+  std::vector<int32_t> offsets = {1};
+  std::vector<int32_t> out(512, -1);
+  EXPECT_EQ(vk_dsa_topk_transform(1, score.data(), lengths.data(), out.data(),
+                                  16, 4, 512, 512, page_table.data(), 64,
+                                  nullptr, offsets.data(), nullptr, nullptr),
+            VK_ERROR_INVALID_ARGUMENT);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
 TEST(CapiDsa, ConfigDecode) {
   int bq = 0, threads = 0, bi = 0, ii = 0;
   vk_dsa_config(1, 64, 256, 128, &bq, &threads, &bi, &ii);  // decode

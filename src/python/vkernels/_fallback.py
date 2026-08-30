@@ -1033,6 +1033,77 @@ def dsa_config(S_q, H, dim, topk):
     return (bq, threads, block_I, inner_iter)
 
 
+def dsa_topk_group_topk_supported(group_topk):
+    return int(group_topk) in (128, 160, 192, 224, 256, 512)
+
+
+def dsa_topk_transform(batch_size, score_stride, pool_size, token_topk, out_cols,
+                       score, lengths, out, page_table=None,
+                       page_table_row_index=None, topk_indices_offset=None,
+                       row_starts=None, seq_lens=None, page_table_stride=0):
+    group_topk = int(token_topk) // int(pool_size)
+    if not dsa_topk_group_topk_supported(group_topk):
+        raise ValueError("unsupported pool-level top-k")
+    score = np.ascontiguousarray(score, dtype=np.float32).reshape(batch_size, score_stride)
+    lengths = np.ascontiguousarray(lengths, dtype=np.int32).reshape(batch_size)
+    out = np.ascontiguousarray(out, dtype=np.int32).reshape(batch_size, out_cols)
+    row_starts = None if row_starts is None else np.ascontiguousarray(row_starts, dtype=np.int32).reshape(batch_size)
+    seq_lens = None if seq_lens is None else np.ascontiguousarray(seq_lens, dtype=np.int32).reshape(batch_size)
+    page_table_row_index = (
+        None
+        if page_table_row_index is None
+        else np.ascontiguousarray(page_table_row_index, dtype=np.int32).reshape(batch_size)
+    )
+    topk_indices_offset = (
+        None
+        if topk_indices_offset is None
+        else np.ascontiguousarray(topk_indices_offset, dtype=np.int32).reshape(batch_size)
+    )
+    if page_table is not None:
+        page_table = np.ascontiguousarray(page_table, dtype=np.int32).reshape(-1, page_table_stride)
+    tail_cols = 0 if seq_lens is None else pool_size - 1
+    if out_cols != token_topk + tail_cols:
+        raise ValueError("out_cols does not match the transform layout")
+    out.fill(-1)
+    for row in range(batch_size):
+        length = int(lengths[row])
+        row_start = 0 if row_starts is None else int(row_starts[row])
+        if length < 0 or row_start < 0 or row_start + length > score_stride:
+            raise ValueError("valid score range exceeds score_stride")
+        valid_groups = min(length, group_topk)
+        if length <= group_topk:
+            selected = np.arange(valid_groups, dtype=np.int32)
+        else:
+            row_scores = score[row, row_start:row_start + length]
+            # Match the C++ contract: the winning set matters, not a stable order.
+            selected = np.argpartition(-row_scores, group_topk - 1)[:group_topk].astype(np.int32)
+        if page_table is None:
+            page_row = None
+        else:
+            page_row_id = row if page_table_row_index is None else int(page_table_row_index[row])
+            if page_row_id < 0 or page_row_id >= page_table.shape[0]:
+                raise ValueError("page_table_row_index entries must address a page-table row")
+            page_row = page_table[page_row_id]
+        offset = 0 if topk_indices_offset is None else int(topk_indices_offset[row])
+        history_len = valid_groups * pool_size
+        for col in range(history_len):
+            group_id = col // pool_size
+            raw_token = int(selected[group_id]) * pool_size + (col % pool_size)
+            out[row, col] = (
+                int(page_row[raw_token]) if page_row is not None else raw_token + offset
+                if topk_indices_offset is not None else raw_token
+            )
+        if seq_lens is not None:
+            tail_count = int(seq_lens[row]) % pool_size
+            for tail in range(tail_count):
+                raw_token = length * pool_size + tail
+                out[row, history_len + tail] = (
+                    int(page_row[raw_token]) if page_row is not None else raw_token + offset
+                    if topk_indices_offset is not None else raw_token
+                )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # MHC: multi-head hybrid-attention pre-norm (issue #51, part 2)
 # ---------------------------------------------------------------------------

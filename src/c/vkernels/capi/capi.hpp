@@ -178,6 +178,26 @@ int32_t vk_dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
                           const float* q, const float* kv,
                           const int32_t* indices, float* out, float* lse);
 
+/* Pool-level radix top-k transform between DSA logits and sparse forward.
+ * score is [batch_size, score_stride] fp32 with per-row valid counts in
+ * lengths. The transform selects token_topk/pool_size pool groups, expands
+ * each winner to pool_size token ids, and optionally appends the tail
+ * seq_len % pool_size tokens when seq_lens is provided. page_table and
+ * topk_indices_offset are mutually exclusive. page_table is
+ * [batch_size, page_table_stride], and page_table_row_index entries must be
+ * in [0, batch_size). */
+int32_t vk_dsa_topk_transform(
+    int32_t batch_size, const float* score, const int32_t* lengths,
+    int32_t* dst_token_indices, int64_t score_stride, int32_t pool_size,
+    int32_t token_topk, int32_t out_cols, const int32_t* page_table,
+    int64_t page_table_stride, const int32_t* page_table_row_index,
+    const int32_t* topk_indices_offset, const int32_t* row_starts,
+    const int32_t* seq_lens);
+
+/* True when token_topk/pool_size is one of the supported radix
+ * specialisations (128, 160, 192, 224, 256, 512). Never throws. */
+int vk_dsa_topk_group_topk_supported(int32_t group_topk);
+
 /* Per-shape (bq, threads, block_I, inner_iter) tile selector for the HIP
  * DSA kernel. decode (S_q <= 8) -> (1, 64, 64, i); prefill -> (4, 256, ...).
  * Never throws. */

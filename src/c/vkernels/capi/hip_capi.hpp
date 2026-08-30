@@ -201,6 +201,28 @@ void vk_hip_dsa_sparse_fwd(
     int block_I, int inner_iter, float sm_scale, int return_lse,
     const void* q, const void* kv, const void* indices, void* out, void* lse);
 
+/* Pool-level radix top-k transform for the DSA kpool indexer.
+ *
+ *   score             [batch_size, score_stride] strided fp32
+ *   lengths           [batch_size] int32 valid group counts
+ *   dst_token_indices [batch_size, out_cols] contiguous int32
+ *   page_table        [batch_size, page_table_stride] int32 (optional)
+ *
+ * token_topk / pool_size must be one of 128, 160, 192, 224, 256, or
+ * 512. page_table and topk_indices_offset are mutually exclusive. When
+ * page_table_row_index is null, score row i uses page-table row i; otherwise
+ * every entry must be in [0, batch_size). When
+ * seq_lens is non-null, out_cols must equal token_topk + pool_size - 1 and
+ * the seq_len % pool_size trailing tokens are appended after history.
+ */
+void vk_hip_dsa_topk_transform(
+    int32_t batch_size, const float* score, const int32_t* lengths,
+    int32_t* dst_token_indices, int64_t score_stride, int32_t pool_size,
+    int32_t token_topk, int32_t out_cols, const int32_t* page_table,
+    int64_t page_table_stride, const int32_t* page_table_row_index,
+    const int32_t* topk_indices_offset, const int32_t* row_starts,
+    const int32_t* seq_lens);
+
 /* Per-shape (bq, threads, block_I, inner_iter) tile selector for the HIP
  * DSA kernel (mirrors vk_dsa_config). Never throws. */
 void vk_hip_dsa_config(int S_q, int H, int dim, int topk, int* bq,
