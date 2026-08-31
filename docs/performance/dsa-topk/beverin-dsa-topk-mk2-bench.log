@@ -1,4 +1,4 @@
-=== node: nid002920  date: 2026-08-31T17:12:23Z ===
+=== node: nid002920  date: 2026-08-31T18:46:27Z ===
 GPU[0]		: Card Series: 		Aqua Vanjaram [Instinct MI300A]
 GPU[0]		: Card Model: 		0x74a0
 GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
@@ -10,13 +10,13 @@ GPU[1]		: mclk clock level: 3: (1300Mhz)
 GPU[1]		: sclk clock level: S: (96Mhz)
 === configure (HIP, gfx942, Release, benchmarks ON) ===
 -- Configuring done (0.6s)
--- Generating done (14.9s)
+-- Generating done (9.0s)
 -- Build files have been written to: /users/xyao/vkernels-git/build_topk
-=== build (test_dsa_topk_correct + dsa_topk_bench) ===
-[ 95%] Built target vkernels
+=== build (test_dsa_topk_correct + dsa_topk_logits_bench) ===
+[ 92%] Built target vkernels
 [100%] Built target test_dsa_topk_correct
 [ 95%] Built target vkernels
-[100%] Built target dsa_topk_bench
+[100%] Built target dsa_topk_logits_bench
 
 ############ 1. CORRECTNESS (test_dsa_topk_correct) ############
 GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
@@ -38,25 +38,25 @@ GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
 
 PASS (0 failure(s))
 
-############ 2. BENCHMARK (dsa_topk_bench) ############
+############ 2. BENCHMARK (dsa_topk_logits_bench) ############
 GPU: AMD Instinct MI300A (arch=gfx942)  228 CUs,  roof 1307 TFLOP/s bf16, 5300 GB/s HBM3, ridge ~247 FLOP/B
 
 === hip::dsa_topk_logits (GLM-5.3 indexer) ===
     bs    H ms_len    B   mt   nb  split   us(min)   us(med)      GB/s    AI  %bw  bound
-     1   32     512   64    8    8      1     262.8     264.6       0.3  57.2  0.0  mem
-     1   32    1024   64   16   16      1     360.7     362.6       0.4  58.9  0.0  mem
-     1   32    2048   64   32   32      1     531.4     534.9       0.5  59.8  0.0  mem
-     1   32    4096   64   64   64      1     889.6     918.6       0.6  60.2  0.0  mem
-     2   32     512   64    8    8      1     262.5     264.2       0.6  57.2  0.0  mem
-     4   32     512   64    8    8      1     270.9     272.4       1.1  57.2  0.0  mem
-     8   32     512   64    8    8      1     271.1     272.8       2.2  57.2  0.0  mem
-    16   32     512   64    8    8      1     268.7     270.3       4.4  57.2  0.1  mem
-    32   32     512   64    8    8      1     269.2     270.4       8.7  57.2  0.2  mem
-    64   32     512   64    8    8      1     269.6     270.4      17.5  57.2  0.3  mem
-     1   64     512   64    8    8      1     305.6     309.1       0.3 108.2  0.0  mem
-     1   64    1024   64   16   16      1     435.5     438.6       0.3 114.4  0.0  mem
-     1   64    4096   64   64   64      1    1218.4    1252.0       0.5 119.6  0.0  mem
-     1   32     128   64    2    2      1     194.4     196.7       0.1  48.8  0.0  mem
+     1   32     512   64    8    8      1     262.6     264.1       0.3  57.2  0.0  mem
+     1   32    1024   64   16   16      1     360.6     362.9       0.4  58.9  0.0  mem
+     1   32    2048   64   32   32      1     531.0     535.2       0.5  59.8  0.0  mem
+     1   32    4096   64   64   64      1     887.8     893.1       0.6  60.2  0.0  mem
+     2   32     512   64    8    8      1     262.2     264.0       0.6  57.2  0.0  mem
+     4   32     512   64    8    8      1     271.1     272.5       1.1  57.2  0.0  mem
+     8   32     512   64    8    8      1     270.2     272.4       2.2  57.2  0.0  mem
+    16   32     512   64    8    8      1     268.3     270.1       4.4  57.2  0.1  mem
+    32   32     512   64    8    8      1     269.0     270.0       8.8  57.2  0.2  mem
+    64   32     512   64    8    8      1     268.6     270.1      17.5  57.2  0.3  mem
+     1   64     512   64    8    8      1     305.6     307.7       0.3 108.2  0.0  mem
+     1   64    1024   64   16   16      1     434.5     438.5       0.3 114.4  0.0  mem
+     1   64    4096   64   64   64      1    1220.9    1253.8       0.5 119.6  0.0  mem
+     1   32     128   64    2    2      1     194.4     196.6       0.1  48.8  0.0  mem
   Roof: 1307 TFLOP/s bf16 (Matrix-Core), 5300 GB/s HBM3.
   NB: the working set (68-560 KB for these shapes) is L2-resident
       after warmup, so the kernel is NOT HBM-bandwidth-bound -- the
@@ -71,13 +71,13 @@ GPU: AMD Instinct MI300A (arch=gfx942)  228 CUs,  roof 1307 TFLOP/s bf16, 5300 G
 === split_kv sweep (bs=1 H=32 D=128 B=64 mt=64 nb=64, max_seq_len=4096, 228 CUs) ===
   dsa_topk_logits_split_for(1, 4096, 64) = 64  (recommended)
    split   us(min)   us(med)      GB/s   speedup
-       1     889.8     897.3       0.6      1.0x
-       2     530.4     537.1       1.0      1.7x
-       4     364.1     379.6       1.5      2.4x
-       8     270.3     272.6       2.1      3.3x
-      16     224.8     225.6       2.5      4.0x
-      32     201.6     202.3       2.8      4.4x
-      64     189.8     190.4       2.9      4.7x
+       1     886.8     896.3       0.6      1.0x
+       2     531.1     535.7       1.0      1.7x
+       4     363.4     366.5       1.5      2.4x
+       8     270.7     272.0       2.1      3.3x
+      16     224.5     225.6       2.5      4.0x
+      32     201.7     202.2       2.8      4.4x
+      64     189.3     190.2       3.0      4.7x
   (split_kv is perf-only and grouping-independent -- the
         reference logit is identical across splits; see
         test_dsa_topk_correct.hip case split=2. Max split
@@ -87,10 +87,10 @@ GPU: AMD Instinct MI300A (arch=gfx942)  228 CUs,  roof 1307 TFLOP/s bf16, 5300 G
 
 === hip::dsa_topk_logits variant comparison (bs=1 H=32 D=128 B=64 max_seq_len=512, 228 CUs) ===
      var   us(min)   us(med)   vs fp32
-    auto     262.5     264.1     1.00x
-    fp32    2712.1    2716.9     1.00x
-    fp8q    4235.1    4241.0     0.64x
-    mfma     262.7     265.4    10.24x
+    auto     262.0     264.2     1.00x
+    fp32    2713.5    2716.9     1.00x
+    fp8q    4240.7    4244.6     0.64x
+    mfma     262.7     264.5    10.27x
   (auto dispatches mfma here -- the SMALLEST-variant + Matrix-Core path.
    fp32-Q stages Q as fp32 once (49,536 B),
    fp8-Q stages Q raw + dequants on the fly (41,472 B),
@@ -98,3 +98,4 @@ GPU: AMD Instinct MI300A (arch=gfx942)  228 CUs,  roof 1307 TFLOP/s bf16, 5300 G
    See dsa.hpp::dsa_topk_logits_fits_lds{,_fp8q,_mfma}.)
 
 ===== DONE =====
+
