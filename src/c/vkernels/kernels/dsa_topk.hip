@@ -223,24 +223,17 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_transform_kernel(
   const int32_t history_len = valid_groups * pool_size;
   const int32_t tail_count = seq_lens == nullptr ? 0 : seq_lens[row] % pool_size;
 
-  if (length <= K) {
-    for (int32_t col = tid; col < out_cols; col += kThreadsPerBlock) {
-      if (col < history_len) {
-        dst[col] =
-            transform_token(col, page_table_entry, page_table_stride, topk_indices_offset, offset);
-      } else if (col < history_len + tail_count) {
-        const int32_t raw_token = length * pool_size + col - history_len;
-        dst[col] = transform_token(
-            raw_token, page_table_entry, page_table_stride, topk_indices_offset, offset);
-      } else {
-        dst[col] = -1;
-      }
-    }
-    return;
-  }
-
   __shared__ int32_t selected_groups[K];
-  radix_topk<K>(score_row, selected_groups, row_start, length);
+  // When length <= K the top-k winners are trivially [0, length): the CPU
+  // oracle does the same (std::iota then skips nth_element), so the identity
+  // fill makes the short-row output bit-identical to radix_topk's and lets a
+  // single output loop replace the former fast/slow pair.
+  if (length <= K) {
+    for (int32_t i = tid; i < length; i += kThreadsPerBlock) selected_groups[i] = i;
+    __syncthreads();
+  } else {
+    radix_topk<K>(score_row, selected_groups, row_start, length);
+  }
   for (int32_t col = tid; col < out_cols; col += kThreadsPerBlock) {
     if (col < history_len) {
       const int32_t group_id = selected_groups[col / pool_size];

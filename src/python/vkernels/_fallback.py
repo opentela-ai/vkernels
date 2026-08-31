@@ -1037,6 +1037,15 @@ def dsa_topk_group_topk_supported(group_topk):
     return int(group_topk) in (128, 160, 192, 224, 256, 512)
 
 
+# Mirror of the C++ ``transform_token`` helper (dsa_topk.cpp): apply exactly
+# one of the page-table remap, the ragged offset, or the identity. Factored so
+# the two fill sites in ``dsa_topk_transform`` stay in lock-step with it.
+def _dsa_topk_transform_token(raw_token, page_row, has_offset, offset):
+    if page_row is not None:
+        return int(page_row[raw_token])
+    return raw_token + offset if has_offset else raw_token
+
+
 def dsa_topk_transform(batch_size, score_stride, pool_size, token_topk, out_cols,
                        score, lengths, out, page_table=None,
                        page_table_row_index=None, topk_indices_offset=None,
@@ -1064,12 +1073,21 @@ def dsa_topk_transform(batch_size, score_stride, pool_size, token_topk, out_cols
     tail_cols = 0 if seq_lens is None else pool_size - 1
     if out_cols != token_topk + tail_cols:
         raise ValueError("out_cols does not match the transform layout")
+    # Mirror the C++ VK_EXPECTS checks (dsa_topk.cpp): the two remaps are
+    # mutually exclusive and a page table needs a positive stride.
+    if page_table is not None and topk_indices_offset is not None:
+        raise ValueError("page_table and topk_indices_offset are mutually exclusive")
+    if page_table is not None and page_table_stride <= 0:
+        raise ValueError("page_table_stride must be positive when a page table is used")
     out.fill(-1)
+    has_offset = topk_indices_offset is not None
     for row in range(batch_size):
         length = int(lengths[row])
         row_start = 0 if row_starts is None else int(row_starts[row])
         if length < 0 or row_start < 0 or row_start + length > score_stride:
             raise ValueError("valid score range exceeds score_stride")
+        if length > 2147483647 // pool_size:
+            raise ValueError("expanded token index overflows int32")
         valid_groups = min(length, group_topk)
         if length <= group_topk:
             selected = np.arange(valid_groups, dtype=np.int32)
@@ -1081,7 +1099,9 @@ def dsa_topk_transform(batch_size, score_stride, pool_size, token_topk, out_cols
             page_row = None
         else:
             page_row_id = row if page_table_row_index is None else int(page_table_row_index[row])
-            if page_row_id < 0 or page_row_id >= page_table.shape[0]:
+            # The C++/HIP contract bounds page_row by batch_size (the score-row
+            # count), not by the page table's own row count -- see dsa.hpp.
+            if page_row_id < 0 or page_row_id >= batch_size:
                 raise ValueError("page_table_row_index entries must address a page-table row")
             page_row = page_table[page_row_id]
         offset = 0 if topk_indices_offset is None else int(topk_indices_offset[row])
@@ -1089,18 +1109,15 @@ def dsa_topk_transform(batch_size, score_stride, pool_size, token_topk, out_cols
         for col in range(history_len):
             group_id = col // pool_size
             raw_token = int(selected[group_id]) * pool_size + (col % pool_size)
-            out[row, col] = (
-                int(page_row[raw_token]) if page_row is not None else raw_token + offset
-                if topk_indices_offset is not None else raw_token
-            )
+            out[row, col] = _dsa_topk_transform_token(raw_token, page_row, has_offset, offset)
         if seq_lens is not None:
+            if int(seq_lens[row]) < 0:
+                raise ValueError("seq_lens entries must be non-negative")
             tail_count = int(seq_lens[row]) % pool_size
             for tail in range(tail_count):
                 raw_token = length * pool_size + tail
-                out[row, history_len + tail] = (
-                    int(page_row[raw_token]) if page_row is not None else raw_token + offset
-                    if topk_indices_offset is not None else raw_token
-                )
+                out[row, history_len + tail] = _dsa_topk_transform_token(
+                    raw_token, page_row, has_offset, offset)
 def dsa_topk_logits_split_for(batch_size, max_seq_len, block):
     """Optimal split_kv for the HIP dsa_topk_logits indexer (mirrors
     ``dsa_topk_logits_split_for``; issue #51). Perf only -- the CPU
