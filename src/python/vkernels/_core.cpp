@@ -570,6 +570,57 @@ PYBIND11_MODULE(_core, m) {
       },
       py::arg("group_topk"),
       "True when the DSA radix top-k transform supports group_topk.");
+  // --- DSA: paged-MQA gated top-k logits (issue #51), the kpool>1 -------
+  // indexer path. The FIRST stage feeding dsa_sparse_fwd (above): each
+  // query scores its paged KV tiles and the gate picks the top-k blocks
+  // to attend over. CPU reference (always compiled); the device ABI is
+  // FP8 e4m3fnuz and the host reference is fp32 end-to-end (the
+  // integrator converts -- mirrors dsa_sparse_fwd's bf16->fp32).
+  kernels.def(
+      "dsa_topk_logits",
+      [](int batch_size, int num_heads, int head_dim, int block,
+         int max_table_len, int num_blocks,
+         FloatArray q, FloatArray kv, FloatArray k_scale, FloatArray gate,
+         I32Array seq_lens, I32Array page_table, FloatArray out) {
+        require_writeable(out);
+        kernels::dsa_topk_logits_cpu(batch_size, num_heads, head_dim, block,
+                                     max_table_len, num_blocks,
+                                     q.data(), kv.data(), k_scale.data(),
+                                     gate.data(), seq_lens.data(),
+                                     page_table.data(), out.mutable_data());
+        return out;
+      },
+      py::arg("batch_size"), py::arg("num_heads"), py::arg("head_dim"),
+      py::arg("block"), py::arg("max_table_len"), py::arg("num_blocks"),
+      py::arg("q"), py::arg("kv"), py::arg("k_scale"), py::arg("gate"),
+      py::arg("seq_lens"), py::arg("page_table"), py::arg("out"),
+      "DSA paged-MQA gated top-k logits (CPU reference), the kpool>1 "
+      "indexer path and the FIRST stage feeding dsa_sparse_fwd: "
+      "q [B,H,D] fp32, kv [num_blocks,block,D] fp32, "
+      "k_scale [num_blocks,block] fp32, gate [B,H] fp32, "
+      "seq_lens [B] int32 (pooled valid), page_table [B,max_table_len] int32 "
+      "-> out [B,max_table_len*block] fp32. Tokens >= seq_lens[b] are left "
+      "UNWRITTEN (zero the output first).");
+
+  // dsa_topk_logits_split_for: optimal split_kv for the HIP indexer (issue
+  // #51), single source of truth for the formula the hip_capi.hpp ABI
+  // docstring used to restate (with the wrong NUM_CU). Pure host
+  // arithmetic -- the CPU reference has no split_kv (single-threaded), but
+  // the integrator calls this before launching the GPU kernel.
+  kernels.def(
+      "dsa_topk_logits_split_for",
+      [](int batch_size, int max_seq_len, int block) {
+        return kernels::dsa_topk_logits_split_for(batch_size, max_seq_len,
+                                                  block);
+      },
+      py::arg("batch_size"), py::arg("max_seq_len"), py::arg("block"),
+      "Optimal split_kv for the HIP dsa_topk_logits indexer (issue #51), "
+      "PERF ONLY (grouping-independent): max(1, min(ceildiv(max_seq_len,"
+      "block), 228/batch_size)) with NUM_CU=228 (MI300A / gfx942). At "
+      "bs=1 msl=4096 B=64 this is 64 (measured 898 us -> 191 us, 4.7x; "
+      "the bf16-MFMA fast path at split=1 is already ~24x faster than "
+      "the fp32-Q baseline, compressing the split gain). "
+      "Call before launching the GPU kernel instead of recomputing.");
 
   // --- MHC: multi-head hybrid-attention pre-norm (issue #51, part 2) ------
   //

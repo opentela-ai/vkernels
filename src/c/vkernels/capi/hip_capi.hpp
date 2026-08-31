@@ -229,6 +229,61 @@ void vk_hip_dsa_config(int S_q, int H, int dim, int topk, int* bq,
                        int* threads, int* block_I, int* inner_iter);
 
 /* ------------------------------------------------------------------ */
+/* DSA paged-MQA gated top-k logits (src/c/vkernels/kernels/dsa.hip,    */
+/* #51 -- the kpool>1 indexer path)                                     */
+/* ------------------------------------------------------------------ */
+/*
+ * The INDEXER scores each query against its paged KV tiles; the top-k
+ * selects over the results. See dsa.hpp for the gated-logit formula.
+ *
+ *   q_fp8       [batch_size, num_heads, head_dim]        fp8 e4m3fnuz
+ *   kvcache_u8  [num_blocks, block*(head_dim+4)]         uint8 (block*head_dim
+ *                 fp8 keys, then block fp32 per-token scales)
+ *   weight      [batch_size, num_heads]                  fp32 (the gate)
+ *   seq_lens    [batch_size]                             int32 (POOLED valid)
+ *   page_table  [batch_size, max_table_len]              int32
+ *   out         [batch_size, max_seq_len]                fp32 (ZERO first;
+ *                 max_seq_len = max_table_len*block. Tokens >= seq_len[b]
+ *                 are left unwritten -- sglang masks invalid positions)
+ *   split_kv    perf only: max(1, min(max_seq_len//block, NUM_CU//batch_size))
+ *                 with NUM_CU = 228 (MI300A / gfx942;
+ *                 hipDeviceProp_t::multiProcessorCount, verified on a CSCS
+ *                 beverin node -- the cap was wrongly stated as 256 here
+ *                 before dsa.hpp::dsa_topk_logits_split_for). Grouping-
+ *                 independent (any positive split_kv yields the same top-k).
+ *                 The host C ABI vk_dsa_topk_logits_split_for is the single
+ *                 source of truth for this formula; call it instead of
+ *                 recomputing.
+ *
+ * Dispatches on the staged-bytes cap (gfx942's 64 KB NON-OPTIN dynamic-LDS
+ * limit; NO hipFuncSetAttribute opt-in past it -- see the KB note
+ * mi300a-dynamic-lds-no-optin). The AUTO dispatcher (dsa_topk_logits in
+ * dsa.hip, via dsa_topk_logits_with_variant(0)) picks the SMALLEST-
+ * footprint variant that fits the shape's cap:
+ *   1. bf16-MFMA (dsa_topk_logits_kernel_mfma) -- Q transposed as bf16
+ *      sQt[D][H] staged once, one bf16 K-tile reloaded, gated via Matrix
+ *      Cores. Needs H%16==0, head_dim%64==0, block%16==0 and fits
+ *      dsa_topk_logits_fits_lds_mfma. At the GLM-5.3 indexer (H=32, D=128,
+ *      B=64) that is 16,768 B and runs ~10x faster than the fp32-Q kernel;
+ *      it also fits H=64 (25,088 B) and H=128 (41,728 B), so those now
+ *      take the MFMA fast path instead of the fp8-Q fallback.
+ *   2. fp32-Q (dsa_topk_logits_kernel) -- Q dequanted once into shared.
+ *      Fallback for shapes the MFMA kernel refuses but that fit
+ *      dsa_topk_logits_fits_lds (e.g. H not a multiple of 16).
+ *   3. fp8-Q (dsa_topk_logits_kernel_fp8q) -- Q staged raw, dequantised
+ *      on the fly -- bit-identical output. Fallback for shapes fitting
+ *      neither of the above but dsa_topk_logits_fits_lds_fp8q.
+ * Shapes fitting NONE are REFUSED -- a stderr diagnostic + no-op, leaving
+ * `out` as the caller provided.
+ */
+void vk_hip_dsa_topk_logits(
+    int batch_size, int num_heads, int head_dim, int block,
+    int max_table_len, int max_seq_len, int split_kv,
+    const void* q_fp8, const void* kvcache_u8,
+    const void* weight, const void* seq_lens,
+    const void* page_table, void* out);
+
+/* ------------------------------------------------------------------ */
 /* MHC multi-head hybrid-attention pre-norm (src/c/vkernels/kernels/    */
 /* mhc.hip, #51 part 2)                                                 */
 /* ------------------------------------------------------------------ */

@@ -1101,6 +1101,69 @@ def dsa_topk_transform(batch_size, score_stride, pool_size, token_topk, out_cols
                     int(page_row[raw_token]) if page_row is not None else raw_token + offset
                     if topk_indices_offset is not None else raw_token
                 )
+def dsa_topk_logits_split_for(batch_size, max_seq_len, block):
+    """Optimal split_kv for the HIP dsa_topk_logits indexer (mirrors
+    ``dsa_topk_logits_split_for``; issue #51). Perf only -- the CPU
+    reference has no split_kv (single-threaded), but the integrator calls
+    this before launching the GPU kernel. split_kv = max(1,
+    min(ceildiv(max_seq_len, block), 228 / batch_size)) with NUM_CU=228
+    (MI300A / gfx942). At bs=1 msl=4096 B=64 this is 64 (measured
+    21.5 ms -> 0.36 ms, 59.9x)."""
+    if batch_size <= 0 or max_seq_len <= 0 or block <= 0:
+        return 1
+    pages = -(-max_seq_len // block)  # ceildiv
+    by_cu = 228 // batch_size
+    s = min(pages, by_cu)
+    return s if s >= 1 else 1
+
+
+def dsa_topk_logits(batch_size, num_heads, head_dim, block, max_table_len,
+                    num_blocks, q, kv, k_scale, gate, seq_lens, page_table,
+                    out):
+    """Pure-Python (numpy) DSA paged-MQA gated top-k logits; mirrors
+    ``dsa_topk_logits_cpu`` exactly (the kpool>1 indexer path, the FIRST
+    stage feeding ``dsa_sparse_fwd``). ``q`` ``(B,H,D)``, ``kv``
+    ``(num_blocks,block,D)``, ``k_scale`` ``(num_blocks,block)``, ``gate``
+    ``(B,H)``, ``seq_lens`` ``(B,)`` int32 (pooled valid), ``page_table``
+    ``(B,max_table_len)`` int32 -> ``out`` ``(B,max_table_len*block)`` fp32.
+    Tokens ``t >= seq_lens[b]`` are left UNWRITTEN (the caller zeroes the
+    output first, mirroring the tilelang ``clean_logits=False`` path).
+    """
+    q = np.ascontiguousarray(q, dtype=np.float32).reshape(batch_size,
+                                                           num_heads, head_dim)
+    kv = np.ascontiguousarray(kv, dtype=np.float32).reshape(num_blocks, block,
+                                                            head_dim)
+    k_scale = np.ascontiguousarray(k_scale, dtype=np.float32).reshape(
+        num_blocks, block)
+    gate = np.ascontiguousarray(gate, dtype=np.float32).reshape(batch_size,
+                                                                num_heads)
+    seq_lens = np.ascontiguousarray(seq_lens, dtype=np.int32).reshape(batch_size)
+    page_table = np.ascontiguousarray(page_table, dtype=np.int32).reshape(
+        batch_size, max_table_len)
+    out = np.ascontiguousarray(out, dtype=np.float32).reshape(
+        batch_size, max_table_len * block)
+    for b in range(batch_size):
+        sl = int(seq_lens[b])
+        if sl <= 0:
+            continue  # nothing to write (output stays zeroed)
+        ob = out[b]   # (max_table_len * block,)
+        qb = q[b]     # (H, D)
+        gb = gate[b]  # (H,)
+        for i in range(max_table_len):
+            page = int(page_table[b, i])
+            if page < 0 or page >= num_blocks:
+                continue  # OOB page -> unwritten (mirrors dsa_sparse_fwd)
+            kb = kv[page]        # (block, D)
+            sb = k_scale[page]   # (block,)
+            # Per-head gated dot; H heads share the one K tile (paged MQA).
+            acc = (np.maximum(qb @ kb.T, np.float32(0.0)) * gb[:, None]).sum(
+                axis=0
+            )  # (block,)
+            for j in range(block):
+                t = i * block + j
+                if t >= sl:
+                    break  # rest of this page is past seq_len
+                ob[t] = np.float32(sb[j] * acc[j])
     return out
 
 

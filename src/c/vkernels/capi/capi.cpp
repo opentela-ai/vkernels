@@ -356,6 +356,35 @@ void vk_dsa_config(int S_q, int H, int dim, int topk, int* bq,
 }
 
 /* ------------------------------------------------------------------ */
+/* kernels: DSA — paged-MQA gated top-k logits (dsa.hpp, #51)         */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_dsa_topk_logits(int batch_size, int num_heads, int head_dim,
+                           int block, int max_table_len, int num_blocks,
+                           const float* q, const float* kv,
+                           const float* k_scale, const float* gate,
+                           const int32_t* seq_lens,
+                           const int32_t* page_table, float* out) {
+  VK_CAPI_TRY
+  vkernels::kernels::dsa_topk_logits_cpu(batch_size, num_heads, head_dim,
+                                         block, max_table_len, num_blocks,
+                                         q, kv, k_scale, gate, seq_lens,
+                                         page_table, out);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_dsa_topk_logits_split_for(int batch_size, int max_seq_len,
+                                     int block, int* split_kv) {
+  VK_CAPI_TRY
+  if (split_kv == nullptr) return VK_ERROR_INVALID_ARGUMENT;
+  *split_kv = vkernels::kernels::dsa_topk_logits_split_for(batch_size,
+                                                           max_seq_len, block);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+/* ------------------------------------------------------------------ */
 /* kernels: MHC — multi-head hybrid-attention pre-norm (mhc.hpp, #51)  */
 /* ------------------------------------------------------------------ */
 

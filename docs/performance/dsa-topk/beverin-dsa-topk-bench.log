@@ -1,0 +1,63 @@
+=== test_dsa_topk_correct (H=32 fp32-Q, H=64/H=128 fp8-Q) ===
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  bs=1  H=32 D=128 B=64 mt=8  nb=8  split=1  out[a=0.0625 r=0.000011]  PASS
+  bs=1  H=32 D=128 B=64 mt=16 nb=16 split=1  out[a=0.0625 r=0.000080]  PASS
+  bs=2  H=32 D=128 B=64 mt=8  nb=8  split=1  out[a=0.0625 r=0.000095]  PASS
+  bs=1  H=32 D=128 B=64 mt=8  nb=8  split=2  out[a=0.0625 r=0.000011]  PASS
+  bs=1  H=64 D=128 B=64 mt=8  nb=8  split=1  out[a=0.0938 r=0.000028]  PASS
+  bs=1  H=64 D=128 B=64 mt=16 nb=16 split=1  out[a=0.0938 r=0.000157]  PASS
+  bs=2  H=64 D=128 B=64 mt=8  nb=8  split=1  out[a=0.2500 r=0.000028]  PASS
+  bs=1  H=64 D=128 B=64 mt=8  nb=8  split=2  out[a=0.0938 r=0.000028]  PASS
+  bs=1  H=128 D=128 B=64 mt=8  nb=8  split=1  out[a=0.2500 r=0.000013]  PASS
+  bs=1  H=4  D=16  B=8  mt=32 nb=32 split=1  out[a=0.0020 r=0.000001]  PASS
+  bs=1  H=2  D=8   B=4  mt=16 nb=16 split=1  out[a=0.0020 r=0.000000]  PASS
+  bs=1  H=1  D=2   B=2  mt=4  nb=4  split=1  out[a=0.0000 r=0.000000]  PASS
+
+PASS (0 failure(s))
+
+=== dsa_topk_bench ===
+GPU: AMD Instinct MI300A (arch=gfx942)  228 CUs,  roof 1307 TFLOP/s bf16, 5300 GB/s HBM3, ridge ~247 FLOP/B
+
+=== hip::dsa_topk_logits (GLM-5.3 indexer) ===
+    bs    H ms_len    B   mt   nb  split   us(min)   us(med)      GB/s    AI  %bw  bound
+     1   32     512   64    8    8      1    2696.9    2701.6       0.0  57.2  0.0  mem
+     1   32    1024   64   16   16      1    5377.1    5382.7       0.0  58.9  0.0  mem
+     1   32    2048   64   32   32      1   10728.7   10746.6       0.0  59.8  0.0  mem
+     1   32    4096   64   64   64      1   21442.6   21461.1       0.0  60.2  0.0  mem
+     2   32     512   64    8    8      1    2696.2    2702.9       0.1  57.2  0.0  mem
+     4   32     512   64    8    8      1    2701.9    2709.1       0.1  57.2  0.0  mem
+     8   32     512   64    8    8      1    2715.4    2719.1       0.2  57.2  0.0  mem
+    16   32     512   64    8    8      1    2715.1    2719.5       0.4  57.2  0.0  mem
+    32   32     512   64    8    8      1    2717.3    2722.3       0.9  57.2  0.0  mem
+    64   32     512   64    8    8      1    2719.7    2725.2       1.7  57.2  0.0  mem
+     1   64     512   64    8    8      1    8212.0    8220.9       0.0 108.2  0.0  mem
+     1   64    1024   64   16   16      1   16410.9   16418.9       0.0 114.4  0.0  mem
+     1   64    4096   64   64   64      1   65590.1   65628.5       0.0 119.6  0.0  mem
+     1   32     128   64    2    2      1     687.2     694.7       0.0  48.8  0.0  mem
+  Roof: 1307 TFLOP/s bf16 (Matrix-Core), 5300 GB/s HBM3.
+  NB: the working set (68-560 KB for these shapes) is L2-resident
+      after warmup, so the kernel is NOT HBM-bandwidth-bound -- the
+      binding constraint at decode (bs=1, split=1) is OCCUPANCY: the
+      grid is ONE wavefront (one of MI300A's 228 CUs). split_kv
+      (below) distributes the page range across more CUs and gives
+      near-linear speedup; batch scaling is free parallelism up to
+      ~228 batches. The follow-on tiled-key/MFMA the kernel's
+      docstring references raises occupancy AND moves toward the
+      compute roof.
+
+=== split_kv sweep (bs=1 H=32 D=128 B=64 mt=64 nb=64, max_seq_len=4096, 228 CUs) ===
+  dsa_topk_logits_split_for(1, 4096, 64) = 64  (recommended)
+   split   us(min)   us(med)      GB/s   speedup
+       1   21433.0   21468.1       0.0      1.0x
+       2   10730.5   10744.4       0.1      2.0x
+       4    5385.5    5391.9       0.1      4.0x
+       8    2712.8    2718.3       0.2      7.9x
+      16    1366.9    1371.4       0.4     15.7x
+      32     693.5     698.7       0.8     30.7x
+      64     355.8     361.5       1.6     59.4x
+  (split_kv is perf-only and grouping-independent -- the
+        reference logit is identical across splits; see
+        test_dsa_topk_correct.hip case split=2. Max split
+        here is ceildiv(max_seq_len,B)=64. The integrator
+        should set split_kv = min(ceildiv(max_seq_len,B),
+        CUs/batch_size) -- see dsa.hpp::dsa_topk_logits_split_for.)
