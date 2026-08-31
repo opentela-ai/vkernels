@@ -856,6 +856,96 @@ TEST(CapiDsa, NullArgsThrow) {
   EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
 }
 
+// --- DSA paged-MQA gated top-k logits (dsa.hpp, issue #51, the kpool>1 ---
+//    indexer path that FEEDS vk_dsa_sparse_fwd) -------------------------
+
+// Mirrors test_dsa.cpp::DsaTopk::HandCheckedSingleHead: 1 head, 1 block,
+// 2 keys [1,0][0,1], scales [2,3], gate [1], seq_len 2.
+//   t=0: dot=1, acc=1*1=1, out=2*1=2 ;  t=1: dot=1, acc=1, out=3*1=3
+TEST(CapiDsaTopk, HandCheckedSingleHead) {
+  const float q[2] = {1, 1};
+  const float kv[4] = {1, 0, 0, 1};        // [1 block][2 tokens][2]
+  const float k_scale[2] = {2, 3};
+  const float gate[1] = {1};
+  const int32_t sl[1] = {2};
+  const int32_t pt[1] = {0};
+  std::vector<float> out(2, -1.0f);
+  EXPECT_EQ(vk_dsa_topk_logits(1, 1, 2, 2, 1, 1, q, kv, k_scale, gate, sl,
+                              pt, out.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 2.0f, 1e-6f);
+  EXPECT_NEAR(out[1], 3.0f, 1e-6f);
+}
+
+// seq_len truncates WITHIN a page (block=4, seq_len=2): tokens 2,3 of the
+// page are past seq_len and LEFT UNWRITTEN. Mirrors test_dsa.cpp::DsaTopk.
+TEST(CapiDsaTopk, SeqLenTruncatesWithinPage) {
+  const float q[2] = {1, 1};
+  const float kv[8] = {1, 1, 2, 2, 3, 3, 4, 4};  // [1][4 tokens][2]
+  const float k_scale[4] = {1, 1, 1, 1};
+  const float gate[1] = {1};
+  const int32_t sl[1] = {2};
+  const int32_t pt[1] = {0};
+  std::vector<float> out(4, 0.0f);                 // max_seq_len = 1*4
+  EXPECT_EQ(vk_dsa_topk_logits(1, 1, 2, 4, 1, 1, q, kv, k_scale, gate, sl,
+                              pt, out.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 2.0f, 1e-6f);
+  EXPECT_NEAR(out[1], 4.0f, 1e-6f);
+  EXPECT_EQ(out[2], 0.0f);   // past seq_len, left unwritten
+  EXPECT_EQ(out[3], 0.0f);
+}
+
+// Empty (batch_size==0 or max_table_len==0) is a no-op: output untouched
+// (mirrors CapiDsa::EmptyIsNoOp + test_dsa.cpp::DsaTopk::EmptyIsNoOp).
+TEST(CapiDsaTopk, EmptyIsNoOp) {
+  std::vector<float> out = {3.0f, 4.0f};
+  const float q[2] = {1, 1}, kv[4] = {1, 1, 1, 1}, k_scale[2] = {1, 1},
+      gate[1] = {1};
+  const int32_t sl[1] = {2}, pt[1] = {0};
+  EXPECT_EQ(vk_dsa_topk_logits(0, 1, 2, 2, 1, 1, q, kv, k_scale, gate, sl,
+                              pt, out.data()),
+            VK_OK);
+  EXPECT_EQ(out[0], 3.0f);
+  EXPECT_EQ(out[1], 4.0f);
+  EXPECT_EQ(vk_dsa_topk_logits(1, 1, 2, 2, 0, 1, q, kv, k_scale, gate, sl,
+                              pt, out.data()),
+            VK_OK);
+  EXPECT_EQ(out[0], 3.0f);
+  EXPECT_EQ(out[1], 4.0f);
+}
+
+// Null pointer (batch_size>0, max_table_len>0) -> VK_ERROR_INVALID_ARGUMENT.
+TEST(CapiDsaTopk, NullArgsThrow) {
+  const float kv[4] = {1, 1, 1, 1}, k_scale[2] = {1, 1}, gate[1] = {1};
+  const int32_t sl[1] = {2}, pt[1] = {0};
+  std::vector<float> out(2, 1.0f);
+  EXPECT_NE(vk_dsa_topk_logits(1, 1, 2, 2, 1, 1, nullptr, kv, k_scale, gate,
+                              sl, pt, out.data()),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+// dsa_topk_logits_split_for: optimal split_kv = max(1, min(ceildiv(msl,B),
+// 228/bs)). bs=1 msl=4096 B=64 -> 64 (one page/split, 64 of 228 CUs);
+// bs=64 msl=4096 B=64 -> min(64, 3) = 3 (192 of 228 CUs); empty -> 1.
+TEST(CapiDsaTopk, SplitFor) {
+  int sp = 0;
+  EXPECT_EQ(vk_dsa_topk_logits_split_for(1, 4096, 64, &sp), VK_OK);
+  EXPECT_EQ(sp, 64);
+  EXPECT_EQ(vk_dsa_topk_logits_split_for(1, 1024, 64, &sp), VK_OK);
+  EXPECT_EQ(sp, 16);
+  EXPECT_EQ(vk_dsa_topk_logits_split_for(64, 4096, 64, &sp), VK_OK);
+  EXPECT_EQ(sp, 3);
+  EXPECT_EQ(vk_dsa_topk_logits_split_for(0, 4096, 64, &sp), VK_OK);
+  EXPECT_EQ(sp, 1);
+}
+
+TEST(CapiDsaTopk, SplitForNullArg) {
+  EXPECT_NE(vk_dsa_topk_logits_split_for(1, 4096, 64, nullptr), VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
 // --- MHC — multi-head hybrid-attention pre-norm (mhc.hpp, issue #51) ----
 
 TEST(CapiMhc, PreGemmSqrsumHandChecked) {

@@ -19,6 +19,11 @@
 
 using vkernels::kernels::dsa_config_for;
 using vkernels::kernels::dsa_sparse_fwd_cpu;
+using vkernels::kernels::dsa_topk_logits_cpu;
+using vkernels::kernels::dsa_topk_logits_fits_lds;
+using vkernels::kernels::dsa_topk_logits_fits_lds_fp8q;
+using vkernels::kernels::dsa_topk_logits_fits_lds_mfma;
+using vkernels::kernels::dsa_topk_logits_split_for;
 
 namespace {
 
@@ -281,4 +286,308 @@ TEST(DsaFwd, EmptyIsNoOp) {
                      nullptr, nullptr, out.data(), nullptr);
   EXPECT_EQ(out[0], 3.0f);
   EXPECT_EQ(out[1], 4.0f);
+}
+
+// ---------------------------------------------------------------------------
+//  DSA paged-MQA gated top-k logits (issue #51): the kpool>1 indexer path.
+//  Hand-checked cases for the gated-logit formula (per-head gate weighting,
+//  ReLU on the per-head dot, per-token k_scale), the seq_len truncation
+//  (tokens >= seq_len left unwritten -- the caller ZEROES the output first),
+//  the OOB-page mask (page_table[b,i] < 0 or >= num_blocks skipped, exactly
+//  like dsa_sparse_fwd masks an index >= S_kv), the null-arg / negative-dim
+//  / empty no-op edges, and an independent reference across several shapes.
+// ---------------------------------------------------------------------------
+
+// Independent reference (different decomposition: iterate (b, t) with
+// i = t/block, j = t%block; truncate per-token with `continue`, not a page
+// `break`; OOB page skipped with `continue`) to catch indexing / stride /
+// truncation errors the hand-checked cases might miss.
+static void topk_ref(int batch_size, int num_heads, int head_dim, int block,
+                     int max_table_len, int num_blocks,
+                     const std::vector<float>& q,    // [bs, H, D]
+                     const std::vector<float>& kv,   // [num_blocks, block, D]
+                     const std::vector<float>& k_scale,  // [num_blocks, block]
+                     const std::vector<float>& gate,     // [bs, H]
+                     const std::vector<int32_t>& seq_lens,
+                     const std::vector<int32_t>& page_table,
+                     std::vector<float>& out) {  // [bs, max_table_len*block], ZEROED
+  const int max_t = max_table_len * block;
+  for (int b = 0; b < batch_size; ++b) {
+    const int seq_len = seq_lens[b];
+    for (int t = 0; t < max_t; ++t) {
+      if (t >= seq_len) continue;
+      const int i = t / block, j = t % block;
+      const int32_t page = page_table[(size_t)b * max_table_len + i];
+      if (page < 0 || page >= num_blocks) continue;
+      float acc = 0.0f;
+      for (int h = 0; h < num_heads; ++h) {
+        const float* qh = q.data() + (((size_t)b * num_heads + h) * head_dim);
+        const float* kj = kv.data() + (((size_t)page * block + j) * head_dim);
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) dot += qh[d] * kj[d];
+        acc += std::fmax(dot, 0.0f) * gate[(size_t)b * num_heads + h];
+      }
+      out[(size_t)b * max_table_len * block + t] =
+          k_scale[(size_t)page * block + j] * acc;
+    }
+  }
+}
+
+// Hand-checked, single head, two-token page (block=2). q=[1,1] keys
+// [[1,0],[0,1]] scales [2,3] gate [1] seq_len 2:
+//   t=0: dot=1, acc=1*1=1, out=2*1=2 ;  t=1: dot=1, acc=1, out=3*1=3
+TEST(DsaTopk, HandCheckedSingleHead) {
+  std::vector<float> q = {1, 1};
+  std::vector<float> kv = {1, 0, 0, 1};        // [1 block][2 tokens][2]
+  std::vector<float> k_scale = {2, 3};          // [1 block][2 tokens]
+  std::vector<float> gate = {1};
+  std::vector<int32_t> sl = {2};
+  std::vector<int32_t> pt = {0};
+  std::vector<float> out(2, 0);
+  dsa_topk_logits_cpu(1, 1, 2, 2, 1, 1, q.data(), kv.data(), k_scale.data(),
+                      gate.data(), sl.data(), pt.data(), out.data());
+  EXPECT_NEAR(out[0], 2.0f, 1e-6f);
+  EXPECT_NEAR(out[1], 3.0f, 1e-6f);
+}
+
+// Hand-checked, two heads, one-token pages (block=1): per-head gate
+// weighting [2,3] with a ReLU-masked negative dot in each head.
+//   q H0=[1,0] H1=[0,1]  page0 k=[1,-1]  page1 k=[-2,2]  scales [1,1] seq 2
+//   t=0: H0 dot=+1 ->2, H1 dot=-1 ->0 ; acc=2 ; out=2
+//   t=1: H0 dot=-2 ->0, H1 dot=+2 ->6 ; acc=6 ; out=6
+TEST(DsaTopk, HandCheckedMultiHeadGateRelu) {
+  std::vector<float> q = {1, 0, 0, 1};          // [1][2 heads][2]
+  std::vector<float> kv = {1, -1, -2, 2};       // [2 blocks][1 token][2]
+  std::vector<float> k_scale = {1, 1};          // [2 blocks][1 token]
+  std::vector<float> gate = {2, 3};
+  std::vector<int32_t> sl = {2};
+  std::vector<int32_t> pt = {0, 1};
+  std::vector<float> out(2, 0);
+  dsa_topk_logits_cpu(1, 2, 2, 1, 2, 2, q.data(), kv.data(), k_scale.data(),
+                      gate.data(), sl.data(), pt.data(), out.data());
+  EXPECT_NEAR(out[0], 2.0f, 1e-6f);
+  EXPECT_NEAR(out[1], 6.0f, 1e-6f);
+}
+
+// seq_len truncates WITHIN a page (block=4, seq_len=2): tokens 2,3 of the
+// page are past seq_len and must be LEFT UNWRITTEN (caller zeroed first).
+//   q=[1,1] keys [1,1][2,2][3,3][4,4] scales [1,1,1,1] gate [1] seq_len 2
+//   t=0,1: dot=2,4 -> out=2,4 ;  t=2,3: unwritten -> stay 0
+TEST(DsaTopk, SeqLenTruncatesWithinPage) {
+  std::vector<float> q = {1, 1};
+  std::vector<float> kv = {1, 1, 2, 2, 3, 3, 4, 4};  // [1][4 tokens][2]
+  std::vector<float> k_scale = {1, 1, 1, 1};          // [1][4 tokens]
+  std::vector<float> gate = {1};
+  std::vector<int32_t> sl = {2};
+  std::vector<int32_t> pt = {0};
+  std::vector<float> out(4, 0);                         // max_seq_len = 1*4
+  dsa_topk_logits_cpu(1, 1, 2, 4, 1, 1, q.data(), kv.data(), k_scale.data(),
+                      gate.data(), sl.data(), pt.data(), out.data());
+  EXPECT_NEAR(out[0], 2.0f, 1e-6f);
+  EXPECT_NEAR(out[1], 4.0f, 1e-6f);
+  EXPECT_EQ(out[2], 0.0f);   // past seq_len, left unwritten
+  EXPECT_EQ(out[3], 0.0f);
+}
+
+// OOB page (page_table entry >= num_blocks) is skipped -- its tokens stay
+// unwritten, exactly like dsa_sparse_fwd masks an index >= S_kv.
+//   q=[1,1] 1 block (2 keys [1,1]) scales [1,1] gate [1] seq_len 4
+//   page_table [0, 5] -> page 5 is OOB (num_blocks=1); t=2,3 stay 0.
+TEST(DsaTopk, OutOfBoundPageIsUnwritten) {
+  std::vector<float> q = {1, 1};
+  std::vector<float> kv = {1, 1, 1, 1};        // [1 block][2 tokens][2]
+  std::vector<float> k_scale = {1, 1};          // [1 block][2 tokens]
+  std::vector<float> gate = {1};
+  std::vector<int32_t> sl = {4};                // expects 4 tokens
+  std::vector<int32_t> pt = {0, 5};            // page 5 is OOB
+  std::vector<float> out(4, 0);                 // max_seq_len = 2*2
+  dsa_topk_logits_cpu(1, 1, 2, 2, 2, 1, q.data(), kv.data(), k_scale.data(),
+                      gate.data(), sl.data(), pt.data(), out.data());
+  EXPECT_NEAR(out[0], 2.0f, 1e-6f);
+  EXPECT_NEAR(out[1], 2.0f, 1e-6f);
+  EXPECT_EQ(out[2], 0.0f);   // OOB page, left unwritten
+  EXPECT_EQ(out[3], 0.0f);
+}
+
+// Cross-check the oracle against the independent reference across several
+// shapes (GLM-5.3-like D=128/block=64 included, with truncated seq_lens and
+// ~10% of page_table entries masked to -1 to exercise both edges).
+TEST(DsaTopk, MatchesReference) {
+  struct Cfg { int bs, H, D, block, max_table_len, num_blocks; };
+  const Cfg cfgs[] = {
+      {1, 2, 8, 4, 16, 16},     // decode-ish
+      {1, 4, 16, 8, 32, 32},    // more heads
+      {2, 1, 8, 4, 16, 16},     // batch > 1
+      {1, 2, 128, 64, 8, 8},    // GLM-5.3-ish (D=128, block=64)
+      {1, 1, 2, 2, 4, 4},       // tiny
+  };
+  std::mt19937 rng(98765);
+  auto rf = [&]() { return static_cast<float>(rng() % 2000) / 1000.0f - 1.0f; };
+  for (const auto& c : cfgs) {
+    const int max_seq_len = c.max_table_len * c.block;
+    std::vector<float> q((size_t)c.bs * c.H * c.D);
+    std::vector<float> kv((size_t)c.num_blocks * c.block * c.D);
+    std::vector<float> k_scale((size_t)c.num_blocks * c.block);
+    std::vector<float> gate((size_t)c.bs * c.H);
+    std::vector<int32_t> sl(c.bs);
+    std::vector<int32_t> pt((size_t)c.bs * c.max_table_len);
+    for (auto& x : q) x = rf();
+    for (auto& x : kv) x = rf();
+    for (auto& x : k_scale) x = static_cast<float>(rng() % 1000) / 1000.0f + 0.5f;
+    for (auto& x : gate) x = rf();
+    for (int b = 0; b < c.bs; ++b)
+      sl[b] = static_cast<int32_t>(rng() % (max_seq_len + 1));  // [0, max_seq_len]
+    for (size_t i = 0; i < pt.size(); ++i)
+      pt[i] = (rng() % 10 == 0) ? -1 : static_cast<int32_t>(rng() % c.num_blocks);
+
+    std::vector<float> out((size_t)c.bs * max_seq_len, 0.0f);
+    std::vector<float> rout((size_t)c.bs * max_seq_len, 0.0f);
+    dsa_topk_logits_cpu(c.bs, c.H, c.D, c.block, c.max_table_len, c.num_blocks,
+                        q.data(), kv.data(), k_scale.data(), gate.data(),
+                        sl.data(), pt.data(), out.data());
+    topk_ref(c.bs, c.H, c.D, c.block, c.max_table_len, c.num_blocks,
+             q, kv, k_scale, gate, sl, pt, rout);
+    float maxd = 0.0f;
+    for (size_t i = 0; i < out.size(); ++i)
+      maxd = std::max(maxd, std::fabs(out[i] - rout[i]));
+    EXPECT_NEAR(maxd, 0.0f, 1e-4f);
+  }
+}
+
+// Null pointers are rejected when there is work; allowed (no-op) when
+// batch_size == 0 or max_table_len == 0; negative / zero dims are rejected.
+TEST(DsaTopk, NullArgsAndDimsThrow) {
+  std::vector<float> q(4, 1), kv(4, 1), k_scale(2, 1), gate(2, 1), out(2, 1);
+  std::vector<int32_t> sl{2}, pt{0};
+  // batch_size>0, max_table_len>0 -> every pointer is required.
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 2, 2, 2, 1, 1, nullptr, kv.data(),
+                      k_scale.data(), gate.data(), sl.data(), pt.data(), out.data()),
+               std::invalid_argument);
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 2, 2, 2, 1, 1, q.data(), nullptr,
+                      k_scale.data(), gate.data(), sl.data(), pt.data(), out.data()),
+               std::invalid_argument);
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 2, 2, 2, 1, 1, q.data(), kv.data(),
+                      nullptr, gate.data(), sl.data(), pt.data(), out.data()),
+               std::invalid_argument);
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 2, 2, 2, 1, 1, q.data(), kv.data(),
+                      k_scale.data(), nullptr, sl.data(), pt.data(), out.data()),
+               std::invalid_argument);
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 2, 2, 2, 1, 1, q.data(), kv.data(),
+                      k_scale.data(), gate.data(), nullptr, pt.data(), out.data()),
+               std::invalid_argument);
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 2, 2, 2, 1, 1, q.data(), kv.data(),
+                      k_scale.data(), gate.data(), sl.data(), nullptr, out.data()),
+               std::invalid_argument);
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 2, 2, 2, 1, 1, q.data(), kv.data(),
+                      k_scale.data(), gate.data(), sl.data(), pt.data(), nullptr),
+               std::invalid_argument);
+  // No work -> null pointers are allowed (no-op, mirrors EmptyIsNoOp).
+  EXPECT_NO_THROW(dsa_topk_logits_cpu(0, 2, 2, 2, 1, 1, nullptr, nullptr,
+                      nullptr, nullptr, nullptr, nullptr, nullptr));
+  EXPECT_NO_THROW(dsa_topk_logits_cpu(1, 2, 2, 2, 0, 1, nullptr, nullptr,
+                      nullptr, nullptr, nullptr, nullptr, nullptr));
+  // Negative / zero dims are rejected.
+  EXPECT_THROW(dsa_topk_logits_cpu(-1, 2, 2, 2, 1, 1, nullptr, nullptr,
+                      nullptr, nullptr, nullptr, nullptr, nullptr),
+               std::invalid_argument);
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 0, 2, 2, 1, 1, q.data(), kv.data(),
+                      k_scale.data(), gate.data(), sl.data(), pt.data(), out.data()),
+               std::invalid_argument);
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 2, 0, 2, 1, 1, q.data(), kv.data(),
+                      k_scale.data(), gate.data(), sl.data(), pt.data(), out.data()),
+               std::invalid_argument);
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 2, 2, 0, 1, 1, q.data(), kv.data(),
+                      k_scale.data(), gate.data(), sl.data(), pt.data(), out.data()),
+               std::invalid_argument);
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 2, 2, 2, -1, 1, q.data(), kv.data(),
+                      k_scale.data(), gate.data(), sl.data(), pt.data(), out.data()),
+               std::invalid_argument);
+  EXPECT_THROW(dsa_topk_logits_cpu(1, 2, 2, 2, 1, -1, q.data(), kv.data(),
+                      k_scale.data(), gate.data(), sl.data(), pt.data(), out.data()),
+               std::invalid_argument);
+}
+
+// Empty (batch_size==0 or max_table_len==0) is a no-op: output untouched.
+TEST(DsaTopk, EmptyIsNoOp) {
+  std::vector<float> out = {3.0f, 4.0f};
+  dsa_topk_logits_cpu(0, 1, 2, 2, 1, 1, nullptr, nullptr, nullptr, nullptr,
+                      nullptr, nullptr, out.data());
+  EXPECT_EQ(out[0], 3.0f);
+  EXPECT_EQ(out[1], 4.0f);
+  dsa_topk_logits_cpu(1, 1, 2, 2, 0, 1, nullptr, nullptr, nullptr, nullptr,
+                      nullptr, nullptr, out.data());
+  EXPECT_EQ(out[0], 3.0f);
+  EXPECT_EQ(out[1], 4.0f);
+}
+
+// Whether the indexer shape fits gfx942's 64 KB non-optin dynamic-LDS cap
+// under the fp32-Q kernel -- the launcher's FAST-PATH guard. The kernel
+// stages Q (H*D), the per-head gate (H), one K tile (B*D) and its
+// per-token scales (B), all fp32: (H*D + H + B*D + B) * 4 B. GLM-5.3
+// (H=32, D=128, B=64) stages 49,536 B (verified); H=64 stages 66,048 B and
+// is refused BY THIS GUARD (the launcher then falls back to the fp8-Q
+// kernel, see FitsLdsFp8q below). The host oracle is shape-agnostic, so
+// these only exercise the launcher's dsa_topk_logits_fits_lds guard.
+TEST(DsaTopk, FitsLdsCap) {
+  EXPECT_TRUE(dsa_topk_logits_fits_lds(32, 128, 64));    // GLM-5.3: 49,536 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds(2, 8, 4));       // tiny: 216 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds(63, 128, 64));   // edge: 65,532 B
+  EXPECT_FALSE(dsa_topk_logits_fits_lds(64, 128, 64));  // 66,048 B (-> fp8-Q)
+  EXPECT_FALSE(dsa_topk_logits_fits_lds(32, 128, 128)); // 82,560 B (larger block)
+}
+
+// Whether the indexer shape fits the fp8-Q kernel (Q staged RAW, dequantised
+// on the fly in the dot loop with the SAME fp8e4m3fnuz_to_f32 helper -- so
+// the dequanted Q values and the output are bit-identical to the fp32-Q
+// kernel), the launcher's FALLBACK for shapes FitsLdsCap refuses:
+// (H + B*D + B) * 4 + H*D B. GLM-5.3 2x (H=64, D=128, B=64) stages 41,472 B
+// and is VERIFIED on a CSCS beverin node
+// (meta/benchmarks/test_dsa_topk_correct.hip); the fp8-Q cap admits up to
+// H=246 at D=128, B=64 (shapes fitting neither variant are refused).
+TEST(DsaTopk, FitsLdsFp8q) {
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_fp8q(64, 128, 64));    // GLM-5.3 2x: 41,472 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_fp8q(128, 128, 64));   // 4x: 49,920 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_fp8q(246, 128, 64));   // edge: 65,496 B
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_fp8q(247, 128, 64));  // 65,628 B (just over)
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_fp8q(32, 128, 128));  // 70,272 B (neither fits)
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_fp8q(2, 8, 4));        // tiny: 168 B
+}
+
+// dsa_topk_logits_fits_lds_mfma: the bf16-MFMA variant stages Q
+// transposed as bf16 sQt[D][H] ONCE, one bf16 K-tile sK[B][kBK=64], the
+// gate sGate[H] and scales sKscale[B] as fp32 ->
+//   (D*H + B*64)*2 + (H + B)*4   bytes
+// the SMALLEST of the three variants at every GLM-5.3 width (16,768 / 25,088 /
+// 41,728 B at H=32/64/128). The verified 16x16x16bf16_1k fragment needs exact
+// multiples, so this is FALSE unless H%16==0, D%64==0 AND B%16==0.
+TEST(DsaTopk, FitsLdsMfma) {
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(32, 128, 64));    // GLM-5.3: 16,768 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(64, 128, 64));    // 2x: 25,088 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(128, 128, 64));   // 4x: 41,728 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(208, 128, 64));   // edge H: 62,528 B
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(224, 128, 64));  // 66,688 B (1st mult-16 over)
+  // Shape constraints -- the verified fragment needs exact multiples.
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(246, 128, 64));  // H not mult of 16
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(32, 130, 64));   // D not mult of 64
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(32, 128, 72));   // B not mult of 16
+  // Bigger B is fine for the MFMA kernel (32,128,128 stages 25,216 B) --
+  // it fits where the fp32-Q (82,560 B) and fp8-Q (70,272 B) BOTH refuse.
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(32, 128, 128));   // 25,216 B (fits!)
+  // Same SMALLEST-footprint win at the tiny end (D must be >= 64).
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(2, 8, 4));       // D=8 not mult of 64
+}
+
+// dsa_topk_logits_split_for: optimal split_kv = max(1, min(ceildiv(msl,B),
+// 228/bs)) -- the single source of truth the hip_capi.hpp docstring used
+// to restate (with the wrong NUM_CU=256).
+TEST(DsaTopk, SplitFor) {
+  EXPECT_EQ(dsa_topk_logits_split_for(1, 4096, 64), 64);   // 64 pages, 228/1
+  EXPECT_EQ(dsa_topk_logits_split_for(1, 1024, 64), 16);   // 16 pages, 228/1
+  EXPECT_EQ(dsa_topk_logits_split_for(64, 4096, 64), 3);  // min(64, 228/64)
+  EXPECT_EQ(dsa_topk_logits_split_for(228, 4096, 64), 1); // min(64, 228/228)
+  EXPECT_EQ(dsa_topk_logits_split_for(0, 4096, 64), 1);   // empty -> safe 1
+  EXPECT_EQ(dsa_topk_logits_split_for(1, 0, 64), 1);     // zero msl -> 1
+  EXPECT_EQ(dsa_topk_logits_split_for(1, 4096, 0), 1);   // zero block -> 1
+  // bs=2: each split handles ceildiv(4096,64)/sp pages across 2 batches.
+  EXPECT_EQ(dsa_topk_logits_split_for(2, 4096, 64), 64);  // min(64, 228/2)
 }

@@ -127,6 +127,19 @@ extern "C" void vk_hip_dsa_config(int S_q, int H, int dim, int topk, int* bq,
                                     inner_iter);
 }
 
+// --- DSA paged-MQA gated top-k logits (GLM-5.3-Flash indexer, #51) ---
+extern "C" void vk_hip_dsa_topk_logits(
+    int batch_size, int num_heads, int head_dim, int block,
+    int max_table_len, int max_seq_len, int split_kv,
+    const void* q_fp8, const void* kvcache_u8,
+    const void* weight, const void* seq_lens,
+    const void* page_table, void* out) {
+  vkernels::kernels::hip::dsa_topk_logits(
+      batch_size, num_heads, head_dim, block,
+      max_table_len, max_seq_len, split_kv,
+      q_fp8, kvcache_u8, weight, seq_lens, page_table, out);
+}
+
 // --- MHC multi-head hybrid-attention pre-norm (GLM-5.3-Flash) ---
 extern "C" void vk_hip_mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3,
                                         int hc_hidden_size,

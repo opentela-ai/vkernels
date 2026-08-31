@@ -272,10 +272,27 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_dsa_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_dsa_correct)
 
+  # DSA paged-MQA gated top-k logits (issue #51): the kpool>1 indexer path.
+  add_executable(test_dsa_topk_correct test_dsa_topk_correct.hip)
+  target_link_libraries(test_dsa_topk_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_dsa_topk_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_dsa_topk_correct)
+
   add_executable(dsa_bench bench_dsa.hip)
   target_link_libraries(dsa_bench PRIVATE vkernels::vkernels)
   target_compile_features(dsa_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(dsa_bench)
+
+  # DSA paged-MQA gated top-k logits (issue #51): the kpool>1 indexer path
+  # that FEEDS dsa_sparse_fwd. Same harness style as bench_dsa.hip (HIP
+  # events, variance-driven iters) but for the fp8 e4m3fnuz top-k logits
+  # kernel. Renamed from bench_dsa_topk.hip / dsa_topk_bench to avoid an
+  # add/add collision with the DSA radix top-k TRANSFORM bench (issue #56,
+  # bench_dsa_topk.hip / dsa_topk_bench on main).
+  add_executable(dsa_topk_logits_bench bench_dsa_topk_logits.hip)
+  target_link_libraries(dsa_topk_logits_bench PRIVATE vkernels::vkernels)
+  target_compile_features(dsa_topk_logits_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(dsa_topk_logits_bench)
 
   # MHC multi-head hybrid-attention pre-norm (issue #51, part 2).
   add_executable(test_mhc_correct test_mhc_correct.hip)

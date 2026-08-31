@@ -29,10 +29,34 @@ ROOT = discovery.find_repo_root(_SRC / "vkernels")
 # Exact contract for the kernels/ headers (files sorted alphabetically,
 # declarations in file order): name -> category.
 EXPECTED_KERNELS = [
+    # DSA sparse-MLA forward (issue #51): the two-implementation model is
+    # dsa_sparse_fwd_cpu (always compiled) + the HIP dsa_sparse_fwd[_with_tile].
     ("dsa_sparse_fwd_cpu", "dsa"),
     ("dsa_config_for", "dsa"),
+    # DSA paged-MQA gated top-k logits (issue #51, the kpool>1 indexer path):
+    # the FIRST stage feeding dsa_sparse_fwd. dsa_topk_logits_cpu is the
+    # always-compiled host reference; dsa_topk_logits_fits_lds is the
+    # host-callable 64 KB non-optin LDS-cap guard selecting the launcher's
+    # fp32-Q fast path (verified at H=32); dsa_topk_logits_fits_lds_fp8q is
+    # the fallback guard for larger H (Q staged raw fp8, dequantised on the
+    # fly -- bit-identical output); dsa_topk_logits_fits_lds_mfma is the
+    # bf16-MFMA fast path guard (smallest footprint, Matrix-Core). The HIP
+    # dsa_topk_logits and dsa_topk_logits_with_variant are declared in the
+    # #if VKERNELS_HAS_HIP block, so they sort after dsa_sparse_fwd_with_tile.
+    ("dsa_topk_logits_cpu", "dsa"),
+    ("dsa_topk_logits_fits_lds", "dsa"),
+    ("dsa_topk_logits_fits_lds_fp8q", "dsa"),
+    ("dsa_topk_logits_fits_lds_mfma", "dsa"),
+    # The optimal split_kv for the HIP dsa_topk_logits indexer (issue
+    # #51), the single source of truth for the formula the hip_capi.hpp
+    # docstring used to restate (with the wrong NUM_CU=256 -> 228).
+    ("dsa_topk_logits_split_for", "dsa"),
     ("dsa_sparse_fwd", "dsa"),
     ("dsa_sparse_fwd_with_tile", "dsa"),
+    ("dsa_topk_logits", "dsa"),
+    ("dsa_topk_logits_with_variant", "dsa"),
+    # DSA radix top-k transform (issue #56), declared in dsa_topk.hpp
+    # (file sorts after dsa.hpp, so the dsa_topk block follows the dsa block):
     ("dsa_topk_transform_group_topk_supported", "dsa_topk"),
     ("dsa_topk_transform_cpu", "dsa_topk"),
     ("dsa_topk_transform", "dsa_topk"),

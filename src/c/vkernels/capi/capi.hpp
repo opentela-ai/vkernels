@@ -205,6 +205,56 @@ void vk_dsa_config(int S_q, int H, int dim, int topk, int* bq,
                    int* threads, int* block_I, int* inner_iter);
 
 /* ------------------------------------------------------------------ */
+/* kernels: DSA — paged-MQA gated top-k logits (dsa.hpp, #51, the    */
+/* kpool>1 indexer path that FEEDS vk_dsa_sparse_fwd)                */
+/* ------------------------------------------------------------------ */
+/*
+ * The INDEXER scores each query against its paged KV tiles; the top-k
+ * then selects the blocks to attend over (see dsa.hpp for the gated-
+ * logit formula). This is the FIRST stage of the sparse-MLA forward —
+ * the host fp32 reference the HIP kernel (vk_hip_dsa_topk_logits) is
+ * checked against (the device ABI is FP8 e4m3fnuz).
+ *
+ *   q          [batch_size, num_heads, head_dim]   fp32
+ *   kv         [num_blocks, block, head_dim]       fp32 (one page)
+ *   k_scale    [num_blocks, block]                 fp32 (per-token)
+ *   gate       [batch_size, num_heads]             fp32 (the gate)
+ *   seq_lens   [batch_size]                        int32 (POOLED valid)
+ *   page_table [batch_size, max_table_len]         int32
+ *   out        [batch_size, max_table_len*block]   fp32 (ZERO first;
+ *                max_seq_len = max_table_len*block. Tokens t >= seq_lens[b]
+ *                are left unwritten — sglang masks invalid positions).
+ *
+ * Never throws on valid input; bad dims / null pointers (when
+ * batch_size>0 and max_table_len>0) return VK_ERROR_INVALID_ARGUMENT
+ * (see vk_last_error). Empty (batch_size==0 or max_table_len==0) is a
+ * no-op leaving `out` untouched (mirrors the HIP grid-empty launch).
+ */
+int32_t vk_dsa_topk_logits(int batch_size, int num_heads, int head_dim,
+                           int block, int max_table_len, int num_blocks,
+                           const float* q, const float* kv,
+                           const float* k_scale, const float* gate,
+                           const int32_t* seq_lens,
+                           const int32_t* page_table, float* out);
+
+/* The optimal split_kv for the HIP dsa_topk_logits indexer (issue #51) --
+ * the single source of truth for the formula the GPU ABI docstring used to
+ * restate (with the wrong NUM_CU). split_kv is PERF ONLY (grouping-
+ * independent -- any positive value yields the same logits), and the
+ * binding constraint at decode is occupancy (one wavefront per block on
+ * MI300A's 228 CUs), so more is strictly better until either the page
+ * range is exhausted or the grid saturates the CUs:
+ *
+ *   split_kv = max(1, min( ceildiv(max_seq_len, block), 228 / batch_size ))
+ *
+ * At bs=1, max_seq_len=4096, block=64 this is 64 (measured 21.5 ms ->
+ * 0.36 ms, 59.9x; meta/benchmarks/bench_dsa_topk.hip). Never throws;
+ * safe to call from host code before launching. See dsa.hpp.
+ */
+int32_t vk_dsa_topk_logits_split_for(int batch_size, int max_seq_len,
+                                      int block, int* split_kv);
+
+/* ------------------------------------------------------------------ */
 /* kernels: MHC — multi-head hybrid-attention pre-norm (mhc.hpp, #51)  */
 /*                                                                       */
 /* mhc_pre_gemm_sqrsum:                                                   */

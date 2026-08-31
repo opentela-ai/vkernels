@@ -19,6 +19,8 @@ from vkernels.kernels import (
     add,
     dsa_config,
     dsa_sparse_fwd,
+    dsa_topk_logits,
+    dsa_topk_logits_split_for,
     dsa_topk_transform,
     fused_moe_mxfp4,
     gemm,
@@ -1297,6 +1299,268 @@ class DsaFwdTest(unittest.TestCase):
             cl = np.where(np.isfinite(c_l), c_l, 0.0)
             fl = np.where(np.isfinite(f_l), f_l, 0.0)
             np.testing.assert_allclose(cl, fl, rtol=1e-5, atol=1e-6)
+
+
+
+def _dsa_topk_ref(q, kv, k_scale, gate, seq_lens, page_table):
+    """Independent scalar (triple-nested, fp64 head-accumulation)
+    reference for the DSA paged-MQA gated top-k logits -- a deliberately
+    different code path from the vectorized fp32 fallback
+    (vkernels._fallback.dsa_topk_logits), so a match is a real cross-check
+    rather than a copy. Mirrors the C++ topk_ref in test_dsa.cpp."""
+    B, H, D = (int(v) for v in q.shape)
+    NB, block, _ = (int(v) for v in kv.shape)
+    MTL = int(page_table.shape[1])
+    out = np.zeros((B, MTL * block), dtype=_F32)
+    for b in range(B):
+        sl = int(seq_lens[b])
+        for i in range(MTL):
+            p = int(page_table[b, i])
+            if p < 0 or p >= NB:
+                continue  # OOB page -> unwritten (mirrors dsa_sparse_fwd)
+            for j in range(block):
+                t = i * block + j
+                if t >= sl:
+                    break  # rest of this page is past seq_len
+                acc = 0.0
+                for h in range(H):
+                    dot = float(np.dot(q[b, h], kv[p, j]))  # fp32 dot
+                    acc += max(0.0, dot) * float(gate[b, h])
+                out[b, t] = np.float32(float(k_scale[p, j]) * acc)
+    return out
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class DsaTopkLogitsTest(unittest.TestCase):
+    # DSA paged-MQA gated top-k logits (issue #51, the kpool>1 indexer path
+    # and the FIRST stage feeding dsa_sparse_fwd). Mirrors the host C++
+    # tests in tests/kernels/attn/test_dsa.cpp::DsaTopk and the host C ABI
+    # tests in tests/capi/test_capi.cpp::CapiDsaTopk.
+
+    def test_hand_checked_single_head(self):
+        # 1 head, 1 block, 2 keys [1,0][0,1], scales [2,3], gate [1], seq 2.
+        #   t=0: dot=1, acc=1*1=1, out=2*1=2 ;  t=1: dot=1, acc=1, out=3*1=3
+        q = np.array([1, 1], dtype=_F32).reshape(1, 1, 2)
+        kv = np.array([1, 0, 0, 1], dtype=_F32).reshape(1, 2, 2)
+        k_scale = np.array([2, 3], dtype=_F32).reshape(1, 2)
+        gate = np.array([1], dtype=_F32).reshape(1, 1)
+        sl = np.array([2], dtype=np.int32)
+        pt = np.array([0], dtype=np.int32).reshape(1, 1)
+        out = dsa_topk_logits(q, kv, k_scale, gate, sl, pt)
+        self.assertEqual(out.shape, (1, 2))
+        self.assertEqual(out.dtype, _F32)
+        np.testing.assert_allclose(out[0], [2.0, 3.0], atol=1e-6)
+
+    def test_hand_checked_multi_head_gate_relu(self):
+        # Two heads, one-token pages (block=1): per-head gate weighting
+        # [2,3] with a ReLU-masked negative dot in each head.
+        #   q H0=[1,0] H1=[0,1]  page0 k=[1,-1]  page1 k=[-2,2]  scales [1,1]
+        #   t=0: H0 dot=+1 ->2, H1 dot=-1 ->0 ; acc=2 ; out=2
+        #   t=1: H0 dot=-2 ->0, H1 dot=+2 ->6 ; acc=6 ; out=6
+        q = np.array([1, 0, 0, 1], dtype=_F32).reshape(1, 2, 2)
+        kv = np.array([1, -1, -2, 2], dtype=_F32).reshape(2, 1, 2)
+        k_scale = np.array([1, 1], dtype=_F32).reshape(2, 1)
+        gate = np.array([2, 3], dtype=_F32).reshape(1, 2)
+        sl = np.array([2], dtype=np.int32)
+        pt = np.array([0, 1], dtype=np.int32).reshape(1, 2)
+        out = dsa_topk_logits(q, kv, k_scale, gate, sl, pt)
+        np.testing.assert_allclose(out[0], [2.0, 6.0], atol=1e-6)
+
+    def test_seq_len_truncates_within_page(self):
+        # seq_len=2 truncates WITHIN a page (block=4): tokens 2,3 are past
+        # seq_len and LEFT UNWRITTEN (the public API zeroes the output).
+        #   q=[1,1] keys [1,1][2,2][3,3][4,4] scales [1,1,1,1] gate [1]
+        q = np.array([1, 1], dtype=_F32).reshape(1, 1, 2)
+        kv = np.array([1, 1, 2, 2, 3, 3, 4, 4], dtype=_F32).reshape(1, 4, 2)
+        k_scale = np.array([1, 1, 1, 1], dtype=_F32).reshape(1, 4)
+        gate = np.array([1], dtype=_F32).reshape(1, 1)
+        sl = np.array([2], dtype=np.int32)
+        pt = np.array([0], dtype=np.int32).reshape(1, 1)
+        out = dsa_topk_logits(q, kv, k_scale, gate, sl, pt)
+        self.assertEqual(out.shape, (1, 4))
+        np.testing.assert_allclose(out[0, :2], [2.0, 4.0], atol=1e-6)
+        np.testing.assert_array_equal(out[0, 2:], [0.0, 0.0])
+
+    def test_out_of_bound_page_is_unwritten(self):
+        # OOB page (page_table entry >= num_blocks) is skipped -- its tokens
+        # stay unwritten (zero), exactly like dsa_sparse_fwd masks an
+        # index >= S_kv.   q=[1,1] 1 block (2 keys [1,1]) scales [1,1]
+        #   gate [1] seq_len 4  page_table [0, 5] -> page 5 OOB; t=2,3 stay 0.
+        q = np.array([1, 1], dtype=_F32).reshape(1, 1, 2)
+        kv = np.array([1, 1, 1, 1], dtype=_F32).reshape(1, 2, 2)
+        k_scale = np.array([1, 1], dtype=_F32).reshape(1, 2)
+        gate = np.array([1], dtype=_F32).reshape(1, 1)
+        sl = np.array([4], dtype=np.int32)
+        pt = np.array([0, 5], dtype=np.int32).reshape(1, 2)
+        out = dsa_topk_logits(q, kv, k_scale, gate, sl, pt)
+        np.testing.assert_allclose(out[0, :2], [2.0, 2.0], atol=1e-6)
+        np.testing.assert_array_equal(out[0, 2:], [0.0, 0.0])
+
+    def test_empty_is_no_op(self):
+        # seq_len==0 writes nothing; the public API still zeroes the output
+        # (the "zero the output first" contract), so the result is all zero.
+        q = np.array([1, 1], dtype=_F32).reshape(1, 1, 2)
+        kv = np.array([1, 1, 1, 1], dtype=_F32).reshape(1, 2, 2)
+        k_scale = np.array([1, 1], dtype=_F32).reshape(1, 2)
+        gate = np.array([1], dtype=_F32).reshape(1, 1)
+        sl = np.array([0], dtype=np.int32)
+        pt = np.array([0], dtype=np.int32).reshape(1, 1)
+        out = np.array([3.0, 4.0], dtype=_F32)
+        res = dsa_topk_logits(q, kv, k_scale, gate, sl, pt, out=out)
+        np.testing.assert_array_equal(res, np.zeros((1, 2), dtype=_F32))
+        # batch_size==0 is a grid-empty no-op: the output is (0, max_seq_len).
+        q0 = np.zeros((0, 1, 2), dtype=_F32)
+        gate0 = np.zeros((0, 1), dtype=_F32)
+        sl0 = np.zeros(0, dtype=np.int32)
+        pt0 = np.zeros((0, 1), dtype=np.int32)
+        res0 = dsa_topk_logits(q0, kv, k_scale, gate0, sl0, pt0)
+        self.assertEqual(res0.shape, (0, 2))
+
+    def test_shape_validation(self):
+        q = np.ones((1, 2, 4), dtype=_F32)
+        kv = np.ones((2, 2, 4), dtype=_F32)
+        k_scale = np.ones((2, 2), dtype=_F32)
+        gate = np.ones((1, 2), dtype=_F32)
+        sl = np.array([4], dtype=np.int32)
+        pt = np.array([0, 1], dtype=np.int32).reshape(1, 2)
+        out = dsa_topk_logits(q, kv, k_scale, gate, sl, pt)
+        self.assertEqual(out.shape, (1, 4))
+        # q wrong ndim
+        with self.assertRaises(ValueError):
+            dsa_topk_logits(np.ones(4, dtype=_F32), kv, k_scale, gate, sl, pt)
+        # kv wrong ndim
+        with self.assertRaises(ValueError):
+            dsa_topk_logits(q, np.ones((2, 4), dtype=_F32), k_scale, gate, sl, pt)
+        # k_scale wrong ndim
+        with self.assertRaises(ValueError):
+            dsa_topk_logits(q, kv, np.ones(4, dtype=_F32), gate, sl, pt)
+        # head_dim mismatch (q D=4 vs kv D=3)
+        with self.assertRaises(ValueError):
+            dsa_topk_logits(q, np.ones((2, 2, 3), dtype=_F32), k_scale, gate,
+                            sl, pt)
+        # num_blocks mismatch (kv=2 vs k_scale=3)
+        with self.assertRaises(ValueError):
+            dsa_topk_logits(q, kv, np.ones((3, 2), dtype=_F32), gate, sl, pt)
+        # block mismatch (kv block=2 vs k_scale block=3)
+        with self.assertRaises(ValueError):
+            dsa_topk_logits(q, kv, np.ones((2, 3), dtype=_F32), gate, sl, pt)
+        # gate batch/heads mismatch
+        with self.assertRaises(ValueError):
+            dsa_topk_logits(q, kv, k_scale, np.ones((1, 3), dtype=_F32), sl, pt)
+        # seq_lens len mismatch
+        with self.assertRaises(ValueError):
+            dsa_topk_logits(q, kv, k_scale, gate, np.array([4, 5], dtype=np.int32),
+                            pt)
+        # page_table batch mismatch
+        with self.assertRaises(ValueError):
+            dsa_topk_logits(q, kv, k_scale, gate, sl,
+                            np.array([0, 1], dtype=np.int32).reshape(2, 1))
+        # non-positive H (q has H=0)
+        with self.assertRaises(ValueError):
+            dsa_topk_logits(np.zeros((1, 0, 4), dtype=_F32), kv, k_scale,
+                            gate, sl, pt)
+
+    def test_matches_reference(self):
+        # Cross-check the fallback (via the public API) against the
+        # independent scalar reference across several shapes (GLM-5.3-ish
+        # D=128/block=64 included, with truncated seq_lens and ~10% of
+        # page_table entries masked to -1 to exercise both edges).
+        rng = np.random.default_rng(98765)
+        for (bs, H, D, block, mtl, nb) in [
+            (1, 2, 8, 4, 16, 16),    # decode-ish
+            (1, 4, 16, 8, 32, 32),   # more heads
+            (2, 1, 8, 4, 16, 16),    # batch > 1
+            (1, 2, 128, 64, 8, 8),   # GLM-5.3-ish (D=128, block=64)
+            (1, 1, 2, 2, 4, 4),      # tiny
+        ]:
+            max_seq_len = mtl * block
+            q = (rng.random((bs, H, D)) * 2 - 1).astype(_F32)
+            kv = (rng.random((nb, block, D)) * 2 - 1).astype(_F32)
+            k_scale = (rng.random((nb, block)) * 0.5 + 0.5).astype(_F32)
+            gate = (rng.random((bs, H)) * 2 - 1).astype(_F32)
+            sl = rng.integers(0, max_seq_len + 1, size=bs, dtype=np.int32)
+            pt = np.where(rng.random((bs, mtl)) < 0.1, -1,
+                          rng.integers(0, nb, size=(bs, mtl), dtype=np.int32)
+                         ).astype(np.int32)
+            out = dsa_topk_logits(q, kv, k_scale, gate, sl, pt)
+            ref = _dsa_topk_ref(q, kv, k_scale, gate, sl, pt)
+            self.assertEqual(out.shape, (bs, max_seq_len))
+            np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-4)
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(51)
+        for (bs, H, D, block, mtl, nb) in [
+            (1, 2, 8, 4, 16, 16),
+            (1, 4, 16, 8, 32, 32),
+            (2, 1, 8, 4, 16, 16),
+            (1, 2, 128, 64, 8, 8),   # GLM-5.3-ish
+            (1, 1, 2, 2, 4, 4),
+        ]:
+            max_seq_len = mtl * block
+            q = (rng.random((bs, H, D)) * 2 - 1).astype(_F32)
+            kv = (rng.random((nb, block, D)) * 2 - 1).astype(_F32)
+            k_scale = (rng.random((nb, block)) * 0.5 + 0.5).astype(_F32)
+            gate = (rng.random((bs, H)) * 2 - 1).astype(_F32)
+            sl = rng.integers(0, max_seq_len + 1, size=bs, dtype=np.int32)
+            pt = np.where(rng.random((bs, mtl)) < 0.1, -1,
+                          rng.integers(0, nb, size=(bs, mtl), dtype=np.int32)
+                         ).astype(np.int32)
+
+            def run(impl, q=q, kv=kv, k_scale=k_scale, gate=gate, sl=sl,
+                    pt=pt):
+                prev = kernels._impl
+                kernels._impl = impl
+                try:
+                    return dsa_topk_logits(q, kv, k_scale, gate, sl, pt).copy()
+                finally:
+                    kernels._impl = prev
+
+            c = run(core)
+            f = run(fb)
+            np.testing.assert_allclose(c, f, rtol=1e-5, atol=1e-6)
+
+    def test_split_for(self):
+        # dsa_topk_logits_split_for: optimal split_kv =
+        #   max(1, min(ceildiv(max_seq_len, block), 228 / batch_size))
+        # with NUM_CU=228 (MI300A / gfx942). bs=1 msl=4096 B=64 -> 64
+        # (one page/split, 64 of 228 CUs; measured 21.5 ms -> 0.36 ms).
+        self.assertEqual(dsa_topk_logits_split_for(1, 4096, 64), 64)
+        self.assertEqual(dsa_topk_logits_split_for(1, 1024, 64), 16)
+        self.assertEqual(dsa_topk_logits_split_for(2, 4096, 64), 64)  # min(64,114)
+        self.assertEqual(dsa_topk_logits_split_for(64, 4096, 64), 3)  # min(64,3)
+        self.assertEqual(dsa_topk_logits_split_for(228, 4096, 64), 1)  # min(64,1)
+        self.assertEqual(dsa_topk_logits_split_for(500, 4096, 64), 1)  # 228//500=0
+        # Degenerate shapes -> safe default 1 (mirrors the C ABI).
+        self.assertEqual(dsa_topk_logits_split_for(0, 4096, 64), 1)
+        self.assertEqual(dsa_topk_logits_split_for(1, 0, 64), 1)
+        self.assertEqual(dsa_topk_logits_split_for(1, 4096, 0), 1)
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_split_for_backend_consistency(self):
+        # Compiled and fallback split selectors are bit-exact (pure host
+        # arithmetic on the documented NUM_CU=228 constant).
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        for bs in [0, 1, 2, 3, 5, 8, 16, 32, 64, 100, 228, 500]:
+            for max_seq_len, block in [(512, 64), (4096, 64),
+                                       (8192, 128), (13, 4)]:
+                prev = kernels._impl
+                kernels._impl = core
+                try:
+                    c = kernels.dsa_topk_logits_split_for(bs, max_seq_len,
+                                                          block)
+                finally:
+                    kernels._impl = prev
+                kernels._impl = fb
+                try:
+                    f = kernels.dsa_topk_logits_split_for(bs, max_seq_len,
+                                                          block)
+                finally:
+                    kernels._impl = prev
+                self.assertEqual(c, f, (bs, max_seq_len, block, c, f))
 
 
 @unittest.skipIf(np is None, "numpy is required for these tests")
