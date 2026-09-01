@@ -103,6 +103,23 @@ TEST(Capi, LastErrorDefaultsToOk) {
   EXPECT_NE(vk_last_error(), nullptr);
 }
 
+// vk_set_last_error is the setter the HIP C ABI wrappers use to record
+// contract violations (issue #57). Exercised on the host so the public
+// C API has coverage without the HIP toolkit (vk_set_last_error is only
+// called from hip_capi.cpp otherwise).
+TEST(Capi, SetLastErrorRoundTripsAndClears) {
+  vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "boom from setter");
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+  EXPECT_EQ(std::strcmp(vk_last_error(), "boom from setter"), 0);
+  // nullptr message clears to the empty string (the other ternary branch).
+  vk_set_last_error(VK_ERROR_INTERNAL, nullptr);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INTERNAL);
+  EXPECT_EQ(std::strcmp(vk_last_error(), ""), 0);
+  // Reset so the next test sees the default OK state.
+  vk_set_last_error(VK_OK, "");
+  EXPECT_EQ(vk_last_error_code(), VK_OK);
+}
+
 TEST(Capi, FreeNullIsSafe) {
   vk_free(nullptr);
 }
