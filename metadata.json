@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M1EGD837AR4TB13N5V5DZN4W",
+  "strategy": "manual-commit",
+  "branch": "fix/dsa-sparse-fwd-preconditions",
+  "checkpoints_count": 10,
+  "files_touched": [
+    "src/c/vkernels/capi/capi.cpp",
+    "src/c/vkernels/capi/capi.hpp",
+    "src/c/vkernels/capi/hip_capi.cpp",
+    "src/c/vkernels/capi/hip_capi.hpp",
+    "src/c/vkernels/kernels/dsa.cpp",
+    "src/c/vkernels/kernels/dsa.hip",
+    "src/c/vkernels/kernels/dsa.hpp",
+    "src/python/vkernels/_fallback.py",
+    "src/python/vkernels/kernels.py",
+    "tests/capi/test_capi.cpp",
+    "tests/kernels/attn/test_dsa.cpp",
+    "tests/python/test_kernels.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 1653387,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 20825888,
+    "output_tokens": 201750,
+    "api_call_count": 326
+  }
+}
