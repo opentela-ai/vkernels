@@ -1,0 +1,1 @@
+commit, push a branch, create a PR, squash-merge the PR and close the issue
