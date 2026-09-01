@@ -261,7 +261,7 @@ void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
   VK_EXPECTS(kv_group == 1, "kv_group must be 1 (single shared head_kv)");
   VK_EXPECTS(block_I > 0 && inner_iter > 0,
              "block_I and inner_iter must be positive");
- VK_EXPECTS(topk % (block_I * inner_iter) == 0,
+  VK_EXPECTS(topk % (block_I * inner_iter) == 0,
              "topk must be a multiple of block_I*inner_iter");
   int bq = 0, th = 0, bi = 0, ii = 0;
   ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
