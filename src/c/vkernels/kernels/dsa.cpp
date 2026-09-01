@@ -31,16 +31,32 @@ void dsa_sparse_fwd_cpu(int S_q, int S_kv, int H, int dim, int tail_dim,
   VK_EXPECTS(kv_group == 1, "kv_group must be 1 (single shared head_kv)");
   // block_I / inner_iter are the kernel's group-tiling CONFIGURATION hints
   // (the indexer pads `topk` to a multiple of block_I in the sglang layout).
-  // The forward scores every selected key directly, so divisibility is a
-  // caller convention, not a math requirement (mirrors MLA's bn_kv).
-  VK_EXPECTS(block_I > 0 && inner_iter > 0, "block_I and inner_iter must be positive");
-  VK_EXPECTS(S_q == 0 || H == 0 || q != nullptr, "q must not be null");
+  // The forward scores every selected key directly, so the GROUPING is not
+  // used to form the result -- but the divisibility IS validated here
+  // (mirrors the HIP kernel and the documented dsa.hpp contract) so a
+  // misconfigured caller fails the same way on both paths.
+  VK_EXPECTS(block_I > 0 && inner_iter > 0,
+             "block_I and inner_iter must be positive");
+  VK_EXPECTS(topk % (block_I * inner_iter) == 0,
+             "topk must be a multiple of block_I*inner_iter");
+  VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 || q != nullptr,
+             "q must not be null");
   VK_EXPECTS(S_q == 0 || H == 0 || S_kv == 0 || kv != nullptr,
              "kv must not be null");
   VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 || indices != nullptr,
              "indices must not be null");
-  VK_EXPECTS(S_q == 0 || H == 0 || out != nullptr, "out must not be null");
+  VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 || out != nullptr,
+             "out must not be null");
   VK_EXPECTS(!return_lse || lse != nullptr, "lse must not be null");
+  // With work to do, `out` must not alias any input or `lse` -- the
+  // two-pass softmax writes a row into `out` then reads it back, and a
+  // shared buffer would mix one query's output into the next query's
+  // scores (issue #57: surface this as a named error, not corruption).
+  const void* o = out;
+  VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 ||
+             (o != q && o != kv && o != indices &&
+              (!return_lse || lse != o)),
+             "out must not alias q, kv, indices, or lse");
   if (S_q == 0 || H == 0 || topk == 0) return;  // nothing to do
   // S_kv == 0: every selected index is out of range -> all rows zero.
   const int W = dim + tail_dim;
@@ -111,9 +127,16 @@ void dsa_config_for(int S_q, int H, int dim, int topk, int* bq, int* threads,
     *bq = 4;
     *threads = 256;  // four wavefronts
   }
-  *block_I = 64;
+  // block_I: largest power-of-two divisor of topk that is <= 64, so that
+  // topk % (block_I * inner_iter) == 0 for EVERY topk (including the
+  // hand-checked decode shapes topk < 64). Falls back to 1 for odd topk
+  // (the kernel streams one key at a time, so any block_I <= topk works).
+  int bi = 64;
+  while (bi > 1 && topk % bi != 0) bi >>= 1;
+  *block_I = bi;
   // inner_iter so that block_I * inner_iter divides topk (power-of-two topk
-  // is the common case; fall back to 1).
+  // is the common case; raise it to trade register pressure for fewer
+  // passes on large topk).
   int ii = 1;
   while (ii < 8 && topk % (*block_I * (ii * 2)) == 0) ii *= 2;
   *inner_iter = ii;

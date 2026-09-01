@@ -90,7 +90,7 @@ TEST(DsaFwd, HandCheckedTailDimZero) {
   std::vector<float> kv = {1, 0,  0, 1};       // 2 keys, dim=2
   std::vector<int32_t> idx = {0, 1};
   std::vector<float> out(2, -1), lse(1, 7);
-  dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 64, 1, sm_scale, /*lse=*/true,
+  dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 2, 1, sm_scale, /*lse=*/true,
                      q.data(), kv.data(), idx.data(), out.data(), lse.data());
   EXPECT_NEAR(out[0], 0.5f, 1e-6);
   EXPECT_NEAR(out[1], 0.5f, 1e-6);
@@ -107,7 +107,7 @@ TEST(DsaFwd, HandCheckedTailDimPositive) {
   std::vector<float> kv = {2, 1, 1,  3, 0, 1}; // 2 keys, dim+tail=3
   std::vector<int32_t> idx = {0, 1};
   std::vector<float> out(1, -1), lse(1, 7);
-  dsa_sparse_fwd_cpu(1, 2, 1, 2, 1, 2, 1, 64, 1, sm_scale, true,
+  dsa_sparse_fwd_cpu(1, 2, 1, 2, 1, 2, 1, 2, 1, sm_scale, true,
                      q.data(), kv.data(), idx.data(), out.data(), lse.data());
   EXPECT_NEAR(out[0], 4.0f / 1.5f, 1e-6);
   EXPECT_NEAR(lse[0], 3.0f + std::log2(1.5f), 1e-6);
@@ -121,7 +121,7 @@ TEST(DsaFwd, MaskedIndexIsZero) {
   std::vector<float> kv = {1, 0,  0, 1};
   std::vector<int32_t> idx = {0, -1};
   std::vector<float> out(2, -1), lse(1, 7);
-  dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 64, 1, sm_scale, true,
+  dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 2, 1, sm_scale, true,
                      q.data(), kv.data(), idx.data(), out.data(), lse.data());
   EXPECT_NEAR(out[0], 1.0f, 1e-6);
   EXPECT_NEAR(out[1], 0.0f, 1e-6);
@@ -130,7 +130,7 @@ TEST(DsaFwd, MaskedIndexIsZero) {
   // Out-of-range index (>= S_kv) is masked too.
   std::vector<int32_t> idx2 = {0, 5};
   std::vector<float> out2(2, -1);
-  dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 64, 1, sm_scale, false,
+  dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 2, 1, sm_scale, false,
                      q.data(), kv.data(), idx2.data(), out2.data(), nullptr);
   EXPECT_NEAR(out2[0], 1.0f, 1e-6);
   EXPECT_NEAR(out2[1], 0.0f, 1e-6);
@@ -144,7 +144,7 @@ TEST(DsaFwd, FullyMaskedIsZero) {
   std::vector<float> kv = {9, 9,  9, 9};
   std::vector<int32_t> idx = {-1, -1};
   std::vector<float> out(2, -1), lse(1, 7);
-  dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 64, 1, sm_scale, true,
+  dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 2, 1, sm_scale, true,
                      q.data(), kv.data(), idx.data(), out.data(), lse.data());
   EXPECT_NEAR(out[0], 0.0f, 1e-6);
   EXPECT_NEAR(out[1], 0.0f, 1e-6);
@@ -158,7 +158,7 @@ TEST(DsaFwd, LseOptional) {
   std::vector<float> kv = {1, 0,  0, 1};
   std::vector<int32_t> idx = {0, 1};
   std::vector<float> out(2, -1);
-  dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 64, 1, sm_scale, /*lse=*/false,
+  dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 2, 1, sm_scale, /*lse=*/false,
                      q.data(), kv.data(), idx.data(), out.data(), nullptr);
   EXPECT_NEAR(out[0], 0.5f, 1e-6);
   EXPECT_NEAR(out[1], 0.5f, 1e-6);
@@ -190,8 +190,10 @@ TEST(DsaFwd, MatchesReferenceBothShapeFamilies) {
     const int W = c.dim + c.tail_dim;
     const int d_v = c.dim - c.tail_dim;
     // Emulate kpool tails + padding by masking ~10% of entries. topk is a
-    // caller convention (often a multiple of 64); the forward scores the
-    // selected keys directly, so no divisibility is required.
+    // caller convention (often a multiple of 64); divisibility IS validated
+    // (issue #57), so use dsa_config_for for block_I/inner_iter.
+    int bq = 0, th = 0, bi = 0, ii = 0;
+    dsa_config_for(c.S_q, c.H, c.dim, c.topk, &bq, &th, &bi, &ii);
     std::vector<float> q((size_t)c.S_q * c.H * W);
     std::vector<float> kv((size_t)c.S_kv * W);
     std::vector<int32_t> idx((size_t)c.S_q * c.topk);
@@ -207,7 +209,7 @@ TEST(DsaFwd, MatchesReferenceBothShapeFamilies) {
     std::vector<float> lse((size_t)c.S_q * c.H, 0);
     std::vector<float> rout(out.size(), 0), rlse(lse.size(), 0);
     dsa_sparse_fwd_cpu(c.S_q, c.S_kv, c.H, c.dim, c.tail_dim, c.topk, 1,
-                      64, 1, sm_scale, true, q.data(), kv.data(),
+                      bi, ii, sm_scale, true, q.data(), kv.data(),
                       idx.data(), out.data(), lse.data());
     ref(c.S_q, c.S_kv, c.H, c.dim, c.tail_dim, c.topk, 1, sm_scale, true,
         q, kv, idx, rout, rlse);
@@ -245,29 +247,29 @@ TEST(DsaConfig, DecodeVsPrefill) {
 TEST(DsaFwd, NullArgsThrow) {
   std::vector<float> q(4, 1), kv(4, 1), out(2, 1);
   std::vector<int32_t> idx(2, 0);
-  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 1, 64, 1, 1.0f, false,
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 1, 2, 1, 1.0f, false,
                                   nullptr, kv.data(), idx.data(), out.data(),
                                   nullptr),
                std::invalid_argument);
-  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 1, 64, 1, 1.0f, false,
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 1, 2, 1, 1.0f, false,
                                   q.data(), nullptr, idx.data(), out.data(),
                                   nullptr),
                std::invalid_argument);
-  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 1, 64, 1, 1.0f, false,
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 1, 2, 1, 1.0f, false,
                                   q.data(), kv.data(), nullptr, out.data(),
                                   nullptr),
                std::invalid_argument);
-  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 1, 64, 1, 1.0f, false,
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 1, 2, 1, 1.0f, false,
                                   q.data(), kv.data(), idx.data(), nullptr,
                                   nullptr),
                std::invalid_argument);
   // return_lse == true but lse is null.
-  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 1, 64, 1, 1.0f, true,
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 1, 2, 1, 1.0f, true,
                                   q.data(), kv.data(), idx.data(), out.data(),
                                   nullptr),
                std::invalid_argument);
   // kv_group != 1 is rejected (kernel assumes a single shared head_kv).
-  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 2, 64, 1, 1.0f, false,
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 1, 1, 2, 0, 2, 2, 2, 1, 1.0f, false,
                                   q.data(), kv.data(), idx.data(), out.data(),
                                   nullptr),
                std::invalid_argument);
@@ -280,12 +282,66 @@ TEST(DsaFwd, NullArgsThrow) {
 
 TEST(DsaFwd, EmptyIsNoOp) {
   std::vector<float> out = {3.0f, 4.0f};
-  dsa_sparse_fwd_cpu(0, 1, 1, 2, 0, 2, 1, 64, 1, 1.0f, false, nullptr,
+  dsa_sparse_fwd_cpu(0, 1, 1, 2, 0, 2, 1, 2, 1, 1.0f, false, nullptr,
                      nullptr, nullptr, out.data(), nullptr);
-  dsa_sparse_fwd_cpu(1, 1, 0, 2, 0, 2, 1, 64, 1, 1.0f, false, nullptr,
+  dsa_sparse_fwd_cpu(1, 1, 0, 2, 0, 2, 1, 2, 1, 1.0f, false, nullptr,
                      nullptr, nullptr, out.data(), nullptr);
   EXPECT_EQ(out[0], 3.0f);
   EXPECT_EQ(out[1], 4.0f);
+}
+
+// topk not divisible by block_I*inner_iter is rejected (issue #57): the
+// kernel tiles `topk` into groups of block_I*inner_iter, so a non-multiple
+// is a misconfigured caller, not a silently-wrong result.
+TEST(DsaFwd, DivisibilityCheckThrows) {
+  std::vector<float> q(2, 1), kv(4, 1), out(2, 0);
+  std::vector<int32_t> idx(2, 0);
+  std::vector<float> lse(1, 0);
+  // topk=2, block_I=4, inner_iter=1: 2 % (4*1) = 2 != 0.
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 4, 1, 1.0f, false,
+                                  q.data(), kv.data(), idx.data(), out.data(),
+                                  nullptr),
+               std::invalid_argument);
+  // topk=2, block_I=2, inner_iter=2: 2 % (2*2) = 2 != 0.
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 2, 2, 1.0f, false,
+                                  q.data(), kv.data(), idx.data(), out.data(),
+                                  nullptr),
+               std::invalid_argument);
+  // topk=3, block_I=2, inner_iter=1: 3 % (2*1) = 1 != 0 (odd topk).
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 3, 1, 2, 0, 3, 1, 2, 1, 1.0f, false,
+                                  q.data(), kv.data(), idx.data(), out.data(),
+                                  nullptr),
+               std::invalid_argument);
+  // A VALID divisible call (topk=4, block_I=2, inner_iter=2) must NOT throw.
+  std::vector<float> q4(4, 1), kv4(8, 1), out4(4, 0);
+  std::vector<int32_t> idx4(4, 0);
+  EXPECT_NO_THROW(dsa_sparse_fwd_cpu(1, 4, 1, 2, 0, 4, 1, 2, 2, 1.0f, false,
+                                     q4.data(), kv4.data(), idx4.data(),
+                                     out4.data(), nullptr));
+}
+
+// `out` aliasing any input (or `lse`) is rejected (issue #57): the two-pass
+// softmax writes a row into `out` then reads it back, so a shared buffer
+// would mix one query's output into the next query's scores.
+TEST(DsaFwd, AliasThrows) {
+  std::vector<float> q(2, 1), kv(4, 1), out(2, 0);
+  std::vector<int32_t> idx(2, 0);
+  std::vector<float> lse(1, 0);
+  // out == q (same buffer): the scores read `out` back as `q`.
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 2, 1, 1.0f, false,
+                                  out.data(), kv.data(), idx.data(), out.data(),
+                                  nullptr),
+               std::invalid_argument);
+  // out == kv: the values read `out` back as `kv`.
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 2, 1, 1.0f, false,
+                                  q.data(), out.data(), idx.data(), out.data(),
+                                  nullptr),
+               std::invalid_argument);
+  // out == lse (when return_lse): the LSE write clobbers `out` mid-row.
+  EXPECT_THROW(dsa_sparse_fwd_cpu(1, 2, 1, 2, 0, 2, 1, 2, 1, 1.0f, true,
+                                  q.data(), kv.data(), idx.data(), out.data(),
+                                  out.data()),
+               std::invalid_argument);
 }
 
 // ---------------------------------------------------------------------------

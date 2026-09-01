@@ -767,7 +767,7 @@ TEST(CapiDsa, HandCheckedTailDimZero) {
   std::vector<float> kv = {1, 0, 0, 1};
   std::vector<int32_t> idx = {0, 1};
   std::vector<float> out(2, -1.0f), lse(1, 7.0f);
-  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 0, 2, 1, 64, 1, sm_scale, /*lse=*/1,
+  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 0, 2, 1, 2, 1, sm_scale, /*lse=*/1,
                               q.data(), kv.data(), idx.data(), out.data(),
                               lse.data()),
             VK_OK);
@@ -785,7 +785,7 @@ TEST(CapiDsa, HandCheckedTailDimPositive) {
   std::vector<float> kv = {2, 1, 1, 3, 0, 1}; // 2 keys, dim+tail=3
   std::vector<int32_t> idx = {0, 1};
   std::vector<float> out(1, -1.0f), lse(1, 7.0f);
-  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 1, 2, 1, 64, 1, sm_scale, 1,
+  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 1, 2, 1, 2, 1, sm_scale, 1,
                               q.data(), kv.data(), idx.data(), out.data(),
                               lse.data()),
             VK_OK);
@@ -850,7 +850,30 @@ TEST(CapiDsa, ConfigPrefill) {
 TEST(CapiDsa, NullArgsThrow) {
   std::vector<float> q(4, 1), kv(4, 1), out(2, 1);
   std::vector<int32_t> idx(2, 0);
-  EXPECT_NE(vk_dsa_sparse_fwd(1, 1, 1, 2, 0, 2, 1, 64, 1, 1.0f, 0, nullptr,
+  EXPECT_NE(vk_dsa_sparse_fwd(1, 1, 1, 2, 0, 2, 1, 2, 1, 1.0f, 0, nullptr,
+                              kv.data(), idx.data(), out.data(), nullptr),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+// topk not divisible by block_I*inner_iter is rejected (issue #57).
+TEST(CapiDsa, DivisibilityCheckThrows) {
+  std::vector<float> q(2, 1), kv(4, 1), out(2, 0);
+  std::vector<int32_t> idx(2, 0);
+  // topk=2, block_I=4, inner_iter=1: 2 % (4*1) = 2 != 0.
+  EXPECT_NE(vk_dsa_sparse_fwd(1, 2, 1, 2, 0, 2, 1, 4, 1, 1.0f, 0, q.data(),
+                              kv.data(), idx.data(), out.data(), nullptr),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+// `out` aliasing an input is rejected (issue #57): the two-pass softmax
+// writes a row into `out` then reads it back.
+TEST(CapiDsa, AliasThrows) {
+  std::vector<float> q(2, 1), kv(4, 1), out(2, 0);
+  std::vector<int32_t> idx(2, 0);
+  // out == q (same buffer).
+  EXPECT_NE(vk_dsa_sparse_fwd(1, 2, 1, 2, 0, 2, 1, 2, 1, 1.0f, 0, out.data(),
                               kv.data(), idx.data(), out.data(), nullptr),
             VK_OK);
   EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);

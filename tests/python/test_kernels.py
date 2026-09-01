@@ -1259,7 +1259,47 @@ class DsaFwdTest(unittest.TestCase):
                            dim=4, tail_dim=0, kv_group=2)
         # wrong ndim
         with self.assertRaises(ValueError):
-            dsa_sparse_fwd(np.ones(4, dtype=_F32), kv, idx, dim=4, tail_dim=0)
+            dsa_sparse_fwd(np.ones(4, dtype=_F32), kv, idx,
+                           dim=4, tail_dim=0)
+
+    def test_divisibility_check(self):
+        # topk not divisible by block_I*inner_iter is rejected (issue #57).
+        q = np.ones((1, 1, 1, 4), dtype=_F32)
+        kv = np.ones((1, 2, 1, 4), dtype=_F32)
+        idx = np.array([0, 1], dtype=np.int32).reshape(1, 1, 1, 2)
+        # topk=2, block_I=4, inner_iter=1: 2 % (4*1) = 2 != 0.
+        with self.assertRaises(ValueError):
+            dsa_sparse_fwd(q, kv, idx, dim=4, tail_dim=0,
+                           block_I=4, inner_iter=1)
+        # topk=2, block_I=2, inner_iter=2: 2 % (2*2) = 2 != 0.
+        with self.assertRaises(ValueError):
+            dsa_sparse_fwd(q, kv, idx, dim=4, tail_dim=0,
+                           block_I=2, inner_iter=2)
+        # A VALID divisible call (topk=2, block_I=2, inner_iter=1) must NOT
+        # raise (and matches the default-tile result).
+        out_ref = dsa_sparse_fwd(q, kv, idx, dim=4, tail_dim=0)
+        out = dsa_sparse_fwd(q, kv, idx, dim=4, tail_dim=0,
+                             block_I=2, inner_iter=1)
+        np.testing.assert_array_equal(out, out_ref)
+
+    def test_alias_check(self):
+        # `out` aliasing any input or `lse` is rejected (issue #57): the
+        # two-pass softmax writes a row into `out` then reads it back.
+        q = np.ones((1, 1, 1, 4), dtype=_F32)
+        kv = np.ones((1, 2, 1, 4), dtype=_F32)
+        idx = np.array([0, 1], dtype=np.int32).reshape(1, 1, 1, 2)
+        out = np.zeros((1, 1, 1, 4), dtype=_F32)
+        # out == q (same buffer passed as both q and out).
+        with self.assertRaises(ValueError):
+            dsa_sparse_fwd(out, kv, idx, dim=4, tail_dim=0, out=out)
+        # out == kv (same buffer passed as both kv and out).
+        with self.assertRaises(ValueError):
+            dsa_sparse_fwd(q, out, idx, dim=4, tail_dim=0, out=out)
+        # out == lse (when return_lse).
+        lse = np.zeros((1, 1, 1), dtype=_F32)
+        with self.assertRaises(ValueError):
+            dsa_sparse_fwd(q, kv, idx, dim=4, tail_dim=0,
+                           return_lse=True, out=lse, lse=lse)
 
     @unittest.skipUnless(_COMPILED, "compiled backend not available")
     def test_backend_consistency(self):

@@ -971,7 +971,31 @@ def dsa_sparse_fwd(S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I,
     ``topk`` selected keys, fp32 throughout). ``q`` ``(1,S_q,H,W)``,
     ``kv`` ``(1,S_kv,1,W)``, ``indices`` ``(1,S_q,1,topk)`` int32
     (``<0/>=S_kv`` masked), ``W = dim + tail_dim``, ``d_v = dim - tail_dim``.
+    Validates the same preconditions as the C++ oracle (issue #57): a
+    misconfigured caller raises a named error instead of a wrong result.
     """
+    if not (dim > 0 and tail_dim >= 0 and dim - tail_dim > 0):
+        raise ValueError("dim > tail_dim >= 0 required")
+    if topk <= 0:
+        raise ValueError("topk must be positive")
+    if kv_group != 1:
+        raise ValueError("kv_group must be 1 (single shared head_kv)")
+    if block_I <= 0 or inner_iter <= 0:
+        raise ValueError("block_I and inner_iter must be positive")
+    if topk % (block_I * inner_iter) != 0:
+        raise ValueError(
+            f"topk must be a multiple of block_I*inner_iter "
+            f"({block_I}*{inner_iter}={block_I * inner_iter}): got topk={topk}"
+        )
+    if S_q and H and topk:
+        if q is None or kv is None or indices is None or out is None:
+            raise ValueError("q, kv, indices, out must not be null")
+        if return_lse and lse is None:
+            raise ValueError("lse must not be null when return_lse")
+        if (np.may_share_memory(out, q) or np.may_share_memory(out, kv)
+                or np.may_share_memory(out, indices)
+                or (return_lse and np.may_share_memory(out, lse))):
+            raise ValueError("out must not alias q, kv, indices, or lse")
     W = dim + tail_dim
     d_v = dim - tail_dim
     q = np.ascontiguousarray(q, dtype=np.float32).reshape(S_q, H, W)
@@ -1022,11 +1046,15 @@ def dsa_sparse_fwd(S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I,
 
 def dsa_config(S_q, H, dim, topk):
     """Per-shape (bq, threads, block_I, inner_iter) tile selector (mirrors
-    ``dsa_config_for``; decode S_q<=8 -> (1,64,64,i), prefill ->
-    (4,256,64,i); inner_iter grows while topk % (block_I*inner_iter) == 0)."""
+    ``dsa_config_for``; decode S_q<=8 -> (1,64,bi,i), prefill ->
+    (4,256,bi,i); block_I is the largest power-of-two divisor of topk that
+    is <= 64 so topk % (block_I*inner_iter) == 0 for every topk, and
+    inner_iter grows while that stays true)."""
     bq = 1 if S_q <= 8 else 4
     threads = 64 if S_q <= 8 else 256
     block_I = 64
+    while block_I > 1 and topk % block_I != 0:
+        block_I >>= 1
     inner_iter = 1
     while inner_iter < 8 and topk % (block_I * (inner_iter * 2)) == 0:
         inner_iter *= 2

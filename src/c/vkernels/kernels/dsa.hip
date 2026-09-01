@@ -55,6 +55,7 @@
 #include <cstdio>
 
 #include "vkernels/kernels/dsa.hpp"
+#include "vkernels/util/error.hpp"  // VK_EXPECTS (host: throws std::invalid_argument)
 
 #if VKERNELS_HAS_HIP
 #  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
@@ -202,6 +203,32 @@ void dsa_sparse_fwd_with_tile(int S_q, int S_kv, int H, int dim, int tail_dim,
                               const void* q, const void* kv,
                               const void* indices, void* out, void* lse,
                               int bq, int block_I, int inner_iter, int bn_kv) {
+  // Host-side preconditions (mirror dsa_sparse_fwd_cpu, issue #57): a
+  // misconfigured caller must raise a named error, not a silent hang or
+  // out-of-bounds launch. The two-pass softmax writes a row into `out`
+  // then reads it back, so `out` must not alias any input or `lse`.
+  const int d_v = dim - tail_dim;
+  VK_EXPECTS(dim > 0 && tail_dim >= 0 && d_v > 0,
+             "dim > tail_dim >= 0 required");
+  VK_EXPECTS(topk > 0, "topk must be positive");
+  VK_EXPECTS(kv_group == 1, "kv_group must be 1 (single shared head_kv)");
+  VK_EXPECTS(block_I > 0 && inner_iter > 0,
+             "block_I and inner_iter must be positive");
+  VK_EXPECTS(topk % (block_I * inner_iter) == 0,
+             "topk must be a multiple of block_I*inner_iter");
+  VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 || q != nullptr,
+             "q must not be null");
+  VK_EXPECTS(S_q == 0 || H == 0 || S_kv == 0 || kv != nullptr,
+             "kv must not be null");
+  VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 || indices != nullptr,
+             "indices must not be null");
+  VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 || out != nullptr,
+             "out must not be null");
+  VK_EXPECTS(!return_lse || lse != nullptr, "lse must not be null");
+  VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 ||
+                 (out != q && out != kv && out != indices &&
+                  (!return_lse || out != lse)),
+             "out must not alias q, kv, indices, or lse");
   (void)block_I;     // baseline streams one key at a time; reserved for a
   (void)inner_iter;  // future tiled-key prefetch (group-then-combine merge).
   (void)bn_kv;
@@ -224,6 +251,18 @@ void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
                     float sm_scale, bool return_lse,
                     const void* q, const void* kv, const void* indices,
                     void* out, void* lse) {
+  // Validate the caller's block_I/inner_iter (issue #57) even though the
+  // launch tile comes from dsa_config_for (below): a misconfigured caller
+  // gets a named error instead of a silently-wrong launch.
+  const int d_v0 = dim - tail_dim;
+  VK_EXPECTS(dim > 0 && tail_dim >= 0 && d_v0 > 0,
+             "dim > tail_dim >= 0 required");
+  VK_EXPECTS(topk > 0, "topk must be positive");
+  VK_EXPECTS(kv_group == 1, "kv_group must be 1 (single shared head_kv)");
+  VK_EXPECTS(block_I > 0 && inner_iter > 0,
+             "block_I and inner_iter must be positive");
+ VK_EXPECTS(topk % (block_I * inner_iter) == 0,
+             "topk must be a multiple of block_I*inner_iter");
   int bq = 0, th = 0, bi = 0, ii = 0;
   ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
   (void)th;

@@ -177,6 +177,11 @@ const char* vk_last_error(void) { return g_last_error.c_str(); }
 
 int vk_last_error_code(void) { return g_last_error_code; }
 
+void vk_set_last_error(int code, const char* message) {
+  g_last_error_code = code;
+  g_last_error = (message != nullptr) ? std::string(message) : std::string();
+}
+
 void vk_free(void* p) { std::free(p); }
 
 /* ------------------------------------------------------------------ */

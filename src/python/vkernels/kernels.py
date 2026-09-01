@@ -1020,7 +1020,7 @@ _LOG2E = float(np.log2(np.e))
 
 
 def dsa_sparse_fwd(q, kv, indices, *, dim, tail_dim, topk=None,
-                   kv_group=1, block_I=64, inner_iter=1, sm_scale=None,
+                   kv_group=1, block_I=None, inner_iter=None, sm_scale=None,
                    return_lse=False, out=None, lse=None):
     """DeepseekSparseAttn sparse-MLA forward (GLM-5.3-Flash / DeepSeek-V3),
     fp32 two-pass BASE-2 stable softmax over the ``topk`` indexer-selected
@@ -1060,6 +1060,10 @@ def dsa_sparse_fwd(q, kv, indices, *, dim, tail_dim, topk=None,
         kv_group: number of key/value heads (must be 1).
         block_I, inner_iter: kernel group-tiling configuration (the indexer
             pads ``topk`` to a multiple of ``block_I`` in the sglang layout).
+            When omitted, defaults to :func:`dsa_config` (always divisible
+            for any ``topk``); when given, ``topk % (block_I*inner_iter) ==
+            0`` is validated (issue #57) and a non-multiple raises
+            ``ValueError``.
         sm_scale: softmax pre-scale (folds ``log2(e)``); defaults to
             ``(1/sqrt(dim + tail_dim)) * log2(e)``.
         return_lse: when True, also compute the base-2 log-sum-exp.
@@ -1108,8 +1112,22 @@ def dsa_sparse_fwd(q, kv, indices, *, dim, tail_dim, topk=None,
         topk = tk
     elif int(topk) != tk:
         raise ValueError(f"topk mismatch: arg={topk} indices={tk}")
+    # Default block_I/inner_iter to the kernel's per-shape tile (always
+    # divisible for any topk), so the divisibility precondition holds without
+    # forcing the caller to thread block_I/inner_iter by hand.
+    if block_I is None or inner_iter is None:
+        _bq, _th, _bi, _ii = dsa_config(int(S_q), int(H), int(dim), int(topk))
+        if block_I is None:
+            block_I = _bi
+        if inner_iter is None:
+            inner_iter = _ii
     if block_I <= 0 or inner_iter <= 0:
         raise ValueError("block_I and inner_iter must be positive")
+    if topk % (block_I * inner_iter) != 0:
+        raise ValueError(
+            f"topk must be a multiple of block_I*inner_iter "
+            f"({block_I}*{inner_iter}={block_I * inner_iter}): got topk={topk}"
+        )
     if sm_scale is None:
         sm_scale = (1.0 / float(np.sqrt(float(dim + tail_dim)))) * _LOG2E
 
@@ -1118,6 +1136,15 @@ def dsa_sparse_fwd(q, kv, indices, *, dim, tail_dim, topk=None,
         lse_arr = _as_out(S_q * H, lse, "lse")
     else:
         lse_arr = np.empty(0, dtype=_F32)  # placeholder (never written)
+    # `out` must not alias any input or `lse`: the two-pass softmax writes a
+    # row into `out` then reads it back, and a shared buffer would mix one
+    # query's output into the next query's scores (issue #57).
+    if S_q and H and topk:
+        for name, arr in (("q", q_arr), ("kv", kv_arr), ("indices", idx_arr)):
+            if np.may_share_memory(out_arr, arr):
+                raise ValueError(f"out must not alias {name}")
+        if return_lse and np.may_share_memory(out_arr, lse_arr):
+            raise ValueError("out must not alias lse")
     _impl.dsa_sparse_fwd(
         int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
         int(kv_group), int(block_I), int(inner_iter), float(np.float32(sm_scale)),
@@ -1133,9 +1160,11 @@ def dsa_config(S_q, H, dim, topk):
     """Per-shape ``(bq, threads, block_I, inner_iter)`` tile selector for
     the HIP DSA kernel.
 
-    Decode (``S_q <= 8``) selects ``(1, 64, 64, inner_iter)`` (one query row
+    Decode (``S_q <= 8``) selects ``(1, 64, block_I, inner_iter)`` (one query row
     per block, one wavefront); prefill (``S_q >= 9``) selects
-    ``(4, 256, 64, inner_iter)``. ``inner_iter`` grows while ``topk`` stays
+    ``(4, 256, block_I, inner_iter)``. ``block_I`` is the largest power-of-two
+    divisor of ``topk`` that is ``<= 64`` (so ``topk % (block_I*inner_iter)
+    == 0`` for EVERY ``topk``, including ``topk < 64``); ``inner_iter`` grows while ``topk`` stays
     divisible by ``block_I * inner_iter`` (so the group tiling aligns with
     the indexer's padded-`topk` layout).
 

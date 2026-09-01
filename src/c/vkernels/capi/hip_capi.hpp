@@ -196,10 +196,11 @@ void vk_hip_mla_fwd(
  * runtime -- no zero-size GEMM, the exact case the tilelang code path
  * cannot compile. Online base-2 softmax, fp32 accumulation.
  */
-void vk_hip_dsa_sparse_fwd(
+int vk_hip_dsa_sparse_fwd(
     int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
     int block_I, int inner_iter, float sm_scale, int return_lse,
-    const void* q, const void* kv, const void* indices, void* out, void* lse);
+    const void* q, const void* kv, const void* indices, void* out,
+    void* lse);
 
 /* Pool-level radix top-k transform for the DSA kpool indexer.
  *
