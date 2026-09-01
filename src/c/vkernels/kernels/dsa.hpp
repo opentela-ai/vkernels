@@ -70,9 +70,13 @@ namespace vkernels::kernels {
 //   topk % (block_I * inner_iter) must be 0 (the kernel's group tiling; the
 //       oracle result is grouping-independent so this is validated, not used)
 //   kv_group must be 1 (a single head_kv group is shared by all H heads)
+//   out must not alias q, kv, indices, or lse (the two-pass softmax writes a
+//       row into `out` then reads it back; a shared buffer corrupts the run)
 //
 // `lse` may be null when `return_lse` is false; otherwise it must be large
-// enough for `S_q * H` fp32 values. `out` must not alias any input.
+// enough for `S_q * H` fp32 values. The HIP kernel (dsa.hip) enforces the
+// same preconditions at launch, converting a misconfigured caller into a
+// named error instead of a silent hang (issue #57).
 void dsa_sparse_fwd_cpu(int S_q, int S_kv, int H, int dim, int tail_dim,
                         int topk, int kv_group, int block_I, int inner_iter,
                         float sm_scale, bool return_lse,

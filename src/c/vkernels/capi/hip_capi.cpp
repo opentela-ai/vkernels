@@ -21,6 +21,7 @@
 #include "vkernels/capi/hip_capi.hpp"
 
 #include "vkernels/capi/capi.hpp"  // VK_OK / VK_ERROR_* status codes
+#include <stdexcept>   // std::invalid_argument / std::exception (issue #57 catch)
 #include "vkernels/kernels/moe_fused.hpp"
 #include "vkernels/kernels/mla.hpp"
 #include "vkernels/kernels/dsa.hpp"
@@ -97,13 +98,65 @@ extern "C" void vk_hip_mla_fwd(
 }
 
 // --- DSA sparse-MLA forward (GLM-5.3-Flash / DeepSeek-V3) ---
-extern "C" void vk_hip_dsa_sparse_fwd(
+extern "C" int vk_hip_dsa_sparse_fwd(
     int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
     int block_I, int inner_iter, float sm_scale, int return_lse,
-    const void* q, const void* kv, const void* indices, void* out, void* lse) {
-  vkernels::kernels::hip::dsa_sparse_fwd(
-      S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
-      sm_scale, return_lse != 0, q, kv, indices, out, lse);
+    const void* q, const void* kv, const void* indices, void* out,
+    void* lse) {
+  // Host-side preconditions (mirror vk_dsa_sparse_fwd, issue #57): a
+  // misconfigured caller gets a named error instead of a silent hang or
+  // an out-of-bounds launch. Validated here (before the launch, no sync)
+  // AND in dsa_sparse_fwd with VK_EXPECTS (defensive for direct C++ callers).
+  const int d_v = dim - tail_dim;
+  if (!(dim > 0 && tail_dim >= 0 && d_v > 0)) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT,
+                      "dim > tail_dim >= 0 required");
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  if (topk <= 0) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "topk must be positive");
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  if (kv_group != 1) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT,
+                      "kv_group must be 1 (single shared head_kv)");
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  if (block_I <= 0 || inner_iter <= 0) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT,
+                      "block_I and inner_iter must be positive");
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  if (topk % (block_I * inner_iter) != 0) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT,
+                      "topk must be a multiple of block_I*inner_iter");
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  if (S_q && H && topk) {
+    if (q == nullptr) { vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "q must not be null"); return VK_ERROR_INVALID_ARGUMENT; }
+    if (kv == nullptr) { vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "kv must not be null"); return VK_ERROR_INVALID_ARGUMENT; }
+    if (indices == nullptr) { vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "indices must not be null"); return VK_ERROR_INVALID_ARGUMENT; }
+    if (out == nullptr) { vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "out must not be null"); return VK_ERROR_INVALID_ARGUMENT; }
+    if (return_lse && lse == nullptr) { vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "lse must not be null"); return VK_ERROR_INVALID_ARGUMENT; }
+    if (out == q || out == kv || out == indices ||
+        (return_lse && out == lse)) {
+      vk_set_last_error(VK_ERROR_INVALID_ARGUMENT,
+                        "out must not alias q, kv, indices, or lse");
+      return VK_ERROR_INVALID_ARGUMENT;
+    }
+  }
+  try {
+    vkernels::kernels::hip::dsa_sparse_fwd(
+        S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+        sm_scale, return_lse != 0, q, kv, indices, out, lse);
+  } catch (const std::invalid_argument& e) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, e.what());
+    return VK_ERROR_INVALID_ARGUMENT;
+  } catch (const std::exception& e) {
+    vk_set_last_error(VK_ERROR_INTERNAL, e.what());
+    return VK_ERROR_INTERNAL;
+  }
+  return VK_OK;
 }
 
 // --- DSA pool-level radix top-k transform ---

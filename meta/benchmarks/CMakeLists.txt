@@ -278,6 +278,19 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_dsa_topk_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_dsa_topk_correct)
 
+  # DSA sparse-fwd launch-path preconditions (issue #57): the on-device
+  # regression for the silent gfx942 "D"-state hang. A valid decode-shape
+  # call must still return VK_OK and match the CPU oracle (dsa_sparse_fwd_cpu)
+  # to bf16 tolerance, while every unmet precondition (topk not divisible by
+  # block_I*inner_iter; out aliasing q/kv/indices/lse; lse null with
+  # return_lse) must return VK_ERROR_INVALID_ARGUMENT with a named message in
+  # microseconds instead of hanging. Links both libs: vkernels for the CPU
+  # oracle, vkernels_hip for the C ABI (vk_hip_dsa_sparse_fwd).
+  add_executable(test_dsa_precond_correct test_dsa_precond_correct.hip)
+  target_link_libraries(test_dsa_precond_correct PRIVATE vkernels::vkernels vkernels::vkernels_hip)
+  target_compile_features(test_dsa_precond_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_dsa_precond_correct)
+
   add_executable(dsa_bench bench_dsa.hip)
   target_link_libraries(dsa_bench PRIVATE vkernels::vkernels)
   target_compile_features(dsa_bench PRIVATE cxx_std_17)

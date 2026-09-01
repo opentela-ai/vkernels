@@ -62,6 +62,11 @@ const char* vk_last_error(void);
 /* Status code of the most recent failing call (VK_OK if none). */
 int vk_last_error_code(void);
 
+/* Set the thread-local last-error code/message (used by the HIP C ABI
+ * wrappers, which do NOT link the VK_CAPI_TRY macro from capi.cpp, to
+ * record contract violations the same way the CPU wrappers do). */
+void vk_set_last_error(int code, const char* message);
+
 /* Free memory returned by vk_* functions that allocate results. */
 void vk_free(void* p);
 
