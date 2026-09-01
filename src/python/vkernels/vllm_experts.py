@@ -469,6 +469,69 @@ def resolve_moe_fn(lib):
     return fn
 
 
+def resolve_align_fn(lib):
+    """Return the HIP on-device ``moe_align_block_size`` C ABI function.
+
+    ``vk_hip_moe_align_block_size`` (issue #46 follow-up) reads ``topk_ids``
+    on-device on the caller's stream — ordered after the expert-dispatch
+    all-to-all — and writes the block-aligned ``sorted_ids`` / ``expert_ids``
+    WITHOUT the ``topk_ids.cpu()`` host round-trip that dominated PP0's MoE
+    (97-100% of its per-call ``moe:vkernel_apply``). Returns ``None`` when the
+    symbol is absent (older build) so the caller can fall back to the CPU
+    path; an absent symbol is NOT fatal (unlike ``resolve_moe_fn``) because
+    the CPU path remains correct, just slower.
+    """
+    fn = getattr(lib, "vk_hip_moe_align_block_size", None)
+    if fn is None:
+        return None
+    import ctypes
+    fn.restype = ctypes.c_int
+    fn.argtypes = [
+        ctypes.c_void_p,  # topk_ids        [N] int32  (device)
+        ctypes.c_void_p,  # expert_map      [num_experts] int32 (device), or NULL
+        ctypes.c_int,     # M
+        ctypes.c_int,     # top_k
+        ctypes.c_int,     # block_size
+        ctypes.c_int,     # num_experts  (global)
+        ctypes.c_int,     # local_n      (experts on this rank)
+        ctypes.c_int,     # max_EM       (host high-water bound)
+        ctypes.c_void_p,  # sorted_ids   [max_EM] int32 (device)
+        ctypes.c_void_p,  # expert_ids   [max_EM/block_size] int32 (device)
+        ctypes.c_void_p,  # out_EM       [1] int32 (device; NOT read fast-path)
+        ctypes.c_void_p,  # stream
+    ]
+    return fn
+
+
+# Opt-in: do moe_align_block_size on the GPU (no topk_ids.cpu() host
+# round-trip). Defaults to the CPU path; the GPU path requires the
+# on-device align symbol (PR #47) AND M*top_k <= 1024 (single-block
+# shared memory). Larger N falls back to CPU automatically.
+_GPU_ALIGN = os.environ.get("VKERNELS_GPU_ALIGN", "0") not in ("0", "", "false")
+
+
+def _align_em_bound(M: int, top_k: int, local_n: int, block_size: int) -> int:
+    """Tight, host-computed upper bound on ``EM`` (no device sync).
+
+    Worst-case routing (max padding): each of ``min(N, local_n)`` experts
+    gets exactly one token, each padded to ``block_size``; any remaining
+    tokens land in one expert, padded to a multiple of ``block_size``.
+    This matches the actual ``EM`` from :func:`moe_align_block_size_with_map`
+    at the extreme and is a valid upper bound for every routing — and it is
+    a *constant* for a given batch shape (M, top_k, local_n, block_size are
+    all host integers), so the GEMM grid (``bound / block_size``) is
+    capture-safe and the kernels early-out the padding blocks/rows.
+    """
+    N = M * top_k
+    if N <= 0:
+        return block_size
+    head = min(N, local_n) * block_size
+    if N <= local_n:
+        return head
+    rem = ((N - local_n) + block_size - 1) // block_size * block_size
+    return head + rem
+
+
 # Module singleton, keyed by (device.index, <key>), shared across all MoE
 # layers on a rank (matches the validated cookbook wrapper). Uses the vLLM
 # capture probe so the breakable eager-break window is covered.
@@ -615,48 +678,122 @@ def _build_vllm_experts():
             # Block size: 16 for decode (small M), 64 for prefill (large M)
             block_size = 16 if M <= 32 else 64
 
-            # --- moe_align_block_size (CPU), then copy into persistent
-            # GPU buffers (no per-call allocation). sids/eids are read by
-            # the C kernel via raw ctypes pointers PyTorch's allocator
-            # cannot track, so reallocating here would let the allocator
+            # Launch on PyTorch's *current* compute stream so every device
+            # kernel (the on-device moe_align below when enabled, plus the
+            # fused GEMM) is ordered with the buffers the caller allocated /
+            # will read on that same stream. Acquired ONCE, up here, so the
+            # on-device align (when enabled) runs on this stream too —
+            # ordered after the expert-dispatch all-to-all that produced
+            # topk_ids, WITHOUT the topk_ids.cpu() host round-trip that
+            # previously serialised every TP all-to-all and made each MoE
+            # layer a per-step barrier (issue #46).
+            stream = torch.cuda.current_stream().cuda_stream
+            topk_ids_dev = topk_ids.contiguous().view(-1)
+
+            # Persistent sids/eids are read by the C kernel via raw ctypes
+            # pointers PyTorch's allocator cannot track, so they are sized
+            # once on the eager warmup (at MAX_NUM_BATCHED_TOKENS) and
+            # reused forever — reallocating here would let the allocator
             # recycle the storage mid-capture/replay -> "Memory access
             # fault by GPU node-X". ----------------------------------------
-            with record_function("moe:apply.cpu_copy"):
-                topk_ids_flat = (
-                    topk_ids.contiguous().view(-1).cpu().numpy()
-                    .astype(np.int32)
-                )
-                expert_map_np = (
-                    expert_map.cpu().numpy().astype(np.int32)
-                    if expert_map is not None
-                    else None
-                )
-            with record_function("moe:apply.cpu_align"):
-                sids_np, eids_np, EM = moe_align_block_size_with_map(
-                    topk_ids_flat, global_num_experts, block_size, expert_map_np
-                )
-            with record_function("moe:apply.gpu_copy"):
-                # Size the persistent sids/eids at the high-water mark
-                # (MAX_NUM_BATCHED_TOKENS) on the eager warmup; later calls
-                # only slice.
-                max_M = max_num_tokens_hint()
-                # Local expert count: prefer this layer's view when set,
-                # else fall back to the local w1 row count.
-                try:
-                    local_n = _local_n(self.num_experts, global_num_experts)
-                except AttributeError:
-                    local_n = _local_n(E, global_num_experts)
-                cap_em = max_em_count(max_M, top_k, local_n)
-                d_sids = _scratch.get(
-                    ("sids", top_k, local_n), EM, dtype=torch.int32, device=dev,
-                    capacity=cap_em, name="sids",
-                )
-                d_eids = _scratch.get(
-                    ("eids", top_k, local_n), EM, dtype=torch.int32, device=dev,
-                    capacity=cap_em, name="eids",
-                )
-                d_sids.copy_(torch.from_numpy(sids_np))
-                d_eids[: EM // block_size].copy_(torch.from_numpy(eids_np))
+            max_M = max_num_tokens_hint()
+            # Local expert count: prefer this layer's view when set,
+            # else fall back to the local w1 row count.
+            try:
+                local_n = _local_n(self.num_experts, global_num_experts)
+            except AttributeError:
+                local_n = _local_n(E, global_num_experts)
+            cap_em = max_em_count(max_M, top_k, local_n)
+
+            # On-device moe_align_block_size (issue #46 follow-up): when
+            # the symbol is present (PR #47), VKERNELS_GPU_ALIGN is set, and
+            # M*top_k <= 1024 (single-block shared memory — the decode
+            # regime that dominates PP0), do the routing sort on the GPU on
+            # `stream` and read topk_ids/expert_map on-device — removing the
+            # ~4 ms topk_ids.cpu() host sync (97-100% of PP0's per-call
+            # moe:vkernel_apply). Larger N (prefill) falls back to the CPU
+            # path automatically. The GEMM is launched with max_EM/block_size
+            # blocks (a constant for the batch shape; the kernels early-out
+            # the padding blocks/rows), so NO host read of out_em is needed.
+            align_fn = resolve_align_fn(lib)
+            use_gpu = (
+                _GPU_ALIGN
+                and align_fn is not None
+                and (M * top_k) <= 1024
+            )
+            if use_gpu:
+                with record_function("moe:apply.gpu_align"):
+                    max_EM_host = min(
+                        _align_em_bound(M, top_k, local_n, block_size), cap_em
+                    )
+                    d_sids = _scratch.get(
+                        ("sids", top_k, local_n), max_EM_host,
+                        dtype=torch.int32, device=dev, capacity=cap_em,
+                        name="sids",
+                    )
+                    d_eids = _scratch.get(
+                        ("eids", top_k, local_n), max_EM_host // block_size,
+                        dtype=torch.int32, device=dev, capacity=cap_em,
+                        name="eids",
+                    )
+                    # out_em is written by the GPU but NOT read here (the
+                    # GEMM uses max_EM_host). Persistent + capacity 1 so the
+                    # device pointer is capture-stable and never reallocates.
+                    d_out_em = _scratch.get(
+                        ("out_em", top_k, local_n), 1,
+                        dtype=torch.int32, device=dev, capacity=1,
+                        name="out_em",
+                    )
+                    expert_map_dev = (
+                        expert_map.contiguous() if expert_map is not None else None
+                    )
+                    rc = align_fn(
+                        ctypes.c_void_p(topk_ids_dev.data_ptr()),
+                        ctypes.c_void_p(expert_map_dev.data_ptr())
+                        if expert_map_dev is not None else None,
+                        ctypes.c_int(M), ctypes.c_int(top_k),
+                        ctypes.c_int(block_size),
+                        ctypes.c_int(global_num_experts),
+                        ctypes.c_int(local_n),
+                        ctypes.c_int(max_EM_host),
+                        ctypes.c_void_p(d_sids.data_ptr()),
+                        ctypes.c_void_p(d_eids.data_ptr()),
+                        ctypes.c_void_p(d_out_em.data_ptr()),
+                        ctypes.c_void_p(stream),
+                    )
+                if rc == 0:  # VK_OK
+                    EM = max_EM_host
+                else:
+                    # ABI rejected the inputs (e.g. local_n > num_experts);
+                    # fall back to the proven CPU path below.
+                    use_gpu = False
+
+            if not use_gpu:
+                with record_function("moe:apply.cpu_copy"):
+                    topk_ids_flat = (
+                        topk_ids_dev.cpu().numpy().astype(np.int32)
+                    )
+                    expert_map_np = (
+                        expert_map.cpu().numpy().astype(np.int32)
+                        if expert_map is not None
+                        else None
+                    )
+                with record_function("moe:apply.cpu_align"):
+                    sids_np, eids_np, EM = moe_align_block_size_with_map(
+                        topk_ids_flat, global_num_experts, block_size,
+                        expert_map_np,
+                    )
+                with record_function("moe:apply.gpu_copy"):
+                    d_sids = _scratch.get(
+                        ("sids", top_k, local_n), EM, dtype=torch.int32,
+                        device=dev, capacity=cap_em, name="sids",
+                    )
+                    d_eids = _scratch.get(
+                        ("eids", top_k, local_n), EM, dtype=torch.int32,
+                        device=dev, capacity=cap_em, name="eids",
+                    )
+                    d_sids.copy_(torch.from_numpy(sids_np))
+                    d_eids[: EM // block_size].copy_(torch.from_numpy(eids_np))
 
             # Routing weights: if already applied on input, use a
             # persistent ones buffer (sized once at MAX_NUM_BATCHED_TOKENS
@@ -675,7 +812,9 @@ def _build_vllm_experts():
             else:
                 topk_w = topk_weights.contiguous().view(-1)
 
-            topk_ids_dev = topk_ids.contiguous().view(-1)
+            # topk_ids_dev was acquired before the align branch (no sync):
+            # it is the on-device routing the GPU align reads when enabled,
+            # and the input the CPU fallback .cpu()'s otherwise.
 
             # Activation parameters.
             if activation == MoEActivation.SITU:
@@ -741,13 +880,13 @@ def _build_vllm_experts():
             # recorded into the graph and replays correctly.
             out_fp32.zero_()
 
-            # Launch on PyTorch's *current* compute stream so the
-            # out_fp32 (and act_scratch) writes are ordered with the
-            # fp32→bf16 copy below on that same stream. This removes the
-            # device-wide synchronize the wrapper previously needed as a
-            # cross-stream correctness guard (that drain serialised every
-            # TP all-to-all and made each MoE layer a per-step barrier).
-            stream = torch.cuda.current_stream().cuda_stream
+            # `stream` was acquired before the align branch above so the
+            # on-device moe_align (when enabled) is ordered on the SAME
+            # stream as this GEMM launch and the fp32->bf16 copy below.
+            # This removes the device-wide synchronize the wrapper
+            # previously needed as a cross-stream correctness guard (that
+            # drain serialised every TP all-to-all and made each MoE layer
+            # a per-step barrier).
 
             with record_function("moe:apply.launch"):
                 moe_fn(

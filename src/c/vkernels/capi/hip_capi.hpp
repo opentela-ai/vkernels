@@ -42,6 +42,13 @@
 
 #include <stdint.h>
 
+// The VK_OK / VK_ERROR_* status codes are shared with the CPU ABI
+// (vk_moe_align_block_size). Including capi.hpp here makes them part of
+// the HIP ABI surface for every consumer (ctypes uses the numeric values;
+// C/Rust FFI consumers need the enum). The CPU vk_* declarations it also
+// brings in are extern "C" and disjoint from the vk_hip_* names below.
+#include "vkernels/capi/capi.hpp"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -101,6 +108,51 @@ void vk_hip_fused_moe_mxfp4(
     const float* b13, const float* b2, int block_size, void* stream);
 
 /* ------------------------------------------------------------------ */
+/* moe_align_block_size — device, decode (issue #46 follow-up)         */
+/* ------------------------------------------------------------------ */
+/*
+ * GPU counterpart of `vk_moe_align_block_size` (CPU, capi.hpp). Reads
+ * `topk_ids` on-device on `stream` — ordered after the expert-dispatch
+ * all-to-all — and writes the block-aligned `sorted_ids` / `expert_ids`
+ * consumed by `vk_hip_fused_moe_mxfp4`, WITHOUT the `topk_ids.cpu()` host
+ * round-trip that dominated PP0's MoE (97-100% of its per-call
+ * `moe:vkernel_apply`; see docs/performance/moe-fused/gfx942-pp-pipeline.md).
+ *
+ * `expert_map` [num_experts] (global->local, -1 = skip) or NULL (1:1).
+ * `max_EM` is the host-computed high-water bound (a constant for a given
+ * batch shape, so the GEMM grid `max_EM/block_size` is capture-safe and
+ * the kernels early-out padding blocks/rows). `*out_EM` receives the
+ * actual padded EM — a device write; the capture-safe fast path does NOT
+ * read it (it launches the GEMM with `max_EM/block_size` blocks).
+ *
+ * Limit: `M*top_k` must be `<= 1024` (single-block shared memory, decode).
+ * Larger N returns VK_ERROR_UNSUPPORTED; the caller falls back to the CPU
+ * `vk_moe_align_block_size`.
+ *
+ * Returns VK_OK, or VK_ERROR_INVALID_ARGUMENT on null/bad params,
+ * VK_ERROR_UNSUPPORTED if M*top_k > 1024. Note: unlike the void HIP
+ * compute launchers, this wrapper returns a status code (matches the CPU
+ * ABI and lets the ctypes caller pick the fallback path) — it performs
+ * only host-side validation and returns immediately after launch.
+ *
+ *   topk_ids    [N]            int32  global expert ids (M*top_k)
+ *   expert_map  [num_experts]  int32  global->local (-1 = skip), or NULL
+ *   block_size                16 (decode) or 64 (prefill)
+ *   local_n                   number of local experts on this rank
+ *   max_EM                    host high-water bound on EM
+ *   sorted_ids  [max_EM]            int32  flat indices, padded with N
+ *   expert_ids  [max_EM/block_size] int32  local expert per block, -1 pad
+ *   out_EM      [1]                 int32  actual padded EM (device write)
+ *   stream                     caller's current stream, or NULL (default)
+ */
+int vk_hip_moe_align_block_size(
+    const int32_t* topk_ids, const int32_t* expert_map,
+    int32_t M, int32_t top_k, int32_t block_size,
+    int32_t num_experts, int32_t local_n, int32_t max_EM,
+    int32_t* sorted_ids, int32_t* expert_ids, int32_t* out_EM,
+    void* stream);
+
+/* ------------------------------------------------------------------ */
 /* MLA forward — absorbed form (src/c/vkernels/kernels/mla.hip, #21)   */
 /* ------------------------------------------------------------------ */
 /*
@@ -144,15 +196,93 @@ void vk_hip_mla_fwd(
  * runtime -- no zero-size GEMM, the exact case the tilelang code path
  * cannot compile. Online base-2 softmax, fp32 accumulation.
  */
-void vk_hip_dsa_sparse_fwd(
+int vk_hip_dsa_sparse_fwd(
     int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
     int block_I, int inner_iter, float sm_scale, int return_lse,
-    const void* q, const void* kv, const void* indices, void* out, void* lse);
+    const void* q, const void* kv, const void* indices, void* out,
+    void* lse);
+
+/* Pool-level radix top-k transform for the DSA kpool indexer.
+ *
+ *   score             [batch_size, score_stride] strided fp32
+ *   lengths           [batch_size] int32 valid group counts
+ *   dst_token_indices [batch_size, out_cols] contiguous int32
+ *   page_table        [batch_size, page_table_stride] int32 (optional)
+ *
+ * token_topk / pool_size must be one of 128, 160, 192, 224, 256, or
+ * 512. page_table and topk_indices_offset are mutually exclusive. When
+ * page_table_row_index is null, score row i uses page-table row i; otherwise
+ * every entry must be in [0, batch_size). When
+ * seq_lens is non-null, out_cols must equal token_topk + pool_size - 1 and
+ * the seq_len % pool_size trailing tokens are appended after history.
+ */
+void vk_hip_dsa_topk_transform(
+    int32_t batch_size, const float* score, const int32_t* lengths,
+    int32_t* dst_token_indices, int64_t score_stride, int32_t pool_size,
+    int32_t token_topk, int32_t out_cols, const int32_t* page_table,
+    int64_t page_table_stride, const int32_t* page_table_row_index,
+    const int32_t* topk_indices_offset, const int32_t* row_starts,
+    const int32_t* seq_lens);
 
 /* Per-shape (bq, threads, block_I, inner_iter) tile selector for the HIP
  * DSA kernel (mirrors vk_dsa_config). Never throws. */
 void vk_hip_dsa_config(int S_q, int H, int dim, int topk, int* bq,
                        int* threads, int* block_I, int* inner_iter);
+
+/* ------------------------------------------------------------------ */
+/* DSA paged-MQA gated top-k logits (src/c/vkernels/kernels/dsa.hip,    */
+/* #51 -- the kpool>1 indexer path)                                     */
+/* ------------------------------------------------------------------ */
+/*
+ * The INDEXER scores each query against its paged KV tiles; the top-k
+ * selects over the results. See dsa.hpp for the gated-logit formula.
+ *
+ *   q_fp8       [batch_size, num_heads, head_dim]        fp8 e4m3fnuz
+ *   kvcache_u8  [num_blocks, block*(head_dim+4)]         uint8 (block*head_dim
+ *                 fp8 keys, then block fp32 per-token scales)
+ *   weight      [batch_size, num_heads]                  fp32 (the gate)
+ *   seq_lens    [batch_size]                             int32 (POOLED valid)
+ *   page_table  [batch_size, max_table_len]              int32
+ *   out         [batch_size, max_seq_len]                fp32 (ZERO first;
+ *                 max_seq_len = max_table_len*block. Tokens >= seq_len[b]
+ *                 are left unwritten -- sglang masks invalid positions)
+ *   split_kv    perf only: max(1, min(max_seq_len//block, NUM_CU//batch_size))
+ *                 with NUM_CU = 228 (MI300A / gfx942;
+ *                 hipDeviceProp_t::multiProcessorCount, verified on a CSCS
+ *                 beverin node -- the cap was wrongly stated as 256 here
+ *                 before dsa.hpp::dsa_topk_logits_split_for). Grouping-
+ *                 independent (any positive split_kv yields the same top-k).
+ *                 The host C ABI vk_dsa_topk_logits_split_for is the single
+ *                 source of truth for this formula; call it instead of
+ *                 recomputing.
+ *
+ * Dispatches on the staged-bytes cap (gfx942's 64 KB NON-OPTIN dynamic-LDS
+ * limit; NO hipFuncSetAttribute opt-in past it -- see the KB note
+ * mi300a-dynamic-lds-no-optin). The AUTO dispatcher (dsa_topk_logits in
+ * dsa.hip, via dsa_topk_logits_with_variant(0)) picks the SMALLEST-
+ * footprint variant that fits the shape's cap:
+ *   1. bf16-MFMA (dsa_topk_logits_kernel_mfma) -- Q transposed as bf16
+ *      sQt[D][H] staged once, one bf16 K-tile reloaded, gated via Matrix
+ *      Cores. Needs H%16==0, head_dim%64==0, block%16==0 and fits
+ *      dsa_topk_logits_fits_lds_mfma. At the GLM-5.3 indexer (H=32, D=128,
+ *      B=64) that is 16,768 B and runs ~10x faster than the fp32-Q kernel;
+ *      it also fits H=64 (25,088 B) and H=128 (41,728 B), so those now
+ *      take the MFMA fast path instead of the fp8-Q fallback.
+ *   2. fp32-Q (dsa_topk_logits_kernel) -- Q dequanted once into shared.
+ *      Fallback for shapes the MFMA kernel refuses but that fit
+ *      dsa_topk_logits_fits_lds (e.g. H not a multiple of 16).
+ *   3. fp8-Q (dsa_topk_logits_kernel_fp8q) -- Q staged raw, dequantised
+ *      on the fly -- bit-identical output. Fallback for shapes fitting
+ *      neither of the above but dsa_topk_logits_fits_lds_fp8q.
+ * Shapes fitting NONE are REFUSED -- a stderr diagnostic + no-op, leaving
+ * `out` as the caller provided.
+ */
+void vk_hip_dsa_topk_logits(
+    int batch_size, int num_heads, int head_dim, int block,
+    int max_table_len, int max_seq_len, int split_kv,
+    const void* q_fp8, const void* kvcache_u8,
+    const void* weight, const void* seq_lens,
+    const void* page_table, void* out);
 
 /* ------------------------------------------------------------------ */
 /* MHC multi-head hybrid-attention pre-norm (src/c/vkernels/kernels/    */

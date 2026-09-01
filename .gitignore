@@ -61,6 +61,19 @@ venv/
 *~
 .*.swp
 
+# Local agent / tool config (never track -- machine-local).
+# These were swept into a commit by a stray `git add -A`; keep them
+# out of the shared tree.
+.pi/
+.codex/
+.entire/
+.rcc/
+
+# Local vendored reference trees + scratch blobs (never track).
+# work/k45/vllm/... is a local vLLM install copied in for reference;
+# *.tar under work/ is large binary scratch.
+work/
+
 # build
 build_host
 /dist/

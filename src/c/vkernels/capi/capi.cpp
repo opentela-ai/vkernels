@@ -29,6 +29,7 @@
 #include "vkernels/kernels/kda.hpp"
 #include "vkernels/kernels/mla.hpp"
 #include "vkernels/kernels/dsa.hpp"
+#include "vkernels/kernels/dsa_topk.hpp"
 #include "vkernels/kernels/mhc.hpp"
 #include "vkernels/kernels/moe.hpp"
 #include "vkernels/kernels/moe_aux.hpp"
@@ -175,6 +176,11 @@ int vk_has_cuda(void) { return VKERNELS_HAS_CUDA; }
 const char* vk_last_error(void) { return g_last_error.c_str(); }
 
 int vk_last_error_code(void) { return g_last_error_code; }
+
+void vk_set_last_error(int code, const char* message) {
+  g_last_error_code = code;
+  g_last_error = (message != nullptr) ? std::string(message) : std::string();
+}
 
 void vk_free(void* p) { std::free(p); }
 
@@ -326,10 +332,61 @@ int32_t vk_dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
   VK_CAPI_CATCH_RETURN_CODE()
 }
 
+int32_t vk_dsa_topk_transform(
+    int32_t batch_size, const float* score, const int32_t* lengths,
+    int32_t* dst_token_indices, int64_t score_stride, int32_t pool_size,
+    int32_t token_topk, int32_t out_cols, const int32_t* page_table,
+    int64_t page_table_stride, const int32_t* page_table_row_index,
+    const int32_t* topk_indices_offset, const int32_t* row_starts,
+    const int32_t* seq_lens) {
+  VK_CAPI_TRY
+  vkernels::kernels::dsa_topk_transform_cpu(
+      batch_size, score, lengths, dst_token_indices, score_stride, pool_size,
+      token_topk, out_cols, page_table, page_table_stride, page_table_row_index,
+      topk_indices_offset, row_starts, seq_lens);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int vk_dsa_topk_group_topk_supported(int32_t group_topk) {
+  return vkernels::kernels::dsa_topk_transform_group_topk_supported(group_topk)
+             ? 1
+             : 0;
+}
+
 void vk_dsa_config(int S_q, int H, int dim, int topk, int* bq,
                    int* threads, int* block_I, int* inner_iter) {
   vkernels::kernels::dsa_config_for(S_q, H, dim, topk, bq, threads, block_I,
                                     inner_iter);
+}
+
+/* ------------------------------------------------------------------ */
+/* kernels: DSA — paged-MQA gated top-k logits (dsa.hpp, #51)         */
+/* ------------------------------------------------------------------ */
+
+int32_t vk_dsa_topk_logits(int batch_size, int num_heads, int head_dim,
+                           int block, int max_table_len, int num_blocks,
+                           const float* q, const float* kv,
+                           const float* k_scale, const float* gate,
+                           const int32_t* seq_lens,
+                           const int32_t* page_table, float* out) {
+  VK_CAPI_TRY
+  vkernels::kernels::dsa_topk_logits_cpu(batch_size, num_heads, head_dim,
+                                         block, max_table_len, num_blocks,
+                                         q, kv, k_scale, gate, seq_lens,
+                                         page_table, out);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
+}
+
+int32_t vk_dsa_topk_logits_split_for(int batch_size, int max_seq_len,
+                                     int block, int* split_kv) {
+  VK_CAPI_TRY
+  if (split_kv == nullptr) return VK_ERROR_INVALID_ARGUMENT;
+  *split_kv = vkernels::kernels::dsa_topk_logits_split_for(batch_size,
+                                                           max_seq_len, block);
+  return VK_OK;
+  VK_CAPI_CATCH_RETURN_CODE()
 }
 
 /* ------------------------------------------------------------------ */

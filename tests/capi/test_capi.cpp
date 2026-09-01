@@ -103,6 +103,23 @@ TEST(Capi, LastErrorDefaultsToOk) {
   EXPECT_NE(vk_last_error(), nullptr);
 }
 
+// vk_set_last_error is the setter the HIP C ABI wrappers use to record
+// contract violations (issue #57). Exercised on the host so the public
+// C API has coverage without the HIP toolkit (vk_set_last_error is only
+// called from hip_capi.cpp otherwise).
+TEST(Capi, SetLastErrorRoundTripsAndClears) {
+  vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "boom from setter");
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+  EXPECT_EQ(std::strcmp(vk_last_error(), "boom from setter"), 0);
+  // nullptr message clears to the empty string (the other ternary branch).
+  vk_set_last_error(VK_ERROR_INTERNAL, nullptr);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INTERNAL);
+  EXPECT_EQ(std::strcmp(vk_last_error(), ""), 0);
+  // Reset so the next test sees the default OK state.
+  vk_set_last_error(VK_OK, "");
+  EXPECT_EQ(vk_last_error_code(), VK_OK);
+}
+
 TEST(Capi, FreeNullIsSafe) {
   vk_free(nullptr);
 }
@@ -767,7 +784,7 @@ TEST(CapiDsa, HandCheckedTailDimZero) {
   std::vector<float> kv = {1, 0, 0, 1};
   std::vector<int32_t> idx = {0, 1};
   std::vector<float> out(2, -1.0f), lse(1, 7.0f);
-  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 0, 2, 1, 64, 1, sm_scale, /*lse=*/1,
+  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 0, 2, 1, 2, 1, sm_scale, /*lse=*/1,
                               q.data(), kv.data(), idx.data(), out.data(),
                               lse.data()),
             VK_OK);
@@ -785,12 +802,48 @@ TEST(CapiDsa, HandCheckedTailDimPositive) {
   std::vector<float> kv = {2, 1, 1, 3, 0, 1}; // 2 keys, dim+tail=3
   std::vector<int32_t> idx = {0, 1};
   std::vector<float> out(1, -1.0f), lse(1, 7.0f);
-  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 1, 2, 1, 64, 1, sm_scale, 1,
+  EXPECT_EQ(vk_dsa_sparse_fwd(1, 2, 1, 2, 1, 2, 1, 2, 1, sm_scale, 1,
                               q.data(), kv.data(), idx.data(), out.data(),
                               lse.data()),
             VK_OK);
   EXPECT_NEAR(out[0], 4.0f / 1.5f, 1e-6f);
   EXPECT_NEAR(lse[0], 3.0f + std::log2(1.5f), 1e-6f);
+}
+
+TEST(CapiDsa, TopkGroupSupportHelper) {
+  EXPECT_EQ(vk_dsa_topk_group_topk_supported(128), 1);
+  EXPECT_EQ(vk_dsa_topk_group_topk_supported(64), 0);
+}
+
+TEST(CapiDsa, TopkTransformPageTableAndTail) {
+  std::vector<float> score(16);
+  for (int i = 0; i < 16; ++i) score[i] = static_cast<float>(i);
+  std::vector<int32_t> lengths = {2};
+  std::vector<int32_t> page_table(64);
+  for (int32_t i = 0; i < 64; ++i) page_table[i] = 300 + i;
+  std::vector<int32_t> page_row = {0};
+  std::vector<int32_t> seq_lens = {10};
+  std::vector<int32_t> out(515, -1);
+  EXPECT_EQ(vk_dsa_topk_transform(1, score.data(), lengths.data(), out.data(),
+                                  16, 4, 512, 515, page_table.data(), 64,
+                                  page_row.data(), nullptr, nullptr,
+                                  seq_lens.data()),
+            VK_OK);
+  for (int32_t i = 0; i < 10; ++i) EXPECT_EQ(out[i], 300 + i);
+  for (int32_t i = 10; i < 515; ++i) EXPECT_EQ(out[i], -1);
+}
+
+TEST(CapiDsa, TopkTransformConflictingMappingsSetError) {
+  std::vector<float> score(16, 0.0f);
+  std::vector<int32_t> lengths = {2};
+  std::vector<int32_t> page_table(64, 0);
+  std::vector<int32_t> offsets = {1};
+  std::vector<int32_t> out(512, -1);
+  EXPECT_EQ(vk_dsa_topk_transform(1, score.data(), lengths.data(), out.data(),
+                                  16, 4, 512, 512, page_table.data(), 64,
+                                  nullptr, offsets.data(), nullptr, nullptr),
+            VK_ERROR_INVALID_ARGUMENT);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
 }
 
 TEST(CapiDsa, ConfigDecode) {
@@ -814,9 +867,122 @@ TEST(CapiDsa, ConfigPrefill) {
 TEST(CapiDsa, NullArgsThrow) {
   std::vector<float> q(4, 1), kv(4, 1), out(2, 1);
   std::vector<int32_t> idx(2, 0);
-  EXPECT_NE(vk_dsa_sparse_fwd(1, 1, 1, 2, 0, 2, 1, 64, 1, 1.0f, 0, nullptr,
+  EXPECT_NE(vk_dsa_sparse_fwd(1, 1, 1, 2, 0, 2, 1, 2, 1, 1.0f, 0, nullptr,
                               kv.data(), idx.data(), out.data(), nullptr),
             VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+// topk not divisible by block_I*inner_iter is rejected (issue #57).
+TEST(CapiDsa, DivisibilityCheckThrows) {
+  std::vector<float> q(2, 1), kv(4, 1), out(2, 0);
+  std::vector<int32_t> idx(2, 0);
+  // topk=2, block_I=4, inner_iter=1: 2 % (4*1) = 2 != 0.
+  EXPECT_NE(vk_dsa_sparse_fwd(1, 2, 1, 2, 0, 2, 1, 4, 1, 1.0f, 0, q.data(),
+                              kv.data(), idx.data(), out.data(), nullptr),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+// `out` aliasing an input is rejected (issue #57): the two-pass softmax
+// writes a row into `out` then reads it back.
+TEST(CapiDsa, AliasThrows) {
+  std::vector<float> q(2, 1), kv(4, 1), out(2, 0);
+  std::vector<int32_t> idx(2, 0);
+  // out == q (same buffer).
+  EXPECT_NE(vk_dsa_sparse_fwd(1, 2, 1, 2, 0, 2, 1, 2, 1, 1.0f, 0, out.data(),
+                              kv.data(), idx.data(), out.data(), nullptr),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+// --- DSA paged-MQA gated top-k logits (dsa.hpp, issue #51, the kpool>1 ---
+//    indexer path that FEEDS vk_dsa_sparse_fwd) -------------------------
+
+// Mirrors test_dsa.cpp::DsaTopk::HandCheckedSingleHead: 1 head, 1 block,
+// 2 keys [1,0][0,1], scales [2,3], gate [1], seq_len 2.
+//   t=0: dot=1, acc=1*1=1, out=2*1=2 ;  t=1: dot=1, acc=1, out=3*1=3
+TEST(CapiDsaTopk, HandCheckedSingleHead) {
+  const float q[2] = {1, 1};
+  const float kv[4] = {1, 0, 0, 1};        // [1 block][2 tokens][2]
+  const float k_scale[2] = {2, 3};
+  const float gate[1] = {1};
+  const int32_t sl[1] = {2};
+  const int32_t pt[1] = {0};
+  std::vector<float> out(2, -1.0f);
+  EXPECT_EQ(vk_dsa_topk_logits(1, 1, 2, 2, 1, 1, q, kv, k_scale, gate, sl,
+                              pt, out.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 2.0f, 1e-6f);
+  EXPECT_NEAR(out[1], 3.0f, 1e-6f);
+}
+
+// seq_len truncates WITHIN a page (block=4, seq_len=2): tokens 2,3 of the
+// page are past seq_len and LEFT UNWRITTEN. Mirrors test_dsa.cpp::DsaTopk.
+TEST(CapiDsaTopk, SeqLenTruncatesWithinPage) {
+  const float q[2] = {1, 1};
+  const float kv[8] = {1, 1, 2, 2, 3, 3, 4, 4};  // [1][4 tokens][2]
+  const float k_scale[4] = {1, 1, 1, 1};
+  const float gate[1] = {1};
+  const int32_t sl[1] = {2};
+  const int32_t pt[1] = {0};
+  std::vector<float> out(4, 0.0f);                 // max_seq_len = 1*4
+  EXPECT_EQ(vk_dsa_topk_logits(1, 1, 2, 4, 1, 1, q, kv, k_scale, gate, sl,
+                              pt, out.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 2.0f, 1e-6f);
+  EXPECT_NEAR(out[1], 4.0f, 1e-6f);
+  EXPECT_EQ(out[2], 0.0f);   // past seq_len, left unwritten
+  EXPECT_EQ(out[3], 0.0f);
+}
+
+// Empty (batch_size==0 or max_table_len==0) is a no-op: output untouched
+// (mirrors CapiDsa::EmptyIsNoOp + test_dsa.cpp::DsaTopk::EmptyIsNoOp).
+TEST(CapiDsaTopk, EmptyIsNoOp) {
+  std::vector<float> out = {3.0f, 4.0f};
+  const float q[2] = {1, 1}, kv[4] = {1, 1, 1, 1}, k_scale[2] = {1, 1},
+      gate[1] = {1};
+  const int32_t sl[1] = {2}, pt[1] = {0};
+  EXPECT_EQ(vk_dsa_topk_logits(0, 1, 2, 2, 1, 1, q, kv, k_scale, gate, sl,
+                              pt, out.data()),
+            VK_OK);
+  EXPECT_EQ(out[0], 3.0f);
+  EXPECT_EQ(out[1], 4.0f);
+  EXPECT_EQ(vk_dsa_topk_logits(1, 1, 2, 2, 0, 1, q, kv, k_scale, gate, sl,
+                              pt, out.data()),
+            VK_OK);
+  EXPECT_EQ(out[0], 3.0f);
+  EXPECT_EQ(out[1], 4.0f);
+}
+
+// Null pointer (batch_size>0, max_table_len>0) -> VK_ERROR_INVALID_ARGUMENT.
+TEST(CapiDsaTopk, NullArgsThrow) {
+  const float kv[4] = {1, 1, 1, 1}, k_scale[2] = {1, 1}, gate[1] = {1};
+  const int32_t sl[1] = {2}, pt[1] = {0};
+  std::vector<float> out(2, 1.0f);
+  EXPECT_NE(vk_dsa_topk_logits(1, 1, 2, 2, 1, 1, nullptr, kv, k_scale, gate,
+                              sl, pt, out.data()),
+            VK_OK);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
+}
+
+// dsa_topk_logits_split_for: optimal split_kv = max(1, min(ceildiv(msl,B),
+// 228/bs)). bs=1 msl=4096 B=64 -> 64 (one page/split, 64 of 228 CUs);
+// bs=64 msl=4096 B=64 -> min(64, 3) = 3 (192 of 228 CUs); empty -> 1.
+TEST(CapiDsaTopk, SplitFor) {
+  int sp = 0;
+  EXPECT_EQ(vk_dsa_topk_logits_split_for(1, 4096, 64, &sp), VK_OK);
+  EXPECT_EQ(sp, 64);
+  EXPECT_EQ(vk_dsa_topk_logits_split_for(1, 1024, 64, &sp), VK_OK);
+  EXPECT_EQ(sp, 16);
+  EXPECT_EQ(vk_dsa_topk_logits_split_for(64, 4096, 64, &sp), VK_OK);
+  EXPECT_EQ(sp, 3);
+  EXPECT_EQ(vk_dsa_topk_logits_split_for(0, 4096, 64, &sp), VK_OK);
+  EXPECT_EQ(sp, 1);
+}
+
+TEST(CapiDsaTopk, SplitForNullArg) {
+  EXPECT_NE(vk_dsa_topk_logits_split_for(1, 4096, 64, nullptr), VK_OK);
   EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
 }
 

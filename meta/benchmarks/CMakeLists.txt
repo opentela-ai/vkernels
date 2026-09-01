@@ -199,6 +199,28 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_capi_moe PRIVATE cxx_std_17)
   vkernels_set_warnings(test_capi_moe)
 
+  # C ABI correctness for the on-device moe_align_block_size (issue #46
+  # follow-up): parity between vk_hip_moe_align_block_size (no topk_ids.cpu()
+  # host round-trip) and the CPU reference across several routings, plus an
+  # end-to-end check that GPU-aligned routing feeds the GEMM identically.
+  add_executable(test_capi_moe_align test_capi_moe_align.hip)
+  target_link_libraries(test_capi_moe_align PRIVATE vkernels::vkernels vkernels::vkernels_hip)
+  target_compile_features(test_capi_moe_align PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_capi_moe_align)
+
+  # DSA pool-level radix top-k transform (issue #56): exercise the exported
+  # C ABI against the host oracle for every supported group-top-k, including
+  # the short-row guard, page-table/ragged modes, row starts, and tail append.
+  add_executable(test_capi_dsa_topk test_capi_dsa_topk.hip)
+  target_link_libraries(test_capi_dsa_topk PRIVATE vkernels::vkernels vkernels::vkernels_hip)
+  target_compile_features(test_capi_dsa_topk PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_capi_dsa_topk)
+
+  add_executable(dsa_topk_bench bench_dsa_topk.hip)
+  target_link_libraries(dsa_topk_bench PRIVATE vkernels::vkernels)
+  target_compile_features(dsa_topk_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(dsa_topk_bench)
+
   add_executable(test_moe_aux_correct test_moe_aux_correct.hip)
   target_link_libraries(test_moe_aux_correct PRIVATE vkernels::vkernels)
   target_compile_features(test_moe_aux_correct PRIVATE cxx_std_17)
@@ -250,10 +272,40 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_dsa_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_dsa_correct)
 
+  # DSA paged-MQA gated top-k logits (issue #51): the kpool>1 indexer path.
+  add_executable(test_dsa_topk_correct test_dsa_topk_correct.hip)
+  target_link_libraries(test_dsa_topk_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_dsa_topk_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_dsa_topk_correct)
+
+  # DSA sparse-fwd launch-path preconditions (issue #57): the on-device
+  # regression for the silent gfx942 "D"-state hang. A valid decode-shape
+  # call must still return VK_OK and match the CPU oracle (dsa_sparse_fwd_cpu)
+  # to bf16 tolerance, while every unmet precondition (topk not divisible by
+  # block_I*inner_iter; out aliasing q/kv/indices/lse; lse null with
+  # return_lse) must return VK_ERROR_INVALID_ARGUMENT with a named message in
+  # microseconds instead of hanging. Links both libs: vkernels for the CPU
+  # oracle, vkernels_hip for the C ABI (vk_hip_dsa_sparse_fwd).
+  add_executable(test_dsa_precond_correct test_dsa_precond_correct.hip)
+  target_link_libraries(test_dsa_precond_correct PRIVATE vkernels::vkernels vkernels::vkernels_hip)
+  target_compile_features(test_dsa_precond_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_dsa_precond_correct)
+
   add_executable(dsa_bench bench_dsa.hip)
   target_link_libraries(dsa_bench PRIVATE vkernels::vkernels)
   target_compile_features(dsa_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(dsa_bench)
+
+  # DSA paged-MQA gated top-k logits (issue #51): the kpool>1 indexer path
+  # that FEEDS dsa_sparse_fwd. Same harness style as bench_dsa.hip (HIP
+  # events, variance-driven iters) but for the fp8 e4m3fnuz top-k logits
+  # kernel. Renamed from bench_dsa_topk.hip / dsa_topk_bench to avoid an
+  # add/add collision with the DSA radix top-k TRANSFORM bench (issue #56,
+  # bench_dsa_topk.hip / dsa_topk_bench on main).
+  add_executable(dsa_topk_logits_bench bench_dsa_topk_logits.hip)
+  target_link_libraries(dsa_topk_logits_bench PRIVATE vkernels::vkernels)
+  target_compile_features(dsa_topk_logits_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(dsa_topk_logits_bench)
 
   # MHC multi-head hybrid-attention pre-norm (issue #51, part 2).
   add_executable(test_mhc_correct test_mhc_correct.hip)

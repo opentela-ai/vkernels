@@ -971,7 +971,31 @@ def dsa_sparse_fwd(S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I,
     ``topk`` selected keys, fp32 throughout). ``q`` ``(1,S_q,H,W)``,
     ``kv`` ``(1,S_kv,1,W)``, ``indices`` ``(1,S_q,1,topk)`` int32
     (``<0/>=S_kv`` masked), ``W = dim + tail_dim``, ``d_v = dim - tail_dim``.
+    Validates the same preconditions as the C++ oracle (issue #57): a
+    misconfigured caller raises a named error instead of a wrong result.
     """
+    if not (dim > 0 and tail_dim >= 0 and dim - tail_dim > 0):
+        raise ValueError("dim > tail_dim >= 0 required")
+    if topk <= 0:
+        raise ValueError("topk must be positive")
+    if kv_group != 1:
+        raise ValueError("kv_group must be 1 (single shared head_kv)")
+    if block_I <= 0 or inner_iter <= 0:
+        raise ValueError("block_I and inner_iter must be positive")
+    if topk % (block_I * inner_iter) != 0:
+        raise ValueError(
+            f"topk must be a multiple of block_I*inner_iter "
+            f"({block_I}*{inner_iter}={block_I * inner_iter}): got topk={topk}"
+        )
+    if S_q and H and topk:
+        if q is None or kv is None or indices is None or out is None:
+            raise ValueError("q, kv, indices, out must not be null")
+        if return_lse and lse is None:
+            raise ValueError("lse must not be null when return_lse")
+        if (np.may_share_memory(out, q) or np.may_share_memory(out, kv)
+                or np.may_share_memory(out, indices)
+                or (return_lse and np.may_share_memory(out, lse))):
+            raise ValueError("out must not alias q, kv, indices, or lse")
     W = dim + tail_dim
     d_v = dim - tail_dim
     q = np.ascontiguousarray(q, dtype=np.float32).reshape(S_q, H, W)
@@ -1022,15 +1046,170 @@ def dsa_sparse_fwd(S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I,
 
 def dsa_config(S_q, H, dim, topk):
     """Per-shape (bq, threads, block_I, inner_iter) tile selector (mirrors
-    ``dsa_config_for``; decode S_q<=8 -> (1,64,64,i), prefill ->
-    (4,256,64,i); inner_iter grows while topk % (block_I*inner_iter) == 0)."""
+    ``dsa_config_for``; decode S_q<=8 -> (1,64,bi,i), prefill ->
+    (4,256,bi,i); block_I is the largest power-of-two divisor of topk that
+    is <= 64 so topk % (block_I*inner_iter) == 0 for every topk, and
+    inner_iter grows while that stays true)."""
     bq = 1 if S_q <= 8 else 4
     threads = 64 if S_q <= 8 else 256
     block_I = 64
+    while block_I > 1 and topk % block_I != 0:
+        block_I >>= 1
     inner_iter = 1
     while inner_iter < 8 and topk % (block_I * (inner_iter * 2)) == 0:
         inner_iter *= 2
     return (bq, threads, block_I, inner_iter)
+
+
+def dsa_topk_group_topk_supported(group_topk):
+    return int(group_topk) in (128, 160, 192, 224, 256, 512)
+
+
+# Mirror of the C++ ``transform_token`` helper (dsa_topk.cpp): apply exactly
+# one of the page-table remap, the ragged offset, or the identity. Factored so
+# the two fill sites in ``dsa_topk_transform`` stay in lock-step with it.
+def _dsa_topk_transform_token(raw_token, page_row, has_offset, offset):
+    if page_row is not None:
+        return int(page_row[raw_token])
+    return raw_token + offset if has_offset else raw_token
+
+
+def dsa_topk_transform(batch_size, score_stride, pool_size, token_topk, out_cols,
+                       score, lengths, out, page_table=None,
+                       page_table_row_index=None, topk_indices_offset=None,
+                       row_starts=None, seq_lens=None, page_table_stride=0):
+    group_topk = int(token_topk) // int(pool_size)
+    if not dsa_topk_group_topk_supported(group_topk):
+        raise ValueError("unsupported pool-level top-k")
+    score = np.ascontiguousarray(score, dtype=np.float32).reshape(batch_size, score_stride)
+    lengths = np.ascontiguousarray(lengths, dtype=np.int32).reshape(batch_size)
+    out = np.ascontiguousarray(out, dtype=np.int32).reshape(batch_size, out_cols)
+    row_starts = None if row_starts is None else np.ascontiguousarray(row_starts, dtype=np.int32).reshape(batch_size)
+    seq_lens = None if seq_lens is None else np.ascontiguousarray(seq_lens, dtype=np.int32).reshape(batch_size)
+    page_table_row_index = (
+        None
+        if page_table_row_index is None
+        else np.ascontiguousarray(page_table_row_index, dtype=np.int32).reshape(batch_size)
+    )
+    topk_indices_offset = (
+        None
+        if topk_indices_offset is None
+        else np.ascontiguousarray(topk_indices_offset, dtype=np.int32).reshape(batch_size)
+    )
+    if page_table is not None:
+        page_table = np.ascontiguousarray(page_table, dtype=np.int32).reshape(-1, page_table_stride)
+    tail_cols = 0 if seq_lens is None else pool_size - 1
+    if out_cols != token_topk + tail_cols:
+        raise ValueError("out_cols does not match the transform layout")
+    # Mirror the C++ VK_EXPECTS checks (dsa_topk.cpp): the two remaps are
+    # mutually exclusive and a page table needs a positive stride.
+    if page_table is not None and topk_indices_offset is not None:
+        raise ValueError("page_table and topk_indices_offset are mutually exclusive")
+    if page_table is not None and page_table_stride <= 0:
+        raise ValueError("page_table_stride must be positive when a page table is used")
+    out.fill(-1)
+    has_offset = topk_indices_offset is not None
+    for row in range(batch_size):
+        length = int(lengths[row])
+        row_start = 0 if row_starts is None else int(row_starts[row])
+        if length < 0 or row_start < 0 or row_start + length > score_stride:
+            raise ValueError("valid score range exceeds score_stride")
+        if length > 2147483647 // pool_size:
+            raise ValueError("expanded token index overflows int32")
+        valid_groups = min(length, group_topk)
+        if length <= group_topk:
+            selected = np.arange(valid_groups, dtype=np.int32)
+        else:
+            row_scores = score[row, row_start:row_start + length]
+            # Match the C++ contract: the winning set matters, not a stable order.
+            selected = np.argpartition(-row_scores, group_topk - 1)[:group_topk].astype(np.int32)
+        if page_table is None:
+            page_row = None
+        else:
+            page_row_id = row if page_table_row_index is None else int(page_table_row_index[row])
+            # The C++/HIP contract bounds page_row by batch_size (the score-row
+            # count), not by the page table's own row count -- see dsa.hpp.
+            if page_row_id < 0 or page_row_id >= batch_size:
+                raise ValueError("page_table_row_index entries must address a page-table row")
+            page_row = page_table[page_row_id]
+        offset = 0 if topk_indices_offset is None else int(topk_indices_offset[row])
+        history_len = valid_groups * pool_size
+        for col in range(history_len):
+            group_id = col // pool_size
+            raw_token = int(selected[group_id]) * pool_size + (col % pool_size)
+            out[row, col] = _dsa_topk_transform_token(raw_token, page_row, has_offset, offset)
+        if seq_lens is not None:
+            if int(seq_lens[row]) < 0:
+                raise ValueError("seq_lens entries must be non-negative")
+            tail_count = int(seq_lens[row]) % pool_size
+            for tail in range(tail_count):
+                raw_token = length * pool_size + tail
+                out[row, history_len + tail] = _dsa_topk_transform_token(
+                    raw_token, page_row, has_offset, offset)
+def dsa_topk_logits_split_for(batch_size, max_seq_len, block):
+    """Optimal split_kv for the HIP dsa_topk_logits indexer (mirrors
+    ``dsa_topk_logits_split_for``; issue #51). Perf only -- the CPU
+    reference has no split_kv (single-threaded), but the integrator calls
+    this before launching the GPU kernel. split_kv = max(1,
+    min(ceildiv(max_seq_len, block), 228 / batch_size)) with NUM_CU=228
+    (MI300A / gfx942). At bs=1 msl=4096 B=64 this is 64 (measured
+    21.5 ms -> 0.36 ms, 59.9x)."""
+    if batch_size <= 0 or max_seq_len <= 0 or block <= 0:
+        return 1
+    pages = -(-max_seq_len // block)  # ceildiv
+    by_cu = 228 // batch_size
+    s = min(pages, by_cu)
+    return s if s >= 1 else 1
+
+
+def dsa_topk_logits(batch_size, num_heads, head_dim, block, max_table_len,
+                    num_blocks, q, kv, k_scale, gate, seq_lens, page_table,
+                    out):
+    """Pure-Python (numpy) DSA paged-MQA gated top-k logits; mirrors
+    ``dsa_topk_logits_cpu`` exactly (the kpool>1 indexer path, the FIRST
+    stage feeding ``dsa_sparse_fwd``). ``q`` ``(B,H,D)``, ``kv``
+    ``(num_blocks,block,D)``, ``k_scale`` ``(num_blocks,block)``, ``gate``
+    ``(B,H)``, ``seq_lens`` ``(B,)`` int32 (pooled valid), ``page_table``
+    ``(B,max_table_len)`` int32 -> ``out`` ``(B,max_table_len*block)`` fp32.
+    Tokens ``t >= seq_lens[b]`` are left UNWRITTEN (the caller zeroes the
+    output first, mirroring the tilelang ``clean_logits=False`` path).
+    """
+    q = np.ascontiguousarray(q, dtype=np.float32).reshape(batch_size,
+                                                           num_heads, head_dim)
+    kv = np.ascontiguousarray(kv, dtype=np.float32).reshape(num_blocks, block,
+                                                            head_dim)
+    k_scale = np.ascontiguousarray(k_scale, dtype=np.float32).reshape(
+        num_blocks, block)
+    gate = np.ascontiguousarray(gate, dtype=np.float32).reshape(batch_size,
+                                                                num_heads)
+    seq_lens = np.ascontiguousarray(seq_lens, dtype=np.int32).reshape(batch_size)
+    page_table = np.ascontiguousarray(page_table, dtype=np.int32).reshape(
+        batch_size, max_table_len)
+    out = np.ascontiguousarray(out, dtype=np.float32).reshape(
+        batch_size, max_table_len * block)
+    for b in range(batch_size):
+        sl = int(seq_lens[b])
+        if sl <= 0:
+            continue  # nothing to write (output stays zeroed)
+        ob = out[b]   # (max_table_len * block,)
+        qb = q[b]     # (H, D)
+        gb = gate[b]  # (H,)
+        for i in range(max_table_len):
+            page = int(page_table[b, i])
+            if page < 0 or page >= num_blocks:
+                continue  # OOB page -> unwritten (mirrors dsa_sparse_fwd)
+            kb = kv[page]        # (block, D)
+            sb = k_scale[page]   # (block,)
+            # Per-head gated dot; H heads share the one K tile (paged MQA).
+            acc = (np.maximum(qb @ kb.T, np.float32(0.0)) * gb[:, None]).sum(
+                axis=0
+            )  # (block,)
+            for j in range(block):
+                t = i * block + j
+                if t >= sl:
+                    break  # rest of this page is past seq_len
+                ob[t] = np.float32(sb[j] * acc[j])
+    return out
 
 
 # ---------------------------------------------------------------------------

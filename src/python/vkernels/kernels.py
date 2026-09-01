@@ -1020,7 +1020,7 @@ _LOG2E = float(np.log2(np.e))
 
 
 def dsa_sparse_fwd(q, kv, indices, *, dim, tail_dim, topk=None,
-                   kv_group=1, block_I=64, inner_iter=1, sm_scale=None,
+                   kv_group=1, block_I=None, inner_iter=None, sm_scale=None,
                    return_lse=False, out=None, lse=None):
     """DeepseekSparseAttn sparse-MLA forward (GLM-5.3-Flash / DeepSeek-V3),
     fp32 two-pass BASE-2 stable softmax over the ``topk`` indexer-selected
@@ -1060,6 +1060,10 @@ def dsa_sparse_fwd(q, kv, indices, *, dim, tail_dim, topk=None,
         kv_group: number of key/value heads (must be 1).
         block_I, inner_iter: kernel group-tiling configuration (the indexer
             pads ``topk`` to a multiple of ``block_I`` in the sglang layout).
+            When omitted, defaults to :func:`dsa_config` (always divisible
+            for any ``topk``); when given, ``topk % (block_I*inner_iter) ==
+            0`` is validated (issue #57) and a non-multiple raises
+            ``ValueError``.
         sm_scale: softmax pre-scale (folds ``log2(e)``); defaults to
             ``(1/sqrt(dim + tail_dim)) * log2(e)``.
         return_lse: when True, also compute the base-2 log-sum-exp.
@@ -1108,8 +1112,22 @@ def dsa_sparse_fwd(q, kv, indices, *, dim, tail_dim, topk=None,
         topk = tk
     elif int(topk) != tk:
         raise ValueError(f"topk mismatch: arg={topk} indices={tk}")
+    # Default block_I/inner_iter to the kernel's per-shape tile (always
+    # divisible for any topk), so the divisibility precondition holds without
+    # forcing the caller to thread block_I/inner_iter by hand.
+    if block_I is None or inner_iter is None:
+        _bq, _th, _bi, _ii = dsa_config(int(S_q), int(H), int(dim), int(topk))
+        if block_I is None:
+            block_I = _bi
+        if inner_iter is None:
+            inner_iter = _ii
     if block_I <= 0 or inner_iter <= 0:
         raise ValueError("block_I and inner_iter must be positive")
+    if topk % (block_I * inner_iter) != 0:
+        raise ValueError(
+            f"topk must be a multiple of block_I*inner_iter "
+            f"({block_I}*{inner_iter}={block_I * inner_iter}): got topk={topk}"
+        )
     if sm_scale is None:
         sm_scale = (1.0 / float(np.sqrt(float(dim + tail_dim)))) * _LOG2E
 
@@ -1118,6 +1136,15 @@ def dsa_sparse_fwd(q, kv, indices, *, dim, tail_dim, topk=None,
         lse_arr = _as_out(S_q * H, lse, "lse")
     else:
         lse_arr = np.empty(0, dtype=_F32)  # placeholder (never written)
+    # `out` must not alias any input or `lse`: the two-pass softmax writes a
+    # row into `out` then reads it back, and a shared buffer would mix one
+    # query's output into the next query's scores (issue #57).
+    if S_q and H and topk:
+        for name, arr in (("q", q_arr), ("kv", kv_arr), ("indices", idx_arr)):
+            if np.may_share_memory(out_arr, arr):
+                raise ValueError(f"out must not alias {name}")
+        if return_lse and np.may_share_memory(out_arr, lse_arr):
+            raise ValueError("out must not alias lse")
     _impl.dsa_sparse_fwd(
         int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
         int(kv_group), int(block_I), int(inner_iter), float(np.float32(sm_scale)),
@@ -1133,9 +1160,11 @@ def dsa_config(S_q, H, dim, topk):
     """Per-shape ``(bq, threads, block_I, inner_iter)`` tile selector for
     the HIP DSA kernel.
 
-    Decode (``S_q <= 8``) selects ``(1, 64, 64, inner_iter)`` (one query row
+    Decode (``S_q <= 8``) selects ``(1, 64, block_I, inner_iter)`` (one query row
     per block, one wavefront); prefill (``S_q >= 9``) selects
-    ``(4, 256, 64, inner_iter)``. ``inner_iter`` grows while ``topk`` stays
+    ``(4, 256, block_I, inner_iter)``. ``block_I`` is the largest power-of-two
+    divisor of ``topk`` that is ``<= 64`` (so ``topk % (block_I*inner_iter)
+    == 0`` for EVERY ``topk``, including ``topk < 64``); ``inner_iter`` grows while ``topk`` stays
     divisible by ``block_I * inner_iter`` (so the group tiling aligns with
     the indexer's padded-`topk` layout).
 
@@ -1146,6 +1175,205 @@ def dsa_config(S_q, H, dim, topk):
         int(v)
         for v in _impl.dsa_config(int(S_q), int(H), int(dim), int(topk))
     )
+
+
+def dsa_topk_transform(score, lengths, *, pool_size, token_topk,
+                       out_cols=None, page_table=None,
+                       page_table_row_index=None, topk_indices_offset=None,
+                       row_starts=None, seq_lens=None, out=None):
+    """DeepseekSparseAttn pool-level top-k transform.
+
+    ``score`` is ``(B, score_stride)`` float32 pool-group logits and
+    ``lengths`` is ``(B,)`` int32 valid group counts. The transform selects
+    ``token_topk / pool_size`` pool groups per row, expands each winner to
+    ``pool_size`` token ids, optionally remaps them through ``page_table`` or
+    adds a ragged ``topk_indices_offset``, and optionally appends the
+    ``seq_len % pool_size`` tail tokens.
+    """
+    score_arr = _as_input(score, "score")
+    if score_arr.ndim != 2:
+        raise ValueError("score must be 2-D [batch_size, score_stride]")
+    batch_size, score_stride = (int(v) for v in score_arr.shape)
+    lengths_arr = np.ascontiguousarray(lengths, dtype=np.int32)
+    if lengths_arr.ndim != 1 or lengths_arr.size != batch_size:
+        raise ValueError("lengths must be 1-D with one entry per score row")
+    if pool_size <= 1:
+        raise ValueError("pool_size must be greater than one")
+    if token_topk <= 0 or token_topk % pool_size != 0:
+        raise ValueError("token_topk must be a positive multiple of pool_size")
+    group_topk = int(token_topk) // int(pool_size)
+    if not bool(_impl.dsa_topk_group_topk_supported(group_topk)):
+        raise ValueError("unsupported pool-level top-k")
+    if page_table is not None and topk_indices_offset is not None:
+        raise ValueError("page_table and topk_indices_offset are mutually exclusive")
+
+    def _opt_i32(name, value):
+        if value is None:
+            return None
+        arr = np.ascontiguousarray(value, dtype=np.int32)
+        if arr.ndim != 1 or arr.size != batch_size:
+            raise ValueError(f"{name} must be 1-D with {batch_size} elements")
+        return arr
+
+    page_table_arr = None
+    page_table_stride = 0
+    if page_table is not None:
+        page_table_arr = np.ascontiguousarray(page_table, dtype=np.int32)
+        if page_table_arr.ndim != 2:
+            raise ValueError("page_table must be 2-D [rows, page_table_stride]")
+        if page_table_arr.shape[0] != batch_size:
+            raise ValueError("page_table must have one row per score row")
+        page_table_stride = int(page_table_arr.shape[1])
+    page_row_arr = _opt_i32("page_table_row_index", page_table_row_index)
+    if page_table_arr is not None and page_row_arr is not None:
+        if np.any(page_row_arr < 0) or np.any(page_row_arr >= page_table_arr.shape[0]):
+            raise ValueError("page_table_row_index entries must address a page-table row")
+    offsets_arr = _opt_i32("topk_indices_offset", topk_indices_offset)
+    row_starts_arr = _opt_i32("row_starts", row_starts)
+    seq_lens_arr = _opt_i32("seq_lens", seq_lens)
+    if out_cols is None:
+        out_cols = int(token_topk) + (int(pool_size) - 1 if seq_lens_arr is not None else 0)
+    out_arr = _as_out_typed(out, np.int32, batch_size * int(out_cols), "out") if out is not None else np.empty((batch_size, int(out_cols)), dtype=np.int32)
+    out_flat = out_arr.reshape(batch_size * int(out_cols))
+    _impl.dsa_topk_transform(
+        int(batch_size), int(score_stride), int(pool_size), int(token_topk),
+        int(out_cols), score_arr, lengths_arr, out_flat,
+        page_table_arr, page_row_arr, offsets_arr, row_starts_arr,
+        seq_lens_arr, int(page_table_stride),
+    )
+    return out_flat.reshape(batch_size, int(out_cols))
+def dsa_topk_logits_split_for(batch_size, max_seq_len, block):
+    """The optimal ``split_kv`` for the HIP :func:`dsa_topk_logits` indexer
+    (issue #51) -- the single source of truth for the formula the GPU ABI
+    (``vk_hip_dsa_topk_logits``) docstring used to restate.
+
+    ``split_kv`` is **perf only** (grouping-independent: any positive value
+    yields the same logits; see ``test_dsa_topk_correct.hip`` case
+    ``split=2``). The binding constraint at decode is occupancy (one
+    wavefront per block on MI300A's 228 CUs), so more is strictly better
+    until either the page range is exhausted or the grid saturates the CUs:
+
+    .. code-block:: text
+
+        split_kv = max(1, min( ceildiv(max_seq_len, block), 228 / batch_size ))
+
+    with ``NUM_CU = 228`` (MI300A / gfx942,
+    ``hipDeviceProp_t.multiProcessorCount``, verified on a CSCS beverin
+    node). At ``bs=1, max_seq_len=4096, block=64`` this is ``64`` (one page
+    per split, 64 of 228 CUs) -- with the bf16-MFMA fast path measured
+    ``898 us -> 191 us`` (4.7x; the MFMA kernel at split=1 is already
+    ~24x faster than the fp32-Q baseline, so split_kv compresses the gain.
+    ``meta/benchmarks/bench_dsa_topk.hip``). Call this before launching the
+    GPU kernel instead of recomputing.
+
+    Args:
+        batch_size: number of requests in the batch (>= 0; 0 -> safe ``1``).
+        max_seq_len: pooled valid KV tokens per request (the kernel's
+            ``max_seq_len = max_table_len * block``).
+        block: page size (matches the indexer's ``block_size``).
+
+    Returns:
+        The recommended ``split_kv`` (``int``, always ``>= 1``).
+    """
+    return int(_impl.dsa_topk_logits_split_for(int(batch_size),
+                                               int(max_seq_len), int(block)))
+
+
+def dsa_topk_logits(q, kv, k_scale, gate, seq_lens, page_table, *,
+                    out=None):
+    """DSA paged-MQA gated top-k logits (GLM-5.3 kpool>1 indexer path),
+    the FIRST stage feeding :func:`dsa_sparse_fwd`: each query scores its
+    paged KV tiles and the integrator's top-k then selects the blocks to
+    attend over. This is the CPU reference the gfx942 HIP kernel is
+    checked against; the device ABI is FP8 e4m3fnuz (the integrator
+    converts -- mirrors :func:`dsa_sparse_fwd`'s bf16->fp32).
+
+    * ``q``         : ``(B, H, D)`` float32 — the indexer's query head(s).
+    * ``kv``        : ``(num_blocks, block, D)`` float32 keys (block = page
+                      size; ``kv[j]`` is one page of ``block`` keys).
+    * ``k_scale``   : ``(num_blocks, block)`` float32 per-token scales.
+    * ``gate``      : ``(B, H)`` float32 — the indexer's per-head gate
+                      weight (``_get_logits_head_gate`` after ``squeeze(2)``).
+    * ``seq_lens``  : ``(B,)`` int32 — the POOLED valid KV count per batch
+                      (``pool_seqlens`` in sglang).
+    * ``page_table``: ``(B, max_table_len)`` int32 — the POOLED page table
+                      (``pool_block_tables``; ``page_table[b,i]`` indexes
+                      ``num_blocks``). Entries ``>= num_blocks`` or ``< 0``
+                      are left unwritten (OOB page).
+    * ``out``       : optional writable float32 ``(B, max_table_len*block)``
+                      buffer; a new ZEROED array is allocated when omitted.
+
+    ``block`` is inferred from ``kv.shape[1]``; ``max_seq_len =
+    max_table_len * block``. Tokens ``t >= seq_lens[b]`` are left
+    UNWRITTEN, so the output is zeroed first (mirrors the tilelang
+    ``clean_logits=False`` path; sglang masks invalid positions via
+    ``group_lengths``/``topk_offsets`` before the top-k).
+
+    Args:
+        q: float32 ``(B, H, D)`` indexer queries.
+        kv: float32 ``(num_blocks, block, D)`` paged keys.
+        k_scale: float32 ``(num_blocks, block)`` per-token scales.
+        gate: float32 ``(B, H)`` per-head gate weight.
+        seq_lens: int32 ``(B,)`` pooled valid KV count per batch.
+        page_table: int32 ``(B, max_table_len)`` pooled page table.
+        out: optional writable float32 ``(B, max_table_len*block)`` buffer.
+
+    Returns:
+        ``out`` reshaped to ``(B, max_table_len*block)``.
+
+    Raises:
+        ValueError: on inconsistent shapes or non-positive H/D/block.
+    """
+    q_arr = _as_input(q, "q")
+    kv_arr = _as_input(kv, "kv")
+    ks_arr = _as_input(k_scale, "k_scale")
+    g_arr = _as_input(gate, "gate")
+    sl_arr = np.ascontiguousarray(seq_lens, dtype=np.int32)
+    if sl_arr.dtype != np.int32:
+        raise TypeError("seq_lens must be an integer array")
+    pt_arr = np.ascontiguousarray(page_table, dtype=np.int32)
+    if pt_arr.dtype != np.int32:
+        raise TypeError("page_table must be an integer array")
+    if q_arr.ndim != 3:
+        raise ValueError("q must be 3-D [B, H, D]")
+    if kv_arr.ndim != 3:
+        raise ValueError("kv must be 3-D [num_blocks, block, D]")
+    if ks_arr.ndim != 2:
+        raise ValueError("k_scale must be 2-D [num_blocks, block]")
+    if g_arr.ndim != 2:
+        raise ValueError("gate must be 2-D [B, H]")
+    if sl_arr.ndim != 1:
+        raise ValueError("seq_lens must be 1-D [B]")
+    if pt_arr.ndim != 2:
+        raise ValueError("page_table must be 2-D [B, max_table_len]")
+    B, H, D = (int(v) for v in q_arr.shape)
+    NB, block, D2 = (int(v) for v in kv_arr.shape)
+    NB2, block2 = (int(v) for v in ks_arr.shape)
+    Bg, Hg = (int(v) for v in g_arr.shape)
+    Bsl = int(sl_arr.shape[0])
+    Bpt, MTL = (int(v) for v in pt_arr.shape)
+    if not (H > 0 and D > 0 and block > 0):
+        raise ValueError("H, D and block must be positive")
+    if NB != NB2:
+        raise ValueError(f"num_blocks mismatch: kv={NB} k_scale={NB2}")
+    if block != block2:
+        raise ValueError(f"block mismatch: kv={block} k_scale={block2}")
+    if D != D2:
+        raise ValueError(f"head_dim mismatch: q={D} kv={D2}")
+    if B != Bg or H != Hg:
+        raise ValueError(f"gate shape {(Bg, Hg)} != q batch/heads {(B, H)}")
+    if B != Bsl:
+        raise ValueError(f"seq_lens len {Bsl} != batch_size {B}")
+    if B != Bpt:
+        raise ValueError(f"page_table batch {Bpt} != batch_size {B}")
+    max_seq_len = MTL * block
+    out_arr = _as_out(B * max_seq_len, out, "out")
+    out_arr.fill(np.float32(0.0))  # tokens t >= seq_lens[b] stay zero
+    _impl.dsa_topk_logits(
+        int(B), int(H), int(D), int(block), int(MTL), int(NB),
+        q_arr, kv_arr, ks_arr, g_arr, sl_arr, pt_arr, out_arr,
+    )
+    return out_arr.reshape(B, max_seq_len)
 
 
 # ---------------------------------------------------------------------------
