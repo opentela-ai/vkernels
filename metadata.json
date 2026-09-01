@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M1EGV435BQQA90GTNGHGFH7C",
+  "strategy": "manual-commit",
+  "branch": "fix/dsa-sparse-fwd-preconditions",
+  "checkpoints_count": 10,
+  "files_touched": [
+    "tests/capi/test_capi.cpp"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 17091,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 1336704,
+    "output_tokens": 7458,
+    "api_call_count": 17
+  }
+}
