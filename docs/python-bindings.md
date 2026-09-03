@@ -136,7 +136,7 @@ into a caller-provided `out` or a freshly allocated array.
 | `direct_lds_fill_bf16(lds_dst, global_src, elements)` | global → LDS bf16 copy | raw byte addresses |
 | `use_async_copy_default() -> bool` | async-copy gate (host: always `True`) | `K3_NO_ASYNC` overrides |
 | `moe_align_block_size(topk_ids, num_experts, block_size=16)` | `[M, top_k]` routing → block-aligned layout | returns `(sorted_ids, expert_ids, EM)` |
-| `fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w, expert_ids, *, top_k=1, group_size=32, swiglu_limit=0.0, b13=None, b2=None, act_scratch=None, out=None)` | fused MXFP4 MoE grouped GEMM (gate_up + SwiGLU, then down + combine) | CPU-reference oracle; returns `out` `(M, hidden)` |
+| `fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w, expert_ids, act_scratch=None, out=None, *, top_k=1, group_size=32, swiglu_limit=0.0, activation="swiglu", beta=4.0, linear_beta=25.0, b13=None, b2=None)` | fused MXFP4 MoE grouped GEMM (gate_up + `activation`∈{`swiglu`,`situ`}, then down + combine) | CPU-reference oracle; returns `out` `(M, hidden)` |
 
 Contract violations raise `ValueError`; a badly-typed `out` raises
 `TypeError`. `out` must be writable, C-contiguous `float32` and exactly the
@@ -157,10 +157,17 @@ out = kernels.fused_moe_mxfp4(A, w13, w13_scale, w2, w2_scale,
                               sorted_ids, tw, expert_ids, top_k=top_k)
 ```
 
-`A` is bf16 (`uint16`) `[M, hidden]`; `w13`/`w2` are packed E2M1 `uint8`;
-`w13_scale`/`w2_scale` are ue8m0 `uint8`. These bindings call the CPU
-reference (`fused_moe_mxfp4_cpu`), matching the C++ oracle bit-for-bit up to
-float32 operation order; the HIP GPU path is invoked from the C++ API
+`activation` selects the gate/up epilogue: `"swiglu"` (default, the
+`silu(clamp(gate,L)) · clamp(up,L)` SwiGLU clamp) or `"situ"` (Kimi-K3,
+matching vLLM's `situ_and_mul`: `beta·tanh(gate/beta)·sigmoid(gate) ·
+linear_beta·tanh(up/linear_beta)`, no `swiglu_limit` clamp). `beta` and
+`linear_beta` are the SiTU softcaps. `act_scratch` is an optional
+`uint16 [EM * ispp]` buffer for the activation intermediate (allocated when
+omitted); `b13`/`b2` are optional fp32 biases. `A` is bf16 (`uint16`)
+`[M, hidden]`; `w13`/`w2` are packed E2M1 `uint8`; `w13_scale`/`w2_scale`
+are ue8m0 `uint8`. These bindings call the CPU reference
+(`fused_moe_mxfp4_cpu`), matching the C++ oracle bit-for-bit up to float32
+operation order; the HIP GPU path is invoked from the C++ API
 (`vkernels::kernels::hip::fused_moe_mxfp4`).
 
 #### bf16 GEMM
@@ -263,6 +270,119 @@ kernels.kda_pack_bitmatrix(np.array([1,0,1,1,0,0,0,1,0,1], np.uint8), n_bits=10)
 # array([177,  64], dtype=uint8)
 ```
 
+#### DSA — DeepseekSparseAttn sparse-MLA
+
+`dsa_sparse_fwd(q, kv, indices, *, dim, tail_dim, topk=None, kv_group=1,
+block_I=64, inner_iter=1, sm_scale=None, return_lse=False, out=None,
+lse=None)` is the CPU reference for the gfx942 sparse-MLA forward
+(GLM-5.3-Flash / DeepSeek-V3, issue #51). An external indexer has already
+selected, per query token, the `topk` most relevant KV tiles (`indices`);
+the kernel scores each query against exactly those keys with a two-pass
+base-2 stable softmax and produces the combined attention output.
+
+* `q` is `[1, S_q, H, dim + tail_dim]` fp32 — `[q_main (dim) | q_tail (tail_dim)]` (tail may be 0).
+* `kv` is `[1, S_kv, kv_group, dim + tail_dim]` fp32 (`kv_group == 1`):
+  `v = kv[j][0:d_v]`, `k_main = kv[j][0:dim]`, `k_tail = kv[j][dim:dim+tail_dim]`, `d_v = dim − tail_dim` (> 0).
+* `indices` is `[1, S_q, kv_group, topk]` int32; entries `< 0` or `>= S_kv` are masked kpool tails (weight 0).
+* `sm_scale` defaults to `(1/sqrt(dim + tail_dim)) * log2(e)`. `tail_dim == 0`
+  skips the rope-tail dot entirely — the exact case the tilelang code path
+  cannot compile.
+
+Returns `out` `[1, S_q, H, d_v]` fp32, or `(out, lse)` when `return_lse=True`
+(`lse` is `[1, S_q, H]` fp32, base-2). `dsa_config(S_q, H, dim, topk)`
+returns `(bq, threads, block_I, inner_iter)` (decode `S_q<=8` →
+`(1, 64, 64, inner_iter)`; prefill → `(4, 256, 64, inner_iter)`). The
+device ABI is bf16 (the integrator converts); the paged-MQA gated
+**top-k logits** indexer stage (`dsa_topk_logits`, fp8 e4m3fnuz) is HIP/C
+only and is not exposed as a CPU-path Python binding.
+
+```python
+q  = np.array([1,0,0,0, 0,1,1,0], np.float32).reshape(1, 2, 1, 4)  # dim=4, tail=0
+dim, tail_dim, topk = 4, 0, 2
+kv = np.array([[1,0, 0,1, 1,1, 1,0]], np.float32).reshape(1, 2, 1, 4)
+id = np.array([[[0, 1]]], np.int32).reshape(1, 2, 1, 2)
+kernels.dsa_sparse_fwd(q, kv, id, dim=dim, tail_dim=tail_dim, topk=topk)
+# array([[[[..], [..]]]], dtype=float32)  # shape (1, 2, 1, 4)
+```
+
+`dsa_kpool_assemble(chunk_k, chunk_score, tail_k, tail_score, ape,
+req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base, loc, *,
+slots_per_page, num_pages, write_mask=None, out=None)` is the CPU
+reference for the GLM-5.3 DSA **kpool-cache compress + rotate + write**
+path (issue #60), replacing `_kpool_assemble_softmax_rotate_write_cache_kernel`.
+For each of `n_pools` logical pools it gathers `pool_size` participating
+keys from a TAIL prefix (`n_from_tail`, at `tail_logical_base + s` via
+`phys = (base + s) % tail_size`) and a CHUNK suffix (the remaining
+`pool_size - n_from_tail`, from `chunk_k`/`chunk_score` at
+`chunk_src_start`), computes the `ape`-gated online-softmax weighted
+mean, rotates it by the 128-point involution-normalised Hadamard, and
+writes the bf16-quantised result to the persistent page cache at
+`out[loc[r] // ssp, loc[r] % ssp]`. `write_mask[r] == 0` skips the whole
+row; `out` is zero-initialised so skipped rows stay zero.
+
+`dsa_kpool_decode_update(key, slot_score, tail_k, tail_score, ape,
+block_tables, req_pool_idx, pos, seq_len, out_cache_loc, *, tail_size,
+slots_per_page, num_pages, out=None, tail_k_out=None, tail_score_out=None)`
+is the CPU reference for the GLM-5.3 DSA **kpool-cache decode update +
+maybe-write** path (issue #60), replacing
+`_kpool_decode_update_and_maybe_write_cache_kernel`. For each of `batch`
+requests it substitutes the current token's `key`/`slot_score` into slot
+`pos % pool_size` of the pool (the rest read from the live tail),
+compresses as above, and writes the persistent cache at
+`out[bt[r, clamp(pool_page_group*pool_size, 0, btc-1)], pos % ssp]` —
+but only when the request is valid (`req_pool_idx` in range,
+`out_cache_loc != 0`, `0 <= pos < seq_len`) **and** the pool is full
+(`pos % pool_size == pool_size - 1`). **Unconditionally** the current
+`key`/`slot_score` is written to the live tail at `[r, pos % tail_size]`
+(masked to a no-op for invalid rows, leaving the tail untouched).
+
+Both are `head_dim == 128` (the 128-pt involution-normalised Hadamard);
+the device ABI is bf16 (input dequant on load, output quant on store,
+fp32 accumulation end-to-end), mirroring `dsa_sparse_fwd`. Returns `out`
+`[num_pages, ssp, 128]` (assemble) / `[num_pages, ssp, 128]` (decode);
+`dsa_kpool_decode_update` also writes the live tail **in place** when
+`tail_k_out`/`tail_score_out` are omitted (otherwise to the provided
+buffers). `dsa_kpool_group_topk_supported(group_topk)` and
+`dsa_kpool_max_closed_pools(num_draft_tokens, pool_size)` are the host
+planning helpers (mirroring the C ABI).
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+ck = rng.standard_normal((64, 128)).astype(np.float32)   # chunk_k
+ck_scr = rng.standard_normal((64, 128)).astype(np.float32)
+tk = rng.standard_normal((2, 64, 128)).astype(np.float32)  # live tail
+tk_scr = rng.standard_normal((2, 64, 128)).astype(np.float32)
+ape = rng.standard_normal((4, 128)).astype(np.float32)     # pool_size=4
+rpi = np.array([0, 0, 1, 1], np.int32)        # req per pool
+nft = np.array([3, 2, 4, 1], np.int32)        # n_from_tail per pool
+css = np.array([28, 29, 28, 30], np.int32)    # chunk_src_start per pool
+tlb = np.array([10, 20, 30, 40], np.int32)    # tail_logical_base per pool
+loc = np.array([5, 9, 21, 30], np.int32)      # output page-slot
+wm  = np.array([1, 1, 1, 1], np.int32)        # write_mask (none skipped)
+out = kernels.dsa_kpool_assemble(ck, ck_scr, tk, tk_scr, ape, rpi, nft,
+                                 css, tlb, loc, slots_per_page=8,
+                                 num_pages=16, write_mask=wm)
+assert out.shape == (16, 8, 128) and out.dtype == np.float32
+```
+
+#### MHC — multi-head hybrid-attention pre/post
+
+Two CPU references for the GLM-5.3-Flash MHC kernels (issue #51, part 2):
+
+| Function | Semantics |
+|---|---|
+| `mhc_pre_gemm_sqrsum(x, fn, *, hc_mult, hidden_size, out=None, sqrsum=None)` | pre-norm GEMM + squared-sum: `out[n,o] = Σ_h x[n,h]·fn[o,h]` (`hc_mult3 = hc_mult·(2+hc_mult)` cols) **plus** `sqrsum[n] = Σ_h x[n,h]²` |
+| `mhc_post(a, b, c, d, *, hc, hidden, out=None)` | post-attention combine: `out[n,j,h] = c[n,j]·d[n,h] + Σ_k a[n,k,j]·b[n,k,h]` |
+
+`x`/`b`/`d` are fp32 on the host path (the device path is bf16 —
+`vk_hip_mhc_pre_gemm_sqrsum` / `vk_hip_mhc_post` — checked against these
+fp32 references). `mhc_pre_gemm_sqrsum` infers `num_tokens` from
+`x.size / (hc_mult*hidden_size)`; `mhc_post` infers it from
+`a.size / (hc*hc)`. Both reject inconsistent shapes and non-writable
+`out`. Returns the reshaped output
+(`(num_tokens, hc_mult3)` / `(num_tokens, hc, hidden)`).
+
 ### `vkernels.comm`
 
 | Function / class | Semantics |
@@ -280,6 +400,8 @@ kernels.kda_pack_bitmatrix(np.array([1,0,1,1,0,0,0,1,0,1], np.uint8), n_bits=10)
 | `p2p_gather_runs(dst, src_ptrs, dst_offsets, lengths, *, stream=None)` | single-launch 1-D gather |
 | `p2p_gather_runs_2d(dst, runs, *, stream=None)` | single-launch strided-tile gather |
 | `memcpy_peer_batch_async(dst, src_ptrs, dst_offsets, lengths, *, stream=None)` | legacy per-run seam (benchmarks) |
+| `kv_gather_layer(k_src, v_src, slot_ids, dst, *, stream=None) -> None` | fused indexed K/V gather for one layer (#2); `dst[:,:,0]=k_src[slot_ids]`, `dst[:,:,1]=v_src[slot_ids]` |
+| `kv_scatter_layer(k_dst, v_dst, slot_ids, src, *, stream=None) -> None` | fused indexed K/V scatter for one layer (#1); reverse of `kv_gather_layer`, **unique** destination slots |
 
 `Gather2DRun` is a dataclass with fields `(src, src_stride, dst_offset,
 dst_stride, width, height)`; 6-tuples are accepted wherever a run list is
@@ -304,6 +426,30 @@ completes.
 * `Stream()` — `submit(task)`, `wait()`, `submitted()`; one worker thread
   per stream, in-order execution within a stream, concurrency across
   streams. A destroyed stream first drains its queue.
+
+### `vkernels.dist`
+
+The host reference for the distributed MoE path (issue #18), mirroring
+`src/c/vkernels/dist/dist_moe.{cpp,hpp}`. The fused kernel is
+single-device; `vkernels.dist` shards the weights so per-rank shards are
+consumed verbatim by the stage functions and provides the orchestration
+around them.
+
+| Function | Semantics |
+|---|---|
+| `tp_plan(hidden, ispp, tp, group_size=32) -> dict` | validate a TP split (`hidden%tp`, `ispp%tp`, shards `%64`/`%group_size`) and return the per-rank shard geometry + byte counts |
+| `tp_shard_weights(w13, w13_scale, w2, w2_scale, tp, group_size=32)` | split full weights into `tp` per-rank shards (layout-preserving) |
+| `dist_moe_tp(A, w13, w13_scale, w2, w2_scale, topk_ids, topk_w, b13=None, b2=None, *, top_k, tp, group_size=32, swiglu_limit=0.0, activation="swiglu", beta=4.0, linear_beta=25.0, block_size=16)` | tensor-parallel fused MoE over `tp` simulated ranks; the two linear stages are all-reduced *before* the nonlinear epilogues |
+| `ep_plan(num_experts, ep, rank) -> dict` | expert-parallel placement for `rank` |
+| `ep_dispatch(topk_ids, plan, num_experts, block_size=16) -> (local_ids, recv_counts, offsets, local_expert_ids)` | expert-parallel all-to-all / sort re-layout with local expert ids |
+| `dist_moe_ep(...)` | expert-parallel fused MoE forward |
+| `pp_boundary_send(state, queue)` / `pp_boundary_recv(queue, M, hidden)` | pipeline-parallel boundary transfer (graph-capturable primitive, ties into #10) |
+| `round_bf16(x)` | re-quantise the bf16 stage input (matches `vkernels::round_bf16`) |
+
+The TP/EP forward matches `vkernels.kernels.fused_moe_mxfp4` (the
+single-rank oracle) after the all-reduces. The `activation` knob
+(`"swiglu"`/`"situ"`) is threaded into the same per-stage functions the
+single-rank path uses.
 
 ## Testing
 
@@ -339,6 +485,7 @@ pyproject.toml                # uv-managed Python project (src-layout, numpy dep
 │   │       ├── core.py       # public Device/Stream API
 │   │       ├── kernels.py    # public elementwise/reduce/gemm API
 │   │       ├── comm.py       # public collectives/overlap/p2p API
+│   │       ├── dist.py        # distributed MoE: TP/EP/PP sharding (#18)
 │   │       ├── discovery.py  # C++/CUDA source scanner (no deps)
 │   │       ├── vllm_experts.py # OPTIONAL vLLM integration (torch + vLLM)
 │   │       └── cli/          # the `vkl` command

@@ -30,6 +30,31 @@ import numpy as np
 
 from vkernels._types import Gather2DRun, Result, StagedRun1D, StagedRun2D, Topology
 
+_F32 = np.float32
+
+
+def _build_hadamard128():
+    """The 128x128 involution-normalized Hadamard matrix ``H`` used by the
+    DSA kpool-cache kernels (``H @ x`` mirrors the in-place
+    ``hadamard128`` in dsa_kpool.{cpp,hip}). ``H[i, j] = s / sqrt(128)``
+    where ``s = +1`` iff the parity of ``popcount(i & j)`` is even."""
+    n = 128
+    idx = np.arange(n, dtype=np.int32)
+    c = (idx[:, None] & idx[None, :]).astype(np.uint32)
+    c = c - ((c >> 1) & 0x55555555)
+    c = (c & 0x33333333) + ((c >> 2) & 0x33333333)
+    c = (((c + (c >> 4)) & 0x0F0F0F0F) * 0x01010101) >> 24
+    sign = np.where((c & 1) == 0, _F32(1.0), _F32(-1.0))
+    return (sign / np.sqrt(np.float32(n))).astype(_F32)
+
+
+_HADAMARD128 = _build_hadamard128()
+
+
+def _hadamard128():
+    """Return the cached 128x128 involution-normalized Hadamard matrix."""
+    return _HADAMARD128
+
 # ---------------------------------------------------------------------------
 # core: Device / Stream
 # ---------------------------------------------------------------------------
@@ -1209,6 +1234,190 @@ def dsa_topk_logits(batch_size, num_heads, head_dim, block, max_table_len,
                 if t >= sl:
                     break  # rest of this page is past seq_len
                 ob[t] = np.float32(sb[j] * acc[j])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# DSA kpool-cache compress/write (issue #60): pure-Python (numpy) references,
+# mirroring ``dsa_kpool_assemble_cpu`` / ``dsa_kpool_decode_update_cpu`` (and
+# the gfx942 / SM80 HIP kernel) exactly. The persistent FP8 cache in sglang's
+# ``kpool_fp8_index.py`` is re-laid-out to bf16 for SM80 / A100 (which cannot
+# declare ``*fp8e4nv``); these are the fp32 end-to-end host references and the
+# ``_impl`` (C++ or fallback) is dispatched from ``kernels.py``.
+# ---------------------------------------------------------------------------
+def dsa_kpool_group_topk_supported(group_topk):
+    """Is group_topk one of the compress-write kernels' supported
+    {128,160,192,224,256,512}? Mirrors ``dsa_kpool_group_topk_supported``
+    (and sglang's ``kpool_group_topk_supported``)."""
+    return int(group_topk) in (128, 160, 192, 224, 256, 512)
+
+
+def dsa_kpool_max_closed_pools(num_draft_tokens, pool_size):
+    """Number of fully-closed kpool pools producible from ``num_draft_tokens``
+    at ``pool_size``: ``ceildiv(num_draft_tokens, pool_size)``, 0 when either
+    input is non-positive. Mirrors ``dsa_kpool_max_closed_pools``."""
+    n = int(num_draft_tokens); p = int(pool_size)
+    if n <= 0 or p <= 0:
+        return 0
+    return (n + p - 1) // p
+
+
+def dsa_kpool_assemble(num_chunks, n_pools, pool_size, head_dim, tail_size,
+                       slots_per_page, num_pages, n_reqs, chunk_k,
+                       chunk_score, tail_k, tail_score, ape, req_pool_idx,
+                       n_from_tail, chunk_src_start, tail_logical_base, loc,
+                       write_mask, out):
+    """Pure-Python (numpy) DSA kpool-cache assemble + rotate + write;
+    mirrors ``dsa_kpool_assemble_cpu`` exactly. ``chunk_k/score``
+    ``[num_chunks,128]``, ``tail_k/score`` ``[n_reqs,tail_size,128]``,
+    ``ape`` ``[pool_size,128]``, per-pool int32 index arrays ->
+    ``out`` ``[num_pages,ssp,128]``. ``write_mask[r]==0`` (or ``None``)
+    skips row ``r`` (output stays zeroed). Head dim is 128; the 128-pt
+    involutory Hadamard ``H`` is applied to the softmax-weighted mean
+    before the store.
+    """
+    ck = np.ascontiguousarray(chunk_k, dtype=np.float32).reshape(
+        num_chunks, head_dim)
+    cs = np.ascontiguousarray(chunk_score, dtype=np.float32).reshape(
+        num_chunks, head_dim)
+    tk = np.ascontiguousarray(tail_k, dtype=np.float32).reshape(
+        n_reqs, tail_size, head_dim)
+    ts = np.ascontiguousarray(tail_score, dtype=np.float32).reshape(
+        n_reqs, tail_size, head_dim)
+    ap = np.ascontiguousarray(ape, dtype=np.float32).reshape(
+        pool_size, head_dim)
+    rpi = np.ascontiguousarray(req_pool_idx, dtype=np.int32).reshape(n_pools)
+    nft = np.ascontiguousarray(n_from_tail, dtype=np.int32).reshape(n_pools)
+    css = np.ascontiguousarray(chunk_src_start, dtype=np.int32).reshape(n_pools)
+    tlb = np.ascontiguousarray(tail_logical_base, dtype=np.int32).reshape(
+        n_pools)
+    lc = np.ascontiguousarray(loc, dtype=np.int32).reshape(n_pools)
+    wm = (None if write_mask is None
+          else np.ascontiguousarray(write_mask, dtype=np.int32).reshape(n_pools))
+    o = np.ascontiguousarray(out, dtype=np.float32).reshape(
+        num_pages, slots_per_page, head_dim)
+    o.fill(np.float32(0.0))
+    H128 = _hadamard128()
+    for r in range(n_pools):
+        if wm is not None and wm[r] == 0:
+            continue
+        req = int(rpi[r]); ntail = int(nft[r]); csrc = int(css[r])
+        base = int(tlb[r]); lr = int(lc[r])
+        mx = np.full(head_dim, -np.inf, dtype=np.float32)
+        acc = np.zeros(head_dim, dtype=np.float32)
+        denom = np.zeros(head_dim, dtype=np.float32)
+        for s in range(pool_size):
+            if s < ntail:
+                phys = ((base + s) % tail_size + tail_size) % tail_size
+                sp = ts[req, phys]; kp = tk[req, phys]
+            else:
+                ci = csrc + (s - ntail)
+                sp = cs[ci]; kp = ck[ci]
+            score = sp + ap[s]                      # (head_dim,)
+            new_m = np.maximum(mx, score)
+            rescale = np.exp(mx - new_m, dtype=np.float32)
+            prob = np.exp(score - new_m, dtype=np.float32)
+            denom = denom * rescale + prob
+            acc = acc * rescale + kp * prob
+            mx = new_m
+        mean = acc / denom                          # (head_dim,)
+        out_vec = H128 @ mean                       # 128-pt Hadamard
+        page = lr // slots_per_page
+        sip = lr % slots_per_page
+        o[page, sip] = out_vec.astype(np.float32)
+    np.copyto(np.asarray(out, dtype=np.float32),
+              o.reshape(np.asarray(out).shape))
+    return out
+
+
+def dsa_kpool_decode_update(batch, pool_size, head_dim, tail_size,
+                            slots_per_page, block_table_cols, n_reqs,
+                            num_pages, key, slot_score, tail_k, tail_score,
+                            ape, block_tables, req_pool_idx, positions,
+                            seq_lens, out_cache_loc, out):
+    """Pure-Python (numpy) DSA kpool-cache decode update + maybe-write;
+    mirrors ``dsa_kpool_decode_update_cpu`` exactly. ``key/slot_score``
+    ``[batch,128]``, ``tail_k/score`` ``[n_reqs,tail_size,128]`` (IN-PLACE),
+    ``ape`` ``[pool_size,128]``, ``block_tables`` ``[batch,btc]`` int32 +
+    per-batch int32 index/validity arrays -> ``out`` ``[num_pages,ssp,128]``.
+    The compressed K (Hadamard of the softmax-weighted mean over the pool
+    with the current token substituted into slot ``pos % pool_size``) is
+    written ONLY when the row is valid (``req_pool_idx`` in range,
+    ``out_cache_loc != 0``, ``0 <= pos < seq_len``) AND the pool is full
+    (``pos % pool_size == pool_size - 1``). The current ``key`` /
+    ``slot_score`` is written to the live tail at ``[req, pos % tail_size]``
+    UNCONDITIONALLY (no-op when the row is invalid, so the tail is left
+    untouched for invalid rows).
+    """
+    ky = np.ascontiguousarray(key, dtype=np.float32).reshape(batch, head_dim)
+    ss = np.ascontiguousarray(slot_score, dtype=np.float32).reshape(
+        batch, head_dim)
+    tk = np.ascontiguousarray(tail_k, dtype=np.float32).reshape(
+        n_reqs, tail_size, head_dim)
+    ts = np.ascontiguousarray(tail_score, dtype=np.float32).reshape(
+        n_reqs, tail_size, head_dim)
+    ap = np.ascontiguousarray(ape, dtype=np.float32).reshape(
+        pool_size, head_dim)
+    bt = np.ascontiguousarray(block_tables, dtype=np.int32).reshape(
+        batch, block_table_cols)
+    rpi = np.ascontiguousarray(req_pool_idx, dtype=np.int32).reshape(batch)
+    pos = np.ascontiguousarray(positions, dtype=np.int32).reshape(batch)
+    sl = np.ascontiguousarray(seq_lens, dtype=np.int32).reshape(batch)
+    ocl = np.ascontiguousarray(out_cache_loc, dtype=np.int32).reshape(batch)
+    o = np.ascontiguousarray(out, dtype=np.float32).reshape(
+        num_pages, slots_per_page, head_dim)
+    o.fill(np.float32(0.0))
+    H128 = _hadamard128()
+    for r in range(batch):
+        req_raw = int(rpi[r]); pos_raw = int(pos[r]); seq_len = int(sl[r])
+        cache_loc = int(ocl[r])
+        req_valid = 0 <= req_raw < n_reqs
+        pos_valid = (req_valid and cache_loc != 0 and 0 <= pos_raw < seq_len)
+        safe_pos = pos_raw if pos_raw >= 0 else 0
+        slot = safe_pos % pool_size
+        cur_k = ky[r]; cur_s = ss[r]
+        if pos_valid and slot == pool_size - 1:
+            pool_logical_start = safe_pos - slot
+            mx = np.full(head_dim, -np.inf, dtype=np.float32)
+            acc = np.zeros(head_dim, dtype=np.float32)
+            denom = np.zeros(head_dim, dtype=np.float32)
+            req = req_raw
+            for p in range(pool_size):
+                is_current = (p == slot)
+                phys = ((pool_logical_start + p) % tail_size + tail_size) % tail_size
+                sp = cur_s if is_current else ts[req, phys]
+                kp = cur_k if is_current else tk[req, phys]
+                score = sp + ap[p]
+                new_m = np.maximum(mx, score)
+                rescale = np.exp(mx - new_m, dtype=np.float32)
+                prob = np.exp(score - new_m, dtype=np.float32)
+                denom = denom * rescale + prob
+                acc = acc * rescale + kp * prob
+                mx = new_m
+            mean = acc / denom
+            out_vec = (H128 @ mean).astype(np.float32)
+            pid = safe_pos // pool_size
+            ppg = pid // slots_per_page
+            tpr = ppg * pool_size
+            tpr = int(np.clip(tpr, 0, block_table_cols - 1))
+            packed_page = int(bt[r, tpr])
+            loc_slot = pid % slots_per_page
+            o[packed_page, loc_slot] = out_vec
+        # Unconditional live-tail write (no-op when !pos_valid).
+        if pos_valid:
+            req = req_raw
+            phys_slot = ((safe_pos % tail_size) + tail_size) % tail_size
+            tk[req, phys_slot] = cur_k
+            ts[req, phys_slot] = cur_s
+    np.copyto(np.asarray(out, dtype=np.float32),
+              o.reshape(np.asarray(out).shape))
+    # Propagate the in-place tail update back to the caller's arrays.
+    tk_orig = np.ascontiguousarray(tail_k, dtype=np.float32)
+    ts_orig = np.ascontiguousarray(tail_score, dtype=np.float32)
+    if tk_orig.shape == tk.shape:
+        np.copyto(tk_orig, tk)
+    if ts_orig.shape == ts.shape:
+        np.copyto(ts_orig, ts)
     return out
 
 

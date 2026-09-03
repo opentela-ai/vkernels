@@ -21,6 +21,7 @@ target_sources(vkernels
     vkernels/kernels/mla.cpp
     vkernels/kernels/dsa.cpp
     vkernels/kernels/dsa_topk.cpp
+    vkernels/kernels/dsa_kpool.cpp
     vkernels/kernels/mhc.cpp
     vkernels/kernels/kda.cpp
     vkernels/comm/channel.cpp
@@ -39,7 +40,12 @@ target_sources(vkernels
     vkernels/comm/fabric_import.cpp
     vkernels/comm/cross_node_kv.cpp
     vkernels/dist/dist_moe.cpp
+    # C ABI implementation, one domain per TU (see capi/capi_internal.hpp
+    # for the shared error plumbing):
     vkernels/capi/capi.cpp
+    vkernels/capi/capi_kernels.cpp
+    vkernels/capi/capi_attn.cpp
+    vkernels/capi/capi_moe.cpp
 )
 
 # The CUDA sources compile only when a toolkit is present.
@@ -66,6 +72,24 @@ if(VKERNELS_HAS_CUDA)
       vkernels/comm/cross_node_kv.cu
       vkernels/comm/cross_node_kv_allgather.cu)
   set_target_properties(vkernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+  # HIP-on-NVIDIA: attention device kernels written as .hip sources, compiled
+  # here with nvcc through the tiny HIP compat shim at kernels/cuda_compat/
+  # hip/hip_runtime.h (issue #60 A100 port). Only sources proven on NVIDIA
+  # hardware are listed — extend as more kernels are ported. The macro stays
+  # VKERNELS_HAS_HIP (per-source, so it does not leak into host TUs that
+  # select CUDA headers via VKERNELS_HAS_CUDA) and the include dir is the
+  # shim root so the sources' <hip/hip_runtime.h> resolves to the shim.
+  # Guarded on !HIP: on a machine with both toolkits the HIP branch below
+  # already owns these sources.
+  if(NOT VKERNELS_HAS_HIP)
+    set(VKERNELS_CUDA_HIP_SOURCES vkernels/kernels/dsa_kpool.hip)
+    set_source_files_properties(${VKERNELS_CUDA_HIP_SOURCES} PROPERTIES
+      LANGUAGE CUDA COMPILE_DEFINITIONS VKERNELS_HAS_HIP=1)
+    target_sources(vkernels PRIVATE ${VKERNELS_CUDA_HIP_SOURCES})
+    target_include_directories(vkernels PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/vkernels/kernels/cuda_compat)
+  endif()
 
   # fabric_import.cu is the only translation unit using the CUDA *driver*
   # API (cuMemAddressReserve / cuMemImportFromShareableHandle / cuMemMap /
@@ -127,6 +151,7 @@ if(VKERNELS_HAS_HIP)
       vkernels/kernels/mla.hip
       vkernels/kernels/dsa.hip
       vkernels/kernels/dsa_topk.hip
+      vkernels/kernels/dsa_kpool.hip
       vkernels/kernels/mhc.hip
       vkernels/kernels/kda.hip)
   set_target_properties(vkernels PROPERTIES HIP_SEPARABLE_COMPILATION ON)

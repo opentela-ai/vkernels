@@ -260,6 +260,82 @@ int32_t vk_dsa_topk_logits_split_for(int batch_size, int max_seq_len,
                                       int block, int* split_kv);
 
 /* ------------------------------------------------------------------ */
+/* kernels: DSA — kpool-cache compress/write (dsa_kpool.hpp, #60)     */
+/* ------------------------------------------------------------------ */
+/*
+ * The INDEXER's persistent kpool cache: when index_kpool > 1 a kpool-1
+ * live tail of recent tokens is appended to the fixed index_topk columns
+ * and COMPRESSED (online softmax + Hadamard-128) into a per-page cache.
+ * Two paths -- the sglang Triton kernels declare tl.float8e4nv and JIT-fail
+ * on SM80 (A100) on the first forward (job 82822); these native host fp32
+ * references are the second implementation the gfx942 HIP kernel
+ * (vk_hip_dsa_kpool_*) is checked against.
+ *
+ * vk_dsa_kpool_group_topk_supported -- never throws (mirrors sglang's
+ *   kpool_topk_group_topk_supported).
+ * vk_dsa_kpool_max_closed_pools -- ceildiv(num_draft_tokens, pool_size);
+ *   never throws (mirrors sglang's kpool_max_closed_pools).
+ *
+ * PREFILL (vk_dsa_kpool_assemble, kpool_assemble_softmax_rotate_write_cache):
+ *   chunk_k        [num_chunks, head_dim]      fp32
+ *   chunk_score    [num_chunks, head_dim]      fp32
+ *   tail_k         [n_reqs, tail_size, head_dim] fp32
+ *   tail_score     [n_reqs, tail_size, head_dim] fp32
+ *   ape            [pool_size, head_dim]       fp32  (per-pool-slope bias)
+ *   req_pool_idx   [n_pools]                   int32 (in [0, n_reqs))
+ *   n_from_tail    [n_pools]                   int32 (in [0, pool_size])
+ *   chunk_src_start[n_pools]                   int32
+ *   tail_logical_base [n_pools]                int32
+ *   loc            [n_pools]                   int32 (in [0, num_pages*ssp))
+ *   write_mask     [n_pools] int32 or NULL (non-zero writes, zero skips)
+ *   out            [num_pages, ssp, head_dim]  fp32  (ZERO first)
+ *
+ * DECODE (vk_dsa_kpool_decode_update, kpool_decode_update_and_maybe_write_cache):
+ *   key            [batch, head_dim]           fp32
+ *   slot_score     [batch, head_dim]           fp32
+ *   tail_k         [n_reqs, tail_size, head_dim] fp32 (IN-PLACE updated)
+ *   tail_score     [n_reqs, tail_size, head_dim] fp32 (IN-PLACE updated)
+ *   ape            [pool_size, head_dim]       fp32
+ *   block_tables   [batch, block_table_cols]   int32
+ *   req_pool_indices [batch]                   int32 (<0 or >=n_reqs -> invalid)
+ *   positions      [batch]                     int32
+ *   seq_lens       [batch]                     int32
+ *   out_cache_loc  [batch]                     int32 (==0 -> no compress write)
+ *   out            [num_pages, ssp, head_dim]  fp32  (ZERO first)
+ *
+ * Never throws on valid input; bad dims / null pointers (when n_pools>0 for
+ * the prefill, batch>0 for the decode) return VK_ERROR_INVALID_ARGUMENT
+ * (see vk_last_error). Empty (n_pools==0 / batch==0) is a no-op leaving
+ * `out` and the live tail untouched (mirrors the HIP grid-empty launch).
+ * See dsa_kpool.hpp for the full computation.
+ */
+int vk_dsa_kpool_group_topk_supported(int32_t group_topk);
+int32_t vk_dsa_kpool_max_closed_pools(int32_t num_draft_tokens,
+                                       int32_t pool_size);
+int32_t vk_dsa_kpool_assemble(int n_pools, int pool_size, int head_dim,
+                              int tail_size, int slots_per_page,
+                              int num_pages, int num_chunks, int n_reqs,
+                              const float* chunk_k, const float* chunk_score,
+                              const float* tail_k, const float* tail_score,
+                              const float* ape, const int32_t* req_pool_idx,
+                              const int32_t* n_from_tail,
+                              const int32_t* chunk_src_start,
+                              const int32_t* tail_logical_base,
+                              const int32_t* loc, const int32_t* write_mask,
+                              float* out);
+int32_t vk_dsa_kpool_decode_update(int batch, int pool_size, int head_dim,
+                                   int tail_size, int slots_per_page,
+                                   int block_table_cols, int n_reqs,
+                                   int num_pages, const float* key,
+                                   const float* slot_score, float* tail_k,
+                                   float* tail_score, const float* ape,
+                                   const int32_t* block_tables,
+                                   const int32_t* req_pool_indices,
+                                   const int32_t* positions,
+                                   const int32_t* seq_lens,
+                                   const int32_t* out_cache_loc, float* out);
+
+/* ------------------------------------------------------------------ */
 /* kernels: MHC — multi-head hybrid-attention pre-norm (mhc.hpp, #51)  */
 /*                                                                       */
 /* mhc_pre_gemm_sqrsum:                                                   */

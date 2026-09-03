@@ -96,10 +96,18 @@ __host__ __device__ __forceinline__ float fp8e4m3fnuz_to_f32(uint8_t b) {
 //  The compiler handles register allocation.  The MFMA instruction
 //  syntax uses register *indices*, so we extract them and format
 //  the range syntax (v[lo:hi]) for each operand group.
+//
+//  Portability: the register-asm body only compiles on AMD device
+//  passes, so the SIGNATURE stays visible in every pass (HIP host
+//  passes type-check __global__ callers of this helper) while the
+//  body is guarded. AMD device passes for unsupported targets #error
+//  instead of silently mis-executing; CUDA (nvcc) passes -- which
+//  never call this -- get an empty body.
 // ======================================================================
 __device__ __forceinline__ void mfma_f32_16x16x16bf16(
     float c[4], const uint32_t a[2], const uint32_t b[2],
     int cbsz = 0, int abid = 0, int blgp = 0) {
+#if defined(__gfx942__) || defined(__gfx90a__) || defined(__gfx908__)
   (void)cbsz; (void)abid; (void)blgp;
   register float   r0 asm("v0"), r1 asm("v1"), r2 asm("v2"), r3 asm("v3");
   register uint32_t s0 asm("v4"), s1 asm("v5");
@@ -112,6 +120,14 @@ __device__ __forceinline__ void mfma_f32_16x16x16bf16(
       : "+v"(r0), "+v"(r1), "+v"(r2), "+v"(r3)
       : "v"(s0), "v"(s1), "v"(t0), "v"(t1));
   c[0] = r0; c[1] = r1; c[2] = r2; c[3] = r3;
+#elif defined(__HIP_DEVICE_COMPILE__)
+#error "mfma_f32_16x16x16bf16: unsupported AMD device target"
+#else
+  // HIP host pass or nvcc (host or device) pass: this helper is
+  // gfx942-family-only and nothing outside AMD gemm kernels calls it;
+  // keep the body empty so the TU still type-checks.
+  (void)c; (void)a; (void)b; (void)cbsz; (void)abid; (void)blgp;
+#endif
 }
 
 }  // namespace vkernels::kernels::hip

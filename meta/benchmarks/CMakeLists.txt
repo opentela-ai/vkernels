@@ -278,6 +278,27 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_dsa_topk_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_dsa_topk_correct)
 
+  # DSA kpool-cache compress/write (issue #60): the kpool>1 INDEXER cache
+  # path -- the bf16-storage / no-fp8e4nv HIP kernels for sglang's
+  # kpool_assemble_softmax_rotate_write_cache (prefill) and
+  # kpool_decode_update_and_maybe_write_cache (decode), cross-checked
+  # against the CPU fp32 oracles.
+  add_executable(test_dsa_kpool_correct test_dsa_kpool_correct.hip)
+  target_link_libraries(test_dsa_kpool_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_dsa_kpool_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_dsa_kpool_correct)
+
+  # DSA kpool-cache compress/write BENCHMARK (issue #60): same harness style
+  # as bench_dsa.hip (HIP events, variance-driven iters, roofline table) for
+  # the bf16-storage / no-fp8e4nv kpool kernels. Reports median/min latency
+  # + effective GB/s vs the ~5300 GB/s HBM roof for both the prefill
+  # (dsa_kpool_assemble, 1 warp/pool) and decode (dsa_kpool_decode_update,
+  # 1 warp/req) paths at GLM-5.3-Flash serving shapes.
+  add_executable(dsa_kpool_bench bench_dsa_kpool.hip)
+  target_link_libraries(dsa_kpool_bench PRIVATE vkernels::vkernels)
+  target_compile_features(dsa_kpool_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(dsa_kpool_bench)
+
   # DSA sparse-fwd launch-path preconditions (issue #57): the on-device
   # regression for the silent gfx942 "D"-state hang. A valid decode-shape
   # call must still return VK_OK and match the CPU oracle (dsa_sparse_fwd_cpu)
@@ -317,4 +338,30 @@ if(VKERNELS_HAS_HIP)
   target_link_libraries(mhc_bench PRIVATE vkernels::vkernels)
   target_compile_features(mhc_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(mhc_bench)
+endif()
+
+# DSA kpool-cache correctness + benchmark on NVIDIA (issue #60 A100 port):
+# the same two executables as the HIP block above, built when a CUDA toolkit
+# is present and ROCm is not. The .hip device sources compile with nvcc
+# through the HIP compat shim (src/c/CMakeLists.txt adds them to libvkernels
+# with VKERNELS_HAS_HIP defined per-source); these executable TUs get the
+# same per-source treatment (their TUs include only the kernel header, never
+# core/device.hpp, so a per-source define stays sufficient).
+if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+  set_source_files_properties(test_dsa_kpool_correct.hip bench_dsa_kpool.hip
+    PROPERTIES LANGUAGE CUDA COMPILE_DEFINITIONS VKERNELS_HAS_HIP=1)
+
+  add_executable(test_dsa_kpool_correct test_dsa_kpool_correct.hip)
+  target_link_libraries(test_dsa_kpool_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_dsa_kpool_correct PRIVATE cxx_std_17)
+  target_include_directories(test_dsa_kpool_correct PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+  vkernels_set_warnings(test_dsa_kpool_correct)
+
+  add_executable(dsa_kpool_bench bench_dsa_kpool.hip)
+  target_link_libraries(dsa_kpool_bench PRIVATE vkernels::vkernels)
+  target_compile_features(dsa_kpool_bench PRIVATE cxx_std_17)
+  target_include_directories(dsa_kpool_bench PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+  vkernels_set_warnings(dsa_kpool_bench)
 endif()

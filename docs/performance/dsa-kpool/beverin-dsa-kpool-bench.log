@@ -1,0 +1,92 @@
+=== node: nid002480  date: 2026-09-03T08:02:14Z ===
+GPU[0]		: Card Series: 		Aqua Vanjaram [Instinct MI300A]
+GPU[0]		: Card Model: 		0x74a0
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+=== lock perf level high ===
+(setperflevel not permitted; continuing)
+GPU[0]		: mclk clock level: 3: (1300Mhz)
+GPU[0]		: sclk clock level: S: (96Mhz)
+GPU[1]		: mclk clock level: 3: (1300Mhz)
+GPU[1]		: sclk clock level: S: (98Mhz)
+=== configure (HIP, gfx942, Release, tests + benchmarks ON) ===
+-- =================================
+-- Configuring done (0.6s)
+-- Generating done (15.9s)
+-- Build files have been written to: /users/xyao/vkernels-60/build_kpool
+=== build (vkernels + test_dsa_kpool_correct + dsa_kpool_bench + host oracle) ===
+[100%] Built target vkernels
+[ 95%] Built target vkernels
+[100%] Built target test_dsa_kpool_correct
+[ 95%] Built target vkernels
+[100%] Built target dsa_kpool_bench
+[ 29%] Built target vkernels_test_main
+[ 95%] Built target vkernels
+[100%] Built target vkernels_test_dsa_kpool
+
+############ 1. HOST ORACLE (vkernels_test_dsa_kpool) ############
+[ RUN      ] DsaKpool.DecodeEmptyIsNoOp
+[       OK ] DsaKpool.DecodeEmptyIsNoOp
+[ RUN      ] DsaKpool.DecodeBlockTablesOutOfRangeThrows
+[       OK ] DsaKpool.DecodeBlockTablesOutOfRangeThrows
+
+16/16 test(s) passed, 0 failed
+
+############ 2. DEVICE CORRECTNESS (test_dsa_kpool_correct) ############
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+
+=== PREFILL (dsa_kpool_assemble) ===
+  PRE  np=1  ps=1  ts=64  ssp=8  npg=16 nc=32 nr=1   out[a=0.0000 r=0.000000]  PASS
+  PRE  np=4  ps=4  ts=64  ssp=8  npg=16 nc=32 nr=2   out[a=0.0058 r=0.003798]  PASS
+  PRE  np=8  ps=4  ts=64  ssp=8  npg=16 nc=48 nr=2   out[a=0.0063 r=0.003798]  PASS
+  PRE  np=4  ps=8  ts=64  ssp=8  npg=16 nc=64 nr=3   out[a=0.0038 r=0.003518]  PASS
+  PRE  np=4  ps=8  ts=128 ssp=16 npg=8  nc=32 nr=2   out[a=0.0043 r=0.003707]  PASS
+  PRE  np=2  ps=4  ts=64  ssp=8  npg=16 nc=32 nr=1   out[a=0.0038 r=0.003349]  PASS
+  PRE  np=16 ps=4  ts=64  ssp=8  npg=16 nc=96 nr=4   out[a=0.0072 r=0.003840]  PASS
+
+=== DECODE (dsa_kpool_decode_update) ===
+  DEC  bs=4  ps=4  ts=64  ssp=8  btc=8  nr=4  npg=32  out[a=0.0065 r=0.003393] tk[r=0.00e+00] ts[r=0.00e+00]  PASS
+  DEC  bs=8  ps=4  ts=64  ssp=8  btc=8  nr=8  npg=32  out[a=0.0065 r=0.003393] tk[r=0.00e+00] ts[r=0.00e+00]  PASS
+  DEC  bs=4  ps=8  ts=64  ssp=8  btc=8  nr=4  npg=32  out[a=0.0039 r=0.003361] tk[r=0.00e+00] ts[r=0.00e+00]  PASS
+  DEC  bs=4  ps=8  ts=128 ssp=16 btc=16 nr=4  npg=64  out[a=0.0039 r=0.003361] tk[r=0.00e+00] ts[r=0.00e+00]  PASS
+  DEC  bs=2  ps=4  ts=64  ssp=8  btc=8  nr=2  npg=8   out[a=0.0065 r=0.003393] tk[r=0.00e+00] ts[r=0.00e+00]  PASS
+  DEC  bs=16 ps=4  ts=64  ssp=8  btc=8  nr=16 npg=32  out[a=0.0070 r=0.003496] tk[r=0.00e+00] ts[r=0.00e+00]  PASS
+  DEC  bs=8  ps=8  ts=128 ssp=16 btc=16 nr=8  npg=64  out[a=0.0039 r=0.003361] tk[r=0.00e+00] ts[r=0.00e+00]  PASS
+
+PASS (0 failure(s))
+
+############ 3. BENCHMARK (dsa_kpool_bench) ############
+=== DSA kpool-cache compress/write (gfx942) ===
+  device: AMD Instinct MI300A (arch 942), roof 1307 TFLOP/s bf16, 5300 GB/s HBM
+
+=== hip::dsa_kpool_assemble (PREFILL, 1 warp/pool) ===
+  npool   ps  tail  ssp   npg   warps   us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+      1    4    64    8    16       1     10.71     10.71    0.0006      0.41   1.5  launch
+      4    4    64    8    16       4     11.01     11.01    0.0024      1.59   1.5  launch
+     16    4    64    8    16      16     11.14     11.14    0.0096      6.29   1.5  launch
+     64    4    64    8    16      64     11.19     11.20    0.0380     25.01   1.5  launch
+    128    4    64    8    32     128     11.24     11.25    0.0758     49.81   1.5  launch
+    256    4    64    8    32     256     13.69     13.69    0.1245     81.83   1.5  launch
+      1    8   128   16    16       1     12.15     12.16    0.0009      0.70   1.3  launch
+     16    8   128   16    16      16     12.59     12.60    0.0143     10.76   1.3  launch
+     64    8   128   16    32      64     12.66     12.66    0.0569     42.83   1.3  launch
+    128    8   128   16    32     128     12.71     12.72    0.1134     85.28   1.3  launch
+    256    8   128   16    64     256     15.20     15.20    0.1897    142.64   1.3  launch
+  Roof: 1307 TFLOP/s bf16, 5300 GB/s HBM, ridge ~247 FLOP/B
+
+=== hip::dsa_kpool_decode_update (DECODE, 1 warp/req) ===
+  batch   ps  tail  ssp  npg   warps   us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+      1    4    64    8   16       1     11.68     11.69    0.0006      0.42   1.4  launch
+      8    4    64    8   16       8     12.05     12.05    0.0044      3.24   1.4  launch
+     32    4    64    8   32      32     12.11     12.11    0.0176     12.89   1.4  launch
+    128    4    64    8   64     128     12.21     12.21    0.0698     51.16   1.4  launch
+    256    4    64    8  128     256     14.49     14.49    0.1176     86.22   1.4  launch
+    512    4    64    8  256     512     19.58     19.58    0.1740    127.59   1.4  launch
+      1    8   128   16   16       1     13.54     13.55    0.0008      0.66   1.3  launch
+      8    8   128   16   16       8     13.96     13.96    0.0065      5.14   1.3  launch
+     32    8   128   16   32      32     14.05     14.06    0.0256     20.44   1.3  launch
+    128    8   128   16   64     128     14.13     14.14    0.1020     81.27   1.3  launch
+    256    8   128   16  128     256     16.42     16.42    0.1756    139.94   1.3  launch
+    512    8   128   16  256     512     21.47     21.47    0.2686    214.02   1.3  launch
+  Roof: 1307 TFLOP/s bf16, 5300 GB/s HBM, ridge ~247 FLOP/B
+
+===== DONE 2026-09-03T08:02:57Z =====

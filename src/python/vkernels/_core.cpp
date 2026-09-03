@@ -50,6 +50,7 @@
 #include "vkernels/kernels/mla.hpp"
 #include "vkernels/kernels/dsa.hpp"
 #include "vkernels/kernels/dsa_topk.hpp"
+#include "vkernels/kernels/dsa_kpool.hpp"
 #include "vkernels/kernels/mhc.hpp"
 #include "vkernels/kernels/moe.hpp"
 #include "vkernels/kernels/moe_aux.hpp"
@@ -621,6 +622,113 @@ PYBIND11_MODULE(_core, m) {
       "the bf16-MFMA fast path at split=1 is already ~24x faster than "
       "the fp32-Q baseline, compressing the split gain). "
       "Call before launching the GPU kernel instead of recomputing.");
+
+  // --- DSA: kpool-cache compress/write (issue #60) -----------------------
+  //
+  // Host planning helpers for the kpool>1 indexer (mirror the C ABI
+  // vk_dsa_kpool_group_topk_supported / vk_dsa_kpool_max_closed_pools):
+  // which group_topk the compress kernels support, and how many closed
+  // pools num_draft_tokens produce at a given pool_size (ceildiv, 0 when
+  // either input is non-positive).
+  kernels.def(
+      "dsa_kpool_group_topk_supported",
+      [](int group_topk) {
+        return kernels::dsa_kpool_group_topk_supported(group_topk) ? 1 : 0;
+      },
+      py::arg("group_topk"),
+      "Is group_topk one of the compress-write kernels' supported "
+      "{128,160,192,224,256,512}? (1/0) Mirrors sglang's "
+      "kpool_group_topk_supported.");
+
+  kernels.def(
+      "dsa_kpool_max_closed_pools",
+      [](int num_draft_tokens, int pool_size) {
+        return kernels::dsa_kpool_max_closed_pools(num_draft_tokens,
+                                                    pool_size);
+      },
+      py::arg("num_draft_tokens"), py::arg("pool_size"),
+      "Number of fully-closed kpool pools producible from "
+      "num_draft_tokens at pool_size: ceildiv(num_draft_tokens, pool_size), "
+      "0 when either input is non-positive (mirrors "
+      "_kpool_max_closed_pools).");
+
+  // The two kpool-cache kernels (kpool_assemble_softmax_rotate_write_cache
+  // / kpool_decode_update_and_maybe_write_cache), CPU references (always
+  // compiled). The SM80 / A100 device path (dsa_kpool.hip) is bf16 storage
+  // + fp32 accumulation (no fp8e4nv in the kernel signature -- SM80 Triton
+  // cannot declare *fp8e4nv) and is checked against these fp32 references
+  // (test_dsa_kpool_correct.hip). Mirrors PR #52's dsa.{hpp,cpp,hip} model.
+  kernels.def(
+      "dsa_kpool_assemble",
+      [](int num_chunks, int n_pools, int pool_size, int head_dim,
+         int tail_size, int slots_per_page, int num_pages, int n_reqs,
+         FloatArray chunk_k, FloatArray chunk_score, FloatArray tail_k,
+         FloatArray tail_score, FloatArray ape, I32Array req_pool_idx,
+         I32Array n_from_tail, I32Array chunk_src_start,
+         I32Array tail_logical_base, I32Array loc,
+         std::optional<I32Array> write_mask, FloatArray out) {
+        require_writeable(out);
+        kernels::dsa_kpool_assemble_cpu(
+            n_pools, pool_size, head_dim, tail_size, slots_per_page,
+            num_pages, num_chunks, n_reqs, chunk_k.data(),
+            chunk_score.data(), tail_k.data(), tail_score.data(),
+            ape.data(), req_pool_idx.data(), n_from_tail.data(),
+            chunk_src_start.data(), tail_logical_base.data(), loc.data(),
+            write_mask.has_value() ? write_mask->data() : nullptr,
+            out.mutable_data());
+        return out;
+      },
+      py::arg("num_chunks"), py::arg("n_pools"), py::arg("pool_size"),
+      py::arg("head_dim"), py::arg("tail_size"),
+      py::arg("slots_per_page"), py::arg("num_pages"), py::arg("n_reqs"),
+      py::arg("chunk_k"), py::arg("chunk_score"), py::arg("tail_k"),
+      py::arg("tail_score"), py::arg("ape"), py::arg("req_pool_idx"),
+      py::arg("n_from_tail"), py::arg("chunk_src_start"),
+      py::arg("tail_logical_base"), py::arg("loc"),
+      py::arg("write_mask") = py::none(), py::arg("out"),
+      "DSA kpool-cache assemble + rotate + write (CPU reference), the "
+      "kpool>1 indexer PREFILL/short-context path: chunk_k/score "
+      "[num_chunks,128] fp32, tail_k/score [n_reqs,tail_size,128] fp32, "
+      "ape [pool_size,128] fp32, per-pool int32 index arrays -> "
+      "out [num_pages,ssp,128] fp32 (write_mask[r]==0 skips row r). "
+      "Device ABI is bf16; the integrator converts.");
+
+  kernels.def(
+      "dsa_kpool_decode_update",
+      [](int batch, int pool_size, int head_dim, int tail_size,
+         int slots_per_page, int block_table_cols, int n_reqs,
+         int num_pages, FloatArray key, FloatArray slot_score,
+         FloatArray tail_k, FloatArray tail_score, FloatArray ape,
+         I32Array block_tables, I32Array req_pool_idx, I32Array positions,
+         I32Array seq_lens, I32Array out_cache_loc, FloatArray out) {
+        require_writeable(out);
+        require_writeable(tail_k);  // written IN PLACE
+        require_writeable(tail_score);
+        kernels::dsa_kpool_decode_update_cpu(
+            batch, pool_size, head_dim, tail_size, slots_per_page,
+            block_table_cols, n_reqs, num_pages, key.data(),
+            slot_score.data(), tail_k.mutable_data(),
+            tail_score.mutable_data(), ape.data(), block_tables.data(),
+            req_pool_idx.data(), positions.data(), seq_lens.data(),
+            out_cache_loc.data(), out.mutable_data());
+        return out;
+      },
+      py::arg("batch"), py::arg("pool_size"), py::arg("head_dim"),
+      py::arg("tail_size"), py::arg("slots_per_page"),
+      py::arg("block_table_cols"), py::arg("n_reqs"), py::arg("num_pages"),
+      py::arg("key"), py::arg("slot_score"), py::arg("tail_k"),
+      py::arg("tail_score"), py::arg("ape"), py::arg("block_tables"),
+      py::arg("req_pool_idx"), py::arg("positions"), py::arg("seq_lens"),
+      py::arg("out_cache_loc"), py::arg("out"),
+      "DSA kpool-cache decode update + maybe-write (CPU reference), the "
+      "kpool>1 indexer DECODE path: key/slot_score [batch,128] fp32, "
+      "tail_k/score [n_reqs,tail_size,128] fp32 (IN-PLACE), ape "
+      "[pool_size,128] fp32, block_tables [batch,btc] int32 + per-batch "
+      "int32 index/validity arrays -> out [num_pages,ssp,128] fp32. The "
+      "compressed K is written only when the row is valid AND "
+      "pos%pool_size==pool_size-1; the current key/score is written to "
+      "the live tail unconditionally (no-op when invalid). Device ABI "
+      "is bf16; the integrator converts.");
 
   // --- MHC: multi-head hybrid-attention pre-norm (issue #51, part 2) ------
   //

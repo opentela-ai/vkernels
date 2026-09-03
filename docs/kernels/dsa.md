@@ -53,6 +53,52 @@ per-group `partial_o` / `partial_lse` the tilelang kernel emits are an
 internal parallelism detail — the combined result is grouping-independent,
 which the host test validates directly.
 
+## Paged-MQA gated top-k logits (the kpool>1 indexer, issue #51)
+
+The **first stage** that feeds the sparse-MLA forward above. The external
+indexer computes, per query token and paged KV tile, a gated logit that the
+subsequent top-k selects over (GLM-5.3-Flash `index_n_heads=32`,
+`index_head_dim=128`, `block_size=64` hardcoded in deep_gemm). The
+tilelang `deep_gemm.fp8_paged_mqa_logits` JIT-compiles on gfx942 but the
+launched kernel **never returns** for `num_heads` in {32, 64}; this is the
+portable replacement (host reference + HIP kernel).
+
+For query batch `b`, KV token `t = i*block + j` (`i` in
+`[0, ceildiv(seq_len[b], block))`, `j` in `[0, block)`):
+
+```
+out[b, t] = k_scale[ page[b,i], j ]
+          * Sum_h ( max(0, Sum_d Q[b,h,d] * K[ page[b,i], j,d ] )
+                    * gate[b, h] )
+```
+
+Tokens `t >= seq_len[b]` are **left unwritten** (exactly as the tilelang
+path does with `clean_logits=False`: sglang's `topk_from_pooled_history_logits`
+masks invalid positions via `group_lengths`/`topk_offsets`/`seq_lens` before
+the top-k). The HIP caller and the unit test **zero the output first**
+(strictly safer than the original's `new_empty`). `split_kv` is a
+performance knob only — the grouped logit is grouping-independent (any
+positive `split_kv` yields the same top-k), chosen as
+`max(1, min(max_seq_len//block, NUM_CU//batch_size))` with `NUM_CU = 256`
+(MI300A).
+
+| Tensor | Shape | Dtype |
+|---|---|---|
+| `q` | `[bs, H, D]` | fp8 e4m3fnuz (device) / fp32 (oracle) |
+| `kv` | `[num_blocks, block, D]` | fp8 e4m3fnuz / fp32 (`head_dim == 128`) |
+| `k_scale` | `[num_blocks, block]` | fp32 (per-token scale; packed in the trailing `block*4` bytes of each KV block on the device path, passed separately on the CPU path) |
+| `gate` | `[bs, H]` | fp32 (the indexer's `_get_logits_head_gate` weight, after `.squeeze(2)`) |
+| `seq_lens` | `[bs]` | int32 (the pooled valid KV count) |
+| `page_table` | `[bs, max_table_len]` | int32 (the pooled page table; `page_table[b,i]` indexes the `num_blocks` dim of `kv`/`k_scale`) |
+| `out` | `[bs, max_seq_len]` (`max_seq_len = max_table_len * block`) | fp32 (zero first) |
+
+- **Files**: `src/c/vkernels/kernels/dsa.{hpp,cpp,hip}`;
+  `dsa_topk_logits_cpu` (host oracle, always compiled),
+  `hip::dsa_topk_logits` (device, `VKERNELS_HAS_HIP`).
+- **C ABI**: `vk_hip_dsa_topk_logits` (device only) in `src/c/vkernels/capi/`.
+  There is no host `vk_dsa_topk_logits` — the host path *is* the CPU oracle,
+  not the serving ABI. The FP8 e4m3fnuz dequant is folded into the load.
+
 ## Two-implementation model
 
 Mirrors `mla.{hpp,cpp,hip}` from issue #21:
@@ -92,6 +138,17 @@ int  vk_hip_dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
                            int return_lse,
                            const void* q, const void* kv, const void* indices,
                            void* out, void* lse);
+
+// Device-only: the paged-MQA gated top-k logits indexer (issue #51).
+// `q_fp8`/`kvcache_u8` are fp8 e4m3fnuz; `weight`(gate)/`seq_lens`/
+// `page_table` are fp32/int32. `out` is `[bs, max_table_len*block]` fp32
+// (ZERO the output first; tokens >= seq_len[b] are left unwritten).
+void vk_hip_dsa_topk_logits(int batch_size, int num_heads, int head_dim,
+                            int block, int max_table_len, int max_seq_len,
+                            int split_kv,
+                            const void* q_fp8, const void* kvcache_u8,
+                            const void* weight, const void* seq_lens,
+                            const void* page_table, void* out);
 ```
 
 `q`/`kv` are bf16; `indices` is int32 (padded to a multiple of 64; entries

@@ -1376,6 +1376,335 @@ def dsa_topk_logits(q, kv, k_scale, gate, seq_lens, page_table, *,
     return out_arr.reshape(B, max_seq_len)
 
 
+
+
+# ---------------------------------------------------------------------------
+# DSA kpool-cache compress/write (issue #60): the kpool>1 INDEXER cache
+# path. The persistent FP8 cache (``torch.float8_e4m3fn`` in sglang's
+# ``kpool_fp8_index.py``) is re-laid-out to bf16 for SM80 / A100 (which
+# cannot declare ``*fp8e4nv`` in a Triton kernel signature), with fp32
+# accumulation and no fp8e4nv in the native kernel signature -- the same
+# two-implementation model (``dsa.{hpp,cpp,hip}``) and ``gemm_bf16`` storage
+# convention PR #52 established. These two wrappers are the CPU reference
+# (fp32 end-to-end); the device ABI is bf16 and the integrator converts
+# (mirrors :func:`dsa_sparse_fwd` / :func:`dsa_topk_logits`).
+# ---------------------------------------------------------------------------
+
+
+def dsa_kpool_group_topk_supported(group_topk):
+    """Is ``group_topk`` one of the compress-write kernels' supported
+    ``{128,160,192,224,256,512}``? Mirrors sglang's
+    ``kpool_group_topk_supported`` (and the C ABI
+    ``vk_dsa_kpool_group_topk_supported``).
+    """
+    return bool(_impl.dsa_kpool_group_topk_supported(int(group_topk)))
+
+
+def dsa_kpool_max_closed_pools(num_draft_tokens, pool_size):
+    """Number of fully-closed kpool pools producible from ``num_draft_tokens``
+    at ``pool_size``: ``ceildiv(num_draft_tokens, pool_size)``, ``0`` when
+    either input is non-positive. Mirrors the C ABI
+    ``vk_dsa_kpool_max_closed_pools``.
+    """
+    return int(_impl.dsa_kpool_max_closed_pools(int(num_draft_tokens),
+                                                int(pool_size)))
+
+
+def dsa_kpool_assemble(chunk_k, chunk_score, tail_k, tail_score, ape,
+                       req_pool_idx, n_from_tail, chunk_src_start,
+                       tail_logical_base, loc, *, slots_per_page,
+                       num_pages, write_mask=None, out=None):
+    """DSA kpool-cache assemble + rotate + write (GLM-5.3-Flash
+    ``kpool>1`` indexer, the PREFILL / short-context path of
+    ``_compress_write`` -- the bf16 replacement for sglang's
+    ``_kpool_assemble_softmax_rotate_write_cache_kernel``).
+
+    For each of ``n_pools`` logical pools, the ``pool_size`` participating
+    keys are gathered from a CHUNK suffix (``pool_size - n_from_tail`` of
+    them, taken from ``chunk_k`` / ``chunk_score`` starting at
+    ``chunk_src_start``) and a TAIL prefix (``n_from_tail`` of them, taken
+    from the live tail at logical offsets
+    ``[tail_logical_base, tail_logical_base + n_from_tail)``), gated by
+    per-token ``ape`` weights, online-softmax-combined, Hadamard-rotated
+    (the 128-pt involutory ``H``), and written to the persistent page cache
+    at ``out[ loc[r]//ssp, loc[r]%ssp ]``. ``write_mask[r]==0`` skips row
+    ``r`` (the integrator pre-filters). The canonical shape/contract table
+    lives in ``src/c/vkernels/kernels/dsa_kpool.hpp``; this docstring only
+    restates it for Python callers.
+
+    * ``chunk_k``      : ``(num_chunks, 128)`` fp32 -- per-chunk mean K
+                         (the indexer's ``kpool_chunk_k``).
+    * ``chunk_score``  : ``(num_chunks, 128)`` fp32 -- per-chunk gate
+                         logits (``kpool_chunk_score``).
+    * ``tail_k``       : ``(n_reqs, tail_size, 128)`` fp32 -- live tail K.
+    * ``tail_score``   : ``(n_reqs, tail_size, 128)`` fp32 -- live tail
+                         gate logits.
+    * ``ape``          : ``(pool_size, 128)`` fp32 -- per-token (per-slot)
+                         gate weights (``ape_cache`` / ``compute_ape``).
+    * ``req_pool_idx`` : ``(n_pools,)`` int32 -- which request each pool
+                         belongs to (indexes ``tail_k`` / ``tail_score``).
+    * ``n_from_tail``  : ``(n_pools,)`` int32 -- how many of ``pool_size``
+                         slots come from the tail (in ``[0, pool_size]``).
+    * ``chunk_src_start`` : ``(n_pools,)`` int32 -- first CHUNK slot index
+                         (only the ``pool_size - n_from_tail`` suffix is
+                         read; must satisfy
+                         ``chunk_src_start + (pool_size - n_from_tail)
+                         <= num_chunks``).
+    * ``tail_logical_base`` : ``(n_pools,)`` int32 -- first tail logical
+                         offset (only ``n_from_tail`` are read, taken at
+                         ``(base + s) % tail_size``).
+    * ``loc``          : ``(n_pools,)`` int32 -- the flat output slot
+                         (``page = loc // ssp``, ``sip = loc % ssp``).
+    * ``slots_per_page`` : int -- page width ``ssp`` of the persistent
+                         cache (``page_size``).
+    * ``num_pages``    : int -- number of pages in the persistent cache
+                         (``out`` is ``[num_pages, ssp, 128]``).
+    * ``write_mask``   : optional ``(n_pools,)`` int32; ``write_mask[r]==0``
+                         skips row ``r`` (the integrator pre-filters).
+    * ``out``          : optional writable fp32 ``(num_pages, ssp, 128)``
+                         buffer; a new ZEROED array is allocated when
+                         omitted (skipped rows stay zero).
+
+    ``num_chunks`` is inferred from ``chunk_k.shape[0]``; ``n_pools`` from
+    ``req_pool_idx.shape[0]``; ``pool_size`` from ``ape.shape[0]``;
+    ``tail_size`` from ``tail_k.shape[1]``; ``n_reqs`` from
+    ``tail_k.shape[0]``; ``head_dim`` (must be 128) from ``tail_k.shape[2]``.
+
+    Args:
+        chunk_k: fp32 ``(num_chunks, 128)`` per-chunk mean K.
+        chunk_score: fp32 ``(num_chunks, 128)`` per-chunk gate logits.
+        tail_k: fp32 ``(n_reqs, tail_size, 128)`` live tail K.
+        tail_score: fp32 ``(n_reqs, tail_size, 128)`` live tail logits.
+        ape: fp32 ``(pool_size, 128)`` per-token gate weights.
+        req_pool_idx: int32 ``(n_pools,)`` request per pool.
+        n_from_tail: int32 ``(n_pools,)`` tail slots in the pool.
+        chunk_src_start: int32 ``(n_pools,)`` first CHUNK slot.
+        tail_logical_base: int32 ``(n_pools,)`` first tail logical offset.
+        loc: int32 ``(n_pools,)`` flat output slot.
+        slots_per_page: int page width of the persistent cache.
+        num_pages: int number of pages in the persistent cache.
+        write_mask: optional int32 ``(n_pools,)``; 0 skips the row.
+        out: optional writable fp32 ``(num_pages, ssp, 128)`` buffer.
+
+    Returns:
+        ``out`` reshaped to ``(num_pages, slots_per_page, 128)``.
+
+    Raises:
+        ValueError: on inconsistent shapes or non-positive dims.
+    """
+    ck_arr = _as_input(chunk_k, "chunk_k")
+    cs_arr = _as_input(chunk_score, "chunk_score")
+    tk_arr = _as_input(tail_k, "tail_k")
+    ts_arr = _as_input(tail_score, "tail_score")
+    ape_arr = _as_input(ape, "ape")
+    rpi_arr = np.ascontiguousarray(req_pool_idx, dtype=np.int32)
+    nft_arr = np.ascontiguousarray(n_from_tail, dtype=np.int32)
+    css_arr = np.ascontiguousarray(chunk_src_start, dtype=np.int32)
+    tlb_arr = np.ascontiguousarray(tail_logical_base, dtype=np.int32)
+    loc_arr = np.ascontiguousarray(loc, dtype=np.int32)
+    wm_arr = (None if write_mask is None
+              else np.ascontiguousarray(write_mask, dtype=np.int32))
+    for nm, a in (("req_pool_idx", rpi_arr), ("n_from_tail", nft_arr),
+                  ("chunk_src_start", css_arr), ("tail_logical_base",
+                                                 tlb_arr), ("loc", loc_arr)):
+        if a.ndim != 1:
+            raise ValueError(f"{nm} must be 1-D [n_pools]")
+    if ck_arr.ndim != 2:
+        raise ValueError("chunk_k must be 2-D [num_chunks, 128]")
+    if cs_arr.ndim != 2:
+        raise ValueError("chunk_score must be 2-D [num_chunks, 128]")
+    if tk_arr.ndim != 3:
+        raise ValueError("tail_k must be 3-D [n_reqs, tail_size, 128]")
+    if ts_arr.ndim != 3:
+        raise ValueError("tail_score must be 3-D [n_reqs, tail_size, 128]")
+    if ape_arr.ndim != 2:
+        raise ValueError("ape must be 2-D [pool_size, 128]")
+    num_chunks = int(ck_arr.shape[0])
+    n_pools = int(rpi_arr.shape[0])
+    pool_size = int(ape_arr.shape[0])
+    n_reqs, tail_size, H = (int(v) for v in tk_arr.shape)
+    if not (pool_size > 0 and tail_size > 0 and H > 0
+            and slots_per_page > 0 and num_pages > 0):
+        raise ValueError("pool_size, tail_size, H, ssp, num_pages must be > 0")
+    if H != 128:
+        raise ValueError(f"head_dim must be 128 (GLM-5.3 DSA), got {H}")
+    if cs_arr.shape[0] != num_chunks:
+        raise ValueError(
+            f"chunk_score rows {cs_arr.shape[0]} != chunk_k {num_chunks}")
+    if ts_arr.shape != (n_reqs, tail_size, H):
+        raise ValueError(
+            f"tail_score shape {ts_arr.shape} != tail_k {(n_reqs, tail_size, H)}")
+    if ape_arr.shape[1] != H:
+        raise ValueError(f"ape last dim {ape_arr.shape[1]} != head_dim {H}")
+    n_ok = (nft_arr.shape[0] == css_arr.shape[0] == tlb_arr.shape[0]
+            == loc_arr.shape[0] == n_pools)
+    if not n_ok:
+        raise ValueError(
+            f"per-pool arrays must all have length n_pools={n_pools}")
+    if wm_arr is not None and wm_arr.shape[0] != n_pools:
+        raise ValueError(
+            f"write_mask len {wm_arr.shape[0]} != n_pools {n_pools}")
+    out_arr = _as_out(num_pages * slots_per_page * H, out, "out")
+    out_arr.fill(np.float32(0.0))
+    _impl.dsa_kpool_assemble(
+        int(num_chunks), int(n_pools), int(pool_size), int(H),
+        int(tail_size), int(slots_per_page), int(num_pages), int(n_reqs),
+        ck_arr, cs_arr, tk_arr, ts_arr, ape_arr, rpi_arr, nft_arr,
+        css_arr, tlb_arr, loc_arr, wm_arr, out_arr,
+    )
+    return out_arr.reshape(num_pages, slots_per_page, H)
+
+
+def dsa_kpool_decode_update(key, slot_score, tail_k, tail_score, ape,
+                            block_tables, req_pool_idx, positions, seq_lens,
+                            out_cache_loc, *, tail_size, slots_per_page,
+                            num_pages, out=None):
+    """DSA kpool-cache decode update + maybe-write (GLM-5.3-Flash
+    ``kpool>1`` indexer, the DECODE path of ``_compress_write`` -- the
+    bf16 replacement for sglang's
+    ``_kpool_decode_update_and_maybe_write_cache_kernel``).
+
+    For each of ``batch`` decode requests: the current token's ``key`` /
+    ``slot_score`` is substituted into slot ``pos % pool_size`` of the
+    ``pool_size``-slot pool (the rest read from the live tail), the pool is
+    online-softmax-combined under per-token ``ape`` weights, Hadamard-
+    rotated, and written to the persistent page cache at
+    ``out[ block_tables[r, clamp(pos//ssp*pool_size,0,btc-1)], pos%ssp ]``
+    -- but ONLY when the request is valid (``req_pool_idx>=0``),
+    ``out_cache_loc!=0`` and ``0 <= pos < seq_len`` AND the pool is full
+    (``pos % pool_size == pool_size - 1``). UNCONDITIONALLY (valid or not)
+    the current ``key`` / ``slot_score`` is written to the live tail at
+    ``[req, pos % tail_size]`` (masked to a no-op when ``!valid`` so the
+    tail is untouched for invalid rows). This exactly mirrors the Triton
+    ``_kpool_decode_update_and_maybe_write_cache_kernel``. The canonical
+    shape/contract table lives in ``src/c/vkernels/kernels/dsa_kpool.hpp``;
+    this docstring only restates it for Python callers.
+
+    * ``key``           : ``(batch, 128)`` fp32 -- current token K.
+    * ``slot_score``    : ``(batch, 128)`` fp32 -- current token gate logit.
+    * ``tail_k``        : ``(n_reqs, tail_size, 128)`` fp32 -- live tail K
+                          (IN-PLACE: the current K is written back here).
+    * ``tail_score``    : ``(n_reqs, tail_size, 128)`` fp32 -- live tail
+                          logits (IN-PLACE: the current logit is written
+                          back here).
+    * ``ape``           : ``(pool_size, 128)`` fp32 per-token gate weights.
+    * ``block_tables``  : ``(batch, block_table_cols)`` int32 -- the page
+                          table (``block_table_cols = ssp / pool_size``;
+                          the written page is
+                          ``block_tables[r, clamp(pos//ssp*pool_size,0,btc-1)]``).
+    * ``req_pool_idx``  : ``(batch,)`` int32 -- request per row; ``< 0`` or
+                          ``>= n_reqs`` marks the row invalid.
+    * ``positions``     : ``(batch,)`` int32 -- the token position; ``< 0``
+                          or ``>= seq_len`` marks the row invalid.
+    * ``seq_lens``      : ``(batch,)`` int32 -- the per-request sequence
+                          length (validity upper bound on ``pos``).
+    * ``out_cache_loc`` : ``(batch,)`` int32 -- ``== 0`` marks the row
+                          invalid (no cache write).
+    * ``tail_size``     : int -- the live-tail width (``tail_k.shape[1]``).
+    * ``slots_per_page`` : int -- page width ``ssp`` of the persistent cache.
+    * ``num_pages``     : int -- number of pages (``out`` is
+                          ``[num_pages, ssp, 128]``).
+    * ``out``           : optional writable fp32 ``(num_pages, ssp, 128)``
+                          buffer; a new ZEROED array is allocated when
+                          omitted.
+
+    ``pool_size`` is inferred from ``ape.shape[0]``; ``n_reqs`` from
+    ``tail_k.shape[0]``; ``batch`` from ``key.shape[0]``; ``head_dim``
+    (must be 128) from ``key.shape[1]``; ``block_table_cols`` from
+    ``block_tables.shape[1]``. ``tail_k`` / ``tail_score`` are updated IN
+    PLACE (the caller's arrays are modified).
+
+    Args:
+        key: fp32 ``(batch, 128)`` current token K.
+        slot_score: fp32 ``(batch, 128)`` current token gate logit.
+        tail_k: fp32 ``(n_reqs, tail_size, 128)`` live tail K (IN-PLACE).
+        tail_score: fp32 ``(n_reqs, tail_size, 128)`` live tail logits
+            (IN-PLACE).
+        ape: fp32 ``(pool_size, 128)`` per-token gate weights.
+        block_tables: int32 ``(batch, block_table_cols)`` page table.
+        req_pool_idx: int32 ``(batch,)`` request per row (<0/>=n_reqs invalid).
+        positions: int32 ``(batch,)`` token position (<0/>=seq_len invalid).
+        seq_lens: int32 ``(batch,)`` per-request seq length.
+        out_cache_loc: int32 ``(batch,)`` (==0 marks the row invalid).
+        tail_size: int live-tail width.
+        slots_per_page: int page width of the persistent cache.
+        num_pages: int number of pages in the persistent cache.
+        out: optional writable fp32 ``(num_pages, ssp, 128)`` buffer.
+
+    Returns:
+        ``out`` reshaped to ``(num_pages, slots_per_page, 128)``.
+        ``tail_k`` and ``tail_score`` are updated in place.
+
+    Raises:
+        ValueError: on inconsistent shapes or non-positive dims.
+    """
+    key_arr = _as_input(key, "key")
+    ss_arr = _as_input(slot_score, "slot_score")
+    tk_arr = np.ascontiguousarray(tail_k, dtype=np.float32)
+    ts_arr = np.ascontiguousarray(tail_score, dtype=np.float32)
+    ape_arr = _as_input(ape, "ape")
+    bt_arr = np.ascontiguousarray(block_tables, dtype=np.int32)
+    rpi_arr = np.ascontiguousarray(req_pool_idx, dtype=np.int32)
+    pos_arr = np.ascontiguousarray(positions, dtype=np.int32)
+    sl_arr = np.ascontiguousarray(seq_lens, dtype=np.int32)
+    ocl_arr = np.ascontiguousarray(out_cache_loc, dtype=np.int32)
+    if key_arr.ndim != 2:
+        raise ValueError("key must be 2-D [batch, 128]")
+    if ss_arr.ndim != 2:
+        raise ValueError("slot_score must be 2-D [batch, 128]")
+    if tk_arr.ndim != 3:
+        raise ValueError("tail_k must be 3-D [n_reqs, tail_size, 128]")
+    if ts_arr.ndim != 3:
+        raise ValueError("tail_score must be 3-D [n_reqs, tail_size, 128]")
+    if ape_arr.ndim != 2:
+        raise ValueError("ape must be 2-D [pool_size, 128]")
+    if bt_arr.ndim != 2:
+        raise ValueError("block_tables must be 2-D [batch, block_table_cols]")
+    for nm, a in (("req_pool_idx", rpi_arr), ("positions", pos_arr),
+                  ("seq_lens", sl_arr), ("out_cache_loc", ocl_arr)):
+        if a.ndim != 1:
+            raise ValueError(f"{nm} must be 1-D [batch]")
+    batch, H = (int(v) for v in key_arr.shape)
+    n_reqs, ts, Htk = (int(v) for v in tk_arr.shape)
+    pool_size = int(ape_arr.shape[0])
+    btc = int(bt_arr.shape[1])
+    if not (pool_size > 0 and tail_size > 0 and H > 0
+            and slots_per_page > 0 and num_pages > 0 and btc > 0):
+        raise ValueError(
+            "pool_size, tail_size, H, ssp, num_pages, btc must be > 0")
+    if H != 128:
+        raise ValueError(f"head_dim must be 128 (GLM-5.3 DSA), got {H}")
+    if ss_arr.shape != (batch, H):
+        raise ValueError(f"slot_score shape {ss_arr.shape} != key {(batch, H)}")
+    if ts != tail_size or Htk != H:
+        raise ValueError(
+            f"tail_k shape {tk_arr.shape} != [n_reqs, {tail_size}, {H}]")
+    if ts_arr.shape != tk_arr.shape:
+        raise ValueError(
+            f"tail_score shape {ts_arr.shape} != tail_k {tk_arr.shape}")
+    if ape_arr.shape[1] != H:
+        raise ValueError(f"ape last dim {ape_arr.shape[1]} != head_dim {H}")
+    if (rpi_arr.shape[0] != batch or pos_arr.shape[0] != batch
+            or sl_arr.shape[0] != batch or ocl_arr.shape[0] != batch
+            or bt_arr.shape[0] != batch):
+        raise ValueError(
+            f"per-batch arrays must all have length batch={batch}")
+    out_arr = _as_out(num_pages * slots_per_page * H, out, "out")
+    out_arr.fill(np.float32(0.0))
+    _impl.dsa_kpool_decode_update(
+        int(batch), int(pool_size), int(H), int(tail_size),
+        int(slots_per_page), int(btc), int(n_reqs), int(num_pages),
+        key_arr, ss_arr, tk_arr, ts_arr, ape_arr, bt_arr, rpi_arr,
+        pos_arr, sl_arr, ocl_arr, out_arr,
+    )
+    # The CPU reference writes tail_k / tail_score IN PLACE (mirrors the
+    # device kernel's in-place tail update). The caller passed C-contiguous
+    # float32 arrays; copy the updated values back into the originals.
+    np.copyto(np.asarray(tail_k, dtype=np.float32), tk_arr)
+    np.copyto(np.asarray(tail_score, dtype=np.float32), ts_arr)
+    return out_arr.reshape(num_pages, slots_per_page, H)
+
+
 # ---------------------------------------------------------------------------
 # MHC: multi-head hybrid-attention pre-norm (issue #51, part 2)
 # ---------------------------------------------------------------------------

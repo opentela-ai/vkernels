@@ -285,6 +285,44 @@ void vk_hip_dsa_topk_logits(
     const void* page_table, void* out);
 
 /* ------------------------------------------------------------------ */
+/* DSA kpool-cache compress/write (src/c/vkernels/kernels/dsa_kpool.hip,*/
+/* #60 -- the kpool>1 INDEXER cache path; never declares fp8e4nv)       */
+/* ------------------------------------------------------------------ */
+/*
+ * Native gfx942 HIP kernels for sglang's kpool_assemble_softmax_rotate-
+ * _write_cache (prefill) and kpool_decode_update_and_maybe_write_cache
+ * (decode) in kpool_fp8_index.py -- both declare tl.float8e4nv and JIT-fail
+ * on SM80 (A100) on the first forward (job 82822). These reimplement them
+ * with bf16 STORAGE + fp32 ACCUMULATION and NO fp8e4nv (the bf16 range is
+ * ample, so the per-vector scale is dropped and the cache collapses to
+ * flat [num_pages, ssp, head_dim] bf16). See dsa_kpool.hpp for the full
+ * computation and vk_dsa_kpool_* for the host fp32 reference these are
+ * checked against (meta/benchmarks/test_dsa_kpool_correct.hip).
+ *
+ * All non-ape device pointers are bf16 (raw uint16); ape, block_tables,
+ * req_pool_indices, positions, seq_lens, out_cache_loc are fp32/int32
+ * device. `out` is a bf16 device pointer (ZERO first). `tail_k`/
+ * `tail_score` are IN-PLACE bf16 device. Never throws on valid input;
+ * bad dims are a no-op (stderr diagnostic), mirroring vk_hip_dsa_topk_.*
+ */
+void vk_hip_dsa_kpool_assemble(
+    int n_pools, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
+    const void* chunk_k, const void* chunk_score, const void* tail_k,
+    const void* tail_score, const void* ape, const void* req_pool_idx,
+    const void* n_from_tail, const void* chunk_src_start,
+    const void* tail_logical_base, const void* loc, const void* write_mask,
+    void* out);
+
+void vk_hip_dsa_kpool_decode_update(
+    int batch, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
+    const void* key, const void* slot_score, void* tail_k, void* tail_score,
+    const void* ape, const void* block_tables, const void* req_pool_indices,
+    const void* positions, const void* seq_lens, const void* out_cache_loc,
+    void* out);
+
+/* ------------------------------------------------------------------ */
 /* MHC multi-head hybrid-attention pre-norm (src/c/vkernels/kernels/    */
 /* mhc.hip, #51 part 2)                                                 */
 /* ------------------------------------------------------------------ */

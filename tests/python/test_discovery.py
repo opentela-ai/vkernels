@@ -55,6 +55,15 @@ EXPECTED_KERNELS = [
     ("dsa_sparse_fwd_with_tile", "dsa"),
     ("dsa_topk_logits", "dsa"),
     ("dsa_topk_logits_with_variant", "dsa"),
+    # DSA kpool-cache compress/write (issue #60), declared in dsa_kpool.hpp
+    # (file sorts after dsa.hpp and before dsa_topk.hpp, so the dsa_kpool
+    # block sits between the dsa and dsa_topk blocks):
+    ("dsa_kpool_group_topk_supported", "dsa_kpool"),
+    ("dsa_kpool_max_closed_pools", "dsa_kpool"),
+    ("dsa_kpool_assemble_cpu", "dsa_kpool"),
+    ("dsa_kpool_decode_update_cpu", "dsa_kpool"),
+    ("dsa_kpool_assemble", "dsa_kpool"),
+    ("dsa_kpool_decode_update", "dsa_kpool"),
     # DSA radix top-k transform (issue #56), declared in dsa_topk.hpp
     # (file sorts after dsa.hpp, so the dsa_topk block follows the dsa block):
     ("dsa_topk_transform_group_topk_supported", "dsa_topk"),
