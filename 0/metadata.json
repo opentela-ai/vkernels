@@ -1,0 +1,293 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M1KJWAJQY6JAQT65Z8NFY659",
+  "session_id": "01a063c2-1795-754c-bb82-9597940a11e0",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-03T12:11:16.229643485Z",
+  "branch": "main",
+  "checkpoints_count": 16,
+  "save_step_count": 15,
+  "files_touched": [
+    "docs/README.md",
+    "docs/kernels/dsa.md",
+    "docs/kernels/dsa_kpool.md",
+    "docs/performance/dsa-kpool/A100.md",
+    "docs/performance/dsa-kpool/beverin-dsa-kpool-bench.log",
+    "docs/performance/dsa-kpool/bristen-dsa-kpool-bench-A100.log",
+    "docs/performance/dsa-kpool/gfx942.md",
+    "docs/python-bindings.md",
+    "docs/rust-bindings.md",
+    "meta/benchmarks/CMakeLists.txt",
+    "meta/benchmarks/bench_dsa_kpool.hip",
+    "meta/benchmarks/test_dsa_kpool_correct.hip",
+    "meta/scripts/build_dsa_kpool_a100_cuda.sh",
+    "meta/scripts/run_dsa_kpool_bench_mi300.sh",
+    "src/c/CMakeLists.txt",
+    "src/c/vkernels/capi/capi.cpp",
+    "src/c/vkernels/capi/capi.hpp",
+    "src/c/vkernels/capi/capi_attn.cpp",
+    "src/c/vkernels/capi/capi_internal.hpp",
+    "src/c/vkernels/capi/capi_kernels.cpp",
+    "src/c/vkernels/capi/capi_moe.cpp",
+    "src/c/vkernels/capi/hip_capi.cpp",
+    "src/c/vkernels/capi/hip_capi.hpp",
+    "src/c/vkernels/kernels/cuda_compat/hip/hip_runtime.h",
+    "src/c/vkernels/kernels/dsa_kpool.cpp",
+    "src/c/vkernels/kernels/dsa_kpool.hip",
+    "src/c/vkernels/kernels/dsa_kpool.hpp",
+    "src/c/vkernels/kernels/moe_device.hip",
+    "src/python/vkernels/_core.cpp",
+    "src/python/vkernels/_fallback.py",
+    "src/python/vkernels/kernels.py",
+    "tests/CMakeLists.txt",
+    "tests/kernels/attn/test_dsa_kpool.cpp",
+    "tests/python/test_discovery.py",
+    "tests/python/test_kernels.py"
+  ],
+  "agent": "Pi",
+  "model": "zai-org/GLM-5.3-Flash",
+  "turn_id": "6240b6d7914f",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 14735732,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 26254656,
+    "output_tokens": 488075,
+    "api_call_count": 584
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "pi-skill-thermo-nuclear-code-quality-review-2026-09-03T09:43:40.283Z-0",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "thermo-nuclear-code-quality-review"
+      },
+      "source": {
+        "agent": "pi",
+        "signal": "input_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "8eed4ee6ece5",
+      "timestamp": "2026-09-03T09:43:40.283Z",
+      "native": {
+        "command": "/skill:thermo-nuclear-code-quality-review"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/skill:thermo-nuclear-code-quality-review",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 16
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-03T12:11:15.759393291Z",
+    "agent_lines": 5301,
+    "agent_removed": 616,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 5301,
+    "total_lines_changed": 5917,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 389,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12,
+        "docs/ORIENTATION.md": 329
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 3801,
+      "agent_lines_removed": 51,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 4239,
+      "agent_lines_removed": 51,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 4316,
+      "agent_lines_removed": 51,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    },
+    {
+      "checkpoint_number": 7,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 8,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 4568,
+      "agent_lines_removed": 51,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    },
+    {
+      "checkpoint_number": 9,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 4568,
+      "agent_lines_removed": 51,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    },
+    {
+      "checkpoint_number": 10,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 11,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 12,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 4938,
+      "agent_lines_removed": 51,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    },
+    {
+      "checkpoint_number": 13,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 4938,
+      "agent_lines_removed": 51,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    },
+    {
+      "checkpoint_number": 14,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 15,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 5630,
+      "agent_lines_removed": 616,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    },
+    {
+      "checkpoint_number": 16,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 5630,
+      "agent_lines_removed": 616,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    }
+  ]
+}

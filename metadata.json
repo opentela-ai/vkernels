@@ -1,0 +1,60 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M1KJWAJQY6JAQT65Z8NFY659",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 16,
+  "files_touched": [
+    "docs/README.md",
+    "docs/kernels/dsa.md",
+    "docs/kernels/dsa_kpool.md",
+    "docs/performance/dsa-kpool/A100.md",
+    "docs/performance/dsa-kpool/beverin-dsa-kpool-bench.log",
+    "docs/performance/dsa-kpool/bristen-dsa-kpool-bench-A100.log",
+    "docs/performance/dsa-kpool/gfx942.md",
+    "docs/python-bindings.md",
+    "docs/rust-bindings.md",
+    "meta/benchmarks/CMakeLists.txt",
+    "meta/benchmarks/bench_dsa_kpool.hip",
+    "meta/benchmarks/test_dsa_kpool_correct.hip",
+    "meta/scripts/build_dsa_kpool_a100_cuda.sh",
+    "meta/scripts/run_dsa_kpool_bench_mi300.sh",
+    "src/c/CMakeLists.txt",
+    "src/c/vkernels/capi/capi.cpp",
+    "src/c/vkernels/capi/capi.hpp",
+    "src/c/vkernels/capi/capi_attn.cpp",
+    "src/c/vkernels/capi/capi_internal.hpp",
+    "src/c/vkernels/capi/capi_kernels.cpp",
+    "src/c/vkernels/capi/capi_moe.cpp",
+    "src/c/vkernels/capi/hip_capi.cpp",
+    "src/c/vkernels/capi/hip_capi.hpp",
+    "src/c/vkernels/kernels/cuda_compat/hip/hip_runtime.h",
+    "src/c/vkernels/kernels/dsa_kpool.cpp",
+    "src/c/vkernels/kernels/dsa_kpool.hip",
+    "src/c/vkernels/kernels/dsa_kpool.hpp",
+    "src/c/vkernels/kernels/moe_device.hip",
+    "src/python/vkernels/_core.cpp",
+    "src/python/vkernels/_fallback.py",
+    "src/python/vkernels/kernels.py",
+    "tests/CMakeLists.txt",
+    "tests/kernels/attn/test_dsa_kpool.cpp",
+    "tests/python/test_discovery.py",
+    "tests/python/test_kernels.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 14735732,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 26254656,
+    "output_tokens": 488075,
+    "api_call_count": 584
+  }
+}
