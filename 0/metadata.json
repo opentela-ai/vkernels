@@ -1,0 +1,64 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M1KJWEN817Y17XQMXBJFBAW0",
+  "session_id": "01a063c2-1795-754c-bb82-9597940a11e0",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-03T12:11:18.875679305Z",
+  "branch": "main",
+  "checkpoints_count": 16,
+  "save_step_count": 1,
+  "files_touched": [
+    "docs/ORIENTATION.md"
+  ],
+  "agent": "Pi",
+  "model": "zai-org/GLM-5.3-Flash",
+  "turn_id": "6240b6d7914f",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 14818949,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 26254656,
+    "output_tokens": 488170,
+    "api_call_count": 585
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "pi-skill-thermo-nuclear-code-quality-review-2026-09-03T09:43:40.283Z-0",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "thermo-nuclear-code-quality-review"
+      },
+      "source": {
+        "agent": "pi",
+        "signal": "input_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "8eed4ee6ece5",
+      "timestamp": "2026-09-03T09:43:40.283Z",
+      "native": {
+        "command": "/skill:thermo-nuclear-code-quality-review"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/skill:thermo-nuclear-code-quality-review",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 16
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-03T12:11:18.402629436Z",
+    "agent_lines": 329,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 329,
+    "total_lines_changed": 329,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}
