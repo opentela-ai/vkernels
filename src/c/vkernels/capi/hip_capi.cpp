@@ -223,6 +223,64 @@ extern "C" void vk_hip_dsa_kpool_decode_update(
       block_tables, req_pool_indices, positions, seq_lens, out_cache_loc, out);
 }
 
+extern "C" void vk_hip_dsa_kpool_assemble_on_stream(
+    int n_pools, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
+    const void* chunk_k, const void* chunk_score, const void* tail_k,
+    const void* tail_score, const void* ape, const void* req_pool_idx,
+    const void* n_from_tail, const void* chunk_src_start,
+    const void* tail_logical_base, const void* loc, const void* write_mask,
+    void* out, void* stream) {
+  vkernels::kernels::hip::dsa_kpool_assemble_on_stream(
+      n_pools, pool_size, head_dim, tail_size, slots_per_page, num_pages,
+      num_chunks, n_reqs, chunk_k, chunk_score, tail_k, tail_score, ape,
+      req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base, loc,
+      write_mask, out, stream);
+}
+
+extern "C" void vk_hip_dsa_kpool_decode_update_on_stream(
+    int batch, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
+    const void* key, const void* slot_score, void* tail_k, void* tail_score,
+    const void* ape, const void* block_tables, const void* req_pool_indices,
+    const void* positions, const void* seq_lens, const void* out_cache_loc,
+    void* out, void* stream) {
+  vkernels::kernels::hip::dsa_kpool_decode_update_on_stream(
+      batch, pool_size, head_dim, tail_size, slots_per_page, block_table_cols,
+      n_reqs, num_pages, key, slot_score, tail_k, tail_score, ape,
+      block_tables, req_pool_indices, positions, seq_lens, out_cache_loc, out,
+      stream);
+}
+
+extern "C" void vk_hip_dsa_kpool_assemble_fp8(
+    int n_pools, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
+    const void* chunk_k, const void* chunk_score, const void* tail_k,
+    const void* tail_score, const void* ape, const void* req_pool_idx,
+    const void* n_from_tail, const void* chunk_src_start,
+    const void* tail_logical_base, const void* loc, const void* write_mask,
+    void* cache_u8, const void* round_scale_or_null, void* stream) {
+  vkernels::kernels::hip::dsa_kpool_assemble_fp8(
+      n_pools, pool_size, head_dim, tail_size, slots_per_page, num_pages,
+      num_chunks, n_reqs, chunk_k, chunk_score, tail_k, tail_score, ape,
+      req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base, loc,
+      write_mask, cache_u8, round_scale_or_null, stream);
+}
+
+extern "C" void vk_hip_dsa_kpool_decode_update_fp8(
+    int batch, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
+    const void* key, const void* slot_score, void* tail_k, void* tail_score,
+    const void* ape, const void* block_tables, const void* req_pool_indices,
+    const void* positions, const void* seq_lens, const void* out_cache_loc,
+    void* cache_u8, const void* round_scale_or_null, void* stream) {
+  vkernels::kernels::hip::dsa_kpool_decode_update_fp8(
+      batch, pool_size, head_dim, tail_size, slots_per_page, block_table_cols,
+      n_reqs, num_pages, key, slot_score, tail_k, tail_score, ape,
+      block_tables, req_pool_indices, positions, seq_lens, out_cache_loc,
+      cache_u8, round_scale_or_null, stream);
+}
+
 // --- MHC multi-head hybrid-attention pre-norm (GLM-5.3-Flash) ---
 extern "C" void vk_hip_mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3,
                                         int hc_hidden_size,

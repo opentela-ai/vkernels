@@ -322,6 +322,48 @@ void vk_hip_dsa_kpool_decode_update(
     const void* positions, const void* seq_lens, const void* out_cache_loc,
     void* out);
 
+/* Issue #61: graph-capturable overloads and fp8+scale store variants.
+ * Same contracts as vk_hip_dsa_kpool_assemble / vk_hip_dsa_kpool_decode_update
+ * above, except:
+ *   - *_on_stream takes an explicit stream (NULL -> default stream).
+ *   - *_fp8 writes the legacy uint8 cache [num_pages, ssp*(head_dim+4)]
+ *     with head_dim fp8e4m3fn bytes + one fp32 scale per vector. cache_u8
+ *     is a device uint8 pointer (zeroed first). tail_k/tail_score are still
+ *     IN-PLACE bf16 device (decode live tail). key/slot_score are bf16 device.
+ *   - round_scale_or_null is a device int pointer (or NULL); *it > 0 selects
+ *     power-of-two scale rounding, otherwise raw absmax/448.
+ */
+void vk_hip_dsa_kpool_assemble_on_stream(
+    int n_pools, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
+    const void* chunk_k, const void* chunk_score, const void* tail_k,
+    const void* tail_score, const void* ape, const void* req_pool_idx,
+    const void* n_from_tail, const void* chunk_src_start,
+    const void* tail_logical_base, const void* loc, const void* write_mask,
+    void* out, void* stream);
+void vk_hip_dsa_kpool_decode_update_on_stream(
+    int batch, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
+    const void* key, const void* slot_score, void* tail_k, void* tail_score,
+    const void* ape, const void* block_tables, const void* req_pool_indices,
+    const void* positions, const void* seq_lens, const void* out_cache_loc,
+    void* out, void* stream);
+void vk_hip_dsa_kpool_assemble_fp8(
+    int n_pools, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
+    const void* chunk_k, const void* chunk_score, const void* tail_k,
+    const void* tail_score, const void* ape, const void* req_pool_idx,
+    const void* n_from_tail, const void* chunk_src_start,
+    const void* tail_logical_base, const void* loc, const void* write_mask,
+    void* cache_u8, const void* round_scale_or_null, void* stream);
+void vk_hip_dsa_kpool_decode_update_fp8(
+    int batch, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
+    const void* key, const void* slot_score, void* tail_k, void* tail_score,
+    const void* ape, const void* block_tables, const void* req_pool_indices,
+    const void* positions, const void* seq_lens, const void* out_cache_loc,
+    void* cache_u8, const void* round_scale_or_null, void* stream);
+
 /* ------------------------------------------------------------------ */
 /* MHC multi-head hybrid-attention pre-norm (src/c/vkernels/kernels/    */
 /* mhc.hip, #51 part 2)                                                 */

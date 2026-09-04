@@ -80,6 +80,129 @@ __device__ __forceinline__ void hadamard128(float* x) {
   for (int i = 0; i < 128; ++i) x[i] *= kScale;
 }
 
+// Round-trip through bf16 (RNE) -> back to fp32. Matches the CPU oracle's
+// round_bf16 (dsa_kpool.cpp) and sglang's `.to(tl.bfloat16).to(tl.float32)`.
+__device__ __forceinline__ float round_bf16(float v) {
+  return bf16_to_f32(f2bf(v));
+}
+
+// fp32 -> fp8e4m3fn round-to-nearest-even. Pure IEEE bit manipulation, no
+// native FP8 (SM80/A100 safe). Layout: 1 sign | 4 exponent (BIAS 7) |
+// 3 mantissa; max finite = 448 (0x7E), NaN at 0x7F/0xFF. Mirrors the CPU
+// oracle's f32_to_fp8e4m3fn_rne EXACTLY (same cases, subnormal handling,
+// and tie-break rule) so device and oracle agree byte-for-byte.
+__device__ __forceinline__ uint8_t f32_to_fp8e4m3fn_rne(float fv) {
+  uint32_t bits;
+  __builtin_memcpy(&bits, &fv, sizeof(bits));
+  const uint32_t sign = (bits >> 31) & 1u;
+  const uint32_t mag_bits = bits & 0x7FFFFFFFu;
+  float amag;
+  __builtin_memcpy(&amag, &mag_bits, sizeof(amag));
+  if (amag != amag) return 0x7Fu;                  // NaN -> +NaN
+  if (amag == 0.0f) return static_cast<uint8_t>(sign << 7);
+  if (amag > 448.0f) return static_cast<uint8_t>((sign << 7) | 0x7Eu);  // saturate
+  int e;
+  const float frac = frexpf(amag, &e);             // frac in [0.5,1), amag=frac*2^e
+  const int e_unbiased = e - 1;                    // 2*frac in [1,2), amag=(2*frac)*2^e_unbiased
+  if (e_unbiased < -9) return static_cast<uint8_t>(sign << 7);  // rounds to 0
+  auto round_mant = [](float mf) -> uint32_t {     // RNE of mf in [0,8)
+    uint32_t fl = static_cast<uint32_t>(floorf(mf));
+    const float rem = mf - static_cast<float>(fl);
+    if (rem < 0.5f) return fl;
+    if (rem > 0.5f) return fl + 1u;
+    return (fl & 1u) ? fl + 1u : fl;               // tie -> even
+  };
+  if (e_unbiased < -6) {                           // subnormal (stored exp=0)
+    const uint32_t mant = round_mant(amag * 64.0f);  // amag / 2^-6 = amag*2^6
+    if (mant >= 8u) return static_cast<uint8_t>((sign << 7) | 0x08u);  // -> smallest normal
+    return static_cast<uint8_t>((sign << 7) | mant);
+  }
+  // normal: stored_exp = e_unbiased + 7 in [1, 15]; mant = round((2*frac-1)*8)
+  uint32_t mant = round_mant((2.0f * frac - 1.0f) * 8.0f);
+  uint32_t stored_exp = static_cast<uint32_t>(e_unbiased + 7);
+  if (mant >= 8u) { mant = 0u; stored_exp += 1u; }  // carry into exponent
+  if (stored_exp == 15u && mant == 7u) return static_cast<uint8_t>((sign << 7) | 0x7Eu);  // NaN slot -> max finite
+  if (stored_exp > 15u) return static_cast<uint8_t>((sign << 7) | 0x7Eu);  // overflow -> max finite
+  return static_cast<uint8_t>((sign << 7) | (stored_exp << 3) | mant);
+}
+
+// NOTE: the fp8 store epilogue needs TWO block-wide reductions -- an OR
+// over "any element finite" (skip gate) and a max of |mean| (the single
+// per-vector scale). These were first written with __shfl_xor (a 64-lane
+// butterfly), but __shfl_xor is a HIP wavefront intrinsic that is undefined
+// under nvcc, and a 64-lane butterfly is wrong on A100 (32-lane warps). They
+// are now done inline in store_kpool_fp8_device via shared memory +
+// __syncthreads -- the SAME block-wide pattern the bf16 kernels already use,
+// which works for blockDim=64 whether that is one gfx942 wavefront or two
+// sm_80 warps.
+
+// FP8+scale store epilogue for ONE pool row. ``mean`` is the Hadamard-
+// transformed fp32 128-vector already in shared memory. Lane l owns elements
+// {2l, 2l+1}. Writes raw fp8 bytes to k_dst[0..127] and one fp32 scale to
+// *scale_dst. Mirrors the CPU oracle's store_kpool_fp8 (dsa_kpool.cpp).
+__device__ __forceinline__ void store_kpool_fp8_device(
+    float* mean, int lane, int slots_per_page,
+    uint8_t* k_dst, float* scale_dst, bool round_scale,
+    bool finite0, bool finite1) {
+  // Round mean -> bf16 -> fp32 (matches CPU round_bf16). Read BOTH owned
+  // elements into registers FIRST: mean is reused below as the reduction
+  // scratch, so every element read must complete before any scratch write
+  // (writes touch mean[0..63] and mean[64..127] -- the whole buffer -- and
+  // would race with other lanes' element reads without this barrier).
+  const float x0 = round_bf16(mean[2 * lane]);
+  const float x1 = round_bf16(mean[2 * lane + 1]);
+  __syncthreads();  // all element reads done before reusing mean as scratch
+
+  // Block-wide reductions via shared memory (portable across gfx942 64-lane
+  // wavefronts and sm_80 32-lane warps: blockDim=64 is one wavefront on
+  // gfx942 and two warps on sm_80, and __syncthreads is block-wide). Reuse
+  // the 128-float mean buffer now that x0/x1 are in registers:
+  //   mean[ 0..63]  -> per-lane absmax (0.0 for non-finite lanes)
+  //   mean[64..127] -> per-lane any-finite flag (0.0 / 1.0)
+  const bool any_local = (finite0 || finite1);
+  mean[lane] = any_local ? fmaxf(fabsf(x0), fabsf(x1)) : 0.0f;
+  mean[64 + lane] = any_local ? 1.0f : 0.0f;
+  __syncthreads();
+  if (lane == 0) {
+    float mx = mean[0], fin = mean[64];
+    for (int l = 1; l < blockDim.x; ++l) {
+      mx = fmaxf(mx, mean[l]);
+      fin = fmaxf(fin, mean[64 + l]);
+    }
+    mean[0] = mx;    // global absmax (0 iff no lane was finite)
+    mean[64] = fin;  // global any-finite flag (0.0 / 1.0)
+  }
+  __syncthreads();
+
+  const bool any_finite = (mean[64] > 0.5f);
+  if (!any_finite) {
+    if (lane == 0) *scale_dst = 0.0f;
+    k_dst[2 * lane] = 0u;
+    k_dst[2 * lane + 1] = 0u;
+    return;
+  }
+
+  float absmax = mean[0];
+  if (absmax < 1e-4f) absmax = 1e-4f;  // floored (Triton max(absmax, 1e-4))
+  const float fp8_max_inv = 1.0f / 448.0f;
+  float scale;
+  if (round_scale) {
+    scale = exp2f(ceilf(log2f(absmax * fp8_max_inv)));
+  } else {
+    scale = absmax * fp8_max_inv;
+  }
+  if (lane == 0) *scale_dst = scale;
+
+  float q0 = x0 / scale;
+  if (q0 > 448.0f) q0 = 448.0f;
+  else if (q0 < -448.0f) q0 = -448.0f;
+  float q1 = x1 / scale;
+  if (q1 > 448.0f) q1 = 448.0f;
+  else if (q1 < -448.0f) q1 = -448.0f;
+  k_dst[2 * lane] = f32_to_fp8e4m3fn_rne(q0);
+  k_dst[2 * lane + 1] = f32_to_fp8e4m3fn_rne(q1);
+}
+
 // PREFILL: one warp per pool row. Lane l owns head elements {2l, 2l+1}.
 // Online softmax over the pool's pool_size slots, then the staged Hadamard
 // (lane 0 on the shared-buffered mean), then the bf16 store at
@@ -253,6 +376,198 @@ __global__ void dsa_kpool_decode_kernel(
   }
 }
 
+// PREFILL (fp8+scale): one warp per pool row. Mirrors
+// dsa_kpool_assemble_kernel above; the weighted mean is staged through
+// bf16-rounded fp32, Hadamard'd, then run through store_kpool_fp8_device
+// which writes raw fp8 bytes + one fp32 scale into the legacy uint8 cache.
+__global__ void dsa_kpool_assemble_fp8_kernel(
+    const uint16_t* __restrict__ chunk_k,
+    const uint16_t* __restrict__ chunk_score,
+    const uint16_t* __restrict__ tail_k,
+    const uint16_t* __restrict__ tail_score,
+    const float* __restrict__ ape,
+    const int32_t* __restrict__ req_pool_idx,
+    const int32_t* __restrict__ n_from_tail,
+    const int32_t* __restrict__ chunk_src_start,
+    const int32_t* __restrict__ tail_logical_base,
+    const int32_t* __restrict__ loc,
+    const int32_t* __restrict__ write_mask,
+    uint8_t* __restrict__ cache_u8,             // [num_pages, ssp*(128+4)]
+    int n_pools, int pool_size, int tail_size, int slots_per_page,
+    int num_chunks, int n_reqs, const int* round_scale_or_null) {
+  const int r = blockIdx.x;
+  const int lane = threadIdx.x;
+  if (r >= n_pools) return;
+  if (write_mask && write_mask[r] == 0) return;
+
+  const int req = req_pool_idx[r];
+  const int n_tail = n_from_tail[r];
+  const int chunk_src = chunk_src_start[r];
+  const int tail_base = tail_logical_base[r];
+  const int lr = loc[r];
+
+  float m[2] = {-INFINITY, -INFINITY};
+  float acc[2] = {0.0f, 0.0f};
+  float denom[2] = {0.0f, 0.0f};
+  for (int slot = 0; slot < pool_size; ++slot) {
+    const int phys = ((tail_base + slot) % tail_size + tail_size) % tail_size;
+    const int ci = chunk_src + (slot - n_tail);
+    const uint16_t* spf = (slot < n_tail)
+        ? tail_score + ((size_t)req * tail_size + phys) * 128
+        : chunk_score + (size_t)ci * 128;
+    const uint16_t* kpf = (slot < n_tail)
+        ? tail_k + ((size_t)req * tail_size + phys) * 128
+        : chunk_k + (size_t)ci * 128;
+    for (int t = 0; t < 2; ++t) {
+      const int d = 2 * lane + t;
+      const float score = bf16_to_f32(spf[d]) + ape[(size_t)slot * 128 + d];
+      const float new_m = fmaxf(m[t], score);
+      const float rescale = expf(m[t] - new_m);
+      const float prob = expf(score - new_m);
+      denom[t] = denom[t] * rescale + prob;
+      acc[t] = acc[t] * rescale + bf16_to_f32(kpf[d]) * prob;
+      m[t] = new_m;
+    }
+  }
+
+  extern __shared__ float smem[];
+  float* mean = smem;
+  const bool finite0 = (denom[0] > 0.0f && isfinite(denom[0]) && isfinite(acc[0]));
+  const bool finite1 = (denom[1] > 0.0f && isfinite(denom[1]) && isfinite(acc[1]));
+  mean[2 * lane] = finite0 ? round_bf16(acc[0] / denom[0]) : 0.0f;
+  mean[2 * lane + 1] = finite1 ? round_bf16(acc[1] / denom[1]) : 0.0f;
+  __syncthreads();
+  if (lane == 0) hadamard128(mean);
+  __syncthreads();
+
+  const int page = lr / slots_per_page;
+  const int sip = lr % slots_per_page;
+  const int page_bytes = slots_per_page * (128 + 4);
+  uint8_t* k_dst = cache_u8 + (size_t)page * page_bytes + (size_t)sip * 128;
+  float* scale_dst = reinterpret_cast<float*>(
+      cache_u8 + (size_t)page * page_bytes) + (slots_per_page * 128 / 4) + sip;
+  // round_scale is a DEVICE int (see hip_capi.hpp): read *it > 0 on-device,
+  // never on the host, so a prior graph node can produce it on this stream.
+  const bool round_scale = round_scale_or_null && *round_scale_or_null > 0;
+  store_kpool_fp8_device(mean, lane, slots_per_page, k_dst, scale_dst,
+                         round_scale, finite0, finite1);
+}
+
+// DECODE (fp8+scale): one warp per request row. Mirrors
+// dsa_kpool_decode_kernel above; when the pool is complete it writes fp8 K +
+// scale, and unconditionally writes the current key/score to the bf16 live
+// tail (same as bf16 decode).
+__global__ void dsa_kpool_decode_fp8_kernel(
+    const uint16_t* __restrict__ key,
+    const uint16_t* __restrict__ slot_score,
+    uint16_t* __restrict__ tail_k,
+    uint16_t* __restrict__ tail_score,
+    const float* __restrict__ ape,
+    const int32_t* __restrict__ block_tables,
+    const int32_t* __restrict__ req_pool_indices,
+    const int32_t* __restrict__ positions,
+    const int32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ out_cache_loc,
+    uint8_t* __restrict__ cache_u8,
+    int batch, int pool_size, int tail_size, int slots_per_page,
+    int block_table_cols, int n_reqs, int num_pages,
+    const int* round_scale_or_null) {
+  const int r = blockIdx.x;
+  const int lane = threadIdx.x;
+  if (r >= batch) return;
+
+  const int req_raw = req_pool_indices[r];
+  const bool req_valid = req_raw >= 0 && req_raw < n_reqs;
+  const int req = req_valid ? req_raw : (req_raw < 0 ? 0 : n_reqs - 1);
+  const int pos_raw = positions[r];
+  const int safe_pos = pos_raw < 0 ? 0 : pos_raw;
+  const int seq_len = seq_lens[r];
+  const int cache_loc = out_cache_loc[r];
+  const bool pos_valid = req_valid && cache_loc != 0 && pos_raw >= 0 &&
+                         pos_raw < seq_len;
+  const int slot = safe_pos % pool_size;
+
+  const uint16_t* cur_k = key + (size_t)r * 128;
+  const uint16_t* cur_s = slot_score + (size_t)r * 128;
+
+  extern __shared__ float smem[];
+  float* mean = smem;
+
+  if (pos_valid && slot == pool_size - 1) {
+    const int pool_logical_start = safe_pos - slot;
+    float mx[2] = {-INFINITY, -INFINITY};
+    for (int p = 0; p < pool_size; ++p) {
+      const bool is_current = (p == slot);
+      const int phys = ((pool_logical_start + p) % tail_size + tail_size) % tail_size;
+      const uint16_t* sb = tail_score + ((size_t)req * tail_size + phys) * 128;
+      for (int t = 0; t < 2; ++t) {
+        const int d = 2 * lane + t;
+        const float s = (is_current ? bf16_to_f32(cur_s[d]) : bf16_to_f32(sb[d]))
+                        + ape[(size_t)p * 128 + d];
+        mx[t] = fmaxf(mx[t], s);
+      }
+    }
+    float acc[2] = {0.0f, 0.0f}, denom[2] = {0.0f, 0.0f};
+    for (int p = 0; p < pool_size; ++p) {
+      const bool is_current = (p == slot);
+      const int phys = ((pool_logical_start + p) % tail_size + tail_size) % tail_size;
+      const uint16_t* sb = tail_score + ((size_t)req * tail_size + phys) * 128;
+      const uint16_t* kb = tail_k + ((size_t)req * tail_size + phys) * 128;
+      for (int t = 0; t < 2; ++t) {
+        const int d = 2 * lane + t;
+        const float s = (is_current ? bf16_to_f32(cur_s[d]) : bf16_to_f32(sb[d]))
+                        + ape[(size_t)p * 128 + d];
+        const float prob = expf(s - mx[t]);
+        denom[t] += prob;
+        acc[t] += (is_current ? bf16_to_f32(cur_k[d]) : bf16_to_f32(kb[d])) * prob;
+      }
+    }
+    const bool finite0 = (denom[0] > 0.0f && isfinite(denom[0]) && isfinite(acc[0]));
+    const bool finite1 = (denom[1] > 0.0f && isfinite(denom[1]) && isfinite(acc[1]));
+    mean[2 * lane] = finite0 ? round_bf16(acc[0] / denom[0]) : 0.0f;
+    mean[2 * lane + 1] = finite1 ? round_bf16(acc[1] / denom[1]) : 0.0f;
+    __syncthreads();
+    if (lane == 0) hadamard128(mean);
+    __syncthreads();
+
+    const int pool_id = safe_pos / pool_size;
+    const int pool_page_group = pool_id / slots_per_page;
+    int tpr = pool_page_group * pool_size;
+    if (tpr < 0) tpr = 0;
+    if (tpr >= block_table_cols) tpr = block_table_cols - 1;
+    const int packed_page = block_tables[(size_t)r * block_table_cols + tpr];
+    const int loc_slot = pool_id % slots_per_page;
+    const int page_bytes = slots_per_page * (128 + 4);
+    // sglang packed layout (matches dsa_kpool_assemble_fp8 above and the
+    // CPU oracle dsa_kpool_decode_update_fp8_cpu): K region is ``ssp``
+    // contiguous 128-B vectors at ``page*page_bytes + loc_slot*128``, the
+    // ``ssp`` fp32 scales occupy the trailing ``ssp*4`` bytes. K is NOT
+    // interleaved with its scale (an earlier ``(page*ssp+slot)*132`` stride
+    // wrote K at ``slot*132`` and crashed the device-vs-CPU cross-check at
+    // high slot density -- it is only valid for ``loc_slot==0``).
+    uint8_t* k_dst = cache_u8 + (size_t)packed_page * page_bytes
+                     + (size_t)loc_slot * 128;
+    float* scale_dst = reinterpret_cast<float*>(
+        cache_u8 + (size_t)packed_page * page_bytes) + (slots_per_page * 128 / 4) + loc_slot;
+    // round_scale is a DEVICE int (see hip_capi.hpp): read *it > 0 on-device,
+    // never on the host, so a prior graph node can produce it on this stream.
+    const bool round_scale = round_scale_or_null && *round_scale_or_null > 0;
+    store_kpool_fp8_device(mean, lane, slots_per_page, k_dst, scale_dst,
+                           round_scale, finite0, finite1);
+  }
+
+  // Unconditional live-tail write (no-op when !pos_valid).
+  if (pos_valid) {
+    const int phys_slot = ((safe_pos % tail_size) + tail_size) % tail_size;
+    uint16_t* tk = tail_k + ((size_t)req * tail_size + phys_slot) * 128;
+    uint16_t* ts = tail_score + ((size_t)req * tail_size + phys_slot) * 128;
+    tk[2 * lane] = cur_k[2 * lane];
+    tk[2 * lane + 1] = cur_k[2 * lane + 1];
+    ts[2 * lane] = cur_s[2 * lane];
+    ts[2 * lane + 1] = cur_s[2 * lane + 1];
+  }
+}
+
 }  // namespace
 
 void dsa_kpool_assemble(int n_pools, int pool_size, int head_dim,
@@ -322,6 +637,153 @@ void dsa_kpool_decode_update(int batch, int pool_size, int head_dim,
       reinterpret_cast<const int32_t*>(out_cache_loc),
       reinterpret_cast<uint16_t*>(out), batch, pool_size, tail_size,
       slots_per_page, block_table_cols, n_reqs, num_pages);
+}
+
+// Graph-capturable overloads (issue #61). ``stream`` is a hipStream_t passed
+// through void*; nullptr selects the default stream (legacy behaviour).
+void dsa_kpool_assemble_on_stream(
+    int n_pools, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
+    const void* chunk_k, const void* chunk_score, const void* tail_k,
+    const void* tail_score, const void* ape, const void* req_pool_idx,
+    const void* n_from_tail, const void* chunk_src_start,
+    const void* tail_logical_base, const void* loc, const void* write_mask,
+    void* out, void* stream) {
+  VK_EXPECTS(n_pools >= 0 && pool_size > 0 && head_dim == 128 &&
+                 tail_size > 0 && slots_per_page > 0 && num_pages > 0 &&
+                 num_chunks >= 0 && n_reqs >= 0,
+             "dsa_kpool_assemble_on_stream: positive dims, head_dim==128, "
+             "non-negative counts");
+  if (n_pools == 0) return;
+  const int shmem = 128 * sizeof(float);
+  dim3 grid(n_pools, 1, 1);
+  dim3 block(64);
+  const hipStream_t s = stream ? static_cast<hipStream_t>(stream) : 0;
+  dsa_kpool_assemble_kernel<<<grid, block, shmem, s>>>(
+      reinterpret_cast<const uint16_t*>(chunk_k),
+      reinterpret_cast<const uint16_t*>(chunk_score),
+      reinterpret_cast<const uint16_t*>(tail_k),
+      reinterpret_cast<const uint16_t*>(tail_score),
+      reinterpret_cast<const float*>(ape),
+      reinterpret_cast<const int32_t*>(req_pool_idx),
+      reinterpret_cast<const int32_t*>(n_from_tail),
+      reinterpret_cast<const int32_t*>(chunk_src_start),
+      reinterpret_cast<const int32_t*>(tail_logical_base),
+      reinterpret_cast<const int32_t*>(loc),
+      reinterpret_cast<const int32_t*>(write_mask),
+      reinterpret_cast<uint16_t*>(out), n_pools, pool_size, tail_size,
+      slots_per_page, num_chunks, n_reqs);
+}
+
+void dsa_kpool_decode_update_on_stream(
+    int batch, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
+    const void* key, const void* slot_score, void* tail_k, void* tail_score,
+    const void* ape, const void* block_tables, const void* req_pool_indices,
+    const void* positions, const void* seq_lens, const void* out_cache_loc,
+    void* out, void* stream) {
+  VK_EXPECTS(batch >= 0 && pool_size > 0 && head_dim == 128 &&
+                 tail_size > 0 && slots_per_page > 0 && block_table_cols > 0 &&
+                 n_reqs >= 0 && num_pages >= 0,
+             "dsa_kpool_decode_update_on_stream: positive dims, head_dim==128, "
+             "non-negative counts");
+  if (batch == 0) return;
+  const int shmem = 128 * sizeof(float);
+  dim3 grid(batch, 1, 1);
+  dim3 block(64);
+  const hipStream_t s = stream ? static_cast<hipStream_t>(stream) : 0;
+  dsa_kpool_decode_kernel<<<grid, block, shmem, s>>>(
+      reinterpret_cast<const uint16_t*>(key),
+      reinterpret_cast<const uint16_t*>(slot_score),
+      reinterpret_cast<uint16_t*>(tail_k),
+      reinterpret_cast<uint16_t*>(tail_score),
+      reinterpret_cast<const float*>(ape),
+      reinterpret_cast<const int32_t*>(block_tables),
+      reinterpret_cast<const int32_t*>(req_pool_indices),
+      reinterpret_cast<const int32_t*>(positions),
+      reinterpret_cast<const int32_t*>(seq_lens),
+      reinterpret_cast<const int32_t*>(out_cache_loc),
+      reinterpret_cast<uint16_t*>(out), batch, pool_size, tail_size,
+      slots_per_page, block_table_cols, n_reqs, num_pages);
+}
+
+// Issue #61: fp8+scale store epilogue device launchers.
+void dsa_kpool_assemble_fp8(
+    int n_pools, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
+    const void* chunk_k, const void* chunk_score, const void* tail_k,
+    const void* tail_score, const void* ape, const void* req_pool_idx,
+    const void* n_from_tail, const void* chunk_src_start,
+    const void* tail_logical_base, const void* loc, const void* write_mask,
+    void* cache_u8, const void* round_scale_or_null, void* stream) {
+  VK_EXPECTS(n_pools >= 0 && pool_size > 0 && head_dim == 128 &&
+                 tail_size > 0 && slots_per_page > 0 && num_pages > 0 &&
+                 num_chunks >= 0 && n_reqs >= 0 && cache_u8,
+             "dsa_kpool_assemble_fp8: positive dims, head_dim==128, "
+             "non-negative counts, non-null cache_u8");
+  if (n_pools == 0) return;
+  const int shmem = 128 * sizeof(float);
+  dim3 grid(n_pools, 1, 1);
+  dim3 block(64);
+  // round_scale_or_null is a DEVICE int pointer (see hip_capi.hpp): the
+  // kernel reads *it > 0 on-device so the value can be produced by a prior
+  // graph node on this stream. The host must NOT dereference it -- a raw
+  // CUDA device pointer is not host-accessible and only "worked" on ROCm
+  // because its device memory happens to be host-visible (HMM).
+  const hipStream_t s = stream ? static_cast<hipStream_t>(stream) : 0;
+  dsa_kpool_assemble_fp8_kernel<<<grid, block, shmem, s>>>(
+      reinterpret_cast<const uint16_t*>(chunk_k),
+      reinterpret_cast<const uint16_t*>(chunk_score),
+      reinterpret_cast<const uint16_t*>(tail_k),
+      reinterpret_cast<const uint16_t*>(tail_score),
+      reinterpret_cast<const float*>(ape),
+      reinterpret_cast<const int32_t*>(req_pool_idx),
+      reinterpret_cast<const int32_t*>(n_from_tail),
+      reinterpret_cast<const int32_t*>(chunk_src_start),
+      reinterpret_cast<const int32_t*>(tail_logical_base),
+      reinterpret_cast<const int32_t*>(loc),
+      reinterpret_cast<const int32_t*>(write_mask),
+      reinterpret_cast<uint8_t*>(cache_u8), n_pools, pool_size, tail_size,
+      slots_per_page, num_chunks, n_reqs,
+      reinterpret_cast<const int*>(round_scale_or_null));
+}
+
+void dsa_kpool_decode_update_fp8(
+    int batch, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
+    const void* key, const void* slot_score, void* tail_k, void* tail_score,
+    const void* ape, const void* block_tables, const void* req_pool_indices,
+    const void* positions, const void* seq_lens, const void* out_cache_loc,
+    void* cache_u8, const void* round_scale_or_null, void* stream) {
+  VK_EXPECTS(batch >= 0 && pool_size > 0 && head_dim == 128 &&
+                 tail_size > 0 && slots_per_page > 0 && block_table_cols > 0 &&
+                 n_reqs >= 0 && num_pages >= 0 && cache_u8,
+             "dsa_kpool_decode_update_fp8: positive dims, head_dim==128, "
+             "non-negative counts, non-null cache_u8");
+  if (batch == 0) return;
+  const int shmem = 128 * sizeof(float);
+  dim3 grid(batch, 1, 1);
+  dim3 block(64);
+  // round_scale_or_null is a DEVICE int pointer (see hip_capi.hpp): the
+  // kernel reads *it > 0 on-device so the value can be produced by a prior
+  // graph node on this stream. The host must NOT dereference it -- a raw
+  // CUDA device pointer is not host-accessible and only "worked" on ROCm
+  // because its device memory happens to be host-visible (HMM).
+  const hipStream_t s = stream ? static_cast<hipStream_t>(stream) : 0;
+  dsa_kpool_decode_fp8_kernel<<<grid, block, shmem, s>>>(
+      reinterpret_cast<const uint16_t*>(key),
+      reinterpret_cast<const uint16_t*>(slot_score),
+      reinterpret_cast<uint16_t*>(tail_k),
+      reinterpret_cast<uint16_t*>(tail_score),
+      reinterpret_cast<const float*>(ape),
+      reinterpret_cast<const int32_t*>(block_tables),
+      reinterpret_cast<const int32_t*>(req_pool_indices),
+      reinterpret_cast<const int32_t*>(positions),
+      reinterpret_cast<const int32_t*>(seq_lens),
+      reinterpret_cast<const int32_t*>(out_cache_loc),
+      reinterpret_cast<uint8_t*>(cache_u8), batch, pool_size, tail_size,
+      slots_per_page, block_table_cols, n_reqs, num_pages,
+      reinterpret_cast<const int*>(round_scale_or_null));
 }
 
 }  // namespace vkernels::kernels::hip

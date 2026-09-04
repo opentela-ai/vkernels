@@ -62,8 +62,15 @@ EXPECTED_KERNELS = [
     ("dsa_kpool_max_closed_pools", "dsa_kpool"),
     ("dsa_kpool_assemble_cpu", "dsa_kpool"),
     ("dsa_kpool_decode_update_cpu", "dsa_kpool"),
+    # Issue #61: fp8+scale store variants (CPU references + HIP kernels).
+    ("dsa_kpool_assemble_fp8_cpu", "dsa_kpool"),
+    ("dsa_kpool_decode_update_fp8_cpu", "dsa_kpool"),
     ("dsa_kpool_assemble", "dsa_kpool"),
     ("dsa_kpool_decode_update", "dsa_kpool"),
+    ("dsa_kpool_assemble_on_stream", "dsa_kpool"),
+    ("dsa_kpool_decode_update_on_stream", "dsa_kpool"),
+    ("dsa_kpool_assemble_fp8", "dsa_kpool"),
+    ("dsa_kpool_decode_update_fp8", "dsa_kpool"),
     # DSA radix top-k transform (issue #56), declared in dsa_topk.hpp
     # (file sorts after dsa.hpp, so the dsa_topk block follows the dsa block):
     ("dsa_topk_transform_group_topk_supported", "dsa_topk"),
