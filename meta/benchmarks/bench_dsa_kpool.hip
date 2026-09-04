@@ -197,6 +197,29 @@ static double decode_bytes(int pool_size) {
             + 2.0 * (2.0 * (double)H);              // live-tail key+score (bf16)
   return rd + wr;
 }
+// fp8+scale storage: the READS are identical to the bf16 kernels (keys /
+// scores stay bf16 inputs; only the compressed-mean STORE changes). The
+// mean is written as H fp8 bytes + one fp32 scale (H+4 bytes) instead of
+// 2*H bf16 bytes -- the smaller store is the whole point of the path and
+// what the effective GB/s below reflects. The live-tail write in decode is
+// STILL bf16 (tail_k/tail_score are in-place bf16 buffers in both paths).
+static double assemble_bytes_fp8(int pool_size) {
+  const int H = 128;
+  double rd = 2.0 * (2.0 * (double)pool_size * H)   // keys + scores (bf16)
+            + 4.0 * (double)pool_size * H           // ape (fp32)
+            + 6.0 * 4;                              // index scalars
+  double wr = (double)H + 4.0;                      // 1 mean (fp8 + fp32 scale)
+  return rd + wr;
+}
+static double decode_bytes_fp8(int pool_size) {
+  const int H = 128;
+  double rd = 2.0 * (2.0 * (double)pool_size * H)   // pool_size tail+current (bf16)
+            + 4.0 * (double)pool_size * H           // ape (fp32)
+            + 4.0 * 4;                              // bt + pos/seq/ocl scalars
+  double wr = (double)H + 4.0                        // 1 mean (fp8 + fp32 scale)
+            + 2.0 * (2.0 * (double)H);              // live-tail key+score (bf16)
+  return rd + wr;
+}
 
 // ---------------------------------------------------------------------------
 // PREFILL: dsa_kpool_assemble (kpool_assemble_softmax_rotate_write_cache).
@@ -437,6 +460,249 @@ static void bench_decode(const GpuInfo& info, hipEvent_t start,
               info.tflops, info.tflops_unit, info.bw, info.tflops * 1e3 / info.bw);
 }
 
+// ---------------------------------------------------------------------------
+// PREFILL fp8: dsa_kpool_assemble_fp8 (issue #61). Same grid/shapes as the
+// bf16 bench above but the compressed mean is stored as fp8e4m3fn + one
+// fp32 scale per vector (round_scale=1, the heavier round-trip path), so
+// rows are directly comparable to the bf16 section: same READS, smaller
+// STORE. round_scale is a DEVICE int so the call is graph-capturable (the
+// launcher does NOT dereference it on the host).
+static void bench_assemble_fp8(const GpuInfo& info, hipEvent_t start,
+                               hipEvent_t stop) {
+  struct Cfg { int n_pools, pool_size, tail_size, ssp, num_pages,
+                      num_chunks, n_reqs; };
+  const Cfg cfgs[] = {
+      {1,   4, 64,  8, 16,  32, 1},
+      {4,   4, 64,  8, 16,  32, 2},
+      {16,  4, 64,  8, 16,  32, 2},
+      {64,  4, 64,  8, 16,  32, 2},
+      {128, 4, 64,  8, 32,  32, 4},
+      {256, 4, 64,  8, 32,  32, 4},
+      {1,   8, 128, 16, 16, 64, 1},
+      {16,  8, 128, 16, 32, 64, 2},
+      {64,  8, 128, 16, 32, 64, 2},
+      {128, 8, 128, 16, 64, 64, 4},
+      {256, 8, 128, 16, 64, 64, 4},
+  };
+  const int H = 128;
+
+  std::printf("\n=== hip::dsa_kpool_assemble_fp8 (PREFILL, 1 warp/pool, round_scale=1) ===\n");
+  std::printf("  %5s %4s %5s %4s %5s %7s %9s %9s %9s %9s %5s  %s\n",
+              "npool", "ps", "tail", "ssp", "npg", "warps",
+              "us(min)", "us(med)", "TFLOP/s", "GB/s", "AI", "bound");
+
+  int32_t host_rs = 1, *drs = nullptr;
+  check_hip(hipMalloc(&drs, sizeof(int32_t)), "drs");
+  check_hip(hipMemcpy(drs, &host_rs, sizeof(int32_t), hipMemcpyHostToDevice), "cpyrs");
+
+  for (const auto& c : cfgs) {
+    const size_t nck  = (size_t)c.num_chunks * H;
+    const size_t ntlk = (size_t)c.n_reqs * c.tail_size * H;
+    const size_t nape = (size_t)c.pool_size * H;
+    std::vector<uint16_t> ck(nck), cs(nck), tlk(ntlk), tls(ntlk);
+    std::vector<float>    ape(nape);
+    std::vector<int32_t>  rpi(c.n_pools), nft(c.n_pools), css(c.n_pools),
+        tlb(c.n_pools), loc(c.n_pools), wm(c.n_pools, 1);
+    for (size_t i = 0; i < nck; ++i)  { ck[i]  = f2bf(rnd(1, (int)i));
+                                         cs[i]  = f2bf(rnd(2, (int)i)); }
+    for (size_t i = 0; i < ntlk; ++i) { tlk[i] = f2bf(rnd(3, (int)i));
+                                         tls[i] = f2bf(rnd(4, (int)i)); }
+    for (size_t i = 0; i < nape; ++i) ape[i] = rnd(5, (int)i);
+    for (int r = 0; r < c.n_pools; ++r) {
+      rpi[r] = r % c.n_reqs;
+      nft[r] = r % (c.pool_size + 1);
+      const int nc = c.pool_size - nft[r];
+      css[r] = nc > 0 ? (int32_t)(r % (c.num_chunks - nc + 1)) : 0;
+      tlb[r] = r % c.tail_size;
+      loc[r] = r % (c.num_pages * c.ssp);
+    }
+
+    uint16_t *dck, *dcs, *dtlk, *dtls;  // inputs still bf16
+    float    *dape;
+    int32_t  *drpi, *dnft, *dcss, *dtlb, *dloc, *dwm;
+    uint8_t  *dcache_u8;
+    const size_t nout = (size_t)c.num_pages * c.ssp * (H + 4);  // fp8 + scale
+    check_hip(hipMalloc(&dck,   nck  * 2), "ck");
+    check_hip(hipMalloc(&dcs,   nck  * 2), "cs");
+    check_hip(hipMalloc(&dtlk,  ntlk * 2), "tlk");
+    check_hip(hipMalloc(&dtls,  ntlk * 2), "tls");
+    check_hip(hipMalloc(&dape,  nape * 4), "ape");
+    check_hip(hipMalloc(&drpi,  (size_t)c.n_pools * 4), "rpi");
+    check_hip(hipMalloc(&dnft,  (size_t)c.n_pools * 4), "nft");
+    check_hip(hipMalloc(&dcss,  (size_t)c.n_pools * 4), "css");
+    check_hip(hipMalloc(&dtlb,  (size_t)c.n_pools * 4), "tlb");
+    check_hip(hipMalloc(&dloc,  (size_t)c.n_pools * 4), "loc");
+    check_hip(hipMalloc(&dwm,   (size_t)c.n_pools * 4), "wm");
+    check_hip(hipMalloc(&dcache_u8, nout), "cache_u8");
+    check_hip(hipMemcpy(dck,  ck.data(),  nck  * 2, hipMemcpyHostToDevice), "cpyck");
+    check_hip(hipMemcpy(dcs,  cs.data(),  nck  * 2, hipMemcpyHostToDevice), "cpycs");
+    check_hip(hipMemcpy(dtlk, tlk.data(), ntlk * 2, hipMemcpyHostToDevice), "cpytlk");
+    check_hip(hipMemcpy(dtls, tls.data(), ntlk * 2, hipMemcpyHostToDevice), "cpytls");
+    check_hip(hipMemcpy(dape, ape.data(), nape * 4, hipMemcpyHostToDevice), "cpyape");
+    check_hip(hipMemcpy(drpi, rpi.data(), (size_t)c.n_pools * 4, hipMemcpyHostToDevice), "cpyrpi");
+    check_hip(hipMemcpy(dnft, nft.data(), (size_t)c.n_pools * 4, hipMemcpyHostToDevice), "cpynft");
+    check_hip(hipMemcpy(dcss, css.data(), (size_t)c.n_pools * 4, hipMemcpyHostToDevice), "cpycss");
+    check_hip(hipMemcpy(dtlb, tlb.data(), (size_t)c.n_pools * 4, hipMemcpyHostToDevice), "cpytlb");
+    check_hip(hipMemcpy(dloc, loc.data(), (size_t)c.n_pools * 4, hipMemcpyHostToDevice), "cpyloc");
+    check_hip(hipMemcpy(dwm,  wm.data(),  (size_t)c.n_pools * 4, hipMemcpyHostToDevice), "cpywm");
+
+    auto L = [&] {
+      vkernels::kernels::hip::dsa_kpool_assemble_fp8(
+          c.n_pools, c.pool_size, H, c.tail_size, c.ssp, c.num_pages,
+          c.num_chunks, c.n_reqs, dck, dcs, dtlk, dtls, dape, drpi, dnft,
+          dcss, dtlb, dloc, dwm, dcache_u8, drs, nullptr);
+    };
+    auto r = bench_us(L, start, stop);
+
+    double flops = compress_flops(c.pool_size) * (double)c.n_pools;
+    double bytes = assemble_bytes_fp8(c.pool_size) * (double)c.n_pools;
+    double tflops = flops / (r.median_us / 1e6) / 1e12;
+    double gbs    = bytes / (r.median_us / 1e6) / 1e9;
+    double ai     = flops / bytes;
+    const char* bound = ai < (info.tflops * 1e3 / info.bw)
+                            ? (gbs < 0.10 * info.bw ? "launch" : "mem")
+                            : "comp";
+    std::printf("  %5d %4d %5d %4d %5d %7d %9.2f %9.2f %9.4f %9.2f %5.1f  %s\n",
+                c.n_pools, c.pool_size, c.tail_size, c.ssp, c.num_pages,
+                c.n_pools, r.min_us, r.median_us, tflops, gbs, ai, bound);
+
+    check_hip(hipFree(dck),  "fck");
+    check_hip(hipFree(dcs),  "fcs");
+    check_hip(hipFree(dtlk), "ftlk");
+    check_hip(hipFree(dtls), "ftls");
+    check_hip(hipFree(dape), "fape");
+    check_hip(hipFree(drpi), "frpi");
+    check_hip(hipFree(dnft), "fnft");
+    check_hip(hipFree(dcss), "fcss");
+    check_hip(hipFree(dtlb), "ftlb");
+    check_hip(hipFree(dloc), "floc");
+    check_hip(hipFree(dwm),  "fwm");
+    check_hip(hipFree(dcache_u8), "fcache_u8");
+  }
+  check_hip(hipFree(drs), "fdrs");
+  std::printf("  Roof: %.0f TFLOP/s %s, %.0f GB/s HBM, ridge ~%.0f FLOP/B\n",
+              info.tflops, info.tflops_unit, info.bw, info.tflops * 1e3 / info.bw);
+}
+
+// ---------------------------------------------------------------------------
+// DECODE fp8: dsa_kpool_decode_update_fp8 (issue #61). Same grid/shapes as
+// the bf16 decode bench; only the compressed-mean STORE is fp8+scale
+// (round_scale=1). row-for-row comparable to the bf16 section.
+static void bench_decode_fp8(const GpuInfo& info, hipEvent_t start,
+                             hipEvent_t stop) {
+  struct Cfg { int batch, pool_size, tail_size, ssp, btc, n_reqs, num_pages; };
+  const Cfg cfgs[] = {
+      {1,   4, 64,  8, 2, 1,   16},
+      {8,   4, 64,  8, 2, 8,   16},
+      {32,  4, 64,  8, 2, 32,  32},
+      {128, 4, 64,  8, 2, 128, 64},
+      {256, 4, 64,  8, 2, 256, 128},
+      {512, 4, 64,  8, 2, 512, 256},
+      {1,   8, 128, 16, 2, 1,   16},
+      {8,   8, 128, 16, 2, 8,   16},
+      {32,  8, 128, 16, 2, 32,  32},
+      {128, 8, 128, 16, 2, 128, 64},
+      {256, 8, 128, 16, 2, 256, 128},
+      {512, 8, 128, 16, 2, 512, 256},
+  };
+  const int H = 128;
+
+  std::printf("\n=== hip::dsa_kpool_decode_update_fp8 (DECODE, 1 warp/req, round_scale=1) ===\n");
+  std::printf("  %5s %4s %5s %4s %4s %7s %9s %9s %9s %9s %5s  %s\n",
+              "batch", "ps", "tail", "ssp", "npg", "warps",
+              "us(min)", "us(med)", "TFLOP/s", "GB/s", "AI", "bound");
+
+  int32_t host_rs = 1, *drs = nullptr;
+  check_hip(hipMalloc(&drs, sizeof(int32_t)), "drs");
+  check_hip(hipMemcpy(drs, &host_rs, sizeof(int32_t), hipMemcpyHostToDevice), "cpyrs");
+
+  for (const auto& c : cfgs) {
+    const size_t nkey = (size_t)c.batch * H;
+    const size_t ntlk = (size_t)c.n_reqs * c.tail_size * H;
+    const size_t nape = (size_t)c.pool_size * H;
+    const size_t nbt  = (size_t)c.batch * c.btc;
+    std::vector<uint16_t> key(nkey), ss(nkey), tlk(ntlk), tls(ntlk);
+    std::vector<float>    ape(nape);
+    std::vector<int32_t>  bt(nbt), rpi(c.batch), pos(c.batch),
+        sl(c.batch), ocl(c.batch);
+    for (size_t i = 0; i < nkey; ++i) { key[i] = f2bf(rnd(1, (int)i));
+                                         ss[i]  = f2bf(rnd(2, (int)i)); }
+    for (size_t i = 0; i < ntlk; ++i) { tlk[i] = f2bf(rnd(3, (int)i));
+                                         tls[i] = f2bf(rnd(4, (int)i)); }
+    for (size_t i = 0; i < nape; ++i) ape[i] = rnd(5, (int)i);
+    for (int r = 0; r < c.batch; ++r) {
+      for (int b = 0; b < c.btc; ++b)
+        bt[r * c.btc + b] = (r * c.btc + b) % c.num_pages;
+      rpi[r] = r % c.n_reqs;
+      pos[r] = r * c.pool_size + (c.pool_size - 1);
+      sl[r]  = pos[r] + 1;
+      ocl[r] = (r % c.num_pages) + 1;
+    }
+
+    uint16_t *dkey, *dss, *dtlk, *dtls;  // inputs + live-tail still bf16
+    float    *dape;
+    int32_t  *dbt, *drpi, *dpos, *dsl, *docl;
+    uint8_t  *dcache_u8;
+    const size_t nout = (size_t)c.num_pages * c.ssp * (H + 4);  // fp8 + scale
+    check_hip(hipMalloc(&dkey, nkey * 2), "key");
+    check_hip(hipMalloc(&dss,  nkey * 2), "ss");
+    check_hip(hipMalloc(&dtlk, ntlk * 2), "tlk");
+    check_hip(hipMalloc(&dtls, ntlk * 2), "tls");
+    check_hip(hipMalloc(&dape, nape * 4), "ape");
+    check_hip(hipMalloc(&dbt,  nbt * 4), "bt");
+    check_hip(hipMalloc(&drpi, (size_t)c.batch * 4), "rpi");
+    check_hip(hipMalloc(&dpos, (size_t)c.batch * 4), "pos");
+    check_hip(hipMalloc(&dsl,  (size_t)c.batch * 4), "sl");
+    check_hip(hipMalloc(&docl, (size_t)c.batch * 4), "ocl");
+    check_hip(hipMalloc(&dcache_u8, nout), "cache_u8");
+    check_hip(hipMemcpy(dkey, key.data(), nkey * 2, hipMemcpyHostToDevice), "cpykey");
+    check_hip(hipMemcpy(dss,  ss.data(),  nkey * 2, hipMemcpyHostToDevice), "cpyss");
+    check_hip(hipMemcpy(dtlk, tlk.data(), ntlk * 2, hipMemcpyHostToDevice), "cpytlk");
+    check_hip(hipMemcpy(dtls, tls.data(), ntlk * 2, hipMemcpyHostToDevice), "cpytls");
+    check_hip(hipMemcpy(dape, ape.data(), nape * 4, hipMemcpyHostToDevice), "cpyape");
+    check_hip(hipMemcpy(dbt,  bt.data(),  nbt * 4, hipMemcpyHostToDevice), "cpybt");
+    check_hip(hipMemcpy(drpi, rpi.data(), (size_t)c.batch * 4, hipMemcpyHostToDevice), "cpyrpi");
+    check_hip(hipMemcpy(dpos, pos.data(), (size_t)c.batch * 4, hipMemcpyHostToDevice), "cpypos");
+    check_hip(hipMemcpy(dsl,  sl.data(),  (size_t)c.batch * 4, hipMemcpyHostToDevice), "cpysl");
+    check_hip(hipMemcpy(docl, ocl.data(), (size_t)c.batch * 4, hipMemcpyHostToDevice), "cpyocl");
+
+    auto L = [&] {
+      vkernels::kernels::hip::dsa_kpool_decode_update_fp8(
+          c.batch, c.pool_size, H, c.tail_size, c.ssp, c.btc, c.n_reqs,
+          c.num_pages, dkey, dss, dtlk, dtls, dape, dbt, drpi, dpos, dsl,
+          docl, dcache_u8, drs, nullptr);
+    };
+    auto r = bench_us(L, start, stop);
+
+    double flops = compress_flops(c.pool_size) * (double)c.batch;
+    double bytes = decode_bytes_fp8(c.pool_size) * (double)c.batch;
+    double tflops = flops / (r.median_us / 1e6) / 1e12;
+    double gbs    = bytes / (r.median_us / 1e6) / 1e9;
+    double ai     = flops / bytes;
+    const char* bound = ai < (info.tflops * 1e3 / info.bw)
+                            ? (gbs < 0.10 * info.bw ? "launch" : "mem")
+                            : "comp";
+    std::printf("  %5d %4d %5d %4d %4d %7d %9.2f %9.2f %9.4f %9.2f %5.1f  %s\n",
+                c.batch, c.pool_size, c.tail_size, c.ssp, c.num_pages,
+                c.batch, r.min_us, r.median_us, tflops, gbs, ai, bound);
+
+    check_hip(hipFree(dkey), "fkey");
+    check_hip(hipFree(dss),  "fss");
+    check_hip(hipFree(dtlk), "ftlk");
+    check_hip(hipFree(dtls), "ftls");
+    check_hip(hipFree(dape), "fape");
+    check_hip(hipFree(dbt),  "fbt");
+    check_hip(hipFree(drpi), "frpi");
+    check_hip(hipFree(dpos), "fpos");
+    check_hip(hipFree(dsl),  "fsl");
+    check_hip(hipFree(docl), "focl");
+    check_hip(hipFree(dcache_u8), "fcache_u8");
+  }
+  check_hip(hipFree(drs), "fdrs");
+  std::printf("  Roof: %.0f TFLOP/s %s, %.0f GB/s HBM, ridge ~%.0f FLOP/B\n",
+              info.tflops, info.tflops_unit, info.bw, info.tflops * 1e3 / info.bw);
+}
+
 int main() {
   const GpuInfo info = get_gpu_info();
   std::printf("=== DSA kpool-cache compress/write (%s) ===\n", info.name.c_str());
@@ -451,6 +717,10 @@ int main() {
 
   bench_assemble(info, start, stop);
   bench_decode(info, start, stop);
+
+  // Issue #61: fp8+scale storage path (round_scale=1, graph-capturable).
+  bench_assemble_fp8(info, start, stop);
+  bench_decode_fp8(info, start, stop);
 
   check_hip(hipEventDestroy(start), "d_start");
   check_hip(hipEventDestroy(stop),  "d_stop");
