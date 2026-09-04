@@ -1,0 +1,40 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M1PSGMCBYZBVQZ108CGZBAVF",
+  "session_id": "01a06bae-c79a-782b-99fc-b083c731eab8",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-04T18:04:54.714299689Z",
+  "branch": "feat/issue-61-kpool-fp8-graph-capture",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "docs/performance/dsa-kpool/fp8.md"
+  ],
+  "agent": "Pi",
+  "model": "CSCS-Inference/zai-org/GLM-5.2",
+  "turn_id": "1b214d041d08",
+  "checkpoint_transcript_start": 1169,
+  "transcript_lines_at_start": 1169,
+  "compact_transcript_start": 486,
+  "token_usage": {
+    "input_tokens": 10858,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 487680,
+    "output_tokens": 5029,
+    "api_call_count": 6
+  },
+  "session_metrics": {
+    "turn_count": 34
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-04T18:04:54.301637633Z",
+    "agent_lines": 135,
+    "agent_removed": 0,
+    "human_added": 151,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 286,
+    "total_lines_changed": 286,
+    "agent_percentage": 47.2027972027972,
+    "metric_version": 2
+  }
+}

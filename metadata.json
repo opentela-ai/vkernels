@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M1PSGMCBYZBVQZ108CGZBAVF",
+  "strategy": "manual-commit",
+  "branch": "feat/issue-61-kpool-fp8-graph-capture",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "docs/performance/dsa-kpool/fp8.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 10858,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 487680,
+    "output_tokens": 5029,
+    "api_call_count": 6
+  }
+}
