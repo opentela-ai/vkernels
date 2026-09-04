@@ -1,0 +1,38 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M1PMWYYM5HGTJCJ70YXJ6GEV",
+  "strategy": "manual-commit",
+  "branch": "feat/issue-61-kpool-fp8-graph-capture",
+  "checkpoints_count": 32,
+  "files_touched": [
+    "meta/benchmarks/test_dsa_kpool_correct.hip",
+    "src/c/vkernels/capi/capi.hpp",
+    "src/c/vkernels/capi/capi_attn.cpp",
+    "src/c/vkernels/capi/hip_capi.cpp",
+    "src/c/vkernels/capi/hip_capi.hpp",
+    "src/c/vkernels/kernels/dsa_kpool.cpp",
+    "src/c/vkernels/kernels/dsa_kpool.hip",
+    "src/c/vkernels/kernels/dsa_kpool.hpp",
+    "src/python/vkernels/_core.cpp",
+    "src/python/vkernels/_fallback.py",
+    "src/python/vkernels/kernels.py",
+    "tests/kernels/attn/test_dsa_kpool.cpp",
+    "tests/python/test_discovery.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 2444880,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 25426688,
+    "output_tokens": 332168,
+    "api_call_count": 472
+  }
+}
