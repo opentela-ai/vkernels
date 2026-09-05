@@ -1410,6 +1410,120 @@ def dsa_kpool_max_closed_pools(num_draft_tokens, pool_size):
                                                 int(pool_size)))
 
 
+def _kpool_assemble_dims(ck_arr, cs_arr, tk_arr, ts_arr, ape_arr, rpi_arr,
+                         nft_arr, css_arr, tlb_arr, loc_arr, wm_arr, *,
+                         slots_per_page, num_pages):
+    """Shared shape/contract validation for the kpool PREFILL entry points
+    (bf16 :func:`dsa_kpool_assemble` and fp8 :func:`dsa_kpool_assemble_fp8`
+    -- the contract is identical; only the store differs, so the checks are
+    written once). Returns the dims tuple the impl call needs."""
+    for nm, a in (("req_pool_idx", rpi_arr), ("n_from_tail", nft_arr),
+                  ("chunk_src_start", css_arr), ("tail_logical_base",
+                                                 tlb_arr), ("loc", loc_arr)):
+        if a.ndim != 1:
+            raise ValueError(f"{nm} must be 1-D [n_pools]")
+    if ck_arr.ndim != 2:
+        raise ValueError("chunk_k must be 2-D [num_chunks, 128]")
+    if cs_arr.ndim != 2:
+        raise ValueError("chunk_score must be 2-D [num_chunks, 128]")
+    if tk_arr.ndim != 3:
+        raise ValueError("tail_k must be 3-D [n_reqs, tail_size, 128]")
+    if ts_arr.ndim != 3:
+        raise ValueError("tail_score must be 3-D [n_reqs, tail_size, 128]")
+    if ape_arr.ndim != 2:
+        raise ValueError("ape must be 2-D [pool_size, 128]")
+    num_chunks = int(ck_arr.shape[0])
+    n_pools = int(rpi_arr.shape[0])
+    pool_size = int(ape_arr.shape[0])
+    n_reqs, tail_size, H = (int(v) for v in tk_arr.shape)
+    if not (pool_size > 0 and tail_size > 0 and H > 0
+            and slots_per_page > 0 and num_pages > 0):
+        raise ValueError("pool_size, tail_size, H, ssp, num_pages must be > 0")
+    if H != 128:
+        raise ValueError(f"head_dim must be 128 (GLM-5.3 DSA), got {H}")
+    if cs_arr.shape[0] != num_chunks:
+        raise ValueError(
+            f"chunk_score rows {cs_arr.shape[0]} != chunk_k {num_chunks}")
+    if ts_arr.shape != (n_reqs, tail_size, H):
+        raise ValueError(
+            f"tail_score shape {ts_arr.shape} != tail_k {(n_reqs, tail_size, H)}")
+    if ape_arr.shape[1] != H:
+        raise ValueError(f"ape last dim {ape_arr.shape[1]} != head_dim {H}")
+    n_ok = (nft_arr.shape[0] == css_arr.shape[0] == tlb_arr.shape[0]
+            == loc_arr.shape[0] == n_pools)
+    if not n_ok:
+        raise ValueError(
+            f"per-pool arrays must all have length n_pools={n_pools}")
+    if wm_arr is not None and wm_arr.shape[0] != n_pools:
+        raise ValueError(
+            f"write_mask len {wm_arr.shape[0]} != n_pools {n_pools}")
+    return num_chunks, n_pools, pool_size, H, n_reqs, tail_size
+
+
+def _kpool_decode_dims(key_arr, ss_arr, tk_arr, ts_arr, ape_arr, bt_arr,
+                       rpi_arr, pos_arr, sl_arr, ocl_arr, *, tail_size,
+                       slots_per_page, num_pages):
+    """Shared shape/contract validation for the kpool DECODE entry points
+    (bf16 :func:`dsa_kpool_decode_update` and fp8
+    :func:`dsa_kpool_decode_update_fp8`). Returns the dims tuple the impl
+    call needs."""
+    if key_arr.ndim != 2:
+        raise ValueError("key must be 2-D [batch, 128]")
+    if ss_arr.ndim != 2:
+        raise ValueError("slot_score must be 2-D [batch, 128]")
+    if tk_arr.ndim != 3:
+        raise ValueError("tail_k must be 3-D [n_reqs, tail_size, 128]")
+    if ts_arr.ndim != 3:
+        raise ValueError("tail_score must be 3-D [n_reqs, tail_size, 128]")
+    if ape_arr.ndim != 2:
+        raise ValueError("ape must be 2-D [pool_size, 128]")
+    if bt_arr.ndim != 2:
+        raise ValueError("block_tables must be 2-D [batch, block_table_cols]")
+    for nm, a in (("req_pool_idx", rpi_arr), ("positions", pos_arr),
+                  ("seq_lens", sl_arr), ("out_cache_loc", ocl_arr)):
+        if a.ndim != 1:
+            raise ValueError(f"{nm} must be 1-D [batch]")
+    batch, H = (int(v) for v in key_arr.shape)
+    n_reqs, ts, Htk = (int(v) for v in tk_arr.shape)
+    pool_size = int(ape_arr.shape[0])
+    btc = int(bt_arr.shape[1])
+    if not (pool_size > 0 and tail_size > 0 and H > 0
+            and slots_per_page > 0 and num_pages > 0 and btc > 0):
+        raise ValueError(
+            "pool_size, tail_size, H, ssp, num_pages, btc must be > 0")
+    if H != 128:
+        raise ValueError(f"head_dim must be 128 (GLM-5.3 DSA), got {H}")
+    if ss_arr.shape != (batch, H):
+        raise ValueError(f"slot_score shape {ss_arr.shape} != key {(batch, H)}")
+    if ts != tail_size or Htk != H:
+        raise ValueError(
+            f"tail_k shape {tk_arr.shape} != [n_reqs, {tail_size}, {H}]")
+    if ts_arr.shape != tk_arr.shape:
+        raise ValueError(
+            f"tail_score shape {ts_arr.shape} != tail_k {tk_arr.shape}")
+    if ape_arr.shape[1] != H:
+        raise ValueError(f"ape last dim {ape_arr.shape[1]} != head_dim {H}")
+    if (rpi_arr.shape[0] != batch or pos_arr.shape[0] != batch
+            or sl_arr.shape[0] != batch or ocl_arr.shape[0] != batch
+            or bt_arr.shape[0] != batch):
+        raise ValueError(
+            f"per-batch arrays must all have length batch={batch}")
+    return batch, pool_size, H, n_reqs, btc
+
+
+def _kpool_fp8_cache(cache_u8, cache_nbytes):
+    """Zeroed-or-validated uint8 legacy cache buffer shared by the fp8
+    entry points (``cache_u8=None`` allocates a zeroed buffer; a provided
+    buffer must be exactly ``cache_nbytes`` uint8)."""
+    if cache_u8 is None:
+        return np.zeros(cache_nbytes, dtype=np.uint8)
+    cache_arr = np.ascontiguousarray(cache_u8, dtype=np.uint8)
+    if cache_arr.size != cache_nbytes:
+        raise ValueError(
+            f"cache_u8 size {cache_arr.size} != {cache_nbytes}")
+    return cache_arr
+
+
 def dsa_kpool_assemble(chunk_k, chunk_score, tail_k, tail_score, ape,
                        req_pool_idx, n_from_tail, chunk_src_start,
                        tail_logical_base, loc, *, slots_per_page,
@@ -1504,46 +1618,10 @@ def dsa_kpool_assemble(chunk_k, chunk_score, tail_k, tail_score, ape,
     loc_arr = np.ascontiguousarray(loc, dtype=np.int32)
     wm_arr = (None if write_mask is None
               else np.ascontiguousarray(write_mask, dtype=np.int32))
-    for nm, a in (("req_pool_idx", rpi_arr), ("n_from_tail", nft_arr),
-                  ("chunk_src_start", css_arr), ("tail_logical_base",
-                                                 tlb_arr), ("loc", loc_arr)):
-        if a.ndim != 1:
-            raise ValueError(f"{nm} must be 1-D [n_pools]")
-    if ck_arr.ndim != 2:
-        raise ValueError("chunk_k must be 2-D [num_chunks, 128]")
-    if cs_arr.ndim != 2:
-        raise ValueError("chunk_score must be 2-D [num_chunks, 128]")
-    if tk_arr.ndim != 3:
-        raise ValueError("tail_k must be 3-D [n_reqs, tail_size, 128]")
-    if ts_arr.ndim != 3:
-        raise ValueError("tail_score must be 3-D [n_reqs, tail_size, 128]")
-    if ape_arr.ndim != 2:
-        raise ValueError("ape must be 2-D [pool_size, 128]")
-    num_chunks = int(ck_arr.shape[0])
-    n_pools = int(rpi_arr.shape[0])
-    pool_size = int(ape_arr.shape[0])
-    n_reqs, tail_size, H = (int(v) for v in tk_arr.shape)
-    if not (pool_size > 0 and tail_size > 0 and H > 0
-            and slots_per_page > 0 and num_pages > 0):
-        raise ValueError("pool_size, tail_size, H, ssp, num_pages must be > 0")
-    if H != 128:
-        raise ValueError(f"head_dim must be 128 (GLM-5.3 DSA), got {H}")
-    if cs_arr.shape[0] != num_chunks:
-        raise ValueError(
-            f"chunk_score rows {cs_arr.shape[0]} != chunk_k {num_chunks}")
-    if ts_arr.shape != (n_reqs, tail_size, H):
-        raise ValueError(
-            f"tail_score shape {ts_arr.shape} != tail_k {(n_reqs, tail_size, H)}")
-    if ape_arr.shape[1] != H:
-        raise ValueError(f"ape last dim {ape_arr.shape[1]} != head_dim {H}")
-    n_ok = (nft_arr.shape[0] == css_arr.shape[0] == tlb_arr.shape[0]
-            == loc_arr.shape[0] == n_pools)
-    if not n_ok:
-        raise ValueError(
-            f"per-pool arrays must all have length n_pools={n_pools}")
-    if wm_arr is not None and wm_arr.shape[0] != n_pools:
-        raise ValueError(
-            f"write_mask len {wm_arr.shape[0]} != n_pools {n_pools}")
+    num_chunks, n_pools, pool_size, H, n_reqs, tail_size = _kpool_assemble_dims(
+        ck_arr, cs_arr, tk_arr, ts_arr, ape_arr, rpi_arr, nft_arr, css_arr,
+        tlb_arr, loc_arr, wm_arr, slots_per_page=slots_per_page,
+        num_pages=num_pages)
     out_arr = _as_out(num_pages * slots_per_page * H, out, "out")
     out_arr.fill(np.float32(0.0))
     _impl.dsa_kpool_assemble(
@@ -1600,54 +1678,12 @@ def dsa_kpool_assemble_fp8(chunk_k, chunk_score, tail_k, tail_score, ape,
     loc_arr = np.ascontiguousarray(loc, dtype=np.int32)
     wm_arr = (None if write_mask is None
               else np.ascontiguousarray(write_mask, dtype=np.int32))
-    for nm, a in (("req_pool_idx", rpi_arr), ("n_from_tail", nft_arr),
-                  ("chunk_src_start", css_arr), ("tail_logical_base",
-                                                 tlb_arr), ("loc", loc_arr)):
-        if a.ndim != 1:
-            raise ValueError(f"{nm} must be 1-D [n_pools]")
-    if ck_arr.ndim != 2:
-        raise ValueError("chunk_k must be 2-D [num_chunks, 128]")
-    if cs_arr.ndim != 2:
-        raise ValueError("chunk_score must be 2-D [num_chunks, 128]")
-    if tk_arr.ndim != 3:
-        raise ValueError("tail_k must be 3-D [n_reqs, tail_size, 128]")
-    if ts_arr.ndim != 3:
-        raise ValueError("tail_score must be 3-D [n_reqs, tail_size, 128]")
-    if ape_arr.ndim != 2:
-        raise ValueError("ape must be 2-D [pool_size, 128]")
-    num_chunks = int(ck_arr.shape[0])
-    n_pools = int(rpi_arr.shape[0])
-    pool_size = int(ape_arr.shape[0])
-    n_reqs, tail_size, H = (int(v) for v in tk_arr.shape)
-    if not (pool_size > 0 and tail_size > 0 and H > 0
-            and slots_per_page > 0 and num_pages > 0):
-        raise ValueError("pool_size, tail_size, H, ssp, num_pages must be > 0")
-    if H != 128:
-        raise ValueError(f"head_dim must be 128 (GLM-5.3 DSA), got {H}")
-    if cs_arr.shape[0] != num_chunks:
-        raise ValueError(
-            f"chunk_score rows {cs_arr.shape[0]} != chunk_k {num_chunks}")
-    if ts_arr.shape != (n_reqs, tail_size, H):
-        raise ValueError(
-            f"tail_score shape {ts_arr.shape} != tail_k {(n_reqs, tail_size, H)}")
-    if ape_arr.shape[1] != H:
-        raise ValueError(f"ape last dim {ape_arr.shape[1]} != head_dim {H}")
-    n_ok = (nft_arr.shape[0] == css_arr.shape[0] == tlb_arr.shape[0]
-            == loc_arr.shape[0] == n_pools)
-    if not n_ok:
-        raise ValueError(
-            f"per-pool arrays must all have length n_pools={n_pools}")
-    if wm_arr is not None and wm_arr.shape[0] != n_pools:
-        raise ValueError(
-            f"write_mask len {wm_arr.shape[0]} != n_pools {n_pools}")
+    num_chunks, n_pools, pool_size, H, n_reqs, tail_size = _kpool_assemble_dims(
+        ck_arr, cs_arr, tk_arr, ts_arr, ape_arr, rpi_arr, nft_arr, css_arr,
+        tlb_arr, loc_arr, wm_arr, slots_per_page=slots_per_page,
+        num_pages=num_pages)
     cache_nbytes = num_pages * slots_per_page * (H + 4)
-    if cache_u8 is None:
-        cache_arr = np.zeros(cache_nbytes, dtype=np.uint8)
-    else:
-        cache_arr = np.ascontiguousarray(cache_u8, dtype=np.uint8)
-        if cache_arr.size != cache_nbytes:
-            raise ValueError(
-                f"cache_u8 size {cache_arr.size} != {cache_nbytes}")
+    cache_arr = _kpool_fp8_cache(cache_u8, cache_nbytes)
     rs_arr = np.array([1.0 if round_scale else 0.0], dtype=np.float32)
     _impl.dsa_kpool_assemble_fp8(
         int(num_chunks), int(n_pools), int(pool_size), int(H),
@@ -1751,47 +1787,10 @@ def dsa_kpool_decode_update(key, slot_score, tail_k, tail_score, ape,
     pos_arr = np.ascontiguousarray(positions, dtype=np.int32)
     sl_arr = np.ascontiguousarray(seq_lens, dtype=np.int32)
     ocl_arr = np.ascontiguousarray(out_cache_loc, dtype=np.int32)
-    if key_arr.ndim != 2:
-        raise ValueError("key must be 2-D [batch, 128]")
-    if ss_arr.ndim != 2:
-        raise ValueError("slot_score must be 2-D [batch, 128]")
-    if tk_arr.ndim != 3:
-        raise ValueError("tail_k must be 3-D [n_reqs, tail_size, 128]")
-    if ts_arr.ndim != 3:
-        raise ValueError("tail_score must be 3-D [n_reqs, tail_size, 128]")
-    if ape_arr.ndim != 2:
-        raise ValueError("ape must be 2-D [pool_size, 128]")
-    if bt_arr.ndim != 2:
-        raise ValueError("block_tables must be 2-D [batch, block_table_cols]")
-    for nm, a in (("req_pool_idx", rpi_arr), ("positions", pos_arr),
-                  ("seq_lens", sl_arr), ("out_cache_loc", ocl_arr)):
-        if a.ndim != 1:
-            raise ValueError(f"{nm} must be 1-D [batch]")
-    batch, H = (int(v) for v in key_arr.shape)
-    n_reqs, ts, Htk = (int(v) for v in tk_arr.shape)
-    pool_size = int(ape_arr.shape[0])
-    btc = int(bt_arr.shape[1])
-    if not (pool_size > 0 and tail_size > 0 and H > 0
-            and slots_per_page > 0 and num_pages > 0 and btc > 0):
-        raise ValueError(
-            "pool_size, tail_size, H, ssp, num_pages, btc must be > 0")
-    if H != 128:
-        raise ValueError(f"head_dim must be 128 (GLM-5.3 DSA), got {H}")
-    if ss_arr.shape != (batch, H):
-        raise ValueError(f"slot_score shape {ss_arr.shape} != key {(batch, H)}")
-    if ts != tail_size or Htk != H:
-        raise ValueError(
-            f"tail_k shape {tk_arr.shape} != [n_reqs, {tail_size}, {H}]")
-    if ts_arr.shape != tk_arr.shape:
-        raise ValueError(
-            f"tail_score shape {ts_arr.shape} != tail_k {tk_arr.shape}")
-    if ape_arr.shape[1] != H:
-        raise ValueError(f"ape last dim {ape_arr.shape[1]} != head_dim {H}")
-    if (rpi_arr.shape[0] != batch or pos_arr.shape[0] != batch
-            or sl_arr.shape[0] != batch or ocl_arr.shape[0] != batch
-            or bt_arr.shape[0] != batch):
-        raise ValueError(
-            f"per-batch arrays must all have length batch={batch}")
+    batch, pool_size, H, n_reqs, btc = _kpool_decode_dims(
+        key_arr, ss_arr, tk_arr, ts_arr, ape_arr, bt_arr, rpi_arr, pos_arr,
+        sl_arr, ocl_arr, tail_size=tail_size, slots_per_page=slots_per_page,
+        num_pages=num_pages)
     out_arr = _as_out(num_pages * slots_per_page * H, out, "out")
     out_arr.fill(np.float32(0.0))
     _impl.dsa_kpool_decode_update(
@@ -1849,55 +1848,12 @@ def dsa_kpool_decode_update_fp8(key, slot_score, tail_k, tail_score, ape,
     pos_arr = np.ascontiguousarray(positions, dtype=np.int32)
     sl_arr = np.ascontiguousarray(seq_lens, dtype=np.int32)
     ocl_arr = np.ascontiguousarray(out_cache_loc, dtype=np.int32)
-    if key_arr.ndim != 2:
-        raise ValueError("key must be 2-D [batch, 128]")
-    if ss_arr.ndim != 2:
-        raise ValueError("slot_score must be 2-D [batch, 128]")
-    if tk_arr.ndim != 3:
-        raise ValueError("tail_k must be 3-D [n_reqs, tail_size, 128]")
-    if ts_arr.ndim != 3:
-        raise ValueError("tail_score must be 3-D [n_reqs, tail_size, 128]")
-    if ape_arr.ndim != 2:
-        raise ValueError("ape must be 2-D [pool_size, 128]")
-    if bt_arr.ndim != 2:
-        raise ValueError("block_tables must be 2-D [batch, block_table_cols]")
-    for nm, a in (("req_pool_idx", rpi_arr), ("positions", pos_arr),
-                  ("seq_lens", sl_arr), ("out_cache_loc", ocl_arr)):
-        if a.ndim != 1:
-            raise ValueError(f"{nm} must be 1-D [batch]")
-    batch, H = (int(v) for v in key_arr.shape)
-    n_reqs, ts, Htk = (int(v) for v in tk_arr.shape)
-    pool_size = int(ape_arr.shape[0])
-    btc = int(bt_arr.shape[1])
-    if not (pool_size > 0 and tail_size > 0 and H > 0
-            and slots_per_page > 0 and num_pages > 0 and btc > 0):
-        raise ValueError(
-            "pool_size, tail_size, H, ssp, num_pages, btc must be > 0")
-    if H != 128:
-        raise ValueError(f"head_dim must be 128 (GLM-5.3 DSA), got {H}")
-    if ss_arr.shape != (batch, H):
-        raise ValueError(f"slot_score shape {ss_arr.shape} != key {(batch, H)}")
-    if ts != tail_size or Htk != H:
-        raise ValueError(
-            f"tail_k shape {tk_arr.shape} != [n_reqs, {tail_size}, {H}]")
-    if ts_arr.shape != tk_arr.shape:
-        raise ValueError(
-            f"tail_score shape {ts_arr.shape} != tail_k {tk_arr.shape}")
-    if ape_arr.shape[1] != H:
-        raise ValueError(f"ape last dim {ape_arr.shape[1]} != head_dim {H}")
-    if (rpi_arr.shape[0] != batch or pos_arr.shape[0] != batch
-            or sl_arr.shape[0] != batch or ocl_arr.shape[0] != batch
-            or bt_arr.shape[0] != batch):
-        raise ValueError(
-            f"per-batch arrays must all have length batch={batch}")
+    batch, pool_size, H, n_reqs, btc = _kpool_decode_dims(
+        key_arr, ss_arr, tk_arr, ts_arr, ape_arr, bt_arr, rpi_arr, pos_arr,
+        sl_arr, ocl_arr, tail_size=tail_size, slots_per_page=slots_per_page,
+        num_pages=num_pages)
     cache_nbytes = num_pages * slots_per_page * (H + 4)
-    if cache_u8 is None:
-        cache_arr = np.zeros(cache_nbytes, dtype=np.uint8)
-    else:
-        cache_arr = np.ascontiguousarray(cache_u8, dtype=np.uint8)
-        if cache_arr.size != cache_nbytes:
-            raise ValueError(
-                f"cache_u8 size {cache_arr.size} != {cache_nbytes}")
+    cache_arr = _kpool_fp8_cache(cache_u8, cache_nbytes)
     rs_arr = np.array([1.0 if round_scale else 0.0], dtype=np.float32)
     _impl.dsa_kpool_decode_update_fp8(
         int(batch), int(pool_size), int(H), int(tail_size),

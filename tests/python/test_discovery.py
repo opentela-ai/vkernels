@@ -67,8 +67,6 @@ EXPECTED_KERNELS = [
     ("dsa_kpool_decode_update_fp8_cpu", "dsa_kpool"),
     ("dsa_kpool_assemble", "dsa_kpool"),
     ("dsa_kpool_decode_update", "dsa_kpool"),
-    ("dsa_kpool_assemble_on_stream", "dsa_kpool"),
-    ("dsa_kpool_decode_update_on_stream", "dsa_kpool"),
     ("dsa_kpool_assemble_fp8", "dsa_kpool"),
     ("dsa_kpool_decode_update_fp8", "dsa_kpool"),
     # DSA radix top-k transform (issue #56), declared in dsa_topk.hpp

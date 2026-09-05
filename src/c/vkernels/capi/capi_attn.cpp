@@ -168,43 +168,6 @@ int32_t vk_dsa_kpool_decode_update(int batch, int pool_size, int head_dim,
   VK_CAPI_CATCH_RETURN_CODE()
 }
 
-int32_t vk_dsa_kpool_assemble_on_stream(
-    int n_pools, int pool_size, int head_dim, int tail_size,
-    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
-    const float* chunk_k, const float* chunk_score, const float* tail_k,
-    const float* tail_score, const float* ape, const int32_t* req_pool_idx,
-    const int32_t* n_from_tail, const int32_t* chunk_src_start,
-    const int32_t* tail_logical_base, const int32_t* loc,
-    const int32_t* write_mask, float* out, void* stream) {
-  VK_CAPI_TRY
-  vkernels::kernels::dsa_kpool_assemble_cpu(
-      n_pools, pool_size, head_dim, tail_size, slots_per_page, num_pages,
-      num_chunks, n_reqs, chunk_k, chunk_score, tail_k, tail_score, ape,
-      req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base, loc,
-      write_mask, out);
-  (void)stream;
-  return VK_OK;
-  VK_CAPI_CATCH_RETURN_CODE()
-}
-
-int32_t vk_dsa_kpool_decode_update_on_stream(
-    int batch, int pool_size, int head_dim, int tail_size,
-    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
-    const float* key, const float* slot_score, float* tail_k,
-    float* tail_score, const float* ape, const int32_t* block_tables,
-    const int32_t* req_pool_indices, const int32_t* positions,
-    const int32_t* seq_lens, const int32_t* out_cache_loc, float* out,
-    void* stream) {
-  VK_CAPI_TRY
-  vkernels::kernels::dsa_kpool_decode_update_cpu(
-      batch, pool_size, head_dim, tail_size, slots_per_page, block_table_cols,
-      n_reqs, num_pages, key, slot_score, tail_k, tail_score, ape,
-      block_tables, req_pool_indices, positions, seq_lens, out_cache_loc, out);
-  (void)stream;
-  return VK_OK;
-  VK_CAPI_CATCH_RETURN_CODE()
-}
-
 int32_t vk_dsa_kpool_assemble_fp8(
     int n_pools, int pool_size, int head_dim, int tail_size,
     int slots_per_page, int num_pages, int num_chunks, int n_reqs,

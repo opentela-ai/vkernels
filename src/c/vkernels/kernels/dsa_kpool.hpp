@@ -244,6 +244,13 @@ void dsa_kpool_decode_update_fp8_cpu(
 #if VKERNELS_HAS_HIP
 namespace vkernels::kernels::hip {
 
+// Device stream convention (ONE convention for every device entry in this
+// file): each launcher takes a trailing ``void* stream`` -- a hipStream_t
+// passed through void*, with nullptr selecting the default stream. Under a
+// CUDA/HIP graph capture the kernels MUST be launched on the *caller's*
+// current stream (PyTorch's ``torch.cuda.current_stream().cuda_stream``) so
+// the writes are ordered against buffers allocated on that stream.
+
 // DSA kpool-cache compress/write -- PREFILL path (gfx942). bf16 storage +
 // fp32 accumulation, NO fp8e4nv. Same computation as dsa_kpool_assemble_cpu
 // (see above for the formula and the write-mask contract); the per-pool-row
@@ -260,7 +267,8 @@ void dsa_kpool_assemble(int n_pools, int pool_size, int head_dim,
                         const void* req_pool_idx, const void* n_from_tail,
                         const void* chunk_src_start,
                         const void* tail_logical_base,
-                        const void* loc, const void* write_mask, void* out);
+                        const void* loc, const void* write_mask, void* out,
+                        void* stream = nullptr);
 
 // DSA kpool-cache compress/write + live-tail update -- DECODE path (gfx942).
 // bf16 storage + fp32 accumulation, NO fp8e4nv. Same computation as
@@ -280,30 +288,8 @@ void dsa_kpool_decode_update(int batch, int pool_size, int head_dim,
                              const void* block_tables,
                              const void* req_pool_indices,
                              const void* positions, const void* seq_lens,
-                             const void* out_cache_loc, void* out);
-
-// Issue #61: graph-capturable overloads. The launchers above use the HIP
-// default stream (stream 0); under a CUDA/HIP graph capture the kernels
-// MUST be launched on the *caller's* current stream (PyTorch's
-// ``torch.cuda.current_stream().cuda_stream``) so the writes are ordered
-// against the buffers the caller allocated on that stream. These overloads
-// take an explicit ``stream`` (NULL -> default stream, legacy behaviour).
-void dsa_kpool_assemble_on_stream(
-    int n_pools, int pool_size, int head_dim, int tail_size,
-    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
-    const void* chunk_k, const void* chunk_score, const void* tail_k,
-    const void* tail_score, const void* ape, const void* req_pool_idx,
-    const void* n_from_tail, const void* chunk_src_start,
-    const void* tail_logical_base, const void* loc, const void* write_mask,
-    void* out, void* stream);
-
-void dsa_kpool_decode_update_on_stream(
-    int batch, int pool_size, int head_dim, int tail_size,
-    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
-    const void* key, const void* slot_score, void* tail_k, void* tail_score,
-    const void* ape, const void* block_tables, const void* req_pool_indices,
-    const void* positions, const void* seq_lens, const void* out_cache_loc,
-    void* out, void* stream);
+                             const void* out_cache_loc, void* out,
+                             void* stream = nullptr);
 
 // Issue #61: fp8+scale store epilogue (gfx942). Same compress/write
 // computation + write gates as ``dsa_kpool_assemble`` / ``dsa_kpool_decode_
@@ -313,8 +299,9 @@ void dsa_kpool_decode_update_on_stream(
 // SM80 safe) and one fp32 scale per vector into ``cache_u8
 // [num_pages, ssp*(128+4)]``. ``tail_k``/``tail_score`` are IN-PLACE bf16
 // device (decode); ``key``/``slot_score`` are bf16 device. ``round_scale_or_null``
-// is a device int (``*it > 0`` -> power-of-two scale); NULL -> raw scale.
-// ``cache_u8`` is a uint8 device pointer (zeroed first). Launched on ``stream``.
+// is a device int (``*it > 0`` -> power-of-two
+// scale); NULL -> raw scale. ``cache_u8`` is a uint8 device pointer (zeroed
+// first).
 void dsa_kpool_assemble_fp8(
     int n_pools, int pool_size, int head_dim, int tail_size,
     int slots_per_page, int num_pages, int num_chunks, int n_reqs,
