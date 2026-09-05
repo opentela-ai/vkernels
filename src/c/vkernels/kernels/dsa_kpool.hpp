@@ -174,10 +174,82 @@ void dsa_kpool_decode_update_cpu(int batch, int pool_size, int head_dim,
                                  const int32_t* seq_lens,
                                  const int32_t* out_cache_loc, float* out);
 
+// -----------------------------------------------------------------------
+// Issue #61: fp8+scale store epilogue.
+//
+// These are the SAME compress/write kernels as ``dsa_kpool_assemble_cpu`` /
+// ``dsa_kpool_decode_update_cpu`` (identical online softmax, pool-complete
+// gate, write_mask, in-place live-tail write, head_dim==128), but the
+// compressed K is stored as ``torch.float8_e4m3fn`` (round-to-nearest-even)
+// WITH a single per-vector fp32 scale -- byte-for-byte sglang's original
+// ``kpool_fp8_index.py`` legacy cache, so a Bristen A100 graph (SM80, no
+// native fp8) can write the EXACT layout the fp8 indexer expects WITHOUT
+// the ``tl.float8e4nv`` Triton path that JIT-fails on A100 (job 82822).
+//
+// Legacy uint8 cache layout (per page ``p``, slot ``s``, head_dim==128):
+//   cache_u8 : [num_pages, slots_per_page * (head_dim + 4)] uint8
+//     K region    [0, ssp*128)            -> ssp slots x 128 fp8e4m3 bytes
+//     scale region [ssp*128, ssp*128 + ssp*4) -> ssp slots x ONE fp32
+//   K offset     : p * ssp*(128+4) + s*128 + d
+//   scale offset : p * ssp*(128+4)/4 + ssp*128/4 + s   (fp32 index)
+// (Mirrors the existing kvcache_u8 [nb, B*(D+4)] precedent in
+// meta/benchmarks/test_dsa_topk_correct.hip.)
+//
+// Quantization (mirrors sglang's ``_hadamard_quantize_fp8`` exactly):
+//   x       = hadamard128( bf16(mean) )  -- the Hadamard output is rounded
+//                                         to bf16 (to(fp32)) first, so the
+//                                         fp8 reference is a STRICT upper
+//                                         bound on the A100 bf16-intermediate
+//                                         device store
+//   absmax  = max_d |x[d]|, floored at 1e-4
+//   scale   = round_scale ? exp2(ceil(log2(absmax/448))) : absmax/448
+//   k_fp8   = clamp(x/scale, -448, 448)   stored fp8e4m3 round-to-nearest-even
+// A scale of 0 (denom==0 / empty pool) writes all-zero K and a 0 scale.
+//
+// ``cache_u8`` is a raw uint8 buffer of ``num_pages * ssp * (head_dim+4)``
+// bytes; the caller zeroes it first (only written rows are touched).
+//
+// Prefill (``dsa_kpool_assemble_fp8_cpu``): same args + write contract as
+//   ``dsa_kpool_assemble_cpu`` except ``out`` -> ``cache_u8`` (uint8 legacy
+//   cache) and a trailing ``round_scale_or_null`` (see below).
+// Decode (``dsa_kpool_decode_update_fp8_cpu``): same args + write contract
+//   as ``dsa_kpool_decode_update_cpu`` except ``out`` -> ``cache_u8``;
+//   ``tail_k``/``tail_score`` stay fp32 IN-PLACE (the live tail is fp32
+//   end-to-end, identical to the fp32 variant), and a trailing
+//   ``round_scale_or_null``.
+//
+// ``round_scale_or_null``: when non-null and ``*it > 0`` the scale is rounded
+//   up to the next power of two (``exp2(ceil(log2(absmax/448)))``); when null
+//   or ``<= 0`` the raw ``absmax/448`` scale is used (sglang ``round_scale=False``).
+void dsa_kpool_assemble_fp8_cpu(
+    int n_pools, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
+    const float* chunk_k, const float* chunk_score, const float* tail_k,
+    const float* tail_score, const float* ape, const int32_t* req_pool_idx,
+    const int32_t* n_from_tail, const int32_t* chunk_src_start,
+    const int32_t* tail_logical_base, const int32_t* loc,
+    const int32_t* write_mask, uint8_t* cache_u8, float* round_scale_or_null);
+
+void dsa_kpool_decode_update_fp8_cpu(
+    int batch, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
+    const float* key, const float* slot_score, float* tail_k,
+    float* tail_score, const float* ape, const int32_t* block_tables,
+    const int32_t* req_pool_indices, const int32_t* positions,
+    const int32_t* seq_lens, const int32_t* out_cache_loc, uint8_t* cache_u8,
+    float* round_scale_or_null);
+
 }  // namespace vkernels::kernels
 
 #if VKERNELS_HAS_HIP
 namespace vkernels::kernels::hip {
+
+// Device stream convention (ONE convention for every device entry in this
+// file): each launcher takes a trailing ``void* stream`` -- a hipStream_t
+// passed through void*, with nullptr selecting the default stream. Under a
+// CUDA/HIP graph capture the kernels MUST be launched on the *caller's*
+// current stream (PyTorch's ``torch.cuda.current_stream().cuda_stream``) so
+// the writes are ordered against buffers allocated on that stream.
 
 // DSA kpool-cache compress/write -- PREFILL path (gfx942). bf16 storage +
 // fp32 accumulation, NO fp8e4nv. Same computation as dsa_kpool_assemble_cpu
@@ -195,7 +267,8 @@ void dsa_kpool_assemble(int n_pools, int pool_size, int head_dim,
                         const void* req_pool_idx, const void* n_from_tail,
                         const void* chunk_src_start,
                         const void* tail_logical_base,
-                        const void* loc, const void* write_mask, void* out);
+                        const void* loc, const void* write_mask, void* out,
+                        void* stream = nullptr);
 
 // DSA kpool-cache compress/write + live-tail update -- DECODE path (gfx942).
 // bf16 storage + fp32 accumulation, NO fp8e4nv. Same computation as
@@ -215,7 +288,36 @@ void dsa_kpool_decode_update(int batch, int pool_size, int head_dim,
                              const void* block_tables,
                              const void* req_pool_indices,
                              const void* positions, const void* seq_lens,
-                             const void* out_cache_loc, void* out);
+                             const void* out_cache_loc, void* out,
+                             void* stream = nullptr);
+
+// Issue #61: fp8+scale store epilogue (gfx942). Same compress/write
+// computation + write gates as ``dsa_kpool_assemble`` / ``dsa_kpool_decode_
+// update`` (see dsa_kpool_*_fp8_cpu in dsa_kpool.hpp for the legacy uint8
+// cache layout and the ``_hadamard_quantize_fp8`` math). K is stored as raw
+// fp8e4m3 bytes (``f2fp8e4m3fn`` round-to-nearest-even, NO native fp8 --
+// SM80 safe) and one fp32 scale per vector into ``cache_u8
+// [num_pages, ssp*(128+4)]``. ``tail_k``/``tail_score`` are IN-PLACE bf16
+// device (decode); ``key``/``slot_score`` are bf16 device. ``round_scale_or_null``
+// is a device int (``*it > 0`` -> power-of-two
+// scale); NULL -> raw scale. ``cache_u8`` is a uint8 device pointer (zeroed
+// first).
+void dsa_kpool_assemble_fp8(
+    int n_pools, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
+    const void* chunk_k, const void* chunk_score, const void* tail_k,
+    const void* tail_score, const void* ape, const void* req_pool_idx,
+    const void* n_from_tail, const void* chunk_src_start,
+    const void* tail_logical_base, const void* loc, const void* write_mask,
+    void* cache_u8, const void* round_scale_or_null, void* stream);
+
+void dsa_kpool_decode_update_fp8(
+    int batch, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
+    const void* key, const void* slot_score, void* tail_k, void* tail_score,
+    const void* ape, const void* block_tables, const void* req_pool_indices,
+    const void* positions, const void* seq_lens, const void* out_cache_loc,
+    void* cache_u8, const void* round_scale_or_null, void* stream);
 
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP

@@ -1,10 +1,11 @@
 // meta/benchmarks/bench_dsa_kpool.hip
 //
-// Micro-benchmark for the DSA kpool-cache compress/write kernels (issue #60)
-// on AMD gfx942 (MI300A) and NVIDIA A100 (the latter via the HIP compat
-// shim): the bf16-storage / no-fp8e4nv HIP replacements for sglang's
+// Micro-benchmark for the DSA kpool-cache compress/write kernels (issues
+// #60/#61) on AMD gfx942 (MI300A) and NVIDIA A100 (the latter via the HIP
+// compat shim): the bf16-storage / no-fp8e4nv HIP replacements for sglang's
 // ``kpool_assemble_softmax_rotate_write_cache`` (PREFILL) and
-// ``kpool_decode_update_and_maybe_write_cache`` (DECODE).
+// ``kpool_decode_update_and_maybe_write_cache`` (DECODE), plus their
+// fp8+scale store variants (issue #61).
 //
 // For each GLM-5.3-Flash serving shape it reports, against the detected
 // device's roofline (gfx942: ~1307 TFLOP/s bf16, ~5300 GB/s HBM3, ridge
@@ -23,7 +24,13 @@
 //
 // Both kernels are HEAD_DIM == 128 (the 128-point involution-normalised
 // Hadamard). The compress reduction is fp32 end-to-end (keys/scores are
-// bf16 storage, dequant on load; the compressed mean is bf16 on store).
+// bf16 storage, dequant on load; the compressed mean is bf16 or fp8+scale
+// on store).
+//
+// The bf16 and fp8 sections share ONE harness per path (template policy
+// over the store epilogue): identical grids, shapes and READS -- only the
+// store differs -- so rows stay directly comparable by construction
+// instead of by keeping two copies in sync.
 //
 // Built only with VKERNELS_HAS_HIP + VKERNELS_BUILD_BENCHMARKS.
 
@@ -36,6 +43,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "vkernels/kernels/dsa_kpool.hpp"
@@ -174,35 +182,98 @@ static double compress_flops(int pool_size) {
   per += H;                 // 1/sqrt(128) scale
   return per;
 }
-static double assemble_bytes(int pool_size) {
-  // READ pool_size keys + pool_size scores (bf16) + ape (fp32, pool_size
-  // rows reused across pools but counted once per pool launch) + 6 int32
-  // index scalars; WRITE 1 compressed mean (bf16).
+// The READS are identical between the bf16 and fp8 stores (keys / scores
+// stay bf16 inputs; only the compressed-mean STORE changes): 2*H bf16 bytes
+// for the mean, vs (H+4) fp8+scale bytes -- the smaller store is the whole
+// point of the fp8 path and what the effective GB/s below reflects. The
+// live-tail write in decode is STILL bf16 (tail_k/tail_score are in-place
+// bf16 buffers in both paths).
+static double assemble_bytes(int pool_size, bool fp8) {
   const int H = 128;
   double rd = 2.0 * (2.0 * (double)pool_size * H)   // keys + scores (bf16)
             + 4.0 * (double)pool_size * H           // ape (fp32)
             + 6.0 * 4;                              // index scalars
-  double wr = 2.0 * (double)H;                      // 1 mean (bf16)
+  double wr = fp8 ? (double)H + 4.0                 // 1 mean (fp8 + fp32 scale)
+                  : 2.0 * (double)H;                // 1 mean (bf16)
   return rd + wr;
 }
-static double decode_bytes(int pool_size) {
-  // READ (pool_size-1) tail slots (bf16 key+score) + current key/score
-  // (bf16) + ape (fp32) + block_tables + pos/seq/ocl scalars; WRITE 1
-  // compressed mean (bf16) + the live-tail slot (bf16 key+score).
+static double decode_bytes(int pool_size, bool fp8) {
   const int H = 128;
   double rd = 2.0 * (2.0 * (double)pool_size * H)   // pool_size tail+current (bf16)
             + 4.0 * (double)pool_size * H           // ape (fp32)
             + 4.0 * 4;                              // bt + pos/seq/ocl scalars
-  double wr = 2.0 * (double)H                       // 1 mean (bf16)
+  double wr = (fp8 ? (double)H + 4.0 : 2.0 * (double)H)  // 1 mean
             + 2.0 * (2.0 * (double)H);              // live-tail key+score (bf16)
   return rd + wr;
 }
 
 // ---------------------------------------------------------------------------
-// PREFILL: dsa_kpool_assemble (kpool_assemble_softmax_rotate_write_cache).
+// Store policies. The bf16 and fp8 paths differ in exactly: the impl entry
+// (and its trailing stream / device round_scale), the output allocation,
+// and the bytes accounting. Everything else -- shapes, inputs, timing,
+// roofline print -- is shared, so the harness below is written once.
+// ---------------------------------------------------------------------------
+struct Bf16Store {
+  static constexpr bool kFp8 = false;
+  static size_t out_nbytes(int num_pages, int ssp, int H) {
+    return (size_t)num_pages * ssp * H * 2;             // bf16
+  }
+  static void launch(int n_pools, int pool_size, int H, int tail_size,
+                     int ssp, int num_pages, int num_chunks, int n_reqs,
+                     const void* a, const void* b, void* c, void* d,
+                     const void* e, const void* f, const void* g,
+                     const void* h, const void* i, const void* j,
+                     const void* k, void* out, void* /*drs*/, void* stream) {
+    vkernels::kernels::hip::dsa_kpool_assemble(
+        n_pools, pool_size, H, tail_size, ssp, num_pages, num_chunks, n_reqs,
+        a, b, c, d, e, f, g, h, i, j, k, out, stream);
+  }
+  static void launch_decode(int batch, int pool_size, int H, int tail_size,
+                            int ssp, int btc, int n_reqs, int num_pages,
+                            const void* a, const void* b, void* c, void* d,
+                            const void* e, const void* f, const void* g,
+                            const void* h, const void* i, const void* j,
+                            void* out, void* /*drs*/, void* stream) {
+    vkernels::kernels::hip::dsa_kpool_decode_update(
+        batch, pool_size, H, tail_size, ssp, btc, n_reqs, num_pages, a, b, c,
+        d, e, f, g, h, i, j, out, stream);
+  }
+};
+
+struct Fp8Store {
+  static constexpr bool kFp8 = true;
+  static size_t out_nbytes(int num_pages, int ssp, int H) {
+    return (size_t)num_pages * ssp * (H + 4);           // fp8 + fp32 scale
+  }
+  static void launch(int n_pools, int pool_size, int H, int tail_size,
+                     int ssp, int num_pages, int num_chunks, int n_reqs,
+                     const void* a, const void* b, void* c, void* d,
+                     const void* e, const void* f, const void* g,
+                     const void* h, const void* i, const void* j,
+                     const void* k, void* out, void* drs, void* stream) {
+    vkernels::kernels::hip::dsa_kpool_assemble_fp8(
+        n_pools, pool_size, H, tail_size, ssp, num_pages, num_chunks, n_reqs,
+        a, b, c, d, e, f, g, h, i, j, k, out, drs, stream);
+  }
+  static void launch_decode(int batch, int pool_size, int H, int tail_size,
+                            int ssp, int btc, int n_reqs, int num_pages,
+                            const void* a, const void* b, void* c, void* d,
+                            const void* e, const void* f, const void* g,
+                            const void* h, const void* i, const void* j,
+                            void* out, void* drs, void* stream) {
+    vkernels::kernels::hip::dsa_kpool_decode_update_fp8(
+        batch, pool_size, H, tail_size, ssp, btc, n_reqs, num_pages, a, b, c,
+        d, e, f, g, h, i, j, out, drs, stream);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// PREFILL bench (kpool_assemble_softmax_rotate_write_cache).
 // Grid = (n_pools, 1, 1), block = 64 (one warp per pool). n_pools is the
 // number of fully-closed pools the indexer writes this forward
 // (ceildiv(num_draft_tokens, pool_size) for a long-context prefill).
+// ---------------------------------------------------------------------------
+template <class Store>
 static void bench_assemble(const GpuInfo& info, hipEvent_t start,
                            hipEvent_t stop) {
   struct Cfg { int n_pools, pool_size, tail_size, ssp, num_pages,
@@ -210,7 +281,7 @@ static void bench_assemble(const GpuInfo& info, hipEvent_t start,
   // GLM-5.3-Flash prefill shapes: n_pools scales with num_draft_tokens
   // (decode-via-prefill n_pools=1 up to a long 512-draft prefill). pool_size
   // 4 and 8 (the supported group_topk / pool_size families). tail_size 64
-  // and 128; ssp 8 and 16.
+  // and 128; ssp 8 and 16. ONE list for both stores so the rows pair up.
   const Cfg cfgs[] = {
       {1,   4, 64,  8, 16,  32, 1},   // single-pool (decode-via-prefill)
       {4,   4, 64,  8, 16,  32, 2},
@@ -226,10 +297,23 @@ static void bench_assemble(const GpuInfo& info, hipEvent_t start,
   };
   const int H = 128;
 
-  std::printf("\n=== hip::dsa_kpool_assemble (PREFILL, 1 warp/pool) ===\n");
+  std::printf("\n=== %s (PREFILL, 1 warp/pool%s) ===\n",
+              Store::kFp8 ? "hip::dsa_kpool_assemble_fp8"
+                          : "hip::dsa_kpool_assemble",
+              Store::kFp8 ? ", round_scale=1" : "");
   std::printf("  %5s %4s %5s %4s %5s %7s %9s %9s %9s %9s %5s  %s\n",
               "npool", "ps", "tail", "ssp", "npg", "warps",
               "us(min)", "us(med)", "TFLOP/s", "GB/s", "AI", "bound");
+
+  // fp8 only: round_scale is a DEVICE int so the call is graph-capturable
+  // (the launcher does NOT dereference it on the host).
+  int32_t host_rs = 1;
+  void* drs = nullptr;
+  if (Store::kFp8) {
+    check_hip(hipMalloc(&drs, sizeof(int32_t)), "drs");
+    check_hip(hipMemcpy(drs, &host_rs, sizeof(int32_t), hipMemcpyHostToDevice),
+              "cpyrs");
+  }
 
   for (const auto& c : cfgs) {
     const size_t nck  = (size_t)c.num_chunks * H;
@@ -253,10 +337,9 @@ static void bench_assemble(const GpuInfo& info, hipEvent_t start,
       loc[r] = r % (c.num_pages * c.ssp);
     }
 
-    uint16_t *dck, *dcs, *dtlk, *dtls, *dout;
-    float    *dape;
-    int32_t  *drpi, *dnft, *dcss, *dtlb, *dloc, *dwm;
-    const size_t nout = (size_t)c.num_pages * c.ssp * H;
+    void *dck, *dcs, *dtlk, *dtls, *dape, *drpi, *dnft, *dcss, *dtlb, *dloc,
+        *dwm, *dout;
+    const size_t nout = Store::out_nbytes(c.num_pages, c.ssp, H);
     check_hip(hipMalloc(&dck,   nck  * 2), "ck");
     check_hip(hipMalloc(&dcs,   nck  * 2), "cs");
     check_hip(hipMalloc(&dtlk,  ntlk * 2), "tlk");
@@ -268,7 +351,7 @@ static void bench_assemble(const GpuInfo& info, hipEvent_t start,
     check_hip(hipMalloc(&dtlb,  (size_t)c.n_pools * 4), "tlb");
     check_hip(hipMalloc(&dloc,  (size_t)c.n_pools * 4), "loc");
     check_hip(hipMalloc(&dwm,   (size_t)c.n_pools * 4), "wm");
-    check_hip(hipMalloc(&dout,  nout * 2), "out");
+    check_hip(hipMalloc(&dout,  nout), "out");
     check_hip(hipMemcpy(dck,  ck.data(),  nck  * 2, hipMemcpyHostToDevice), "cpyck");
     check_hip(hipMemcpy(dcs,  cs.data(),  nck  * 2, hipMemcpyHostToDevice), "cpycs");
     check_hip(hipMemcpy(dtlk, tlk.data(), ntlk * 2, hipMemcpyHostToDevice), "cpytlk");
@@ -282,15 +365,15 @@ static void bench_assemble(const GpuInfo& info, hipEvent_t start,
     check_hip(hipMemcpy(dwm,  wm.data(),  (size_t)c.n_pools * 4, hipMemcpyHostToDevice), "cpywm");
 
     auto L = [&] {
-      vkernels::kernels::hip::dsa_kpool_assemble(
-          c.n_pools, c.pool_size, H, c.tail_size, c.ssp, c.num_pages,
-          c.num_chunks, c.n_reqs, dck, dcs, dtlk, dtls, dape, drpi, dnft,
-          dcss, dtlb, dloc, dwm, dout);
+      Store::launch(c.n_pools, c.pool_size, H, c.tail_size, c.ssp,
+                    c.num_pages, c.num_chunks, c.n_reqs, dck, dcs, dtlk, dtls,
+                    dape, drpi, dnft, dcss, dtlb, dloc, dwm, dout, drs,
+                    nullptr);
     };
     auto r = bench_us(L, start, stop);
 
     double flops = compress_flops(c.pool_size) * (double)c.n_pools;
-    double bytes = assemble_bytes(c.pool_size) * (double)c.n_pools;
+    double bytes = assemble_bytes(c.pool_size, Store::kFp8) * (double)c.n_pools;
     double tflops = flops / (r.median_us / 1e6) / 1e12;
     double gbs    = bytes / (r.median_us / 1e6) / 1e9;
     double ai     = flops / bytes;
@@ -314,14 +397,17 @@ static void bench_assemble(const GpuInfo& info, hipEvent_t start,
     check_hip(hipFree(dwm),  "fwm");
     check_hip(hipFree(dout), "fout");
   }
+  if (drs) check_hip(hipFree(drs), "fdrs");
   std::printf("  Roof: %.0f TFLOP/s %s, %.0f GB/s HBM, ridge ~%.0f FLOP/B\n",
               info.tflops, info.tflops_unit, info.bw, info.tflops * 1e3 / info.bw);
 }
 
 // ---------------------------------------------------------------------------
-// DECODE: dsa_kpool_decode_update (kpool_decode_update_and_maybe_write).
+// DECODE bench (kpool_decode_update_and_maybe_write).
 // Grid = (batch, 1, 1), block = 64 (one warp per request). batch is the
 // number of concurrent decode requests (1 -> 512).
+// ---------------------------------------------------------------------------
+template <class Store>
 static void bench_decode(const GpuInfo& info, hipEvent_t start,
                          hipEvent_t stop) {
   struct Cfg { int batch, pool_size, tail_size, ssp, btc, n_reqs, num_pages; };
@@ -344,10 +430,21 @@ static void bench_decode(const GpuInfo& info, hipEvent_t start,
   };
   const int H = 128;
 
-  std::printf("\n=== hip::dsa_kpool_decode_update (DECODE, 1 warp/req) ===\n");
+  std::printf("\n=== %s (DECODE, 1 warp/req%s) ===\n",
+              Store::kFp8 ? "hip::dsa_kpool_decode_update_fp8"
+                          : "hip::dsa_kpool_decode_update",
+              Store::kFp8 ? ", round_scale=1" : "");
   std::printf("  %5s %4s %5s %4s %4s %7s %9s %9s %9s %9s %5s  %s\n",
               "batch", "ps", "tail", "ssp", "npg", "warps",
               "us(min)", "us(med)", "TFLOP/s", "GB/s", "AI", "bound");
+
+  void* drs = nullptr;
+  if (Store::kFp8) {
+    int32_t host_rs = 1;  // round_scale on (the heavier round-trip path)
+    check_hip(hipMalloc(&drs, sizeof(int32_t)), "drs");
+    check_hip(hipMemcpy(drs, &host_rs, sizeof(int32_t),
+                        hipMemcpyHostToDevice), "cpyrs");
+  }
 
   for (const auto& c : cfgs) {
     const size_t nkey = (size_t)c.batch * H;
@@ -375,10 +472,9 @@ static void bench_decode(const GpuInfo& info, hipEvent_t start,
       ocl[r] = (r % c.num_pages) + 1;             // never 0 -> cache write
     }
 
-    uint16_t *dkey, *dss, *dtlk, *dtls, *dout;
-    float    *dape;
-    int32_t  *dbt, *drpi, *dpos, *dsl, *docl;
-    const size_t nout = (size_t)c.num_pages * c.ssp * H;
+    void *dkey, *dss, *dtlk, *dtls, *dape, *dbt, *drpi, *dpos, *dsl, *docl,
+        *dout;
+    const size_t nout = Store::out_nbytes(c.num_pages, c.ssp, H);
     check_hip(hipMalloc(&dkey, nkey * 2), "key");
     check_hip(hipMalloc(&dss,  nkey * 2), "ss");
     check_hip(hipMalloc(&dtlk, ntlk * 2), "tlk");
@@ -389,7 +485,7 @@ static void bench_decode(const GpuInfo& info, hipEvent_t start,
     check_hip(hipMalloc(&dpos, (size_t)c.batch * 4), "pos");
     check_hip(hipMalloc(&dsl,  (size_t)c.batch * 4), "sl");
     check_hip(hipMalloc(&docl, (size_t)c.batch * 4), "ocl");
-    check_hip(hipMalloc(&dout, nout * 2), "out");
+    check_hip(hipMalloc(&dout, nout), "out");
     check_hip(hipMemcpy(dkey, key.data(), nkey * 2, hipMemcpyHostToDevice), "cpykey");
     check_hip(hipMemcpy(dss,  ss.data(),  nkey * 2, hipMemcpyHostToDevice), "cpyss");
     check_hip(hipMemcpy(dtlk, tlk.data(), ntlk * 2, hipMemcpyHostToDevice), "cpytlk");
@@ -402,15 +498,14 @@ static void bench_decode(const GpuInfo& info, hipEvent_t start,
     check_hip(hipMemcpy(docl, ocl.data(), (size_t)c.batch * 4, hipMemcpyHostToDevice), "cpyocl");
 
     auto L = [&] {
-      vkernels::kernels::hip::dsa_kpool_decode_update(
-          c.batch, c.pool_size, H, c.tail_size, c.ssp, c.btc, c.n_reqs,
-          c.num_pages, dkey, dss, dtlk, dtls, dape, dbt, drpi, dpos, dsl,
-          docl, dout);
+      Store::launch_decode(c.batch, c.pool_size, H, c.tail_size, c.ssp, c.btc,
+                           c.n_reqs, c.num_pages, dkey, dss, dtlk, dtls, dape,
+                           dbt, drpi, dpos, dsl, docl, dout, drs, nullptr);
     };
     auto r = bench_us(L, start, stop);
 
     double flops = compress_flops(c.pool_size) * (double)c.batch;
-    double bytes = decode_bytes(c.pool_size) * (double)c.batch;
+    double bytes = decode_bytes(c.pool_size, Store::kFp8) * (double)c.batch;
     double tflops = flops / (r.median_us / 1e6) / 1e12;
     double gbs    = bytes / (r.median_us / 1e6) / 1e9;
     double ai     = flops / bytes;
@@ -433,6 +528,7 @@ static void bench_decode(const GpuInfo& info, hipEvent_t start,
     check_hip(hipFree(docl), "focl");
     check_hip(hipFree(dout), "fout");
   }
+  if (drs) check_hip(hipFree(drs), "fdrs");
   std::printf("  Roof: %.0f TFLOP/s %s, %.0f GB/s HBM, ridge ~%.0f FLOP/B\n",
               info.tflops, info.tflops_unit, info.bw, info.tflops * 1e3 / info.bw);
 }
@@ -449,8 +545,12 @@ int main() {
   check_hip(hipEventCreate(&start), "ev_start");
   check_hip(hipEventCreate(&stop),  "ev_stop");
 
-  bench_assemble(info, start, stop);
-  bench_decode(info, start, stop);
+  bench_assemble<Bf16Store>(info, start, stop);
+  bench_decode<Bf16Store>(info, start, stop);
+
+  // Issue #61: fp8+scale storage path (round_scale=1, graph-capturable).
+  bench_assemble<Fp8Store>(info, start, stop);
+  bench_decode<Fp8Store>(info, start, stop);
 
   check_hip(hipEventDestroy(start), "d_start");
   check_hip(hipEventDestroy(stop),  "d_stop");

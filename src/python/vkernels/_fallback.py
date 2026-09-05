@@ -1422,6 +1422,223 @@ def dsa_kpool_decode_update(batch, pool_size, head_dim, tail_size,
 
 
 # ---------------------------------------------------------------------------
+# DSA kpool-cache FP8+scale store variants (issue #61). Pure-Python
+# references mirroring ``dsa_kpool_assemble_fp8_cpu`` / ``dsa_kpool_decode_
+# update_fp8_cpu``. The compressed K is stored as raw fp8e4m3fn bytes plus
+# one fp32 scale per vector in cache_u8 [num_pages, ssp*(128+4)].
+# ---------------------------------------------------------------------------
+def _bf16_round(x):
+    """Round fp32 x -> bf16 (RNE) -> fp32."""
+    x = np.asarray(x, dtype=np.float32)
+    bits = x.view(np.uint32)
+    lsb = (bits >> 16) & 1
+    rounded = ((bits + 0x7FFF + lsb) >> 16).astype(np.uint16)
+    return np.frombuffer(
+        (rounded.astype(np.uint32) << 16).tobytes(),
+        dtype=np.float32).reshape(x.shape)
+
+
+def _fp8_e4m3fn_encode(x):
+    """Vectorized fp32 -> fp8e4m3fn round-to-nearest-even byte encoding.
+
+    Mirrors the C++ ``f32_to_fp8e4m3fn_rne`` exactly for the finite values
+    that survive the caller's clamp to [-448, 448]. Returns uint8 bytes.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    sign = ((x.view(np.uint32) >> 31) & 1).astype(np.uint8)
+    ax = np.abs(x)
+    # For the values we feed here ax is in [0, 448], so we can use the fast
+    # normal-path formula. Construct fp32 bits: sign, exp=bias+floor(log2(ax)),
+    # mant=round((ax/2^e_unbiased - 1) * 8).
+    # This is not a general fp8 encoder (no subnormal/NaN handling) but is
+    # sufficient because the caller clamps and the C++ encoder hits only the
+    # normal/saturation/zero paths for these inputs.
+    with np.errstate(divide='ignore', invalid='ignore'):
+        e_unbiased = np.floor(np.log2(ax)).astype(np.int32)
+    e_unbiased = np.where(ax == 0, -127, e_unbiased)
+    # Reconstruct significand: ax = 1.m * 2^e_unbiased, mant = round((1.m-1)*8)
+    frac = ax / np.exp2(e_unbiased.astype(np.float32)) - 1.0
+    mant = np.rint(frac * 8.0).astype(np.int32)
+    stored_exp = e_unbiased + 7
+    # Carry into exponent if mantissa rounded to 8.
+    carry = mant >= 8
+    mant = np.where(carry, 0, mant)
+    stored_exp = np.where(carry, stored_exp + 1, stored_exp)
+    # Clamp to max finite 0x7E.
+    stored_exp = np.clip(stored_exp, 0, 15)
+    mant = np.clip(mant, 0, 7)
+    byte = (sign << 7) | (stored_exp.astype(np.uint8) << 3) | mant.astype(np.uint8)
+    byte = np.where(ax == 0, sign << 7, byte)
+    # Preserve the C++ NaN encoding (should never happen for finite inputs).
+    byte = np.where(~np.isfinite(ax), 0x7F, byte)
+    return byte
+
+
+def _store_kpool_fp8(mean, round_scale, k_dst, scale_dst):
+    """Store one 128-vector as fp8+scale (matches C++ store_kpool_fp8)."""
+    x = _bf16_round(mean.astype(np.float32))
+    absmax = float(np.max(np.abs(x)))
+    if absmax < 1e-4:
+        absmax = 1e-4
+    inv_max = 1.0 / 448.0
+    if round_scale:
+        scale = float(np.exp2(np.ceil(np.log2(absmax * inv_max))))
+    else:
+        scale = float(absmax * inv_max)
+    scale_dst[0] = scale
+    if scale == 0.0:
+        k_dst[:] = 0
+        return
+    q = np.clip(x / scale, -448.0, 448.0)
+    k_dst[:] = _fp8_e4m3fn_encode(q)
+
+
+def dsa_kpool_assemble_fp8(num_chunks, n_pools, pool_size, head_dim,
+                           tail_size, slots_per_page, num_pages, n_reqs,
+                           chunk_k, chunk_score, tail_k, tail_score, ape,
+                           req_pool_idx, n_from_tail, chunk_src_start,
+                           tail_logical_base, loc, write_mask, cache_u8,
+                           round_scale_or_null):
+    """Pure-Python FP8+scale assemble; mirrors ``dsa_kpool_assemble_fp8_cpu``."""
+    H = head_dim
+    cache_u8 = np.ascontiguousarray(cache_u8, dtype=np.uint8).reshape(
+        num_pages, slots_per_page, H + 4)
+    cache_u8.fill(0)
+    ck = np.ascontiguousarray(chunk_k, dtype=np.float32).reshape(
+        num_chunks, H)
+    cs = np.ascontiguousarray(chunk_score, dtype=np.float32).reshape(
+        num_chunks, H)
+    tk = np.ascontiguousarray(tail_k, dtype=np.float32).reshape(
+        n_reqs, tail_size, H)
+    ts = np.ascontiguousarray(tail_score, dtype=np.float32).reshape(
+        n_reqs, tail_size, H)
+    ap = np.ascontiguousarray(ape, dtype=np.float32).reshape(pool_size, H)
+    rpi = np.ascontiguousarray(req_pool_idx, dtype=np.int32).reshape(n_pools)
+    nft = np.ascontiguousarray(n_from_tail, dtype=np.int32).reshape(n_pools)
+    css = np.ascontiguousarray(chunk_src_start, dtype=np.int32).reshape(n_pools)
+    tlb = np.ascontiguousarray(tail_logical_base, dtype=np.int32).reshape(n_pools)
+    lc = np.ascontiguousarray(loc, dtype=np.int32).reshape(n_pools)
+    wm = (None if write_mask is None
+          else np.ascontiguousarray(write_mask, dtype=np.int32).reshape(n_pools))
+    H128 = _hadamard128()
+    round_scale = (round_scale_or_null is not None
+                   and float(round_scale_or_null.flat[0]) > 0.0)
+    for r in range(n_pools):
+        if wm is not None and wm[r] == 0:
+            continue
+        req = int(rpi[r]); ntail = int(nft[r]); csrc = int(css[r])
+        base = int(tlb[r]); lr = int(lc[r])
+        mx = np.full(H, -np.inf, dtype=np.float32)
+        acc = np.zeros(H, dtype=np.float32)
+        denom = np.zeros(H, dtype=np.float32)
+        for s in range(pool_size):
+            if s < ntail:
+                phys = ((base + s) % tail_size + tail_size) % tail_size
+                sp = ts[req, phys]; kp = tk[req, phys]
+            else:
+                ci = csrc + (s - ntail)
+                sp = cs[ci]; kp = ck[ci]
+            score = sp + ap[s]
+            new_m = np.maximum(mx, score)
+            rescale = np.exp(mx - new_m, dtype=np.float32)
+            prob = np.exp(score - new_m, dtype=np.float32)
+            denom = denom * rescale + prob
+            acc = acc * rescale + kp * prob
+            mx = new_m
+        mean = acc / denom
+        mean = _bf16_round(mean)
+        out_vec = H128 @ mean
+        out_vec = _bf16_round(out_vec)
+        page = lr // slots_per_page
+        sip = lr % slots_per_page
+        k_dst = cache_u8[page, sip, :H]
+        scale_dst = cache_u8[page, sip, H:H + 4].view(np.float32)
+        _store_kpool_fp8(out_vec, round_scale, k_dst, scale_dst)
+    return cache_u8
+
+
+def dsa_kpool_decode_update_fp8(batch, pool_size, head_dim, tail_size,
+                                slots_per_page, block_table_cols, n_reqs,
+                                num_pages, key, slot_score, tail_k,
+                                tail_score, ape, block_tables, req_pool_idx,
+                                positions, seq_lens, out_cache_loc,
+                                cache_u8, round_scale_or_null):
+    """Pure-Python FP8+scale decode update; mirrors
+    ``dsa_kpool_decode_update_fp8_cpu``."""
+    H = head_dim
+    cache_u8 = np.ascontiguousarray(cache_u8, dtype=np.uint8).reshape(
+        num_pages, slots_per_page, H + 4)
+    cache_u8.fill(0)
+    ky = np.ascontiguousarray(key, dtype=np.float32).reshape(batch, H)
+    ss = np.ascontiguousarray(slot_score, dtype=np.float32).reshape(batch, H)
+    tk = np.ascontiguousarray(tail_k, dtype=np.float32).reshape(
+        n_reqs, tail_size, H)
+    ts = np.ascontiguousarray(tail_score, dtype=np.float32).reshape(
+        n_reqs, tail_size, H)
+    ap = np.ascontiguousarray(ape, dtype=np.float32).reshape(pool_size, H)
+    bt = np.ascontiguousarray(block_tables, dtype=np.int32).reshape(
+        batch, block_table_cols)
+    rpi = np.ascontiguousarray(req_pool_idx, dtype=np.int32).reshape(batch)
+    pos = np.ascontiguousarray(positions, dtype=np.int32).reshape(batch)
+    sl = np.ascontiguousarray(seq_lens, dtype=np.int32).reshape(batch)
+    ocl = np.ascontiguousarray(out_cache_loc, dtype=np.int32).reshape(batch)
+    H128 = _hadamard128()
+    round_scale = (round_scale_or_null is not None
+                   and float(round_scale_or_null.flat[0]) > 0.0)
+    for r in range(batch):
+        req_raw = int(rpi[r]); pos_raw = int(pos[r]); seq_len = int(sl[r])
+        cache_loc = int(ocl[r])
+        req_valid = 0 <= req_raw < n_reqs
+        pos_valid = (req_valid and cache_loc != 0 and 0 <= pos_raw < seq_len)
+        safe_pos = pos_raw if pos_raw >= 0 else 0
+        slot = safe_pos % pool_size
+        cur_k = ky[r]; cur_s = ss[r]
+        if pos_valid and slot == pool_size - 1:
+            pool_logical_start = safe_pos - slot
+            mx = np.full(H, -np.inf, dtype=np.float32)
+            acc = np.zeros(H, dtype=np.float32)
+            denom = np.zeros(H, dtype=np.float32)
+            req = req_raw
+            for p in range(pool_size):
+                is_current = (p == slot)
+                phys = ((pool_logical_start + p) % tail_size + tail_size) % tail_size
+                sp = cur_s if is_current else ts[req, phys]
+                kp = cur_k if is_current else tk[req, phys]
+                score = sp + ap[p]
+                new_m = np.maximum(mx, score)
+                rescale = np.exp(mx - new_m, dtype=np.float32)
+                prob = np.exp(score - new_m, dtype=np.float32)
+                denom = denom * rescale + prob
+                acc = acc * rescale + kp * prob
+                mx = new_m
+            mean = acc / denom
+            mean = _bf16_round(mean)
+            out_vec = H128 @ mean
+            out_vec = _bf16_round(out_vec)
+            pid = safe_pos // pool_size
+            ppg = pid // slots_per_page
+            tpr = ppg * pool_size
+            tpr = int(np.clip(tpr, 0, block_table_cols - 1))
+            packed_page = int(bt[r, tpr])
+            loc_slot = pid % slots_per_page
+            k_dst = cache_u8[packed_page, loc_slot, :H]
+            scale_dst = cache_u8[packed_page, loc_slot, H:H + 4].view(np.float32)
+            _store_kpool_fp8(out_vec, round_scale, k_dst, scale_dst)
+        if pos_valid:
+            req = req_raw
+            phys_slot = ((safe_pos % tail_size) + tail_size) % tail_size
+            tk[req, phys_slot] = cur_k
+            ts[req, phys_slot] = cur_s
+    tk_orig = np.ascontiguousarray(tail_k, dtype=np.float32)
+    ts_orig = np.ascontiguousarray(tail_score, dtype=np.float32)
+    if tk_orig.shape == tk.shape:
+        np.copyto(tk_orig, tk)
+    if ts_orig.shape == ts.shape:
+        np.copyto(ts_orig, ts)
+    return cache_u8
+
+
+# ---------------------------------------------------------------------------
 # MHC: multi-head hybrid-attention pre-norm (issue #51, part 2)
 # ---------------------------------------------------------------------------
 

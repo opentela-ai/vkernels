@@ -335,6 +335,34 @@ int32_t vk_dsa_kpool_decode_update(int batch, int pool_size, int head_dim,
                                    const int32_t* seq_lens,
                                    const int32_t* out_cache_loc, float* out);
 
+/* Issue #61: fp8+scale store variants (the stream convention lives with the
+ * device entries in hip_capi.hpp -- the host oracles here are pure CPU and
+ * take no stream).
+ * Same contracts as vk_dsa_kpool_assemble / vk_dsa_kpool_decode_update above,
+ * except the *_fp8 entry writes the legacy uint8 cache
+ * [num_pages, ssp*(head_dim+4)] with head_dim fp8e4m3fn bytes + one fp32
+ * scale per vector. cache_u8 is uint8 (host). round_scale_or_null is
+ * float* (host scalar); *it > 0 selects power-of-two scale rounding,
+ * otherwise raw absmax/448.
+ */
+int32_t vk_dsa_kpool_assemble_fp8(
+    int n_pools, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int num_pages, int num_chunks, int n_reqs,
+    const float* chunk_k, const float* chunk_score, const float* tail_k,
+    const float* tail_score, const float* ape, const int32_t* req_pool_idx,
+    const int32_t* n_from_tail, const int32_t* chunk_src_start,
+    const int32_t* tail_logical_base, const int32_t* loc,
+    const int32_t* write_mask, uint8_t* cache_u8,
+    float* round_scale_or_null);
+int32_t vk_dsa_kpool_decode_update_fp8(
+    int batch, int pool_size, int head_dim, int tail_size,
+    int slots_per_page, int block_table_cols, int n_reqs, int num_pages,
+    const float* key, const float* slot_score, float* tail_k,
+    float* tail_score, const float* ape, const int32_t* block_tables,
+    const int32_t* req_pool_indices, const int32_t* positions,
+    const int32_t* seq_lens, const int32_t* out_cache_loc, uint8_t* cache_u8,
+    float* round_scale_or_null);
+
 /* ------------------------------------------------------------------ */
 /* kernels: MHC — multi-head hybrid-attention pre-norm (mhc.hpp, #51)  */
 /*                                                                       */

@@ -33,193 +33,15 @@
 
 #include "vkernels/kernels/dsa_kpool.hpp"
 
+#include "dsa_kpool_ref.hpp"  // shared INDEPENDENT reference (hadamard, refs, fp8 oracle)
+
 using vkernels::kernels::dsa_kpool_assemble_cpu;
+using vkernels::kernels::dsa_kpool_assemble_fp8_cpu;
 using vkernels::kernels::dsa_kpool_decode_update_cpu;
+using vkernels::kernels::dsa_kpool_decode_update_fp8_cpu;
 using vkernels::kernels::dsa_kpool_group_topk_supported;
 using vkernels::kernels::dsa_kpool_max_closed_pools;
 
-namespace {
-
-constexpr float kInf = std::numeric_limits<float>::infinity();
-
-// Dense normalized 128-point Walsh-Hadamard (independent of the staged
-// decomposition the oracle uses): H[i][j] = prod_bits (-1)^(bit_i & bit_j) /
-// sqrt(128). Built once; the test applies it as a plain matvec so the only
-// residual against the oracle is FMA-vs-mul-add (<<1e-4).
-const std::vector<float>& dense_hadamard128() {
-  static std::vector<float> H(128 * 128);
-  static bool built = false;
-  if (built) return H;
-  const float scale = 1.0f / std::sqrt(128.0f);
-  for (int i = 0; i < 128; ++i)
-    for (int j = 0; j < 128; ++j) {
-      int x = i & j, sign = 1;
-      while (x) { if (x & 1) sign = -sign; x >>= 1; }
-      H[(size_t)i * 128 + j] = (float)sign * scale;
-    }
-  built = true;
-  return H;
-}
-
-void apply_dense_hadamard(const std::vector<float>& v, std::vector<float>& out) {
-  const std::vector<float>& H = dense_hadamard128();
-  for (int i = 0; i < 128; ++i) {
-    float s = 0;
-    for (int j = 0; j < 128; ++j) s += H[(size_t)i * 128 + j] * v[j];
-    out[i] = s;
-  }
-}
-
-// Independent two-pass reference for the PREFILL path (different code path:
-// build the full per-slot score, naive softmax, weighted sum, then the dense
-// Hadamard). Mirrors dsa_kpool_assemble_cpu's contract exactly.
-void assemble_ref(int n_pools, int pool_size, int head_dim, int tail_size,
-                  int slots_per_page, int num_chunks, int n_reqs,
-                  const std::vector<float>& chunk_k,
-                  const std::vector<float>& chunk_score,
-                  const std::vector<float>& tail_k,
-                  const std::vector<float>& tail_score,
-                  const std::vector<float>& ape,
-                  const std::vector<int32_t>& req_pool_idx,
-                  const std::vector<int32_t>& n_from_tail,
-                  const std::vector<int32_t>& chunk_src_start,
-                  const std::vector<int32_t>& tail_logical_base,
-                  const std::vector<int32_t>& loc,
-                  const std::vector<int32_t>* write_mask,
-                  std::vector<float>& out) {
-  (void)num_chunks; (void)n_reqs;
-  for (int r = 0; r < n_pools; ++r) {
-    if (write_mask && (*write_mask)[r] == 0) continue;
-    const int req = req_pool_idx[r];
-    const int n_tail = n_from_tail[r];
-    const int chunk_src = chunk_src_start[r];
-    const int tail_base = tail_logical_base[r];
-    std::vector<float> acc(head_dim, 0.0f), denom(head_dim, 0.0f);
-    // Two-pass naive: max, then exp/sum/weighted.
-    std::vector<float> sc(pool_size * head_dim, -kInf);
-    for (int slot = 0; slot < pool_size; ++slot) {
-      const float* sp;
-      if (slot < n_tail) {
-        const int phys = ((tail_base + slot) % tail_size + tail_size) % tail_size;
-        sp = tail_score.data() + (size_t)req * tail_size * head_dim
-                                  + (size_t)phys * head_dim;
-      } else {
-        const int ci = chunk_src + (slot - n_tail);
-        sp = chunk_score.data() + (size_t)ci * head_dim;
-      }
-      for (int d = 0; d < head_dim; ++d)
-        sc[slot * head_dim + d] = sp[d] + ape[slot * head_dim + d];
-    }
-    std::vector<float> mx(head_dim, -kInf);
-    for (int slot = 0; slot < pool_size; ++slot)
-      for (int d = 0; d < head_dim; ++d)
-        mx[d] = std::max(mx[d], sc[slot * head_dim + d]);
-    for (int slot = 0; slot < pool_size; ++slot) {
-      const float* kp;
-      if (slot < n_tail) {
-        const int phys = ((tail_base + slot) % tail_size + tail_size) % tail_size;
-        kp = tail_k.data() + (size_t)req * tail_size * head_dim
-                            + (size_t)phys * head_dim;
-      } else {
-        const int ci = chunk_src + (slot - n_tail);
-        kp = chunk_k.data() + (size_t)ci * head_dim;
-      }
-      for (int d = 0; d < head_dim; ++d) {
-        const float prob = std::exp(sc[slot * head_dim + d] - mx[d]);
-        denom[d] += prob;
-        acc[d] += kp[d] * prob;
-      }
-    }
-    std::vector<float> mean(head_dim), h(128);
-    for (int d = 0; d < head_dim; ++d) mean[d] = acc[d] / denom[d];
-    apply_dense_hadamard(mean, h);
-    const int lr = loc[r];
-    const int page = lr / slots_per_page;
-    const int sip = lr % slots_per_page;
-    float* dst = out.data() + (size_t)page * slots_per_page * head_dim
-                             + (size_t)sip * head_dim;
-    for (int d = 0; d < head_dim; ++d) dst[d] = h[d];
-  }
-}
-
-// Independent two-pass reference for the DECODE path (max, then weighted sum
-// under the fixed max, current token substituted; the dense Hadamard; plus
-// the in-place live-tail write). Mirrors dsa_kpool_decode_update_cpu exactly.
-void decode_ref(int batch, int pool_size, int head_dim, int tail_size,
-                int slots_per_page, int block_table_cols, int n_reqs,
-                const std::vector<float>& key,
-                const std::vector<float>& slot_score,
-                std::vector<float>& tail_k, std::vector<float>& tail_score,
-                const std::vector<float>& ape,
-                const std::vector<int32_t>& block_tables,
-                const std::vector<int32_t>& req_pool_indices,
-                const std::vector<int32_t>& positions,
-                const std::vector<int32_t>& seq_lens,
-                const std::vector<int32_t>& out_cache_loc,
-                std::vector<float>& out) {
-  for (int r = 0; r < batch; ++r) {
-    const int req_raw = req_pool_indices[r];
-    const bool req_valid = req_raw >= 0 && req_raw < n_reqs;
-    const int req = req_valid ? req_raw : std::min(std::max(req_raw, 0), n_reqs - 1);
-    const int pos_raw = positions[r];
-    const int safe_pos = std::max(pos_raw, 0);
-    const int seq_len = seq_lens[r];
-    const int cache_loc = out_cache_loc[r];
-    const bool pos_valid = req_valid && cache_loc != 0 && pos_raw >= 0 &&
-                           pos_raw < seq_len;
-    const int slot = safe_pos % pool_size;
-    const int phys_slot = ((safe_pos % tail_size) + tail_size) % tail_size;
-    const float* cur_k = key.data() + (size_t)r * head_dim;
-    const float* cur_s = slot_score.data() + (size_t)r * head_dim;
-    if (pos_valid && slot == pool_size - 1) {
-      const int pool_logical_start = safe_pos - slot;
-      std::vector<float> mx(head_dim, -kInf);
-      for (int p = 0; p < pool_size; ++p) {
-        const int phys = ((pool_logical_start + p) % tail_size + tail_size) % tail_size;
-        const float* sb = tail_score.data() + (size_t)req * tail_size * head_dim
-                                            + (size_t)phys * head_dim;
-        for (int d = 0; d < head_dim; ++d) {
-          const float s = (p == slot ? cur_s[d] : sb[d]) + ape[p * head_dim + d];
-          mx[d] = std::max(mx[d], s);
-        }
-      }
-      std::vector<float> acc(head_dim, 0.0f), denom(head_dim, 0.0f);
-      for (int p = 0; p < pool_size; ++p) {
-        const int phys = ((pool_logical_start + p) % tail_size + tail_size) % tail_size;
-        const float* sb = tail_score.data() + (size_t)req * tail_size * head_dim
-                                            + (size_t)phys * head_dim;
-        const float* kb = tail_k.data() + (size_t)req * tail_size * head_dim
-                                        + (size_t)phys * head_dim;
-        for (int d = 0; d < head_dim; ++d) {
-          const float s = (p == slot ? cur_s[d] : sb[d]) + ape[p * head_dim + d];
-          const float prob = std::exp(s - mx[d]);
-          denom[d] += prob;
-          acc[d] += (p == slot ? cur_k[d] : kb[d]) * prob;
-        }
-      }
-      std::vector<float> mean(head_dim), h(128);
-      for (int d = 0; d < head_dim; ++d) mean[d] = acc[d] / denom[d];
-      apply_dense_hadamard(mean, h);
-      const int pool_id = safe_pos / pool_size;
-      const int pool_page_group = pool_id / slots_per_page;
-      int tpr = std::min(std::max(pool_page_group * pool_size, 0), block_table_cols - 1);
-      const int packed_page = block_tables[(size_t)r * block_table_cols + tpr];
-      const int loc_slot = pool_id % slots_per_page;
-      float* dst = out.data() + (size_t)packed_page * slots_per_page * head_dim
-                             + (size_t)loc_slot * head_dim;
-      for (int d = 0; d < head_dim; ++d) dst[d] = h[d];
-    }
-    if (pos_valid) {
-      float* tk = tail_k.data() + (size_t)req * tail_size * head_dim
-                                 + (size_t)phys_slot * head_dim;
-      float* ts = tail_score.data() + (size_t)req * tail_size * head_dim
-                                     + (size_t)phys_slot * head_dim;
-      for (int d = 0; d < head_dim; ++d) { tk[d] = cur_k[d]; ts[d] = cur_s[d]; }
-    }
-  }
-}
-
-}  // namespace
 
 // ----------------------------------------------------------------------------
 // Arithmetic helpers
@@ -471,10 +293,11 @@ TEST(DsaKpool, AssembleMatchesReference) {
                            req_pool_idx.data(), n_from_tail.data(),
                            chunk_src_start.data(), tail_logical_base.data(),
                            loc.data(), nullptr, out.data());
-    assemble_ref(c.n_pools, c.pool_size, H, c.tail_size, c.ssp, c.num_chunks,
-                 c.n_reqs, chunk_k, chunk_score, tail_k, tail_score, ape,
-                 req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base,
-                 loc, nullptr, rout);
+    dsa_kpool_ref::assemble_ref(c.n_pools, c.pool_size, H, c.tail_size,
+                                c.ssp, chunk_k, chunk_score, tail_k,
+                                tail_score, ape, req_pool_idx, n_from_tail,
+                                chunk_src_start, tail_logical_base, loc,
+                                nullptr, rout);
     float maxd = 0.0f;
     for (size_t i = 0; i < out.size(); ++i)
       maxd = std::max(maxd, std::fabs(out[i] - rout[i]));
@@ -529,10 +352,11 @@ TEST(DsaKpool, DecodeMatchesReference) {
                                 block_tables.data(), req_pool_indices.data(),
                                 positions.data(), seq_lens.data(),
                                 out_cache_loc.data(), out.data());
-    decode_ref(c.batch, c.pool_size, H, c.tail_size, c.ssp, c.btc, c.n_reqs,
-               key, slot_score, tail_k_ref, tail_score_ref,
-               ape, block_tables, req_pool_indices, positions, seq_lens,
-               out_cache_loc, rout);
+    dsa_kpool_ref::decode_ref(c.batch, c.pool_size, H, c.tail_size, c.ssp,
+                              c.btc, c.n_reqs, key, slot_score, tail_k_ref,
+                              tail_score_ref, ape, block_tables,
+                              req_pool_indices, positions, seq_lens,
+                              out_cache_loc, rout);
     float maxd = 0.0f;
     for (size_t i = 0; i < out.size(); ++i)
       maxd = std::max(maxd, std::fabs(out[i] - rout[i]));
@@ -620,3 +444,4 @@ TEST(DsaKpool, DecodeBlockTablesOutOfRangeThrows) {
                                            sl.data(), ocl.data(), key.data()),
                std::invalid_argument);
 }
+

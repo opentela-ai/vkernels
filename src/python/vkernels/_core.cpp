@@ -730,6 +730,91 @@ PYBIND11_MODULE(_core, m) {
       "the live tail unconditionally (no-op when invalid). Device ABI "
       "is bf16; the integrator converts.");
 
+  // Issue #61: fp8+scale store variants (CPU references). The compressed K
+  // is written as head_dim fp8e4m3fn bytes + one fp32 scale per vector into
+  // the legacy uint8 cache [num_pages, ssp*(128+4)]. cache_u8 is a uint8
+  // numpy buffer (zeroed first). round_scale_or_null is an optional float32
+  // scalar array; *it > 0 selects power-of-two scale rounding.
+  kernels.def(
+      "dsa_kpool_assemble_fp8",
+      [](int num_chunks, int n_pools, int pool_size, int head_dim,
+         int tail_size, int slots_per_page, int num_pages, int n_reqs,
+         FloatArray chunk_k, FloatArray chunk_score, FloatArray tail_k,
+         FloatArray tail_score, FloatArray ape, I32Array req_pool_idx,
+         I32Array n_from_tail, I32Array chunk_src_start,
+         I32Array tail_logical_base, I32Array loc,
+         std::optional<I32Array> write_mask, ByteArray cache_u8,
+         std::optional<FloatArray> round_scale_or_null) {
+        require_writeable(cache_u8);
+        float* rs = nullptr;
+        if (round_scale_or_null.has_value()) {
+          rs = const_cast<float*>(round_scale_or_null->data());
+        }
+        kernels::dsa_kpool_assemble_fp8_cpu(
+            n_pools, pool_size, head_dim, tail_size, slots_per_page,
+            num_pages, num_chunks, n_reqs, chunk_k.data(),
+            chunk_score.data(), tail_k.data(), tail_score.data(),
+            ape.data(), req_pool_idx.data(), n_from_tail.data(),
+            chunk_src_start.data(), tail_logical_base.data(), loc.data(),
+            write_mask.has_value() ? write_mask->data() : nullptr,
+            cache_u8.mutable_data(), rs);
+        return cache_u8;
+      },
+      py::arg("num_chunks"), py::arg("n_pools"), py::arg("pool_size"),
+      py::arg("head_dim"), py::arg("tail_size"),
+      py::arg("slots_per_page"), py::arg("num_pages"), py::arg("n_reqs"),
+      py::arg("chunk_k"), py::arg("chunk_score"), py::arg("tail_k"),
+      py::arg("tail_score"), py::arg("ape"), py::arg("req_pool_idx"),
+      py::arg("n_from_tail"), py::arg("chunk_src_start"),
+      py::arg("tail_logical_base"), py::arg("loc"),
+      py::arg("write_mask") = py::none(),
+      py::arg("cache_u8"), py::arg("round_scale_or_null") = py::none(),
+      "DSA kpool-cache assemble + rotate + write FP8+scale (CPU reference). "
+      "Same gather/softmax/Hadamard as dsa_kpool_assemble, but the output "
+      "is the legacy uint8 cache [num_pages, ssp*(128+4)] with 128 fp8e4m3 "
+      "bytes + one fp32 scale per vector. cache_u8 must be zeroed first; "
+      "round_scale_or_null is an optional length-1 float32 scalar (>0 -> "
+      "power-of-two scale rounding).");
+
+  kernels.def(
+      "dsa_kpool_decode_update_fp8",
+      [](int batch, int pool_size, int head_dim, int tail_size,
+         int slots_per_page, int block_table_cols, int n_reqs,
+         int num_pages, FloatArray key, FloatArray slot_score,
+         FloatArray tail_k, FloatArray tail_score, FloatArray ape,
+         I32Array block_tables, I32Array req_pool_idx, I32Array positions,
+         I32Array seq_lens, I32Array out_cache_loc, ByteArray cache_u8,
+         std::optional<FloatArray> round_scale_or_null) {
+        require_writeable(cache_u8);
+        require_writeable(tail_k);  // written IN PLACE
+        require_writeable(tail_score);
+        float* rs = nullptr;
+        if (round_scale_or_null.has_value()) {
+          rs = const_cast<float*>(round_scale_or_null->data());
+        }
+        kernels::dsa_kpool_decode_update_fp8_cpu(
+            batch, pool_size, head_dim, tail_size, slots_per_page,
+            block_table_cols, n_reqs, num_pages, key.data(),
+            slot_score.data(), tail_k.mutable_data(),
+            tail_score.mutable_data(), ape.data(), block_tables.data(),
+            req_pool_idx.data(), positions.data(), seq_lens.data(),
+            out_cache_loc.data(), cache_u8.mutable_data(), rs);
+        return cache_u8;
+      },
+      py::arg("batch"), py::arg("pool_size"), py::arg("head_dim"),
+      py::arg("tail_size"), py::arg("slots_per_page"),
+      py::arg("block_table_cols"), py::arg("n_reqs"), py::arg("num_pages"),
+      py::arg("key"), py::arg("slot_score"), py::arg("tail_k"),
+      py::arg("tail_score"), py::arg("ape"), py::arg("block_tables"),
+      py::arg("req_pool_idx"), py::arg("positions"), py::arg("seq_lens"),
+      py::arg("out_cache_loc"), py::arg("cache_u8"),
+      py::arg("round_scale_or_null") = py::none(),
+      "DSA kpool-cache decode update + maybe-write FP8+scale (CPU reference). "
+      "Same pool-complete gate and in-place live-tail update as "
+      "dsa_kpool_decode_update, but the compressed K is written as 128 "
+      "fp8e4m3 bytes + one fp32 scale per vector into cache_u8 "
+      "[num_pages, ssp*(128+4)]. cache_u8 must be zeroed first.");
+
   // --- MHC: multi-head hybrid-attention pre-norm (issue #51, part 2) ------
   //
   // The two MHC kernels (mhc_pre_gemm_sqrsum + mhc_post), fp32 CPU
