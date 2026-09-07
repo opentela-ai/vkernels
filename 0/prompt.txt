@@ -1,0 +1,45 @@
+Can we investigate https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html, and see if some of our kernels can be implemented in cutedsl?
+
+---
+
+Can we translate those AMD kernels onto nvidia platform, and then compare the performance?
+
+---
+
+you can ssh ds5 to test
+
+---
+
+goggogo
+
+---
+
+Port the remaining
+
+---
+
+continue
+
+---
+
+continue
+
+---
+
+continue
+
+---
+
+continue
+
+---
+
+continue
+
+---
+
+continue
+
+---
+
+continue
