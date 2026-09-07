@@ -329,3 +329,59 @@ void dsa_topk_logits_with_variant(int batch_size, int num_heads, int head_dim,
 
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP
+
+#if VKERNELS_HAS_CUDA
+namespace vkernels::kernels::cuda {
+
+// CUDA sparse-MLA forward? No -- only the top-k LOGITS indexer is ported
+// to NVIDIA (see below). The sparse-MLA forward itself (dsa_sparse_fwd in
+// the HIP section above) is the value-combine stage that FEEDS off these
+// logits and remains HIP-only for now; the dsa.cu port covers the indexer
+// stage whose wmma kernel is the GB10 counterpart of gfx942's MFMA.
+
+// DSA paged-MQA gated top-k logits (NVIDIA, issue #51 CUDA port): same
+// computation as dsa_topk_logits_cpu / hip::dsa_topk_logits (see above for
+// the formula and the left-unwritten contract), but the caller passes the
+// FP8 e4m3fnuz Q/K raw and the device dequants on load (mirrors the HIP
+// path). Dispatches on GB10's opt-in dynamic-LDS cap (101,376 B, HONOURED
+// via cudaFuncAttributeMaxDynamicSharedMemorySize -- unlike gfx942's 64 KB
+// non-optin cap, see the KB note mi300a-dynamic-lds-no-optin): the bf16
+// wmma kernel (smallest footprint, Matrix-Core) takes the fast path at
+// every width it fits (kTh=(B/16)*(H/16)*32 <= 1024); shapes the wmma
+// kernel refuses but the fp32-Q kernel fits take that; shapes fitting
+// NEITHER but the fp8-Q kernel (Q staged raw, dequantised on the fly --
+// bit-identical output) take the fallback; shapes fitting NONE are refused
+// (a stderr diagnostic + no-op, leaving `out` as the caller provided).
+//
+// `q_fp8`/`kvcache_u8` are fp8 e4m3fnuz device pointers; `kvcache_u8` is the
+// `(num_blocks, block*(head_dim+4))` uint8 view (B*D fp8 keys, then B fp32
+// per-token scales). `weight`/`seq_lens`/`page_table` are fp32/int32 device
+// pointers; `out` is fp32 device (ZERO the output first).
+void dsa_topk_logits(int batch_size, int num_heads, int head_dim, int block,
+                     int max_table_len, int max_seq_len, int split_kv,
+                     const void* q_fp8, const void* kvcache_u8,
+                     const void* weight, const void* seq_lens,
+                     const void* page_table, void* out);
+
+// Explicit-variant entry point (offline-autotuner / correctness hook),
+// mirroring hip::dsa_topk_logits_with_variant exactly:
+//   variant 0 -> auto (wmma-if-fits, else fp32q-if-fits, else fp8q-if-fits,
+//                      else refuse); identical to dsa_topk_logits
+//   variant 1 -> dsa_topk_logits_kernel        (fp32-Q)
+//   variant 2 -> dsa_topk_logits_kernel_fp8q    (fp8-Q)
+//   variant 3 -> dsa_topk_logits_kernel_wmma    (bf16 wmma)
+// An explicit variant (1/2/3) that does NOT fit the shape's LDS cap is
+// refused with a stderr diagnostic + no-op (the caller zeroed `out`, which
+// is what stays) rather than launch a block the driver would drop --
+// mirrors dsa_topk_logits's contract. Same pointers/contract as
+// dsa_topk_logits.
+void dsa_topk_logits_with_variant(int batch_size, int num_heads, int head_dim,
+                                  int block, int max_table_len,
+                                  int max_seq_len, int split_kv,
+                                  const void* q_fp8, const void* kvcache_u8,
+                                  const void* weight, const void* seq_lens,
+                                  const void* page_table, void* out,
+                                  int variant);
+
+}  // namespace vkernels::kernels::cuda
+#endif  // VKERNELS_HAS_CUDA

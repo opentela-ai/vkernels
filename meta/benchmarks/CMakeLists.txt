@@ -365,3 +365,44 @@ if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
     ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
   vkernels_set_warnings(dsa_kpool_bench)
 endif()
+
+# bf16 GEMM correctness + benchmark on NVIDIA (issue #29 CUDA port): the
+# CUDA wmma kernel (vkernels/kernels/gemm_bf16.cu, a native .cu added to
+# libvkernels under VKERNELS_HAS_CUDA) and these native .cu harnesses build
+# when a CUDA toolkit is present and ROCm is not (same gate as the kpool
+# block above; on a dual-GPU box the .hip versions under VKERNELS_HAS_HIP
+# already provide test_gemm_bf16_correct / gemm_bf16_bench, so the native
+# CUDA port is skipped to avoid duplicate target names). No HIP compat
+# shim is needed -- these are plain CUDA TUs using <cuda_runtime.h>/<mma.h>.
+if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+  add_executable(test_gemm_bf16_correct test_gemm_bf16_correct.cu)
+  target_link_libraries(test_gemm_bf16_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_gemm_bf16_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_gemm_bf16_correct)
+
+  add_executable(gemm_bf16_bench bench_gemm_bf16.cu)
+  target_link_libraries(gemm_bf16_bench PRIVATE vkernels::vkernels)
+  target_compile_features(gemm_bf16_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(gemm_bf16_bench)
+endif()
+
+# DSA paged-MQA gated top-k logits correctness + benchmark on NVIDIA
+# (issue #51 CUDA port): the CUDA wmma kernel (vkernels/kernels/dsa.cu,
+# a native .cu added to libvkernels under VKERNELS_HAS_CUDA) and these
+# native .cu harnesses build when a CUDA toolkit is present and ROCm is
+# not (same gate as the gemm_bf16 block above; on a dual-GPU box the .hip
+# versions under VKERNELS_HAS_HIP already provide test_dsa_topk_correct /
+# dsa_topk_logits_bench, so the native CUDA port is skipped to avoid
+# duplicate target names). No HIP compat shim is needed -- these are
+# plain CUDA TUs using <cuda_runtime.h>/<mma.h>.
+if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+  add_executable(test_dsa_topk_correct_cuda test_dsa_topk_correct.cu)
+  target_link_libraries(test_dsa_topk_correct_cuda PRIVATE vkernels::vkernels)
+  target_compile_features(test_dsa_topk_correct_cuda PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_dsa_topk_correct_cuda)
+
+  add_executable(dsa_topk_logits_bench_cuda bench_dsa_topk_logits.cu)
+  target_link_libraries(dsa_topk_logits_bench_cuda PRIVATE vkernels::vkernels)
+  target_compile_features(dsa_topk_logits_bench_cuda PRIVATE cxx_std_17)
+  vkernels_set_warnings(dsa_topk_logits_bench_cuda)
+endif()

@@ -61,6 +61,8 @@ if(VKERNELS_HAS_CUDA)
       vkernels/kernels/elementwise.cu
       vkernels/kernels/reduce.cu
       vkernels/kernels/gemm.cu
+      vkernels/kernels/gemm_bf16.cu
+      vkernels/kernels/dsa.cu
       vkernels/comm/allreduce.cu
       vkernels/comm/p2p_gather.cu
       vkernels/comm/p2p_kv_restore.cu
