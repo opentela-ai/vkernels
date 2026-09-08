@@ -1,0 +1,13 @@
+Can we benchmark the performance of existing kernels on beverin? Particularly those related to glm-5.3-flash.
+
+---
+
+how can we further improve this?
+
+---
+
+yes continue
+
+---
+
+we can also look into if https://github.com/rocm/flydsl can help
