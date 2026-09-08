@@ -91,6 +91,17 @@ if(VKERNELS_HAS_CUDA)
     target_sources(vkernels PRIVATE ${VKERNELS_CUDA_HIP_SOURCES})
     target_include_directories(vkernels PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/vkernels/kernels/cuda_compat)
+    # Extern "C" entry points so ctypes consumers (the sglang serving image)
+    # can reach the nvcc-compiled device kernels: same names/contracts as
+    # hip_capi.hpp (one loader serves both backends). See
+    # capi/cuda_capi_kpool.cpp. Goes into the SHARED `vkernels_c` (added
+    # below); the per-source VKERNELS_HAS_HIP=1 exposes the
+    # vkernels::kernels::hip declarations from dsa_kpool.hpp to this host TU.
+    set(VKERNELS_CUDA_KPOOL_CAPI_SRC vkernels/capi/cuda_capi_kpool.cpp)
+    set_source_files_properties(${VKERNELS_CUDA_KPOOL_CAPI_SRC} PROPERTIES
+      COMPILE_DEFINITIONS VKERNELS_HAS_HIP=1)
+  else()
+    unset(VKERNELS_CUDA_KPOOL_CAPI_SRC)
   endif()
 
   # fabric_import.cu is the only translation unit using the CUDA *driver*
@@ -124,7 +135,10 @@ if(VKERNELS_HAS_CUDA)
     vkernels/comm/fabric_import_c.cpp
     vkernels/comm/fabric_import_c.cu
     vkernels/comm/cross_node_kv_c.cu
-    vkernels/comm/cross_node_kv_allgather_c.cu)
+    vkernels/comm/cross_node_kv_allgather_c.cu
+    # kpool device C ABI (issue #60 A100 serving path; empty on ROCm builds,
+    # where hip_capi.cpp owns the vk_hip_* symbols).
+    ${VKERNELS_CUDA_KPOOL_CAPI_SRC})
   add_library(vkernels::vkernels_c ALIAS vkernels_c)
   target_link_libraries(vkernels_c PRIVATE vkernels)
   target_include_directories(vkernels_c PRIVATE
