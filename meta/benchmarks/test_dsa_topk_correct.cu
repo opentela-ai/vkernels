@@ -17,11 +17,12 @@
 //
 // Method. The source Q and K are torch.float8_e4m3fnuz (raw uint8). The
 // harness generates fp8 bytes directly, then BOTH paths dequant them via the
-// SAME helper (fp8e4m3fnuz_to_f32 -- copied verbatim into the anonymous
-// namespace below): the CPU oracle runs on the host-dequanted fp32, the
-// device kernel dequants on load. With identical dequant, the only residual
-// is FMA vs IEEE mul+add over the D-dot and H-sum (a few ULP), so we require
-// max_rel < 1e-3 (same convention as test_dsa_topk_correct.hip).
+// SAME helper (fp8e4m3fnuz_to_f32 -- the shared definition in
+// device_numeric.cuh, the one the device kernels load through too): the CPU
+// oracle runs on the host-dequanted fp32, the device kernel dequants on
+// load. With identical dequant, the only residual is FMA vs IEEE mul+add
+// over the D-dot and H-sum (a few ULP), so we require max_rel < 1e-3 (same
+// convention as test_dsa_topk_correct.hip).
 //
 // Invariant (the caller contract the kernel relies on): page_table[b,i] is
 // VALID (in [0, num_blocks)) for every used slot i < ceildiv(seq_len, B).
@@ -43,6 +44,7 @@
 #include <vector>
 
 #include "vkernels/kernels/dsa.hpp"
+#include "vkernels/kernels/device_numeric.cuh"  // fp8e4m3fnuz_to_f32 (shared)
 
 #define CK(e, m)                                                       \
   do {                                                                 \
@@ -75,28 +77,9 @@ uint8_t rnd_fp8(int seed, int i) {
   return b;
 }
 
-// fp8 e4m3fnuz -> fp32. VERBATIM copy of fp8e4m3fnuz_to_f32 in
-// moe_device.hip (__host__ __device__); the harness dequants on the host,
-// the device kernel dequants on load via its own copy. Both MUST agree --
-// the kernel's docstring asserts this, and we cross-check it here.
-__host__ __device__ __forceinline__ float fp8e4m3fnuz_to_f32(uint8_t b) {
-  const uint32_t s = static_cast<uint32_t>(b >> 7) & 1u;     // sign
-  const uint32_t e = static_cast<uint32_t>(b >> 3) & 0xFu;   // exponent (bias 8)
-  const uint32_t m = static_cast<uint32_t>(b) & 0x7u;        // mantissa (3)
-  if ((b & 0x7Fu) == 0u) return 0.0f;                        // +0 (0x00 AND 0x80)
-  float f;
-  if (e == 15u && m == 7u) {                                 // 0x7F = NaN -> qNaN
-    const uint32_t qnan = 0x7fc00000u;
-    __builtin_memcpy(&f, &qnan, sizeof(f));
-  } else if (e == 0u) {                                      // subnormal: m*2^-7
-    const float v = static_cast<float>(m) * 0x1p-7f;         // m*2^(1-8), exact
-    f = s ? -v : v;
-  } else {                                                   // normal: 2^(e-8)*(1+m/8)
-    const uint32_t bits = (s << 31) | ((e + 119u) << 23) | (m << 20);
-    __builtin_memcpy(&f, &bits, sizeof(f));
-  }
-  return f;
-}
+// fp8 e4m3fnuz -> fp32 comes from device_numeric.cuh (the single definition
+// every device TU and harness dequants through).
+using vkernels::kernels::fp8e4m3fnuz_to_f32;
 
 struct Stats { double max_abs, max_rel; };
 

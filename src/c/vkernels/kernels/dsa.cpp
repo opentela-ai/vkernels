@@ -222,18 +222,13 @@ void dsa_topk_logits_cpu(int batch_size, int num_heads, int head_dim, int block,
 // has NO hipFuncSetAttribute opt-in past 64 KB -- see the KB note
 // mi300a-dynamic-lds-no-optin; the fp8-Q variant below is the path for
 // larger H). All-int so the host build (WARNINGS_AS_ERROR) stays clean.
-bool dsa_topk_logits_fits_lds(int num_heads, int head_dim, int block) {
-  // gfx942 (MI300A) non-optin dynamic-LDS cap; EQUALS the opt-in ceiling
-  // (hipFuncSetAttribute(MaxDynamicSharedMemorySize, N>65536) is a silent
-  // no-op, verified on a CSCS beverin node). Larger H falls back to the
-  // fp8-Q variant instead of raising this cap. See dsa.hpp and the KB note
-  // mi300a-dynamic-lds-no-optin.
-  static constexpr int kDsaTopkLDSNonOptinCap = 64 * 1024;
+bool dsa_topk_logits_fits_lds(int num_heads, int head_dim, int block,
+                              int lds_cap) {
   // The kernel stages Q (H*D), the gate (H), one K tile (B*D) and its
   // per-token scales (B), all fp32 -> 4 bytes/element (see dsa.hpp).
   const int bytes =
       (num_heads * head_dim + num_heads + block * head_dim + block) * 4;
-  return bytes > 0 && bytes <= kDsaTopkLDSNonOptinCap;
+  return bytes > 0 && bytes <= lds_cap;
 }
 
 // Whether the indexer shape fits gfx942's 64 KB non-optin dynamic-LDS cap
@@ -246,11 +241,11 @@ bool dsa_topk_logits_fits_lds(int num_heads, int head_dim, int block) {
 // (H=64, D=128, B=64) that is 41,472 B < the fp32-Q kernel's 66,048 B.
 // All-int, same cap constant as above. See dsa.hpp and the host unit test
 // tests/kernels/attn/test_dsa.cpp::DsaTopk::FitsLdsFp8q.
-bool dsa_topk_logits_fits_lds_fp8q(int num_heads, int head_dim, int block) {
-  static constexpr int kDsaTopkLDSNonOptinCap = 64 * 1024;
+bool dsa_topk_logits_fits_lds_fp8q(int num_heads, int head_dim, int block,
+                                   int lds_cap) {
   const int bytes =
       (num_heads + block * head_dim + block) * 4 + num_heads * head_dim;
-  return bytes > 0 && bytes <= kDsaTopkLDSNonOptinCap;
+  return bytes > 0 && bytes <= lds_cap;
 }
 
 // Whether the indexer shape fits gfx942's 64 KB non-optin dynamic-LDS cap
@@ -267,18 +262,44 @@ bool dsa_topk_logits_fits_lds_fp8q(int num_heads, int head_dim, int block) {
 // H=32; 25,088 B at H=64; 41,728 B at H=128). The verified 16x16x16bf16_1k
 // fragment needs exact multiples, so this is FALSE unless num_heads % 16,
 // head_dim % 64 and block % 16 are all zero (e.g. H=246 -- not a multiple
-// of 16 -- is refused, exactly as under the other two variants). All-int,
-// same cap constant as above. See dsa.hpp and the host unit test
+// of 16 -- is refused, exactly as under the other two variants). All-int.
+// See dsa.hpp and the host unit test
 // tests/kernels/attn/test_dsa.cpp::DsaTopk::FitsLdsMfma.
-bool dsa_topk_logits_fits_lds_mfma(int num_heads, int head_dim, int block) {
-  static constexpr int kDsaTopkLDSNonOptinCap = 64 * 1024;
+bool dsa_topk_logits_fits_lds_mfma(int num_heads, int head_dim, int block,
+                                   int lds_cap) {
   static constexpr int kBK = 64;   // MFMA K-tile (fixed; see dsa.hip)
   if (num_heads <= 0 || head_dim <= 0 || block <= 0) return false;
   if (num_heads % 16 != 0 || head_dim % kBK != 0 || block % 16 != 0)
     return false;   // 16x16x16bf16_1k fragment needs exact multiples
   const int bytes =
       (head_dim * num_heads + block * kBK) * 2 + (num_heads + block) * 4;
-  return bytes <= kDsaTopkLDSNonOptinCap;
+  return bytes <= lds_cap;
+}
+
+// CUDA wmma admission: the MFMA shape gates + kTh = (B/16)*(H/16)*32 <= 1024
+// (CUDA max threads/block -- each warp owns ONE [16,16] c_frag, not the kNF
+// fragments-per-lane the AMD 64-lane MFMA layout demands) and the MFMA
+// staged footprint PLUS the sAcc[B][H] fp32 buffer the store_matrix_sync
+// epilogue stages through:
+//
+//   bytes = (head_dim*num_heads + block*kBK)*2 + (num_heads + block)*4
+//         + block*num_heads*4
+//
+// At the GLM-5.3 widths (H=32/64/128, D=128, B=64) that is 24,960 / 41,472 /
+// 74,496 B. No default cap -- the kernel only exists on CUDA parts and the
+// meaningful ceiling is the device's queried sharedMemPerBlockOptin. See
+// dsa.hpp and tests/kernels/attn/test_dsa.cpp::DsaTopk::FitsLdsWmma.
+bool dsa_topk_logits_fits_lds_wmma(int num_heads, int head_dim, int block,
+                                   int lds_cap) {
+  static constexpr int kBK = 64;   // wmma K-tile (fixed; see dsa.cu)
+  if (num_heads <= 0 || head_dim <= 0 || block <= 0) return false;
+  if (num_heads % 16 != 0 || head_dim % kBK != 0 || block % 16 != 0)
+    return false;   // wmma 16x16x16 fragment needs exact multiples
+  const int kTh = (block / 16) * (num_heads / 16) * 32;  // threads per block
+  if (kTh > 1024) return false;                          // CUDA max threads/block
+  const int bytes = (head_dim * num_heads + block * kBK) * 2 +
+                    (num_heads + block) * 4 + block * num_heads * 4;
+  return bytes <= lds_cap;
 }
 
 int dsa_topk_logits_split_for(int batch_size, int max_seq_len, int block) {

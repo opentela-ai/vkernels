@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "vkernels/kernels/gemm_bf16.hpp"
+#include "vkernels/kernels/device_numeric.cuh"  // f2bf (shared, oracle-exact)
 
 // The explicit-tile dispatcher is intentionally not in the public header
 // (vkl discovery), so the harness forward-declares it here.
@@ -57,11 +58,9 @@ float rnd(int seed, int i) {  // deterministic pseudo-random in [-1, 1]
   return (float)((int)x % 200000) / 100000.0f;
 }
 
-uint16_t f2bf(float v) {
-  uint32_t b; std::memcpy(&b, &v, 4);
-  b += 0x7FFFu + ((b >> 16) & 1);
-  return (uint16_t)(b >> 16);
-}
+// bf16 round-to-nearest-even store comes from device_numeric.cuh (the one
+// definition the CPU oracle's .cpp copies and every device TU mirror).
+using vkernels::kernels::f2bf;
 
 // One shape: CPU oracle vs CUDA, alpha/beta configurable.
 struct Stats { double max_abs, max_rel; };

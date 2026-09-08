@@ -24,6 +24,7 @@
 #if VKERNELS_HAS_CUDA
 #  include <cuda_runtime.h>
 #  include <mma.h>
+#  include "vkernels/kernels/device_numeric.cuh"  // bf16<->f32 (bit-exact with the oracle)
 
 namespace vkernels::kernels::cuda {
 
@@ -31,23 +32,6 @@ using namespace nvcuda::wmma;
 
 static constexpr int kMmaK = 16;   // one bf16 wmma reduces K = 16
 static constexpr int BK    = 64;   // K-tile (fixed); every K3 K is a multiple of 64
-
-// bf16 <-> f32, bit-exact with gemm_bf16_cpu (the oracle). Replicated here so
-// the .cu TU is self-contained on a host+device build (the HIP helpers in
-// moe_device.hip are unavailable under VKERNELS_HAS_CUDA).
-static __device__ __forceinline__ uint16_t f2bf(float f) {
-  union { float f; uint32_t u; } x;
-  x.f = f;
-  uint32_t b = x.u;
-  uint32_t lsb = (b >> 16) & 1u;
-  b += 0x7FFFu + lsb;
-  return static_cast<uint16_t>(b >> 16);
-}
-static __device__ __forceinline__ float bf2f(uint16_t v) {
-  union { uint32_t u; float f; } x;
-  x.u = static_cast<uint32_t>(v) << 16;
-  return x.f;
-}
 
 // ======================================================================
 //  Tiled bf16 wmma GEMM kernel
@@ -127,13 +111,18 @@ __global__ void gemm_bf16_kernel(const uint16_t* __restrict__ A,
     const int gc = n_tile * BN + warp_c * 16 + c;
     if (gr < M && gc < N) {
       float v = alpha * sc[warp * 256 + i];
-      if (beta != 0.0f) v += beta * bf2f(C[(size_t)gr * N + gc]);
+      if (beta != 0.0f) v += beta * bf16_to_f32(C[(size_t)gr * N + gc]);
       C[(size_t)gr * N + gc] = f2bf(v);
     }
   }
 }
 
 namespace {
+
+// CUDA's default per-block shared budget (static + dynamic). Requests above
+// it must opt in per function; see launch<> below.
+constexpr int kSharedMemDefault = 48 * 1024;
+
 template <int BM, int BN>
 void launch(const uint16_t* A, const uint16_t* B, uint16_t* C,
             int M, int N, int K, float alpha, float beta) {
@@ -141,21 +130,18 @@ void launch(const uint16_t* A, const uint16_t* B, uint16_t* C,
   constexpr int kTh = kWarps * 32;
   // Per-warp fp32 accumulator staging: one 16x16 (=256) float per warp.
   constexpr int dynamic_bytes = kWarps * 16 * 16 * (int)sizeof(float);
-  // Opt in to the larger-than-default dynamic shared region ONCE per kernel
-  // instantiation. cudaFuncAttributeMaxDynamicSharedMemorySize is a
-  // per-context, per-function attribute that persists, so setting it on
-  // every launch (as in a timing loop) perturbs the event clock and can
-  // make cudaEventElapsedTime return 0. Needed only when static sA/sB +
-  // dynamic sc exceed the 48 KB default per-block cap (e.g. the 64x128
-  // tile: 24 KB static + 32 KB dynamic = 56 KB); harmless for smaller tiles
-  // (all stay under sharedMemPerBlockOptin, ~99 KB on GB10).
-  static const bool inited = [] {
+  constexpr int static_bytes = (BM * BK + BK * BN) * (int)sizeof(uint16_t);
+  // Opt in only when the tile's static sA/sB + dynamic sc request exceeds
+  // the 48 KB default per-block budget (the 64x128 tile: 24 KB static +
+  // 32 KB dynamic = 56 KB). The attribute is PER-DEVICE state, so a
+  // process-lifetime set -- the static-init this replaces -- silently
+  // leaves every other device in a multi-GPU process unconfigured; setting
+  // it per launch is a cheap host-side call and small tiles never pay it.
+  if (static_bytes + dynamic_bytes > kSharedMemDefault) {
     cudaFuncSetAttribute((const void*)gemm_bf16_kernel<BM, BN>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          dynamic_bytes);
-    return true;
-  }();
-  (void)inited;
+  }
   dim3 block(kTh);
   dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN);  // x = M-tiles, y = N-tiles
   gemm_bf16_kernel<BM, BN><<<grid, block, dynamic_bytes, 0>>>(

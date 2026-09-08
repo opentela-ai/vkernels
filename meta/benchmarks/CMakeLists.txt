@@ -369,33 +369,30 @@ endif()
 # bf16 GEMM correctness + benchmark on NVIDIA (issue #29 CUDA port): the
 # CUDA wmma kernel (vkernels/kernels/gemm_bf16.cu, a native .cu added to
 # libvkernels under VKERNELS_HAS_CUDA) and these native .cu harnesses build
-# when a CUDA toolkit is present and ROCm is not (same gate as the kpool
-# block above; on a dual-GPU box the .hip versions under VKERNELS_HAS_HIP
-# already provide test_gemm_bf16_correct / gemm_bf16_bench, so the native
-# CUDA port is skipped to avoid duplicate target names). No HIP compat
+# whenever a CUDA toolkit is present. The _cuda suffix keeps them distinct
+# from the HIP harnesses, so both stacks build side by side on a dual-toolkit
+# box (the dsa CUDA block below follows the same convention). No HIP compat
 # shim is needed -- these are plain CUDA TUs using <cuda_runtime.h>/<mma.h>.
-if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
-  add_executable(test_gemm_bf16_correct test_gemm_bf16_correct.cu)
-  target_link_libraries(test_gemm_bf16_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_gemm_bf16_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_gemm_bf16_correct)
+if(VKERNELS_HAS_CUDA)
+  add_executable(test_gemm_bf16_correct_cuda test_gemm_bf16_correct.cu)
+  target_link_libraries(test_gemm_bf16_correct_cuda PRIVATE vkernels::vkernels)
+  target_compile_features(test_gemm_bf16_correct_cuda PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_gemm_bf16_correct_cuda)
 
-  add_executable(gemm_bf16_bench bench_gemm_bf16.cu)
-  target_link_libraries(gemm_bf16_bench PRIVATE vkernels::vkernels)
-  target_compile_features(gemm_bf16_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(gemm_bf16_bench)
+  add_executable(gemm_bf16_bench_cuda bench_gemm_bf16.cu)
+  target_link_libraries(gemm_bf16_bench_cuda PRIVATE vkernels::vkernels)
+  target_compile_features(gemm_bf16_bench_cuda PRIVATE cxx_std_17)
+  vkernels_set_warnings(gemm_bf16_bench_cuda)
 endif()
 
 # DSA paged-MQA gated top-k logits correctness + benchmark on NVIDIA
 # (issue #51 CUDA port): the CUDA wmma kernel (vkernels/kernels/dsa.cu,
 # a native .cu added to libvkernels under VKERNELS_HAS_CUDA) and these
-# native .cu harnesses build when a CUDA toolkit is present and ROCm is
-# not (same gate as the gemm_bf16 block above; on a dual-GPU box the .hip
-# versions under VKERNELS_HAS_HIP already provide test_dsa_topk_correct /
-# dsa_topk_logits_bench, so the native CUDA port is skipped to avoid
-# duplicate target names). No HIP compat shim is needed -- these are
-# plain CUDA TUs using <cuda_runtime.h>/<mma.h>.
-if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+# native .cu harnesses build whenever a CUDA toolkit is present, under the
+# same _cuda-suffix convention as the gemm_bf16 CUDA block above (both
+# stacks build side by side on a dual-toolkit box). No HIP compat shim is
+# needed -- these are plain CUDA TUs using <cuda_runtime.h>/<mma.h>.
+if(VKERNELS_HAS_CUDA)
   add_executable(test_dsa_topk_correct_cuda test_dsa_topk_correct.cu)
   target_link_libraries(test_dsa_topk_correct_cuda PRIVATE vkernels::vkernels)
   target_compile_features(test_dsa_topk_correct_cuda PRIVATE cxx_std_17)

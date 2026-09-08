@@ -59,6 +59,7 @@
 
 #if VKERNELS_HAS_HIP
 #  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
+#  include "vkernels/kernels/dsa_topk_device.cuh"  // shared scalar dsa_topk_logits kernels
 #  include <hip/hip_runtime.h>
 
 namespace vkernels::kernels::hip {
@@ -280,172 +281,11 @@ void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
 //  kernel NEVER returns for num_heads in {32,64}) and deep_gemm's CUDA-only
 //  fp8_paged_mqa_logits.
 //
-//  One wavefront (B lanes) per (batch, split_kv) block stages Q (H*D fp32)
-//  and the per-head gate (H fp32) once, then -- per page -- one K tile
-//  (B*D fp8->fp32) and the B per-token scales (fp32, packed in the trailing
-//  B*4 bytes of each KV block). Total shared = (H*D + H + B*D + B) * 4 =
-//  49,536 B at the GLM-5.3 config (H=32, D=128, B=64) -- UNDER the 64 KB
-//  non-optin LDS cap, so NO hipFuncSetAttribute opt-in is needed (gfx942's
-//  opt-in ceiling EQUALS the non-optin cap, 65,536 B, verified on a CSCS
-//  beverin node -- see the KB note mi300a-dynamic-lds-no-optin; the MHC
-//  256 KB bug was a *static* over-allocation, not a dynamic-LDS opt-in).
-//  Larger H (e.g. 64 -> 66,048 B) exceeds this fp32-Q cap, so the launcher
-//  dispatches dsa_topk_logits_kernel_fp8q below -- Q staged as RAW fp8,
-//  dequantised on the fly in the dot loop with the SAME helper, so the
-//  output is bit-identical to this kernel, total (H + B*D + B)*4 + H*D
-//  bytes = 41,472 B at H=64. Shapes exceeding BOTH variants are REFUSED
-//  (a stderr diagnostic + no-op; the caller zeroed `out`, which is what
-//  stays) rather than launch a block the driver silently drops. Each lane owns ONE KV token (j = lane), reuses the staged K
-//  across all H heads, and writes out[b, i*B+lane] only when
-//  t = i*B+lane < seq_len[b] (the caller ZEROES the output first). The
-//  grid's split_kv slices [0, ceildiv(seq_len, B)) across the split blocks
-//  and is perf-only (the grouped logit is grouping-independent, mirroring
-//  the forward's block_I/inner_iter).
-//
-//  This is the simple, correct baseline (one lane per key, sequential H-sum,
-//  K staged once per page and reused across all H heads) -- the topk's
-//  counterpart to dsa_sparse_fwd's "one query row per wavefront, one key at
-//  a time". A tiled-key / MFMA-fp8 prefetch is a follow-on optimisation,
-//  not required for correctness.
+//  The two scalar variants -- dsa_topk_logits_kernel (fp32-Q) and
+//  dsa_topk_logits_kernel_fp8q (raw-fp8-Q fallback) -- are the shared
+//  definitions in dsa_topk_device.cuh, byte-identical to the ones the CUDA
+//  TU (dsa.cu) launches. Only the MFMA fast path below is gfx942-specific.
 // ---------------------------------------------------------------------------
-__global__ void dsa_topk_logits_kernel(
-    const uint8_t* __restrict__ q_fp8,
-    const uint8_t* __restrict__ kvcache_u8,
-    const float* __restrict__ weight,
-    const int32_t* __restrict__ seq_lens,
-    const int32_t* __restrict__ page_table,
-    float* __restrict__ out,
-    int H, int D, int B, int max_table_len, int max_seq_len, int split_kv) {
-  const int b = blockIdx.x;
-  const int pid_split = blockIdx.y;
-  const int lane = threadIdx.x;                // 0..B-1 -> KV token j
-
-  const int seq_len = seq_lens[b];
-  const int np_total = (seq_len + B - 1) / B;  // pages with content
-  const int stride = (np_total + split_kv - 1) / split_kv;
-  const int i_start = pid_split * stride;
-  const int rem = np_total - i_start;
-  const int n_iters = (rem <= 0) ? 0 : (stride < rem ? stride : rem);
-  if (n_iters <= 0) return;
-
-  extern __shared__ float smem[];
-  float* sQ = smem;                            // H * D
-  float* sGate = sQ + (size_t)H * D;           // H
-  float* sK = sGate + H;                       // B * D (reloaded per page)
-  float* sKscale = sK + (size_t)B * D;         // B
-
-  // --- cooperative load Q (H*D fp8 -> fp32) + gate (H fp32) once per block ---
-  const uint8_t* qp = q_fp8 + (size_t)b * H * D;
-  for (int idx = lane; idx < H * D; idx += B) sQ[idx] = fp8e4m3fnuz_to_f32(qp[idx]);
-  const float* gp = weight + (size_t)b * H;
-  for (int h = lane; h < H; h += B) sGate[h] = gp[h];
-  __syncthreads();
-
-  for (int it = 0; it < n_iters; ++it) {
-    const int i = i_start + it;
-    const int32_t page = page_table[(size_t)b * max_table_len + i];
-    const uint8_t* kbase = kvcache_u8 + (size_t)page * (B * (D + 4));
-    // keys: B*D fp8 e4m3fnuz (bytes [0 : B*D]); scales: B fp32 (bytes
-    // [B*D : B*(D+4)], 4-aligned). Cooperative load into shared.
-    for (int idx = lane; idx < B * D; idx += B) sK[idx] = fp8e4m3fnuz_to_f32(kbase[idx]);
-    for (int j = lane; j < B; j += B) sKscale[j] = reinterpret_cast<const float*>(kbase + B * D)[j];
-    __syncthreads();
-
-    // --- this lane owns KV token j = lane within the page ---
-    const float* kj = sK + (size_t)lane * D;
-    float acc = 0.0f;
-    for (int h = 0; h < H; ++h) {
-      const float* qh = sQ + (size_t)h * D;
-      float dot = 0.0f;
-      for (int d = 0; d < D; ++d) dot += kj[d] * qh[d];
-      acc += fmaxf(dot, 0.0f) * sGate[h];
-    }
-    const int t = i * B + lane;
-    if (t < seq_len) out[(size_t)b * max_seq_len + t] = sKscale[lane] * acc;
-
-    __syncthreads();                           // before reloading sK next iter
-  }
-}
-
-// fp8-Q variant of dsa_topk_logits_kernel for shapes whose fp32-Q staging
-// (H*D + H + B*D + B) * 4 exceeds gfx942's 64 KB non-optin dynamic-LDS cap
-// (e.g. the GLM-5.3 2x indexer H=64, D=128, B=64 -> 66,048 B). gfx942 has
-// NO hipFuncSetAttribute opt-in past 64 KB (hipFuncSetAttribute(
-// MaxDynamicSharedMemorySize, N>65536) returns hipSuccess but the launch
-// silently never runs; verified on a CSCS beverin node -- see the KB note
-// mi300a-dynamic-lds-no-optin), so instead of a driver opt-in this variant
-// stages Q as RAW fp8 e4m3fnuz (1 byte/element), dequantising on the fly in
-// the dot loop with the SAME fp8e4m3fnuz_to_f32 helper the fp32-Q kernel
-// uses at load. The dequanted Q values -- and therefore the fp32 dot
-// accumulator, the gated H-sum and the written output -- are BIT-IDENTICAL
-// to dsa_topk_logits_kernel, so the H=32 cross-check (max_rel < 1e-3 in
-// meta/benchmarks/test_dsa_topk_correct.hip) carries over unchanged. Staging
-// drops to (H + B*D + B) * 4 + H*D bytes = 41,472 B at H=64 (37,248 B at
-// H=32, though the fp32-Q kernel remains the fast path there -- Q dequanted
-// once, not per dot). Each lane owns ONE KV token (j = lane) as in the
-// fp32-Q kernel; only the Q storage layout differs.
-__global__ void dsa_topk_logits_kernel_fp8q(
-    const uint8_t* __restrict__ q_fp8,
-    const uint8_t* __restrict__ kvcache_u8,
-    const float* __restrict__ weight,
-    const int32_t* __restrict__ seq_lens,
-    const int32_t* __restrict__ page_table,
-    float* __restrict__ out,
-    int H, int D, int B, int max_table_len, int max_seq_len, int split_kv) {
-  const int b = blockIdx.x;
-  const int pid_split = blockIdx.y;
-  const int lane = threadIdx.x;                // 0..B-1 -> KV token j
-
-  const int seq_len = seq_lens[b];
-  const int np_total = (seq_len + B - 1) / B;  // pages with content
-  const int stride = (np_total + split_kv - 1) / split_kv;
-  const int i_start = pid_split * stride;
-  const int rem = np_total - i_start;
-  const int n_iters = (rem <= 0) ? 0 : (stride < rem ? stride : rem);
-  if (n_iters <= 0) return;
-
-  // fp8-Q staging: the gate, one K tile and its per-token scales as fp32
-  // (naturally aligned -- they come first), then Q as RAW fp8 bytes
-  // (dequantised on the fly in the dot loop below).
-  extern __shared__ float smem[];
-  float* sGate = smem;                         // H
-  float* sK = sGate + H;                       // B * D (reloaded per page)
-  float* sKscale = sK + (size_t)B * D;         // B
-  uint8_t* sQ_raw = reinterpret_cast<uint8_t*>(sKscale + B);  // H * D (fp8)
-
-  // --- cooperative load Q (raw fp8) + gate (fp32) once per block ---
-  const uint8_t* qp = q_fp8 + (size_t)b * H * D;
-  for (int idx = lane; idx < H * D; idx += B) sQ_raw[idx] = qp[idx];
-  const float* gp = weight + (size_t)b * H;
-  for (int h = lane; h < H; h += B) sGate[h] = gp[h];
-  __syncthreads();
-
-  for (int it = 0; it < n_iters; ++it) {
-    const int i = i_start + it;
-    const int32_t page = page_table[(size_t)b * max_table_len + i];
-    const uint8_t* kbase = kvcache_u8 + (size_t)page * (B * (D + 4));
-    // keys: B*D fp8 e4m3fnuz (bytes [0 : B*D]); scales: B fp32 (bytes
-    // [B*D : B*(D+4)], 4-aligned). Cooperative load into shared.
-    for (int idx = lane; idx < B * D; idx += B) sK[idx] = fp8e4m3fnuz_to_f32(kbase[idx]);
-    for (int j = lane; j < B; j += B) sKscale[j] = reinterpret_cast<const float*>(kbase + B * D)[j];
-    __syncthreads();
-
-    // --- this lane owns KV token j = lane within the page ---
-    const float* kj = sK + (size_t)lane * D;
-    float acc = 0.0f;
-    for (int h = 0; h < H; ++h) {
-      const uint8_t* qh_raw = sQ_raw + (size_t)h * D;
-      float dot = 0.0f;
-      for (int d = 0; d < D; ++d) dot += kj[d] * fp8e4m3fnuz_to_f32(qh_raw[d]);
-      acc += fmaxf(dot, 0.0f) * sGate[h];
-    }
-    const int t = i * B + lane;
-    if (t < seq_len) out[(size_t)b * max_seq_len + t] = sKscale[lane] * acc;
-
-    __syncthreads();                           // before reloading sK next iter
-  }
-}
-
 
 // bf16-MFMA variant of dsa_topk_logits_kernel -- the launcher's FAST path
 // for the GLM-5.3 indexer family (H a multiple of 16, D a multiple of 64,

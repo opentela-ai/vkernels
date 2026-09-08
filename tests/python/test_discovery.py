@@ -42,17 +42,26 @@ EXPECTED_KERNELS = [
     # fly -- bit-identical output); dsa_topk_logits_fits_lds_mfma is the
     # bf16-MFMA fast path guard (smallest footprint, Matrix-Core). The HIP
     # dsa_topk_logits and dsa_topk_logits_with_variant are declared in the
-    # #if VKERNELS_HAS_HIP block, so they sort after dsa_sparse_fwd_with_tile.
+    # #if VKERNELS_HAS_HIP block, so they sort after dsa_sparse_fwd_with_tile;
+    # the CUDA wmma port declares the same launcher pair in a
+    # vkernels::kernels::cuda namespace at the end of the header, and since
+    # discovery flattens namespaces each pair repeats (HIP first, then CUDA).
     ("dsa_topk_logits_cpu", "dsa"),
     ("dsa_topk_logits_fits_lds", "dsa"),
     ("dsa_topk_logits_fits_lds_fp8q", "dsa"),
     ("dsa_topk_logits_fits_lds_mfma", "dsa"),
+    # dsa_topk_logits_fits_lds_wmma (PR #30 review): the CUDA wmma kernel's
+    # admission guard -- the MFMA gates + sAcc staging + the CUDA 1024
+    # threads/block cap -- declared in dsa.hpp right after the mfma guard.
+    ("dsa_topk_logits_fits_lds_wmma", "dsa"),
     # The optimal split_kv for the HIP dsa_topk_logits indexer (issue
     # #51), the single source of truth for the formula the hip_capi.hpp
     # docstring used to restate (with the wrong NUM_CU=256 -> 228).
     ("dsa_topk_logits_split_for", "dsa"),
     ("dsa_sparse_fwd", "dsa"),
     ("dsa_sparse_fwd_with_tile", "dsa"),
+    ("dsa_topk_logits", "dsa"),
+    ("dsa_topk_logits_with_variant", "dsa"),
     ("dsa_topk_logits", "dsa"),
     ("dsa_topk_logits_with_variant", "dsa"),
     # DSA kpool-cache compress/write (issue #60), declared in dsa_kpool.hpp
@@ -80,6 +89,9 @@ EXPECTED_KERNELS = [
     ("gemm", "gemm"),
     ("gemm_bf16_cpu", "gemm_bf16"),
     ("gemm_bf16_config_for", "gemm_bf16"),
+    ("gemm_bf16", "gemm_bf16"),
+    # Same two-namespace model as dsa.hpp: the CUDA wmma GEMM (PR #30)
+    # declares gemm_bf16 a second time in vkernels::kernels::cuda.
     ("gemm_bf16", "gemm_bf16"),
     ("kda_layer_norm_gated_cpu", "kda"),
     ("kda_gate_chunk_cumsum_cpu", "kda"),
