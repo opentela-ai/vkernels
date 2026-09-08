@@ -25,6 +25,26 @@ It has two layers:
   (`Result`), exactly like the `ValueError`s of the Python bindings and the
   `std::invalid_argument`s of the C++ library.
 
+## Coverage
+
+The safe crate currently mirrors the Python `vkernels.kernels` /
+`vkernels.comm` / `vkernels.core` surface. The recent
+**serving-runtime** additions are *not yet wrapped* in the safe API:
+
+| Capability | Python | C ABI | Rust safe | Rust FFI (`vkernels-sys`) |
+|---|---|---|---|---|
+| DSA sparse-MLA + paged-MQA top-k logits (#51) | `kernels.dsa_sparse_fwd` / `dsa_config` | `vk_dsa_sparse_fwd`, `vk_hip_dsa_sparse_fwd`, `vk_hip_dsa_topk_logits` | ✗ | ✗ |
+| MHC pre/post (#51) | `kernels.mhc_pre_gemm_sqrsum` / `mhc_post` | `vk_mhc_pre_gemm_sqrsum`, `vk_mhc_post` (+ `vk_hip_*` device) | ✗ | ✗ |
+| Fused indexed K/V gather / scatter (#2 / #1) | `comm.kv_gather_layer` / `kv_scatter_layer` | `vkernels_kv_{gather,scatter}_layer` (+ `_device_slots`) in `src/c/vkernels/comm/*_c.{h,cu}` | ✗ | raw `vkernels_kv_{gather,scatter}_layer_device_slots` (`serving`) |
+| Cross-node KV restore/donate/all-gather + fabric import (#49) | — | `vkernels_cross_node_kv_*` / `vkernels_fabric_import_*` in `src/c/vkernels/comm/*_c.{h,cpp,cu}` | ✗ | raw `vkernels_cross_node_kv_*` / `vk_fabric_import_*` (`serving`) |
+| Distributed MoE TP/EP/PP sharding (#18) | `vkernels.dist` | `src/c/vkernels/dist/dist_moe.*` | ✗ (no `dist` module) | ✗ |
+
+The DSA/MHC device kernels use the `vk_hip_*` prefix in `capi/`; the KV
+and cross-node families use the `vkernels_*` prefix in `comm/*_c.*`. The
+raw FFI for the cross-node KV family and the KV gather/scatter device-slot
+helpers lives in
+[`vkernels-sys/src/serving.rs`](../src/rust/vkernels-sys/src/serving.rs).
+
 ## Building and testing
 
 The crate is host-buildable on any machine with a Rust toolchain — the
@@ -186,10 +206,13 @@ return raw `u16` bit patterns. Convert to/from `f32` with
 | `mxfp4_moe_scatter_reduce_q(partial_q, partial_s, topk_w, M, width, top_k, group_size, out) -> Result<()>` | scatter-reduce + per-group dequant | `width%2==0`, `%group_size==0` |
 | `moe_align_block_size(topk_ids, M, top_k, block_size, num_experts) -> Result<(Vec<i32>, Vec<i32>, usize)>` | block-aligned sort (allocates output) | returns `(sorted_ids, expert_ids, em)` |
 | `moe_align_block_size_max_em(M, top_k, block_size, num_experts) -> usize` | upper bound on `em` (pure) | `((M+BS-1)/BS + num_experts) * BS` |
-| `fused_moe_mxfp4(a, w13, b13, w2, b2, a_scales, topk_ids, topk_scales, act_scratch, out, M, hidden, ispp, group_size, activation) -> Result<()>` | end-to-end MXFP4 MoE | `EM%16==0`; `b13`/`b2` optional via `Option<&[f32]>` |
+| `fused_moe_mxfp4(a, w13, w13_scale, w2, w2_scale, sorted_ids, topk_w_sorted, expert_ids, act_scratch, out, M, hidden, ispp, top_k, group_size, swiglu_limit, activation, beta, linear_beta, b13, b2) -> Result<()>` | end-to-end MXFP4 MoE | `a`=`u16[M*hidden]` bf16; `w13`/`w2`=`u8` E2M1; `*_scale`=`u8` ue8m0; `act_scratch`=`u16[em*ispp]`; `out`=`f32[M*hidden]`; `b13`/`b2`=`Option<&[f32]>`; `EM%16==0` |
 
 `MoeActivation` is `pub enum MoeActivation { SwiGLU, SiTU }` (`#[derive(Clone,Copy,PartialEq,Eq,Debug)]`);
-`fused_moe_mxfp4` infers `num_experts` from `w13.len() / (2*ispp*(hidden/2))`, and `em` from `topk_ids.len() / top_k`.
+`fused_moe_mxfp4` infers `num_experts` from `w13.len() / (2*ispp*(hidden/2))`, and
+takes `em` from `sorted_ids.len()` (the padded length returned by
+`moe_align_block_size`). `beta`/`linear_beta` are the SiTU softcaps
+(defaults `4.0`/`25.0`); `swiglu_limit` is the SwiGLU clamp.
 
 Example — a tiny MXFP4 MoE:
 
@@ -197,18 +220,23 @@ Example — a tiny MXFP4 MoE:
 use vkernels::kernels::{self, MoeActivation};
 
 let (m, hidden, ispp, gs, e, top_k) = (16, 128, 64, 32, 1, 1);
-let a = vec![1.0_f32; m * hidden];
-let w13 = vec![1.0_f32; e * 2 * ispp * (hidden / 2)];
-let w2 = vec![1.0_f32; e * ispp * hidden];
-let a_scales = vec![127u8; m * hidden / gs];
-let topk_ids = vec![0i32; m * top_k];
-let topk_scales = vec![1.0_f32; m * top_k];
-let mut act_scratch = vec![0.0_f32; m * ispp];
+let (sorted_ids, expert_ids, em) =
+    kernels::moe_align_block_size(&vec![0i32; m * top_k], m, top_k, 16, e)?;
+let a = vec![0x3c00u16; m * hidden];                       // bf16 1.0
+let w13 = vec![0u8; e * 2 * ispp * (hidden / 2)];         // [E, 2*ispp, hidden/2]
+let w13_scale = vec![127u8; e * 2 * ispp * (hidden / gs)]; // [E, 2*ispp, hidden/gs]
+let w2 = vec![0u8; e * hidden * (ispp / 2)];              // [E, hidden, ispp/2]
+let w2_scale = vec![127u8; e * hidden * (ispp / gs)];     // [E, hidden, ispp/gs]
+let topk_w_sorted = vec![1.0_f32; em];
+let mut act_scratch = vec![0u16; em * ispp];
 let mut out = vec![0.0_f32; m * hidden];
 kernels::fused_moe_mxfp4(
-    &a, &w13, None, &w2, None, &a_scales,
-    &topk_ids, &topk_scales, &mut act_scratch, &mut out,
-    m, hidden, ispp, gs, MoeActivation::SwiGLU,
+    &a, &w13, &w13_scale, &w2, &w2_scale,
+    &sorted_ids, &topk_w_sorted, &expert_ids,
+    &mut act_scratch, &mut out,
+    m, hidden, ispp, top_k, gs, 0.0,                       // swiglu_limit
+    MoeActivation::SwiGLU, 4.0, 25.0,                      // activation, beta, linear_beta
+    None, None,                                            // b13, b2
 )?;
 # Ok::<(), vkernels::Error>(())
 ```

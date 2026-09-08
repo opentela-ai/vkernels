@@ -75,18 +75,31 @@ static BenchResult bench_us(const std::function<void()>& launch,
       hipEventSynchronize(stop);
       float ms = 0;
       hipEventElapsedTime(&ms, start, stop);
+      // ROCm 6.3 event quirk (observed on MI300A with rapid-fire event
+      // pairs around DVFS clock transitions): a rare event pair reports
+      // elapsed exactly 0.0 even though the kernels ran (verified by
+      // output checksum). Discard such samples instead of poisoning
+      // min/median; a window where EVERY sample is 0 widens once and
+      // ultimately yields the {0,0,0} result (a visible broken row -- the
+      // login-node no-gfx-agent signature), rather than a hang.
+      if (ms <= 0.0f) continue;
       times.push_back(ms * 1000.0f);
+    }
+    const int n = (int)times.size();
+    if (n == 0) {
+      iters *= 2;
+      continue;
     }
     double sum = 0;
     for (double t : times) sum += t;
-    double mean = sum / iters;
+    double mean = sum / n;
     double sum2 = 0;
     for (double t : times) sum2 += t * t;
-    double var = sum2 / iters - mean * mean;
+    double var = sum2 / n - mean * mean;
     double stddev = std::sqrt(std::max(0.0, var));
     if ((mean > 0 && stddev / mean < 0.03) || iters >= max_iters) {
       std::sort(times.begin(), times.end());
-      return {times[0], times[iters / 2], mean};
+      return {times[0], times[n / 2], mean};
     }
     iters *= 2;
   }

@@ -148,11 +148,21 @@ void dsa_topk_logits_cpu(int batch_size, int num_heads, int head_dim, int block,
                          const int32_t* seq_lens, const int32_t* page_table,
                          float* out);
 
-// Whether an indexer shape fits gfx942's 64 KB NON-OPTIN dynamic-LDS cap
-// under the fp32-Q kernel (dsa_topk_logits_kernel) -- the test the HIP
-// launcher (dsa.hip::dsa_topk_logits) runs to pick the fast path. The
-// kernel stages Q (H*D fp32), the per-head gate (H fp32), one K tile
-// (B*D fp32) and its per-token scales (B fp32), so the request is
+// The gfx942 (MI300A) non-optin dynamic-LDS cap all three HIP-path guards
+// below test against by default; EQUALS the opt-in ceiling (hipFuncSet-
+// Attribute(MaxDynamicSharedMemorySize, N>65536) is a silent no-op, verified
+// on a CSCS beverin node). Larger H falls back to the fp8-Q variant instead
+// of raising this cap. See the KB note mi300a-dynamic-lds-no-optin. Every
+// guard takes the cap as a parameter so the CUDA TU can run the SAME
+// arithmetic against another device's ceiling (e.g. GB10's 101,376 B
+// opt-in) instead of forking the formulas.
+inline constexpr int kDsaTopkLdsCapGfx942 = 64 * 1024;
+
+// Whether an indexer shape fits a dynamic-LDS cap under the fp32-Q kernel
+// (dsa_topk_logits_kernel) -- the test the HIP launcher (dsa.hip::
+// dsa_topk_logits) runs to pick the fast path. The kernel stages Q (H*D
+// fp32), the per-head gate (H fp32), one K tile (B*D fp32) and its
+// per-token scales (B fp32), so the request is
 //
 //   shmem = (H*D + H + B*D + B) * 4   bytes
 //
@@ -172,8 +182,10 @@ void dsa_topk_logits_cpu(int batch_size, int num_heads, int head_dim, int block,
 // Pure arithmetic on a documented device constant -- safe to call from host
 // code, so the sglang backend can query it before launching and the host
 // unit tests (tests/kernels/attn/test_dsa.cpp::DsaTopk::FitsLdsCap) assert
-// on it.
-bool dsa_topk_logits_fits_lds(int num_heads, int head_dim, int block);
+// on it. `lds_cap` defaults to the gfx942 cap above; the CUDA launcher
+// passes its device's queried opt-in ceiling.
+bool dsa_topk_logits_fits_lds(int num_heads, int head_dim, int block,
+                              int lds_cap = kDsaTopkLdsCapGfx942);
 
 // Whether an indexer shape fits gfx942's 64 KB non-optin dynamic-LDS cap
 // under the fp8-Q kernel (dsa_topk_logits_kernel_fp8q) -- the launcher's
@@ -191,7 +203,8 @@ bool dsa_topk_logits_fits_lds(int num_heads, int head_dim, int block);
 // cross-check (max_rel < 1e-3) carries over. Pure arithmetic on the same
 // device cap as dsa_topk_logits_fits_lds; host unit tests
 // (tests/kernels/attn/test_dsa.cpp::DsaTopk::FitsLdsFp8q) assert on it.
-bool dsa_topk_logits_fits_lds_fp8q(int num_heads, int head_dim, int block);
+bool dsa_topk_logits_fits_lds_fp8q(int num_heads, int head_dim, int block,
+                                   int lds_cap = kDsaTopkLdsCapGfx942);
 
 // Whether the indexer shape fits gfx942's 64 KB NON-OPTIN dynamic-LDS cap
 // under the MFMA kernel (dsa_topk_logits_kernel_mfma) -- the launcher's
@@ -209,7 +222,7 @@ bool dsa_topk_logits_fits_lds_fp8q(int num_heads, int head_dim, int block);
 // -- the SMALLEST of the three variants at every GLM-5.3 indexer width:
 // 16,768 B at H=32, 25,088 B at H=64, 41,728 B at H=128 (vs the fp8-Q
 // kernel's 37,248 / 41,472 / 49,920 B and the fp32-Q kernel's
-// 49,536 / 66,048 / 98,432 B). Shape constraints (the verified
+// 49,536 / 66,048 / 99,072 B). Shape constraints (the verified
 // 16x16x16bf16_1k fragment needs exact multiples): num_heads % 16 == 0
 // (kNF = H/16 column fragments), head_dim % 64 == 0 (BK=64 K-tiles) and
 // block % 16 == 0 (BM = B, one wavefront per 16-row fragment). H not a
@@ -217,7 +230,31 @@ bool dsa_topk_logits_fits_lds_fp8q(int num_heads, int head_dim, int block);
 // launcher exactly as before. Pure arithmetic on the same device cap as
 // dsa_topk_logits_fits_lds; host unit tests
 // (tests/kernels/attn/test_dsa.cpp::DsaTopk::FitsLdsMfma) assert on it.
-bool dsa_topk_logits_fits_lds_mfma(int num_heads, int head_dim, int block);
+bool dsa_topk_logits_fits_lds_mfma(int num_heads, int head_dim, int block,
+                                   int lds_cap = kDsaTopkLdsCapGfx942);
+
+// Whether an indexer shape fits a dynamic-LDS cap under the CUDA wmma kernel
+// (dsa.cu::dsa_topk_logits_kernel_wmma) -- the CUDA analogue of the MFMA
+// guard above: the SAME fragment-multiple shape gates (num_heads % 16,
+// head_dim % 64, block % 16), the SAME staged footprint PLUS the sAcc[B][H]
+// fp32 buffer the store_matrix_sync epilogue needs (the AMD fragment-layout
+// warp-shuffle gated reduce has no wmma analogue),
+//
+//   shmem = (D*H + B*BK)*2 + (H + B)*4 + B*H*4   bytes   (BK = 64, fixed)
+//
+// and ONE extra CUDA-specific gate: the block runs kTh = (B/16)*(H/16)*32 =
+// B*H/8 warps' worth of threads -- each warp owns ONE [16,16] c_frag, not
+// the kNF fragments-per-lane the AMD 64-lane MFMA layout demands -- and
+// kTh must not exceed the 1024 CUDA max threads/block (at H=128, B=64 that
+// is exactly 1024; larger H needs smaller B).
+//
+// Unlike the three guards above there is NO portable default cap -- the
+// wmma kernel only exists on CUDA parts and the meaningful ceiling is the
+// device's queried sharedMemPerBlockOptin (101,376 B on GB10/sm_121), so
+// `lds_cap` is required. Pure arithmetic; host unit tests
+// (tests/kernels/attn/test_dsa.cpp::DsaTopk::FitsLdsWmma) assert on it.
+bool dsa_topk_logits_fits_lds_wmma(int num_heads, int head_dim, int block,
+                                   int lds_cap);
 
 // The optimal split_kv for the HIP dsa_topk_logits indexer (issue #51) --
 // the single source of truth for the formula the hip_capi.hpp ABI
@@ -329,3 +366,59 @@ void dsa_topk_logits_with_variant(int batch_size, int num_heads, int head_dim,
 
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP
+
+#if VKERNELS_HAS_CUDA
+namespace vkernels::kernels::cuda {
+
+// CUDA sparse-MLA forward? No -- only the top-k LOGITS indexer is ported
+// to NVIDIA (see below). The sparse-MLA forward itself (dsa_sparse_fwd in
+// the HIP section above) is the value-combine stage that FEEDS off these
+// logits and remains HIP-only for now; the dsa.cu port covers the indexer
+// stage whose wmma kernel is the GB10 counterpart of gfx942's MFMA.
+
+// DSA paged-MQA gated top-k logits (NVIDIA, issue #51 CUDA port): same
+// computation as dsa_topk_logits_cpu / hip::dsa_topk_logits (see above for
+// the formula and the left-unwritten contract), but the caller passes the
+// FP8 e4m3fnuz Q/K raw and the device dequants on load (mirrors the HIP
+// path). Dispatches on GB10's opt-in dynamic-LDS cap (101,376 B, HONOURED
+// via cudaFuncAttributeMaxDynamicSharedMemorySize -- unlike gfx942's 64 KB
+// non-optin cap, see the KB note mi300a-dynamic-lds-no-optin): the bf16
+// wmma kernel (smallest footprint, Matrix-Core) takes the fast path at
+// every width it fits (kTh=(B/16)*(H/16)*32 <= 1024); shapes the wmma
+// kernel refuses but the fp32-Q kernel fits take that; shapes fitting
+// NEITHER but the fp8-Q kernel (Q staged raw, dequantised on the fly --
+// bit-identical output) take the fallback; shapes fitting NONE are refused
+// (a stderr diagnostic + no-op, leaving `out` as the caller provided).
+//
+// `q_fp8`/`kvcache_u8` are fp8 e4m3fnuz device pointers; `kvcache_u8` is the
+// `(num_blocks, block*(head_dim+4))` uint8 view (B*D fp8 keys, then B fp32
+// per-token scales). `weight`/`seq_lens`/`page_table` are fp32/int32 device
+// pointers; `out` is fp32 device (ZERO the output first).
+void dsa_topk_logits(int batch_size, int num_heads, int head_dim, int block,
+                     int max_table_len, int max_seq_len, int split_kv,
+                     const void* q_fp8, const void* kvcache_u8,
+                     const void* weight, const void* seq_lens,
+                     const void* page_table, void* out);
+
+// Explicit-variant entry point (offline-autotuner / correctness hook),
+// mirroring hip::dsa_topk_logits_with_variant exactly:
+//   variant 0 -> auto (wmma-if-fits, else fp32q-if-fits, else fp8q-if-fits,
+//                      else refuse); identical to dsa_topk_logits
+//   variant 1 -> dsa_topk_logits_kernel        (fp32-Q)
+//   variant 2 -> dsa_topk_logits_kernel_fp8q    (fp8-Q)
+//   variant 3 -> dsa_topk_logits_kernel_wmma    (bf16 wmma)
+// An explicit variant (1/2/3) that does NOT fit the shape's LDS cap is
+// refused with a stderr diagnostic + no-op (the caller zeroed `out`, which
+// is what stays) rather than launch a block the driver would drop --
+// mirrors dsa_topk_logits's contract. Same pointers/contract as
+// dsa_topk_logits.
+void dsa_topk_logits_with_variant(int batch_size, int num_heads, int head_dim,
+                                  int block, int max_table_len,
+                                  int max_seq_len, int split_kv,
+                                  const void* q_fp8, const void* kvcache_u8,
+                                  const void* weight, const void* seq_lens,
+                                  const void* page_table, void* out,
+                                  int variant);
+
+}  // namespace vkernels::kernels::cuda
+#endif  // VKERNELS_HAS_CUDA

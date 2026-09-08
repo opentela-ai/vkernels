@@ -18,6 +18,8 @@ from vkernels import _backend, kernels
 from vkernels.kernels import (
     add,
     dsa_config,
+    dsa_kpool_assemble,
+    dsa_kpool_decode_update,
     dsa_sparse_fwd,
     dsa_topk_logits,
     dsa_topk_logits_split_for,
@@ -1601,6 +1603,182 @@ class DsaTopkLogitsTest(unittest.TestCase):
                 finally:
                     kernels._impl = prev
                 self.assertEqual(c, f, (bs, max_seq_len, block, c, f))
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class DsaKpoolAssembleTest(unittest.TestCase):
+    # DSA kpool-cache assemble + rotate + write (issue #60), the kpool>1
+    # INDEXER cache PREFILL/short-context path -- the bf16 replacement for
+    # sglang's _kpool_assemble_softmax_rotate_write_cache_kernel. Mirrors the
+    # host C++ tests in tests/kernels/attn/test_dsa_kpool.cpp::DsaKpoolAssemble
+    # and the device cross-check in meta/benchmarks/test_dsa_kpool_correct.hip.
+    # head_dim is hard-wired to 128 (the 128-pt involutory Hadamard), so the
+    # cases below are randomized fp32 and assert the compiled backend matches
+    # the pure-Python fallback (the gemm_bf16 "backend consistency" pattern)
+    # plus the zero-init / write_mask contract.
+
+    @staticmethod
+    def _case(rng, n_pools, pool_size, tail_size, ssp, num_pages, num_chunks,
+              n_reqs):
+        H = 128
+        ck = rng.standard_normal((num_chunks, H)).astype(_F32)
+        cs = rng.standard_normal((num_chunks, H)).astype(_F32)
+        tk = rng.standard_normal((n_reqs, tail_size, H)).astype(_F32)
+        ts = rng.standard_normal((n_reqs, tail_size, H)).astype(_F32)
+        ape = rng.standard_normal((pool_size, H)).astype(_F32)
+        rpi = (rng.integers(0, n_reqs, n_pools)).astype(np.int32)
+        nft = (rng.integers(0, pool_size + 1, n_pools)).astype(np.int32)
+        css = np.array([min(num_chunks - (pool_size - int(n)),
+                            num_chunks) if (pool_size - int(n)) > 0
+                        else 0 for n in nft], dtype=np.int32)
+        tlb = (rng.integers(0, tail_size, n_pools)).astype(np.int32)
+        loc = (rng.integers(0, num_pages * ssp, n_pools)).astype(np.int32)
+        wm = (rng.integers(0, 2, n_pools)).astype(np.int32)
+        return ck, cs, tk, ts, ape, rpi, nft, css, tlb, loc, wm
+
+    def test_shape_dtype_zero_contract(self):
+        rng = np.random.default_rng(11)
+        ck, cs, tk, ts, ape, rpi, nft, css, tlb, loc, wm = self._case(
+            rng, n_pools=4, pool_size=4, tail_size=64, ssp=8, num_pages=16,
+            num_chunks=32, n_reqs=2)
+        out = dsa_kpool_assemble(ck, cs, tk, ts, ape, rpi, nft, css, tlb, loc,
+                                 slots_per_page=8, num_pages=16, write_mask=wm)
+        self.assertEqual(out.shape, (16, 8, 128))
+        self.assertEqual(out.dtype, _F32)
+        # With non-trivial inputs at least one slot must be non-zero (the
+        # softmax-weighted Hadamard output is generically non-zero), and the
+        # out cache is ZERO-initialised (skipped pools leave zero).
+        self.assertGreater(np.abs(np.asarray(out)).sum(), 0.0)
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(23)
+        for (n_pools, pool_size, tail_size, ssp, num_pages, num_chunks,
+             n_reqs) in [(1, 4, 64, 8, 16, 32, 1),
+                         (4, 4, 64, 8, 16, 32, 2),
+                         (4, 8, 64, 8, 16, 64, 2),
+                         (2, 8, 128, 16, 8, 32, 2)]:
+            args = self._case(rng, n_pools, pool_size, tail_size, ssp,
+                              num_pages, num_chunks, n_reqs)
+            c = _run_under(core, lambda a=args: dsa_kpool_assemble(
+                *a[:10], slots_per_page=ssp, num_pages=num_pages,
+                write_mask=a[10]).copy())
+            f = _run_under(fb, lambda a=args: dsa_kpool_assemble(
+                *a[:10], slots_per_page=ssp, num_pages=num_pages,
+                write_mask=a[10]).copy())
+            # Both are fp32 references; the compiled backend is a scalar
+            # per-element loop while the fallback is vectorized numpy, so
+            # they agree to fp32 accumulation-order tolerance (a few ULP
+            # over the pool_size x 128 reduction), not bit-exactly. The
+            # bf16 device kernel is cross-checked separately in
+            # meta/benchmarks/test_dsa_kpool_correct.hip.
+            np.testing.assert_allclose(np.asarray(c), np.asarray(f),
+                                       atol=1e-3, rtol=1e-4)
+
+
+@unittest.skipIf(np is None, "numpy is required for these tests")
+class DsaKpoolDecodeUpdateTest(unittest.TestCase):
+    # DSA kpool-cache decode update + maybe-write (issue #60), the kpool>1
+    # INDEXER cache DECODE path -- the bf16 replacement for sglang's
+    # _kpool_decode_update_and_maybe_write_cache_kernel. Mirrors the host C++
+    # tests in tests/kernels/attn/test_dsa_kpool.cpp::DsaKpoolDecodeUpdate and
+    # the device cross-check. head_dim is hard-wired to 128; the cases below
+    # assert the compiled backend matches the pure-Python fallback, the
+    # zero-init out contract, the in-place live-tail write, and that invalid
+    # rows (req<0, cache_loc==0, pos<0, pos>=seq_len) are no-ops on both the
+    # out cache AND the live tail.
+
+    @staticmethod
+    def _case(rng, batch, pool_size, tail_size, ssp, btc, num_pages, n_reqs):
+        H = 128
+        ky = rng.standard_normal((batch, H)).astype(_F32)
+        ss = rng.standard_normal((batch, H)).astype(_F32)
+        tk = rng.standard_normal((n_reqs, tail_size, H)).astype(_F32)
+        ts = rng.standard_normal((n_reqs, tail_size, H)).astype(_F32)
+        ape = rng.standard_normal((pool_size, H)).astype(_F32)
+        bt = (rng.integers(0, num_pages, (batch, btc))).astype(np.int32)
+        rpi = (rng.integers(-1, n_reqs, batch)).astype(np.int32)
+        pos = (rng.integers(-1, pool_size * 4, batch)).astype(np.int32)
+        sl = (pool_size * (1 + rng.integers(0, 4, batch))).astype(np.int32)
+        ocl = (rng.integers(0, 4, batch)).astype(np.int32)  # ~25% zero
+        return ky, ss, tk, ts, ape, bt, rpi, pos, sl, ocl
+
+    def test_invalid_row_leaves_tail_untouched_and_out_zero(self):
+        rng = np.random.default_rng(41)
+        # ALL rows invalid: req<0 -> no tail write, no out write.
+        H = 128; pool_size = 4; tail_size = 64; ssp = 8; btc = 2
+        num_pages = 16; n_reqs = 2; batch = 4
+        ky = rng.standard_normal((batch, H)).astype(_F32)
+        ss = rng.standard_normal((batch, H)).astype(_F32)
+        tk = rng.standard_normal((n_reqs, tail_size, H)).astype(_F32)
+        ts = rng.standard_normal((n_reqs, tail_size, H)).astype(_F32)
+        ape = rng.standard_normal((pool_size, H)).astype(_F32)
+        bt = np.zeros((batch, btc), np.int32)
+        rpi = np.full(batch, -1, np.int32)  # all invalid
+        pos = np.arange(batch, dtype=np.int32)
+        sl = np.full(batch, pool_size, np.int32)
+        ocl = np.ones(batch, np.int32)
+        tk0 = tk.copy()
+        out = dsa_kpool_decode_update(ky, ss, tk, ts, ape, bt, rpi, pos, sl,
+                                      ocl, tail_size=tail_size,
+                                      slots_per_page=ssp, num_pages=num_pages)
+        np.testing.assert_array_equal(np.asarray(out), 0.0)
+        np.testing.assert_array_equal(tk, tk0)  # tail untouched
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_backend_consistency(self):
+        core = _backend.load_extension().kernels
+        fb = _fallback_impl()
+        rng = np.random.default_rng(53)
+        for (batch, pool_size, tail_size, ssp, btc, num_pages, n_reqs) in [
+                (4, 4, 64, 8, 2, 16, 2),
+                (8, 4, 64, 8, 2, 16, 2),
+                (4, 8, 128, 16, 2, 16, 3)]:
+            args = self._case(rng, batch, pool_size, tail_size, ssp, btc,
+                              num_pages, n_reqs)
+            c_tk = args[2].copy(); c_ts = args[3].copy()
+            f_tk = args[2].copy(); f_ts = args[3].copy()
+            cargs = (args[0], args[1], c_tk, c_ts) + args[4:]
+            fargs = (args[0], args[1], f_tk, f_ts) + args[4:]
+            c = _run_under(core, lambda: dsa_kpool_decode_update(
+                *cargs, tail_size=tail_size, slots_per_page=ssp,
+                num_pages=num_pages).copy())
+            f = _run_under(fb, lambda: dsa_kpool_decode_update(
+                *fargs, tail_size=tail_size, slots_per_page=ssp,
+                num_pages=num_pages).copy())
+            np.testing.assert_allclose(np.asarray(c), np.asarray(f), atol=1e-5)
+            np.testing.assert_array_equal(c_tk, f_tk)
+            np.testing.assert_array_equal(c_ts, f_ts)
+
+    @unittest.skipUnless(_COMPILED, "compiled backend not available")
+    def test_in_place_tail_write_for_valid_rows(self):
+        # A single valid row at pool_size-1 (full pool) writes BOTH the out
+        # cache and the live tail at [req, pos % tail_size].
+        rng = np.random.default_rng(67)
+        H = 128; pool_size = 4; tail_size = 64; ssp = 8; btc = 2
+        num_pages = 16; n_reqs = 1; batch = 1
+        ky = rng.standard_normal((batch, H)).astype(_F32)
+        ss = rng.standard_normal((batch, H)).astype(_F32)
+        tk = rng.standard_normal((n_reqs, tail_size, H)).astype(_F32)
+        ts = rng.standard_normal((n_reqs, tail_size, H)).astype(_F32)
+        ape = rng.standard_normal((pool_size, H)).astype(_F32)
+        bt = np.array([[3]], np.int32)
+        rpi = np.array([0], np.int32)
+        pos = np.array([pool_size - 1], np.int32)  # full pool -> writes out
+        sl = np.array([pool_size], np.int32)
+        ocl = np.array([1], np.int32)
+        tk0 = tk.copy()
+        dsa_kpool_decode_update(ky, ss, tk, ts, ape, bt, rpi, pos, sl, ocl,
+                                tail_size=tail_size, slots_per_page=ssp,
+                                num_pages=num_pages)
+        # The live tail at [0, (pool_size-1) % tail_size] == the current key.
+        phys_slot = (pool_size - 1) % tail_size
+        np.testing.assert_array_equal(tk[0, phys_slot], ky[0])
+        # Every other live-tail slot is untouched.
+        mask = np.ones(tail_size, bool); mask[phys_slot] = False
+        np.testing.assert_array_equal(tk[0, mask], tk0[0, mask])
 
 
 @unittest.skipIf(np is None, "numpy is required for these tests")

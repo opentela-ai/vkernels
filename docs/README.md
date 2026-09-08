@@ -85,6 +85,104 @@ shapes** — the ones that today fall back to AITER's untuned
 
 ---
 
+## Attention kernels — Kimi-K3 / GLM-5.3 (gfx942 / MI300A)
+
+These replace the AITER / tilelang / Triton attention kernels that
+GPU-fault or JIT-abort on gfx942 (CDNA3), so Kimi-K3 and GLM-5.3-Flash
+serving no longer needs a vendor-specific fallback. Every kernel follows
+the **two-implementation model**: a CPU reference (oracle, always
+compiled) and a HIP path (`VKERNELS_HAS_HIP`), validated against the
+oracle on gfx942.
+
+### MLA — Multi-head Latent Attention (absorbed form, issue #21)
+
+| Function | Computation | Data type | GPU backend |
+|---|---|---|---|
+| `mla_fwd_cpu(B,H,S_q,S_kv,q_s,kv_s,lr,rhd,scale,q,k_c,k_pe,v_c,out)` | `out[i] = Σ_j softmax_causal(scale·(q_nope[i]·k_c[j] + q_rope[i]·k_pe[j]))[i,j] · v_c[j]` | float32 | HIP |
+| `hip::mla_fwd(...)` | online softmax, fp32 accum, bf16 storage | bf16 (device) / fp32 (oracle) | HIP |
+| `mla_config_for(S_q, lr, rhd, &bq, &bn_kv, &th)` | decode `S_q≤8`→1 row·1 wf; prefill→BQ rows·4 wf | — | — |
+
+- `q` is `[B,H,S_q, kv_lora_rank+qk_rope_head_dim]` (`[q_nope | q_rope]`);
+  `k_c`/`v_c` are `[B,S_kv,kv_lora_rank]`; `k_pe` is `[B,S_kv,qk_rope_head_dim]`.
+  Causality is `kv_start + j <= q_start + i` (chunked prefill masked correctly).
+- **Files**: `src/c/vkernels/kernels/mla.{hpp,cpp,hip}`
+- **Python**: `vkernels.kernels.mla_fwd / mla_config`
+- **Rust**: `vkernels::kernels::mla_fwd / mla_config`
+- **Docs**: [kernels/mla.md](kernels/mla.md)
+
+### KDA — Kimi Delta Attention (gated delta-rule, issues #21, #45)
+
+A per-key-dim gated delta-rule linear attention: state `S_t` (`D×D` per
+head) is decayed by a **per-key-dim** forget gate `g_t[k]`, then updated by
+the delta correction `β_t (v_t − a_t) ⊗ k_t`, with output `o_t = S_t · q_t`.
+
+| Function | Computation | Notes |
+|---|---|---|
+| `kda_naive_delta_rule_fwd_cpu(q,k,v,g,beta,out,B,H,S,D)` | per-token oracle (`O(S·D²)`), **per-key-dim** gate `[B,H,S,D]`, post-gate prediction | the K3 / HIP oracle |
+| `kda_delta_rule_fwd_cpu(q,k,v,g,beta,out,B,H,S,D,chunk)` | chunked forward (gate cumsum → intra → inter → output) | the **standard** (scalar-gate) rule; cross-checked against its own inline oracle |
+| `hip::kda_delta_rule_fwd(...)` | cooperative per-token recurrence, `D×D` state in LDS | K3 oracle; matches `kda_naive_delta_rule_fwd_cpu` |
+| `hip::kda_delta_rule_fwd_with_scratch(...,state,...)` | caller-owned `[B,H,D,D]` state scratch (multi-turn decode: pre-fill `S_0`, read back `S_S`) | K3 serving path (issue #45) |
+| `kda_layer_norm_gated_cpu / hip::kda_layer_norm_gated` | gated RMSNorm × `silu(gate)` pre-attention normaliser | |
+| `kda_gate_chunk_cumsum_cpu / hip::kda_gate_chunk_cumsum` | intra inclusive + inter exclusive log-gate cumsum | |
+| `kda_delta_rule_intra_cpu` / `kda_delta_rule_inter_cpu` / `kda_gla_fwd_o_cpu` | the chunked pieces (standard rule), standalone | |
+| `kda_pack_bitmatrix_cpu / hip::kda_pack_bitmatrix` | MSB-first bit packing of binary gate/routing matrices | |
+
+- `k` is L2-normalised by the caller; `g` is `[B,H,S,D]` in normal space
+  `(0,1]`; `β` is `[B,H,S]` scalar per (token, head).
+- **Files**: `src/c/vkernels/kernels/kda.{hpp,cpp,hip}`
+- **Python**: `vkernels.kernels.{kda_layer_norm_gated, kda_gate_chunk_cumsum,
+  kda_naive_delta_rule_fwd, kda_delta_rule_intra, kda_delta_rule_inter,
+  kda_gla_fwd_o, kda_delta_rule_fwd, kda_pack_bitmatrix}`
+- **Rust**: `vkernels::kernels::{kda_layer_norm_gated, kda_gate_chunk_cumsum,
+  kda_naive_delta_rule_fwd, kda_delta_rule_fwd, kda_delta_rule_intra,
+  kda_delta_rule_inter, kda_gla_fwd_o, kda_pack_bitmatrix}`
+- **Docs**: [kernels/kda.md](kernels/kda.md)
+
+### DSA — DeepseekSparseAttn sparse-MLA forward (issue #51)
+
+A sparse-MLA forward (GLM-5.3-Flash / DeepSeek-V3): an external *indexer*
+has already picked, per query token, the `topk` most relevant KV tiles
+(`indices`); the kernel scores each query against exactly those selected
+keys and produces the combined output. The `tail_dim == 0` shape
+(GLM-5.3-Flash) that tilelang *cannot compile* is a first-class,
+hand-checked case (the rope-tail dot is skipped at runtime).
+
+| Function | Computation | Data type | GPU backend |
+|---|---|---|---|
+| `dsa_sparse_fwd_cpu(...)` | two-pass base-2 softmax over the `topk` selected keys; masked keys → weight 0 | float32 | — |
+| `hip::dsa_sparse_fwd(...)` | online softmax, fp32 accum, bf16 storage | bf16 (device) / fp32 (oracle) | HIP |
+| `dsa_config_for(S_q,H,dim,topk,&bq,&th,&block_I,&inner_iter)` | decode `S_q≤8`→1 row·1 wf; prefill→BQ rows·4 wf | — | — |
+| `dsa_topk_logits_cpu(...)` / `hip::dsa_topk_logits(...)` | paged-MQA gated top-k **logits** — the FIRST stage (kpool logits) that feeds this forward (kpool>1 indexer path, issue #51). FP8 e4m3fnuz Q/K dequantised to fp32 on load; tokens ≥ `seq_len[b]` left unwritten (zero the output first) | fp8 e4m3fnuz (device) / fp32 (oracle) | HIP |
+
+- `q` is `[1,S_q,H, dim+tail_dim]`; `kv` is `[1,S_kv,kv_group, dim+tail_dim]`
+  with `d_v = dim − tail_dim`; `kv_group == 1`. `sm_scale = (1/√(dim+tail_dim))·log2(e)`.
+- **C ABI**: `vk_dsa_config`, `vk_dsa_sparse_fwd` (host),
+  `vk_hip_dsa_sparse_fwd` / `vk_hip_dsa_topk_logits` (device) in `src/c/vkernels/capi/`
+- **Files**: `src/c/vkernels/kernels/dsa.{hpp,cpp,hip}`
+- **Python**: `vkernels.kernels.dsa_sparse_fwd / dsa_config`
+- **Docs**: [kernels/dsa.md](kernels/dsa.md)
+
+### MHC — Multi-head hybrid-attention pre/post (issue #51, part 2)
+
+Two of the tilelang MHC kernels from `sglang/kernels/ops/layernorm/mhc.py`
+that JIT-abort on gfx942 (dynamic shared memory > the 64 KB non-optin cap):
+the split-k `mhc_pre_gemm_sqrsum` stage-0 kernel and the `mhc_post`
+combine. The HIP kernels use *static* shared memory within MI300A's
+non-optin cap (no `hipFuncSetAttribute` opt-in).
+
+| Function | Computation | Data type | GPU backend |
+|---|---|---|---|
+| `mhc_pre_gemm_sqrsum_cpu(...)` / `hip::mhc_pre_gemm_sqrsum(...)` | `out[n,o] = Σ_h x[n,h]·fn[o,h]` (GEMM `x@fnᵀ`, `hc_mult3 = hc_mult·(2+hc_mult)` cols) **plus** `sqrsum[n] = Σ_h x[n,h]²` | bf16 in (device) / fp32 (oracle) → fp32 out | HIP |
+| `mhc_post_cpu(...)` / `hip::mhc_post(...)` | `out[n,j,h] = c[n,j]·d[n,h] + Σ_k a[n,k,j]·b[n,k,h]` (post-attention combine) | bf16 `b`/`d`/`out` (device) / fp32 (oracle) | HIP |
+
+- **C ABI**: `vk_mhc_pre_gemm_sqrsum`, `vk_mhc_post` (host),
+  `vk_hip_mhc_pre_gemm_sqrsum`, `vk_hip_mhc_post` (device) in `src/c/vkernels/capi/`
+- **Files**: `src/c/vkernels/kernels/mhc.{hpp,cpp,hip}`
+- **Python**: `vkernels.kernels.mhc_pre_gemm_sqrsum / mhc_post`
+- **Docs**: [kernels/mhc.md](kernels/mhc.md)
+
+---
+
 ## MoE (Mixture of Experts) — AMD gfx942 / CDNA3 low-level primitives
 
 These fill gaps where CDNA4-only (gfx950) instructions used in the AITER flydsl
@@ -197,6 +295,13 @@ rounded to bf16 **once**, matching the xkernels oracle exactly (a split
 3-kernel pipeline introduced a spurious intermediate bf16 rounding). The
 gate value is clamped to `L` *before* the sigmoid (SwiGLU clamp).
 
+With `activation="situ"` (Kimi-K3, matches vLLM's `situ_and_mul`) the
+epilogue is a soft-capped gate × up instead of SwiGLU:
+`gate' = beta·tanh(gate/beta)·sigmoid(gate)`,
+`up' = linear_beta·tanh(up/linear_beta)` (no `swiglu_limit` clamp).
+`activation` (`"swiglu"` | `"situ"`), `beta` and `linear_beta` are the
+MoE-level knobs.
+
 ### Kernel 1 — down + routed combine (`down_combine_kernel`)
 ```
 out[M, hidden] += act @ w2^T · topk_w_sorted + b2
@@ -205,8 +310,8 @@ out[M, hidden] += act @ w2^T · topk_w_sorted + b2
 
 | Function | Tile constants | Data types | Backend |
 |---|---|---|---|
-| `fused_moe_mxfp4(..., block_size=16)` | decode: BM=16, BN=64, BK=64, 64 threads/block | bf16 activations, fp4 (E2M1) weights with ue8m0 scales, fp32 output | HIP, CPU |
-| `fused_moe_mxfp4(..., block_size=64)` | prefill: BM=64, BN=64, BK=64, 256 threads/block | same | HIP |
+| `fused_moe_mxfp4(..., block_size=16)` | decode: BM=16, BN=64, BK=64, 64 threads/block; `activation`∈{`swiglu`,`situ`} (K3) | bf16 activations, fp4 (E2M1) weights with ue8m0 scales, fp32 output | HIP, CPU |
+| `fused_moe_mxfp4(..., block_size=64)` | prefill: BM=64, BN=64, BK=64, 256 threads/block; `activation`∈{`swiglu`,`situ`} | same | HIP |
 
 `block_size` selects the tile config: `16` = decode (16×64, 64 threads),
 `64` = prefill (64×64, 256 threads). The caller aligns with the matching
@@ -318,7 +423,7 @@ scratch buffer, replacing per-run `cudaMemcpyPeerAsync` loops.
 - Vectorized 16-byte (`uint4`) path for aligned runs.
 
 - **File**: `src/c/vkernels/comm/p2p_gather.cpp` (CPU), `.cu` (CUDA)
-- **Docs**: [p2p-gather.md](p2p-gather.md)
+- **Docs**: [kernels/p2p-gather.md](kernels/p2p-gather.md)
 - **Performance**: [performance/p2p-gather/](performance/p2p-gather/)
 
 ### P2P KV restore (fused)
@@ -442,6 +547,37 @@ donate plan's two-stage fallback exposes as `kv_gather`.
   buffer). The pure-Python reference in `_fallback.py` is byte-exact for
   both BF16 (passed as a `uint16` view) and FP16.
 
+### Fused indexed K/V layer scatter — issue #1
+
+The restore-side reverse of `kv_gather` (issue #2): KVAAS scatters a
+contiguous, already-gathered per-layer scratch buffer back into the paged
+KV pool. The destination token slots are arbitrary and non-contiguous, so
+a memcpy cannot place the data directly. The current fallback performs two
+PyTorch advanced-index writes (one for K, one for V); this kernel fuses
+both writes (and the K/V split) into a single launch that reads each slot
+id once and writes K and V together.
+
+| Function | Computation |
+|---|---|
+| `kv_scatter_layer(k_dst, v_dst, slot_ids, src, *, stream=None)` | `k_dst[slot_ids] = src[:,:,0]` and `v_dst[slot_ids] = src[:,:,1]` in one operation |
+| `kv_scatter_layer_device_slots(...)` | CUDA-only: caller-owned DEVICE `slot_ids` (no D2H sync, no content validation) |
+
+- **Contract**: `k_dst`/`v_dst` are `[num_slots, num_kv_heads, head_dim]`,
+  BF16 or FP16 (`elem_size == 2`); `slot_ids` is `[num_pages, page_size]`,
+  int32 or int64, with **UNIQUE** destination slots in `[0, num_slots)`
+  (scatter writes disjoint destinations, unlike the gather's repeatable
+  sources); `src` is packed `[num_pages, page_size, 2, num_kv_heads, head_dim]`.
+  `num_pages == 0` is a valid no-op.
+- **Lifetime**: for the host-input `kv_scatter_layer` the slot map is copied
+  into owned storage before the function returns; `k_dst`, `v_dst`, `src`
+  must outlive `stream`. Async on the caller's stream with NO device-wide sync.
+- **File**: `src/c/vkernels/comm/kv_scatter.{hpp,cpp,cu}`, `kv_scatter_cuda.hpp`
+  (CUDA entry points), `kv_scatter_c.{h,cu}` (C ABI)
+- **Python**: `vkernels.kv_scatter_layer(k_dst, v_dst, slot_ids, src, *,
+  stream=None)` (also `vkernels.comm.kv_scatter_layer`); non-default strides
+  are rejected explicitly. The pure-Python reference in `_fallback.py` is
+  byte-exact for both BF16 and FP16.
+
 ### Compute/communication overlap
 
 | Class / Function | Computation |
@@ -500,6 +636,56 @@ the CUDA path is the device realization.
 - **C ABI**: `src/c/vkernels/comm/pipeline_boundary_c.{h,cpp}` (always compiled) + `pipeline_boundary_c.cu` (CUDA-only)
 - **Docs**: [comm-pipeline-boundary.md](comm-pipeline-boundary.md)
 
+### Cross-node KV transfer + fabric import — issue #49
+
+A vkernels-side mechanism that makes the existing **prepared fused KV
+restore / donate kernels** (issues #27, #36 — same-node NVLink peer only)
+operate **across nodes**, instead of being replaced by a separate,
+synchronous host-staged bulk copy (kvaas NIXL/libfabric `transfer()`).
+The prepared kernels are transport-agnostic at the pointer level:
+`*_execute_offset` dereferences `peer_src_ptrs`/`peer_dst_ptrs` that must
+*already be device-addressable on the local fabric*. `fabric_import`
+yields that directly device-addressable handle (`CU_MEM_HANDLE_TYPE_FABRIC`
+/ IMEX) so the existing kernels run UNCHANGED over cross-node memory.
+
+| Surface | Role |
+|---|---|
+| `FabricImportConfig` | `same_node` \| `has_gpudirect_rdma` \| `dram_only_libfabric` |
+| `classify_fabric_import(cfg)` | precedence `same_node` > `dram_only` > `gpudirect` > bounce: `kSameNodePeer` / `kFabricMapped` / `kHostBounce` |
+| `is_import_graph_capturable(t)` | `true` for the two device transports, `false` for `kHostBounce` |
+| `eager_break_fabric_import(cfg)` | 1 when a host-bounce must be excluded from the captured segment (ties into #10) |
+| `FabricImport` | performs the import ONCE; `device_ptr()` (nullptr on `kHostBounce`) + `write_back(remote)` |
+| `CrossNodeKvRestorePlan` / `CrossNodeKvDonatePlan` | reuse `P2PKvRestorePlan`/`P2PKvDonatePlan` over the imported pointer; graph-capturable or eager-break host bounce (`kv_gather`/`kv_scatter` over a `ByteChannel`) |
+| `cross_node_kv_throughput(transport, total_bytes, gh200_dram_only)` | per-hop cost model vs the same-node roofline (88.5 GB/s) and bulk-copy fallback (1.4) |
+
+- On GH200 the libfabric plugin only carries DRAM↔DRAM (hwloc-PCIe
+  discovery cannot see the C2C-attached H100), so cross-node VRAM is
+  reported as `kHostBounce` regardless of the RDMA bit — the caveat called
+  out explicitly. Measured on JSC InfiniBand HDR, the cross-node hop caps
+  at **one HDR-200 port (~24 GB/s, ~75× slower than the 3.3 TB/s same-node
+  HBM ceiling)** regardless of operation type.
+- **Host reference**: `src/c/vkernels/comm/fabric_import.{hpp,cpp}`, `cross_node_kv.{hpp,cpp}` (always compiled, 100% line-covered CI gate)
+- **CUDA device path**: `fabric_import.cu`, `fabric_import_cuda.hpp`, `cross_node_kv.cu`, `cross_node_kv_cuda.hpp` (`VKERNELS_HAS_CUDA`)
+- **C ABI**: `fabric_import_c.{h,cpp,cu}`, `cross_node_kv_c.{h,cu}`
+- **Bench**: `meta/benchmarks/bench_cross_node_kv.cpp` (host cost model), `bench_cross_node_nccl.cu` (JSC HDR measurement, `VKERNELS_HAS_NCCL`)
+- **Docs**: [comm-cross-node-kv.md](comm-cross-node-kv.md)
+
+### Cross-node KV all-gather — issue #49 (draft)
+
+The cross-node hop caps at one HDR-200 port because a 2-rank
+point-to-point donate/restore cannot stripe across the ≥3 edges a ring
+provides. An **all-gather** plan is the primitive that *does* use the
+N−1 edges a ≥3-node ring provides (climbing toward the 4-port aggregate a
+single donate cannot reach), for the case where every node needs the full
+KV. A prepared plan plus access-pattern routing (each rank publishes its
+shard; every rank gathers the full set over the fabric).
+
+- **File**: `src/c/vkernels/comm/cross_node_kv_allgather.cu`,
+  `cross_node_kv_allgather_cuda.hpp` (communicator + prepared plan),
+  `cross_node_kv_allgather_c.{h,cu}` (stable serving-runtime C ABI)
+- **Docs**: [comm-cross-node-kv-allgather-draft.md](comm-cross-node-kv-allgather-draft.md)
+  (draft only; the multi-port result is unmeasured)
+
 ---
 
 ## Core infrastructure
@@ -517,44 +703,78 @@ the CUDA path is the device realization.
 ```
 src/c/vkernels/
 ├── kernels/
-│   ├── elementwise.{cpp,cu}     # add, scale, relu
-│   ├── reduce.{cpp,cu}          # sum, max
-│   ├── gemm.{cpp,cu}            # tiled SGEMM
-│   ├── gemm_bf16.{cpp,hip}      # bf16 K16-MFMA GEMM (gfx942, #29)
-│   ├── moe.{cpp,hip}            # gfx942 primitives (#12–#15)
-│   ├── moe_aux.{cpp,hip}        # MXFP4 MoE orchestration: quant, sort, scatter-reduce (#22)
-│   └── moe_fused.{cpp,hip}      # fused MXFP4 MoE grouped GEMM
+│   ├── elementwise.{cpp,cu,hpp}  # add, scale, relu
+│   ├── reduce.{cpp,cu,hpp}       # sum, max
+│   ├── gemm.{cpp,cu,hpp}         # tiled SGEMM
+│   ├── gemm_bf16.{cpp,hip,hpp}   # bf16 K16-MFMA GEMM (gfx942, #29)
+│   ├── mla.{cpp,hip,hpp}         # Multi-head Latent Attention, absorbed form (#21)
+│   ├── kda.{cpp,hip,hpp}         # Kimi Delta Attention — gated delta-rule (#21, #45)
+│   ├── dsa.{cpp,hip,hpp}         # DeepseekSparseAttn sparse-MLA + paged-MQA top-k logits (#51)
+│   ├── mhc.{cpp,hip,hpp}         # MHC pre-norm GEMM+sqrsum / post combine (#51)
+│   ├── moe.{cpp,hip,hpp}         # gfx942 primitives (#12–#15)
+│   ├── moe_device.hip            # shared bf16↔f32 helpers used by the MoE kernels
+│   ├── moe_aux.{cpp,hip,hpp}     # MXFP4 MoE orchestration: quant, sort, scatter-reduce (#22)
+│   └── moe_fused.{cpp,hip,hpp}   # fused MXFP4 MoE grouped GEMM
+├── dist/
+│   └── dist_moe.{cpp,hpp}        # distributed MoE: TP/EP/PP sharding (#18)
 ├── comm/
-│   ├── allreduce.{cpp,cu}       # ring all-reduce
-│   ├── p2p_gather.{cpp,cu}      # single-launch peer gather
-│   ├── p2p_kv_restore.{cpp,cu}  # fused KV restore
-│   ├── p2p_kv_donate.{cpp,cu}   # fused KV donate (#36)
-│   ├── kv_gather.{hpp,cpp,cu}   # fused indexed K/V layer gather (#2)
-│   ├── kv_gather_cuda.hpp       # CUDA entry points (issue #2)
-│   ├── kv_gather_c.{h,cu}       # C ABI for the fused K/V gather (#2)
-│   ├── cross_node_kv_allgather.cu # equal-shard NCCL KV all-gather
+│   ├── allreduce.{cpp,cu,hpp}    # ring all-reduce
+│   ├── overlap.{cpp,hpp}         # compute/comm overlap executor
+│   ├── channel.{cpp,hpp}         # blocking queue & mock channel
+│   ├── topology.hpp              # ring topology helpers
+│   ├── p2p_gather.{cpp,cu,hpp}   # single-launch peer gather
+│   ├── p2p_gather_cuda.hpp       #   CUDA entry points
+│   ├── p2p_gather_c.{h,cu}       #   C ABI for the peer gather
+│   ├── p2p_kv_restore.{cpp,cu,hpp} # prepared fused KV restore (#27)
+│   ├── p2p_kv_restore_cuda.hpp   #   CUDA plan declarations
+│   ├── p2p_kv_restore_c.{h,cu}   #   C ABI
+│   ├── p2p_kv_donate.{cpp,cu,hpp} # prepared fused KV donate (#36)
+│   ├── p2p_kv_donate_cuda.hpp    #   CUDA plan declarations
+│   ├── p2p_kv_donate_c.{h,cu}    #   C ABI
+│   ├── kv_gather.{hpp,cpp,cu}    # fused indexed K/V layer gather (#2)
+│   ├── kv_gather_cuda.hpp        #   CUDA entry points
+│   ├── kv_gather_c.{h,cu}        #   C ABI for the fused K/V gather (#2)
+│   ├── kv_scatter.{hpp,cpp,cu}   # fused indexed K/V layer scatter (#1)
+│   ├── kv_scatter_cuda.hpp       #   CUDA entry points
+│   ├── kv_scatter_c.{h,cu}       #   C ABI for the fused K/V scatter (#1)
+│   ├── cross_node_kv.{cpp,cu,hpp} # cross-node KV restore/donate plans (#49)
+│   ├── cross_node_kv_cuda.hpp    #   CUDA plan declarations
+│   ├── cross_node_kv_c.{h,cu}    #   C ABI for the cross-node KV transfer (#49)
+│   ├── cross_node_kv_allgather.cu # equal-shard NCCL KV all-gather (#49)
 │   ├── cross_node_kv_allgather_cuda.hpp # communicator + prepared plan
 │   ├── cross_node_kv_allgather_c.{h,cu} # stable serving-runtime C ABI
-│   ├── pipeline_boundary.{cpp,cu} # graph-capturable PP boundary (#10)
-│   ├── overlap.cpp              # compute/comm overlap executor
-│   ├── channel.cpp              # blocking queue & mock channel
-│   ├── topology.{cpp,hpp}       # ring topology helpers
-│   ├── rccl.{cpp,hpp}           # HIP/RCCL transport host reference (#19)
-│   ├── rccl.hip                 # HIP/RCCL all-reduce (VKERNELS_HAS_RCCL)
-│   ├── rccl_hip.hpp             # RcclChannel / plan declarations
-│   ├── rccl_c.{h,cpp}           # C ABI for the RCCL transport
-│   ├── pipeline_boundary_cuda.hpp # CUDA plan declarations
-│   └── pipeline_boundary_c.{h,cpp,cu} # C ABI for the PP boundary
-└── core/
-    ├── device.cpp               # Device abstraction
-    ├── stream.{cpp,cu}          # Stream (async task queue)
-    └── allocator.cpp            # CUDA memory pool tuning
+│   ├── fabric_import.{cpp,cu,hpp} # fabric / VMM import host reference (#49)
+│   ├── fabric_import_cuda.hpp    #   CUDA fabric-import declarations
+│   ├── fabric_import_c.{h,cpp,cu} # C ABI for the fabric import (#49)
+│   ├── slot_map.hpp              # shared slot-map validators (#1, #2, #27, #36)
+│   ├── pipeline_boundary.{cpp,cu,hpp} # graph-capturable PP boundary (#10)
+│   ├── pipeline_boundary_cuda.hpp #   CUDA plan declarations
+│   ├── pipeline_boundary_c.{h,cpp,cu} # C ABI for the PP boundary (#10)
+│   ├── rccl.{cpp,hpp}            # HIP/RCCL transport host reference (#19)
+│   ├── rccl.hip                  # HIP/RCCL all-reduce (VKERNELS_HAS_RCCL)
+│   ├── rccl_hip.hpp              # RcclChannel / plan declarations
+│   └── rccl_c.{h,cpp}            # C ABI for the RCCL transport
+├── capi/
+│   ├── capi.{cpp,hpp}            # C ABI (host path), exceptions → status codes
+│   ├── hip_capi.{cpp,hpp}        # C ABI over the gfx942 HIP compute kernels (#44)
+│   └── serving_c.{h,cpp}         # serving-runtime CUDA ABI
+├── core/
+│   ├── device.{cpp,hpp}          # Device abstraction
+│   ├── stream.{cpp,cu,hpp}       # Stream (async task queue)
+│   └── allocator.hpp             # CUDA memory pool tuning
+└── util/
+    ├── annotations.hpp           # [[nodiscard]] / VK_EXPORT helpers
+    ├── config.hpp                # VKERNELS_HAS_CUDA / HIP / RCCL / OFI macros
+    ├── error.hpp                 # VK_EXPECTS / VK_ENSURES status codes
+    ├── logging.hpp               # compile-time logging
+    ├── span.hpp                  # non-owning view (C++ only)
+    └── version.hpp               # version constants
 ```
 
 ## Language bindings
 
 | Language | Module | Docs |
 |---|---|---|
-| Python | `vkernels.kernels`, `vkernels.comm`, `vkernels.core` | [python-bindings.md](python-bindings.md) |
+| Python | `vkernels.kernels`, `vkernels.comm`, `vkernels.core`, `vkernels.dist` | [python-bindings.md](python-bindings.md) |
 | Rust | `vkernels::kernels`, `vkernels::comm`, `vkernels::core` | [rust-bindings.md](rust-bindings.md) |
-| C | `vkernels_c_*` (C ABI via `capi.hpp`) | — |
+| C | `vkernels_c_*` / `vk_hip_*` (C ABI via `capi.hpp`) | — |

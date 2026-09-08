@@ -73,3 +73,17 @@ void gemm_bf16(std::size_t M, std::size_t N, std::size_t K, float alpha,
 
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP
+
+#if VKERNELS_HAS_CUDA
+namespace vkernels::kernels::cuda {
+
+// CUDA bf16 GEMM entry point (NVIDIA, wmma 16x16x16; see gemm_bf16.cu).
+// Selects a tuned tile via gemm_bf16_config_for and launches the wmma
+// kernel. Same contract as the CPU reference: C = alpha * A @ B + beta * C,
+// bf16 in/out, fp32 accumulate.
+void gemm_bf16(std::size_t M, std::size_t N, std::size_t K, float alpha,
+               const uint16_t* A, const uint16_t* B, float beta,
+               uint16_t* C);
+
+}  // namespace vkernels::kernels::cuda
+#endif  // VKERNELS_HAS_CUDA
