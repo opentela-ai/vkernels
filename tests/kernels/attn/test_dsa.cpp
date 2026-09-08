@@ -19,10 +19,12 @@
 
 using vkernels::kernels::dsa_config_for;
 using vkernels::kernels::dsa_sparse_fwd_cpu;
+using vkernels::kernels::dsa_sparse_fwd_split_for;
 using vkernels::kernels::dsa_topk_logits_cpu;
 using vkernels::kernels::dsa_topk_logits_fits_lds;
 using vkernels::kernels::dsa_topk_logits_fits_lds_fp8q;
 using vkernels::kernels::dsa_topk_logits_fits_lds_mfma;
+using vkernels::kernels::dsa_topk_logits_fits_lds_wmma;
 using vkernels::kernels::dsa_topk_logits_split_for;
 
 namespace {
@@ -590,6 +592,13 @@ TEST(DsaTopk, FitsLdsCap) {
   EXPECT_TRUE(dsa_topk_logits_fits_lds(63, 128, 64));   // edge: 65,532 B
   EXPECT_FALSE(dsa_topk_logits_fits_lds(64, 128, 64));  // 66,048 B (-> fp8-Q)
   EXPECT_FALSE(dsa_topk_logits_fits_lds(32, 128, 128)); // 82,560 B (larger block)
+  // The cap is a parameter: the CUDA launcher runs the SAME formula against
+  // its device's queried opt-in ceiling (101,376 B on GB10/sm_121), where
+  // the H=64 shape gfx942 refuses fits the fp32-Q kernel after all.
+  EXPECT_TRUE(dsa_topk_logits_fits_lds(64, 128, 64, 66 * 1024));   // 66,048 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds(128, 128, 64, 101376));     // 99,072 B
+  EXPECT_FALSE(dsa_topk_logits_fits_lds(128, 128, 64, 99071));     // just over
+  EXPECT_FALSE(dsa_topk_logits_fits_lds(64, 128, 64, 0));          // no device
 }
 
 // Whether the indexer shape fits the fp8-Q kernel (Q staged RAW, dequantised
@@ -633,6 +642,35 @@ TEST(DsaTopk, FitsLdsMfma) {
   EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(2, 8, 4));       // D=8 not mult of 64
 }
 
+// dsa_topk_logits_fits_lds_wmma: the CUDA wmma kernel's admission -- the
+// MFMA guard's shape gates and staged footprint (sQt[D][H] bf16 +
+// sK[B][64] bf16 + gate + scales) PLUS the sAcc[B][H] fp32 buffer the
+// store_matrix_sync epilogue stages through:
+//   (D*H + B*64)*2 + (H + B)*4 + B*H*4   bytes
+// = 24,960 / 41,472 / 74,496 B at H=32/64/128 (D=128, B=64), and ONE extra
+// CUDA-specific gate: kTh = (B/16)*(H/16)*32 = B*H/8 threads/block <= 1024.
+// No default cap -- the ceiling is the device's queried
+// sharedMemPerBlockOptin (101,376 B on GB10/sm_121), which the CUDA
+// launcher passes; the explicit-cap asserts below pin that usage.
+TEST(DsaTopk, FitsLdsWmma) {
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_wmma(32, 128, 64, 101376));   // 24,960 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_wmma(64, 128, 64, 101376));   // 41,472 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_wmma(128, 128, 64, 101376));  // 74,496 B
+  // kTh boundary: H=128, B=64 -> exactly 1024 threads (the CUDA max).
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_wmma(128, 128, 64, 74496));   // exact fit
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_wmma(128, 128, 64, 74495));  // just over
+  // Thread cap: H=160, B=64 -> kTh = 1280 > 1024, even though the staged
+  // footprint (91,008 B) would fit GB10's ceiling. Larger H needs smaller B.
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_wmma(160, 128, 64, 101376));
+  // Cap participates: the same thread-legal H=128 shape vs a tiny cap.
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_wmma(128, 128, 64, 0));
+  // Shape constraints -- same fragment multiples as the MFMA guard.
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_wmma(246, 128, 64, 101376));  // H mult
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_wmma(32, 130, 64, 101376));   // D mult
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_wmma(32, 128, 72, 101376));   // B mult
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_wmma(0, 128, 64, 101376));    // bad dims
+}
+
 // dsa_topk_logits_split_for: optimal split_kv = max(1, min(ceildiv(msl,B),
 // 228/bs)) -- the single source of truth the hip_capi.hpp docstring used
 // to restate (with the wrong NUM_CU=256).
@@ -646,4 +684,32 @@ TEST(DsaTopk, SplitFor) {
   EXPECT_EQ(dsa_topk_logits_split_for(1, 4096, 0), 1);   // zero block -> 1
   // bs=2: each split handles ceildiv(4096,64)/sp pages across 2 batches.
   EXPECT_EQ(dsa_topk_logits_split_for(2, 4096, 64), 64);  // min(64, 228/2)
+}
+
+// dsa_sparse_fwd_split_for: the forward's split recommendation, fitted to
+// the measured sweep (docs/performance/dsa/gfx942.md): prefill returns 1
+// (the plain grid already fills the CUs); decode returns ceil(sqrt(2*topk))
+// capped at topk -- the measured optimum is 8-32 keys per split, NOT the
+// indexer's CU-filling floor (which is 5-6x off at H=64).
+TEST(DsaSparse, SplitFor) {
+  using vkernels::kernels::dsa_sparse_fwd_split_for;
+  // GLM-5.3-Flash full-topk decode: measured best split = 64 (19.7x).
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 228), 64);
+  // topk=256 decode: ceil(sqrt(512)) = 23 (measured best 16, neighbor 32).
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 256, 64, 228), 23);
+  // topk=128 decode: ceil(sqrt(256)) = 16 (measured best).
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 128, 64, 228), 16);
+  // DeepSeek-V3 decode (H=16): 16 blocks, still under-filled -> 23.
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 16, 256, 64, 228), 23);
+  // Huge H saturates the CUs with the plain grid: no split.
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 256, 2048, 64, 228), 1);
+  // Prefill S_q=8192 (BQ=4): 2048*H blocks >> CUs -> split 1.
+  EXPECT_EQ(dsa_sparse_fwd_split_for(8192, 1, 128, 64, 228), 1);
+  // topk=2: sqrt(4) = 2, capped at topk = 2.
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 1, 2, 2, 228), 2);
+  // Degenerate inputs -> safe 1.
+  EXPECT_EQ(dsa_sparse_fwd_split_for(0, 64, 2048, 64, 228), 1);
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 0, 64, 228), 1);
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 0, 228), 64);  // block_I unused
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 0), 64);   // default CUs
 }

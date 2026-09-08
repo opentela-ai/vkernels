@@ -240,3 +240,10 @@ CPU/torch reference; `K3_DISABLE_KDA=1` is no longer required.
 
 GLM-5.3-Flash serves on gfx942 with `--dsa-prefill-backend vkernels
 --dsa-decode-backend vkernels` and no custom tilelang overlay.
+Measured MI300A performance for the stack (indexer → kpool → sparse
+forward, MHC pre/post): [`docs/performance/dsa/gfx942.md`](docs/performance/dsa/gfx942.md),
+[`docs/performance/mhc/gfx942.md`](docs/performance/mhc/gfx942.md).
+The sparse forward's decode uses the split-key path
+(`dsa_sparse_fwd_split` + `dsa_sparse_fwd_split_for`): 3.12 → 0.156 ms
+per layer at full topk (20.0x), 0.40 → 0.059 ms at serving topk=256
+(6.7x), cross-checked against the fp32 oracle including uneven splits.

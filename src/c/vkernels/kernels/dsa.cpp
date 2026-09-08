@@ -315,4 +315,38 @@ int dsa_topk_logits_split_for(int batch_size, int max_seq_len, int block) {
   return s < 1 ? 1 : s;
 }
 
+int dsa_sparse_fwd_split_for(int S_q, int H, int topk, int block_I,
+                             int num_cu) {
+  // Same CU count as dsa_topk_logits_split_for (MI300A / gfx942, verified on
+  // a CSCS beverin node); parameterized so a caller can pass the device's
+  // hipDeviceProp_t::multiProcessorCount instead of the default.
+  if (num_cu <= 0) num_cu = 228;
+  if (S_q <= 0 || H <= 0 || topk <= 0) return 1;
+  int bq = 0, th = 0, bi = 0, ii = 0;
+  dsa_config_for(S_q, H, /*dim=*/0, topk, &bq, &th, &bi, &ii);
+  const int blocks = ((S_q + bq - 1) / bq) * H;   // blocks per single split
+  // Prefill / wide-H shapes: the plain grid already fills (or over-fills)
+  // the CUs, so serial key streaming is amortized across blocks -- splitting
+  // only adds combine traffic. Measured: prefill S_q=8192 runs 28% of the
+  // HBM roof unsplit.
+  if (blocks >= num_cu) return 1;
+  // Decode shapes: the optimum is set by the per-block SERIAL key chain (a
+  // key's global read is a load->use dependency, ~1.2 us unpipelined), not
+  // by CU filling -- over-subscription up to ~18 waves measured strictly
+  // beneficial. The split sweep (docs/performance/dsa/gfx942.md, MI300A)
+  // puts the best at 8-32 keys per split on every decode shape, and
+  // ceil(sqrt(2*topk)) lands on the measured best or its nearest measured
+  // neighbor on all four: topk=2048 -> 64 (19.7x), 256 -> 23 (best 16),
+  // 128 -> 16 (4.1x), DSv3 256 -> 23 (best 16). The indexer's floor-division
+  // formula (num_cu/blocks) is WRONG here: it recommends 3-4 at H=64, 5-6x
+  // off the measured optimum, because it models CU filling, not the serial
+  // chain. block_I stays reserved for the future tiled-key variant (whose
+  // split cap WILL be ceildiv(topk, block_I)); the streaming partial kernel
+  // reads one key at a time, so any split in [1, topk] is legal.
+  (void)block_I;
+  int s = (int)std::ceil(std::sqrt(2.0 * (double)topk));
+  if (s > topk) s = topk;   // every split keeps >= 1 key
+  return s < 1 ? 1 : s;
+}
+
 }  // namespace vkernels::kernels

@@ -68,18 +68,31 @@ static BenchResult bench_us(const std::function<void()>& launch,
       hipEventSynchronize(stop);
       float ms = 0;
       hipEventElapsedTime(&ms, start, stop);
+      // ROCm 6.3 event quirk (observed on MI300A with rapid-fire event
+      // pairs around DVFS clock transitions): a rare event pair reports
+      // elapsed exactly 0.0 even though the kernels ran (verified by
+      // output checksum). Discard such samples instead of poisoning
+      // min/median; a window where EVERY sample is 0 widens once and
+      // ultimately yields the {0,0,0} result (a visible broken row -- the
+      // login-node no-gfx-agent signature), rather than a hang.
+      if (ms <= 0.0f) continue;
       times.push_back(ms * 1000.0f);
+    }
+    const int n = (int)times.size();
+    if (n == 0) {
+      iters *= 2;
+      continue;
     }
     double sum = 0;
     for (double t : times) sum += t;
-    double mean = sum / iters;
+    double mean = sum / n;
     double sum2 = 0;
     for (double t : times) sum2 += t * t;
-    double var = sum2 / iters - mean * mean;
+    double var = sum2 / n - mean * mean;
     double stddev = std::sqrt(std::max(0.0, var));
     if ((mean > 0 && stddev / mean < 0.03) || iters >= max_iters) {
       std::sort(times.begin(), times.end());
-      return {times[0], times[iters / 2], mean};
+      return {times[0], times[n / 2], mean};
     }
     iters *= 2;
   }
@@ -273,6 +286,103 @@ static void autotune(const GpuInfo& info, hipEvent_t start, hipEvent_t stop) {
 }
 
 // ---------------------------------------------------------------------------
+// Split-key sweep (decode occupancy fix, issue #51 follow-up): the plain
+// forward's grid is (ceil(S_q/BQ), H) -- 64 blocks on 228 CUs at the
+// GLM-5.3-Flash decode shape -- so decode is occupancy-bound, not
+// bandwidth-bound (docs/performance/dsa/gfx942.md). dsa_sparse_fwd_split
+// divides the topk index range across `split` partial blocks + a combine
+// pass (grouping-independent, exact log2-domain merge). This sweep measures
+// the decode shapes across split and marks the dsa_sparse_fwd_split_for
+// recommendation so the launcher's default can be regenerated from data.
+static void split_sweep(const GpuInfo& info, hipEvent_t start,
+                        hipEvent_t stop) {
+  struct Cfg { int H, S_q, S_kv, dim, tail_dim, topk; };
+  const Cfg cfgs[] = {
+      {64, 1, 2048, 256, 0, 2048},  // GLM-5.3 decode, full topk
+      {64, 1,  256, 256, 0,  256},  // GLM-5.3 decode, serving topk
+      {64, 1,  128, 256, 0,  128},  // GLM-5.3 decode, small topk
+      {16, 1,  512, 576, 64,  256}, // DeepSeek-V3 decode
+  };
+  const int splits[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
+  constexpr int nS = sizeof(splits) / sizeof(splits[0]);
+
+  std::printf("\n=== DSA split-key sweep (decode shapes; split x partial +"
+              " combine) ===\n");
+  for (const auto& c : cfgs) {
+    const int H = c.H, S_q = c.S_q, S_kv = c.S_kv, dim = c.dim;
+    const int tail_dim = c.tail_dim, topk = c.topk;
+    const int W = dim + tail_dim, d_v = dim - tail_dim;
+    const float sm_scale = (1.0f / std::sqrt((float)W)) * 1.4426950408889634f;
+    const size_t nq = (size_t)S_q * H * W, nkv = (size_t)S_kv * W;
+    const size_t nidx = (size_t)S_q * topk, nout = (size_t)S_q * H * d_v;
+    std::vector<uint16_t> q(nq), kv(nkv), out(nout, 0);
+    std::vector<int32_t> idx(nidx);
+    for (size_t i = 0; i < nq; ++i)  q[i]  = f2bf(rnd(1, (int)i));
+    for (size_t i = 0; i < nkv; ++i) kv[i] = f2bf(rnd(2, (int)i));
+    for (int i = 0; i < S_q; ++i)
+      for (int k = 0; k < topk; ++k)
+        idx[(size_t)i * topk + k] =
+            (k % 10 == 9) ? -1 : (int32_t)(((unsigned)(i * 31 + k * 7)) %
+                                           (unsigned)S_kv);
+    uint16_t *dq, *dkv, *dout;
+    int32_t* didx;
+    float *dlse, *dpart_out, *dpart_lse;
+    check_hip(hipMalloc(&dq,   nq   * 2), "q");
+    check_hip(hipMalloc(&dkv,  nkv  * 2), "kv");
+    check_hip(hipMalloc(&didx, nidx * 4), "idx");
+    check_hip(hipMalloc(&dout, nout * 2), "out");
+    check_hip(hipMalloc(&dlse, (size_t)S_q * H * 4), "lse");
+    // Scratch for the largest legal split in the sweep (<= topk).
+    int smax = 1;
+    for (int s : splits) if (s <= topk && s > smax) smax = s;
+    check_hip(hipMalloc(&dpart_out,
+                        (size_t)S_q * H * smax * d_v * 4), "part_out");
+    check_hip(hipMalloc(&dpart_lse, (size_t)S_q * H * smax * 4), "part_lse");
+    check_hip(hipMemcpy(dq,   q.data(),   nq   * 2, hipMemcpyHostToDevice),
+              "cpyq");
+    check_hip(hipMemcpy(dkv,  kv.data(),  nkv  * 2, hipMemcpyHostToDevice),
+              "cpykv");
+    check_hip(hipMemcpy(didx, idx.data(), nidx * 4, hipMemcpyHostToDevice),
+              "cpyidx");
+
+    const int rec = vkernels::kernels::dsa_sparse_fwd_split_for(
+        S_q, H, topk, /*block_I=*/64, /*num_cu=*/228);
+    std::printf("\n  H=%d S_q=%d topk=%d (dim=%d tail=%d):"
+                " dsa_sparse_fwd_split_for = %d\n",
+                H, S_q, topk, dim, tail_dim, rec);
+    std::printf("    %5s %9s %9s %9s %8s  %s\n", "split", "us(min)",
+                "us(med)", "GB/s", "speedup", "note");
+    double base_us = 0.0;
+    for (int s : splits) {
+      if (s > topk) continue;
+      auto L = [&] {
+        vkernels::kernels::hip::dsa_sparse_fwd_split(
+            S_q, S_kv, H, dim, tail_dim, topk, 1, /*block_I=*/64,
+            /*inner_iter=*/1, sm_scale, /*return_lse=*/true, s,
+            dq, dkv, didx, dout, dlse, dpart_out, dpart_lse);
+      };
+      auto r = bench_us(L, start, stop, 3, 60);
+      if (s == 1) base_us = r.median_us;
+      // Same byte model as the main table: kv re-read once per head.
+      double bytes = 2.0 * ((double)S_q * H * W + (double)S_q * H * d_v +
+                            (double)S_q * H * topk * W)
+                   + 4.0 * (double)S_q * topk;
+      double gbs = bytes / (r.median_us / 1e6) / 1e9;
+      std::printf("    %5d %9.1f %9.1f %9.1f %7.1fx  %s\n", s, r.min_us,
+                  r.median_us, gbs, base_us / r.median_us,
+                  s == rec ? "<- split_for" : "");
+    }
+    check_hip(hipFree(dq),   "fq");
+    check_hip(hipFree(dkv),  "fkv");
+    check_hip(hipFree(didx), "fidx");
+    check_hip(hipFree(dout), "fout");
+    check_hip(hipFree(dlse), "flse");
+    check_hip(hipFree(dpart_out), "fpart_out");
+    check_hip(hipFree(dpart_lse), "fpart_lse");
+  }
+}
+
+// ---------------------------------------------------------------------------
 int main() {
   auto info = get_gpu_info();
   std::printf("GPU: %s  arch=%d  bf16=%.0f TFLOP/s  HBM=%.0f GB/s\n",
@@ -281,6 +391,7 @@ int main() {
   hipEventCreate(&start); hipEventCreate(&stop);
   bench_shapes(info, start, stop);
   autotune(info, start, stop);
+  split_sweep(info, start, stop);
   hipEventDestroy(start); hipEventDestroy(stop);
   return 0;
 }

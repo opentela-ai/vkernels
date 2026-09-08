@@ -1,0 +1,166 @@
+=== node: nid002424  date: 2026-09-08T08:35:26Z ===
+GPU[0]		: Card Series: 		Aqua Vanjaram [Instinct MI300A]
+GPU[0]		: Card Model: 		0x74a0
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+=== lock perf level high ===
+(setperflevel not permitted; continuing)
+GPU[0]		: mclk clock level: 3: (1300Mhz)
+GPU[0]		: sclk clock level: S: (96Mhz)
+GPU[1]		: mclk clock level: 3: (1300Mhz)
+GPU[1]		: sclk clock level: S: (97Mhz)
+=== configure (HIP, gfx942, Release, tests + benchmarks ON) ===
+-- =================================
+-- Configuring done (0.5s)
+-- Generating done (5.2s)
+-- Build files have been written to: /users/xyao/vkernels/build_dsamhc
+=== build (vkernels + hip C ABI + correctness tests + the three benches) ===
+/users/xyao/vkernels/meta/benchmarks/bench_mhc.hip:67:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels/meta/benchmarks/bench_mhc.hip:69:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels/meta/benchmarks/bench_mhc.hip:70:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels/meta/benchmarks/bench_mhc.hip:72:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels/meta/benchmarks/bench_mhc.hip:251:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels/meta/benchmarks/bench_mhc.hip:251:27: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels/meta/benchmarks/bench_mhc.hip:256:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/users/xyao/vkernels/meta/benchmarks/bench_mhc.hip:256:27: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+[100%] Linking HIP executable mhc_bench
+[100%] Built target mhc_bench
+[ 96%] Built target vkernels
+[ 96%] Building HIP object meta/benchmarks/CMakeFiles/dsa_topk_logits_bench.dir/bench_dsa_topk_logits.hip.o
+[100%] Linking HIP executable dsa_topk_logits_bench
+[100%] Built target dsa_topk_logits_bench
+
+############ 1. DSA CORRECTNESS (test_dsa_correct) ############
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+
+############ 2. MHC CORRECTNESS (test_mhc_correct) ############
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+
+mhc_pre_gemm_sqrsum (vs CPU reference, fp32 both paths):
+  n=1  hc_mult=2 hidden=2    (hc_hidden=4     hc_mult3=8 )  abs=2.3842e-07 rel=7.1973e-08  PASS
+  n=7  hc_mult=3 hidden=3    (hc_hidden=9     hc_mult3=15)  abs=9.5367e-07 rel=3.5932e-07  PASS
+  n=1  hc_mult=4 hidden=4096 (hc_hidden=16384 hc_mult3=24)  abs=1.9531e-01 rel=9.7448e-06  PASS
+  n=7  hc_mult=4 hidden=4096 (hc_hidden=16384 hc_mult3=24)  abs=2.7148e-01 rel=1.9263e-05  PASS
+  n=1  hc_mult=4 hidden=7168 (hc_hidden=28672 hc_mult3=24)  abs=7.6953e-01 rel=2.0074e-05  PASS
+
+mhc_post (vs CPU reference, bf16 store):
+  n=1  hc=2 hidden=2     abs=7.1509e-03 rel=2.4019e-03  PASS
+  n=7  hc=4 hidden=5     abs=1.4932e-02 rel=3.7855e-03  PASS
+  n=1  hc=4 hidden=4096  abs=3.0088e-02 rel=3.8722e-03  PASS
+  n=7  hc=4 hidden=4096  abs=3.1231e-02 rel=3.8845e-03  PASS
+  n=1  hc=4 hidden=7168  abs=2.9481e-02 rel=3.8721e-03  PASS
+  n=4  hc=8 hidden=1024  abs=3.1247e-02 rel=3.8870e-03  PASS
+
+PASS (0 failure(s))
+
+############ 3. BENCHMARK: DSA sparse-MLA forward (dsa_bench) ############
+GPU: AMD Instinct MI300A  arch=942  bf16=1307 TFLOP/s  HBM=5300 GB/s
+
+=== hip::dsa_sparse_fwd (GLM-5.3 + DeepSeek-V3) ===
+     H    S_q   S_kv   dim  tail  topk   us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+    64      1   2048   256     0  2048    3106.9    3120.4     0.043      21.5   2.0  mem  [BQ=1]
+    64      1    256   256     0   256     394.5     397.3     0.042      21.3   2.0  mem  [BQ=1]
+    64      1    128   256     0   128     200.4     203.4     0.041      20.9   2.0  mem  [BQ=1]
+     8     64    256   256     0   128     214.6     217.1     0.309     157.1   2.0  mem  [BQ=4]
+     1   8192   1024   256     0   128     479.8     486.8     2.206    1128.7   2.0  mem  [BQ=4]
+    16      1    256   576    64   256     731.2     743.2     0.013       7.1   1.8  mem  [BQ=1]
+    16      1    512   576    64   256     737.2     742.2     0.013       7.1   1.8  mem  [BQ=1]
+     1     64    256   576    64   256     805.3     813.8     0.046      26.0   1.8  mem  [BQ=4]
+     1   8192   1024   576    64   256    1835.7    1847.8     2.615    1467.5   1.8  mem  [BQ=4]
+  Roof: 1307 TFLOP/s bf16, 5300 GB/s HBM, ridge ~247 FLOP/B
+
+=== DSA autotuner (H=64 S_q=1 dim=256 tail=0 topk=2048): us(med) per BQ ===
+  BQ=1   3119.3 us
+  BQ=2   3184.9 us
+  BQ=4   3184.3 us
+  BQ=8   3180.5 us
+  best: BQ=1  (3119.3 us)
+
+=== DSA autotuner (H=16 S_q=1 dim=576 tail=64 topk=256): us(med) per BQ ===
+  BQ=1   740.3 us
+  BQ=2   754.0 us
+  BQ=4   754.8 us
+  BQ=8   754.2 us
+  best: BQ=1  (740.3 us)
+
+=== DSA autotuner (H=8 S_q=64 dim=256 tail=0 topk=128): us(med) per BQ ===
+  BQ=1   209.6 us
+  BQ=2   217.1 us
+  BQ=4   216.8 us
+  BQ=8   222.2 us
+  best: BQ=1  (209.6 us)
+
+=== DSA autotuner (H=1 S_q=8192 dim=256 tail=0 topk=128): us(med) per BQ ===
+  BQ=1   498.7 us
+  BQ=2   494.3 us
+  BQ=4   487.0 us
+  BQ=8   489.5 us
+  best: BQ=4  (487.0 us)
+
+=== DSA split-key sweep (decode shapes; split x partial + combine) ===
+
+  H=64 S_q=1 topk=2048 (dim=256 tail=0): dsa_sparse_fwd_split_for = 64
+    split   us(min)   us(med)      GB/s  speedup  note
+        1    3094.9    3119.5      21.5     1.0x  
+        2    1595.4    1602.2      41.9     1.9x  
+        4     820.3     823.9      81.5     3.8x  
+        8     428.8     431.0     155.9     7.2x  
+       16     239.2     241.8     277.8    12.9x  
+       32     160.1     163.0     412.1    19.1x  
+       64     154.1     156.3     429.8    20.0x  <- split_for
+      128     233.1     236.3     284.3    13.2x  
+      256     392.3     397.2     169.1     7.9x  
+
+  H=64 S_q=1 topk=256 (dim=256 tail=0): dsa_sparse_fwd_split_for = 23
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     394.6     396.8      21.3     1.0x  
+        2     210.6     212.7      39.8     1.9x  
+        4     114.4     116.5      72.6     3.4x  
+        8      70.3      73.0     115.9     5.4x  
+       16      56.5      58.9     143.6     6.7x  
+       32      66.0      68.3     123.8     5.8x  
+       64     101.6     104.1      81.2     3.8x  
+      128     181.9     184.5      45.8     2.2x  
+      256     345.7     349.0      24.2     1.1x  
+
+  H=64 S_q=1 topk=128 (dim=256 tail=0): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     200.0     202.9      21.0     1.0x  
+        2     110.2     112.9      37.7     1.8x  
+        4      64.6      66.8      63.8     3.0x  
+        8      45.4      48.6      87.7     4.2x  
+       16      43.0      45.4      93.8     4.5x  <- split_for
+       32      58.1      60.6      70.3     3.3x  
+       64      97.2      99.0      43.0     2.0x  
+      128     179.8     182.5      23.3     1.1x  
+
+  H=16 S_q=1 topk=256 (dim=576 tail=64): dsa_sparse_fwd_split_for = 23
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     737.7     741.3       7.1     1.0x  
+        2     383.5     387.4      13.6     1.9x  
+        4     204.7     207.3      25.5     3.6x  
+        8     119.6     122.1      43.3     6.1x  
+       16      91.7      94.2      56.1     7.9x  
+       32     102.8     105.6      50.0     7.0x  
+       64     158.6     162.4      32.5     4.6x  
+      128     291.1     293.8      18.0     2.5x  
+      256     560.8     565.6       9.3     1.3x  
+
