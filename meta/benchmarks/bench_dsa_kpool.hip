@@ -126,17 +126,30 @@ static BenchResult bench_us(const std::function<void()>& launch,
         (void)hipEventSynchronize(stop);
         float ms = 0;
         (void)hipEventElapsedTime(&ms, start, stop);
+        // ROCm 6.3 event quirk (observed on MI300A with rapid-fire event
+        // pairs around DVFS clock transitions): a rare event pair reports
+        // elapsed exactly 0.0 even though the kernels ran (verified by
+        // output checksum). Discard such samples instead of poisoning
+        // min/median/mean; a window where EVERY sample is 0 widens once
+        // and ultimately yields the {0,0,0} result (a visible broken row
+        // -- the login-node no-gfx-agent signature), rather than a hang.
+        if (ms <= 0.0f) continue;
         per.push_back(ms * 1000.0f / (float)reps);   // per-launch us
       }
+      const int n = (int)per.size();
+      if (n == 0) {
+        samples *= 2;
+        continue;
+      }
       double sum = 0;  for (double t : per)  sum += t;
-      double mean = sum / samples;
+      double mean = sum / n;
       double sum2 = 0; for (double t : per)  sum2 += t * t;
-      double var = sum2 / samples - mean * mean;
+      double var = sum2 / n - mean * mean;
       double sd = std::sqrt(std::max(0.0, var));
       double cv = mean > 0 ? sd / mean : 0;
       if (cv < 0.05 || samples >= max_samples) {
         std::sort(per.begin(), per.end());
-        return BenchResult{per[0], per[samples / 2], mean};
+        return BenchResult{per[0], per[n / 2], mean};
       }
       samples *= 2;
     }
