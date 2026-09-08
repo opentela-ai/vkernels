@@ -1,0 +1,50 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M205K0G4D4SDFJF5GZTJYD56",
+  "session_id": "01a0800e-f4cb-7428-9bd2-f036a40e17c7",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-08T09:29:05.377390843Z",
+  "branch": "main",
+  "checkpoints_count": 6,
+  "save_step_count": 1,
+  "files_touched": [
+    "README.md",
+    "docs/kernels/dsa.md",
+    "docs/performance/dsa/beverin-dsa-bench.log",
+    "docs/performance/dsa/gfx942.md",
+    "docs/performance/mhc/beverin-mhc-bench.log",
+    "docs/performance/mhc/gfx942.md",
+    "meta/benchmarks/bench_dsa.hip",
+    "meta/benchmarks/test_dsa_correct.hip",
+    "meta/scripts/run_dsa_mhc_bench_mi300.sh",
+    "src/c/vkernels/capi/hip_capi.cpp",
+    "src/c/vkernels/capi/hip_capi.hpp",
+    "tests/kernels/attn/test_dsa.cpp"
+  ],
+  "agent": "Pi",
+  "model": "zai-org/GLM-5.3-Flash",
+  "turn_id": "0b9a29c0db02",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 18065033,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 161886,
+    "api_call_count": 243
+  },
+  "session_metrics": {
+    "turn_count": 6
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-08T09:29:05.1251941Z",
+    "agent_lines": 1136,
+    "agent_removed": 30,
+    "human_added": 354,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1490,
+    "total_lines_changed": 1520,
+    "agent_percentage": 76.71052631578948,
+    "metric_version": 2
+  }
+}
