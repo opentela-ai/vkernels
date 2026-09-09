@@ -1,0 +1,39 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M22HYKMWWP1BV9Z983R2XPGF",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 5,
+  "files_touched": [
+    "docs/mhc-projection.md",
+    "docs/qkv-projection.md",
+    "meta/benchmarks/bench_mhc_projection.py",
+    "meta/benchmarks/bench_qkv_projection.py",
+    "meta/benchmarks/bench_roofline.py",
+    "meta/benchmarks/bench_roofline_counters.py",
+    "meta/benchmarks/check_qkv_tuned_blas.py",
+    "src/python/vkernels/torch_ops/__init__.py",
+    "src/python/vkernels/torch_ops/mhc_projection.py",
+    "src/python/vkernels/torch_ops/qkv_projection.py",
+    "src/python/vkernels/torch_ops/qkv_tuned_blas.py",
+    "tests/python/test_mhc_projection.py",
+    "tests/python/test_qkv_projection.py",
+    "tests/python/test_qkv_tuned_blas.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 1997750,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 25922880,
+    "output_tokens": 466258,
+    "api_call_count": 381
+  }
+}
