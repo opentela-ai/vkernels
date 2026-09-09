@@ -369,6 +369,168 @@ def _triton_native_backend(a_fnuz, a_scales, b_fnuz, b_scales, out):
     return out
 
 
+def quantize_activations_fnuz(x, group_size: int = 128):
+    """BF16 [M, K] -> (fnuz payload, DOUBLED scales) in one step (the
+    native-backend convention: halved payload x doubled scale = value)."""
+    import torch
+
+    q, sc = quantize_activations_fp8(x, group_size)
+    return e4m3fn_to_fnuz(q, sc)
+
+
+@lru_cache(maxsize=1)
+def _grouped_kernel():
+    """Single-launch grouped blockwise fp8 GEMM (MoE): one grid covers
+    every active expert's (row-tile, N-tile) work. A rows are GATHERED
+    through the sort order (token index per slot); B and scales are
+    selected per tile from the expert stacks. Operands are fnuz with the
+    doubled-scale convention."""
+    global tl
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _grouped_gemm(
+        A, SA, W, SW, D,
+        TOK, TILE_EXP, TILE_R0, TILE_M,
+        N, K,
+        san, sakb, swn, swkb,
+        BM: tl.constexpr, BN: tl.constexpr, A_BY_TOKEN: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        pid_m = tl.program_id(1)
+        e = tl.load(TILE_EXP + pid_m).to(tl.int64)
+        r0 = tl.load(TILE_R0 + pid_m)
+        me = tl.load(TILE_M + pid_m)
+        ri = r0 + tl.arange(0, BM)               # sorted-slot space
+        rmask = tl.arange(0, BM) < me
+        # A rows: gate_up gathers the shared per-TOKEN activation; the down
+        # GEMM's post-swiglu activations are per-SLOT (one per expert
+        # assignment) and already live in sorted order — index directly.
+        tok = (tl.load(TOK + ri, mask=rmask, other=0).to(tl.int64)
+               if A_BY_TOKEN else ri)
+        rn = pid_n * BN + tl.arange(0, BN)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        wbase = W + e * N * K                    # expert's [N, K] panel
+        swbase = SW + e * (N // 128) * (K // 128)
+        for kb in range(0, K // 128):
+            rk = kb * 128 + tl.arange(0, 128)
+            a = tl.load(
+                A + tok[:, None] * K + rk[None, :],
+                mask=rmask[:, None], other=0.0,
+            )
+            b = tl.load(
+                wbase + rn[:, None] * K + rk[None, :],
+                mask=rn[:, None] < N, other=0.0,
+            )
+            sa = tl.load(SA + tok * san + kb * sakb, mask=rmask, other=0.0)
+            sb = tl.load(swbase + (rn // 128) * swn + kb * swkb,
+                         mask=rn < N, other=0.0)
+            blk = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
+            acc += blk * (sa[:, None] * sb[None, :])
+        tl.store(
+            D + ri[:, None] * N + rn[None, :], acc.to(D.dtype.element_ty),
+            mask=rmask[:, None] & (rn[None, :] < N),
+        )
+
+    return _grouped_gemm
+
+
+def _grouped_backend(a_nz, asc2, w_nz, wsc2, out, tok, tile_exp, tile_r0,
+                     tile_m, n, k, a_by_token=True):
+    """One grouped launch. With a_by_token, a_nz rows are gathered by the
+    TOKEN id in `tok` (shared activations, gate_up); otherwise rows are
+    indexed directly in SORTED-slot order (per-slot activations, down).
+    `out` rows are always in sorted-slot order ([n_slots, n])."""
+    import torch
+
+    kfn = _grouped_kernel()
+    bm, bn, warps, stages = 64, 128, 4, 3
+    cfg = os.environ.get("VK_FP8GEMM_TILES", "")
+    if cfg:
+        bm, bn, warps, stages = (int(x) for x in cfg.split(","))
+    import triton
+
+    grid = (triton.cdiv(n, bn), len(tile_m))
+    kfn[grid](
+        a_nz, asc2, w_nz, wsc2, out,
+        tok, tile_exp, tile_r0, tile_m,
+        n, k,
+        asc2.stride(0), asc2.stride(1),
+        wsc2.stride(1), wsc2.stride(2),
+        BM=bm, BN=bn, A_BY_TOKEN=a_by_token,
+        num_warps=warps, num_stages=stages,
+    )
+    return out
+
+
+def glm_moe_grouped_gemm_native(
+    x,
+    gate_up_nz, gate_up_sc2,
+    down_nz, down_sc2,
+    topk_index,
+    topk_weights,
+    swiglu_limit=7.0,
+):
+    """Routed expert MLP via TWO single-launch grouped fp8 GEMMs.
+
+    Inputs: x bf16 [T, H]; gate_up_nz/down_nz the ONE-TIME converted
+    e4m3fnuz expert stacks with DOUBLED scales (e4m3fn_to_fnuz); routing
+    int64 [T, K] + fp weights [T, K]. Returns bf16 [T, H].
+
+    Host work per call: one sort, a handful of tiny torch ops for the
+    tile map, two grouped launches, one swiglu + per-row quantize — no
+    per-expert Python loop (that loop measured host-bound at ~200 ms on
+    MI300A; this replaces it)."""
+    import torch
+
+    t, k = topk_index.shape
+    h = x.shape[1]
+    two_i, h2 = gate_up_nz.shape[1], gate_up_nz.shape[2]
+    i = two_i // 2
+    dev = x.device
+
+    flat = topk_index.reshape(-1)
+    tok_all = torch.arange(t, device=dev).repeat_interleave(k)
+    order = torch.argsort(flat, stable=True)
+    sorted_tok = tok_all[order]
+    sorted_exp = flat[order]
+    uniq, counts = torch.unique_consecutive(sorted_exp, return_counts=True)
+    seg = torch.zeros(len(uniq) + 1, device=dev, dtype=torch.int64)
+    seg[1:] = torch.cumsum(counts, 0)
+
+    a_nz, asc2 = quantize_activations_fnuz(x)
+
+    bm = int(os.environ.get("VK_FP8GEMM_TILES", "64,128,4,3").split(",")[0])
+    tiles = (counts + bm - 1) // bm
+    toff = torch.zeros(len(uniq) + 1, device=dev, dtype=torch.int64)
+    toff[1:] = torch.cumsum(tiles, 0)
+    tile_exp = torch.repeat_interleave(uniq, tiles)
+    tile_r0 = torch.repeat_interleave(seg[:-1], tiles)
+    tile_m = torch.repeat_interleave(counts, tiles)
+
+    slots = t * k
+    gu = torch.empty((slots, two_i), device=dev, dtype=torch.bfloat16)
+    _grouped_backend(a_nz, asc2, gate_up_nz, gate_up_sc2, gu,
+                     sorted_tok, tile_exp, tile_r0, tile_m, two_i, h)
+    gate = gu[:, :i].float().clamp(max=swiglu_limit)
+    up = gu[:, i:].float().clamp(min=-swiglu_limit, max=swiglu_limit)
+    act = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+
+    # act rows are per-SLOT in sorted order (K expert assignments per
+    # token) — the down GEMM indexes A directly, no gather.
+    a2_nz, a2sc2 = quantize_activations_fnuz(act)
+    dn = torch.empty((slots, h), device=dev, dtype=torch.bfloat16)
+    _grouped_backend(a2_nz, a2sc2, down_nz, down_sc2, dn,
+                     sorted_tok, tile_exp, tile_r0, tile_m, h, i,
+                     a_by_token=False)
+
+    w = topk_weights.reshape(-1)[order].float().unsqueeze(-1)
+    y = torch.zeros((t, h), device=dev, dtype=torch.float32)
+    y.index_add_(0, sorted_tok, dn.float() * w)
+    return y.to(torch.bfloat16)
+
+
 def _triton_backend(a_fp8, a_scales, b_fp8, b_scales, out):
     """VK_FP8GEMM_TILES='BM,BN,warps,stages' overrides the defaults (tuning)."""
     import torch
