@@ -266,6 +266,18 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(kda_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(kda_bench)
 
+  # GLM block-FP8 decode-fused GEMV (#64): correctness vs the CPU oracle +
+  # fused-vs-materialized microbenchmark.
+  add_executable(test_glm_fp8_gemv test_glm_fp8_gemv.hip)
+  target_link_libraries(test_glm_fp8_gemv PRIVATE vkernels::vkernels)
+  target_compile_features(test_glm_fp8_gemv PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_glm_fp8_gemv)
+
+  add_executable(glm_fp8_gemv_bench bench_glm_fp8_gemv.hip)
+  target_link_libraries(glm_fp8_gemv_bench PRIVATE vkernels::vkernels)
+  target_compile_features(glm_fp8_gemv_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(glm_fp8_gemv_bench)
+
   # Chunked WY K3 forward (#70): correctness vs the CPU oracle + A/B vs the
   # committed cooperative kernel.
   add_executable(test_kda_chunked test_kda_chunked.hip)
