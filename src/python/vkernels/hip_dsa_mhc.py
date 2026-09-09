@@ -43,6 +43,8 @@ __all__ = [
     "mhc_post",
     "kda_delta_rule_fwd",
     "kda_delta_rule_fwd_with_scratch",
+    "kda_delta_rule_fwd_chunked",
+    "kda_chunked_scratch_floats",
 ]
 
 # MI300A / gfx942 CU count (hipDeviceProp_t::multiProcessorCount, verified on
@@ -492,4 +494,82 @@ def kda_delta_rule_fwd_with_scratch(
     f.restype = None
     f.argtypes = [_VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _INT, _INT, _INT, _INT]
     f(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta), _dptr(state), _dptr(out), B, H, S, D)
+    return out, state
+
+
+def kda_chunked_scratch_floats(B: int, H: int, S: int, D: int) -> int:
+    """WY scratch size in float32s for :func:`kda_delta_rule_fwd_chunked`."""
+    lib = _load()
+    if lib is None:
+        raise RuntimeError("libvkernels_hip.so not found")
+    f = lib.vk_hip_kda_chunked_scratch_floats
+    f.restype = ctypes.c_ulonglong
+    f.argtypes = [_INT, _INT, _INT, _INT]
+    return int(f(B, H, S, D))
+
+
+def kda_delta_rule_fwd_chunked(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    scratch: Optional[torch.Tensor] = None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunked WY per-key-dim delta-rule forward (device, fp32 ABI, #70).
+
+    Same contract and layouts as :func:`kda_delta_rule_fwd_with_scratch`
+    (normal-space ``g`` in ``(0, 1]``, L2-normalised ``k``, caller-scaled
+    ``q``, caller-owned ``state [B, H, D, D]`` read and written in place),
+    computed in the affine WY form: gate cumsum -> per-chunk grams +
+    explicit triangular inverse + U_v/W/T/Opar precompute -> an nc-step
+    serial state pass split over D-row blocks. 1.1-4.0x over the
+    cooperative kernel on gfx942 (beverin, docs/kda-lds-optimization.md).
+
+    CONTRACT (stricter than the cooperative kernel): ``k`` must be
+    L2-normalised (bounds the explicit inverse); ``chunk_size`` must be
+    64 and ``S % 64 == 0`` (pad at the call site); ``D <= 128`` and
+    ``D % 16 == 0``; eager (the launcher syncs).
+
+    ``scratch`` is the WY buffer of
+    :func:`kda_chunked_scratch_floats` (B, H, S, D) float32s — pass
+    it to reuse storage across calls; when None a fresh buffer is
+    allocated per call (contents clobbered either way).
+    """
+    lib = _load()
+    if lib is None:
+        raise RuntimeError("libvkernels_hip.so not found")
+    B, H, S, D, (q, k, v, g, beta) = _kda_check(q, k, v, g, beta)
+    if chunk_size != 64 or S % 64 != 0:
+        raise ValueError(
+            f"chunked KDA requires chunk_size==64 and S%64==0 "
+            f"(got chunk_size={chunk_size}, S={S}); pad S at the call site")
+    if D > 128 or D % 16 != 0:
+        raise ValueError(f"chunked KDA requires D<=128 and D%16==0 (got D={D})")
+    if tuple(state.shape) != (B, H, D, D):
+        raise ValueError(f"state shape {tuple(state.shape)} != {(B, H, D, D)}")
+    state = _contig(state, "state", torch.float32)
+    if out is None:
+        out = torch.empty(B, H, S, D, dtype=torch.float32, device=q.device)
+    else:
+        _contig(out, "out", torch.float32)
+    if scratch is None:
+        scratch = torch.empty(
+            kda_chunked_scratch_floats(B, H, S, D),
+            dtype=torch.float32, device=q.device)
+    else:
+        want = kda_chunked_scratch_floats(B, H, S, D)
+        if scratch.numel() < want:
+            raise ValueError(f"scratch needs {want} floats "
+                             f"(got {scratch.numel()})")
+        scratch = _contig(scratch, "scratch", torch.float32)
+    f = lib.vk_hip_kda_delta_rule_fwd_chunked_with_scratch
+    f.restype = None
+    f.argtypes = ([_VOIDP] * 8 + [_INT] * 5)
+    f(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta), _dptr(state),
+      _dptr(out), _dptr(scratch), B, H, S, D, int(chunk_size))
     return out, state

@@ -448,6 +448,27 @@ void vk_hip_kda_delta_rule_fwd_with_scratch(
     const float* g, const float* beta, float* state,
     float* out, int B, int H, int S, int D);
 
+/* Chunked WY forward (#70): the same recurrence and buffers as
+ * vk_hip_kda_delta_rule_fwd_with_scratch, in the affine WY form —
+ * gate cumsum -> per-chunk precompute (grams, triangular inverse,
+ * U_v/W/T/Opar GEMMs) -> an nc-step serial state pass split over
+ * D-row blocks. CONTRACT (stricter than the cooperative kernel):
+ * k must be L2-normalised (|gate-weighted Gram| <= 1 keeps the explicit
+ * triangular inverse bounded); g in normal space (0,1]; gates/beta <= 1;
+ * chunk_size == 64 with S % 64 == 0 (pad at the call site); D <= 128
+ * with D % 16 == 0. 1.1-4.0x over the cooperative kernel on gfx942.
+ * scratch: caller-owned, vk_hip_kda_chunked_scratch_floats(B,H,S,D)
+ * float32s (contents clobbered; allocate once and reuse). */
+void vk_hip_kda_delta_rule_fwd_chunked_with_scratch(
+    const float* q, const float* k, const float* v,
+    const float* g, const float* beta, float* state,
+    float* out, float* scratch,
+    int B, int H, int S, int D, int chunk_size);
+
+/* WY scratch size in float32s for the chunked forward above. */
+unsigned long long vk_hip_kda_chunked_scratch_floats(
+    int B, int H, int S, int D);
+
 #ifdef __cplusplus
 }
 #endif

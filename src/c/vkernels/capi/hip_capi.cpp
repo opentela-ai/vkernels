@@ -362,3 +362,19 @@ extern "C" void vk_hip_kda_delta_rule_fwd_with_scratch(
   vkernels::kernels::hip::kda_delta_rule_fwd_with_scratch(
       q, k, v, g, beta, state, out, B, H, S, D);
 }
+
+// --- KDA chunked WY forward (#70; caller-owned state + WY scratch) ---
+extern "C" void vk_hip_kda_delta_rule_fwd_chunked_with_scratch(
+    const float* q, const float* k, const float* v,
+    const float* g, const float* beta, float* state,
+    float* out, float* scratch,
+    int B, int H, int S, int D, int chunk_size) {
+  vkernels::kernels::hip::kda_delta_rule_fwd_chunked_with_scratch(
+      q, k, v, g, beta, state, out, scratch, B, H, S, D, chunk_size);
+}
+
+extern "C" unsigned long long vk_hip_kda_chunked_scratch_floats(
+    int B, int H, int S, int D) {
+  return (unsigned long long)vkernels::kernels::hip::
+      kda_chunked_scratch_floats(B, H, S, D);
+}
