@@ -65,3 +65,7 @@ Goal-mode rules:
 - If the goal is incomplete at the end of a turn and goal_wait was not accepted, expect automatic continuation and keep working from the current state.
 
 <!-- pi-goal-prompt:0dea5a5a-f1a3-4b76-a8d4-6d4765595b40 -->
+
+---
+
+continue
