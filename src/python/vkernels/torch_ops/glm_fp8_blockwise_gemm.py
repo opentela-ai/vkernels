@@ -283,7 +283,94 @@ def _triton_kernel():
     return _blockwise_gemm
 
 
+def e4m3fn_to_fnuz(w_fp8, scales):
+    """e4m3fn -> e4m3fnuz with the payload-halving trick (one-time).
+
+    gfx942's fp8 tensor cores and fp8->fp32 conversions are FNUZ-semantics
+    (bias 4, max finite 240); checkpoint e4m3fn has bias 7 / max 448, so a
+    VALUE-preserving cast overflows to NaN for payloads in (240, 448].
+    Instead: halve every payload (EXACT for fp8 normals — one exponent
+    decrement, mantissa untouched; subnormals round to the coarser fnuz
+    subnormal grid) and DOUBLE the per-block scales, so payload x scale is
+    unchanged. Returns (w_fnuz, scales_x2)."""
+    import torch
+
+    if w_fp8.dtype == torch.float8_e4m3fnuz:
+        return w_fp8, scales
+    half = (w_fp8.to(torch.float32) * 0.5).to(torch.float8_e4m3fnuz)
+    return half, scales * 2.0
+
+
+@lru_cache(maxsize=1)
+def _triton_native_kernel():
+    """Native-fp8 blockwise GEMM: operands already e4m3fnuz; hardware
+    fp8 tl.dot (CDNA3 v_mfma), per-128-K-block fp32 scale application —
+    the same math as the oracle with fnuz-rounded operands."""
+    global tl
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _blockwise_gemm_native(
+        A, SA, B, SB, D,
+        M, N, K,
+        sam, sakb, sbn, sbkb,
+        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        pid_m = tl.program_id(1)
+        rm = pid_m * BM + tl.arange(0, BM)
+        rn = pid_n * BN + tl.arange(0, BN)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for kb in range(0, K // 128):
+            rk = kb * 128 + tl.arange(0, 128)
+            a = tl.load(
+                A + rm[:, None] * K + rk[None, :],
+                mask=rm[:, None] < M, other=0.0,
+            )
+            b = tl.load(
+                B + rn[:, None] * K + rk[None, :],
+                mask=rn[:, None] < N, other=0.0,
+            )
+            sa = tl.load(SA + rm * sam + kb * sakb, mask=rm < M, other=0.0)
+            sb = tl.load(SB + (rn // 128) * sbn + kb * sbkb,
+                         mask=rn < N, other=0.0)
+            blk = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
+            acc += blk * (sa[:, None] * sb[None, :])
+        tl.store(
+            D + rm[:, None] * N + rn[None, :], acc.to(D.dtype.element_ty),
+            mask=(rm[:, None] < M) & (rn[None, :] < N),
+        )
+
+    return _blockwise_gemm_native
+
+
+def _triton_native_backend(a_fnuz, a_scales, b_fnuz, b_scales, out):
+    import torch
+
+    kfn = _triton_native_kernel()
+    m, k = a_fnuz.shape
+    n = b_fnuz.shape[0]
+    import triton
+
+    bm, bn, warps, stages = 128, 128, 4, 3
+    cfg = os.environ.get("VK_FP8GEMM_TILES", "")
+    if cfg:
+        bm, bn, warps, stages = (int(x) for x in cfg.split(","))
+    grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
+    kfn[grid](
+        a_fnuz, a_scales, b_fnuz, b_scales, out,
+        m, n, k,
+        a_scales.stride(0), a_scales.stride(1),
+        b_scales.stride(0), b_scales.stride(1),
+        BM=bm, BN=bn, BK=128,
+        num_warps=warps, num_stages=stages,
+    )
+    return out
+
+
 def _triton_backend(a_fp8, a_scales, b_fp8, b_scales, out):
+    """VK_FP8GEMM_TILES='BM,BN,warps,stages' overrides the defaults (tuning)."""
     import torch
 
     kfn = _triton_kernel()
@@ -293,15 +380,18 @@ def _triton_backend(a_fp8, a_scales, b_fp8, b_scales, out):
     b8 = b_fp8.view(torch.uint8)
     import triton
 
-    BM, BN = 64, 128
-    grid = (triton.cdiv(n, BN), triton.cdiv(m, BM))
+    bm, bn, warps, stages = 128, 128, 8, 3
+    cfg = os.environ.get("VK_FP8GEMM_TILES", "")
+    if cfg:
+        bm, bn, warps, stages = (int(x) for x in cfg.split(","))
+    grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
     kfn[grid](
         a8, a_scales, b8, b_scales, out,
         m, n, k,
         a_scales.stride(0), a_scales.stride(1),
         b_scales.stride(0), b_scales.stride(1),
-        BM=BM, BN=BN, BK=128,
-        num_warps=8, num_stages=3,
+        BM=bm, BN=bn, BK=128,
+        num_warps=warps, num_stages=stages,
     )
     return out
 
