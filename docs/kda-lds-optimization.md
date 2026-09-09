@@ -69,19 +69,38 @@ recurrence — four barrier-separated phases per token, with PREDICT and OUTPUT
 using only `Db=32` of `kTh=256` threads (12.5%) for the length-`D` dot products,
 leaving most of each wavefront idle at every barrier.
 
+## A negative result: 4→3 barriers is a RACE (do not retry)
+
+Removing the post-OUTPUT `__syncthreads` looks redundant by a naive
+same-thread argument — GATE-(t+1) is a read-modify-write of the exact
+`srow[idx]` that UPDATE-(t) wrote on the *same* thread, and the cross-thread
+UPDATE-(t)→PREDICT-(t+1) dependency is published by the post-GATE-(t+1)
+barrier. **That argument is wrong and was disproven by experiment**
+(`meta/scripts/verify_kda_3barrier.sh` + `ab_kda_barriers.sh`, beverin
+MI300A): the 3-barrier kernel fails **5 of 6** delta_rule_fwd configs with
+clean, systematic max_rel ≈ 1.4–2.0, while the 4-barrier kernel stays
+11/11 PASS. The post-GATE barrier is *after* GATE, so it cannot stop a
+race *during* GATE: GATE-(t+1) on thread `tid` **writes** `srow[idx]`
+(element `idx%D` of row `idx/D`) while OUTPUT-(t) on a *different* thread
+(`tid2 = idx/D`) is still reading that same row (`srow[tid2*D + e]` for all
+`e`, including `idx%D`) for its dot product. The post-OUTPUT barrier is
+therefore a **true dependency**, not dead synchronisation. (The race is
+worst at low block counts — grid ≤ 4 — and is masked by serialization only
+at very high H.)
+
 ## Next levers (not yet taken)
 
 1. **Profile to localise the latency** — `omniperf` single-kernel metrics
    (wavefront stall reasons, VALU utilization) on the S=512 D=128 H=128 case to
    confirm whether the barrier cost or the PREDICT/OUTPUT thread starvation
-   dominates, per hip-kernel-profiling.
+   dominates, per hip-kernel-profiling. (omniperf/omnitrace are absent on
+   beverin; `rocprof --stats` works and gives per-launch DurationNs but not
+   stall reasons.)
 2. **Parallelise the dot products** — give each of the `Db` rows a small group
    of threads (length-D dot product split across r threads + `__shfl`/LDS
-   reduce) so PREDICT/OUTPUT use more of the 256-thread block.
-3. **Fewer barriers per token** — GATE→PREDICT and UPDATE→OUTPUT are true data
-   dependencies (3 barriers needed); the 4th (post-OUTPUT) folds into the next
-   token's GATE.
-4. **Token-level pipelining / parallel scan** for inter-chunk parallelism (the
+   reduce) so PREDICT/OUTPUT use more of the 256-thread block. This is the
+   only intra-block lever left, since all four barriers are required (above).
+3. **Token-level pipelining / parallel scan** for inter-chunk parallelism (the
    #70 chunked-prefill work) — the only lever that scales past one block's
    serial token loop, but a much larger change.
 
