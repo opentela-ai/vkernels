@@ -20,12 +20,14 @@ everything else is lazy (the shared library is loaded on first use, so
 only the call sites raise). :func:`available` reports whether the device
 path is usable without raising.
 
-Stream discipline: the DSA/MHC/KDA C ABI entry points launch on the HIP
-legacy default stream (stream 0), which is ordered with PyTorch's default
-current stream in eager execution. **Capture is refused** — a null-stream
-launch cannot be captured into a graph; callers must run eager (floe's
-serving path does for these ops) or extend the ABI with a stream
-parameter first.
+Stream discipline (issue #69): every function takes ``stream=None`` which
+resolves to torch's CURRENT stream — during graph capture that is the
+capturing stream, so these calls are capture-safe with a current library
+(the ``*_stream`` C ABI symbols; a pre-#69 library falls back to the
+legacy eager entry points and raises if an explicit stream is passed).
+The KDA ``with_scratch``/``chunked`` variants do NOT synchronise on the
+stream path — ordering and sync are the caller's (stream order or graph
+replay).
 """
 
 from __future__ import annotations
@@ -81,6 +83,46 @@ def _load():
     return _LIB
 
 
+def _stream_ptr(stream) -> int:
+    """Resolve a ctypes-usable hipStream_t: explicit arg or torch's current
+    stream (the graph-capturing stream during capture — issue #69)."""
+    import torch
+    if stream is None:
+        return torch.cuda.current_stream().cuda_stream
+    if isinstance(stream, torch.cuda.Stream):
+        return stream.cuda_stream
+    return int(stream)
+
+
+def _launch(f_stream, f_legacy, args, stream):
+    """Call the _stream symbol when present (returning the launch error so a
+    partial failure is never silent); fall back to the legacy symbol for
+    pre-#69 libraries (stream must be None there)."""
+    if f_stream is not None:
+        rc = f_stream(*args, _stream_ptr(stream))
+        if rc != 0:
+            raise RuntimeError(f"HIP launch failed: error {rc}")
+        return
+    if stream is not None:
+        raise RuntimeError("this libvkernels_hip build predates the #69 "
+                           "stream ABI; pass stream=None or rebuild")
+    f_legacy(*args)
+
+
+def _sym(lib, name):
+    return getattr(lib, name, None)
+
+
+def stream_abi() -> bool:
+    """True when the loaded library carries the #69 ``*_stream`` symbols
+    (graph-capture-safe launches). Floe uses this to decide whether its
+    device dispatch may run under capture or must fall back to torch."""
+    lib = _load()
+    if lib is None:
+        return False
+    return hasattr(lib, "vk_hip_kda_delta_rule_fwd_chunked_with_scratch_stream")
+
+
 def available() -> bool:
     """True when ``libvkernels_hip.so`` is loadable (device path usable)."""
     return _load() is not None
@@ -93,10 +135,14 @@ def _dptr(t: torch.Tensor) -> int:
 def _check_device(t: torch.Tensor, name: str) -> None:
     if not t.is_cuda:
         raise ValueError(f"{name} must be a device tensor (got {t.device})")
-    if torch.cuda.is_current_stream_capturing():
+    if torch.cuda.is_current_stream_capturing() and not stream_abi():
+        # Pre-#69 library: the launches would go to the legacy default
+        # stream, which cannot be captured. With the stream ABI the calls
+        # resolve torch's CURRENT (capturing) stream and are safe.
         raise RuntimeError(
-            "vkernels HIP DSA/MHC/KDA kernels launch on the legacy default "
-            "stream and cannot be captured into a CUDA/HIP graph"
+            "this libvkernels_hip build predates the #69 stream ABI; its "
+            "launches go to the legacy default stream and cannot be "
+            "captured into a CUDA/HIP graph"
         )
 
 
@@ -125,8 +171,13 @@ def dsa_sparse_fwd(
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    stream=None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Sparse-MLA forward over indexer-selected keys (device, bf16 ABI).
+
+    ``stream`` (issue #69): a torch.cuda.Stream, raw stream int, or None
+    (default: torch's current stream — the capturing stream during graph
+    capture, making this call capture-safe).
 
     Mirrors :func:`vkernels.kernels.dsa_sparse_fwd` (the fp32 CPU oracle)
     with the device ABI's storage dtypes:
@@ -187,21 +238,38 @@ def dsa_sparse_fwd(
 
     _bq, _th, block_i, inner_iter = dsa_config(int(S_q), int(H), int(dim), int(topk))
 
-    fn = lib.vk_hip_dsa_sparse_fwd
-    fn.restype = _INT
-    fn.argtypes = [
-        _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT, _INT,
-        _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
-    ]
-    rc = fn(
-        int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
-        int(kv_group), int(block_i), int(inner_iter), ctypes.c_float(sm_scale),
-        1 if return_lse else 0,
-        _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
-        _dptr(lse) if return_lse else None,
-    )
-    if rc != 0:
-        raise RuntimeError(f"vk_hip_dsa_sparse_fwd failed with rc={rc}")
+    fs = _sym(lib, "vk_hip_dsa_sparse_fwd_stream")
+    if fs is not None:
+        fs.restype = _INT
+        fs.argtypes = [
+            _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT,
+            _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
+        ]
+        rc = fs(
+            int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
+            int(kv_group), int(block_i), int(inner_iter),
+            ctypes.c_float(sm_scale), 1 if return_lse else 0,
+            _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
+            _dptr(lse) if return_lse else None, _stream_ptr(stream),
+        )
+        if rc != 0:
+            raise RuntimeError(f"vk_hip_dsa_sparse_fwd failed with rc={rc}")
+    else:
+        fn = lib.vk_hip_dsa_sparse_fwd
+        fn.restype = _INT
+        fn.argtypes = [
+            _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT,
+            _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
+        ]
+        rc = fn(
+            int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
+            int(kv_group), int(block_i), int(inner_iter),
+            ctypes.c_float(sm_scale), 1 if return_lse else 0,
+            _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
+            _dptr(lse) if return_lse else None,
+        )
+        if rc != 0:
+            raise RuntimeError(f"vk_hip_dsa_sparse_fwd failed with rc={rc}")
     return (out, lse) if return_lse else out
 
 
@@ -233,6 +301,7 @@ def dsa_sparse_fwd_split(
     split_kv: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    stream=None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-key sparse-MLA forward (decode occupancy fix).
 
@@ -298,21 +367,41 @@ def dsa_sparse_fwd_split(
 
     _bq, _th, block_i, inner_iter = dsa_config(int(S_q), int(H), int(dim), int(topk))
 
-    fn = lib.vk_hip_dsa_sparse_fwd_split
-    fn.restype = _INT
-    fn.argtypes = [
-        _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT, _INT,
-        _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
-    ]
-    rc = fn(
-        int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
-        int(kv_group), int(block_i), int(inner_iter), ctypes.c_float(sm_scale),
-        1 if return_lse else 0, int(split_kv),
-        _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
-        _dptr(lse) if return_lse else None,
-        _dptr(partial_out) if partial_out is not None else None,
-        _dptr(partial_lse) if partial_lse is not None else None,
-    )
+    fs = _sym(lib, "vk_hip_dsa_sparse_fwd_split_stream")
+    if fs is not None:
+        fs.restype = _INT
+        fs.argtypes = [
+            _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT,
+            _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
+            _VOIDP, _VOIDP,
+        ]
+        rc = fs(
+            int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
+            int(kv_group), int(block_i), int(inner_iter),
+            ctypes.c_float(sm_scale), 1 if return_lse else 0, int(split_kv),
+            _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
+            _dptr(lse) if return_lse else None,
+            _dptr(partial_out) if partial_out is not None else None,
+            _dptr(partial_lse) if partial_lse is not None else None,
+            _stream_ptr(stream),
+        )
+    else:
+        fn = lib.vk_hip_dsa_sparse_fwd_split
+        fn.restype = _INT
+        fn.argtypes = [
+            _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT,
+            _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
+            _VOIDP,
+        ]
+        rc = fn(
+            int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
+            int(kv_group), int(block_i), int(inner_iter),
+            ctypes.c_float(sm_scale), 1 if return_lse else 0, int(split_kv),
+            _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
+            _dptr(lse) if return_lse else None,
+            _dptr(partial_out) if partial_out is not None else None,
+            _dptr(partial_lse) if partial_lse is not None else None,
+        )
     if rc != 0:
         raise RuntimeError(f"vk_hip_dsa_sparse_fwd_split failed with rc={rc}")
     return (out, lse) if return_lse else out
@@ -327,6 +416,7 @@ def mhc_pre_gemm_sqrsum(
     *,
     out: Optional[torch.Tensor] = None,
     sqrsum: Optional[torch.Tensor] = None,
+    stream=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``out = x @ fn.T`` (fp32) + per-token ``sum(x^2)`` (device).
 
@@ -357,10 +447,20 @@ def mhc_pre_gemm_sqrsum(
         sqrsum = torch.empty(n, dtype=torch.float32, device=x.device)
     else:
         _contig(sqrsum, "sqrsum", torch.float32)
-    f = lib.vk_hip_mhc_pre_gemm_sqrsum
-    f.restype = None
-    f.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
-    f(int(n), int(hc_mult3), int(hc_hidden), _dptr(x), _dptr(fn), _dptr(out), _dptr(sqrsum))
+    fs = _sym(lib, "vk_hip_mhc_pre_gemm_sqrsum_stream")
+    if fs is not None:
+        fs.restype = _INT
+        fs.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
+        rc = fs(int(n), int(hc_mult3), int(hc_hidden), _dptr(x), _dptr(fn),
+                _dptr(out), _dptr(sqrsum), _stream_ptr(stream))
+        if rc != 0:
+            raise RuntimeError(f"vk_hip_mhc_pre_gemm_sqrsum failed: rc={rc}")
+    else:
+        f = lib.vk_hip_mhc_pre_gemm_sqrsum
+        f.restype = None
+        f.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
+        f(int(n), int(hc_mult3), int(hc_hidden), _dptr(x), _dptr(fn),
+          _dptr(out), _dptr(sqrsum))
     return out, sqrsum
 
 
@@ -371,6 +471,7 @@ def mhc_post(
     d: torch.Tensor,
     *,
     out: Optional[torch.Tensor] = None,
+    stream=None,
 ) -> torch.Tensor:
     """``out[n,j,:] = c[n,j]·d[n,:] + Σ_k a[n,k,j]·b[n,k,:]`` (device).
 
@@ -397,10 +498,21 @@ def mhc_post(
         out = torch.empty(n, hc, hidden, dtype=torch.bfloat16, device=d.device)
     else:
         _contig(out, "out", torch.bfloat16)
-    f = lib.vk_hip_mhc_post
-    f.restype = None
-    f.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
-    f(int(n), int(hc), int(hidden), _dptr(a), _dptr(b), _dptr(c), _dptr(d), _dptr(out))
+    fs = _sym(lib, "vk_hip_mhc_post_stream")
+    if fs is not None:
+        fs.restype = _INT
+        fs.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
+                       _VOIDP, _VOIDP]
+        rc = fs(int(n), int(hc), int(hidden), _dptr(a), _dptr(b), _dptr(c),
+                _dptr(d), _dptr(out), _stream_ptr(stream))
+        if rc != 0:
+            raise RuntimeError(f"vk_hip_mhc_post failed: rc={rc}")
+    else:
+        f = lib.vk_hip_mhc_post
+        f.restype = None
+        f.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
+        f(int(n), int(hc), int(hidden), _dptr(a), _dptr(b), _dptr(c),
+          _dptr(d), _dptr(out))
     return out
 
 
@@ -467,6 +579,7 @@ def kda_delta_rule_fwd_with_scratch(
     state: torch.Tensor,
     *,
     out: Optional[torch.Tensor] = None,
+    stream=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """As :func:`kda_delta_rule_fwd` but the caller owns the state scratch.
 
@@ -490,10 +603,26 @@ def kda_delta_rule_fwd_with_scratch(
         out = torch.empty(B, H, S, D, dtype=torch.float32, device=q.device)
     else:
         _contig(out, "out", torch.float32)
-    f = lib.vk_hip_kda_delta_rule_fwd_with_scratch
-    f.restype = None
-    f.argtypes = [_VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _INT, _INT, _INT, _INT]
-    f(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta), _dptr(state), _dptr(out), B, H, S, D)
+    fs = _sym(lib, "vk_hip_kda_delta_rule_fwd_with_scratch_stream")
+    if fs is not None:
+        fs.restype = _INT
+        fs.argtypes = [_VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
+                       _INT, _INT, _INT, _INT, _VOIDP]
+        rc = fs(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta),
+                _dptr(state), _dptr(out), B, H, S, D, _stream_ptr(stream))
+        if rc != 0:
+            raise RuntimeError(f"vk_hip_kda_delta_rule_fwd_with_scratch "
+                               f"failed: rc={rc}")
+    else:
+        if stream is not None:
+            raise RuntimeError("stream requires the #69 stream ABI "
+                               "(rebuild libvkernels_hip)")
+        f = lib.vk_hip_kda_delta_rule_fwd_with_scratch
+        f.restype = None
+        f.argtypes = [_VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
+                      _INT, _INT, _INT, _INT]
+        f(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta), _dptr(state),
+          _dptr(out), B, H, S, D)
     return out, state
 
 
@@ -519,6 +648,7 @@ def kda_delta_rule_fwd_chunked(
     out: Optional[torch.Tensor] = None,
     scratch: Optional[torch.Tensor] = None,
     chunk_size: int = 64,
+    stream=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunked WY per-key-dim delta-rule forward (device, fp32 ABI, #70).
 
@@ -567,9 +697,23 @@ def kda_delta_rule_fwd_chunked(
             raise ValueError(f"scratch needs {want} floats "
                              f"(got {scratch.numel()})")
         scratch = _contig(scratch, "scratch", torch.float32)
-    f = lib.vk_hip_kda_delta_rule_fwd_chunked_with_scratch
-    f.restype = None
-    f.argtypes = ([_VOIDP] * 8 + [_INT] * 5)
-    f(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta), _dptr(state),
-      _dptr(out), _dptr(scratch), B, H, S, D, int(chunk_size))
+    fs = _sym(lib, "vk_hip_kda_delta_rule_fwd_chunked_with_scratch_stream")
+    if fs is not None:
+        fs.restype = _INT
+        fs.argtypes = ([_VOIDP] * 8 + [_INT] * 5 + [_VOIDP])
+        rc = fs(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta),
+                _dptr(state), _dptr(out), _dptr(scratch), B, H, S, D,
+                int(chunk_size), _stream_ptr(stream))
+        if rc != 0:
+            raise RuntimeError(f"vk_hip_kda_delta_rule_fwd_chunked "
+                               f"failed: rc={rc}")
+    else:
+        if stream is not None:
+            raise RuntimeError("stream requires the #69 stream ABI "
+                               "(rebuild libvkernels_hip)")
+        f = lib.vk_hip_kda_delta_rule_fwd_chunked_with_scratch
+        f.restype = None
+        f.argtypes = ([_VOIDP] * 8 + [_INT] * 5)
+        f(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta), _dptr(state),
+          _dptr(out), _dptr(scratch), B, H, S, D, int(chunk_size))
     return out, state

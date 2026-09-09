@@ -184,12 +184,13 @@ namespace {
 template <int BQ>
 void launch(const void* q, const void* kv, const void* indices, void* out,
             void* lse, int S_q, int S_kv, int H, int dim, int tail_dim,
-            int topk, int kv_group, float sm_scale, bool return_lse) {
+            int topk, int kv_group, float sm_scale, bool return_lse,
+            hipStream_t stream = nullptr) {  // #69: caller stream
   const int W = dim + tail_dim;
   const int shmem = BQ * W * sizeof(float);
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, 1);
-  dsa_sparse_fwd_kernel<BQ><<<grid, block, shmem, 0>>>(
+  dsa_sparse_fwd_kernel<BQ><<<grid, block, shmem, stream>>>(
       reinterpret_cast<const uint16_t*>(q),
       reinterpret_cast<const uint16_t*>(kv),
       reinterpret_cast<const int32_t*>(indices),
@@ -203,7 +204,8 @@ void dsa_sparse_fwd_with_tile(int S_q, int S_kv, int H, int dim, int tail_dim,
                               bool return_lse,
                               const void* q, const void* kv,
                               const void* indices, void* out, void* lse,
-                              int bq, int block_I, int inner_iter, int bn_kv) {
+                              int bq, int block_I, int inner_iter, int bn_kv,
+                              void* stream) {
   // Host-side preconditions (mirror dsa_sparse_fwd_cpu, issue #57): a
   // misconfigured caller must raise a named error, not a silent hang or
   // out-of-bounds launch. The two-pass softmax writes a row into `out`
@@ -235,23 +237,23 @@ void dsa_sparse_fwd_with_tile(int S_q, int S_kv, int H, int dim, int tail_dim,
   (void)bn_kv;
   if (bq <= 1)
     launch<1>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
-              kv_group, sm_scale, return_lse);
+              kv_group, sm_scale, return_lse, static_cast<hipStream_t>(stream));
   else if (bq <= 2)
     launch<2>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
-              kv_group, sm_scale, return_lse);
+              kv_group, sm_scale, return_lse, static_cast<hipStream_t>(stream));
   else if (bq <= 4)
     launch<4>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
-              kv_group, sm_scale, return_lse);
+              kv_group, sm_scale, return_lse, static_cast<hipStream_t>(stream));
   else
     launch<8>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
-              kv_group, sm_scale, return_lse);
+              kv_group, sm_scale, return_lse, static_cast<hipStream_t>(stream));
 }
 
 void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
                     int topk, int kv_group, int block_I, int inner_iter,
                     float sm_scale, bool return_lse,
                     const void* q, const void* kv, const void* indices,
-                    void* out, void* lse) {
+                    void* out, void* lse, void* stream) {
   // Validate the caller's block_I/inner_iter (issue #57) even though the
   // launch tile comes from dsa_config_for (below): a misconfigured caller
   // gets a named error instead of a silently-wrong launch.
@@ -271,7 +273,7 @@ void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
   (void)inner_iter;
   dsa_sparse_fwd_with_tile(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
                            sm_scale, return_lse, q, kv, indices, out, lse,
-                           bq, bi, ii, 0);
+                           bq, bi, ii, 0, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -450,12 +452,13 @@ template <int BQ>
 void launch_partial(const void* q, const void* kv, const void* indices,
                     void* part_out, void* part_lse, int S_q, int S_kv, int H,
                     int dim, int tail_dim, int topk, int kv_group,
-                    float sm_scale, int split_kv) {
+                    float sm_scale, int split_kv,
+                    hipStream_t stream = nullptr) {  // #69: caller stream
   const int W = dim + tail_dim;
   const int shmem = BQ * W * sizeof(float);
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, split_kv);
-  dsa_sparse_fwd_partial_kernel<BQ><<<grid, block, shmem, 0>>>(
+  dsa_sparse_fwd_partial_kernel<BQ><<<grid, block, shmem, stream>>>(
       reinterpret_cast<const uint16_t*>(q),
       reinterpret_cast<const uint16_t*>(kv),
       reinterpret_cast<const int32_t*>(indices),
@@ -469,7 +472,8 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
                           float sm_scale, bool return_lse, int split_kv,
                           const void* q, const void* kv, const void* indices,
                           void* out, void* lse,
-                          void* partial_out, void* partial_lse) {
+                          void* partial_out, void* partial_lse,
+                          void* stream) {
   // Host-side preconditions: the same contract as dsa_sparse_fwd_with_tile
   // (issue #57) plus the split bounds; the combine writes `out` from the
   // partials, so `out` must not alias them either.
@@ -515,18 +519,22 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
   (void)inner_iter;  // the plain forward (tiled-key prefetch is a follow-on)
   if (bq <= 1)
     launch_partial<1>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
-                      dim, tail_dim, topk, kv_group, sm_scale, split_kv);
+                      dim, tail_dim, topk, kv_group, sm_scale, split_kv,
+                      static_cast<hipStream_t>(stream));
   else if (bq <= 2)
     launch_partial<2>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
-                      dim, tail_dim, topk, kv_group, sm_scale, split_kv);
+                      dim, tail_dim, topk, kv_group, sm_scale, split_kv,
+                      static_cast<hipStream_t>(stream));
   else if (bq <= 4)
     launch_partial<4>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
-                      dim, tail_dim, topk, kv_group, sm_scale, split_kv);
+                      dim, tail_dim, topk, kv_group, sm_scale, split_kv,
+                      static_cast<hipStream_t>(stream));
   else
     launch_partial<8>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
-                      dim, tail_dim, topk, kv_group, sm_scale, split_kv);
+                      dim, tail_dim, topk, kv_group, sm_scale, split_kv,
+                      static_cast<hipStream_t>(stream));
   dim3 cgrid(S_q, H);
-  dsa_sparse_fwd_combine_kernel<<<cgrid, 64>>>(
+  dsa_sparse_fwd_combine_kernel<<<cgrid, 64, 0, static_cast<hipStream_t>(stream)>>>(
       reinterpret_cast<const float*>(partial_out),
       reinterpret_cast<const float*>(partial_lse),
       reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),

@@ -82,9 +82,10 @@ namespace vkernels::kernels::hip {
 // No dynamic-shared-memory workaround: per-block shared is a single static
 // `hc_hidden_size`-wide bf16 staging buffer (<= 56 KB), well within MI300A's
 // 64 KB non-optin cap.
+// stream (issue #69): caller hipStream_t (as void*); nullptr = legacy.
 void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
                          const void* x, const void* fn,
-                         void* out, void* sqrsum);
+                         void* out, void* sqrsum, void* stream = nullptr);
 
 // HIP post-attention combine (gfx942). `a` (`comb_res_mix`) and `c`
 // (`post_layer_mix`) are fp32 device pointers; `b` (`residual`) and `d`
@@ -92,7 +93,7 @@ void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
 // output. One block per (token, output-head j).
 void mhc_post(int num_tokens, int hc, int hidden,
               const void* a, const void* b, const void* c, const void* d,
-              void* out);
+              void* out, void* stream = nullptr);
 
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP

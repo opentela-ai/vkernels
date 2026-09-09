@@ -259,10 +259,15 @@ void kda_delta_rule_fwd(const float* q, const float* k, const float* v,
 // pre-normalised. state : [B, H, D, D] caller-owned scratch — pre-fill with
 // the gathered initial state (zeros for first-turn prefill); the final
 // state S_S is written back into the SAME buffer (read it after the call).
+// stream (issue #69): pass a hipStream_t (as void*) to launch on a caller
+// stream WITHOUT internal synchronisation — required for graph capture;
+// the caller owns ordering/sync. nullptr (default/legacy) keeps the
+// default-stream + sync-on-return behaviour.
 void kda_delta_rule_fwd_with_scratch(const float* q, const float* k,
                                      const float* v, const float* g,
                                      const float* beta, float* state,
-                                     float* out, int B, int H, int S, int D);
+                                     float* out, int B, int H, int S, int D,
+                                     void* stream = nullptr);
 
 // #L8 — chunked WY forward (#70): the SAME K3 per-key-dim recurrence as
 // kda_delta_rule_fwd_with_scratch, in the affine WY (UT-transform) form
@@ -286,7 +291,7 @@ void kda_delta_rule_fwd_with_scratch(const float* q, const float* k,
 void kda_delta_rule_fwd_chunked_with_scratch(
     const float* q, const float* k, const float* v, const float* g,
     const float* beta, float* state, float* out, float* scratch,
-    int B, int H, int S, int D, int chunk_size);
+    int B, int H, int S, int D, int chunk_size, void* stream = nullptr);
 
 std::size_t kda_chunked_scratch_floats(int B, int H, int S, int D);
 

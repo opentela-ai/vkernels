@@ -245,16 +245,22 @@ constexpr int kChunk = 256;
 
 template <int D, int Db>
 void launch(const float* q, const float* k, const float* v, const float* g,
-            const float* beta, float* state, float* out, int B, int H, int S) {
+            const float* beta, float* state, float* out, int B, int H, int S,
+            hipStream_t stream = nullptr) {
   static_assert(D % Db == 0, "D must be a multiple of Db");
   dim3 grid(H, B, D / Db);
   dim3 block(kTh);
+  // stream (issue #69): with a caller stream the chunk launches are
+  // ordered BY THE STREAM (bit-identical result) and the caller owns
+  // synchronisation — required for graph capture, where a device sync
+  // is illegal. Legacy nullptr keeps the historical default-stream +
+  // sync-on-return behaviour.
   for (int cs = 0; cs < S; cs += kChunk) {
     const int len = (S - cs < kChunk) ? (S - cs) : kChunk;
-    kda_delta_rule_fwd_kernel<D, Db><<<grid, block, 0, 0>>>(
+    kda_delta_rule_fwd_kernel<D, Db><<<grid, block, 0, stream>>>(
         q, k, v, g, beta, state, out, H, S, cs, len);
   }
-  hipDeviceSynchronize();   // wait for all chunks before returning
+  if (stream == nullptr) hipDeviceSynchronize();
 }
 }  // namespace
 
@@ -264,15 +270,17 @@ void launch(const float* q, const float* k, const float* v, const float* g,
 void kda_delta_rule_fwd_with_scratch(const float* q, const float* k,
                                      const float* v, const float* g,
                                      const float* beta, float* state,
-                                     float* out, int B, int H, int S, int D) {
+                                     float* out, int B, int H, int S, int D,
+                                     void* stream) {
   if (B == 0 || H == 0 || S == 0) return;
   // Db = per-block row count; D/Db = z-blocks of row parallelism per (b,h).
   // Larger D → more blocks so a single (b,h) still fans out across CUs.
-  if (D <= 16)       launch<16, 16>(q, k, v, g, beta, state, out, B, H, S);
-  else if (D <= 32)  launch<32, 32>(q, k, v, g, beta, state, out, B, H, S);
-  else if (D <= 64)  launch<64, 16>(q, k, v, g, beta, state, out, B, H, S);
-  else if (D <= 128) launch<128, 32>(q, k, v, g, beta, state, out, B, H, S);
-  else               launch<128, 32>(q, k, v, g, beta, state, out, B, H, S);  // cap
+  const hipStream_t st = static_cast<hipStream_t>(stream);
+  if (D <= 16)       launch<16, 16>(q, k, v, g, beta, state, out, B, H, S, st);
+  else if (D <= 32)  launch<32, 32>(q, k, v, g, beta, state, out, B, H, S, st);
+  else if (D <= 64)  launch<64, 16>(q, k, v, g, beta, state, out, B, H, S, st);
+  else if (D <= 128) launch<128, 32>(q, k, v, g, beta, state, out, B, H, S, st);
+  else               launch<128, 32>(q, k, v, g, beta, state, out, B, H, S, st);  // cap
 }
 
 void kda_delta_rule_fwd(const float* q, const float* k, const float* v,
@@ -284,7 +292,10 @@ void kda_delta_rule_fwd(const float* q, const float* k, const float* v,
   float* state = nullptr;
   hipMalloc(&state, (size_t)B * H * D * D * sizeof(float));
   hipMemsetAsync(state, 0, (size_t)B * H * D * D * sizeof(float), 0);
-  kda_delta_rule_fwd_with_scratch(q, k, v, g, beta, state, out, B, H, S, D);
+  // legacy entry: eager default-stream + sync (the stream variant is the
+  // graph-capture-safe one)
+  kda_delta_rule_fwd_with_scratch(q, k, v, g, beta, state, out, B, H, S, D,
+                                  nullptr);
   // kda_delta_rule_fwd_with_scratch syncs on return, so the scratch is no
   // longer in use; hipFree (NOT synchronous in ROCm, unlike cudaFree) is
   // then safe.
@@ -721,7 +732,8 @@ namespace {
 template <int D>
 void launch_chunked(const float* q, const float* k, const float* v,
                     const float* g, const float* beta, float* state,
-                    float* out, float* scratch, int B, int H, int S) {
+                    float* out, float* scratch, int B, int H, int S,
+                    hipStream_t stream) {
   const int nc = S / kCs;
   const size_t ncsd = (size_t)B * H * S * D;      // per-array float count
   float* L    = scratch;
@@ -733,23 +745,23 @@ void launch_chunked(const float* q, const float* k, const float* v,
   float* M    = Opar + ncsd;
   float* N    = M + (size_t)B * H * nc * kCs * kCs;
   const dim3 gchunk(B * H, nc);
-  kda_k3_cumsum_kernel<<<gchunk, kTh>>>(g, L, nc, S, D);
-  kda_k3_gram_kernel<D><<<gchunk, kThL>>>(q, k, beta, L, M, N, nc, S);
-  kda_k3_local_kernel<D><<<gchunk, kThL>>>(q, k, v, beta, L, M, N, Kgw, Qgw,
-                                          Kgb, dgG, U_v, W, T, Opar, nc, S,
-                                          nullptr);
+  kda_k3_cumsum_kernel<<<gchunk, kTh, 0, stream>>>(g, L, nc, S, D);
+  kda_k3_gram_kernel<D><<<gchunk, kThL, 0, stream>>>(q, k, beta, L, M, N, nc, S);
+  kda_k3_local_kernel<D><<<gchunk, kThL, 0, stream>>>(
+      q, k, v, beta, L, M, N, Kgw, Qgw, Kgb, dgG, U_v, W, T, Opar, nc, S,
+      nullptr);
   constexpr int Rb = (D <= 32) ? D : 32;          // state rows per block
   const dim3 gstate(D / Rb, B * H);
-  kda_k3_state_kernel<D, Rb><<<gstate, kTh>>>(U_v, W, T, Opar, Kgb, dgG,
-                                              state, out, nc, S);
-  hipDeviceSynchronize();   // match the cooperative launcher's convention
+  kda_k3_state_kernel<D, Rb><<<gstate, kTh, 0, stream>>>(
+      U_v, W, T, Opar, Kgb, dgG, state, out, nc, S);
+  if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
 }
 }  // namespace
 
 void kda_delta_rule_fwd_chunked_with_scratch(
     const float* q, const float* k, const float* v, const float* g,
     const float* beta, float* state, float* out, float* scratch,
-    int B, int H, int S, int D, int chunk_size) {
+    int B, int H, int S, int D, int chunk_size, void* stream) {
   if (B == 0 || H == 0 || S == 0) return;
   if (chunk_size != kCs || S % kCs != 0 || D > 128) {
     std::fprintf(stderr,
@@ -758,10 +770,11 @@ void kda_delta_rule_fwd_chunked_with_scratch(
                  chunk_size, S, D);
     return;
   }
-  if (D <= 16)      launch_chunked<16>(q, k, v, g, beta, state, out, scratch, B, H, S);
-  else if (D <= 32) launch_chunked<32>(q, k, v, g, beta, state, out, scratch, B, H, S);
-  else if (D <= 64) launch_chunked<64>(q, k, v, g, beta, state, out, scratch, B, H, S);
-  else              launch_chunked<128>(q, k, v, g, beta, state, out, scratch, B, H, S);
+  const hipStream_t st = static_cast<hipStream_t>(stream);
+  if (D <= 16)      launch_chunked<16>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+  else if (D <= 32) launch_chunked<32>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+  else if (D <= 64) launch_chunked<64>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+  else              launch_chunked<128>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
 }
 
 void kda_delta_rule_fwd_chunked(const float* q, const float* k,
@@ -776,7 +789,8 @@ void kda_delta_rule_fwd_chunked(const float* q, const float* k,
   const size_t sf = kda_chunked_scratch_floats(B, H, S, D);
   hipMalloc(&scratch, sf * sizeof(float));
   kda_delta_rule_fwd_chunked_with_scratch(q, k, v, g, beta, state, out,
-                                          scratch, B, H, S, D, chunk_size);
+                                          scratch, B, H, S, D, chunk_size,
+                                          nullptr);
   hipFree(state);
   hipFree(scratch);
 }

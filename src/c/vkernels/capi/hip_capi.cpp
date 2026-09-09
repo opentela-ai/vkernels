@@ -20,6 +20,12 @@
 
 #include "vkernels/capi/hip_capi.hpp"
 
+// hipGetLastError for the #69 stream ABI's error returns. This TU is a
+// plain C++ compile without the ROCm include path, so declare the C
+// symbol directly (it lives in libamdhip64, which the shared library
+// already links).
+extern "C" int hipGetLastError();
+
 #include "vkernels/capi/capi.hpp"  // VK_OK / VK_ERROR_* status codes
 #include <stdexcept>   // std::invalid_argument / std::exception (issue #57 catch)
 #include "vkernels/kernels/moe_fused.hpp"
@@ -361,6 +367,70 @@ extern "C" void vk_hip_kda_delta_rule_fwd_with_scratch(
     float* out, int B, int H, int S, int D) {
   vkernels::kernels::hip::kda_delta_rule_fwd_with_scratch(
       q, k, v, g, beta, state, out, B, H, S, D);
+}
+
+// --- Stream-safe variants (issue #69): int-returning, never silent ---
+extern "C" int vk_hip_dsa_sparse_fwd_stream(
+    int S_q, int S_kv, int H, int dim, int tail_dim, int topk,
+    int kv_group, int block_I, int inner_iter, float sm_scale,
+    int return_lse, const void* q, const void* kv, const void* indices,
+    void* out, void* lse, void* stream) {
+  vkernels::kernels::hip::dsa_sparse_fwd(
+      S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+      sm_scale, return_lse != 0, q, kv, indices, out, lse, stream);
+  return (int)hipGetLastError();
+}
+
+extern "C" int vk_hip_dsa_sparse_fwd_split_stream(
+    int S_q, int S_kv, int H, int dim, int tail_dim, int topk,
+    int kv_group, int block_I, int inner_iter, float sm_scale,
+    int return_lse, int split_kv, const void* q, const void* kv,
+    const void* indices, void* out, void* lse, void* partial_out,
+    void* partial_lse, void* stream) {
+  vkernels::kernels::hip::dsa_sparse_fwd_split(
+      S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+      sm_scale, return_lse != 0, split_kv, q, kv, indices, out, lse,
+      partial_out, partial_lse, stream);
+  return (int)hipGetLastError();
+}
+
+extern "C" int vk_hip_mhc_pre_gemm_sqrsum_stream(int num_tokens, int hc_mult3,
+                                                 int hc_hidden_size,
+                                                 const void* x, const void* fn,
+                                                 void* out, void* sqrsum,
+                                                 void* stream) {
+  vkernels::kernels::hip::mhc_pre_gemm_sqrsum(num_tokens, hc_mult3,
+                                              hc_hidden_size, x, fn, out,
+                                              sqrsum, stream);
+  return (int)hipGetLastError();
+}
+
+extern "C" int vk_hip_mhc_post_stream(int num_tokens, int hc, int hidden,
+                                      const void* a, const void* b,
+                                      const void* c, const void* d, void* out,
+                                      void* stream) {
+  vkernels::kernels::hip::mhc_post(num_tokens, hc, hidden, a, b, c, d, out,
+                                   stream);
+  return (int)hipGetLastError();
+}
+
+extern "C" int vk_hip_kda_delta_rule_fwd_with_scratch_stream(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, float* state, float* out, int B, int H, int S,
+    int D, void* stream) {
+  vkernels::kernels::hip::kda_delta_rule_fwd_with_scratch(
+      q, k, v, g, beta, state, out, B, H, S, D, stream);
+  return (int)hipGetLastError();
+}
+
+extern "C" int vk_hip_kda_delta_rule_fwd_chunked_with_scratch_stream(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, float* state, float* out, float* scratch,
+    int B, int H, int S, int D, int chunk_size, void* stream) {
+  vkernels::kernels::hip::kda_delta_rule_fwd_chunked_with_scratch(
+      q, k, v, g, beta, state, out, scratch, B, H, S, D, chunk_size,
+      stream);
+  return (int)hipGetLastError();
 }
 
 // --- KDA chunked WY forward (#70; caller-owned state + WY scratch) ---

@@ -157,12 +157,12 @@ __global__ void mhc_post_kernel(
 // ---------------------------------------------------------------------------
 void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
                          const void* x, const void* fn,
-                         void* out, void* sqrsum) {
+                         void* out, void* sqrsum, void* stream) {
   if (num_tokens <= 0 || hc_mult3 <= 0 || hc_hidden_size <= 0) return;
   if (hc_mult3 > 32 || hc_hidden_size > kMaxHcHidden) return;
   dim3 grid(num_tokens);
   dim3 block(32);  // one warp per token; lane == output column
-  mhc_pre_gemm_sqrsum_kernel<<<grid, block, 0, 0>>>(
+  mhc_pre_gemm_sqrsum_kernel<<<grid, block, 0, static_cast<hipStream_t>(stream)>>>(
       reinterpret_cast<const uint16_t*>(x), reinterpret_cast<const float*>(fn),
       reinterpret_cast<float*>(out), reinterpret_cast<float*>(sqrsum),
       num_tokens, hc_mult3, hc_hidden_size);
@@ -170,12 +170,12 @@ void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
 
 void mhc_post(int num_tokens, int hc, int hidden,
               const void* a, const void* b, const void* c, const void* d,
-              void* out) {
+              void* out, void* stream) {
   if (num_tokens <= 0 || hc <= 0 || hidden <= 0) return;
   if (hc > 63) return;  // sCol[64] backstop
   dim3 grid(num_tokens, hc);
   dim3 block(256);
-  mhc_post_kernel<<<grid, block, 0, 0>>>(
+  mhc_post_kernel<<<grid, block, 0, static_cast<hipStream_t>(stream)>>>(
       reinterpret_cast<const float*>(a), reinterpret_cast<const uint16_t*>(b),
       reinterpret_cast<const float*>(c), reinterpret_cast<const uint16_t*>(d),
       reinterpret_cast<uint16_t*>(out), num_tokens, hc, hidden);
