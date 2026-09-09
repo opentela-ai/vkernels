@@ -137,16 +137,46 @@ can't be removed (race) and the per-phase compute can't be sped up
 regresses the latency-critical case). The only lever that scales past one
 block's serial token loop is **inter-chunk parallelism** below.
 
-## Remaining lever (not yet taken)
+## Remaining lever (not yet taken): inter-chunk parallelism (#70)
 
-1. **Token-level pipelining / parallel scan** for inter-chunk parallelism
-   (the #70 chunked-prefill work): FLA's `C_{c-1}`-decoupled solve lets
-   chunks within a (b,h) run concurrently once the inter-chunk log-cumsum
-   is known, breaking out of the one-block-per-(b,h) serial loop. This is
-   the only remaining scaling lever but a much larger architectural change
-   (the cooperative kernel would split into intra-chunk + inter-chunk
-   passes, as `kda.cpp` already sketches). Per-phase micro-tuning
-   (barrier layout, dot parallelism) is exhausted — do not revisit.
+FLA's `C_{c-1}`-decoupled solve lets chunks within a (b,h) run
+concurrently once the inter-chunk log-cumsum is known, breaking out of
+the one-block-per-(b,h) serial loop. This is the only remaining scaling
+lever but a much larger architectural change.
+
+**Important correction.** The chunked primitives already in `kda.cpp`
+(L4 intra / L5 inter / L6 output) implement the OLD *standard* gated
+delta rule (scalar gate `[B,H,S]`, pre-gate prediction) and are
+ cross-checked against an inline `kda_standard_delta_rule_fwd` — NOT
+against `kda_naive_delta_rule_fwd_cpu` (the K3 per-key-dim oracle the
+serving path actually needs). A K3 chunked kernel therefore requires a
+NEW per-key-dim chunked derivation, not a port of L4/L5/L6.
+
+**That derivation is now spelled out and verified on CPU** in
+`tests/kernels/attn/test_kda_k3_chunked.cpp` (no GPU). The structure is
+identical to the standard-rule chunking (gate cumsum → intra lower-
+triangular solve → inter propagation → output combine) but with:
+- **per-column gate products** `G_{a,b}[k]` (gate `[B,H,S,D]` → log-
+  cumsum `[B,H,nc,cs,D]`),
+- the gate **inside** the Gram sum `M_{j,t}=Σ_k G_{j+1,t}[k] k_j[k] k_t[k]`
+  (vs the standard rule's scalar `G_{j+1,t-1}·(k_j·k_t)`), and
+- **post-gate prediction** (`G_{0,t}` includes `g_t`, vs the standard
+  rule's pre-gate `G_{0,t-1}`).
+
+The test validates the chunked path against `kda_naive_delta_rule_fwd_cpu`
+at 7 configs (1–4 chunks, H=2, B=2, D up to 16), full-history (g==1), and
+single-chunk (random gates) — all to ≤1e-6 absolute, i.e. bit-identical to
+fp32 round-off. (Inputs use the same stable regime as the existing
+`KdaDeltaRuleFwd.ChunkedMatchesStandardOracle`: q/k/v ∈ [−1,1], g ∈
+[0.3,1.0], beta ∈ [0.3,1.0], absolute 1e-4 tolerance. The per-token
+recurrence is contractive in this regime; pathological inputs
+g∈(0.01,1]+unnormalised v∈[−10,10] make the state diverge to ~1e25 in
+BOTH paths and turn summation-order round-off into 1e-2 rel error — not a
+derivation bug.)
+
+The CPU derivation is the correctness foundation; the next step is a HIP
+chunked kernel. Per-phase micro-tuning (barrier layout, dot parallelism)
+is exhausted — do not revisit.
 
 These are diminishing returns against a serial recurrence; the LDS cache was
 the single high-value win (it removed the dominant, H-scaling HBM traffic).
