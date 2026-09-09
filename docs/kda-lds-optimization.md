@@ -137,16 +137,84 @@ can't be removed (race) and the per-phase compute can't be sped up
 regresses the latency-critical case). The only lever that scales past one
 block's serial token loop is **inter-chunk parallelism** below.
 
-## Remaining lever (not yet taken)
+## Inter-chunk parallelism (#70): TAKEN — chunked WY kernel, 1.1–4.0x
 
-1. **Token-level pipelining / parallel scan** for inter-chunk parallelism
-   (the #70 chunked-prefill work): FLA's `C_{c-1}`-decoupled solve lets
-   chunks within a (b,h) run concurrently once the inter-chunk log-cumsum
-   is known, breaking out of the one-block-per-(b,h) serial loop. This is
-   the only remaining scaling lever but a much larger architectural change
-   (the cooperative kernel would split into intra-chunk + inter-chunk
-   passes, as `kda.cpp` already sketches). Per-phase micro-tuning
-   (barrier layout, dot parallelism) is exhausted — do not revisit.
+**Status (2026-09-09, beverin MI300A): implemented, oracle-validated
+(12/12 GPU configs, max_rel ≤ 6e-6), and benchmarked.** The chunked WY
+forward (`kda_delta_rule_fwd_chunked[_with_scratch]`, `kda.hip` #L8) beats
+the committed cooperative kernel at EVERY measured shape; the long-context
+prefill shapes that motivated #70 are ~3.3–3.6x.
+
+| Shape (B=1) | coop (µs) | chunked (µs) | speedup |
+| --- | ---: | ---: | ---: |
+| H=1 S=512 D=128 | 1897 | 718 | 2.64x |
+| H=8 S=512 D=128 | 1963 | 727 | 2.70x |
+| H=16 S=512 D=128 | 2887 | 729 | 3.96x |
+| H=32 S=512 D=128 | 2966 | 1107 | 2.68x |
+| H=64 S=512 D=128 | 2929 | 1744 | 1.68x |
+| H=128 S=512 D=128 | 3191 | 2941 | 1.08x |
+| H=32 S=1024 D=128 | 5978 | 1825 | 3.28x |
+| H=32 S=2048 D=128 | 11758 | 3313 | 3.55x |
+
+Median graph latency per forward, identical events/inputs; the state is
+re-zeroed per sample. Reproduce from a clean checkout:
+`SRC=$SCRATCH/vkernels sbatch meta/scripts/ab_kda_chunked_mi300.sh`
+(copies live under `$SCRATCH/vkernels` on beverin; home is no longer used).
+
+### Derivation (CPU-verified first)
+
+The chunked primitives in `kda.cpp` (L4/L5/L6) implement the OLD
+*standard* rule (scalar gate, pre-gate prediction) — NOT the K3 per-key-dim
+oracle. The K3 chunked derivation is spelled out and CPU-verified in
+`tests/kernels/attn/test_kda_k3_chunked.cpp`: forward-substitution form
+(`k3_delta_rule_fwd`, ≤1e-6 vs oracle at 7 configs + full-history +
+single-chunk) and the **affine WY form** (`k3_wy_chunked_fwd`, what the HIP
+kernel implements op-for-op, ≤1e-6 incl. S=512 D=128 cs=64):
+
+  M[t][j] = b_j Σ_k G_{j+1,t}[k] k_j k_t (strict tril);  Ainv=(I+tril M,−1)⁻¹
+  N[t][j] = b_j Σ_k G_{j+1,t}[k] k_j q_t (incl diag)
+  Kgw=exp(L_t)k_t; Qgw=exp(L_t)q_t; Kgb=b_t·exp(L_end−L_t)k_t; diagG=exp(L_end)
+  U_v=Ainv v; W=Ainv Kgw; T=N U_v; Opar=Qgw−N W
+  serial pass (rowblock-splittable): u=U_v−W Cᵀ; o=T+Opar Cᵀ; C=diagG⊙C+Kgbᵀu
+
+All exp() arguments are ≤0 (products of gates in (0,1]): no overflow,
+graceful underflow. **CONTRACT (stronger than the coop kernel): k must be
+L2-normalised** (production contract) — |M|≤1 by Cauchy–Schwarz keeps the
+explicit Ainv bounded; with unnormalised k, Ainv entries grow like |M|^(cs−1)
+and overflow at cs=64 (measured 1e14; the forward-substitution form is
+immune). Encoded in both the CPU test and `test_kda_chunked.hip`.
+
+### HIP structure (kda.hip #L8) and what actually mattered
+
+Four launches: (1) per-key log-cumsum; (2a) grams M/N — k and L staged at
+full D in LDS (64 KB, the whole per-workgroup budget), q streamed, one
+warp per (t,j) pair; (2b) Ainv (warp-per-16×16-diagonal-block forward
+substitution + 3 blocked levels) and the U_v/W/T/Opar GEMMs; (3) the
+nc-step serial state pass, split over D-row blocks like the coop kernel
+(each state row is independent). Per-phase micro-tuning of the coop
+kernel (barrier layout, dot parallelism) remains exhausted — do not
+revisit; this section supersedes it.
+
+Measured lessons (all on beverin, `kda_chunked_phase_times`):
+- The obvious port (grams streaming from gmem, thread-per-pair) was
+  **L2-latency-bound**: ~950 µs/block even at 512 threads. Staging k/L in
+  LDS (→ all gram operands but q are LDS hits, 32 lanes × 1 float4 each)
+  plus 512-thread blocks (LDS-capped at 1 block/CU → 16 warps) took the
+  gram phase 950→268 µs.
+- **LDS bank conflicts from D-strided rows**: sC rows at stride D (multiple
+  of 32) put all 32 lanes in one bank on every state read — the whole
+  serial pass ran ~20x slow. Stride D+4 fixes banks AND keeps rows 16B-
+  aligned for float4.
+- **float4 everything** (grams, GEMM streams, state pass): 4x fewer load
+  instructions on latency-bound phases; another ~1.15–1.3x end-to-end.
+- Splitting grams (2a) from inverse+GEMMs (2b) via a gmem M/N round-trip
+  was neutral-to-positive and keeps each kernel's LDS small.
+
+Remaining headroom (not taken): the gram phase is still the largest
+single block cost (268 µs of 748 at H=1; ~25x above its SFU/exp floor) and
+the H=128 throughput point sits at 1.08x — a deeper gram restructure
+(e.g. safe two-factor gate products with per-16-token renormalisation,
+FLA-style) or fp16 grams could push both, but the math risk grows.
 
 These are diminishing returns against a serial recurrence; the LDS cache was
 the single high-value win (it removed the dominant, H-scaling HBM traffic).

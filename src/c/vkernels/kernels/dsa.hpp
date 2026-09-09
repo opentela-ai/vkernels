@@ -324,11 +324,15 @@ namespace vkernels::kernels::hip {
 // `lse` is fp32 device (nullable when `return_lse` is false). Device pointers
 // must reside in device or host-pinned memory. `tail_dim == 0` is handled by
 // skipping the rope-tail dot at runtime (no zero-size GEMM).
+// stream (issue #69): a caller hipStream_t (as void*) launches without
+// internal synchronisation (graph-capture safe); nullptr = legacy default
+// stream. These launchers never internally sync either way (the kernels
+// are single-launch); ordering is the caller's.
 void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
                     int topk, int kv_group, int block_I, int inner_iter,
                     float sm_scale, bool return_lse,
                     const void* q, const void* kv, const void* indices,
-                    void* out, void* lse);
+                    void* out, void* lse, void* stream = nullptr);
 
 // Explicit-tile entry point (offline autotuner hook). Dispatches the concrete
 // (bq, block_I, inner_iter) tile; threads is derived as max(bq,1)*64 capped
@@ -338,7 +342,8 @@ void dsa_sparse_fwd_with_tile(int S_q, int S_kv, int H, int dim, int tail_dim,
                               bool return_lse,
                               const void* q, const void* kv,
                               const void* indices, void* out, void* lse,
-                              int bq, int block_I, int inner_iter, int bn_kv);
+                              int bq, int block_I, int inner_iter, int bn_kv,
+                              void* stream = nullptr);
 
 // Split-key forward (issue #51 decode follow-up): same math and contract as
 // dsa_sparse_fwd, but the `topk` index range is divided across `split_kv`
@@ -361,7 +366,8 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
                           float sm_scale, bool return_lse, int split_kv,
                           const void* q, const void* kv, const void* indices,
                           void* out, void* lse,
-                          void* partial_out, void* partial_lse);
+                          void* partial_out, void* partial_lse,
+                          void* stream = nullptr);
 
 // DSA paged-MQA gated top-k logits (gfx942), issue #51. Same computation
 // as dsa_topk_logits_cpu (see above for the formula and the left-unwritten

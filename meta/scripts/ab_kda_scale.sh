@@ -4,7 +4,7 @@
 # idle; at H>=64 the grid (H*4 blocks) fills the GPU. The LDS state-cache
 # win should hold or grow at scale (gmem state traffic scales with H).
 set -uo pipefail
-B=/users/xyao/vkernels-issue63/build_kda
+B=/capstor/scratch/cscs/xyao/vkernels/build_kda
 GMEM=$B/meta/benchmarks/kda_bench_GMEM
 LDS=$B/meta/benchmarks/kda_bench_LDS
 printf "%5s %9s %9s %8s %9s %9s\n" H GMEMus LDSus speedup GMEMtf LDStf

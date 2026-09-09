@@ -24,6 +24,7 @@ target_sources(vkernels
     vkernels/kernels/dsa_kpool.cpp
     vkernels/kernels/mhc.cpp
     vkernels/kernels/kda.cpp
+    vkernels/kernels/glm_moe.cpp
     vkernels/comm/channel.cpp
     vkernels/comm/rccl.cpp
     vkernels/comm/rccl_c.cpp
@@ -148,6 +149,7 @@ if(VKERNELS_HAS_HIP)
     PRIVATE
       vkernels/kernels/moe.hip
       vkernels/kernels/moe_fused.hip
+      vkernels/kernels/glm_moe.hip
       vkernels/kernels/moe_aux.hip
       vkernels/kernels/gemm_bf16.hip
       vkernels/kernels/mla.hip

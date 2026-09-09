@@ -448,6 +448,71 @@ void vk_hip_kda_delta_rule_fwd_with_scratch(
     const float* g, const float* beta, float* state,
     float* out, int B, int H, int S, int D);
 
+/* Chunked WY forward (#70): the same recurrence and buffers as
+ * vk_hip_kda_delta_rule_fwd_with_scratch, in the affine WY form —
+ * gate cumsum -> per-chunk precompute (grams, triangular inverse,
+ * U_v/W/T/Opar GEMMs) -> an nc-step serial state pass split over
+ * D-row blocks. CONTRACT (stricter than the cooperative kernel):
+ * k must be L2-normalised (|gate-weighted Gram| <= 1 keeps the explicit
+ * triangular inverse bounded); g in normal space (0,1]; gates/beta <= 1;
+ * chunk_size == 64 with S % 64 == 0 (pad at the call site); D <= 128
+ * with D % 16 == 0. 1.1-4.0x over the cooperative kernel on gfx942.
+ * scratch: caller-owned, vk_hip_kda_chunked_scratch_floats(B,H,S,D)
+ * float32s (contents clobbered; allocate once and reuse). */
+void vk_hip_kda_delta_rule_fwd_chunked_with_scratch(
+    const float* q, const float* k, const float* v,
+    const float* g, const float* beta, float* state,
+    float* out, float* scratch,
+    int B, int H, int S, int D, int chunk_size);
+
+/* WY scratch size in float32s for the chunked forward above. */
+unsigned long long vk_hip_kda_chunked_scratch_floats(
+    int B, int H, int S, int D);
+
+/* ---- Stream-safe variants (issue #69) --------------------------------
+ * Same math, arguments, and contracts as the functions above, plus a
+ * trailing `void* stream` (a hipStream_t) and an int return carrying the
+ * launch error (0 = success, else hipError_t) so a partially failed
+ * launch is NEVER silently absorbed. With stream != NULL the kernels
+ * launch on the caller's stream and the entry points do NOT synchronise
+ * (graph-capture safe: the caller owns ordering). stream == NULL keeps
+ * the legacy behaviour of the non-suffixed entry (kda syncs, dsa/mhc
+ * are single-launch either way).
+ *
+ * Supported today: DSA sparse forward (+split), MHC pre/post, KDA
+ * cooperative with-scratch, KDA chunked WY with-scratch. */
+int vk_hip_dsa_sparse_fwd_stream(
+    int S_q, int S_kv, int H, int dim, int tail_dim, int topk,
+    int kv_group, int block_I, int inner_iter, float sm_scale,
+    int return_lse, const void* q, const void* kv, const void* indices,
+    void* out, void* lse, void* stream);
+
+int vk_hip_dsa_sparse_fwd_split_stream(
+    int S_q, int S_kv, int H, int dim, int tail_dim, int topk,
+    int kv_group, int block_I, int inner_iter, float sm_scale,
+    int return_lse, int split_kv, const void* q, const void* kv,
+    const void* indices, void* out, void* lse, void* partial_out,
+    void* partial_lse, void* stream);
+
+int vk_hip_mhc_pre_gemm_sqrsum_stream(int num_tokens, int hc_mult3,
+                                      int hc_hidden_size, const void* x,
+                                      const void* fn, void* out,
+                                      void* sqrsum, void* stream);
+
+int vk_hip_mhc_post_stream(int num_tokens, int hc, int hidden,
+                           const void* a, const void* b, const void* c,
+                           const void* d, void* out, void* stream);
+
+int vk_hip_kda_delta_rule_fwd_with_scratch_stream(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, float* state, float* out, int B, int H, int S,
+    int D, void* stream);
+
+int vk_hip_kda_delta_rule_fwd_chunked_with_scratch_stream(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, float* state, float* out, float* scratch,
+    int B, int H, int S, int D, int chunk_size, void* stream);
+
 #ifdef __cplusplus
 }
 #endif

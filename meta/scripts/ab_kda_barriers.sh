@@ -5,7 +5,7 @@
 # 3-barrier binary is rebuilt here. Only the trailing __syncthreads() after the
 # OUTPUT loop differs, so this isolates the barrier cost.
 set -uo pipefail
-B=/users/xyao/vkernels-issue63/build_kda
+B=/capstor/scratch/cscs/xyao/vkernels/build_kda
 OLD=$B/meta/benchmarks/kda_bench_4B     # 4 barriers/token (committed kda.hip, fresh gfx942 build)
 NEW=$B/meta/benchmarks/kda_bench_3B     # 3 barriers/token (post-OUTPUT barrier removed)
 printf "%5s %9s %9s %8s\n" H B4_us B3_us speedup
