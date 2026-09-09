@@ -27,28 +27,37 @@ row-split; then a fixed-order reduce + bf16 round. `sk` ∈ {1,2,4,8}
 dividing K/128, picked for ≥ ~2 blocks/CU (`glm_fp8_gemv_pick_sk`).
 
 Correctness: 8/8 configs vs the CPU oracle (max_rel ≤ 7.5e-3 = bf16
-rounding level).
+rounding level), including the SEGS-template instantiations and the
+generic odd-segment path (K=1152).
 
 Measured (beverin, median, vs a structure-matched materialized-BF16 GEMV
-plus the one-time dequant):
+plus the one-time dequant; best sk swept over {1,2,4,8}; job 629781):
 
 | shape | M | fused | mat-GEMV | dequant (once) | steady win |
 |---|---|---:|---:|---:|---:|
-| gate/up [4096,4096] | 1 | 22.8 µs (735 GB/s) | 41.2 µs | 43.9 µs | **1.80×** |
-| gate/up [4096,4096] | 2 | 34.9 µs | 61.2 µs | — | **1.75×** |
-| down [4096,2048] | 1 | 17.0 µs | 17.0 µs | 22.9 µs | 1.00× |
-| down [4096,2048] | 2 | 19.5 µs | 25.7 µs | — | 1.32× |
+| gate/up [4096,4096] | 1 | 22.4 µs (751 GB/s) | 42.0 µs | 47.0 µs | **1.88×** |
+| gate/up [4096,4096] | 2 | 29.5 µs | 62.2 µs | — | **2.11×** |
+| down [4096,2048] | 1 | 16.4 µs | 17.4 µs | 24.4 µs | 1.06× |
+| down [4096,2048] | 2 | 18.1 µs | 26.6 µs | — | 1.47× |
 
-Per decode token (top-8 experts × gate/up + down): ~318 µs fused vs
-~465 µs materialized steady-state, plus the dequant buffer and its
-traffic eliminated entirely. Both kernels are still ~14% of the 5.3 TB/s
-roof — more headroom (vectorised 8-byte loads, larger sk, wave
-quantisation) remains; this is the primitive, not the ceiling.
+Per decode token (top-8 experts × gate/up + down): ~324 µs fused vs
+~529 µs materialized steady-state, plus the dequant buffer and its
+traffic eliminated entirely.
 
-**Measured lessons:** the row-parallel-only grid (128 blocks on 228 CUs,
-~14% occupancy) ran at 175 GB/s — split-K was worth 1.5×; the branchy
-per-value decode serialised SIMT lanes — the branchless `2^120` decode
-plus a single weight pass for M=2 was worth another 2.7×.
+**Measured lessons (three structural rounds):**
+1. Row-parallel-only (128 blocks on 228 CUs, ~14% occupancy) ran at
+   175 GB/s — split-K partials bought 1.5×.
+2. The branchy per-value decode serialised SIMT lanes; the branchless
+   `2^120` decode plus a single weight pass for M=2 bought 2.7×.
+3. A runtime-bounded segment loop prevented unrolling/pipelining (warp
+   issue serialised load→use per segment); a SEGS template with full
+   unroll plus an sk sweep to 8 blocks/CU bought ~1.2× and made M=2
+   consistently 2.1× vs materialized.
+All three kernels (fused, toy bf16 baseline, dequant) plateau at
+~500–800 GB/s regardless of structure after round 3 — the op is now
+instruction-issue-bound, not bandwidth-bound; further gains need a
+different design (hardware fp8→fp16 converts, MFMA, or fusing the
+top-k gather), not tuning.
 
 ## #66/#68 — `vkernels.torch_ops.glm_projection`: batch-one small-output projection
 

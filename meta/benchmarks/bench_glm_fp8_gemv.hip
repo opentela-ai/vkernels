@@ -183,15 +183,21 @@ int main(int argc, char** argv) {
       CK(hipMalloc(&dout, (size_t)M * c.N * 2), "ao");
       CK(hipMalloc(&dwb, nw * 2), "ab");
       const int sk = h::glm_fp8_gemv_pick_sk(c.N, c.K);
-      CK(hipMalloc(&dpart, (size_t)M * c.N * sk * 4), "ap");
+      CK(hipMalloc(&dpart, (size_t)M * c.N * 8 * 4), "ap");
       CK(hipMemcpy(dx, x.data(), nx * 2, hipMemcpyHostToDevice), "cx");
       CK(hipMemcpy(dw, w.data(), nw, hipMemcpyHostToDevice), "cw");
       CK(hipMemcpy(ds, s.data(), ns * 4, hipMemcpyHostToDevice), "cs");
 
-      const double fused = bench_us([&] {
-        h::glm_fp8_block_gemv_with_scratch(dx, dw, ds, dout, dpart,
-                                           M, c.N, c.K, sk);
-      }, a, b, 5, iters);
+      double fused = 1e30;
+      int best_sk = sk;
+      for (int sk_try = 1; sk_try <= 8; sk_try <<= 1) {
+        if ((c.K / 128) % sk_try != 0) continue;
+        const double t = bench_us([&] {
+          h::glm_fp8_block_gemv_with_scratch(dx, dw, ds, dout, dpart,
+                                             M, c.N, c.K, sk_try);
+        }, a, b, 5, iters);
+        if (t < fused) { fused = t; best_sk = sk_try; }
+      }
       const double mat = bench_us([&] {
         const int grid = (int)((nw + kTh - 1) / kTh);
         bf16_gemv_kernel<<<(c.N + 31) / 32, kTh>>>(dx, dwb, dout, M, c.N, c.K);
@@ -209,9 +215,9 @@ int main(int argc, char** argv) {
       const double roof_f = fused_bytes / roof_gbs / 1e9 * 1e6;
       const double roof_m = mat_bytes / roof_gbs / 1e9 * 1e6;
       std::printf("%-22s %2d  %9.1f %8.0f %9.1f %8.0f %9.1f   %.2fx "
-                  "(sk=%d, roofs %.1f/%.1f us)\n",
+                  "(best sk=%d of {1,2,4,8}, roofs %.1f/%.1f us)\n",
                   c.tag, M, fused, fgb, mat, mgb, dq,
-                  mat / (fused > 0 ? fused : 1), sk, roof_f, roof_m);
+                  mat / (fused > 0 ? fused : 1), best_sk, roof_f, roof_m);
       hipFree(dx); hipFree(dw); hipFree(ds); hipFree(dout); hipFree(dwb);
       hipFree(dpart);
     }

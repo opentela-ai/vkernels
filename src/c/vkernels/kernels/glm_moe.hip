@@ -60,16 +60,23 @@ __device__ __forceinline__ float e4m3_f32(uint32_t code) {
 }
 
 // Partial: rows [row0, row0+32) of out, k-segments [seg0, seg0+segs).
+// SEGS > 0 is a template constant so the segment loop fully unrolls and
+// per-segment loads batch ahead of their consumers — with a runtime bound
+// the in-order warp issue serialises load->use per segment and the kernel
+// stalls on L2 latency (measured ~2x slower). SEGS == 0 is the generic
+// runtime-bound fallback for odd segment counts (e.g. K=1152 -> 9).
+template <int SEGS>
 __global__ void glm_fp8_gemv_partial_kernel(
     const uint16_t* __restrict__ x, const uint8_t* __restrict__ w,
     const float* __restrict__ scales, float* __restrict__ part,
-    int M, int N, int K, int SK, int segs) {
-  const int seg0 = blockIdx.y * segs;   // this split's k-segment range
+    int M, int N, int K, int SK, int rt_segs) {
   __shared__ float sx[2 * kMaxK];        // M x slice (slice <= K <= 4096)
   const int tid = threadIdx.x;
+  const int segs = (SEGS > 0) ? SEGS : rt_segs;
   const int slice = segs * 128;
   for (int i = tid; i < M * slice; i += kTh)
-    sx[i] = bf16_to_f32(x[(size_t)((i / slice) * K) + seg0 * 128 + (i % slice)]);
+    sx[i] = bf16_to_f32(x[(size_t)((i / slice) * K) +
+                          (size_t)blockIdx.y * slice + (i % slice)]);
   __syncthreads();
 
   const int warp = tid >> 5, lane = tid & 31;
@@ -80,24 +87,33 @@ __global__ void glm_fp8_gemv_partial_kernel(
     if (row >= N) break;
     const uint8_t* wrow = w + (size_t)row * K;
     const float* srow = scales + (size_t)(row >> 7) * (K >> 7);
-    // One pass over the weight row serves BOTH tokens (two accumulators,
-    // one x-load pair per segment) — M=2 must not re-read the fp8 stream.
+    // One pass over the weight row serves BOTH tokens; the decode's 2^120
+    // scale is folded into the per-segment scale (sc120), leaving one FMA
+    // per code plus byte extraction (at roof speed the per-code arithmetic
+    // otherwise exceeds the CU's vector throughput).
     float acc0 = 0.0f, acc1 = 0.0f;
+    #pragma unroll
     for (int s = 0; s < segs; ++s) {
-      const int seg = seg0 + s;
-      const float sc = srow[seg];
+      const int seg = blockIdx.y * segs + s;
+      const float sc120 = srow[seg] * 0x1p120f;
       const uint32_t code =
           *(const uint32_t*)(wrow + (size_t)seg * 128 + lane * 4);
-      const float d0 = e4m3_f32(code & 0xFFu);
-      const float d1 = e4m3_f32((code >> 8) & 0xFFu);
-      const float d2 = e4m3_f32((code >> 16) & 0xFFu);
-      const float d3 = e4m3_f32(code >> 24);
+      const uint32_t b0 = code & 0xFFu, b1 = (code >> 8) & 0xFFu;
+      const uint32_t b2 = (code >> 16) & 0xFFu, b3 = code >> 24;
+      const float d0 =
+          __uint_as_float(((b0 & 0x80u) << 24) | ((b0 & 0x7Fu) << 20));
+      const float d1 =
+          __uint_as_float(((b1 & 0x80u) << 24) | ((b1 & 0x7Fu) << 20));
+      const float d2 =
+          __uint_as_float(((b2 & 0x80u) << 24) | ((b2 & 0x7Fu) << 20));
+      const float d3 =
+          __uint_as_float(((b3 & 0x80u) << 24) | ((b3 & 0x7Fu) << 20));
       const float4 xv0 = *(const float4*)(sx + s * 128 + lane * 4);
-      acc0 += sc * (d0 * xv0.x + d1 * xv0.y + d2 * xv0.z + d3 * xv0.w);
+      acc0 += sc120 * (d0 * xv0.x + d1 * xv0.y + d2 * xv0.z + d3 * xv0.w);
       if (M > 1) {
         const float4 xv1 =
             *(const float4*)(sx + slice + s * 128 + lane * 4);
-        acc1 += sc * (d0 * xv1.x + d1 * xv1.y + d2 * xv1.z + d3 * xv1.w);
+        acc1 += sc120 * (d0 * xv1.x + d1 * xv1.y + d2 * xv1.z + d3 * xv1.w);
       }
     }
     #pragma unroll
@@ -124,9 +140,9 @@ __global__ void glm_fp8_gemv_reduce_kernel(const float* __restrict__ part,
 }
 
 int gemv_pick_sk(int N, int K) {
-  // Fill MI300A's 228 CUs with >= ~2 blocks each, within {1,2,4,8} and
-  // the segment budget (K/128 splits at most).
-  int sk = (456 * 32 + N - 1) / N;
+  // Fill MI300A's 228 CUs with ~4 blocks each where the segment budget
+  // allows, within {1,2,4,8} and divisibility of K/128.
+  int sk = (912 * 32 + N - 1) / N;
   if (sk < 1) sk = 1;
   if (sk > 8) sk = 8;
   while (sk > 1 && (K / 128) % sk != 0) sk >>= 1;   // must divide K/128
@@ -150,8 +166,14 @@ void glm_fp8_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
   }
   const int segs = (K / 128) / sk;
   const dim3 grid((N + 31) / 32, sk);
-  glm_fp8_gemv_partial_kernel<<<grid, kTh>>>(x, w, scales, part, M, N, K, sk,
-                                             segs);
+  switch (segs) {
+    case 2:  glm_fp8_gemv_partial_kernel<2><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
+    case 4:  glm_fp8_gemv_partial_kernel<4><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
+    case 8:  glm_fp8_gemv_partial_kernel<8><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
+    case 16: glm_fp8_gemv_partial_kernel<16><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
+    case 32: glm_fp8_gemv_partial_kernel<32><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
+    default: glm_fp8_gemv_partial_kernel<0><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
+  }
   const int mn = M * N;
   glm_fp8_gemv_reduce_kernel<<<(mn + kTh - 1) / kTh, kTh>>>(part, out, mn, sk);
 }
