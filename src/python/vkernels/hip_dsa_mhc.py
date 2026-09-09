@@ -94,6 +94,20 @@ def _stream_ptr(stream) -> int:
     return int(stream)
 
 
+def _device_guard(t):
+    """Context manager running the enclosed HIP launch on t's device.
+
+    HIP launches target the CURRENT device: without this guard, tensors
+    living on a non-current GPU (multi-GPU serving) launch on the wrong
+    device with foreign pointers — garbage or a fault (#69 non-current
+    device contract). No-op when t is already on the current device;
+    restores the previous device on exit. torch.cuda.device requires a
+    torch Tensor (device index), which every caller here has.
+    """
+    import contextlib
+    return contextlib.nullcontext() if t is None else torch.cuda.device(t.device)
+
+
 def _launch(f_stream, f_legacy, args, stream):
     """Call the _stream symbol when present (returning the launch error so a
     partial failure is never silent); fall back to the legacy symbol for
@@ -245,13 +259,14 @@ def dsa_sparse_fwd(
             _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT,
             _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
         ]
-        rc = fs(
-            int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
-            int(kv_group), int(block_i), int(inner_iter),
-            ctypes.c_float(sm_scale), 1 if return_lse else 0,
-            _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
-            _dptr(lse) if return_lse else None, _stream_ptr(stream),
-        )
+        with _device_guard(q):
+            rc = fs(
+                int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
+                int(kv_group), int(block_i), int(inner_iter),
+                ctypes.c_float(sm_scale), 1 if return_lse else 0,
+                _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
+                _dptr(lse) if return_lse else None, _stream_ptr(stream),
+            )
         if rc != 0:
             raise RuntimeError(f"vk_hip_dsa_sparse_fwd failed with rc={rc}")
     else:
@@ -261,13 +276,14 @@ def dsa_sparse_fwd(
             _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT,
             _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
         ]
-        rc = fn(
-            int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
-            int(kv_group), int(block_i), int(inner_iter),
-            ctypes.c_float(sm_scale), 1 if return_lse else 0,
-            _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
-            _dptr(lse) if return_lse else None,
-        )
+        with _device_guard(q):
+            rc = fn(
+                int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
+                int(kv_group), int(block_i), int(inner_iter),
+                ctypes.c_float(sm_scale), 1 if return_lse else 0,
+                _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
+                _dptr(lse) if return_lse else None,
+            )
         if rc != 0:
             raise RuntimeError(f"vk_hip_dsa_sparse_fwd failed with rc={rc}")
     return (out, lse) if return_lse else out
@@ -375,16 +391,17 @@ def dsa_sparse_fwd_split(
             _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
             _VOIDP, _VOIDP,
         ]
-        rc = fs(
-            int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
-            int(kv_group), int(block_i), int(inner_iter),
-            ctypes.c_float(sm_scale), 1 if return_lse else 0, int(split_kv),
-            _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
-            _dptr(lse) if return_lse else None,
-            _dptr(partial_out) if partial_out is not None else None,
-            _dptr(partial_lse) if partial_lse is not None else None,
-            _stream_ptr(stream),
-        )
+        with _device_guard(q):
+            rc = fs(
+                int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
+                int(kv_group), int(block_i), int(inner_iter),
+                ctypes.c_float(sm_scale), 1 if return_lse else 0,
+                int(split_kv), _dptr(q), _dptr(kv), _dptr(indices),
+                _dptr(out), _dptr(lse) if return_lse else None,
+                _dptr(partial_out) if partial_out is not None else None,
+                _dptr(partial_lse) if partial_lse is not None else None,
+                _stream_ptr(stream),
+            )
     else:
         fn = lib.vk_hip_dsa_sparse_fwd_split
         fn.restype = _INT
@@ -393,15 +410,16 @@ def dsa_sparse_fwd_split(
             _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
             _VOIDP,
         ]
-        rc = fn(
-            int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
-            int(kv_group), int(block_i), int(inner_iter),
-            ctypes.c_float(sm_scale), 1 if return_lse else 0, int(split_kv),
-            _dptr(q), _dptr(kv), _dptr(indices), _dptr(out),
-            _dptr(lse) if return_lse else None,
-            _dptr(partial_out) if partial_out is not None else None,
-            _dptr(partial_lse) if partial_lse is not None else None,
-        )
+        with _device_guard(q):
+            rc = fn(
+                int(S_q), int(S_kv), int(H), int(dim), int(tail_dim),
+                int(topk), int(kv_group), int(block_i), int(inner_iter),
+                ctypes.c_float(sm_scale), 1 if return_lse else 0,
+                int(split_kv), _dptr(q), _dptr(kv), _dptr(indices),
+                _dptr(out), _dptr(lse) if return_lse else None,
+                _dptr(partial_out) if partial_out is not None else None,
+                _dptr(partial_lse) if partial_lse is not None else None,
+            )
     if rc != 0:
         raise RuntimeError(f"vk_hip_dsa_sparse_fwd_split failed with rc={rc}")
     return (out, lse) if return_lse else out
@@ -451,8 +469,10 @@ def mhc_pre_gemm_sqrsum(
     if fs is not None:
         fs.restype = _INT
         fs.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
-        rc = fs(int(n), int(hc_mult3), int(hc_hidden), _dptr(x), _dptr(fn),
-                _dptr(out), _dptr(sqrsum), _stream_ptr(stream))
+        with _device_guard(x):
+            rc = fs(int(n), int(hc_mult3), int(hc_hidden), _dptr(x),
+                    _dptr(fn), _dptr(out), _dptr(sqrsum),
+                    _stream_ptr(stream))
         if rc != 0:
             raise RuntimeError(f"vk_hip_mhc_pre_gemm_sqrsum failed: rc={rc}")
     else:
@@ -503,8 +523,9 @@ def mhc_post(
         fs.restype = _INT
         fs.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
                        _VOIDP, _VOIDP]
-        rc = fs(int(n), int(hc), int(hidden), _dptr(a), _dptr(b), _dptr(c),
-                _dptr(d), _dptr(out), _stream_ptr(stream))
+        with _device_guard(d):
+            rc = fs(int(n), int(hc), int(hidden), _dptr(a), _dptr(b),
+                    _dptr(c), _dptr(d), _dptr(out), _stream_ptr(stream))
         if rc != 0:
             raise RuntimeError(f"vk_hip_mhc_post failed: rc={rc}")
     else:
@@ -608,8 +629,10 @@ def kda_delta_rule_fwd_with_scratch(
         fs.restype = _INT
         fs.argtypes = [_VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
                        _INT, _INT, _INT, _INT, _VOIDP]
-        rc = fs(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta),
-                _dptr(state), _dptr(out), B, H, S, D, _stream_ptr(stream))
+        with _device_guard(q):
+            rc = fs(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta),
+                    _dptr(state), _dptr(out), B, H, S, D,
+                    _stream_ptr(stream))
         if rc != 0:
             raise RuntimeError(f"vk_hip_kda_delta_rule_fwd_with_scratch "
                                f"failed: rc={rc}")
@@ -701,9 +724,10 @@ def kda_delta_rule_fwd_chunked(
     if fs is not None:
         fs.restype = _INT
         fs.argtypes = ([_VOIDP] * 8 + [_INT] * 5 + [_VOIDP])
-        rc = fs(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta),
-                _dptr(state), _dptr(out), _dptr(scratch), B, H, S, D,
-                int(chunk_size), _stream_ptr(stream))
+        with _device_guard(q):
+            rc = fs(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta),
+                    _dptr(state), _dptr(out), _dptr(scratch), B, H, S, D,
+                    int(chunk_size), _stream_ptr(stream))
         if rc != 0:
             raise RuntimeError(f"vk_hip_kda_delta_rule_fwd_chunked "
                                f"failed: rc={rc}")
