@@ -77,3 +77,7 @@ Can we integrate it into floe? Floe locates at @../floe/
 ---
 
 continue with the floe-side implementation
+
+---
+
+can we close the issue, and continue to #64 and #65?
