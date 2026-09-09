@@ -32,3 +32,7 @@ Goal-mode rules:
 - If the goal is incomplete at the end of a turn and goal_wait was not accepted, expect automatic continuation and keep working from the current state.
 
 <!-- pi-goal-prompt:8c021e55-a43a-4c25-926e-7587a69451c5 -->
+
+---
+
+Can we put everything under $SCRATCH/vkernels on beverin instead of home?
