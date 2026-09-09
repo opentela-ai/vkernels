@@ -74,6 +74,15 @@ venv/
 # *.tar under work/ is large binary scratch.
 work/
 
+# Bootstrapped CPython headers (python-build-standalone) used only to give
+# Triton's AMD host helper a Python.h on beverin nodes that lack
+# python3.11-devel. See meta/scripts/run_issue63_torchops_mi300.sh.
+.pybuild/
+
+# Slurm batch job stdout/stderr written into the checkout root.
+slurm-*.out
+slurm-*.err
+
 # build
 build_host
 /dist/
