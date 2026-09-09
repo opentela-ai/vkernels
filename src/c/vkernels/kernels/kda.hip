@@ -156,14 +156,32 @@ __global__ void kda_delta_rule_fwd_kernel(const float* __restrict__ q,
   const int tid = threadIdx.x;
   const size_t bh = (size_t)(b * H + h) * S;       // q/k/v/out base ([B,H,S,D])
   const size_t sh = (size_t)(b * H + h);           // state index ([B,H,D,D])
-  float* Sstate = state + sh * D * D;              // this (b,h)'s D×D state (gmem)
-  __shared__ float sa[Db];                    // a = S k for this block's rows
+  float* Sstate = state + sh * D * D;   // gmem owner-of-record (load/store once)
+  // Cache this block's Db state rows in LDS across the whole chunk so the
+  // per-token GATE / PREDICT / UPDATE / OUTPUT phases touch on-chip state
+  // instead of round-tripping HBM ~6× per token. The D×D state was the
+  // binding resource (AI≈0.4 ≪ MI300A ridge ~247): a D=128 chunk paid
+  // 6×(Db·D)·4 B = 96 KB/token of HBM for the state alone. Caching cuts that
+  // to a single load+store per chunk (~375 B/token amortised over kChunk),
+  // ~250× less HBM state traffic. Row-independence (each z-block owns
+  // disjoint rows) needs no cross-block coordination; the gmem state is only
+  // the between-chunk handoff. Math is unchanged from the gmem variant, so
+  // results are bit-identical to kda_naive_delta_rule_fwd_cpu.
+  __shared__ float srow[Db * D];              // this block's Db state rows (LDS)
+  __shared__ float sa[Db];                    // a[d] = S[d,:] . k_t (this block)
 
-  // Each token runs three barrier-separated phases — (1) a = S k,
-  // (2) S = g S + β (v−a) kᵀ, (3) o = S q — grid-strided over the Db / D²
-  // work items, so the only cross-thread dependency is the per-token
-  // barrier, never a data race. The recurrence order is identical to the
-  // oracle (kda_naive_delta_rule_fwd_cpu); only fp round-off differs.
+  // Load this block's Db state rows from gmem into LDS (once per chunk).
+  for (int idx = tid; idx < Db * D; idx += kTh) {
+    const int j = idx / D, e = idx % D;
+    srow[idx] = Sstate[(size_t)(row0 + j) * D + e];
+  }
+  __syncthreads();
+
+  // Each token runs four barrier-separated phases — (1) GATE: S' = g⊙S,
+  // (2) PREDICT: a = S'k, (3) UPDATE: S = S' + β(v−a)kᵀ, (4) OUTPUT: o = Sq
+  // — grid-strided over the Db / D² work items, all on the LDS state cache.
+  // The only cross-thread dependency is the per-token barrier, never a data
+  // race; the recurrence order is identical to the oracle.
   for (int t = 0; t < chunk_len; ++t) {
     const size_t off = bh + (size_t)(chunk_start + t);  // full-S token index
     const float* kt = k + off * D;
@@ -172,44 +190,46 @@ __global__ void kda_delta_rule_fwd_kernel(const float* __restrict__ q,
     const float* gt = g + off * D;       // per-key-dim forget gate [D]
     const float bt = beta[off];          // scalar delta gate
 
-    // (1) GATE: S'[d,e] *= g_t[e]   (per-key-dim, this block's Db*D entries)
+    // (1) GATE: s'[j,e] *= g_t[e]   (LDS only — no HBM state round-trip)
     for (int idx = tid; idx < Db * D; idx += kTh) {
-      const int j = idx / D;              // local row index in [0,Db)
       const int e = idx % D;
-      const int d = row0 + j;             // global state row
-      Sstate[(size_t)d * D + e] *= gt[e];
+      srow[idx] *= gt[e];
     }
     __syncthreads();
 
-    // (2) PREDICT: a[d] = S'[d,:] . k_t   (from GATED state; this block's Db rows)
+    // (2) PREDICT: a[j] = s'[j,:] . k_t   (LDS read; one thread per row)
     for (int j = tid; j < Db; j += kTh) {
-      const int d = row0 + j;
-      const float* Srow = Sstate + (size_t)d * D;
+      const float* sr = srow + (size_t)j * D;
       float s = 0.0f;
-      for (int e = 0; e < D; ++e) s += Srow[e] * kt[e];
+      for (int e = 0; e < D; ++e) s += sr[e] * kt[e];
       sa[j] = s;
     }
     __syncthreads();
 
-    // (3) UPDATE: S[d,e] += beta_t * (v_t[d] - a[d]) * k_t[e]
+    // (3) UPDATE: s[j,e] += beta_t * (v_t[d] - a[j]) * k_t[e]   (LDS only)
     for (int idx = tid; idx < Db * D; idx += kTh) {
-      const int j = idx / D;              // local row index in [0,Db)
-      const int e = idx % D;
-      const int d = row0 + j;             // global state row
+      const int j = idx / D, e = idx % D;
+      const int d = row0 + j;             // global state row -> v_t index
       const float ud = vt[d] - sa[j];
-      Sstate[(size_t)d * D + e] += bt * ud * kt[e];
+      srow[idx] += bt * ud * kt[e];
     }
     __syncthreads();
 
-    // (4) OUTPUT: o_t[d] = S_t[d,:] . q_t   (this block's Db rows)
+    // (4) OUTPUT: o_t[d] = s[j,:] . q_t   (LDS read; one thread per row)
     for (int j = tid; j < Db; j += kTh) {
       const int d = row0 + j;
-      const float* Srow = Sstate + (size_t)d * D;
+      const float* sr = srow + (size_t)j * D;
       float s = 0.0f;
-      for (int e = 0; e < D; ++e) s += Srow[e] * qt[e];
+      for (int e = 0; e < D; ++e) s += sr[e] * qt[e];
       out[off * D + d] = s;
     }
     __syncthreads();
+  }
+
+  // Store this block's Db state rows back to gmem (once per chunk).
+  for (int idx = tid; idx < Db * D; idx += kTh) {
+    const int j = idx / D, e = idx % D;
+    Sstate[(size_t)(row0 + j) * D + e] = srow[idx];
   }
 }
 
