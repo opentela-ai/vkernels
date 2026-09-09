@@ -283,6 +283,36 @@ bool dsa_topk_logits_fits_lds_wmma(int num_heads, int head_dim, int block,
 // different CU count.
 int dsa_topk_logits_split_for(int batch_size, int max_seq_len, int block);
 
+// The optimal split for the HIP dsa_sparse_fwd_split forward. Unlike the
+// indexer's split_kv (pure CU-filling, floor formula), the forward's decode
+// optimum is set by the per-block SERIAL key chain: each split block's
+// key loop is a load->use dependency chain (~1.2 us per key unpipelined),
+// so over-subscribing the CUs up to ~18 waves measured strictly beneficial
+// and the CU-filling formula is 5-6x off (recommends 3-4 at H=64 where the
+// measured best is 16-64). The split sweep (docs/performance/dsa/gfx942.md,
+// MI300A) puts the best at 8-32 keys per split on every decode shape, and
+// ceil(sqrt(2*topk)) lands on the measured best or its nearest neighbor on
+// all four shapes (topk=2048 -> 64 = measured best, 19.7x; 256 -> 23, best
+// 16; 128 -> 16 = measured best; DSv3 256 -> 23, best 16):
+//
+//   split = 1                                   if ceildiv(S_q,BQ)*H >= NUM_CU
+//         = min(ceil(sqrt(2*topk)), topk)       otherwise
+//
+// with NUM_CU = 228 (MI300A / gfx942; hipDeviceProp_t::multiProcessorCount,
+// verified on a CSCS beverin node). The plain-grid term returns 1 for
+// prefill (S_q=8192 already runs 28% of the HBM roof unsplit -- splitting
+// would only add combine traffic). Grouping-independent (the combine is the
+// exact log2-domain merge of the per-split online-softmax states,
+// cross-checked against dsa_sparse_fwd_cpu by test_dsa_correct.hip,
+// including uneven splits). Pure arithmetic on documented device constants
+// -- the sglang backend can call it before allocating the partial scratch.
+// `block_I` is reserved for the future tiled-key variant (whose split cap
+// will be ceildiv(topk, block_I)); the streaming partial kernel reads one
+// key at a time, so any split in [1, topk] is legal. Host unit tests:
+// tests/kernels/attn/test_dsa.cpp :: DsaSparse::SplitFor.
+int dsa_sparse_fwd_split_for(int S_q, int H, int topk, int block_I,
+                             int num_cu);
+
 }  // namespace vkernels::kernels
 
 #if VKERNELS_HAS_HIP
@@ -309,6 +339,29 @@ void dsa_sparse_fwd_with_tile(int S_q, int S_kv, int H, int dim, int tail_dim,
                               const void* q, const void* kv,
                               const void* indices, void* out, void* lse,
                               int bq, int block_I, int inner_iter, int bn_kv);
+
+// Split-key forward (issue #51 decode follow-up): same math and contract as
+// dsa_sparse_fwd, but the `topk` index range is divided across `split_kv`
+// partial blocks (grid (ceil(S_q/BQ), H, split_kv), each streaming a
+// contiguous chunk of the per-query indices) writing fp32 partial outputs
+// NORMALIZED by their split's local row-sum (the flash-decoding convention)
+// plus per-split lse, then a combine kernel merges them in the log2 domain
+// (exact online-softmax merge; masked/empty splits carry lse = -inf and
+// weight 0). PERF ONLY -- bit-comparable to dsa_sparse_fwd up to fp32
+// summation order, bf16-tolerant vs dsa_sparse_fwd_cpu.
+//
+// `partial_out` is a caller-owned fp32 scratch of S_q*H*split_kv*d_v floats
+// and `partial_lse` one of S_q*H*split_kv floats (device or pinned); both
+// may be null ONLY when split_kv <= 1, in which case the call delegates to
+// the plain dsa_sparse_fwd (no scratch, no partial launch). split_kv must
+// satisfy 1 <= split_kv <= topk (every split >= 1 key). The recommended
+// value comes from dsa_sparse_fwd_split_for above.
+void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
+                          int topk, int kv_group, int block_I, int inner_iter,
+                          float sm_scale, bool return_lse, int split_kv,
+                          const void* q, const void* kv, const void* indices,
+                          void* out, void* lse,
+                          void* partial_out, void* partial_lse);
 
 // DSA paged-MQA gated top-k logits (gfx942), issue #51. Same computation
 // as dsa_topk_logits_cpu (see above for the formula and the left-unwritten

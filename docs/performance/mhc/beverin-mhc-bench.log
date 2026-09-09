@@ -1,0 +1,50 @@
+=== node: nid002664  date: 2026-09-08T08:13:28Z ===
+GPU[0]		: Card Series: 		Aqua Vanjaram [Instinct MI300A]
+GPU[0]		: Card Model: 		0x74a0
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+=== lock perf level high ===
+(setperflevel not permitted; continuing)
+GPU[0]		: mclk clock level: 3: (1300Mhz)
+GPU[0]		: sclk clock level: S: (95Mhz)
+GPU[1]		: mclk clock level: 3: (1300Mhz)
+GPU[1]		: sclk clock level: S: (96Mhz)
+############ 2. MHC CORRECTNESS (test_mhc_correct) ############
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+
+mhc_pre_gemm_sqrsum (vs CPU reference, fp32 both paths):
+  n=1  hc_mult=2 hidden=2    (hc_hidden=4     hc_mult3=8 )  abs=2.3842e-07 rel=7.1973e-08  PASS
+  n=7  hc_mult=3 hidden=3    (hc_hidden=9     hc_mult3=15)  abs=9.5367e-07 rel=3.5932e-07  PASS
+  n=1  hc_mult=4 hidden=4096 (hc_hidden=16384 hc_mult3=24)  abs=1.9531e-01 rel=9.7448e-06  PASS
+  n=7  hc_mult=4 hidden=4096 (hc_hidden=16384 hc_mult3=24)  abs=2.7148e-01 rel=1.9263e-05  PASS
+  n=1  hc_mult=4 hidden=7168 (hc_hidden=28672 hc_mult3=24)  abs=7.6953e-01 rel=2.0074e-05  PASS
+
+mhc_post (vs CPU reference, bf16 store):
+  n=1  hc=2 hidden=2     abs=7.1509e-03 rel=2.4019e-03  PASS
+  n=7  hc=4 hidden=5     abs=1.4932e-02 rel=3.7855e-03  PASS
+  n=1  hc=4 hidden=4096  abs=3.0088e-02 rel=3.8722e-03  PASS
+  n=7  hc=4 hidden=4096  abs=3.1231e-02 rel=3.8845e-03  PASS
+  n=1  hc=4 hidden=7168  abs=2.9481e-02 rel=3.8721e-03  PASS
+  n=4  hc=8 hidden=1024  abs=3.1247e-02 rel=3.8870e-03  PASS
+
+PASS (0 failure(s))
+
+############ 4. BENCHMARK: MHC pre/post (mhc_bench) ############
+GPU: AMD Instinct MI300A  arch=942  bf16=1307 TFLOP/s  HBM=5300 GB/s
+
+=== hip::mhc_pre_gemm_sqrsum ===
+     n hc_hidden hc_mult3  us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+     1        4      8      0.0       0.0      <res      <res   0.4  mem
+     1    16384     24    271.0     278.4     0.003       5.8   0.5  mem
+     7    16384     24    274.6     281.2     0.020       6.4   3.2  mem
+     1    28672     24    464.4     477.2     0.003       5.9   0.5  mem
+
+=== hip::mhc_post ===
+     n   hc hidden  us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+     1    2      2      0.0       0.0      <res      <res   0.5  mem
+     1    4   4096      0.0       0.0      <res      <res   2.2  mem
+     7    4   4096      0.0       0.0      <res      <res   2.2  mem
+     1    4   7168      0.0       0.0      <res      <res   2.2  mem
+     4    8   1024      0.0       0.0      <res      <res   4.2  mem
+
+Roof: 1307 TFLOP/s bf16, 5300 GB/s HBM, ridge ~247 FLOP/B
+

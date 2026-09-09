@@ -160,6 +160,82 @@ extern "C" int vk_hip_dsa_sparse_fwd(
   return VK_OK;
 }
 
+// --- DSA split-key sparse-MLA forward (decode occupancy fix) ---
+extern "C" int vk_hip_dsa_sparse_fwd_split(
+    int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
+    int block_I, int inner_iter, float sm_scale, int return_lse, int split_kv,
+    const void* q, const void* kv, const void* indices, void* out, void* lse,
+    void* partial_out, void* partial_lse) {
+  // Host-side preconditions: the vk_hip_dsa_sparse_fwd contract plus the
+  // split bounds (mirrors dsa_sparse_fwd_split's VK_EXPECTS).
+  const int d_v = dim - tail_dim;
+  if (!(dim > 0 && tail_dim >= 0 && d_v > 0)) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT,
+                      "dim > tail_dim >= 0 required");
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  if (topk <= 0) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "topk must be positive");
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  if (kv_group != 1) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT,
+                      "kv_group must be 1 (single shared head_kv)");
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  if (block_I <= 0 || inner_iter <= 0) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT,
+                      "block_I and inner_iter must be positive");
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  if (topk % (block_I * inner_iter) != 0) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT,
+                      "topk must be a multiple of block_I*inner_iter");
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  if (split_kv < 1 || split_kv > topk) {
+    vk_set_last_error(
+        VK_ERROR_INVALID_ARGUMENT,
+        "split_kv must be in [1, topk] (every split needs >= 1 key)");
+    return VK_ERROR_INVALID_ARGUMENT;
+  }
+  if (S_q && H && topk) {
+    if (q == nullptr) { vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "q must not be null"); return VK_ERROR_INVALID_ARGUMENT; }
+    if (kv == nullptr) { vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "kv must not be null"); return VK_ERROR_INVALID_ARGUMENT; }
+    if (indices == nullptr) { vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "indices must not be null"); return VK_ERROR_INVALID_ARGUMENT; }
+    if (out == nullptr) { vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "out must not be null"); return VK_ERROR_INVALID_ARGUMENT; }
+    if (return_lse && lse == nullptr) { vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, "lse must not be null"); return VK_ERROR_INVALID_ARGUMENT; }
+    if (split_kv > 1 && (partial_out == nullptr || partial_lse == nullptr)) {
+      vk_set_last_error(VK_ERROR_INVALID_ARGUMENT,
+                        "partial_out and partial_lse scratch required when "
+                        "split_kv > 1");
+      return VK_ERROR_INVALID_ARGUMENT;
+    }
+    if (out == q || out == kv || out == indices ||
+        (return_lse && out == lse) || out == partial_out ||
+        out == partial_lse || (return_lse && (lse == partial_out ||
+                                              lse == partial_lse))) {
+      vk_set_last_error(VK_ERROR_INVALID_ARGUMENT,
+                        "out/lse must not alias q, kv, indices, lse, or the "
+                        "partial scratch");
+      return VK_ERROR_INVALID_ARGUMENT;
+    }
+  }
+  try {
+    vkernels::kernels::hip::dsa_sparse_fwd_split(
+        S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+        sm_scale, return_lse != 0, split_kv, q, kv, indices, out, lse,
+        partial_out, partial_lse);
+  } catch (const std::invalid_argument& e) {
+    vk_set_last_error(VK_ERROR_INVALID_ARGUMENT, e.what());
+    return VK_ERROR_INVALID_ARGUMENT;
+  } catch (const std::exception& e) {
+    vk_set_last_error(VK_ERROR_INTERNAL, e.what());
+    return VK_ERROR_INTERNAL;
+  }
+  return VK_OK;
+}
+
 // --- DSA pool-level radix top-k transform ---
 extern "C" void vk_hip_dsa_topk_transform(
     int32_t batch_size, const float* score, const int32_t* lengths,

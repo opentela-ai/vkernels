@@ -2,21 +2,25 @@
 //
 // Micro-benchmark for the K3 Kimi Delta-Attention kernels (issue #21) on
 // AMD gfx942 (MI300A). The forward (kda_delta_rule_fwd) is the cooperative
-// per-token recurrence with the DxD state in a per-(b,h) GLOBAL scratch
-// buffer (correct for any D incl. K3's 128). For each (H, S, D) shape it
-// reports, against the MI300A roof (~1307 TFLOP/s bf16, ~5300 GB/s HBM3,
-// ridge ~247 FLOP/byte):
+// per-token recurrence whose DxD state is cached per-block in LDS (loaded
+// + stored once per chunk; correct for any D incl. K3's 128). For each
+// (H, S, D) shape it reports, against the MI300A roof (~1307 TFLOP/s bf16,
+// ~5300 GB/s HBM3, ridge ~247 FLOP/byte):
 //
 //   * median / min latency (us),
 //   * achieved TFLOP/s  = 7*S*D^2*H*B / t          (~ a=Sk + gS+b*uk + o=Sq),
-//   * effective GB/s    = actual HBM bytes / t    (state: 3 read + 1 write
-//                                                  per token; q,k,v,out once),
-//   * arithmetic intensity (~0.44 for large D -> strongly memory-bound) and
-//     the binding resource.
+//   * effective GB/s    = LEGACY gmem-state HBM bytes / t (state: 3 read +
+//     1 write per token; q,k,v,out once). NOTE: kda_delta_rule_fwd now keeps
+//     the block's Db state rows in LDS (load+store once per chunk), so its
+//     REAL HBM is ~250x lower and this column OVERSTATES it -- judge the LDS
+//     kernel on wall-time + achieved TFLOP/s (compute is unchanged).
+//   * arithmetic intensity (legacy ~0.44; the LDS kernel's real AI is
+//     ~5*D/(4*256) per token on q/k/v/g alone) and the binding resource.
 //
-// The baseline writes the FULL DxD state to HBM every token, so for D=128 it
-// moves ~16 KB/token/head of state traffic -- the dominant cost and the
-// target of the LDS-resident-state and chunked-intra/inter follow-ons.
+// The gmem baseline (committed kda.hip @ HEAD) writes the FULL DxD state to
+// HBM every token: for D=128 it moves ~16 KB/token/head of state traffic --
+// the dominant cost the LDS-resident-state change removes (~2.03x faster on
+// S=512 D=128; see meta/scripts/ab_kda_lds_vs_gmem.sh).
 // Also reports layer_norm_gated (K3 RMSNorm+SiLU gate) and gate_chunk_cumsum
 // at K3 shapes.
 //
@@ -123,10 +127,13 @@ static void bench_one_fwd(const GpuInfo& info, hipEvent_t start,
   const size_t m = (size_t)B * H * S * D;
   const size_t ng = (size_t)B * H * S;
   const size_t nstate = (size_t)B * H * D * D;
-  std::vector<float> q(m), k(m), v(m), g(ng), beta(ng), out(m, 0.0f);
+  // g is per-key-dim [B,H,S,D] (the kernel indexes g[off*D+e]); beta is
+  // per-token [B,H,S]. Sizing g as [B,H,S] was an out-of-bounds read that
+  // faulted the bench on every D>1 config (why no delta_rule table appeared).
+  std::vector<float> q(m), k(m), v(m), g(ng * D), beta(ng), out(m, 0.0f);
   for (size_t i = 0; i < m; ++i)  { q[i] = rnd(1, (int)i); k[i] = rnd(2, (int)i); v[i] = rnd(3, (int)i); }
-  for (size_t i = 0; i < ng; ++i) { g[i] = 0.05f + 0.95f * (rnd(4, (int)i) + 1.0f) * 0.5f;
-                                    beta[i] = 0.05f + 0.95f * (rnd(5, (int)i) + 1.0f) * 0.5f; }
+  for (size_t i = 0; i < ng * D; ++i) g[i] = 0.05f + 0.95f * (rnd(4, (int)i) + 1.0f) * 0.5f;
+  for (size_t i = 0; i < ng; ++i)     beta[i] = 0.05f + 0.95f * (rnd(5, (int)i) + 1.0f) * 0.5f;
   for (int x = 0; x < B * H * S; ++x) {
     float* kk = k.data() + (size_t)x * D;
     float n = 0.0f;
@@ -139,14 +146,14 @@ static void bench_one_fwd(const GpuInfo& info, hipEvent_t start,
   check_hip(hipMalloc(&dq,     m      * 4), "q");
   check_hip(hipMalloc(&dk,     m      * 4), "k");
   check_hip(hipMalloc(&dv,     m      * 4), "v");
-  check_hip(hipMalloc(&dg,     ng     * 4), "g");
+  check_hip(hipMalloc(&dg,     ng * D * 4), "g");
   check_hip(hipMalloc(&db,     ng     * 4), "b");
   check_hip(hipMalloc(&dstate, nstate * 4), "state");
   check_hip(hipMalloc(&dout,   m      * 4), "out");
   check_hip(hipMemcpy(dq, q.data(),    m  * 4, hipMemcpyHostToDevice), "cpyq");
   check_hip(hipMemcpy(dk, k.data(),    m  * 4, hipMemcpyHostToDevice), "cpyk");
   check_hip(hipMemcpy(dv, v.data(),    m  * 4, hipMemcpyHostToDevice), "cpyv");
-  check_hip(hipMemcpy(dg, g.data(),    ng * 4, hipMemcpyHostToDevice), "cpyg");
+  check_hip(hipMemcpy(dg, g.data(),    ng * D * 4, hipMemcpyHostToDevice), "cpyg");
   check_hip(hipMemcpy(db, beta.data(), ng * 4, hipMemcpyHostToDevice), "cpyb");
 
   // Each timed iter is identical: zero the state, then run the forward.

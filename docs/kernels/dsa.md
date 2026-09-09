@@ -17,14 +17,17 @@ is no zero-size GEMM to lower.
 - **Source (HIP)**: `src/c/vkernels/kernels/dsa.hip`
 - **Header**: `src/c/vkernels/kernels/dsa.hpp`
 - **C ABI**: `vk_dsa_config`, `vk_dsa_sparse_fwd` (host),
-  `vk_hip_dsa_sparse_fwd` (device) in `src/c/vkernels/capi/`
+  `vk_hip_dsa_sparse_fwd` + `vk_hip_dsa_sparse_fwd_split` (device) in
+  `src/c/vkernels/capi/`
 - **Tests (host)**: `tests/kernels/attn/test_dsa.cpp` (10 cases, incl. a
   hand-checked `tail_dim == 0` GLM-5.3-Flash case and a `tail_dim > 0`
   DeepSeek-V3 case, plus a randomized matches-reference sweep over both
   shape families)
 - **Tests (HIP)**: `meta/benchmarks/test_dsa_correct.hip` (device kernel vs
   `dsa_sparse_fwd_cpu`, bf16-tolerant, run on gfx942)
-- **Benchmark**: `meta/benchmarks/bench_dsa.hip` (+ `bench_dsa.sh` driver)
+- **Benchmark**: `meta/benchmarks/bench_dsa.hip`, driven on gfx942 by
+  `meta/scripts/run_dsa_mhc_bench_mi300.sh`; results in
+  [`docs/performance/dsa/gfx942.md`](../performance/dsa/gfx942.md)
 
 ---
 
@@ -117,6 +120,32 @@ in prefill — streams its `topk` selected keys in `block_I` tiles repeated
 with bf16 storage. It matches the oracle to bf16 tolerance for both
 `tail_dim == 0` and `tail_dim > 0`.
 
+### Split-key decode (`dsa_sparse_fwd_split`)
+
+The plain forward's decode grid is `(S_q/BQ, H)` — 64 blocks on MI300A's
+228 CUs at the GLM-5.3-Flash shape — so decode is bound by each block's
+SERIAL key chain (~1.2 us per key: load→use, no pipelining), not by any
+roof (0.4% of HBM at full topk). The split path (grid
+`(ceil(S_q/BQ), H, split_kv)`) divides the per-query index range across
+`split_kv` partial blocks, each writing its **normalized** fp32 partial
+output (numerator / local row-sum — the flash-decoding convention) plus
+the per-split lse, and a 64-thread combine kernel merges the splits in
+the log2 domain (`w_s = 2^(lse_s − max)`, `out = Σ w_s·part_s / Σ w_s`,
+`lse = max + log2 Σ w_s`; masked/empty splits carry lse = −inf and
+weight 0). PERF ONLY — grouping-independent, verified against the same
+oracle including uneven splits (`test_dsa_correct.hip` split rows).
+`partial_out` (`S_q·H·split_kv·d_v` fp32) and `partial_lse
+(S_q·H·split_kv` fp32) are caller-owned scratch; `split_kv == 1`
+delegates to the plain kernel (null scratch allowed).
+
+The recommended split comes from `dsa_sparse_fwd_split_for(S_q, H,
+topk, block_I, num_cu)`: 1 for prefill (the plain grid already fills
+the CUs), else `min(ceil(sqrt(2*topk)), topk)` for decode — fitted to
+the measured sweep (`docs/performance/dsa/gfx942.md`): the optimum sits
+at 8–32 keys per split (the serial chain, NOT CU filling, binds; the
+indexer's floor formula is 5–6x off here), and the sqrt fit lands on
+the measured best on all four decode shapes (20.0x at full topk).
+
 ## C ABI
 
 ```c
@@ -138,6 +167,18 @@ int  vk_hip_dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
                            int return_lse,
                            const void* q, const void* kv, const void* indices,
                            void* out, void* lse);
+
+// Device entry, split-key decode (gfx942): divides the topk range across
+// `split_kv` partial blocks + a log2-domain combine (see the split-key
+// section above). `partial_out` [S_q, H, split_kv, dim-tail_dim] fp32 and
+// `partial_lse` [S_q, H, split_kv] fp32 are caller scratch (NULL allowed
+// only when split_kv <= 1, which behaves exactly like vk_hip_dsa_sparse_fwd).
+// The recommended split is dsa_sparse_fwd_split_for (vkernels/kernels/dsa.hpp).
+int  vk_hip_dsa_sparse_fwd_split(
+    int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
+    int block_I, int inner_iter, float sm_scale, int return_lse, int split_kv,
+    const void* q, const void* kv, const void* indices, void* out, void* lse,
+    void* partial_out, void* partial_lse);
 
 // Device-only: the paged-MQA gated top-k logits indexer (issue #51).
 // `q_fp8`/`kvcache_u8` are fp8 e4m3fnuz; `weight`(gate)/`seq_lens`/
@@ -167,8 +208,15 @@ fp32 and may be null when `return_lse` is false.
 
 ## Benchmark (MI300A, gfx942)
 
-`meta/benchmarks/bench_dsa.hip` (+ `bench_dsa.sh` driver). Roof: 1307
-TFLOP/s bf16, 5300 GB/s HBM3, ridge ~247 FLOP/B.
+`meta/benchmarks/bench_dsa.hip`, driven on gfx942 by
+`meta/scripts/run_dsa_mhc_bench_mi300.sh`. Roof: 1307 TFLOP/s bf16,
+5300 GB/s HBM3, ridge ~247 FLOP/B. Measured numbers on MI300A:
+[`docs/performance/dsa/gfx942.md`](../performance/dsa/gfx942.md) —
+decode was occupancy-bound (64 blocks on 228 CUs streaming `topk` keys
+serially; 0.20/0.40/3.12 ms per layer at topk=128/256/2048 unsplit);
+the split-key path fixes it (0.045/0.059/0.156 ms at the
+`dsa_sparse_fwd_split_for` recommendation — 4.5x/6.7x/20.0x), prefill
+reaches 21–28% of the HBM roof unsplit.
 
 The kernel scores `S_q · H · topk` (query·key) dots, each `W = dim + tail_dim`
 wide (the key dot) plus `d_v = dim - tail_dim` wide (the value gather). At

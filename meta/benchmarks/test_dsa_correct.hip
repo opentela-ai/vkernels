@@ -110,7 +110,8 @@ CaseStats run_case(int S_q, int S_kv, int H, int dim, int tail_dim, int topk,
                    const std::vector<float>& kv,   // fp32 source (S_kv*W)
                    const std::vector<int32_t>& idx,// [S_q*topk]
                    uint16_t* dq, uint16_t* dkv, int32_t* didx, uint16_t* dout,
-                   float* dlse) {
+                   float* dlse, int split_kv = 0, float* dpart_out = nullptr,
+                   float* dpart_lse = nullptr) {
   const int W = dim + tail_dim;
   const int d_v = dim - tail_dim;
   const size_t nq = (size_t)S_q * H * W;
@@ -131,16 +132,27 @@ CaseStats run_case(int S_q, int S_kv, int H, int dim, int tail_dim, int topk,
       sm_scale, /*return_lse=*/true, qr.data(), kr.data(), idx.data(),
       ref.data(), ref_lse.data());
 
-  // Device.
+  // Device. split_kv == 0 exercises the plain dsa_sparse_fwd entry;
+  // split_kv >= 1 goes through dsa_sparse_fwd_split (which delegates the
+  // degenerate split_kv == 1 back to the plain kernel with null scratch --
+  // that delegation is exercised by the split=1 row below). The merge is
+  // exact in the log2 domain, so the tolerance contract is unchanged.
   CK(hipMemcpy(dq, qb.data(), nq * 2, hipMemcpyHostToDevice), "cpyq");
   CK(hipMemcpy(dkv, kb.data(), nkv * 2, hipMemcpyHostToDevice), "cpykv");
   // indices are [1, S_q, kv_group==1, topk] -> S_q*topk int32 (the CPU
   // oracle and the kernel share the same single-head_kv selection).
   CK(hipMemcpy(didx, idx.data(), (size_t)S_q * topk * 4,
                hipMemcpyHostToDevice), "cpyidx");
-  vkernels::kernels::hip::dsa_sparse_fwd(
-      S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
-      sm_scale, /*return_lse=*/true, dq, dkv, didx, dout, dlse);
+  if (split_kv > 0) {
+    vkernels::kernels::hip::dsa_sparse_fwd_split(
+        S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+        sm_scale, /*return_lse=*/true, split_kv, dq, dkv, didx, dout, dlse,
+        dpart_out, dpart_lse);
+  } else {
+    vkernels::kernels::hip::dsa_sparse_fwd(
+        S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+        sm_scale, /*return_lse=*/true, dq, dkv, didx, dout, dlse);
+  }
   CK(hipDeviceSynchronize(), "sync");
 
   std::vector<uint16_t> hout(nout);
@@ -177,27 +189,50 @@ int main() {
   CK(hipMalloc(&didx, (size_t)Sqmax * Topkmax * 4), "alloc idx");
   CK(hipMalloc(&dout, (size_t)Sqmax * Hmax * Dvmax * 2), "alloc out");
   CK(hipMalloc(&dlse, (size_t)Sqmax * Hmax * 4), "alloc lse");
+  // Split-path scratch, sized for the largest SPLIT row below (split=128:
+  // 1 x H=64 x 128 splits x d_v=256 fp32 numerators; Dvmax=512 headroom).
+  float *dpart_out, *dpart_lse;
+  CK(hipMalloc(&dpart_out, (size_t)128 * Hmax * Dvmax * 4), "alloc part_out");
+  CK(hipMalloc(&dpart_lse, (size_t)128 * Hmax * 4), "alloc part_lse");
 
   int fails = 0;
   const float OUT_THRESH = 2e-2f;
   const float LSE_THRESH = 1e-3f;
 
-  struct Cfg { int S_q, S_kv, H, dim, tail_dim, topk; };
+  struct Cfg { int S_q, S_kv, H, dim, tail_dim, topk, block_I, split; };
   const Cfg cfgs[] = {
       // GLM-5.3-Flash: tail_dim == 0 (the uncompilable tilelang case).
-      {1, 128, 64, 256, 0, 128},     // decode, topk=128
-      {1, 256, 64, 256, 0, 256},     // decode, topk=256
-      {1, 2048, 64, 256, 0, 2048},   // decode, full topk=2048
-      {64, 256, 1, 256, 0, 128},     // short
-      {8192, 1024, 1, 256, 0, 128},  // prefill (H=1; CPU-tractable)
+      // split=0 -> plain dsa_sparse_fwd; split>=1 -> dsa_sparse_fwd_split.
+      {1, 128, 64, 256, 0, 128, 64, 0},     // decode, topk=128
+      {1, 256, 64, 256, 0, 256, 64, 0},     // decode, topk=256
+      {1, 2048, 64, 256, 0, 2048, 64, 0},   // decode, full topk=2048
+      {64, 256, 1, 256, 0, 128, 64, 0},     // short
+      {8192, 1024, 1, 256, 0, 128, 64, 0},  // prefill (H=1; CPU-tractable)
       // DeepSeek-V3: tail_dim > 0.
-      {1, 256, 16, 576, 64, 256},    // decode, d_v=512
-      {1, 512, 16, 576, 64, 256},    // decode, more keys
-      {64, 256, 1, 576, 64, 256},    // short
-      {8192, 1024, 1, 576, 64, 256}, // prefill (H=1)
-      // Tiny hand-check shapes (sanity, both tail families).
-      {1, 2, 1, 2, 0, 2},            // scores {1,1} -> {0.5,0.5}, lse=2
-      {1, 2, 1, 2, 1, 2},            // tail>0: scores {2,3} -> 4/1.5
+      {1, 256, 16, 576, 64, 256, 64, 0},    // decode, d_v=512
+      {1, 512, 16, 576, 64, 256, 64, 0},    // decode, more keys
+      {64, 256, 1, 576, 64, 256, 64, 0},    // short
+      {8192, 1024, 1, 576, 64, 256, 64, 0}, // prefill (H=1)
+      // Tiny hand-check shapes (sanity, both tail families). block_I must
+      // divide topk (issue #59 precondition: topk % (block_I*inner_iter)
+      // == 0) -- the tiling does not change the result (the forward scores
+      // every selected key directly), so block_I=topk is the right tile here.
+      {1, 2, 1, 2, 0, 2, 2, 0},         // scores {1,1} -> {0.5,0.5}, lse=2
+      {1, 2, 1, 2, 1, 2, 2, 0},         // tail>0: scores {2,3} -> 4/1.5
+      // Split-path rows (issue #51 decode follow-up): the split-partial +
+      // combine merge is exact in the log2 domain and grouping-independent,
+      // so the tolerance contract is unchanged. Covers the degenerate
+      // split=1 delegation (null scratch), the recommended
+      // dsa_sparse_fwd_split_for value, an UNEVEN split (7 does not divide
+      // 128 -- chunk boundaries land mid-tile), the DSv3 decode shape, the
+      // full-topk decode shape the perf doc targets, and split == topk
+      // (one key per split).
+      {1, 128, 64, 256, 0, 128, 64, 1},    // degenerate: delegates to plain
+      {1, 128, 64, 256, 0, 128, 64, 2},    // split=2 (matches split_for)
+      {1, 128, 64, 256, 0, 128, 64, 7},    // uneven split
+      {1, 256, 16, 576, 64, 256, 64, 14},  // DSv3 decode, split=14
+      {1, 2048, 64, 256, 0, 2048, 64, 3},  // full-topk decode, split=3
+      {1, 128, 64, 256, 0, 128, 64, 128},  // split == topk (1 key/split)
   };
 
   for (const auto& c : cfgs) {
@@ -214,13 +249,14 @@ int main() {
             (k % 10 == 9) ? -1 : (int32_t)(((unsigned)(i * 31 + k * 7)) %
                                            (unsigned)c.S_kv);
 
-    auto st = run_case(c.S_q, c.S_kv, c.H, c.dim, c.tail_dim, c.topk, 1, 64,
-                       1, sm_scale, q, kv, idx, dq, dkv, didx, dout, dlse);
+    auto st = run_case(c.S_q, c.S_kv, c.H, c.dim, c.tail_dim, c.topk, 1,
+                       c.block_I, 1, sm_scale, q, kv, idx, dq, dkv, didx,
+                       dout, dlse, c.split, dpart_out, dpart_lse);
     bool ok = st.out.max_rel < OUT_THRESH && st.lse.max_rel < LSE_THRESH &&
               st.lse.worst_inf < 1.0;
-    std::printf("  S_q=%-4d S_kv=%-4d H=%-2d dim=%-3d tail=%-2d topk=%-4d  "
-                "out[a=%.4f r=%.6f] lse[a=%.4f r=%.6f inf=%.1f]  %s\n",
-                c.S_q, c.S_kv, c.H, c.dim, c.tail_dim, c.topk,
+    std::printf("  S_q=%-4d S_kv=%-4d H=%-2d dim=%-3d tail=%-2d topk=%-4d "
+                "split=%-3d out[a=%.4f r=%.6f] lse[a=%.4f r=%.6f inf=%.1f]  %s\n",
+                c.S_q, c.S_kv, c.H, c.dim, c.tail_dim, c.topk, c.split,
                 st.out.max_abs, st.out.max_rel, st.lse.max_abs, st.lse.max_rel,
                 st.lse.worst_inf, ok ? "PASS" : "FAIL");
     if (!ok) ++fails;

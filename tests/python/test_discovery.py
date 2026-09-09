@@ -58,8 +58,16 @@ EXPECTED_KERNELS = [
     # #51), the single source of truth for the formula the hip_capi.hpp
     # docstring used to restate (with the wrong NUM_CU=256 -> 228).
     ("dsa_topk_logits_split_for", "dsa"),
+    # dsa_sparse_fwd_split_for: the split-key decode recommendation
+    # (ceil(sqrt(2*topk)) for decode, 1 for prefill) fitted to the measured
+    # sweep (docs/performance/dsa/gfx942.md), used by the serving decode
+    # path; sits in dsa.hpp right before the device declarations.
+    ("dsa_sparse_fwd_split_for", "dsa"),
     ("dsa_sparse_fwd", "dsa"),
     ("dsa_sparse_fwd_with_tile", "dsa"),
+    # dsa_sparse_fwd_split: the split-key decode entry (partial + log2-domain
+    # combine), declared after with_tile; see docs/kernels/dsa.md.
+    ("dsa_sparse_fwd_split", "dsa"),
     ("dsa_topk_logits", "dsa"),
     ("dsa_topk_logits_with_variant", "dsa"),
     ("dsa_topk_logits", "dsa"),

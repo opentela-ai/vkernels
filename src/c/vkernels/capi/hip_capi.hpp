@@ -202,6 +202,29 @@ int vk_hip_dsa_sparse_fwd(
     const void* q, const void* kv, const void* indices, void* out,
     void* lse);
 
+/* Split-key sparse-MLA forward (decode occupancy fix, issue #51 follow-up).
+ *
+ * Same math and contract as vk_hip_dsa_sparse_fwd, but the `topk` index
+ * range is divided across `split_kv` partial blocks (each streaming a
+ * contiguous chunk of the per-query indices, writing fp32 partial outputs
+ * NORMALIZED by their split's local row-sum plus the per-split lse) and a
+ * combine kernel merges the splits in the log2 domain. PERF ONLY -- the
+ * merged result is bf16-tolerant vs the CPU oracle; any 1 <= split_kv <=
+ * topk is legal.
+ *
+ *   partial_out [S_q, H, split_kv, dim - tail_dim]  fp32 (caller scratch)
+ *   partial_lse [S_q, H, split_kv]                  fp32 (caller scratch)
+ *
+ * partial_out/partial_lse may be NULL only when split_kv <= 1 (the call
+ * then behaves exactly like vk_hip_dsa_sparse_fwd). The recommended split
+ * comes from dsa_sparse_fwd_split_for (host, vkernels/kernels/dsa.hpp).
+ */
+int vk_hip_dsa_sparse_fwd_split(
+    int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
+    int block_I, int inner_iter, float sm_scale, int return_lse, int split_kv,
+    const void* q, const void* kv, const void* indices, void* out, void* lse,
+    void* partial_out, void* partial_lse);
+
 /* Pool-level radix top-k transform for the DSA kpool indexer.
  *
  *   score             [batch_size, score_stride] strided fp32

@@ -50,8 +50,18 @@ float rnd(int seed, int i) {
   x ^= x >> 15;
   return (float)((int)x % 200000) / 100000.0f;  // [-1, 1)
 }
-float rgate(int seed, int i) {  // (0.05, 1] — never fully forgotten
-  return 0.05f + 0.95f * std::fabs(rnd(seed, i));
+// rgate must be a contractive forget gate in (0, 1) (the production regime:
+// sigmoid gates; the header documents "g, β in (0, 1]"). The naive
+// `0.05 + 0.95*fabs(rnd)` instead reached ~1.95 (rnd's (int)x % 200000
+// sign-flips on unsigned overflow), which EXPANDS the state — a
+// near-unstable regime where over S=512 steps tiny GPU-vs-CPU FMA
+// rounding amplified to max_rel≈11%. Unsigned modulo keeps g in
+// (0.05, 1.0) so the recurrence is well-conditioned and the kernel
+// matches the oracle to fp precision.
+float rgate(int seed, int i) {
+  unsigned x = (unsigned)(seed * 2654435761u + (unsigned)i * 40503u);
+  x ^= x >> 13; x *= 0x5bd1e995u; x ^= x >> 15;
+  return 0.05f + 0.95f * (float)(x % 100000u) / 100000.0f;  // (0.05, 1.0)
 }
 
 // --- forward: hip::kda_delta_rule_fwd vs kda_naive_delta_rule_fwd_cpu ---
@@ -86,7 +96,7 @@ Stats run_fwd(int B, int H, int S, int D, int chunk_size,
   CK(hipMemcpy(dq, q.data(), n * 4, hipMemcpyHostToDevice), "cpyq");
   CK(hipMemcpy(dk, k.data(), n * 4, hipMemcpyHostToDevice), "cpyk");
   CK(hipMemcpy(dv, v.data(), n * 4, hipMemcpyHostToDevice), "cpyv");
-  CK(hipMemcpy(dg, g.data(), (size_t)B * H * S * 4, hipMemcpyHostToDevice),
+  CK(hipMemcpy(dg, g.data(), (size_t)B * H * S * D * 4, hipMemcpyHostToDevice),
      "cpyg");
   CK(hipMemcpy(db, beta.data(), (size_t)B * H * S * 4, hipMemcpyHostToDevice),
      "cpyb");
@@ -126,7 +136,7 @@ int main() {
     CK(hipMalloc(&dq, n * 4), "alloc q");
     CK(hipMalloc(&dk, n * 4), "alloc k");
     CK(hipMalloc(&dv, n * 4), "alloc v");
-    CK(hipMalloc(&dg, (size_t)Bm * Hm * Sm * 4), "alloc g");
+    CK(hipMalloc(&dg, (size_t)Bm * Hm * Sm * Dm * 4), "alloc g");
     CK(hipMalloc(&db, (size_t)Bm * Hm * Sm * 4), "alloc b");
     CK(hipMalloc(&dout, n * 4), "alloc out");
 
@@ -139,10 +149,17 @@ int main() {
     std::printf("--- kda_delta_rule_fwd vs naive oracle ---\n");
     for (const auto& c : cfgs) {
       const size_t m = (size_t)c.B * c.H * c.S * c.D;
-      std::vector<float> q(m), k(m), v(m), g((size_t)c.B * c.H * c.S),
-          beta((size_t)c.B * c.H * c.S);
+      // g is the per-key-dim forget gate [B,H,S,D] (see
+      // kda_naive_delta_rule_fwd_cpu / kda_delta_rule_fwd_kernel:
+      // gt = g + (bh+t)*D, S[v,k] *= gt[k]); beta is the per-token scalar
+      // delta gate [B,H,S]. Previously g was allocated [B,H,S], so for D>1
+      // every token's gt[k>=1] read out of bounds (CPU heap vs GPU stale
+      // buffer) -> chaotic 1e31/NaN spikes diverging from t=floor(S/D).
+      std::vector<float> q(m), k(m), v(m),
+          g((size_t)c.B * c.H * c.S * c.D), beta((size_t)c.B * c.H * c.S);
       for (size_t i = 0; i < m; ++i) { q[i] = rnd(1, (int)i); k[i] = rnd(2, (int)i); v[i] = rnd(3, (int)i); }
-      for (size_t i = 0; i < g.size(); ++i) { g[i] = rgate(4, (int)i); beta[i] = rgate(5, (int)i); }
+      for (size_t i = 0; i < g.size(); ++i) g[i] = rgate(4, (int)i);
+      for (size_t i = 0; i < beta.size(); ++i) beta[i] = rgate(5, (int)i);
       normalize_keys(k, c.B, c.H, c.S, c.D);
       auto st = run_fwd(c.B, c.H, c.S, c.D, c.chunk, q, k, v, g, beta,
                         dq, dk, dv, dg, db, dout);

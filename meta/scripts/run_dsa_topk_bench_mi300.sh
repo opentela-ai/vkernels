@@ -1,6 +1,13 @@
 #!/bin/bash
+#SBATCH --job-name=vkdstopk
+#SBATCH --partition=mi300
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=64
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:25:00
 # Build + benchmark dsa_topk on an MI300A (gfx942) compute node.
-# Run interactively:
+# sbatch-safe (lands on mi300 by default); also runnable interactively:
 #   srun --partition=mi300 -N1 -G1 --time=00:25:00 bash meta/scripts/run_dsa_topk_bench_mi300.sh
 set -euo pipefail
 : "${SRC:=$HOME/vkernels}"

@@ -275,6 +275,265 @@ void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
 }
 
 // ---------------------------------------------------------------------------
+//  Split-key forward (decode occupancy fix): the plain forward's grid is
+//  (ceil(S_q/BQ), H) -- 64 blocks on MI300A's 228 CUs at the GLM-5.3-Flash
+//  decode shape, each streaming its `topk` keys serially (measured 0.4% of
+//  the HBM roof; docs/performance/dsa/gfx942.md). The partial kernel below
+//  adds a blockIdx.z split of the per-query index range: each block runs the
+//  SAME online softmax over its [k0, k1) chunk but writes its NORMALIZED
+//  fp32 partial output (numerator / local row-sum -- the flash-decoding
+//  convention; the raw numerator would need a 2^(row_max_s - m) weight, not
+//  2^(lse_s - m)) plus the per-split lse, and a combine kernel merges the
+//  splits in the log2 domain (the exact online-softmax merge:
+//  w_s = 2^(lse_s - max_lse), out = sum_s w_s*part_s / sum_w,
+//  lse = max + log2(sum_w); masked/empty splits carry lse = -inf / weight 0
+//  exactly like masked keys above). PERF ONLY -- the merged result matches
+//  dsa_sparse_fwd_cpu to bf16 tolerance (test_dsa_correct.hip split rows,
+//  including uneven splits); any 1 <= split_kv <= topk is legal.
+// ---------------------------------------------------------------------------
+template <int BQ>
+__global__ void dsa_sparse_fwd_partial_kernel(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ kv,
+    const int32_t* __restrict__ indices, float* __restrict__ part_out,
+    float* __restrict__ part_lse,
+    int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
+    float sm_scale, int split_kv) {
+  const int q_tile = blockIdx.x;
+  const int h = blockIdx.y;            // kv_group == 1: one shared head_kv
+  const int s = blockIdx.z;            // which [k0,k1) chunk of the topk range
+  const int tid = threadIdx.x;
+  const int warp = tid >> 6;           // which query row within the tile
+  const int lane = tid & 63;           // strided head index this lane owns
+  const int gi = q_tile * BQ + warp;   // global query row
+  if (gi >= S_q) return;
+
+  const int W = dim + tail_dim;
+  const int d_v = dim - tail_dim;
+  const int main_tiles = (dim + 63) / 64;
+  const int tail_tiles = (tail_dim + 63) / 64;  // 0 when tail_dim == 0
+  const int v_tiles = (d_v + 63) / 64;
+
+  // This split's contiguous chunk of the per-query index range. Uneven
+  // splits are legal (the chunk boundaries need not align to block_I: the
+  // kernel streams one key at a time).
+  const int k0 = (int)(((long)topk * s) / split_kv);
+  const int k1 = (int)(((long)topk * (s + 1)) / split_kv);
+
+  // --- stage the BQ query rows in LDS once (bf16 -> fp32, per-block) ---
+  extern __shared__ float sQ[];       // sQ[BQ][W]
+  for (int idx = tid; idx < BQ * W; idx += BQ * 64) {
+    const int r = idx / W, c = idx % W;
+    const int gr = q_tile * BQ + r;
+    sQ[idx] = (gr < S_q) ? bf16_to_f32(
+                  q[((size_t)gr * H + h) * W + c])
+                         : 0.0f;
+  }
+  __syncthreads();
+
+  const float* qrow = &sQ[warp * W];  // this warp's query row (fp32)
+  const int32_t* idx_i =
+      indices + (size_t)gi * kv_group * topk;  // kv_group == 1 -> gi*topk
+
+  // Lane-local slices of the output accumulator (strided by 64 over d_v).
+  float o[kPerLane];
+  for (int t = 0; t < kPerLane; ++t) o[t] = 0.0f;
+  float row_max = -INFINITY;          // running max (same on every lane)
+  float row_sum = 0.0f;               // running denominator (same on every lane)
+
+  for (int k = k0; k < k1; ++k) {
+    const int32_t idx = idx_i[k];
+    const bool valid = (idx >= 0) && (idx < S_kv);
+
+    // --- lane-local partial score (main + tail), then warp-reduce ---
+    float partial = 0.0f;
+    if (valid) {
+      const uint16_t* kv_p = kv + (size_t)idx * W;  // kv_group==1
+      for (int t = 0; t < main_tiles; ++t) {
+        const int d = lane + t * 64;
+        if (d < dim) partial += qrow[d] * bf16_to_f32(kv_p[d]);
+      }
+      for (int t = 0; t < tail_tiles; ++t) {  // 0 iters when tail_dim == 0
+        const int d = lane + t * 64;
+        if (d < tail_dim)
+          partial += qrow[dim + d] * bf16_to_f32(kv_p[dim + d]);
+      }
+    }
+    float score = partial;
+    for (int off = 32; off > 0; off >>= 1)  // warp-wide sum -> broadcast
+      score += __shfl_xor(score, off);
+    // Masked keys must contribute ZERO weight, so clamp their score to -inf
+    // exactly as the CPU oracle does (else exp2(0-max)=1).
+    score = valid ? (score * sm_scale) : -INFINITY;
+
+    // --- online softmax update (lock-step; identical on every lane) ---
+    const float new_max = fmaxf(row_max, score);
+    const float exp_old = (row_max == -INFINITY) ? 0.0f : exp2f(row_max - new_max);
+    const float exp_s = (score == -INFINITY) ? 0.0f : exp2f(score - new_max);
+    row_sum = row_sum * exp_old + exp_s;
+    for (int t = 0; t < v_tiles; ++t) o[t] *= exp_old;
+    if (valid) {
+      const uint16_t* vp = kv + (size_t)idx * W;  // v = kv[idx][0:d_v]
+      for (int t = 0; t < v_tiles; ++t) {
+        const int d = lane + t * 64;
+        if (d < d_v) o[t] += exp_s * bf16_to_f32(vp[d]);
+      }
+    }
+    row_max = new_max;
+  }
+
+  // --- write the NORMALIZED per-split output (fp32, no bf16 rounding here
+  // -- the combine re-weights in fp32 and rounds once) + per-split lse ---
+  const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
+  float* porow = part_out + (((size_t)gi * H + h) * split_kv + s) * d_v;
+  for (int t = 0; t < v_tiles; ++t) {
+    const int d = lane + t * 64;
+    if (d < d_v) porow[d] = o[t] * inv;
+  }
+  if (lane == 0)
+    part_lse[((size_t)gi * H + h) * split_kv + s] =
+        (row_sum > 0.0f) ? (row_max + log2f(row_sum)) : -INFINITY;
+}
+
+__global__ void dsa_sparse_fwd_combine_kernel(
+    const float* __restrict__ part_out, const float* __restrict__ part_lse,
+    uint16_t* __restrict__ out, float* __restrict__ lse_out,
+    int S_q, int H, int d_v, int split_kv, bool return_lse) {
+  // part_out rows are the per-split NORMALIZED outputs (num / row_sum); the
+  // merge re-weights them by w_s = 2^(lse_s - m) and divides by sum_w -- the
+  // exact log2-domain online-softmax merge.
+  const int gi = blockIdx.x;
+  const int h = blockIdx.y;
+  const int lane = threadIdx.x;        // 64 lanes over d_v, like the forward
+  const size_t base = ((size_t)gi * H + h) * split_kv;
+
+  // Every lane redundantly reduces the per-split lse (split_kv scalar reads,
+  // L2-broadcast) so the weights below are lock-step without LDS traffic.
+  float m = -INFINITY;
+  for (int s = 0; s < split_kv; ++s) m = fmaxf(m, part_lse[base + s]);
+
+  if (m == -INFINITY) {
+    // Every selected key of every split is masked -> zero row, lse = -inf
+    // (same contract as the plain forward's fully-masked row).
+    uint16_t* orow = out + ((size_t)gi * H + h) * d_v;
+    for (int d = lane; d < d_v; d += 64) orow[d] = 0;
+    if (lane == 0 && return_lse) lse_out[(size_t)gi * H + h] = -INFINITY;
+    return;
+  }
+
+  // Lane-local slices of the merged numerator (strided by 64 over d_v).
+  float o[kPerLane];
+  for (int t = 0; t < kPerLane; ++t) o[t] = 0.0f;
+  float denom = 0.0f;                  // same on every lane
+  for (int s = 0; s < split_kv; ++s) {
+    const float l = part_lse[base + s];
+    const float w = (l == -INFINITY) ? 0.0f : exp2f(l - m);
+    denom += w;
+    const float* po = part_out + (base + s) * d_v;
+    for (int t = 0; t < kPerLane; ++t) {
+      const int d = lane + t * 64;
+      if (d < d_v) o[t] += w * po[d];
+    }
+  }
+
+  const float inv = 1.0f / denom;      // denom >= w_max_split = 1 > 0 here
+  uint16_t* orow = out + ((size_t)gi * H + h) * d_v;
+  for (int t = 0; t < kPerLane; ++t) {
+    const int d = lane + t * 64;
+    if (d < d_v) orow[d] = f2bf(o[t] * inv);
+  }
+  if (lane == 0 && return_lse)
+    lse_out[(size_t)gi * H + h] = m + log2f(denom);
+}
+
+namespace {
+template <int BQ>
+void launch_partial(const void* q, const void* kv, const void* indices,
+                    void* part_out, void* part_lse, int S_q, int S_kv, int H,
+                    int dim, int tail_dim, int topk, int kv_group,
+                    float sm_scale, int split_kv) {
+  const int W = dim + tail_dim;
+  const int shmem = BQ * W * sizeof(float);
+  dim3 block(BQ * 64);
+  dim3 grid((S_q + BQ - 1) / BQ, H, split_kv);
+  dsa_sparse_fwd_partial_kernel<BQ><<<grid, block, shmem, 0>>>(
+      reinterpret_cast<const uint16_t*>(q),
+      reinterpret_cast<const uint16_t*>(kv),
+      reinterpret_cast<const int32_t*>(indices),
+      reinterpret_cast<float*>(part_out), reinterpret_cast<float*>(part_lse),
+      S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, split_kv);
+}
+}  // namespace
+
+void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
+                          int topk, int kv_group, int block_I, int inner_iter,
+                          float sm_scale, bool return_lse, int split_kv,
+                          const void* q, const void* kv, const void* indices,
+                          void* out, void* lse,
+                          void* partial_out, void* partial_lse) {
+  // Host-side preconditions: the same contract as dsa_sparse_fwd_with_tile
+  // (issue #57) plus the split bounds; the combine writes `out` from the
+  // partials, so `out` must not alias them either.
+  const int d_v = dim - tail_dim;
+  VK_EXPECTS(dim > 0 && tail_dim >= 0 && d_v > 0,
+             "dim > tail_dim >= 0 required");
+  VK_EXPECTS(topk > 0, "topk must be positive");
+  VK_EXPECTS(kv_group == 1, "kv_group must be 1 (single shared head_kv)");
+  VK_EXPECTS(block_I > 0 && inner_iter > 0,
+             "block_I and inner_iter must be positive");
+  VK_EXPECTS(topk % (block_I * inner_iter) == 0,
+             "topk must be a multiple of block_I*inner_iter");
+  VK_EXPECTS(split_kv >= 1, "split_kv must be positive");
+  VK_EXPECTS(split_kv <= topk,
+             "split_kv must not exceed topk (every split needs >= 1 key)");
+  VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 || q != nullptr,
+             "q must not be null");
+  VK_EXPECTS(S_q == 0 || H == 0 || S_kv == 0 || kv != nullptr,
+             "kv must not be null");
+  VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 || indices != nullptr,
+             "indices must not be null");
+  VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 || out != nullptr,
+             "out must not be null");
+  VK_EXPECTS(!return_lse || lse != nullptr, "lse must not be null");
+  if (split_kv == 1) {
+    // Degenerate split: identical to the plain forward, no scratch needed.
+    dsa_sparse_fwd(S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I,
+                   inner_iter, sm_scale, return_lse, q, kv, indices, out,
+                   lse);
+    return;
+  }
+  VK_EXPECTS(partial_out != nullptr && partial_lse != nullptr,
+             "partial_out and partial_lse scratch required when split_kv > 1");
+  VK_EXPECTS(S_q == 0 || H == 0 || topk == 0 ||
+                 (out != partial_out && out != partial_lse &&
+                  (!return_lse || lse != partial_out &&
+                                 lse != partial_lse)),
+             "out/lse must not alias the partial scratch");
+  int bq = 0, th = 0, bi = 0, ii = 0;
+  ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
+  (void)th;
+  (void)block_I;     // the partial kernel streams one key at a time, like
+  (void)inner_iter;  // the plain forward (tiled-key prefetch is a follow-on)
+  if (bq <= 1)
+    launch_partial<1>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
+                      dim, tail_dim, topk, kv_group, sm_scale, split_kv);
+  else if (bq <= 2)
+    launch_partial<2>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
+                      dim, tail_dim, topk, kv_group, sm_scale, split_kv);
+  else if (bq <= 4)
+    launch_partial<4>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
+                      dim, tail_dim, topk, kv_group, sm_scale, split_kv);
+  else
+    launch_partial<8>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
+                      dim, tail_dim, topk, kv_group, sm_scale, split_kv);
+  dim3 cgrid(S_q, H);
+  dsa_sparse_fwd_combine_kernel<<<cgrid, 64>>>(
+      reinterpret_cast<const float*>(partial_out),
+      reinterpret_cast<const float*>(partial_lse),
+      reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
+      S_q, H, d_v, split_kv, return_lse);
+}
+
+// ---------------------------------------------------------------------------
 //  DSA paged-MQA gated top-k logits (gfx942), issue #51. See dsa.hpp for the
 //  gated-logit formula and the tensor layout; this kernel is the plain
 //  gfx942 replacement for the tilelang path (JIT-compiles but the launched

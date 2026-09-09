@@ -1,4 +1,11 @@
 #!/bin/bash
+#SBATCH --job-name=vkdkpool
+#SBATCH --partition=mi300
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=64
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:30:00
 # Build + benchmark dsa_kpool (issue #60) on an MI300A (gfx942) compute node.
 # The kpool kernels are HIP/gfx942 (AMD) and run on CSCS beverin's `mi300`
 # partition -- NOT on bristen (NVIDIA GH200, no ROCm).

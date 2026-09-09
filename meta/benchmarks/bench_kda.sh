@@ -16,7 +16,7 @@ set -euo pipefail
 BIN="${1:?usage: bench_kda.sh /path/to/kda_bench}"
 ulimit -c 0   # the faulting runs dump multi-hundred-MB GPU cores otherwise
 
-printf '=== hip::kda_delta_rule_fwd (D x D state in gmem, row-parallel) ===\n'
+printf '=== hip::kda_delta_rule_fwd (D x D state in LDS, row-parallel) ===\n'
 printf '  %4s %6s %4s %9s %9s %9s %9s %5s  %s\n' \
        H S D us\(min\) us\(med\) TFLOP/s GB/s AI bound
 for cfg in "1 64 16" "1 64 32" "1 64 64" "16 64 64" \
