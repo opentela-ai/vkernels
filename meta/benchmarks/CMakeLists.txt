@@ -266,6 +266,18 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(kda_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(kda_bench)
 
+  # Chunked WY K3 forward (#70): correctness vs the CPU oracle + A/B vs the
+  # committed cooperative kernel.
+  add_executable(test_kda_chunked test_kda_chunked.hip)
+  target_link_libraries(test_kda_chunked PRIVATE vkernels::vkernels)
+  target_compile_features(test_kda_chunked PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_kda_chunked)
+
+  add_executable(kda_chunked_bench bench_kda_chunked.hip)
+  target_link_libraries(kda_chunked_bench PRIVATE vkernels::vkernels)
+  target_compile_features(kda_chunked_bench PRIVATE cxx_std_17)
+  vkernels_set_warnings(kda_chunked_bench)
+
   # DeepseekSparseAttn sparse-MLA forward (issue #51).
   add_executable(test_dsa_correct test_dsa_correct.hip)
   target_link_libraries(test_dsa_correct PRIVATE vkernels::vkernels)

@@ -5,7 +5,7 @@
 # GMEM kernel, not 4-barrier LDS. Here we use the git-extracted 4-barrier LDS
 # (kda.4barrier.hip, from commit 5028461) directly. Builds only.
 set -uo pipefail
-SRC=/users/xyao/vkernels-issue63; B=$SRC/build_kda
+SRC=/capstor/scratch/cscs/xyao/vkernels; B=$SRC/build_kda
 CLANG=/opt/rocm-6.3.0/lib/llvm/bin/clang++
 COMMON="-O3 -std=c++17 --offload-arch=gfx942 -DVKERNELS_HAS_HIP=1 -D__HIP_ROCclr__=1 -I$SRC/src/c -L/usr/lib64/gcc/x86_64-suse-linux/7 $B/src/c/libvkernels.a /opt/rocm-6.3.0/lib/libamdhip64.so.6.3.60300 -lgcc"
 KDA=$SRC/src/c/vkernels/kernels/kda.hip

@@ -7,7 +7,7 @@
 # from the reordered summation, still ≪ the 2e-2 threshold) then the A/B
 # table at S=512 D=128 sweeping H. See docs/kda-lds-optimization.md.
 set -uo pipefail
-B=/users/xyao/vkernels-issue63/build_kda
+B=/capstor/scratch/cscs/xyao/vkernels/build_kda
 OLD=$B/meta/benchmarks/kda_bench_4B
 NEW=$B/meta/benchmarks/kda_bench_PAR
 ulimit -c 0

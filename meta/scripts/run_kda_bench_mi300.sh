@@ -37,13 +37,13 @@
 # present in this checkout (see issue #65).
 #
 # Run interactively:
-#   SRC=/users/xyao/vkernels-issue63 srun --partition=mi300 -N1 -G1 --time=00:30:00 \
+#   SRC=/capstor/scratch/cscs/xyao/vkernels srun --partition=mi300 -N1 -G1 --time=00:30:00 \
 #     bash meta/scripts/run_kda_bench_mi300.sh
 # Or batch:
-#   SRC=/users/xyao/vkernels-issue63 sbatch -o kda_bench.%j.out \
+#   SRC=/capstor/scratch/cscs/xyao/vkernels sbatch -o kda_bench.%j.out \
 #     meta/scripts/run_kda_bench_mi300.sh
 set -euo pipefail
-: "${SRC:=$HOME/vkernels}"
+: "${SRC:=${SCRATCH:-$HOME}/vkernels}"
 B="$SRC/build_kda"
 mkdir -p "$B"
 

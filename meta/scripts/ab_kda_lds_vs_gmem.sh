@@ -3,7 +3,7 @@
 # Both built + run against the SAME fixed-g bench_kda.hip so the only
 # variable is the state-residence kernel. Saves tables to old/new .out.
 set -euo pipefail
-SRC=/users/xyao/vkernels-issue63
+SRC=/capstor/scratch/cscs/xyao/vkernels
 B="$SRC/build_kda"
 CLANG=/opt/rocm-6.3.0/lib/llvm/bin/clang++
 LIB="$B/src/c/libvkernels.a"

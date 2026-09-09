@@ -264,6 +264,48 @@ void kda_delta_rule_fwd_with_scratch(const float* q, const float* k,
                                      const float* beta, float* state,
                                      float* out, int B, int H, int S, int D);
 
+// #L8 — chunked WY forward (#70): the SAME K3 per-key-dim recurrence as
+// kda_delta_rule_fwd_with_scratch, in the affine WY (UT-transform) form
+// derived and CPU-verified against kda_naive_delta_rule_fwd_cpu in
+// tests/kernels/attn/test_kda_k3_chunked.cpp (k3_wy_chunked_fwd). Three
+// launches: per-key log-cumsum; all chunk-local artifacts (grams, explicit
+// triangular inverse, U_v/W/T/Opar) fully parallel over chunks; then an
+// nc-step serial state pass split over D-row blocks (state rows are
+// independent, like the cooperative kernel's row split). The serial
+// critical path drops from S token steps x 4 barriers to nc chunk steps x 3
+// barriers of GEMM-shaped cooperative work.
+//
+// CONTRACT (stronger than the cooperative kernel): k is L2-NORMALISED by
+// the caller (production contract) so the gate-weighted Gram satisfies
+// |M| <= 1 by Cauchy-Schwarz and the explicit inverse stays bounded — with
+// unnormalised k it overflows at cs=64 (measured; see the CPU test). Gates
+// in (0,1], beta <= 1, chunk_size == 64, S % 64 == 0, D <= 128.
+// state : same in/out contract as kda_delta_rule_fwd_with_scratch.
+// scratch: caller-owned kda_chunked_scratch_floats(B,H,S,D) floats
+//          (allocate once and reuse across calls; contents are clobbered).
+void kda_delta_rule_fwd_chunked_with_scratch(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, float* state, float* out, float* scratch,
+    int B, int H, int S, int D, int chunk_size);
+
+std::size_t kda_chunked_scratch_floats(int B, int H, int S, int D);
+
+// Convenience wrapper (own state + scratch allocs; S_0 = 0).
+void kda_delta_rule_fwd_chunked(const float* q, const float* k,
+                                const float* v, const float* g,
+                                const float* beta, float* out,
+                                int B, int H, int S, int D, int chunk_size);
+
+// Tuning aid (#70): best wall time (us) of each chunked launch —
+// out_us[0]=cumsum, [1]=grams, [2]=chunk-local (inverse+GEMMs),
+// [3]=state pass, [4..9]=local-internal phase deltas (clock64/1000) —
+// over `iters` timed runs after a warmup of each. Same buffers/contract.
+void kda_chunked_phase_times(const float* q, const float* k, const float* v,
+                             const float* g, const float* beta, float* state,
+                             float* out, float* scratch,
+                             int B, int H, int S, int D, int iters,
+                             double* out_us);
+
 void kda_pack_bitmatrix(const uint8_t* bits, uint8_t* packed,
                         std::size_t n_bits);
 

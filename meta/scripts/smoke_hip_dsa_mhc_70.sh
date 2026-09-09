@@ -8,7 +8,7 @@
 #      stream-0 capture refusal fires, and an eager DSA forward runs. The
 #      native DSA/MHC correctness was already PASS on this node (job 629196).
 set -uo pipefail
-cd /users/xyao/vkernels-issue63 || exit 1
+cd /capstor/scratch/cscs/xyao/vkernels || exit 1
 
 echo "=== node: $(hostname)  date: $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 rocm-smi --showproductname 2>/dev/null | grep -A1 "GPU\[0\]" | head -3
@@ -19,9 +19,9 @@ bash meta/benchmarks/bench_kda.sh build_kda/meta/benchmarks/kda_bench 2>&1 | hea
 echo "A_rc=${PIPESTATUS[0]}"
 
 echo; echo "########## B. #69 hip_dsa_mhc.py Python wrapper smoke ##########"
-export VKERNELS_LIB=/users/xyao/vkernels-issue63/build_dsamhc/src/c/libvkernels_hip.so
-export PYTHONPATH=/users/xyao/vkernels-issue63/src/python
-export LD_LIBRARY_PATH=/users/xyao/vkernels-issue63/build_dsamhc/src/c:${LD_LIBRARY_PATH:-}
+export VKERNELS_LIB=/capstor/scratch/cscs/xyao/vkernels/build_dsamhc/src/c/libvkernels_hip.so
+export PYTHONPATH=/capstor/scratch/cscs/xyao/vkernels/src/python
+export LD_LIBRARY_PATH=/capstor/scratch/cscs/xyao/vkernels/build_dsamhc/src/c:${LD_LIBRARY_PATH:-}
 /usr/bin/python3.11 - <<'PYEOF' 2>&1 | tail -25
 import torch
 import vkernels.hip_dsa_mhc as h
