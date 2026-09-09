@@ -1,0 +1,51 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M21WZ4QV45KHBC17Z4TBRR7V",
+  "session_id": "01a08373-4330-70fc-acb0-6abcfbdd0d30",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-09T01:36:55.431400185Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "save_step_count": 1,
+  "files_touched": [],
+  "agent": "Pi",
+  "model": "CSCS-Inference/zai-org/GLM-5.2",
+  "turn_id": "c6f82a48dd2c",
+  "checkpoint_transcript_start": 264,
+  "transcript_lines_at_start": 264,
+  "compact_transcript_start": 80,
+  "token_usage": {
+    "input_tokens": 379250,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 5616064,
+    "output_tokens": 73257,
+    "api_call_count": 70
+  },
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1260,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    }
+  ]
+}
