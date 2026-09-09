@@ -1,4 +1,11 @@
 #!/bin/bash
+#SBATCH --job-name=vkdsamhc
+#SBATCH --partition=mi300
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=64
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:40:00
 # Build + benchmark the GLM-5.3-Flash / DeepSeek-V3 sparse-attention stack
 # (issue #51) on an MI300A (gfx942) compute node -- CSCS beverin `mi300`
 # partition (NOT bristen, which is NVIDIA GH200 with no ROCm).
