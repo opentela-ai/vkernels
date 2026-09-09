@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M22SK13KM3N80EWHPM2TW4PT",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "meta/benchmarks/CMakeLists.txt",
+    "meta/benchmarks/bench_kda_chunked.hip",
+    "meta/benchmarks/test_kda_chunked.hip",
+    "meta/scripts/ab_kda_chunked_mi300.sh",
+    "src/c/vkernels/kernels/kda.hip",
+    "src/c/vkernels/kernels/kda.hpp",
+    "tests/kernels/attn/test_kda_k3_chunked.cpp"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 267223,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 19397248,
+    "output_tokens": 157579,
+    "api_call_count": 109
+  }
+}
