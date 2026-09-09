@@ -88,21 +88,65 @@ therefore a **true dependency**, not dead synchronisation. (The race is
 worst at low block counts — grid ≤ 4 — and is masked by serialization only
 at very high H.)
 
-## Next levers (not yet taken)
+## Negative result: PREDICT/OUTPUT compute is non-binding (do not parallelise the dots)
 
-1. **Profile to localise the latency** — `omniperf` single-kernel metrics
-   (wavefront stall reasons, VALU utilization) on the S=512 D=128 H=128 case to
-   confirm whether the barrier cost or the PREDICT/OUTPUT thread starvation
-   dominates, per hip-kernel-profiling. (omniperf/omnitrace are absent on
-   beverin; `rocprof --stats` works and gives per-launch DurationNs but not
-   stall reasons.)
-2. **Parallelise the dot products** — give each of the `Db` rows a small group
-   of threads (length-D dot product split across r threads + `__shfl`/LDS
-   reduce) so PREDICT/OUTPUT use more of the 256-thread block. This is the
-   only intra-block lever left, since all four barriers are required (above).
-3. **Token-level pipelining / parallel scan** for inter-chunk parallelism (the
-   #70 chunked-prefill work) — the only lever that scales past one block's
-   serial token loop, but a much larger change.
+Hypothesis: with only `Db=32` of `kTh=256` threads doing the length-`D`
+(=128) dots in PREDICT and OUTPUT (12.5% utilisation), each thread runs a
+~128-deep dependent add chain — so parallelising each row's dot across
+`r = kTh/Db = 8` threads (strided over `e`, `__shfl_xor` butterfly reduce)
+should cut the per-block critical path from D to D/r dependent adds and
+speed the kernel up at every H.
+
+**Disproven by experiment** (`meta/benchmarks/kda_pardot.hip` +
+`meta/scripts/ab_kda_pardot{,_run}.sh`, beverin MI300A, S=512 D=128):
+
+| H | 4-barrier (µs) | parallel-dot (µs) | speedup |
+|---|---|---|---|
+| 1 | 1888 | 2140 | **0.88× (−12%)** |
+| 8 | 1897 | 2161 | **0.89× (−11%)** |
+| 16 | 2892 | 2707 | 1.07× |
+| 32 | 2920 | 2722 | 1.07× |
+| 64 | 2935 | 2733 | 1.07× |
+| 128 | 3189 | 3055 | 1.04× |
+
+Stable across 3 runs. The low-H regression is decisive: **if per-block
+PREDICT/OUTPUT compute were the binding resource, parallelising the
+length-D dots would speed up every H, especially low H** (where there is
+no occupancy to fall back on — only `D/Db = 4` blocks exist). It did not:
+at H=1 the parallel-dot is 12% *slower* because the per-token critical
+path is **not** compute-limited, so the extra `__shfl_xor` reduction is
+pure overhead on a path that was already barrier/serial-recurrence bound.
+The 7% win at H≥16 is an **occupancy-mediated** effect (more blocks fill
+the GPU), not a per-block latency breakthrough. The reordered summation
+still passes `test_kda_correct` 11/11 (max_rel 1–2e-6 ≪ 2e-2 threshold —
+the contractive recurrence keeps the reorder cost negligible), so this is
+a clean speed question, not a correctness one.
+
+## Conclusion: the kernel is at its practical per-block latency limit
+
+Two negative results now localise the bottleneck precisely:
+- **All four per-token barriers are required** (the 4→3 experiment is a
+  cross-thread GATE-vs-OUTPUT race).
+- **PREDICT/OUTPUT per-block compute is non-binding** (parallelising the
+  length-D dots regresses low-H and gives only occupancy-mediated gains).
+
+The kernel is therefore **latency-bound on the serial per-token recurrence
++ the four unavoidable per-token barrier latencies** — exactly the regime
+the LDS cache left it in. No intra-block optimisation remains: barriers
+can't be removed (race) and the per-phase compute can't be sped up
+regresses the latency-critical case). The only lever that scales past one
+block's serial token loop is **inter-chunk parallelism** below.
+
+## Remaining lever (not yet taken)
+
+1. **Token-level pipelining / parallel scan** for inter-chunk parallelism
+   (the #70 chunked-prefill work): FLA's `C_{c-1}`-decoupled solve lets
+   chunks within a (b,h) run concurrently once the inter-chunk log-cumsum
+   is known, breaking out of the one-block-per-(b,h) serial loop. This is
+   the only remaining scaling lever but a much larger architectural change
+   (the cooperative kernel would split into intra-chunk + inter-chunk
+   passes, as `kda.cpp` already sketches). Per-phase micro-tuning
+   (barrier layout, dot parallelism) is exhausted — do not revisit.
 
 These are diminishing returns against a serial recurrence; the LDS cache was
 the single high-value win (it removed the dominant, H-scaling HBM traffic).
