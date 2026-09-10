@@ -1,0 +1,144 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M24G5GP779VABFPZWNR3AJAS",
+  "session_id": "01a08869-3c1c-70cf-ab55-5ef8a065e565",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-10T01:50:56.626157905Z",
+  "branch": "main",
+  "checkpoints_count": 4,
+  "save_step_count": 4,
+  "files_touched": [
+    "src/python/vkernels/torch_ops/glm_fp8_blockwise_gemm.py"
+  ],
+  "agent": "Pi",
+  "model": "zai-org/GLM-5.3-Flash",
+  "turn_id": "c7ea5b155db3",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 3889405,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 73931,
+    "api_call_count": 52
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "pi-skill-thermo-nuclear-code-quality-review-2026-09-09T23:03:22.072Z-0",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "thermo-nuclear-code-quality-review"
+      },
+      "source": {
+        "agent": "pi",
+        "signal": "input_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "678c823f55ce",
+      "timestamp": "2026-09-09T23:03:22.072Z",
+      "native": {
+        "command": "/skill:thermo-nuclear-code-quality-review"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/skill:thermo-nuclear-code-quality-review",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 4
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-10T01:50:56.553643783Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 233,
+    "human_removed": 110,
+    "total_committed": 50,
+    "total_lines_changed": 343,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 3916,
+      "user_lines_removed": 645,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12,
+        "README.md": 24,
+        "pyproject.toml": 5,
+        "src/python/vkernels/torch_ops/_glm_fp8_sm90_gemm.py": 1194,
+        "src/python/vkernels/torch_ops/elementwise.py": 415,
+        "src/python/vkernels/torch_ops/gdn_commit.py": 157,
+        "src/python/vkernels/torch_ops/glm_expert_gather_dequant.py": 122,
+        "src/python/vkernels/torch_ops/glm_expert_gemv.py": 112,
+        "src/python/vkernels/torch_ops/glm_fp8_blockwise_gemm.py": 222,
+        "src/python/vkernels/torch_ops/glm_kda_decode.py": 131,
+        "src/python/vkernels/torch_ops/glm_mhc_mix.py": 130,
+        "src/python/vkernels/torch_ops/triton_attn.py": 152,
+        "tests/python/glm_fp8_sm90_validate.py": 133,
+        "tests/python/test_elementwise.py": 164,
+        "tests/python/test_gdn_commit.py": 109,
+        "tests/python/test_glm_expert_gather_dequant.py": 77,
+        "tests/python/test_glm_fp8_blockwise_gemm.py": 180,
+        "tests/python/test_glm_kda_decode.py": 101,
+        "tests/python/test_glm_mhc_mix.py": 105,
+        "tests/python/test_triton_attn.py": 86,
+        "uv.lock": 237
+      },
+      "user_removed_per_file": {
+        "pyproject.toml": 1,
+        "src/python/vkernels/torch_ops/glm_expert_gemv.py": 25,
+        "src/python/vkernels/torch_ops/glm_fp8_blockwise_gemm.py": 81,
+        "uv.lock": 538
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 3856,
+      "agent_lines_removed": 645,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 3827,
+      "agent_lines_removed": 685,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    }
+  ]
+}
