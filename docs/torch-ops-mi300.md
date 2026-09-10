@@ -142,8 +142,12 @@ hot experts, fnuz oracle with the runner's silu-form swiglu — note
 `glm_moe_grouped_gemm`'s sigmoid-form wrapper is NOT a valid
 reference for the native path).
 
-Known follow-ups: (a) the fp8 arm's decode is ~25% slower than the
-bf16 arm (17.8 vs 23.6 tok/s) — decode path breakdown pending;
+Follow-up resolution: the fp8 decode gap was protocol artifact — the
+A/B pinned GLM53_FUSED_GEMV=0, forcing the fp8 arm through the shared
+gather+dequant path. In-process decode A/B (bench_fp8_decode_ab.py):
+fused GEMV 60.11 ms/tok vs gather-dequant 82.31 (1.369x), identical
+first token (69e3bdf fixes the HIP dispatch gate that crashed the
+fused path on MI300A). Remaining known follow-ups:
 (b) fnuz conversion cache costs ~9.7 GiB/layer permanent (both fp8
 originals and fnuz copies resident), capping how many layers group
 under 128 GiB (~5/9 here); (c) the per-layer conversion transient is
