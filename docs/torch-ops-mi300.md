@@ -106,3 +106,45 @@ VK63_SECTIONS='2. torch_ops*' \
   is validated for version/device but retunes in a fresh process. This is
   the gap issue **#67** calls out and is intentionally surfaced, not
   hidden, by the harness.
+
+## Postscript: the #58 grouped-GEMM NaN (found, fixed, A/B-validated)
+
+The real-checkpoint fp8 A/B (#64) produced **NaN NLL on random-token
+prompts** with `GLM53_FP8_GROUPED=1` while natural prompts stayed
+finite, non-deterministically across runs. Diagnostics
+(`floe/docker/beverin/glm5-smoke/diag_fp8_nan{3,4,5,6}.py`, one model
+load to capture a bundle, then bundle-only iterations) localized it:
+
+- The NaN was born in the **gate_up grouped GEMM** with verified-clean
+  fnuz operands (pure-torch oracle on the same tensors: finite).
+- The same inputs through the same kernel in a **fresh process were
+  clean** -> the "NaN" was the `torch.empty()` garbage underneath
+  **silently-unwritten output rows**, not computed NaN. Allocator
+  poison (2 GiB of NaN freed before the call) made 231k NaN values
+  survive the kernel: the smoking gun.
+- Root cause: the tile map repeated each expert's **segment start and
+  full count** across all of its row tiles, so every tile of a
+  count > BM (hot) expert rewrote the expert's first 64 sorted slots
+  and slots beyond the first 64 were written by no one. Uniform
+  synthetic routing never produces a multi-tile expert at BM=64
+  (mean ~14 slots/expert even at T=1024), which is why the #64
+  synthetic parity benches never caught it; the real model's skewed
+  routing at T>=256 created the first ones.
+
+Fix (73bb30d): per-tile `r0 = seg_start + local*BM`, `me = clamped
+remainder`. Post-fix verification on the real L3 bundle: **0/16.7M
+mismatches** vs the oracle, 5/5 deterministic, poison-clean. Full A/B
+re-run: NLL random 13.3988 vs bf16 13.4000 (was NaN), NLL natural
++0.0116, argmax agreement 218/256, prefill **1.76x** (287.9 vs 163.8
+tok/s). Regression test:
+`tests/python/test_glm_fp8_grouped_multitile.py` (skewed routing,
+hot experts, fnuz oracle with the runner's silu-form swiglu — note
+`glm_moe_grouped_gemm`'s sigmoid-form wrapper is NOT a valid
+reference for the native path).
+
+Known follow-ups: (a) the fp8 arm's decode is ~25% slower than the
+bf16 arm (17.8 vs 23.6 tok/s) — decode path breakdown pending;
+(b) fnuz conversion cache costs ~9.7 GiB/layer permanent (both fp8
+originals and fnuz copies resident), capping how many layers group
+under 128 GiB (~5/9 here); (c) the per-layer conversion transient is
+~19 GiB fp32 (chunkable).
