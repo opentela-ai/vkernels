@@ -505,14 +505,35 @@ def glm_moe_grouped_gemm_native(
     tiles = (counts + bm - 1) // bm
     toff = torch.zeros(len(uniq) + 1, device=dev, dtype=torch.int64)
     toff[1:] = torch.cumsum(tiles, 0)
-    tile_exp = torch.repeat_interleave(uniq, tiles)
-    tile_r0 = torch.repeat_interleave(seg[:-1], tiles)
-    tile_m = torch.repeat_interleave(counts, tiles)
+    # Per-TILE metadata. An expert with count > bm spans several row tiles;
+    # each tile needs its OWN row start (segment start + local index * bm)
+    # and its own valid-row count (clamped remainder). Repeating the segment
+    # start/count across all of an expert's tiles made every tile rewrite
+    # the first bm rows and left rows beyond the first bm UNWRITTEN
+    # (torch.empty garbage — the #58 NaN).
+    n_tiles = int(toff[-1])
+    tile_local = torch.arange(n_tiles, device=dev, dtype=torch.int64) - torch.repeat_interleave(
+        toff[:-1], tiles, output_size=n_tiles
+    )
+    tile_exp = torch.repeat_interleave(uniq, tiles, output_size=n_tiles)
+    tile_r0 = torch.repeat_interleave(seg[:-1], tiles, output_size=n_tiles) + tile_local * bm
+    tile_m = torch.clamp(torch.repeat_interleave(counts, tiles, output_size=n_tiles) - tile_local * bm, max=bm)
 
     slots = t * k
     gu = torch.empty((slots, two_i), device=dev, dtype=torch.bfloat16)
-    _grouped_backend(a_nz, asc2, gate_up_nz, gate_up_sc2, gu,
-                     sorted_tok, tile_exp, tile_r0, tile_m, two_i, h)
+    _grouped_backend(
+        a_nz,
+        asc2,
+        gate_up_nz,
+        gate_up_sc2,
+        gu,
+        sorted_tok,
+        tile_exp,
+        tile_r0,
+        tile_m,
+        two_i,
+        h,
+    )
     gate = gu[:, :i].float().clamp(max=swiglu_limit)
     up = gu[:, i:].float().clamp(min=-swiglu_limit, max=swiglu_limit)
     act = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
