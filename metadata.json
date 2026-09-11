@@ -1,0 +1,36 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M28T5CDBHHW58TBBMGZH4K7Z",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 11,
+  "files_touched": [
+    "src/python/vkernels/torch_ops/_fastpath.py",
+    "src/python/vkernels/torch_ops/v41_dsa_indexer.py",
+    "src/python/vkernels/torch_ops/v41_fp8_gemm.py",
+    "src/python/vkernels/torch_ops/v41_mxfp4_dequant.py",
+    "src/python/vkernels/torch_ops/v41_mxfp4_gemv.py",
+    "src/python/vkernels/torch_ops/v41_sparse_attention.py",
+    "tests/python/test_v41_dsa_indexer.py",
+    "tests/python/test_v41_fp8_gemm.py",
+    "tests/python/test_v41_mxfp4_dequant.py",
+    "tests/python/test_v41_mxfp4_gemv.py",
+    "tests/python/test_v41_sparse_attention.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 544309,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 3116928,
+    "output_tokens": 57977,
+    "api_call_count": 63
+  }
+}
