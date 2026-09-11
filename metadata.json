@@ -1,0 +1,52 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M27XP0NXVJ5FAQ8K1TQZ2FK7",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 2,
+  "files_touched": [
+    ".omx/logs/omx-2026-08-28.jsonl",
+    ".omx/logs/omx-2026-08-30.jsonl",
+    ".omx/state/native-stop-state.json",
+    ".omx/state/session.json",
+    ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json",
+    ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json",
+    "README.md",
+    "docker/beverin/glm5-smoke/bench_kda_chunk_hip.py",
+    "docs/beverin-cluster-gotchas.md",
+    "pyproject.toml",
+    "src/python/vkernels/torch_ops/_glm_fp8_sm90_gemm.py",
+    "src/python/vkernels/torch_ops/elementwise.py",
+    "src/python/vkernels/torch_ops/gdn_commit.py",
+    "src/python/vkernels/torch_ops/glm_expert_gather_dequant.py",
+    "src/python/vkernels/torch_ops/glm_fp8_blockwise_gemm.py",
+    "src/python/vkernels/torch_ops/glm_kda_decode.py",
+    "src/python/vkernels/torch_ops/glm_mhc_mix.py",
+    "src/python/vkernels/torch_ops/triton_attn.py",
+    "tests/python/glm_fp8_sm90_validate.py",
+    "tests/python/test_elementwise.py",
+    "tests/python/test_gdn_commit.py",
+    "tests/python/test_glm_expert_gather_dequant.py",
+    "tests/python/test_glm_fp8_blockwise_gemm.py",
+    "tests/python/test_glm_kda_decode.py",
+    "tests/python/test_glm_mhc_mix.py",
+    "tests/python/test_triton_attn.py",
+    "uv.lock"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 15937276,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 289908928,
+    "output_tokens": 1141564,
+    "api_call_count": 1158
+  }
+}
