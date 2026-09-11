@@ -1,6 +1,5 @@
 """V4.1 fp8 block GEMM + UE8M0 quantization: reference oracle + GPU parity."""
 
-import importlib.util
 import subprocess
 import sys
 
@@ -90,4 +89,18 @@ def test_block128_gemm_matches_reference(torch):
     assert torch.equal(
         fp8_block_gemm(qa, sa, qb, sb, block=128),
         fp8_block_gemm_reference(qa, sa, qb, sb, block=128),
+    )
+
+
+def test_wrapper_routes_to_reference_off_gpu(torch):
+    from vkernels.torch_ops.v41_fp8_gemm import fp8_block_gemm, fp8_block_gemm_reference, quantize_fp8_ue8m0
+
+    torch.manual_seed(5)
+    a, b = torch.randn(64, 128), torch.randn(48, 128)
+    qa, sa = quantize_fp8_ue8m0(a, block=32)
+    qb, sb = quantize_fp8_ue8m0(b, block=32)
+    # CPU: the wrapper is always the reference (bitwise)
+    assert torch.equal(
+        fp8_block_gemm(qa, sa, qb, sb, block=32),
+        fp8_block_gemm_reference(qa, sa, qb, sb, block=32),
     )

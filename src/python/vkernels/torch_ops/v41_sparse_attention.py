@@ -13,6 +13,8 @@ Inference-only, no autograd backward.
 
 from functools import lru_cache
 
+from ._fastpath import fast_path
+
 _NEG = -1.0e30
 
 
@@ -44,6 +46,8 @@ def _kernel():
         h = bh % H
         d = tl.arange(0, D)
         q = tl.load(Q + (bh * S + s) * D + d).to(tl.float32)  # [D]
+        # running max starts at the -1e30 sentinel (not -inf: a fully masked
+        # row would hit exp(-inf - -inf) = NaN); sc uses the same sentinel.
         m = tl.full((), -1.0e30, tl.float32)
         l = tl.zeros((), tl.float32)
         acc = tl.zeros((D,), tl.float32)
@@ -81,12 +85,7 @@ def sparse_attention(q, kv, mask, sink, scale):
     bk, n, dk = kv.shape
     if bk != b or dk != d or sink.shape[0] != h or mask.shape != (b, s, n):
         raise ValueError("q/kv/mask/sink shapes are inconsistent")
-    on_gpu = q.is_cuda and kv.is_cuda and mask.is_cuda and sink.is_cuda
-    try:
-        import triton  # noqa: F401
-    except Exception:
-        on_gpu = False
-    if not on_gpu or (d & (d - 1)) or d < 16 or n == 0:
+    if not fast_path(q, kv, mask, sink) or (d & (d - 1)) or d < 16 or n == 0:
         return sparse_attention_reference(q, kv, mask, sink, scale)
 
     qf = q.reshape(b * h, s, d).contiguous()
@@ -94,8 +93,6 @@ def sparse_attention(q, kv, mask, sink, scale):
     mf = mask.float().contiguous()
     sf = sink.float().contiguous()
     out = torch.empty((b * h, s, d), device=q.device, dtype=torch.float32)
-    import triton
-
     BT = 64
     with torch.cuda.device(q.device):
         _kernel()[(b * h, s)](qf, kvf, mf, sf, out, h, s, n, d, float(scale), BT)

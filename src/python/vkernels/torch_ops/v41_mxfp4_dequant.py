@@ -17,20 +17,24 @@ mirrors it and is validated on GPU CI.
 
 from functools import lru_cache
 
+from ._fastpath import fast_path
+
 # E2M1 code (4 bits) -> value. High bit is the sign; low 3 bits are the
-# magnitude {0, .5, 1, 1.5, 2, 3, 4, 6}.
-_FP4_VALUES = (
+# magnitude {0, .5, 1, 1.5, 2, 3, 4, 6}. Format-level constant — the decode
+# GEMV shares it, so it is public (unlike the kernels' private helpers).
+FP4_VALUES = (
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 )
 
 
-def _decode_scale(torch, scale):
+def decode_scale(torch, scale):
     """Return the microscale as an fp32 multiplier.
 
     Accepts an already-decoded float scale (the common loader path), a raw
     uint8 E8M0 exponent code (value ``2**(code-127)``), or torch's native
-    ``float8_e8m0fnu`` (cast handles the exponent decode)."""
+    ``float8_e8m0fnu`` (cast handles the exponent decode). Public: the
+    device GEMV needs the same decode as its reference on every path."""
     if scale.dtype == torch.uint8:
         return torch.exp2(scale.float() - 127.0)
     return scale.float()
@@ -46,11 +50,11 @@ def mxfp4_dequant_reference(packed, scale, *, group: int = 32, dtype=None):
     if dtype is None:
         dtype = torch.bfloat16
     u8 = packed.view(torch.uint8)
-    table = torch.tensor(_FP4_VALUES, dtype=torch.float32, device=u8.device)
+    table = torch.tensor(FP4_VALUES, dtype=torch.float32, device=u8.device)
     low = table[(u8 & 0x0F).long()]
     high = table[((u8 >> 4) & 0x0F).long()]
     vals = torch.stack([low, high], dim=-1).flatten(-2)  # [..., I]
-    sc = _decode_scale(torch, scale)
+    sc = decode_scale(torch, scale)
     width = vals.shape[-1]
     if sc.shape[-1] == width // group:
         sc = sc.repeat_interleave(group, dim=-1)
@@ -88,12 +92,7 @@ def mxfp4_dequant(packed, scale, *, group: int = 32, dtype=None):
         dtype = torch.bfloat16
     if packed.view(torch.uint8).shape[-1] * 2 % group:
         raise ValueError("I must be a multiple of the scale group")
-    on_gpu = packed.is_cuda and scale.is_cuda
-    try:
-        import triton  # noqa: F401  (availability probe)
-    except Exception:
-        on_gpu = False
-    if not on_gpu:
+    if not fast_path(packed, scale):
         return mxfp4_dequant_reference(packed, scale, group=group, dtype=dtype)
 
     u8 = packed.view(torch.uint8)
@@ -103,8 +102,8 @@ def mxfp4_dequant(packed, scale, *, group: int = 32, dtype=None):
         o *= int(d)
     i = int(u8.shape[-1]) * 2
     u8 = u8.reshape(o, i // 2).contiguous()
-    sc = _decode_scale(torch, scale).reshape(o, i // group).contiguous()
-    table = torch.tensor(_FP4_VALUES, dtype=torch.float32, device=u8.device)
+    sc = decode_scale(torch, scale).reshape(o, i // group).contiguous()
+    table = torch.tensor(FP4_VALUES, dtype=torch.float32, device=u8.device)
     out = torch.empty((o, i), device=u8.device, dtype=dtype)
     import triton
 

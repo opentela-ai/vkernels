@@ -75,3 +75,23 @@ def test_gpu_matches_reference(torch):
     ref = indexer_scores_reference(q, k, w)
     got = indexer_scores(q.cuda(), k.cuda(), w.cuda()).cpu()
     assert torch.allclose(got, ref, atol=1e-2, rtol=1e-3)
+
+    # regression: non-pow-2 geometry must fall back to the reference, not
+    # crash in tl.arange (H/D aranges need power-of-two sizes)
+    B, S, H, D, T = 2, 2, 32, 96, 64  # D=96: not a power of two
+    q, k = torch.randn(B, S, H, D), torch.randn(B, T, D)
+    w = torch.randn(B, S, H)
+    got = indexer_scores(q.cuda(), k.cuda(), w.cuda()).cpu()
+    assert torch.equal(got, indexer_scores_reference(q, k, w))
+
+
+def test_wrapper_falls_back_on_cpu(torch):
+    from vkernels.torch_ops.v41_dsa_indexer import indexer_scores, indexer_scores_reference
+
+    torch.manual_seed(3)
+    B, S, H, D, T = 2, 3, 4, 8, 5
+    q, k = torch.randn(B, S, H, D), torch.randn(B, T, D)
+    w = torch.randn(B, S, H)
+    # CPU wrapper routes to the exact reference (the "always correct" promise)
+    got = indexer_scores(q, k, w)
+    assert torch.equal(got, indexer_scores_reference(q, k, w))

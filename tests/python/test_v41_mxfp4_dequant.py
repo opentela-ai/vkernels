@@ -64,4 +64,15 @@ def test_gpu_matches_reference(torch):
     scale = torch.rand(8, 4, generator=g) + 0.5  # group=32 -> I//32 = 4
     ref = mxfp4_dequant_reference(packed, scale, group=32, dtype=torch.bfloat16)
     got = mxfp4_dequant(packed.cuda(), scale.cuda(), group=32, dtype=torch.bfloat16).cpu()
+    # elementwise, identical op order -> bitwise equality is deterministic
     assert torch.equal(got, ref)
+
+
+def test_wrapper_falls_back_on_cpu(torch):
+    from vkernels.torch_ops.v41_mxfp4_dequant import mxfp4_dequant, mxfp4_dequant_reference
+
+    g = torch.Generator().manual_seed(1)
+    packed = torch.randint(0, 256, (4, 32), dtype=torch.uint8, generator=g)  # O=4, I=64
+    scale = torch.rand(4, 2, generator=g) + 0.5  # group=32 -> I//32 = 2
+    got = mxfp4_dequant(packed, scale, group=32, dtype=torch.bfloat16)  # CPU -> reference
+    assert torch.equal(got, mxfp4_dequant_reference(packed, scale, group=32, dtype=torch.bfloat16))

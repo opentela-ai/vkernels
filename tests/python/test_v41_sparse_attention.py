@@ -86,3 +86,16 @@ def test_gpu_matches_reference(torch):
     ref = sparse_attention_reference(q, kv, mask, sink, scale)
     got = sparse_attention(q.cuda(), kv.cuda(), mask.cuda(), sink.cuda(), scale).cpu()
     assert torch.allclose(got, ref, atol=1e-3, rtol=1e-3)
+
+
+def test_wrapper_falls_back_on_cpu(torch):
+    from vkernels.torch_ops.v41_sparse_attention import sparse_attention, sparse_attention_reference
+
+    torch.manual_seed(2)
+    B, H, S, N, D = 2, 3, 4, 6, 8
+    q, kv = torch.randn(B, H, S, D), torch.randn(B, N, D)
+    mask = (torch.rand(B, S, N) > 0.3).float()
+    sink = torch.randn(H)
+    scale = 1.0 / math.sqrt(D)
+    got = sparse_attention(q, kv, mask, sink, scale)  # CPU -> reference
+    assert torch.equal(got, sparse_attention_reference(q, kv, mask, sink, scale))

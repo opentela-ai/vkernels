@@ -7,7 +7,9 @@ expert FFN composes three: gate ``w1``, up ``w3``, down ``w2``).
 
 Weights are ``[E, O, I//2]`` packed E2M1 (two codes/byte, low nibble first),
 scales ``[E, O, I//group]`` (E8M0 or float microscale, ``group`` default 32).
-``x`` is ``[T, I]`` or ``[T, K, I]`` bf16; ``indices`` ``[T, K]`` int64;
+``x`` is ``[T, I]`` or ``[T, K, I]`` (any float dtype — the kernel loads x
+into the fp32 dot at its own precision, exactly like the reference; no
+dtype cast happens on either path); ``indices`` ``[T, K]`` int64;
 output ``[T, K, O]`` bf16 (fp32 dot, bf16-rounded weight — matching
 gather-dequant then GEMV).
 
@@ -17,7 +19,8 @@ path mirrors it and is validated on GPU CI. Torch/Triton load lazily.
 
 from functools import lru_cache
 
-from .v41_mxfp4_dequant import _FP4_VALUES, mxfp4_dequant_reference
+from ._fastpath import fast_path
+from .v41_mxfp4_dequant import FP4_VALUES, decode_scale, mxfp4_dequant_reference
 
 
 def mxfp4_expert_gemv_reference(x, weights, scales, indices, *, group: int = 32):
@@ -81,27 +84,22 @@ def mxfp4_expert_gemv(x, weights, scales, indices, *, group: int = 32):
         raise ValueError("expected x[T,I] or x[T,K,I]")
     if scales.shape != (e, o, i // group):
         raise ValueError(f"expected scales [E,O,I//group] = {(e, o, i // group)}")
-    on_gpu = x.is_cuda and weights.is_cuda and scales.is_cuda and indices.is_cuda
-    try:
-        import triton  # noqa: F401
-    except Exception:
-        on_gpu = False
-    if not on_gpu:
+    if not fast_path(x, weights, scales, indices):
         return mxfp4_expert_gemv_reference(x, weights, scales, indices, group=group)
 
-    xb = x.to(torch.bfloat16).contiguous()
+    xf = x.contiguous()  # no dtype cast: the fp32 dot uses x's own precision
     u8 = weights.view(torch.uint8).contiguous()
-    sc = scales.float().contiguous()
+    sc = decode_scale(torch, scales).contiguous()
     idx = indices.to(torch.int64).contiguous()
-    table = torch.tensor(_FP4_VALUES, dtype=torch.float32, device=u8.device)
-    out = torch.empty((t, k, o), device=xb.device, dtype=torch.bfloat16)
+    table = torch.tensor(FP4_VALUES, dtype=torch.float32, device=u8.device)
+    out = torch.empty((t, k, o), device=xf.device, dtype=torch.bfloat16)
     if t and k:
         import triton
 
-        with torch.cuda.device(xb.device):
+        with torch.cuda.device(xf.device):
             _kernel()[(t * k, triton.cdiv(o, 4))](
-                xb, u8, sc, table, idx, out,
-                o, i, k, group, xb.ndim == 2, 4, triton.next_power_of_2(i),
+                xf, u8, sc, table, idx, out,
+                o, i, k, group, xf.ndim == 2, 4, triton.next_power_of_2(i),
                 num_warps=4, enable_fp_fusion=False,
             )
     return out

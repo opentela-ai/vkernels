@@ -13,6 +13,8 @@ Torch/Triton load lazily. Inference-only, no autograd backward.
 
 from functools import lru_cache
 
+from ._fastpath import fast_path
+
 
 def indexer_scores_reference(q, index_k, weights):
     """``q`` ``[B,S,H,D]``, ``index_k`` ``[B,T,D]``, ``weights`` ``[B,S,H]``
@@ -60,14 +62,16 @@ def indexer_scores(q, index_k, weights):
     bk, t, dk = index_k.shape
     if bk != b or dk != d or weights.shape != (b, s, h):
         raise ValueError("q/index_k/weights shapes are inconsistent")
-    on_gpu = q.is_cuda and index_k.is_cuda and weights.is_cuda
-    try:
-        import triton  # noqa: F401
-    except Exception:
-        on_gpu = False
-    # tl.dot needs >=16 in each tiled dim; small (tiny-config) shapes use the
-    # reference, which is exact and cheap there.
-    if not on_gpu or min(h, d) < 16 or t == 0:
+    # tl.dot needs >=16 in each tiled dim AND power-of-two sizes for the H/D
+    # aranges; infeasible shapes use the reference, which is exact and cheap
+    # there.
+    if (
+        not fast_path(q, index_k, weights)
+        or min(h, d) < 16
+        or (h & (h - 1))
+        or (d & (d - 1))
+        or t == 0
+    ):
         return indexer_scores_reference(q, index_k, weights)
 
     qf = q.reshape(b * s, h, d).contiguous()

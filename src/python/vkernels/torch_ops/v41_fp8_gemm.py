@@ -39,7 +39,7 @@ def quantize_fp8_ue8m0(x, block: int = 32):
     return q.reshape(mb * block, k)[:m].contiguous(), scale.reshape(mb, k // block).contiguous()
 
 
-def _dequant_blocks(torch, q_fp8, scales, block, rows, cols):
+def _dequant_blocks(q_fp8, scales, block, rows, cols):
     full = scales.float().repeat_interleave(block, 0).repeat_interleave(block, 1)
     return q_fp8.float() * full[:rows, :cols]
 
@@ -57,8 +57,8 @@ def fp8_block_gemm_reference(a_fp8, a_scales, b_fp8, b_scales, *, block: int = 3
     n, k2 = b_fp8.shape
     if k != k2:
         raise ValueError(f"K mismatch: A K={k}, B K={k2}")
-    a = _dequant_blocks(torch, a_fp8, a_scales, block, m, k)
-    b = _dequant_blocks(torch, b_fp8, b_scales, block, n, k)
+    a = _dequant_blocks(a_fp8, a_scales, block, m, k)
+    b = _dequant_blocks(b_fp8, b_scales, block, n, k)
     return (a @ b.t()).to(out_dtype)
 
 
@@ -76,5 +76,7 @@ def fp8_block_gemm(a_fp8, a_scales, b_fp8, b_scales, *, block: int = 32, out_dty
 
             return fp8_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out_dtype=out_dtype)
         except Exception:
+            # house idiom (glm_fp8_blockwise_gemm): no triton, or a shape the
+            # GLM kernel validates against, translates to the torch oracle
             pass
     return fp8_block_gemm_reference(a_fp8, a_scales, b_fp8, b_scales, block=block, out_dtype=out_dtype)
