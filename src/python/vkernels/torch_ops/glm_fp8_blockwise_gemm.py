@@ -7,16 +7,21 @@ decode/verify path streams them through :mod:`glm_expert_gemv` (one GEMV per
 need a tensor-core grouped GEMM instead. This module provides it in three
 layers:
 
-1. ``quantize_activations_fp8`` — per-token per-128-group e4m3 activation
-   quantization (the DeepSeek/VLLM serving contract): returns (x_fp8,
-   x_scales[m, K/128]). Required because Hopper WGMMA needs BOTH operands in
-   fp8 (no bf16 x fp8 mixed MMA on sm_90).
+1. Activation quantization — e4m3 with per-group amax/448 scaling (required
+   because Hopper WGMMA needs BOTH operands in fp8 — no bf16 x fp8 mixed MMA
+   on sm_90), at two granularities:
+   ``quantize_activations_fp8`` — per-row per-128-group (the DeepSeek/VLLM
+   serving contract; feeds the fnuz-conversion grouped path), and
+   ``quantize_activations_fp8_blockwise`` — per-128x128-BLOCK, matching the
+   weight scale grid (feeds ``fp8_blockwise_gemm``; degenerates to a
+   per-tensor scale for M <= 128).
 2. ``fp8_blockwise_gemm`` — the single-expert primitive:
-   ``D[m,n] = (sum_k A_fp8[m,k] * B_fp8[n,k]) elementwise-scaled by
-   Sa[m, k//128] * Sb[n//128, k//128]`` accumulated per K-block, BF16 output.
-   Dispatches to the CuTe DSL kernel below when available/importable, else to
-   a pure-torch reference path with identical semantics (block-dequant +
-   per-block-scaled accumulation).
+   ``D[m,n] = sum_kb Sa[m//128, kb] * Sb[n//128, kb] *
+   (sum_{k in kb} A_fp8[m,k] * B_fp8[n,k])``, BF16 output. A scales share
+   the weights' 128-row block grid: [ceil(M/128), K/128]. Dispatches to the
+   CuTe DSL kernel when available/importable, else to a pure-torch reference
+   path with identical semantics (block-dequant + per-block-scaled
+   accumulation).
 3. ``glm_moe_grouped_gemm`` — the MoE-shaped orchestration: host-side
    sort-by-expert of the (token, slot) routing, one blockwise GEMM per ACTIVE
    expert over its gathered activations, epilogue applying routing weights.
@@ -32,9 +37,9 @@ the NLL/quality gates, as with any fp8-activation serving stack.
 The CuTe DSL kernel (``HopperFP8BlockwiseGemmKernel``) is a lean adaptation
 of cutlass's ``dense_gemm_fp8_2xacc.py`` example: warp-specialized
 TMA+WGMMA with the two-level (2xAcc) accumulator, where the promotion every
-``mma_promotion_interval`` k-MMAs (aligned to 128-wide K blocks) multiplies
-``accum_temp`` by the per-block scale tiles ``Sa[:, kb] (x) Sb[:, kb]``
-instead of a scalar. VALIDATION: first compile/run happens on a GH200 job
+k-tile (tile_k == 128 == the scale block, i.e. 4 WGMMA k-blocks) multiplies
+``accum_temp`` by the per-(tile, k-block) scalar ``Sa[m_blk, kb] *
+Sb[n_blk, kb]``. VALIDATION: first compile/run happens on a GH200 job
 (``tests/python/test_glm_fp8_blockwise_gemm.py`` gates on CUDA + the DSL);
 the torch path is the oracle.
 
@@ -76,15 +81,44 @@ def quantize_activations_fp8(x, group_size: int = 128):
     return q, scale.squeeze(-1).contiguous()
 
 
+def quantize_activations_fp8_blockwise(x, block: int = 128):
+    """BF16 [M, K] -> (fp8-e4m3 [M, K], fp32 scales [ceil(M/block), K/block]).
+
+    Per-128x128-BLOCK activation quantization, matching the weight scale
+    granularity so the sm_90 kernel applies BOTH scales as one scalar per
+    (128-tile, k-block) -- no per-fragment scale addressing. Coarser than the
+    per-row DeepSeek contract (quantize_activations_fp8); for the MoE verify
+    path (M <= 128 per expert) this degenerates to a per-tensor scale.
+    """
+    import torch
+
+    if x.ndim != 2:
+        raise ValueError("expected x [M, K]")
+    m, k = x.shape
+    if k % block:
+        raise ValueError(f"K ({k}) must be a multiple of {block}")
+    mb = (m + block - 1) // block
+    pad = mb * block - m
+    xg = x.float()
+    if pad:
+        xg = torch.nn.functional.pad(xg, (0, 0, 0, pad))
+    xg = xg.view(mb, block, k // block, block)
+    amax = xg.abs().amax(dim=(1, 3), keepdim=True).clamp_min(1e-4)
+    scale = (amax / 448.0).clamp_min(1e-12)
+    q = (xg / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return q.view(-1, k)[:m], scale.view(mb, k // block)
+
+
 # ---------------------------------------------------------------------------
 # 2. single-expert blockwise GEMM primitive (kernel + torch oracle)
 # ---------------------------------------------------------------------------
 
 
 def fp8_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out_dtype=None):
-    """D[m,n] = sum_kb Sa[m,kb] * Sb[n//128,kb] * (sum_{k in kb} A[m,k]*B[n,k]).
+    """D[m,n] = sum_kb Sa[m//128,kb] * Sb[n//128,kb] * (sum_{k in kb} A[m,k]*B[n,k]).
 
-    A: fp8-e4m3 [M, K] row-major with scales [M, K/128] fp32.
+    A: fp8-e4m3 [M, K] row-major with 128x128-block scales
+       [ceil(M/128), K/128] fp32 (quantize_activations_fp8_blockwise).
     B: fp8-e4m3 [N, K] row-major (weights, transposed-use) with scales
        [N/128, K/128] fp32 (the checkpoint layout).
     Returns BF16 [M, N] (or ``out_dtype``).
@@ -99,8 +133,12 @@ def fp8_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out_dtype=None):
         raise ValueError(
             f"shape mismatch A[{m},{k}] B[{n},{k2}] (K,N multiples of 128)"
         )
-    if a_scales.shape != (m, k // 128) or b_scales.shape != (n // 128, k // 128):
-        raise ValueError(f"scale shapes {a_scales.shape}/{b_scales.shape} do not match")
+    mb = (m + 127) // 128
+    if a_scales.shape != (mb, k // 128) or b_scales.shape != (n // 128, k // 128):
+        raise ValueError(
+            f"scale shapes {a_scales.shape}/{b_scales.shape} do not match "
+            f"(expected [{mb}, {k // 128}] / [{n // 128}, {k // 128}])"
+        )
     out_dtype = out_dtype or torch.bfloat16
     out = torch.empty((m, n), device=a_fp8.device, dtype=out_dtype)
 
@@ -108,8 +146,10 @@ def fp8_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out_dtype=None):
     if kernel is not None:
         kernel(a_fp8, a_scales, b_fp8, b_scales, out)
         return out
-    if a_fp8.is_cuda and os.environ.get(
-            "VKERNELS_FP8_GEMM_BACKEND", "auto") in ("auto", "triton"):
+    if a_fp8.is_cuda and os.environ.get("VKERNELS_FP8_GEMM_BACKEND", "auto") in (
+        "auto",
+        "triton",
+    ):
         try:
             import triton  # noqa: F401
 
@@ -120,19 +160,27 @@ def fp8_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out_dtype=None):
 
 
 def _torch_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out):
-    """Reference path: block-dequant + per-K-block scaled fp32 accumulation."""
+    """Reference path: block-dequant + per-K-block scaled fp32 accumulation.
+    Both scale grids are 128x128-block granular (scalar per tile x k-block)."""
     import torch
 
     m, k = a_fp8.shape
     n = b_fp8.shape[0]
     kb = k // 128
+    mb = (m + 127) // 128
+    pad = mb * 128 - m
+    # zero-pad the rows once so every 128-row block is dense on the scale grid
+    a32 = (
+        torch.nn.functional.pad(a_fp8.float(), (0, 0, 0, pad))
+        if pad
+        else a_fp8.float()
+    )
     acc = torch.zeros((m, n), device=a_fp8.device, dtype=torch.float32)
     for b in range(kb):
-        a_blk = (
-            a_fp8[:, b * 128 : (b + 1) * 128].to(torch.float32) * a_scales[:, b : b + 1]
-        )
+        a_blk = a32[:, b * 128 : (b + 1) * 128].view(mb, 128, 128)
+        a_blk = (a_blk * a_scales[:, b].view(mb, 1, 1)).view(mb * 128, 128)[:m]
         w_blk = b_fp8[:, b * 128 : (b + 1) * 128].to(torch.float32)
-        w_blk = w_blk.view(n // 128, 128, 128) * b_scales[:, b : b + 1].unsqueeze(-1)
+        w_blk = w_blk.view(n // 128, 128, 128) * b_scales[:, b].view(n // 128, 1, 1)
         acc[:, :] += a_blk @ w_blk.reshape(n, 128).T
     out.copy_(acc.to(out.dtype))
     return out
@@ -141,6 +189,26 @@ def _torch_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out):
 # ---------------------------------------------------------------------------
 # 3. MoE orchestration (sort by expert -> per-active-expert blockwise GEMM)
 # ---------------------------------------------------------------------------
+
+
+def _route(topk_index, device):
+    """Stable sort of the (token, slot) routing pairs by expert id.
+
+    Returns ``(order, sorted_tokens, uniq_experts, counts, offsets)``:
+    expert ``uniq_experts[j]`` owns sorted slots ``[offsets[j], offsets[j+1])``
+    (``counts[j]`` of them); ``order``/``sorted_tokens`` are aligned to that
+    sorted-slot space.
+    """
+    import torch
+
+    t, k = topk_index.shape
+    flat = topk_index.reshape(-1)
+    tokens = torch.arange(t, device=device).repeat_interleave(k)
+    order = torch.argsort(flat, stable=True)
+    uniq, counts = torch.unique_consecutive(flat[order], return_counts=True)
+    offsets = torch.zeros(len(uniq) + 1, device=device, dtype=torch.int64)
+    offsets[1:] = torch.cumsum(counts, 0)
+    return order, tokens[order], uniq, counts, offsets
 
 
 def glm_moe_grouped_gemm(
@@ -174,16 +242,8 @@ def glm_moe_grouped_gemm(
         raise ValueError(
             f"x {tuple(x.shape)} does not match routing [{t}, {k}] and hidden {h}"
         )
-    t = x.shape[0]
 
-    flat_expert = topk_index.reshape(-1)  # [T*K]
-    token_of = torch.arange(t, device=x.device).repeat_interleave(k)
-    sort_idx = torch.argsort(flat_expert, stable=True)
-    experts_sorted = flat_expert[sort_idx]
-    token_sorted = token_of[sort_idx]
-    uniq, starts = torch.unique_consecutive(experts_sorted, return_counts=True)
-    offsets = torch.zeros(len(uniq) + 1, device=x.device, dtype=torch.int64)
-    offsets[1:] = torch.cumsum(starts, 0)
+    sort_idx, token_sorted, uniq, _, offsets = _route(topk_index, x.device)
 
     y = torch.zeros((t, h), device=x.device, dtype=torch.float32)
     for j in range(len(uniq)):
@@ -191,7 +251,7 @@ def glm_moe_grouped_gemm(
         rows = sort_idx[offsets[j] : offsets[j + 1]]
         toks = token_sorted[offsets[j] : offsets[j + 1]]
         xa = x[toks]  # [m_j, H]
-        a8, asc = quantize_activations_fp8(xa)
+        a8, asc = quantize_activations_fp8_blockwise(xa)
         gu = fp8_blockwise_gemm(a8, asc, gate_up_fp8[expert], gate_up_scales[expert])
         gate, up = gu[:, :i].float(), gu[:, i:].float()
         # SwiGLU with the GLM limit (mirrors floe's _swiglu)
@@ -200,7 +260,7 @@ def glm_moe_grouped_gemm(
             if swiglu_limit
             else torch.nn.functional.silu(gate) * up
         )
-        a8d, ascd = quantize_activations_fp8(act.to(torch.bfloat16))
+        a8d, ascd = quantize_activations_fp8_blockwise(act.to(torch.bfloat16))
         dn = fp8_blockwise_gemm(
             a8d, ascd, down_fp8[expert], down_scales[expert]
         ).float()
@@ -233,7 +293,7 @@ def _triton_kernel():
         # values for checkpoint e4m3fn bytes. Decode: exponent bits +120
         # into the f32 exponent, mantissa <<20, subnormals = m/512, the
         # 0x7F/0xFF encodings are NaN (never present in weights).
-        r = raw.to(tl.int32)          # promote: shifts below exceed 8 bits
+        r = raw.to(tl.int32)  # promote: shifts below exceed 8 bits
         e = (r >> 3) & 15
         m = r & 7
         bits = ((e + 120) << 23) | (m << 20)
@@ -244,10 +304,21 @@ def _triton_kernel():
 
     @triton.jit
     def _blockwise_gemm(
-        A, SA, B, SB, D,
-        M, N, K,
-        sam, sakb, sbn, sbkb,
-        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+        A,
+        SA,
+        B,
+        SB,
+        D,
+        M,
+        N,
+        K,
+        sam,
+        sakb,
+        sbn,
+        sbkb,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
     ):
         pid_n = tl.program_id(0)
         pid_m = tl.program_id(1)
@@ -259,24 +330,30 @@ def _triton_kernel():
             # decode to fp32, round ONCE to bf16 for the tensor-core dot:
             # e4m3fn -> bf16 is EXACT (3 mantissa bits fit in 8), so the
             # dot sees the same values the fp32 oracle does.
-            a = _e4m3fn_to_f32(tl.load(
-                A + rm[:, None] * K + rk[None, :],
-                mask=rm[:, None] < M, other=0,
-            )).to(tl.bfloat16)
-            b = _e4m3fn_to_f32(tl.load(
-                B + rn[:, None] * K + rk[None, :],
-                mask=rn[:, None] < N, other=0,
-            )).to(tl.bfloat16)
+            a = _e4m3fn_to_f32(
+                tl.load(
+                    A + rm[:, None] * K + rk[None, :],
+                    mask=rm[:, None] < M,
+                    other=0,
+                )
+            ).to(tl.bfloat16)
+            b = _e4m3fn_to_f32(
+                tl.load(
+                    B + rn[:, None] * K + rk[None, :],
+                    mask=rn[:, None] < N,
+                    other=0,
+                )
+            ).to(tl.bfloat16)
             # row stride * row + col stride * col (a row/col stride swap
             # here reads scale[kb] of the WRONG row — row 0 still looks
             # correct, which is why small probes passed)
             sa = tl.load(SA + rm * sam + kb * sakb, mask=rm < M, other=0.0)
-            sb = tl.load(SB + (rn // 128) * sbn + kb * sbkb,
-                         mask=rn < N, other=0.0)
+            sb = tl.load(SB + (rn // 128) * sbn + kb * sbkb, mask=rn < N, other=0.0)
             blk = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
             acc += blk * (sa[:, None] * sb[None, :])
         tl.store(
-            D + rm[:, None] * N + rn[None, :], acc.to(D.dtype.element_ty),
+            D + rm[:, None] * N + rn[None, :],
+            acc.to(D.dtype.element_ty),
             mask=(rm[:, None] < M) & (rn[None, :] < N),
         )
 
@@ -312,10 +389,21 @@ def _triton_native_kernel():
 
     @triton.jit
     def _blockwise_gemm_native(
-        A, SA, B, SB, D,
-        M, N, K,
-        sam, sakb, sbn, sbkb,
-        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+        A,
+        SA,
+        B,
+        SB,
+        D,
+        M,
+        N,
+        K,
+        sam,
+        sakb,
+        sbn,
+        sbkb,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
     ):
         pid_n = tl.program_id(0)
         pid_m = tl.program_id(1)
@@ -326,19 +414,21 @@ def _triton_native_kernel():
             rk = kb * 128 + tl.arange(0, 128)
             a = tl.load(
                 A + rm[:, None] * K + rk[None, :],
-                mask=rm[:, None] < M, other=0.0,
+                mask=rm[:, None] < M,
+                other=0.0,
             )
             b = tl.load(
                 B + rn[:, None] * K + rk[None, :],
-                mask=rn[:, None] < N, other=0.0,
+                mask=rn[:, None] < N,
+                other=0.0,
             )
             sa = tl.load(SA + rm * sam + kb * sakb, mask=rm < M, other=0.0)
-            sb = tl.load(SB + (rn // 128) * sbn + kb * sbkb,
-                         mask=rn < N, other=0.0)
+            sb = tl.load(SB + (rn // 128) * sbn + kb * sbkb, mask=rn < N, other=0.0)
             blk = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
             acc += blk * (sa[:, None] * sb[None, :])
         tl.store(
-            D + rm[:, None] * N + rn[None, :], acc.to(D.dtype.element_ty),
+            D + rm[:, None] * N + rn[None, :],
+            acc.to(D.dtype.element_ty),
             mask=(rm[:, None] < M) & (rn[None, :] < N),
         )
 
@@ -346,8 +436,6 @@ def _triton_native_kernel():
 
 
 def _triton_native_backend(a_fnuz, a_scales, b_fnuz, b_scales, out):
-    import torch
-
     kfn = _triton_native_kernel()
     m, k = a_fnuz.shape
     n = b_fnuz.shape[0]
@@ -359,12 +447,23 @@ def _triton_native_backend(a_fnuz, a_scales, b_fnuz, b_scales, out):
         bm, bn, warps, stages = (int(x) for x in cfg.split(","))
     grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
     kfn[grid](
-        a_fnuz, a_scales, b_fnuz, b_scales, out,
-        m, n, k,
-        a_scales.stride(0), a_scales.stride(1),
-        b_scales.stride(0), b_scales.stride(1),
-        BM=bm, BN=bn, BK=128,
-        num_warps=warps, num_stages=stages,
+        a_fnuz,
+        a_scales,
+        b_fnuz,
+        b_scales,
+        out,
+        m,
+        n,
+        k,
+        a_scales.stride(0),
+        a_scales.stride(1),
+        b_scales.stride(0),
+        b_scales.stride(1),
+        BM=bm,
+        BN=bn,
+        BK=128,
+        num_warps=warps,
+        num_stages=stages,
     )
     return out
 
@@ -372,7 +471,6 @@ def _triton_native_backend(a_fnuz, a_scales, b_fnuz, b_scales, out):
 def quantize_activations_fnuz(x, group_size: int = 128):
     """BF16 [M, K] -> (fnuz payload, DOUBLED scales) in one step (the
     native-backend convention: halved payload x doubled scale = value)."""
-    import torch
 
     q, sc = quantize_activations_fp8(x, group_size)
     return e4m3fn_to_fnuz(q, sc)
@@ -391,58 +489,72 @@ def _grouped_kernel():
 
     @triton.jit
     def _grouped_gemm(
-        A, SA, W, SW, D,
-        TOK, TILE_EXP, TILE_R0, TILE_M,
-        N, K,
-        san, sakb, swn, swkb,
-        BM: tl.constexpr, BN: tl.constexpr, A_BY_TOKEN: tl.constexpr,
+        A,
+        SA,
+        W,
+        SW,
+        D,
+        TOK,
+        TILE_EXP,
+        TILE_R0,
+        TILE_M,
+        N,
+        K,
+        san,
+        sakb,
+        swn,
+        swkb,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        A_BY_TOKEN: tl.constexpr,
     ):
         pid_n = tl.program_id(0)
         pid_m = tl.program_id(1)
         e = tl.load(TILE_EXP + pid_m).to(tl.int64)
         r0 = tl.load(TILE_R0 + pid_m)
         me = tl.load(TILE_M + pid_m)
-        ri = r0 + tl.arange(0, BM)               # sorted-slot space
+        ri = r0 + tl.arange(0, BM)  # sorted-slot space
         rmask = tl.arange(0, BM) < me
         # A rows: gate_up gathers the shared per-TOKEN activation; the down
         # GEMM's post-swiglu activations are per-SLOT (one per expert
         # assignment) and already live in sorted order — index directly.
-        tok = (tl.load(TOK + ri, mask=rmask, other=0).to(tl.int64)
-               if A_BY_TOKEN else ri)
+        tok = tl.load(TOK + ri, mask=rmask, other=0).to(tl.int64) if A_BY_TOKEN else ri
         rn = pid_n * BN + tl.arange(0, BN)
         acc = tl.zeros((BM, BN), dtype=tl.float32)
-        wbase = W + e * N * K                    # expert's [N, K] panel
+        wbase = W + e * N * K  # expert's [N, K] panel
         swbase = SW + e * (N // 128) * (K // 128)
         for kb in range(0, K // 128):
             rk = kb * 128 + tl.arange(0, 128)
             a = tl.load(
                 A + tok[:, None] * K + rk[None, :],
-                mask=rmask[:, None], other=0.0,
+                mask=rmask[:, None],
+                other=0.0,
             )
             b = tl.load(
                 wbase + rn[:, None] * K + rk[None, :],
-                mask=rn[:, None] < N, other=0.0,
+                mask=rn[:, None] < N,
+                other=0.0,
             )
             sa = tl.load(SA + tok * san + kb * sakb, mask=rmask, other=0.0)
-            sb = tl.load(swbase + (rn // 128) * swn + kb * swkb,
-                         mask=rn < N, other=0.0)
+            sb = tl.load(swbase + (rn // 128) * swn + kb * swkb, mask=rn < N, other=0.0)
             blk = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
             acc += blk * (sa[:, None] * sb[None, :])
         tl.store(
-            D + ri[:, None] * N + rn[None, :], acc.to(D.dtype.element_ty),
+            D + ri[:, None] * N + rn[None, :],
+            acc.to(D.dtype.element_ty),
             mask=rmask[:, None] & (rn[None, :] < N),
         )
 
     return _grouped_gemm
 
 
-def _grouped_backend(a_nz, asc2, w_nz, wsc2, out, tok, tile_exp, tile_r0,
-                     tile_m, n, k, a_by_token=True):
+def _grouped_backend(
+    a_nz, asc2, w_nz, wsc2, out, tok, tile_exp, tile_r0, tile_m, n, k, a_by_token=True
+):
     """One grouped launch. With a_by_token, a_nz rows are gathered by the
     TOKEN id in `tok` (shared activations, gate_up); otherwise rows are
     indexed directly in SORTED-slot order (per-slot activations, down).
     `out` rows are always in sorted-slot order ([n_slots, n])."""
-    import torch
 
     kfn = _grouped_kernel()
     bm, bn, warps, stages = 64, 128, 4, 3
@@ -453,21 +565,36 @@ def _grouped_backend(a_nz, asc2, w_nz, wsc2, out, tok, tile_exp, tile_r0,
 
     grid = (triton.cdiv(n, bn), len(tile_m))
     kfn[grid](
-        a_nz, asc2, w_nz, wsc2, out,
-        tok, tile_exp, tile_r0, tile_m,
-        n, k,
-        asc2.stride(0), asc2.stride(1),
-        wsc2.stride(1), wsc2.stride(2),
-        BM=bm, BN=bn, A_BY_TOKEN=a_by_token,
-        num_warps=warps, num_stages=stages,
+        a_nz,
+        asc2,
+        w_nz,
+        wsc2,
+        out,
+        tok,
+        tile_exp,
+        tile_r0,
+        tile_m,
+        n,
+        k,
+        asc2.stride(0),
+        asc2.stride(1),
+        wsc2.stride(1),
+        wsc2.stride(2),
+        BM=bm,
+        BN=bn,
+        A_BY_TOKEN=a_by_token,
+        num_warps=warps,
+        num_stages=stages,
     )
     return out
 
 
 def glm_moe_grouped_gemm_native(
     x,
-    gate_up_nz, gate_up_sc2,
-    down_nz, down_sc2,
+    gate_up_nz,
+    gate_up_sc2,
+    down_nz,
+    down_sc2,
     topk_index,
     topk_weights,
     swiglu_limit=7.0,
@@ -490,14 +617,7 @@ def glm_moe_grouped_gemm_native(
     i = two_i // 2
     dev = x.device
 
-    flat = topk_index.reshape(-1)
-    tok_all = torch.arange(t, device=dev).repeat_interleave(k)
-    order = torch.argsort(flat, stable=True)
-    sorted_tok = tok_all[order]
-    sorted_exp = flat[order]
-    uniq, counts = torch.unique_consecutive(sorted_exp, return_counts=True)
-    seg = torch.zeros(len(uniq) + 1, device=dev, dtype=torch.int64)
-    seg[1:] = torch.cumsum(counts, 0)
+    order, sorted_tok, uniq, counts, seg = _route(topk_index, dev)
 
     a_nz, asc2 = quantize_activations_fnuz(x)
 
@@ -542,9 +662,20 @@ def glm_moe_grouped_gemm_native(
     # token) — the down GEMM indexes A directly, no gather.
     a2_nz, a2sc2 = quantize_activations_fnuz(act)
     dn = torch.empty((slots, h), device=dev, dtype=torch.bfloat16)
-    _grouped_backend(a2_nz, a2sc2, down_nz, down_sc2, dn,
-                     sorted_tok, tile_exp, tile_r0, tile_m, h, i,
-                     a_by_token=False)
+    _grouped_backend(
+        a2_nz,
+        a2sc2,
+        down_nz,
+        down_sc2,
+        dn,
+        sorted_tok,
+        tile_exp,
+        tile_r0,
+        tile_m,
+        h,
+        i,
+        a_by_token=False,
+    )
 
     w = topk_weights.reshape(-1)[order].float().unsqueeze(-1)
     y = torch.zeros((t, h), device=dev, dtype=torch.float32)
@@ -569,12 +700,23 @@ def _triton_backend(a_fp8, a_scales, b_fp8, b_scales, out):
         bm, bn, warps, stages = (int(x) for x in cfg.split(","))
     grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
     kfn[grid](
-        a8, a_scales, b8, b_scales, out,
-        m, n, k,
-        a_scales.stride(0), a_scales.stride(1),
-        b_scales.stride(0), b_scales.stride(1),
-        BM=bm, BN=bn, BK=128,
-        num_warps=warps, num_stages=stages,
+        a8,
+        a_scales,
+        b8,
+        b_scales,
+        out,
+        m,
+        n,
+        k,
+        a_scales.stride(0),
+        a_scales.stride(1),
+        b_scales.stride(0),
+        b_scales.stride(1),
+        BM=bm,
+        BN=bn,
+        BK=128,
+        num_warps=warps,
+        num_stages=stages,
     )
     return out
 
@@ -605,12 +747,11 @@ def _cute_kernel():
 
 
 def _build_cute_kernel():
-    """Import + JIT-compile the Hopper blockwise kernel lazily; return a
-    (a8, asc, b8, bsc, out) -> None launcher. Compilation happens on first
-    GPU call (cute.compile); the pure-torch reference path is the oracle."""
-    from vkernels.torch_ops._glm_fp8_sm90_gemm import launch
+    """Lazy-import the Hopper blockwise kernel's launch entry point.
 
-    def kernel(a8, asc, b8, bsc, out):
-        launch(a8, asc, b8, bsc, out)
+    Compilation happens on the first GPU call (cute.compile inside launch);
+    the pure-torch reference path is the oracle. launch's signature is
+    (a_fp8, a_scales, b_fp8, b_scales, out) — exactly the dispatcher's."""
+    from vkernels.torch_ops import _glm_fp8_sm90_gemm
 
-    return kernel
+    return _glm_fp8_sm90_gemm.launch

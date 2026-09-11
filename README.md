@@ -38,6 +38,7 @@ vkernels/
 │   ├── python/               #   Python package: `vkl` CLI + kernel bindings
 │   │   └── vkernels/
 │   │       ├── cli/          #     argparse CLI (`list`, `info`)
+│   │       ├── torch_ops/    #     device-op kernels adopted from floe (see below)
 │   │       ├── kernels.py    #     add/scale/relu/sum/max/gemm (public API)
 │   │       ├── comm.py       #     topology/channels/allreduce/overlap/p2p
 │   │       ├── core.py       #     Device/Stream
@@ -62,6 +63,29 @@ Every kernel and collective in this repo is provided **twice**:
 
 This means you can develop, review, and get to 100% coverage on any laptop, and run the
 GPU path only on machines that have a toolkit and device.
+
+## Torch operator kernels (`torch_ops`)
+
+`src/python/vkernels/torch_ops/` hosts the device-op kernels that serve
+floe's runner paths (GLM-5.3-Flash et al.). They are **adopted from floe**
+(the #64/#65 thin-adapter model: vkernels owns the kernel, floe imports it
+back through a re-export adapter in `floe/engine/runner/kernels/`),
+following the same two-implementation discipline as the C++ kernels — each
+module carries a `*_reference` eager oracle, loads torch/triton lazily
+(importing the package pulls in neither), and ships contract + GPU-parity
+tests under `tests/python/`:
+
+| module | kernel |
+|---|---|
+| `glm_expert_gemv` | selected-expert E4M3FN block-FP8 decode GEMV |
+| `glm_expert_gather_dequant` | gather + explicit E4M3FN block-dequant |
+| `glm_fp8_blockwise_gemm` (+ `_glm_fp8_sm90_gemm`) | blockwise-scaled FP8 GEMM / MoE grouped GEMM (Triton + CuTe DSL sm90) |
+| `glm_mhc_mix` | mHC gate + Sinkhorn fusion |
+| `glm_kda_decode` | single-token per-dimension-gated KDA decode |
+| `glm_projection`, `mhc_projection`, `qkv_projection`, `qkv_tuned_blas` | fused projection GEMVs |
+| `gdn_commit` | deferred GDN SSM commit (DFlash2 spec decoding) |
+| `triton_attn` | paged single-token decode attention |
+| `elementwise` | HF RMSNorm/RoPE/SiLU fusions + paged KV store |
 
 ## Development environment (mise)
 
@@ -182,8 +206,9 @@ uv run python -c "from vkernels import kernels; print(kernels.add([1, 2], [3, 4]
 
 See [`docs/python-bindings.md`](docs/python-bindings.md) for the full API.
 
-See [`docs/architecture.md`](docs/architecture.md), [`docs/testing.md`](docs/testing.md),
-and [`docs/communication.md`](docs/communication.md) for the design and conventions.
+See [`docs/README.md`](docs/README.md) for the full kernel and communication
+catalogue, and [`docs/ORIENTATION.md`](docs/ORIENTATION.md) for the design,
+build, and testing conventions.
 
 ## Rust bindings (opt-in)
 
