@@ -375,7 +375,8 @@ Reproduce: `sbatch` a 2-node, 1-GPU/rank job running
 - Cross-node NCCL bench (issue #49 on-site, JSC HDR): `meta/benchmarks/bench_cross_node_nccl.cu`, `meta/cmake/NcclSupport.cmake`.
 - Same-node prepared fused kernels: `src/c/vkernels/comm/p2p_kv_restore.{hpp,cpp}`, `src/c/vkernels/comm/p2p_kv_donate.{hpp,cpp}` (issues #27, #36).
 - Graph-capturable boundary (the eager-break contract this ties into): `src/c/vkernels/comm/pipeline_boundary.{hpp,cpp}`, `docs/comm-pipeline-boundary.md` (issue #10).
-- kvaas FFI inventory: `src/crates/kvaas-py/src/vkernels_ffi.rs` ("Kernel inventory" section).
-- kvaas Python transport: `src/python/kvaas_sglang/{peer_transport,nixl_transport}.py`.
-- kvaas design note: `.agents/docs/design/kvaas-owned-device-kv-pool.md` (cross-node VMM = Fabric-handle/IMEX phase).
-- Same-node roofline: `.agents/docs/operations/codebase-drift.md` §9.2; `.agents/docs/experiments/2026-08-14-bristen-stage3-bandwidth-64k-restore.md`.
+- kvaas (sibling repo at `../kvaas`; paths below relative to its root):
+  - FFI inventory: `src/crates/kvaas-py/src/vkernels_ffi.rs` ("Kernel inventory" section).
+  - Python transport: `vendor/sglang/python/kvaas_sglang/{peer_transport,nixl_transport}.py`.
+  - Design note: `.agents/docs/design/kvaas-owned-device-kv-pool.md` (cross-node VMM = Fabric-handle/IMEX phase).
+  - Same-node roofline: `.agents/docs/operations/codebase-drift.md` §9.2; `.agents/docs/experiments/2026-08-14-bristen-stage3-bandwidth-64k-restore.md`.
