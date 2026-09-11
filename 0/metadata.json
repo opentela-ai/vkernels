@@ -1,0 +1,80 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M27YDYMGC0TST5WQ4SP2WPC0",
+  "session_id": "01a08ac9-8097-714e-827d-d49310091c10",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-11T09:57:55.291119131Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "save_step_count": 1,
+  "files_touched": [
+    "docs/comm-cross-node-kv.md"
+  ],
+  "agent": "Pi",
+  "model": "CSCS-Inference/zai-org/GLM-5.2",
+  "turn_id": "661b224bb2d0",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 285894,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 2225408,
+    "output_tokens": 61369,
+    "api_call_count": 46
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-11T09:57:55.231537621Z",
+    "agent_lines": 5,
+    "agent_removed": 4,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 5,
+    "total_lines_changed": 9,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 3846,
+      "user_lines_removed": 657,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12,
+        "README.md": 24,
+        "pyproject.toml": 5,
+        "src/python/vkernels/torch_ops/_glm_fp8_sm90_gemm.py": 1099,
+        "src/python/vkernels/torch_ops/elementwise.py": 421,
+        "src/python/vkernels/torch_ops/gdn_commit.py": 163,
+        "src/python/vkernels/torch_ops/glm_expert_gather_dequant.py": 122,
+        "src/python/vkernels/torch_ops/glm_fp8_blockwise_gemm.py": 259,
+        "src/python/vkernels/torch_ops/glm_kda_decode.py": 131,
+        "src/python/vkernels/torch_ops/glm_mhc_mix.py": 130,
+        "src/python/vkernels/torch_ops/triton_attn.py": 153,
+        "tests/python/glm_fp8_sm90_validate.py": 133,
+        "tests/python/test_elementwise.py": 164,
+        "tests/python/test_gdn_commit.py": 109,
+        "tests/python/test_glm_expert_gather_dequant.py": 77,
+        "tests/python/test_glm_fp8_blockwise_gemm.py": 267,
+        "tests/python/test_glm_kda_decode.py": 101,
+        "tests/python/test_glm_mhc_mix.py": 105,
+        "tests/python/test_triton_attn.py": 86,
+        "uv.lock": 237
+      },
+      "user_removed_per_file": {
+        "pyproject.toml": 1,
+        "src/python/vkernels/torch_ops/glm_fp8_blockwise_gemm.py": 118,
+        "uv.lock": 538
+      }
+    }
+  ]
+}
