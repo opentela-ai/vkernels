@@ -122,6 +122,8 @@ the delta correction `β_t (v_t − a_t) ⊗ k_t`, with output `o_t = S_t · q_t
 | `kda_delta_rule_fwd_cpu(q,k,v,g,beta,out,B,H,S,D,chunk)` | chunked forward (gate cumsum → intra → inter → output) | the **standard** (scalar-gate) rule; cross-checked against its own inline oracle |
 | `hip::kda_delta_rule_fwd(...)` | cooperative per-token recurrence, `D×D` state in LDS | K3 oracle; matches `kda_naive_delta_rule_fwd_cpu` |
 | `hip::kda_delta_rule_fwd_with_scratch(...,state,...)` | caller-owned `[B,H,D,D]` state scratch (multi-turn decode: pre-fill `S_0`, read back `S_S`) | K3 serving path (issue #45) |
+| `hip::kda_delta_rule_fwd_chunked_with_scratch(q,k,v,g,beta,state,out,scratch,B,H,S,D,chunk)` / `kda_delta_rule_fwd_chunked(...)` | affine **WY (UT-transform)** chunked forward — the same per-key-dim recurrence as the cooperative kernel, in chunked form. Three launches (per-key log-cumsum → parallel chunk-local artefacts → serial `nc`-step state pass split over `D`-row blocks) drop the critical path from `S` token steps × 4 barriers to `nc` chunk steps × 3 barriers | issue #70; **stronger contract** — `k` L2-normalised by the caller, `g` in `(0,1]`, `β≤1`, `chunk_size==64`, `S%64==0`, `D≤128`; matches `kda_naive_delta_rule_fwd_cpu` |
+| `kda_chunked_scratch_floats(B,H,S,D)` / `kda_chunked_phase_times(...)` | WY scratch size in float32s (allocate once, reuse; clobbered each call) / per-launch wall-time tuning aid | #70 |
 | `kda_layer_norm_gated_cpu / hip::kda_layer_norm_gated` | gated RMSNorm × `silu(gate)` pre-attention normaliser | |
 | `kda_gate_chunk_cumsum_cpu / hip::kda_gate_chunk_cumsum` | intra inclusive + inter exclusive log-gate cumsum | |
 | `kda_delta_rule_intra_cpu` / `kda_delta_rule_inter_cpu` / `kda_gla_fwd_o_cpu` | the chunked pieces (standard rule), standalone | |
@@ -129,14 +131,20 @@ the delta correction `β_t (v_t − a_t) ⊗ k_t`, with output `o_t = S_t · q_t
 
 - `k` is L2-normalised by the caller; `g` is `[B,H,S,D]` in normal space
   `(0,1]`; `β` is `[B,H,S]` scalar per (token, head).
-- **Files**: `src/c/vkernels/kernels/kda.{hpp,cpp,hip}`
+- **Files**: `src/c/vkernels/kernels/kda.{hpp,cpp,hip}` (the chunked WY forward is `#L8` in the same files)
 - **Python**: `vkernels.kernels.{kda_layer_norm_gated, kda_gate_chunk_cumsum,
   kda_naive_delta_rule_fwd, kda_delta_rule_intra, kda_delta_rule_inter,
-  kda_gla_fwd_o, kda_delta_rule_fwd, kda_pack_bitmatrix}`
+  kda_gla_fwd_o, kda_delta_rule_fwd, kda_pack_bitmatrix}`; the chunked WY
+  forward + `kda_chunked_scratch_floats` are on the device path
+  (`vkernels.hip_dsa_mhc.kda_delta_rule_fwd_chunked`)
 - **Rust**: `vkernels::kernels::{kda_layer_norm_gated, kda_gate_chunk_cumsum,
   kda_naive_delta_rule_fwd, kda_delta_rule_fwd, kda_delta_rule_intra,
   kda_delta_rule_inter, kda_gla_fwd_o, kda_pack_bitmatrix}`
-- **Docs**: [kernels/kda.md](kernels/kda.md)
+- **C ABI**: `vk_kda_*` (host) + `vk_hip_kda_delta_rule_fwd_chunked_with_scratch` /
+  `vk_hip_kda_chunked_scratch_floats` (device, #70) in `src/c/vkernels/capi/`
+- **Tests**: `tests/kernels/attn/test_kda_k3_chunked.cpp` (host oracle),
+  `meta/benchmarks/test_kda_chunked.hip` (device); bench `meta/benchmarks/bench_kda_chunked.hip` (`bench_kda.sh`)
+- **Docs**: [kernels/kda.md](kernels/kda.md), [kda-lds-optimization.md](kda-lds-optimization.md)
 
 ### DSA — DeepseekSparseAttn sparse-MLA forward (issue #51)
 
@@ -153,14 +161,26 @@ hand-checked case (the rope-tail dot is skipped at runtime).
 | `hip::dsa_sparse_fwd(...)` | online softmax, fp32 accum, bf16 storage | bf16 (device) / fp32 (oracle) | HIP |
 | `dsa_config_for(S_q,H,dim,topk,&bq,&th,&block_I,&inner_iter)` | decode `S_q≤8`→1 row·1 wf; prefill→BQ rows·4 wf | — | — |
 | `dsa_topk_logits_cpu(...)` / `hip::dsa_topk_logits(...)` | paged-MQA gated top-k **logits** — the FIRST stage (kpool logits) that feeds this forward (kpool>1 indexer path, issue #51). FP8 e4m3fnuz Q/K dequantised to fp32 on load; tokens ≥ `seq_len[b]` left unwritten (zero the output first) | fp8 e4m3fnuz (device) / fp32 (oracle) | HIP |
+| `dsa_topk_transform_cpu(...)` / `hip::dsa_topk_transform(...)` | pool-level top-k transform **between** the indexer logits and the sparse forward: selects `token_topk/pool_size` pool groups per row, expands each to `pool_size` token ids, optionally remaps through a `page_table` (or ragged `topk_indices_offset`) and appends the `seq_len % pool_size` tail | fp32 | HIP |
+| `dsa_topk_transform_group_topk_supported(group_topk)` | the group-top-k specialisations validated by sglang's kpool transform | — | — |
+| `dsa_kpool_assemble_cpu` / `hip::dsa_kpool_assemble` (+`_fp8`) | kpool-cache **compress + write** — assemble one rotated mean key per pool and write the cache (runs every forward when `index_kpool > 1`) | bf16/fp32 (gfx942) / fp8e4m3fnuz cache (A100/SM80) | HIP |
+| `dsa_kpool_decode_update_cpu` / `hip::dsa_kpool_decode_update` (+`_fp8`) | append the `kpool-1` live tail and, on decode, maybe write the cache | same | HIP |
 
 - `q` is `[1,S_q,H, dim+tail_dim]`; `kv` is `[1,S_kv,kv_group, dim+tail_dim]`
   with `d_v = dim − tail_dim`; `kv_group == 1`. `sm_scale = (1/√(dim+tail_dim))·log2(e)`.
-- **C ABI**: `vk_dsa_config`, `vk_dsa_sparse_fwd` (host),
-  `vk_hip_dsa_sparse_fwd` / `vk_hip_dsa_topk_logits` (device) in `src/c/vkernels/capi/`
-- **Files**: `src/c/vkernels/kernels/dsa.{hpp,cpp,hip}`
-- **Python**: `vkernels.kernels.dsa_sparse_fwd / dsa_config`
-- **Docs**: [kernels/dsa.md](kernels/dsa.md)
+- **C ABI**: `vk_dsa_config`, `vk_dsa_sparse_fwd`, `vk_dsa_topk_transform`,
+  `vk_dsa_topk_group_topk_supported`, `vk_dsa_kpool_assemble[_fp8]`,
+  `vk_dsa_kpool_decode_update[_fp8]`, `vk_dsa_kpool_max_closed_pools` (host);
+  `vk_hip_dsa_sparse_fwd[_split]`, `vk_hip_dsa_topk_logits`,
+  `vk_hip_dsa_topk_transform`, `vk_hip_dsa_kpool_assemble[_fp8]`,
+  `vk_hip_dsa_kpool_decode_update[_fp8]` (device) in `src/c/vkernels/capi/`
+- **Files**: `src/c/vkernels/kernels/dsa.{hpp,cpp,hip}` (sparse forward + top-k
+  logits), `dsa_topk.{hpp,cpp,hip}` + `dsa_topk_device.cuh` (pool-level top-k
+  transform, #58), `dsa_kpool.{hpp,cpp,hip}` (kpool-cache compress/write, #60/#62)
+- **Python**: `vkernels.kernels.dsa_sparse_fwd / dsa_config / dsa_topk_transform /
+  dsa_kpool_assemble / dsa_kpool_decode_update`
+- **Docs**: [kernels/dsa.md](kernels/dsa.md), [kernels/dsa_topk.md](kernels/dsa_topk.md),
+  [kernels/dsa_kpool.md](kernels/dsa_kpool.md)
 
 ### MHC — Multi-head hybrid-attention pre/post (issue #51, part 2)
 
@@ -180,6 +200,47 @@ non-optin cap (no `hipFuncSetAttribute` opt-in).
 - **Files**: `src/c/vkernels/kernels/mhc.{hpp,cpp,hip}`
 - **Python**: `vkernels.kernels.mhc_pre_gemm_sqrsum / mhc_post`
 - **Docs**: [kernels/mhc.md](kernels/mhc.md)
+
+### GLM-5.3 block-FP8 expert GEMV (issue #64)
+
+A dequant-fused block-FP8 GEMV for the GLM-5.3 expert weights: E4M3FN
+weights (`uint8`, `[N,K]`, row-major) are decoded *inside* the dot against a
+per-`128×128`-block FP32 scale (`scales[N/128, K/128]`), so the expert
+buffer is never materialised to BF16/FP32. At decode (`M ∈ {1,2}`) the op is
+memory-bound on the weight bytes (AI ≈ 2 FLOP/byte), so fusing the dequant
+removes both the materialised-buffer traffic and its allocation. The CPU
+oracle is the cross-checked reference; the HIP kernel is a split-K GEMV
+(partial grid `N/32 × sk` + fixed-order reduce; `sk ∈ {1,2,4,8}` dividing
+`K/128`, picked by an occupancy heuristic).
+
+| Function | Computation | Data type | GPU backend |
+|---|---|---|---|
+| `glm_fp8_block_gemv_cpu(x,w,scales,out,M,N,K)` | `out[m,n] = bf16( Σ_k fp32(x[m,k]) · scale[n/128][k/128] · e4m3(w[n,k]) )` (one RNE bf16 round) | E4M3FN weights + fp32 scales → bf16 | CPU (oracle) |
+| `glm_e4m3_to_f32_cpu(v)` | E4M3FN decode shared by the tests (exact CPU/GPU agreement) | uint8 → fp32 | CPU |
+| `hip::glm_fp8_block_gemv(x,w,scales,out,M,N,K)` | split-K dequant-fused GEMV (partial kernel + fixed-order reduce) | same | HIP |
+| `hip::glm_fp8_block_gemv_with_scratch(...,part,...,sk)` | caller-owned fp32 partials (`M·N·sk`), the autotune hook | same | HIP |
+| `hip::glm_fp8_gemv_pick_sk(N,K)` | occupancy heuristic for the plain wrapper (≥ ~2 blocks/CU on 228-CU MI300A) | — | — |
+
+- **Contract**: `M ∈ {1,2}`, `N % 128 == 0`, `K % 128 == 0`, `K ≤ 4096`. The
+  reserved NaN encodings (`0x7F`/`0xFF`) decode to NaN on the CPU and to
+  `±480` on the GPU's branchless path; weights never carry them. `part` is
+  clobbered each call (allocate once, reuse).
+- **Files**: `src/c/vkernels/kernels/glm_moe.{hpp,cpp,hip}` — CPU oracle
+  (`glm_moe.cpp`, always compiled) + HIP kernel (`glm_moe.hip`,
+  `VKERNELS_HAS_HIP`). *Not* exposed through the `vkernels.kernels` Python
+  API or the C ABI; it is a standalone native GEMV with its own device
+  correctness test + micro-benchmark. The torch_ops GLM FP8 path
+  (`src/python/vkernels/torch_ops/glm_expert_gemv.py`,
+  `glm_fp8_blockwise_gemm.py` + `_glm_fp8_sm90_gemm.py`, issue #65) is a
+  separate Triton/CuTe implementation adopted from floe — see
+  [torch-ops-mi300.md](torch-ops-mi300.md) and [glm53-decode-kernels.md](glm53-decode-kernels.md).
+- **Tests**: `meta/benchmarks/test_glm_fp8_gemv.hip` (device vs
+  `glm_fp8_block_gemv_cpu`, bf16-tolerant `max_rel < 2e-2`); torch_ops
+  parity in `tests/python/test_glm_fp8_blockwise_gemm.py`,
+  `test_glm_expert_gemv.py`.
+- **Bench**: `meta/benchmarks/bench_glm_fp8_gemv.hip` (fused vs a BF16
+  mat-GEMV and a one-time FP8→BF16 dequant, against the MI300A roof ~5300 GB/s).
+- **Docs**: [kernels/glm_moe.md](kernels/glm_moe.md)
 
 ---
 
@@ -710,11 +771,16 @@ src/c/vkernels/
 │   ├── mla.{cpp,hip,hpp}         # Multi-head Latent Attention, absorbed form (#21)
 │   ├── kda.{cpp,hip,hpp}         # Kimi Delta Attention — gated delta-rule (#21, #45)
 │   ├── dsa.{cpp,hip,hpp}         # DeepseekSparseAttn sparse-MLA + paged-MQA top-k logits (#51)
+│   ├── dsa_topk.{cpp,hip,hpp}    # pool-level top-k transform between indexer logits and forward (#58)
+│   ├── dsa_topk_device.cuh       # shared device helpers for the top-k transform
+│   ├── dsa_kpool.{cpp,hip,hpp}   # DSA kpool-cache compress + write (#60/#62)
 │   ├── mhc.{cpp,hip,hpp}         # MHC pre-norm GEMM+sqrsum / post combine (#51)
 │   ├── moe.{cpp,hip,hpp}         # gfx942 primitives (#12–#15)
 │   ├── moe_device.hip            # shared bf16↔f32 helpers used by the MoE kernels
+│   ├── device_numeric.cuh        # shared bf16 / fp8-e4m3fnuz device conversions (hipcc+nvcc)
 │   ├── moe_aux.{cpp,hip,hpp}     # MXFP4 MoE orchestration: quant, sort, scatter-reduce (#22)
-│   └── moe_fused.{cpp,hip,hpp}   # fused MXFP4 MoE grouped GEMM
+│   ├── moe_fused.{cpp,hip,hpp}   # fused MXFP4 MoE grouped GEMM
+│   └── glm_moe.{cpp,hip,hpp}     # GLM-5.3 block-FP8 expert GEMV, dequant-fused (#64)
 ├── dist/
 │   └── dist_moe.{cpp,hpp}        # distributed MoE: TP/EP/PP sharding (#18)
 ├── comm/
@@ -755,7 +821,11 @@ src/c/vkernels/
 │   ├── rccl_hip.hpp              # RcclChannel / plan declarations
 │   └── rccl_c.{h,cpp}            # C ABI for the RCCL transport
 ├── capi/
-│   ├── capi.{cpp,hpp}            # C ABI (host path), exceptions → status codes
+│   ├── capi.{cpp,hpp}            # core C ABI (Device/Stream/Channel), exceptions → status
+│   ├── capi_attn.cpp             # host C ABI for the attention kernels (dsa/mhc/mla/kda)
+│   ├── capi_kernels.cpp          # host C ABI for the basic kernels (add/.../gemm/mfma)
+│   ├── capi_moe.cpp              # host C ABI for the MoE kernels (fused_moe_mxfp4, moe_align)
+│   ├── capi_internal.hpp         # shared capi TU helpers
 │   ├── hip_capi.{cpp,hpp}        # C ABI over the gfx942 HIP compute kernels (#44)
 │   └── serving_c.{h,cpp}         # serving-runtime CUDA ABI
 ├── core/

@@ -15,7 +15,7 @@ name = "vkernels-cli"
 version = "0.1.0"
 description = "vkl — low-level GPU kernels and communication primitives with Python bindings"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "opentela-ai" }]
 keywords = ["cuda", "kernels", "gpu", "collectives", "allreduce"]
@@ -38,6 +38,10 @@ dependencies = [
 # Compiled backend: the pybind11 extension (*not* shipped in the
 # pure-Python wheel; install a platform wheel or build from source).
 compiled = []
+# CuTe DSL (CUTLASS Python DSL) for the sm_90 fp8 blockwise grouped-GEMM
+# path (torch_ops/glm_fp8_blockwise_gemm.py). Optional: without it the
+# module falls back to its pure-torch reference path (the oracle).
+cute = ["nvidia-cutlass-dsl>=4.7", "cuda-python>=13"]
 
 [project.scripts]
 vkl = "vkernels.cli.main:main"
