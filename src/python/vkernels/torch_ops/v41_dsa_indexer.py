@@ -52,8 +52,16 @@ def _kernel():
 
 
 def indexer_scores(q, index_k, weights):
-    """Device DSA indexer scores; falls back to the reference off-GPU /
-    without Triton (or for shapes below ``tl.dot``'s 16-min tiles)."""
+    """Device DSA indexer scores. The torch reference (einsum over cuBLAS) is
+    the DEFAULT backend on GPU too: the fused Triton kernel measured ~6x
+    SLOWER than the einsum at decode shapes on GB10 (q[1,1,32,128], T=4096:
+    230 us vs 37 us), and we do not ship a kernel that loses to the trivial
+    path. Opt back in with ``VKERNELS_DSA_INDEXER_BACKEND=triton`` (re-bench
+    and tune first; see floe deepseek_v41 TODO.md "Kernel performance"). The
+    reference also serves off-GPU / without Triton / below ``tl.dot``'s
+    16-min tiles."""
+    import os
+
     import torch
 
     if q.ndim != 4 or index_k.ndim != 3 or weights.ndim != 3:
@@ -62,11 +70,16 @@ def indexer_scores(q, index_k, weights):
     bk, t, dk = index_k.shape
     if bk != b or dk != d or weights.shape != (b, s, h):
         raise ValueError("q/index_k/weights shapes are inconsistent")
+    backend = os.environ.get("VKERNELS_DSA_INDEXER_BACKEND", "reference")
     # tl.dot needs >=16 in each tiled dim AND power-of-two sizes for the H/D
     # aranges; infeasible shapes use the reference, which is exact and cheap
-    # there.
+    # there. cuBLAS also beats the per-(b,s) tl.dot kernel at real decode
+    # shapes (~6x on GB10), so the reference is the default backend everywhere
+    # until the Triton path is tuned (VKERNELS_DSA_INDEXER_BACKEND=triton
+    # forces it back on).
     if (
-        not fast_path(q, index_k, weights)
+        backend != "triton"
+        or not fast_path(q, index_k, weights)
         or min(h, d) < 16
         or (h & (h - 1))
         or (d & (d - 1))

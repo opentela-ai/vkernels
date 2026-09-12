@@ -88,6 +88,7 @@ def test_gpu_matches_reference(torch):
     assert torch.allclose(got, ref, atol=1e-3, rtol=1e-3)
 
 
+
 def test_wrapper_falls_back_on_cpu(torch):
     from vkernels.torch_ops.v41_sparse_attention import sparse_attention, sparse_attention_reference
 
@@ -99,3 +100,35 @@ def test_wrapper_falls_back_on_cpu(torch):
     scale = 1.0 / math.sqrt(D)
     got = sparse_attention(q, kv, mask, sink, scale)  # CPU -> reference
     assert torch.equal(got, sparse_attention_reference(q, kv, mask, sink, scale))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("triton") is None, reason="triton required")
+def test_gpu_backend_gate_and_prefill(torch):
+    """Shape-gated dispatch (measured GB10 crossover): decode-sized S takes the
+    Triton kernel, prefill-sized S takes the batched-cuBLAS reference — both
+    must match the oracle; forced-triton stays correct at prefill too."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    import os
+
+    from vkernels.torch_ops.v41_sparse_attention import sparse_attention, sparse_attention_reference
+
+    torch.manual_seed(2)
+    H, D, N = 64, 512, 640
+    for s in (1, 64):
+        q = torch.randn(1, H, s, D, device="cuda", dtype=torch.bfloat16) * 0.1
+        kv = torch.randn(1, N, D, device="cuda", dtype=torch.bfloat16) * 0.1
+        mask = (torch.rand(1, s, N, device="cuda") < 0.5).float()
+        sink = torch.rand(H, device="cuda")
+        ref = sparse_attention_reference(q, kv, mask, sink, 0.088)
+        auto = sparse_attention(q, kv, mask, sink, 0.088)
+        assert torch.allclose(auto, ref, atol=1e-2, rtol=1e-2), s
+        os.environ["VKERNELS_V41_SPARSE_ATTN_BACKEND"] = "triton"
+        try:
+            forced = sparse_attention(q, kv, mask, sink, 0.088)
+        finally:
+            os.environ.pop("VKERNELS_V41_SPARSE_ATTN_BACKEND", None)
+        assert torch.allclose(forced, ref, atol=1e-2, rtol=1e-2), s
+        if s == 1:
+            assert torch.equal(auto, forced), s  # auto picked the kernel
+

@@ -17,6 +17,10 @@ from ._fastpath import fast_path
 
 _NEG = -1.0e30
 
+# Measured GB10 crossover (see meta/benchmarks/bench_v41_triton.py): the
+# Triton kernel wins at S <= 2 and loses beyond (S=4: 0.89x, S=64: 0.31x).
+_SPARSE_ATTN_MAX_S = 2
+
 
 def sparse_attention_reference(q, kv, mask, sink, scale):
     """``q`` ``[B,H,S,D]``, ``kv`` ``[B,N,D]`` (shared over heads), ``mask``
@@ -75,8 +79,16 @@ def _kernel():
 
 
 def sparse_attention(q, kv, mask, sink, scale):
-    """Device sparse attention with sink; falls back to the reference
-    off-GPU / without Triton (or for sub-tile ``D``)."""
+    """Device sparse attention with sink. Shape-gated backend on the measured
+    GB10 crossover: the one-query-per-program Triton kernel wins for tiny
+    query lengths (decode ``S <= 2``; S=1 1.73x) and loses to the batched
+    cuBLAS reference beyond (S=64: reference 3.2x faster — the kernel
+    re-reads the whole KV block per query position and its [BT,D] fp32 tile
+    register-spills at D=512). ``VKERNELS_V41_SPARSE_ATTN_BACKEND`` forces
+    ``triton``/``reference``; default ``auto``. Falls back to the reference
+    off-GPU / without Triton (or sub-tile ``D``)."""
+    import os
+
     import torch
 
     if q.ndim != 4 or kv.ndim != 3 or mask.ndim != 3 or sink.ndim != 1:
@@ -87,13 +99,16 @@ def sparse_attention(q, kv, mask, sink, scale):
         raise ValueError("q/kv/mask/sink shapes are inconsistent")
     if not fast_path(q, kv, mask, sink) or (d & (d - 1)) or d < 16 or n == 0:
         return sparse_attention_reference(q, kv, mask, sink, scale)
+    backend = os.environ.get("VKERNELS_V41_SPARSE_ATTN_BACKEND", "auto")
+    if backend == "reference" or (backend == "auto" and s > _SPARSE_ATTN_MAX_S):
+        return sparse_attention_reference(q, kv, mask, sink, scale)
 
     qf = q.reshape(b * h, s, d).contiguous()
     kvf = kv.contiguous()
     mf = mask.float().contiguous()
     sf = sink.float().contiguous()
     out = torch.empty((b * h, s, d), device=q.device, dtype=torch.float32)
-    BT = 64
+    BT = 32
     with torch.cuda.device(q.device):
         _kernel()[(b * h, s)](qf, kvf, mf, sf, out, h, s, n, d, float(scale), BT)
     return out.reshape(b, h, s, d)

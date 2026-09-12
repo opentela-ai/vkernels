@@ -68,6 +68,7 @@ def test_gpu_matches_reference(torch):
     assert torch.equal(got, ref)
 
 
+
 def test_wrapper_falls_back_on_cpu(torch):
     from vkernels.torch_ops.v41_mxfp4_dequant import mxfp4_dequant, mxfp4_dequant_reference
 
@@ -76,3 +77,29 @@ def test_wrapper_falls_back_on_cpu(torch):
     scale = torch.rand(4, 2, generator=g) + 0.5  # group=32 -> I//32 = 2
     got = mxfp4_dequant(packed, scale, group=32, dtype=torch.bfloat16)  # CPU -> reference
     assert torch.equal(got, mxfp4_dequant_reference(packed, scale, group=32, dtype=torch.bfloat16))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("triton") is None, reason="triton required")
+def test_gpu_full_stack_no_int32_overflow(torch):
+    """The flattened V4.1 expert stack (E*O = 884_736 rows x I 5120, ~9 GB out)
+    overflows int32 row offsets (2.26e9 packed bytes > 2**31) — regression for
+    the illegal-memory-access the bench harness hit; the arch itself never
+    materializes the full stack (dequant-on-use), so only big-shape callers
+    see it."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if torch.cuda.get_device_properties(0).total_memory < 20 * 2**30:
+        pytest.skip("needs >20 GB device memory")
+    from vkernels.torch_ops.v41_mxfp4_dequant import mxfp4_dequant, mxfp4_dequant_reference
+
+    e, o, i = 384, 2304, 5120
+    packed = torch.randint(0, 256, (e, o, i // 2), device="cuda", dtype=torch.uint8)
+    scale = (torch.rand(e, o, i // 32, device="cuda") + 0.5).float()
+    got = mxfp4_dequant(packed, scale, group=32, dtype=torch.bfloat16)
+    # Spot-check the LAST row (the one whose int32 offset would wrap) against
+    # the reference on the same rows; a full 9 GB reference round-trip is
+    # unnecessary to pin the overflow.
+    tail_ref = mxfp4_dequant_reference(
+        packed[-4:].cpu(), scale[-4:].cpu(), group=32, dtype=torch.bfloat16)
+    assert torch.equal(got[-4:].cpu(), tail_ref)
+

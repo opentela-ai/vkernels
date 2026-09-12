@@ -71,7 +71,9 @@ def _kernel():
 
     @triton.jit
     def _mxfp4(PACKED, SCALE, TABLE, Y, I: tl.constexpr, GROUP: tl.constexpr, BLOCK: tl.constexpr):
-        row = tl.program_id(0)
+        # int64: the flattened full-stack shape (E*O rows, e.g. 884_736 x 5120)
+        # overflows int32 byte offsets.
+        row = tl.program_id(0).to(tl.int64)
         col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)  # output column in [0, I)
         mask = col < I
         byte = tl.load(PACKED + row * (I // 2) + col // 2, mask, 0).to(tl.int32)

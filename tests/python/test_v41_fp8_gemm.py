@@ -1,5 +1,6 @@
 """V4.1 fp8 block GEMM + UE8M0 quantization: reference oracle + GPU parity."""
 
+import importlib.util
 import subprocess
 import sys
 
@@ -92,6 +93,7 @@ def test_block128_gemm_matches_reference(torch):
     )
 
 
+
 def test_wrapper_routes_to_reference_off_gpu(torch):
     from vkernels.torch_ops.v41_fp8_gemm import fp8_block_gemm, fp8_block_gemm_reference, quantize_fp8_ue8m0
 
@@ -104,3 +106,48 @@ def test_wrapper_routes_to_reference_off_gpu(torch):
         fp8_block_gemm(qa, sa, qb, sb, block=32),
         fp8_block_gemm_reference(qa, sa, qb, sb, block=32),
     )
+
+
+@pytest.mark.skipif(importlib.util.find_spec("triton") is None, reason="triton required")
+def test_gpu_decode_gemm_matches_reference(torch):
+    """Decode-shape Triton block-scaled GEMM vs the torch oracle at real V4.1
+    backbone geometries. Covers the two bugs the first bring-up hit: the
+    per-tile (not per-row) B scale grid, and the padded-M masking (padded rows
+    must neither load nor store)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    import os
+
+    from vkernels.torch_ops.v41_fp8_gemm import fp8_block_gemm, fp8_block_gemm_reference, quantize_fp8_ue8m0
+
+    torch.manual_seed(5)
+    shapes = [
+        ("wq_b", 32768, 1280, 1, 32),
+        ("wkv", 512, 5120, 1, 32),  # below the auto-gate: oracle by default
+        ("wo_b", 5120, 32768, 1, 32),
+        ("m8", 5120, 32768, 8, 32),
+        ("odd_n", 300, 1280, 4, 32),
+        ("block16", 512, 1280, 16, 16),
+        ("m32b32", 5120, 5120, 32, 32),
+    ]
+    for tag, n, k, m, block in shapes:
+        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.1
+        b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+        qa, sa = quantize_fp8_ue8m0(a, block=block)
+        qb, sb = quantize_fp8_ue8m0(b, block=block)
+        ref = fp8_block_gemm_reference(qa, sa, qb, sb, block=block)
+        # forced: the kernel runs on every eligible shape (correct, sometimes slower)
+        os.environ["VKERNELS_V41_FP8_GEMM_BACKEND"] = "triton"
+        try:
+            got = fp8_block_gemm(qa, sa, qb, sb, block=block)
+        finally:
+            os.environ.pop("VKERNELS_V41_FP8_GEMM_BACKEND", None)
+        rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+        assert rel < 1e-3, (tag, rel)
+        # auto: shape-gated dispatch never loses — N >= 2048 takes the kernel
+        auto = fp8_block_gemm(qa, sa, qb, sb, block=block)
+        auto_rel = ((auto.float() - ref.float()).norm() / ref.float().norm()).item()
+        assert auto_rel < 1e-3, (tag, auto_rel)
+        if n >= 2048 and m <= block:
+            assert torch.equal(auto, got), tag  # auto picked the kernel
+
