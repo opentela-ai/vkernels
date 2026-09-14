@@ -76,13 +76,16 @@ def configure_qkv_tuned_blas(path, *, manifest=None, accept_default=True,
         with open(path, newline="") as source:
             rows = list(csv.reader(source))
         validators = {row[1] for row in rows if len(row) >= 3 and row[0] == "Validator"}
-        # PyTorch's ``torch.cuda.tunable.write_file`` emits exactly these validators
-        # on an AMD/HIP target (HIP_VERSION encodes the ROCm stack as
-        # ``major*100+minor``; there is no ``ROCM_VERSION`` validator). Requiring
-        # ``ROCM_VERSION`` here rejected every genuine artifact (job 628932,
-        # section 5); ``read_file`` below still enforces version equality.
-        required = {"PT_VERSION", "HIP_VERSION", "HIPBLASLT_VERSION", "GCN_ARCH_NAME", "ROCBLAS_VERSION"}
-        if not required.issubset(validators):
+        # PyTorch's ``torch.cuda.tunable.write_file`` emits these validators on
+        # an AMD/HIP target. The ROCm-stack key is build-dependent: PT 2.9.1
+        # writes ``HIP_VERSION`` (major*100+minor) and no ``ROCM_VERSION``
+        # (requiring the latter rejected every genuine artifact — job 628932,
+        # section 5), while the serving image's 2.9.0a0 writes ``ROCM_VERSION``
+        # and no ``HIP_VERSION``. Accept either; ``read_file`` below still
+        # enforces equality with the running stack, so a mismatched artifact
+        # cannot load.
+        required = {"PT_VERSION", "HIPBLASLT_VERSION", "GCN_ARCH_NAME", "ROCBLAS_VERSION"}
+        if not required.issubset(validators) or not ({"HIP_VERSION", "ROCM_VERSION"} & validators):
             raise ValueError("QKV tuning artifact must include PyTorch/HIP/library/device validators")
 
         loaded_manifest = manifest if manifest is not None else (
