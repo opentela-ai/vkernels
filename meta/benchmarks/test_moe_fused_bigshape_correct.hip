@@ -331,6 +331,7 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   if (const char* dtok = std::getenv("VKMOE_DELTA_TOKEN")) {
     const int t0 = std::atoi(dtok);
     std::vector<float> singles((size_t)top_k * hidden, 0.0f);
+    std::vector<float> osingles((size_t)top_k * hidden, 0.0f);
     double sum_gpu_rel = 0, sum_orc_rel = 0;
     for (int s = 0; s < top_k; ++s) {
       std::vector<float> tw_d((size_t)M * top_k, 0.0f);
@@ -362,6 +363,8 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
                    hipMemcpyDeviceToHost), "rdOutd");
       std::memcpy(&singles[(size_t)s * hidden], &outd_gpu[(size_t)t0 * hidden],
                   (size_t)hidden * 4);
+      std::memcpy(&osingles[(size_t)s * hidden], &outd_cpu[(size_t)t0 * hidden],
+                  (size_t)hidden * 4);
       double rg = 0, ro = 0, sg = 0, so = 0, sc = 0;
       for (int c = 0; c < hidden; ++c) {
         int i = t0 * hidden + c;
@@ -386,29 +389,32 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
     {
       const float* gf = &out_gpu[(size_t)t0 * hidden];
       const float* cf = &out_cpu[(size_t)t0 * hidden];
-      int n_rec_bad = 0;
+      int n_rec_bad = 0, n_lin_bad = 0;
       for (int c = 0; c < hidden; ++c) {
-        double ss = 0;
-        for (int s = 0; s < top_k; ++s) ss += singles[(size_t)s * hidden + c];
+        double ss = 0, so2 = 0;
+        for (int s = 0; s < top_k; ++s) {
+          ss += singles[(size_t)s * hidden + c];
+          so2 += osingles[(size_t)s * hidden + c];
+        }
         double d_rec = std::fabs((double)gf[c] - ss);
-        double d_orc = std::fabs(ss - (double)cf[c]);
-        if (d_rec > 1.0 && d_orc <= 1.0) {
-          ++n_rec_bad;
-          int s_miss = -1;
-          double best = 1e30;
-          for (int s = 0; s < top_k; ++s) {
-            double d = std::fabs(((double)gf[c] - ss) +
-                                 singles[(size_t)s * hidden + c]);
-            if (d < best) { best = d; s_miss = s; }
-          }
-          std::printf("    [recon t=%d c=%d] gpu_full=%.4f Σsingles=%.4f "
-                      "cpu_full=%.4f | missing slot s=%d (single=%.4f)\n",
-                      t0, c, gf[c], ss, cf[c], s_miss,
-                      singles[(size_t)s_miss * hidden + c]);
+        double d_lin = std::fabs(so2 - (double)cf[c]);
+        if (d_rec > 1.0) ++n_rec_bad;
+        if (d_lin > 1.0) ++n_lin_bad;
+        if (std::fabs((double)gf[c] - (double)cf[c]) > 1.0) {
+          std::printf("    [col t=%d c=%d] gpu_full=%9.4f cpu_full=%9.4f "
+                      "| Sigpu=%9.4f Sorc=%9.4f | rec_dev=%7.4f lin_dev=%7.4f\n",
+                      t0, c, gf[c], cf[c], ss, so2, d_rec, d_lin);
+          for (int s = 0; s < top_k; ++s)
+            std::printf("        s=%2d e=%3d w=%.4f gpu_single=%12.4f "
+                        "orc_single=%12.4f\n",
+                        s, route[(size_t)t0 * top_k + s],
+                        tw[(size_t)t0 * top_k + s],
+                        singles[(size_t)s * hidden + c],
+                        osingles[(size_t)s * hidden + c]);
         }
       }
-      std::printf("    [recon] %d column(s) where gpu_full != Σ singles "
-                  "but oracle is linear\n", n_rec_bad);
+      std::printf("    [recon] %d col(s) gpu_full!=Ssingles; %d col(s) "
+                  "oracle nonlinear\n", n_rec_bad, n_lin_bad);
     }
     // restore the full-weight device run for any later use
     CK(hipMemcpy(dTw, tw.data(), (size_t)M * top_k * 4, hipMemcpyHostToDevice),
