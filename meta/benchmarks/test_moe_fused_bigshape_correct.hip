@@ -130,6 +130,8 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   std::vector<int32_t> sids(EM_max), eids(EM_max / block_size);
   int EM = vkernels::kernels::moe_align_block_size(
       tids.data(), M, top_k, block_size, E, sids.data(), eids.data());
+  std::fprintf(stderr, "[phase] align ok EM=%d max_expert=%d\n", EM,
+               *std::max_element(route.begin(), route.end()));
 
   // Oracle inputs: per-sorted-row weights.
   std::vector<float> tws(EM, 0.0f);
@@ -140,6 +142,8 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   for (size_t i = 0; i < hA.size(); ++i) hA[i] = f2bf(rnd(10, (int)i) * 0.1f);
 
   // CPU oracle.
+  std::fprintf(stderr, "[phase] weights filled (w13=%.1f GB)\n",
+               (double)w13.size() / (1 << 30));
   std::vector<uint16_t> act_cpu((size_t)EM * ispp, 0);
   std::vector<float> out_cpu((size_t)M * hidden, 0.0f);
   vkernels::kernels::fused_moe_mxfp4_cpu(
@@ -147,6 +151,7 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
       sids.data(), tws.data(), eids.data(), act_cpu.data(), out_cpu.data(),
       M, hidden, ispp, top_k, EM, group, LIMIT, activation, beta,
       linear_beta, nullptr, nullptr);
+  std::fprintf(stderr, "[phase] CPU oracle done\n");
 
   // Device buffers (size_t products throughout — the same class of bug).
   uint16_t *dA, *dAct; float *dOut, *dTw;
@@ -177,12 +182,15 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   CK(hipMemcpy(dSids, sids.data(), (size_t)EM * 4, hipMemcpyHostToDevice), "cpSids");
   CK(hipMemcpy(dEids, eids.data(), (size_t)(EM / block_size) * 4, hipMemcpyHostToDevice), "cpEids");
   CK(hipMemset(dOut, 0, (size_t)M * hidden * 4), "zOut");
+  std::fprintf(stderr, "[phase] device buffers ok, launching fused_moe_mxfp4\n");
 
   vkernels::kernels::hip::fused_moe_mxfp4(
       dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
       M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
       linear_beta, nullptr, nullptr, block_size, false);
+  std::fprintf(stderr, "[phase] launcher returned, syncing\n");
   CK(hipDeviceSynchronize(), "sync");
+  std::fprintf(stderr, "[phase] device sync ok\n");
 
   std::vector<float> out_gpu((size_t)M * hidden);
   CK(hipMemcpy(out_gpu.data(), dOut, (size_t)M * hidden * 4,
@@ -206,12 +214,16 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  // Unbuffered: a GPU fault kills the process and we must not lose the log
+  // position (slurm pipes stdout through a block-buffered file).
+  setvbuf(stdout, nullptr, _IONBF, 0);
   hipDeviceProp_t p;
   CK(hipGetDeviceProperties(&p, 0), "props");
   std::printf("GPU: %s (%s)\n\n", p.name, p.gcnArchName);
 
   using vkernels::kernels::kSiTU;
+  int only = (argc > 1) ? std::atoi(argv[1]) : 0;  // 0 = all
 
   // Wrap thresholds at h=7168, ispp=4096 (decode kernels):
   //   down:    e * 7168*2048      >= 2^31 at e >= 147
@@ -221,24 +233,28 @@ int main() {
       7, 73, 74, 100, 145, 146, 147, 180, 200, 220, 240, 250, 253, 254, 255, 74};
 
   // 1. decode regime at the documented fault threshold.
-  run_case("decode ispp=4096 wrap-threshold experts", 256, 7168, 4096, 16, 1,
-           16, route_thresholds, kSiTU);
+  if (only == 0 || only == 1)
+    run_case("decode ispp=4096 wrap-threshold experts", 256, 7168, 4096, 16, 1,
+             16, route_thresholds, kSiTU);
 
   // 2. worst-case single expert (max offset, all 16 slots on expert 255).
   const std::vector<int> route_e255(16, 255);
-  run_case("decode ispp=4096 all-slots expert 255", 256, 7168, 4096, 16, 1,
-           16, route_e255, kSiTU);
+  if (only == 0 || only == 2)
+    run_case("decode ispp=4096 all-slots expert 255", 256, 7168, 4096, 16, 1,
+             16, route_e255, kSiTU);
 
   // 3. prefill regime (64x64 tiles) at the same shape.
-  run_case("prefill ispp=4096 wrap-threshold experts", 256, 7168, 4096, 16, 1,
-           64, route_thresholds, kSiTU);
+  if (only == 0 || only == 3)
+    run_case("prefill ispp=4096 wrap-threshold experts", 256, 7168, 4096, 16, 1,
+             64, route_thresholds, kSiTU);
 
   // 4. the documented serving-shard shape that faulted on beverin
-    // (E=32, ~12 GB resident; down wraps at e >= 18, gateup at e >= 9).
+  // (E=32, ~12 GB resident; down wraps at e >= 18, gateup at e >= 9).
   const std::vector<int> route_shard = {
       2, 5, 9, 12, 17, 18, 19, 20, 22, 24, 26, 28, 29, 30, 31, 8};
-  run_case("decode ispp=33792 E=32 serving shard", 32, 7168, 33792, 16, 1,
-           16, route_shard, kSiTU);
+  if (only == 0 || only == 4)
+    run_case("decode ispp=33792 E=32 serving shard", 32, 7168, 33792, 16, 1,
+             16, route_shard, kSiTU);
 
   if (g_failures) {
     std::printf("\n%d case(s) FAILED\n", g_failures);

@@ -45,7 +45,14 @@ T="$B/meta/benchmarks/test_moe_fused_bigshape_correct"
 GPU="$B/meta/benchmarks/moe_fused_bench"
 
 echo; echo "############ 1. big-shape correctness (GPU vs CPU oracle) ############"
-"$T"
+export VK_MOE_KTIME=1   # per-stage [ktime] lines localize any device fault
+CASE_RC=0
+case_n() { echo "--- case $1: $2 ---"; "$T" "$1" || CASE_RC=1; }
+case_n 1 "decode ispp=4096, wrap-threshold experts"
+case_n 2 "decode ispp=4096, all-slots expert 255"
+case_n 3 "prefill ispp=4096, wrap-threshold experts"
+case_n 4 "decode ispp=33792 E=32 shard"
+if [ "$CASE_RC" -ne 0 ]; then echo "cases failed rc=$CASE_RC"; exit "$CASE_RC"; fi
 
 echo; echo "###### 2. previously-faulting bench: E=256 ispp=4096 (with CPU oracle) ######"
 "$GPU" situ --E 256 --hidden 7168 --ispp 4096 --topk 16 --ms 1,2,4 --kmajor
