@@ -159,7 +159,13 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
     if (sids_o[i] < M * top_k) tws_o[i] = tw[sids_o[i]];
 
   std::vector<uint16_t> hA((size_t)M * hidden);
-  for (size_t i = 0; i < hA.size(); ++i) hA[i] = f2bf(rnd(10, (int)i) * 0.1f);
+  // A ~ 0.002 keeps SwiGLU outputs ~O(0.01-0.1) so the 16-slot combine
+  // sums stay well-conditioned: bf16-ULP act differences (different fp32
+  // transcendental/accumulation orders between GPU and oracle) then perturb
+  // out by ~1e-6 relative instead of being amplified 1e5x by catastrophic
+  // cancellation.  Regression value (int32 offset wrap at E=256/h7168/
+  // ispp=4096) is data-independent - it is about byte offsets.
+  for (size_t i = 0; i < hA.size(); ++i) hA[i] = f2bf(rnd(10, (int)i) * 0.001f);
 
   // CPU oracle (per-16 alignment).
   std::fprintf(stderr, "[phase] weights filled (w13=%.1f GB)\n",
