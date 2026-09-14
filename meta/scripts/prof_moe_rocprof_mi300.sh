@@ -33,24 +33,25 @@ GPU="$B/meta/benchmarks/moe_fused_bench"
 PROF=$(command -v rocprof)
 
 echo; echo "###### default harness M=1 (per-kernel durations) ######"
+# rocprof exits non-zero even on successful collection; don't let set -e
+# kill the job after the first section.
 "$PROF" --stats -o "$TMPDIR/rp_default.csv" "$GPU" situ --ispp 512 --topk 6 --ms 1 \
-  2>&1 | grep -vE "^\[|ROCProfiler" | tail -5
-echo "--- stats:"; cat "$TMPDIR/rp_default"*.csv 2>/dev/null | head -20
+  2>&1 | grep -vE "^\[|ROCProfiler" | tail -5 || true
+echo "--- stats:"; cat "$TMPDIR/rp_default"*.csv 2>/dev/null | head -20 || true
 
 echo; echo "###### full-K3 shard M=1 (per-kernel durations) ######"
 "$PROF" --stats -o "$TMPDIR/rp_shard.csv" \
   "$GPU" situ --E 32 --hidden 7168 --ispp 33792 --topk 16 --ms 1 \
-  --kmajor --dummy --no-cpu 2>&1 | grep -vE "^\[|ROCProfiler" | tail -5
-echo "--- stats:"; cat "$TMPDIR/rp_shard"*.csv 2>/dev/null | head -20
+  --kmajor --dummy --no-cpu 2>&1 | grep -vE "^\[|ROCProfiler" | tail -5 || true
+echo "--- stats:"; cat "$TMPDIR/rp_shard"*.csv 2>/dev/null | head -20 || true
 
 echo; echo "###### unit-busy counters, default harness M=1 ######"
 cat > "$TMPDIR/pmc.txt" <<'PMC'
-pmc: SQ_WAVES SQ_PERCENT_BUSY SQ_INST_CYCLE_VAL
-pmc: SQ_LDS_BANK_CONFLICT SQ_LDS_IDX_ACTIVE
-pmc: TCP_TOTAL_CACHE_ACCESSES_pmc_TCC_TOTAL_READ_SECTORS_pmc_TCC_TOTAL_WRITE_SECTORS_pmc_TCC_MC_RD_REQ_sum_TCC_MC_WR_REQ_sum
+pmc: SQ_WAVES SQ_BUSY_CYCLES SQ_INST_CYCLE_VAL
+pmc: SQ_LDS_BANK_CONFLICT
 PMC
 "$PROF" -i "$TMPDIR/pmc.txt" -o "$TMPDIR/rp_pmc.csv" "$GPU" situ --ispp 512 --topk 6 --ms 1 \
-  2>&1 | grep -vE "^\[|ROCProfiler" | tail -3
-echo "--- pmc:"; cat "$TMPDIR/rp_pmc"*.csv 2>/dev/null | grep -E "kernel|SQ_|TCP_|TCC_" | head -12
+  2>&1 | grep -vE "^\[|ROCProfiler" | tail -3 || true
+echo "--- pmc:"; cat "$TMPDIR/rp_pmc"*.csv 2>/dev/null | grep -E "kernel|SQ_" | head -12 || true
 
 echo; echo "===== ALL DONE ====="

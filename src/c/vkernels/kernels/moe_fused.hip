@@ -302,15 +302,11 @@ __device__ __forceinline__ void dequant_b_16cols_kmajor(
 //  are bit-identical; the old functions stay for the prefill kernels.
 // ======================================================================
 struct PrefBTile {
-  // Same 8 packed + 8 ue8m0 scale bytes as the original uint8_t arrays,
-  // but packed 4-per-32-bit word (byte it lives in bits it*8 of word
-  // it/4).  gfx942 has no byte registers: every uint8_t kept live in the
-  // ring occupied a whole VGPR, so the unpacked form cost 16 VGPRs per
-  // staged tile (~64 for the depth-2 gate/up ring) and the real hipcc
-  // reported 8+136 VGPR/AGPR — residency capped at ~4 blocks/CU instead
-  // of the launch_bounds' 10.  Packed, the ring is 4 VGPRs per tile.
-  uint32_t pb[2];
-  uint32_t sc[2];
+  // 8 packed bytes (4 K-nibbles each) + 8 ue8m0 scale bytes, one per
+  // (it -> kp = lane/16 + it*4) pair; kBytesPerThread*kWhreads covers the
+  // full kBK x 16 tile (kp max = 3 + 7*4 = 31 < kPackedK, so no guard).
+  uint8_t pb[8];
+  uint8_t sc[8];
 };
 
 __device__ __forceinline__ PrefBTile prefetch_b16_nmajor(
@@ -323,15 +319,12 @@ __device__ __forceinline__ PrefBTile prefetch_b16_nmajor(
   int kp_off = k_start / 2;
   int sc_off = k_start / kGroupSize;
   PrefBTile p;
-  p.pb[0] = p.pb[1] = p.sc[0] = p.sc[1] = 0;
 #pragma unroll
   for (int it = 0; it < kBytesPerThread; ++it) {
     int kp = kp_base + it * kKpStep;
-    uint32_t b = packed[n * stride_packed + kp_off + kp];
-    p.pb[it >> 2] |= b << ((it & 3) * 8);
+    p.pb[it] = packed[n * stride_packed + kp_off + kp];
     int gi = (kp * 2) / kGroupSize;
-    uint32_t s = scale[n * stride_scale_n + sc_off + gi];
-    p.sc[it >> 2] |= s << ((it & 3) * 8);
+    p.sc[it] = scale[n * stride_scale_n + sc_off + gi];
   }
   return p;
 }
@@ -346,15 +339,12 @@ __device__ __forceinline__ PrefBTile prefetch_b16_kmajor(
   int kp_off = k_start / 2;
   int sc_off = k_start / kGroupSize;
   PrefBTile p;
-  p.pb[0] = p.pb[1] = p.sc[0] = p.sc[1] = 0;
 #pragma unroll
   for (int it = 0; it < kBytesPerThread; ++it) {
     int kp = kp_base + it * kKpStep;
-    uint32_t b = packed[(kp_off + kp) * stride_k + n];
-    p.pb[it >> 2] |= b << ((it & 3) * 8);
+    p.pb[it] = packed[(kp_off + kp) * stride_k + n];
     int gi = (kp * 2) / kGroupSize;
-    uint32_t s = scale[(sc_off + gi) * stride_scale_k + n];
-    p.sc[it >> 2] |= s << ((it & 3) * 8);
+    p.sc[it] = scale[(sc_off + gi) * stride_scale_k + n];
   }
   return p;
 }
@@ -386,8 +376,8 @@ __device__ __forceinline__ void dequant_b16_from_regs(
 #pragma unroll
   for (int it = 0; it < kBytesPerThread; ++it) {
     int kp = kp_base + it * kKpStep;
-    uint8_t pb = (uint8_t)(p.pb[it >> 2] >> ((it & 3) * 8));
-    float s = ue8m0_decode((uint8_t)(p.sc[it >> 2] >> ((it & 3) * 8)));
+    uint8_t pb = p.pb[it];
+    float s = ue8m0_decode(p.sc[it]);
     uint32_t flo = fp4nib_to_f32bits(pb & 0x0F);
     float vlo; __builtin_memcpy(&vlo, &flo, sizeof(float));
     vlo *= s; __builtin_memcpy(&flo, &vlo, sizeof(float));
