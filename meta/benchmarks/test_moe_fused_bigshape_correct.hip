@@ -257,6 +257,35 @@ int main(int argc, char** argv) {
     run_case("decode ispp=33792 E=32 serving shard", 32, 7168, 33792, 16, 1,
              16, route_shard, kSiTU);
 
+  // 5. prefill at a small shape — isolates a general prefill-path bug from
+  //    a big-shape overflow (case 3 = big + padding).
+  const std::vector<int> route_small = {0, 1, 2, 3};
+  if (only == 0 || only == 5)
+    run_case("prefill small E=8 h512 ispp=512", 8, 512, 512, 4, 1,
+             64, route_small, kSiTU);
+
+  // 6. prefill big, NO padding: M=64 tokens all routed to the same 16
+  //    distinct experts -> EM = 64*16 = 1024 = N, every block full.
+  std::vector<int> route_full;
+  route_full.reserve(64 * 16);
+  for (int i = 0; i < 64; ++i)
+    route_full.insert(route_full.end(), route_thresholds.begin(),
+                      route_thresholds.end());
+  if (only == 0 || only == 6)
+    run_case("prefill ispp=4096 M=64 no-padding", 256, 7168, 4096, 16, 64,
+             64, route_full, kSiTU);
+
+  // 7. prefill big, M=2 (like case 3 but N=32: mostly-padding blocks).
+  std::vector<int> route_m2;
+  route_m2.reserve(2 * 16);
+  route_m2.insert(route_m2.end(), route_thresholds.begin(),
+                  route_thresholds.end());
+  route_m2.insert(route_m2.end(), route_thresholds.begin(),
+                  route_thresholds.end());
+  if (only == 0 || only == 7)
+    run_case("prefill ispp=4096 M=2 padded", 256, 7168, 4096, 16, 2,
+             64, route_m2, kSiTU);
+
   if (g_failures) {
     std::printf("\n%d case(s) FAILED\n", g_failures);
     return 1;

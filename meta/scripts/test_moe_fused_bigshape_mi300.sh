@@ -52,6 +52,9 @@ case_n 1 "decode ispp=4096, wrap-threshold experts"
 case_n 2 "decode ispp=4096, all-slots expert 255"
 case_n 3 "prefill ispp=4096, wrap-threshold experts"
 case_n 4 "decode ispp=33792 E=32 shard"
+case_n 5 "prefill small E=8 h512 ispp=512"
+case_n 6 "prefill ispp=4096 M=64 no-padding"
+case_n 7 "prefill ispp=4096 M=2 padded"
 if [ "$CASE_RC" -ne 0 ]; then echo "cases failed rc=$CASE_RC"; exit "$CASE_RC"; fi
 
 echo; echo "###### 2. previously-faulting bench: E=256 ispp=4096 (with CPU oracle) ######"
