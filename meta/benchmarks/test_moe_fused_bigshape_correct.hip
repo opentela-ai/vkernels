@@ -292,6 +292,63 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   }
   std::printf("\n");
 
+  // Delta forensics (VKMOE_DELTA_TOKEN=t): re-run the whole pipeline with
+  // topk_w = delta (only token t's slot s keeps its weight).  The oracle is
+  // linear in topk_w, so if every single-slot run matches but the full sum
+  // does not, the corruption is in the multi-slot combine; if some single
+  // slot already differs, the down GEMM for that (expert, flat) is wrong.
+  if (const char* dtok = std::getenv("VKMOE_DELTA_TOKEN")) {
+    const int t0 = std::atoi(dtok);
+    double sum_gpu_rel = 0, sum_orc_rel = 0;
+    for (int s = 0; s < top_k; ++s) {
+      std::vector<float> tw_d((size_t)M * top_k, 0.0f);
+      tw_d[(size_t)t0 * top_k + s] = tw[(size_t)t0 * top_k + s];
+      std::vector<float> tws_d(EM, 0.0f);
+      for (int i = 0; i < EM; ++i)
+        if (sids[i] < M * top_k) tws_d[i] = tw_d[sids[i]];
+      std::vector<float> tws_do(EM_o, 0.0f);
+      for (int i = 0; i < EM_o; ++i)
+        if (sids_o[i] < M * top_k) tws_do[i] = tw_d[sids_o[i]];
+      std::vector<uint16_t> act_d((size_t)EM * ispp, 0);
+      std::vector<float> outd_cpu((size_t)M * hidden, 0.0f);
+      vkernels::kernels::fused_moe_mxfp4_cpu(
+          hA.data(), w13.data(), w13s.data(), w2.data(), w2s.data(),
+          sids.data(), tws_d.data(), eids.data(), act_d.data(), outd_cpu.data(),
+          M, hidden, ispp, top_k, EM, group, LIMIT, activation, beta,
+          linear_beta, nullptr, nullptr);
+      CK(hipMemcpy(dTw, tw_d.data(), (size_t)M * top_k * 4,
+                   hipMemcpyHostToDevice), "cpTwd");
+      CK(hipMemset(dOut, 0, (size_t)M * hidden * 4), "zOutd");
+      vkernels::kernels::hip::fused_moe_mxfp4(
+          dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
+          M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
+          linear_beta, nullptr, nullptr, block_size, false);
+      CK(hipDeviceSynchronize(), "syncd");
+      std::vector<float> outd_gpu((size_t)M * hidden);
+      CK(hipMemcpy(outd_gpu.data(), dOut, (size_t)M * hidden * 4,
+                   hipMemcpyDeviceToHost), "rdOutd");
+      double rg = 0, ro = 0, sg = 0, so = 0, sc = 0;
+      for (int c = 0; c < hidden; ++c) {
+        int i = t0 * hidden + c;
+        sg += outd_gpu[i]; so += outd_cpu[i]; sc += out_cpu[i];
+        rg = std::fmax(rg, std::fabs((double)outd_gpu[i] - (double)out_cpu[i]) /
+                               std::fmax(std::fabs((double)out_cpu[i]), 1.0));
+        ro = std::fmax(ro, std::fabs((double)outd_cpu[i] - (double)out_cpu[i]) /
+                               std::fmax(std::fabs((double)out_cpu[i]), 1.0));
+      }
+      sum_gpu_rel = std::fmax(sum_gpu_rel, rg);
+      sum_orc_rel = std::fmax(sum_orc_rel, ro);
+      std::printf("    [delta t=%d s=%d e=%d] gpu-vs-oracle_rel=%.4g "
+                  "oracle-self_rel=%.4g (rowsum gpu=%.3f orc=%.3f full=%.3f)\n",
+                  t0, s, route[(size_t)t0 * top_k + s], rg, ro, sg, so, sc);
+    }
+    std::printf("    [delta] worst gpu-vs-oracle=%.4g oracle-self=%.4g\n",
+                sum_gpu_rel, sum_orc_rel);
+    // restore the full-weight device run for any later use
+    CK(hipMemcpy(dTw, tw.data(), (size_t)M * top_k * 4, hipMemcpyHostToDevice),
+       "cpTwR");
+  }
+
   CK(hipFree(dw13), "f"); CK(hipFree(dw13s), "f"); CK(hipFree(dw2), "f");
   CK(hipFree(dw2s), "f"); CK(hipFree(dA), "f"); CK(hipFree(dAct), "f");
   CK(hipFree(dOut), "f"); CK(hipFree(dTw), "f"); CK(hipFree(dTids), "f");
