@@ -313,8 +313,9 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
       std::vector<float> outd_cpu((size_t)M * hidden, 0.0f);
       vkernels::kernels::fused_moe_mxfp4_cpu(
           hA.data(), w13.data(), w13s.data(), w2.data(), w2s.data(),
-          sids.data(), tws_d.data(), eids.data(), act_d.data(), outd_cpu.data(),
-          M, hidden, ispp, top_k, EM, group, LIMIT, activation, beta,
+          sids_o.data(), tws_do.data(), eids_o.data(), act_d.data(),
+          outd_cpu.data(),
+          M, hidden, ispp, top_k, EM_o, group, LIMIT, activation, beta,
           linear_beta, nullptr, nullptr);
       CK(hipMemcpy(dTw, tw_d.data(), (size_t)M * top_k * 4,
                    hipMemcpyHostToDevice), "cpTwd");
