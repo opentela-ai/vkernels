@@ -48,11 +48,11 @@ echo; echo "############ 1. big-shape correctness (GPU vs CPU oracle) ##########
 export VK_MOE_KTIME=1   # per-stage [ktime] lines localize any device fault
 CASE_RC=0
 case_n() { echo "--- case $1: $2 ---"; "$T" "$1" || CASE_RC=1; }
-case_n 1 "decode ispp=4096, wrap-threshold experts"
-case_n 2 "decode ispp=4096, all-slots expert 255"
-case_n 3 "prefill ispp=4096, wrap-threshold experts"
-case_n 4 "decode ispp=33792 E=32 shard"
-case_n 5 "prefill small E=8 h512 ispp=512"
+true_case_n 1 "decode ispp=4096, wrap-threshold experts"
+true_case_n 2 "decode ispp=4096, all-slots expert 255"
+true_case_n 3 "prefill ispp=4096, wrap-threshold experts"
+true_case_n 4 "decode ispp=33792 E=32 shard"
+true_case_n 5 "prefill small E=8 h512 ispp=512"
 case_n 6 "prefill ispp=4096 M=64 no-padding"
 case_n 7 "prefill ispp=4096 M=2 padded"
 case_n 8 "prefill small M=64 no-padding"

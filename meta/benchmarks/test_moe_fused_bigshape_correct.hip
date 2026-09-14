@@ -127,7 +127,7 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
       tw[(size_t)i * top_k + s] = 0.5f + 0.5f * rnd(20, i * top_k + s);
     }
 
-  const int EM_max = E * block_size;
+  const int EM_max = M * top_k + E * block_size;
   std::vector<int32_t> sids(EM_max), eids(EM_max / block_size);
   int EM = vkernels::kernels::moe_align_block_size(
       tids.data(), M, top_k, block_size, E, sids.data(), eids.data());
@@ -141,7 +141,8 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   // test_moe_fused_prefill_correct.  The final out [M, hidden] is
   // block-size invariant.
   constexpr int kOracleBS = 16;
-  std::vector<int32_t> sids_o(E * kOracleBS), eids_o(E * kOracleBS / kOracleBS);
+  int EM_max_o = M * top_k + E * kOracleBS;
+  std::vector<int32_t> sids_o(EM_max_o), eids_o(EM_max_o / kOracleBS);
   int EM_o = vkernels::kernels::moe_align_block_size(
       tids.data(), M, top_k, kOracleBS, E, sids_o.data(), eids_o.data());
 
