@@ -245,12 +245,12 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
 
   // Intermediate act comparison (matched by flat index across the two
   // alignments): splits a gateup/A-load bug from a down/combine bug.
+  std::vector<uint16_t> act_gpu((size_t)EM * ispp);
+  std::vector<int> pos_gpu(M * top_k, -1), pos_cpu(M * top_k, -1);
+  CK(hipMemcpy(act_gpu.data(), dAct, (size_t)EM * ispp * 2,
+               hipMemcpyDeviceToHost), "rdAct");
   {
-    std::vector<uint16_t> act_gpu((size_t)EM * ispp);
-    CK(hipMemcpy(act_gpu.data(), dAct, (size_t)EM * ispp * 2,
-                 hipMemcpyDeviceToHost), "rdAct");
     // per-alignment real-row lists keyed by flat
-    std::vector<int> pos_gpu(M * top_k, -1), pos_cpu(M * top_k, -1);
     for (int i = 0; i < EM; ++i)
       if (sids[i] < M * top_k) pos_gpu[sids[i]] = i;
     for (int i = 0; i < EM_o; ++i)
@@ -415,6 +415,86 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
       }
       std::printf("    [recon] %d col(s) gpu_full!=Ssingles; %d col(s) "
                   "oracle nonlinear\n", n_rec_bad, n_lin_bad);
+    }
+
+    // FP64 ground truth for one slot (VKMOE_DELTA_SLOT=s): dequantize w2
+    // for the slot's expert col-block by col-block and evaluate the down
+    // GEMM in double against BOTH sides' act rows.  Distinguishes
+    // "different act data" (legitimate bf16 rounding path) from "wrong
+    // down GEMM" (a real bug).
+    if (const char* dslot = std::getenv("VKMOE_DELTA_SLOT")) {
+      const int s0 = std::atoi(dslot);
+      const int flat0 = t0 * top_k + s0;
+      const int e0 = route[(size_t)t0 * top_k + s0];
+      const double w0 = tw[(size_t)t0 * top_k + s0];
+      const size_t w2_eb = (size_t)hidden * (ispp / 2);
+      const size_t w2s_eb = (size_t)hidden * (ispp / group);
+      const int rg_row = pos_gpu[flat0], rc_row = pos_cpu[flat0];
+      std::printf("    [fp64] slot=%d expert=%d flat=%d act_rows gpu=%d orc=%d\n",
+                  s0, e0, flat0, rg_row, rc_row);
+      // act ULP histogram for this row pair
+      {
+        int ulp1 = 0, ulp2 = 0, ulpm = 0, same = 0;
+        for (int k = 0; k < ispp; ++k) {
+          float g = bf16_to_float(act_gpu[(size_t)rg_row * ispp + k]);
+          float x = bf16_to_float(act_cpu[(size_t)rc_row * ispp + k]);
+          if (g == x) { ++same; continue; }
+          double r = std::fabs((double)g - x) /
+                     std::fmax(std::fabs((double)x), 1e-30);
+          if (r <= 0.004) ++ulp1;
+          else if (r <= 0.008) ++ulp2;
+          else ++ulpm;
+        }
+        std::printf("    [fp64] act row: same=%d 1ulp=%d 2ulp=%d >2ulp=%d "
+                    "(of %d)\n", same, ulp1, ulp2, ulpm, ispp);
+      }
+      std::vector<uint16_t> tile((size_t)64 * 64);
+      std::vector<double> part_dg(64, 0.0), part_do(64, 0.0);
+      double worst_g = 0, worst_o = 0, worst_x = 0;
+      int wc = -1;
+      for (int nb2 = 0; nb2 < hidden / 64; ++nb2) {
+        const uint8_t* bp = w2.data() + (size_t)e0 * w2_eb
+                            + (size_t)nb2 * 64 * (ispp / 2);
+        const uint8_t* sp = w2s.data() + (size_t)e0 * w2s_eb
+                            + (size_t)nb2 * 64 * (ispp / group);
+        for (int kb = 0; kb < ispp / 64; ++kb) {
+          dequant_weight_tile(bp + (size_t)kb * 32, sp + kb * (64 / group),
+                              tile.data(), 64, 64, group,
+                              ispp / 2, ispp / group, 1);
+          for (int c = 0; c < 64; ++c) {
+            double dref_g = 0, dref_o = 0;
+            for (int k = 0; k < 64; ++k) {
+              double wv = bf16_to_float(tile[(size_t)k * 64 + c]);
+              dref_g += (double)bf16_to_float(
+                            act_gpu[(size_t)rg_row * ispp + kb * 64 + k]) * wv;
+              dref_o += (double)bf16_to_float(
+                            act_cpu[(size_t)rc_row * ispp + kb * 64 + k]) * wv;
+            }
+            // accumulate across k-blocks against the full-K singles
+            // (recompute incrementally per col)
+            // -- accumulate into per-col partials
+            part_dg[c] += dref_g;
+            part_do[c] += dref_o;
+          }
+        }
+        // compare this col-block's completed dot products
+        for (int c = 0; c < 64; ++c) {
+          const int col = nb2 * 64 + c;
+          const double gpu_d = singles[(size_t)s0 * hidden + col] / w0;
+          const double orc_d = osingles[(size_t)s0 * hidden + col] / w0;
+          double eg = std::fabs(gpu_d - part_dg[c]);
+          double eo = std::fabs(orc_d - part_do[c]);
+          double ex = std::fabs(gpu_d - part_do[c]);
+          if (eg > worst_g) { worst_g = eg; }
+          if (eo > worst_o) { worst_o = eo; }
+          if (eg + eo > worst_x) { worst_x = eg + eo; wc = col; }
+          part_dg[c] = 0.0;
+          part_do[c] = 0.0;
+        }
+      }
+      std::printf("    [fp64] max|gpu_D - ref(gpu_act)|=%.4g "
+                  "max|orc_D - ref(orc_act)|=%.4g worst col=%d\n",
+                  worst_g, worst_o, wc);
     }
     // restore the full-weight device run for any later use
     CK(hipMemcpy(dTw, tw.data(), (size_t)M * top_k * 4, hipMemcpyHostToDevice),
