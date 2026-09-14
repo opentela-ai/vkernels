@@ -378,6 +378,75 @@ def e4m3fn_to_fnuz(w_fp8, scales):
     return half, scales * 2.0
 
 
+@lru_cache(maxsize=16)
+def _fnuz_byte_lut(device):
+    """256-entry e4m3fn -> e4m3fnuz byte map on ``device``.
+
+    The halving conversion is a PURE per-byte function — halving an fp8
+    value is an exact exponent decrement, subnormals land exactly on the
+    fnuz subnormal grid, NaN (0x7f) maps to fnuz NaN (0x80) and fn -0
+    (0x80) maps to fnuz +0 (0x00); verified exhaustive over all 256 bytes
+    against this module's fp32-roundtrip reference. So the conversion needs
+    no fp32 materialization of the weight stack at all: it is a byte gather
+    through this table."""
+    import torch
+
+    raw = torch.arange(256, dtype=torch.uint8)
+    fn = raw.view(torch.float8_e4m3fn)
+    fz = (fn.to(torch.float32) * 0.5).to(torch.float8_e4m3fnuz)
+    return fz.view(torch.uint8).to(device, non_blocking=True)
+
+
+def e4m3fn_to_fnuz_inplace(w_fp8, scales, chunk_bytes=1 << 26):
+    """In-place e4m3fn -> e4m3fnuz (issue #71): rewrite ``w_fp8``'s bytes to
+    the halved-payload fnuz encoding and double ``scales`` in place, so the
+    converted stack SHARES the checkpoint's storage.
+
+    This removes both resident-memory costs of the copy-based conversion
+    (``e4m3fn_to_fnuz``): the fnuz copy is no longer a second ~1 B/element
+    resident copy of every expert weight (the copy-cache roughly doubled
+    expert memory and capped grouped layers under a fixed HBM floor), and
+    the ~4 B/element fp32 conversion transient is gone — the rewrite is a
+    chunked gather through ``_fnuz_byte_lut`` whose peak extra memory is
+    ~9x ``chunk_bytes`` (a uint8 result plus the int64 index temp).
+
+    Returns ``(w_fnuz_view, scales)`` — a fnuz-dtype reinterpret of the SAME
+    storage, bit-identical to ``e4m3fn_to_fnuz``'s payload bytes, drop-in
+    for ``glm_moe_grouped_gemm_native`` and the fnuz-storage decode paths
+    (``expert_gemv`` / ``gather_dequant`` with ``storage="e4m3fnuz"``).
+
+    Contract (mirrors the #69 invalidation pattern):
+    - raises TypeError on an fnuz-dtype input — the byte map is not
+      idempotent and a second application would halve payloads again;
+    - the caller keys a converted-marker on
+      ``(data_ptr, _version, device)`` of BOTH tensors AFTER this call and
+      re-runs it only when the key changes (checkpoint reload copies fresh
+      e4m3fn bytes and bumps ``_version``);
+    - run eagerly, not under CUDA-graph capture: the one-time rewrite is
+      not replay-stable work.
+    """
+    import torch
+
+    if w_fp8.dtype == torch.float8_e4m3fnuz:
+        raise TypeError(
+            "weights are already e4m3fnuz — refusing to halve payloads twice"
+        )
+    if w_fp8.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"expected e4m3fn weights, got {w_fp8.dtype}")
+    if scales.device != w_fp8.device:
+        raise ValueError("scales must share the weight device")
+    if not w_fp8.is_contiguous():
+        raise ValueError("weights must be contiguous for in-place byte conversion")
+    lut = _fnuz_byte_lut(w_fp8.device)
+    flat = w_fp8.view(torch.uint8).reshape(-1)
+    step = max(int(chunk_bytes), 1)
+    for begin in range(0, flat.numel(), step):
+        seg = flat[begin : begin + step]
+        seg.copy_(lut[seg.to(torch.int64)])
+    scales.mul_(2.0)
+    return w_fp8.view(torch.float8_e4m3fnuz), scales
+
+
 @lru_cache(maxsize=1)
 def _triton_native_kernel():
     """Native-fp8 blockwise GEMM: operands already e4m3fnuz; hardware

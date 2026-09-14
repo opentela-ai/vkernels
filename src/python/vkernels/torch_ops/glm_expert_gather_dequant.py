@@ -22,7 +22,8 @@ def _kernel():
 
     @triton.jit
     def _gather_dequant(
-        W, S, IDX, Y, O: tl.constexpr, I: tl.constexpr, BLOCK: tl.constexpr
+        W, S, IDX, Y, O: tl.constexpr, I: tl.constexpr, BLOCK: tl.constexpr,
+        FNUZ: tl.constexpr,
     ):
         selected = tl.program_id(0)
         offset = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -31,15 +32,29 @@ def _kernel():
         raw = tl.load(W + expert * (O * I) + offset, mask, 0).to(tl.int32)
         exponent = (raw >> 3) & 15
         mantissa = raw & 7
-        # Normal E4M3FN numbers have bias 7; all exponent-15 values except
-        # mantissa 7 are finite. Bit construction is exact in FP32.
-        bits = ((exponent + 120) << 23) | (mantissa << 20)
-        value = tl.where(
-            exponent == 0,
-            mantissa.to(tl.float32) * 0.001953125,
-            bits.to(tl.float32, bitcast=True),
-        )
-        value = tl.where((raw & 127) == 127, float("nan"), value)
+        if FNUZ:
+            # e4m3fnuz storage (issue #71 in-place conversion): bias 8, NaN
+            # only at 0x80, subnormals m*2^-10; stored scales are the
+            # DOUBLED scales, reproducing the original e4m3fn values
+            # exactly (verified exhaustive over all 256 bytes).
+            bits = ((exponent + 119) << 23) | (mantissa << 20)
+            value = tl.where(
+                exponent == 0,
+                mantissa.to(tl.float32) * 0.0009765625,
+                bits.to(tl.float32, bitcast=True),
+            )
+            value = tl.where(raw == 128, float("nan"), value)
+        else:
+            # Normal E4M3FN numbers have bias 7; all exponent-15 values
+            # except mantissa 7 are finite. Bit construction is exact in
+            # FP32.
+            bits = ((exponent + 120) << 23) | (mantissa << 20)
+            value = tl.where(
+                exponent == 0,
+                mantissa.to(tl.float32) * 0.001953125,
+                bits.to(tl.float32, bitcast=True),
+            )
+            value = tl.where((raw & 127) == 127, float("nan"), value)
         # Preserve -0 explicitly: arithmetic negation can be folded to 0-x,
         # which produces +0 for a zero input on the HIP compilation path.
         value = (value.to(tl.int32, bitcast=True) | ((raw & 128) << 24)).to(
@@ -53,8 +68,13 @@ def _kernel():
     return _gather_dequant
 
 
-def gather_dequant(weights, scales, indices, dtype=None):
+def gather_dequant(weights, scales, indices, dtype=None, storage="e4m3fn"):
     """Return contiguous [T,K,O,I] selected weights with 128x128 scales.
+
+    ``storage="e4m3fnuz"`` (issue #71) reads the IN-PLACE converted stacks
+    from ``e4m3fn_to_fnuz_inplace`` — fnuz bytes with DOUBLED fp32 scales
+    sharing the checkpoint's storage; values decode identically to the
+    e4m3fn path (verified exhaustive over all 256 bytes).
 
     Inputs must be contiguous GPU tensors on the same device. Indices must
     be valid expert IDs (as supplied by topk); bounds are not checked on the
@@ -72,8 +92,14 @@ def gather_dequant(weights, scales, indices, dtype=None):
         raise ValueError("expert dimensions must be positive multiples of 128")
     if scales.shape != (e, o // 128, i // 128):
         raise ValueError("expected scales [E,O/128,I/128]")
-    if weights.dtype != torch.float8_e4m3fn or scales.dtype != torch.float32:
-        raise TypeError("expected E4M3FN weights and FP32 scales")
+    if storage not in ("e4m3fn", "e4m3fnuz"):
+        raise ValueError(f"unknown weight storage {storage!r}")
+    fnuz = storage == "e4m3fnuz"
+    want = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
+    if weights.dtype != want or scales.dtype != torch.float32:
+        raise TypeError(
+            f"expected {'E4M3FNUZ' if fnuz else 'E4M3FN'} weights and FP32 scales"
+        )
     if indices.dtype != torch.int64 or dtype not in (torch.bfloat16, torch.float16):
         raise TypeError("expected int64 indices and BF16 or FP16 output")
     if any(
@@ -95,27 +121,36 @@ def gather_dequant(weights, scales, indices, dtype=None):
                 o,
                 i,
                 1024,
+                fnuz,
             )
     return out
 
 
-def gather_dequant_reference(weights, scales, indices, dtype=None):
-    """Gather + explicit E4M3FN block-dequant in torch (the oracle).
+def gather_dequant_reference(weights, scales, indices, dtype=None, storage="e4m3fn"):
+    """Gather + explicit E4M3FN/FNUZ block-dequant in torch (the oracle).
 
-    Mirrors the kernel's byte decode: bias-7 exponent reconstruction,
-    subnormal mantissa scaling, NaN on the all-ones mantissa/exponent
-    pattern, and the explicit sign bit (preserving -0).
+    Mirrors the kernel's byte decode: bias-7 (e4m3fn) or bias-8 (e4m3fnuz,
+    NaN only at 0x80, subnormals m*2^-10) exponent reconstruction,
+    subnormal mantissa scaling, NaN on the encoding-specific pattern, and
+    the explicit sign bit (preserving -0).
     """
     import torch
 
+    if storage not in ("e4m3fn", "e4m3fnuz"):
+        raise ValueError(f"unknown weight storage {storage!r}")
+    fnuz = storage == "e4m3fnuz"
     if dtype is None:
         dtype = torch.bfloat16
     raw = weights.view(torch.uint8).to(torch.int32)
     exponent, mantissa = (raw >> 3) & 15, raw & 7
-    bits = (((exponent + 120) << 23) | (mantissa << 20)).to(torch.int32)
+    bias_shift = 119 if fnuz else 120
+    sub_step = 0.0009765625 if fnuz else 0.001953125
+    bits = (((exponent + bias_shift) << 23) | (mantissa << 20)).to(torch.int32)
     value = bits.view(torch.float32)
-    value = torch.where(exponent == 0, mantissa.to(torch.float32) * 0.001953125, value)
-    value = torch.where((raw & 127) == 127, float("nan"), value)
+    value = torch.where(exponent == 0, mantissa.to(torch.float32) * sub_step, value)
+    value = torch.where(
+        (raw == 128) if fnuz else ((raw & 127) == 127), float("nan"), value
+    )
     value = value * torch.where((raw & 128) != 0, -1.0, 1.0)
     scale = scales.repeat_interleave(128, dim=1).repeat_interleave(128, dim=2)
     weight = (value * scale[:, : weights.shape[1], : weights.shape[2]]).to(dtype)

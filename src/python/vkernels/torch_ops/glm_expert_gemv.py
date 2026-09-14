@@ -52,6 +52,7 @@ def _kernel():
         BROADCAST: tl.constexpr,
         ROWS: tl.constexpr,
         COLS: tl.constexpr,
+        FNUZ: tl.constexpr,
     ):
         selected = tl.program_id(0)
         row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
@@ -63,13 +64,30 @@ def _kernel():
             0,
         ).to(tl.int32)
         exponent, mantissa = (raw >> 3) & 15, raw & 7
-        bits = ((exponent + 120) << 23) | (mantissa << 20)
-        value = tl.where(
-            exponent == 0,
-            mantissa.to(tl.float32) * 0.001953125,
-            bits.to(tl.float32, bitcast=True),
-        )
-        value = tl.where((raw & 127) == 127, float("nan"), value)
+        if FNUZ:
+            # e4m3fnuz storage (AMD-native fp8; issue #71 in-place
+            # conversion): bias 8, max finite 240, NaN ONLY at 0x80 (there
+            # is no -0), subnormals m*2^-10. The stored scales are the
+            # DOUBLED scales from e4m3fn_to_fnuz_inplace, so value*scale
+            # reproduces the original e4m3fn weight exactly (verified
+            # exhaustive over all 256 bytes). No hardware shortcut: CUDA
+            # has no fnuz dtype and this Triton rejects direct fp8-pointer
+            # loads, so both backends take the manual bit-decode.
+            bits = ((exponent + 119) << 23) | (mantissa << 20)
+            value = tl.where(
+                exponent == 0,
+                mantissa.to(tl.float32) * 0.0009765625,
+                bits.to(tl.float32, bitcast=True),
+            )
+            value = tl.where(raw == 128, float("nan"), value)
+        else:
+            bits = ((exponent + 120) << 23) | (mantissa << 20)
+            value = tl.where(
+                exponent == 0,
+                mantissa.to(tl.float32) * 0.001953125,
+                bits.to(tl.float32, bitcast=True),
+            )
+            value = tl.where((raw & 127) == 127, float("nan"), value)
         value = (value.to(tl.int32, bitcast=True) | ((raw & 128) << 24)).to(
             tl.float32, bitcast=True
         )
@@ -143,16 +161,25 @@ def _kernel():
     return _expert_gemv, _expert_gemv_native
 
 
-def expert_gemv(x, weights, scales, indices):
+def expert_gemv(x, weights, scales, indices, storage="e4m3fn"):
     """Return BF16 [T,K,O] for BF16 x[T,I] or x[T,K,I], T <= _t_cap().
 
     Contiguous GPU inputs and valid expert IDs are required. On NVIDIA the
     FN bytes are hardware-decoded (e4m3FN == e4m3nv semantics there); on
     gfx942 they are decoded explicitly, because its native fp8 is FNUZ
     (different bias/NaN encodings).
+
+    ``storage="e4m3fnuz"`` (issue #71) reads the IN-PLACE converted stacks
+    produced by ``e4m3fn_to_fnuz_inplace`` — fnuz bytes with DOUBLED fp32
+    scales, sharing the checkpoint's storage. The manual bit-decode handles
+    both backends there (CUDA has no fnuz dtype).
     """
     import torch
 
+    if storage not in ("e4m3fn", "e4m3fnuz"):
+        raise ValueError(f"unknown weight storage {storage!r}")
+    fnuz = storage == "e4m3fnuz"
+    want = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
     cap = _t_cap()
     if weights.ndim != 3 or indices.ndim != 2:
         raise ValueError("expected weights [E,O,I] and indices [T,K]")
@@ -166,12 +193,13 @@ def expert_gemv(x, weights, scales, indices):
         raise ValueError("expected scales [E,O/128,I/128]")
     if (
         x.dtype != torch.bfloat16
-        or weights.dtype != torch.float8_e4m3fn
+        or weights.dtype != want
         or scales.dtype != torch.float32
         or indices.dtype != torch.int64
     ):
         raise TypeError(
-            "requires BF16 activations, E4M3FN weights, FP32 scales, int64 indices"
+            "requires BF16 activations, "
+            f"{'E4M3FNUZ' if fnuz else 'E4M3FN'} weights, FP32 scales, int64 indices"
         )
     if any(not v.is_cuda or v.device != weights.device for v in (x, scales, indices)):
         raise ValueError("inputs must share a GPU device")
@@ -189,22 +217,44 @@ def expert_gemv(x, weights, scales, indices):
             # NVIDIA decodes e4m3FN natively: uint8 load + in-kernel bitcast
             # to float8e4nv (direct fp8-pointer loads are rejected by this
             # Triton), ~8x faster than the ~10-ALU-ops-per-element decode.
-            kernel = gemv if torch.version.hip else gemv_native
-            kernel[(t * k, triton.cdiv(o, 4))](
-                x,
-                weights.view(torch.uint8),
-                scales,
-                indices,
-                out,
-                o,
-                i,
-                k,
-                x.ndim == 2,
-                4,
-                triton.next_power_of_2(i),
-                num_warps=4,
-                enable_fp_fusion=False,
-            )
+            # fnuz STORAGE always takes the manual kernel (FNUZ=1): CUDA has
+            # no fnuz dtype to bitcast to, and the doubled-scale convention
+            # is part of the in-place conversion contract (issue #71).
+            if fnuz:
+                gemv[(t * k, triton.cdiv(o, 4))](
+                    x,
+                    weights.view(torch.uint8),
+                    scales,
+                    indices,
+                    out,
+                    o,
+                    i,
+                    k,
+                    x.ndim == 2,
+                    4,
+                    triton.next_power_of_2(i),
+                    True,
+                    num_warps=4,
+                    enable_fp_fusion=False,
+                )
+            else:
+                kernel = gemv if torch.version.hip else gemv_native
+                kernel[(t * k, triton.cdiv(o, 4))](
+                    x,
+                    weights.view(torch.uint8),
+                    scales,
+                    indices,
+                    out,
+                    o,
+                    i,
+                    k,
+                    x.ndim == 2,
+                    4,
+                    triton.next_power_of_2(i),
+                    False,
+                    num_warps=4,
+                    enable_fp_fusion=False,
+                )
     return out
 
 
