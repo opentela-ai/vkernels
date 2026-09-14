@@ -1,0 +1,67 @@
+{
+  "algos": {
+    "tn_8192_1_4096_ld_4096_4096_8192": "Gemm_Rocblas_621284994",
+    "tn_8192_2_4096_ld_4096_4096_8192": "Gemm_Rocblas_621284994"
+  },
+  "created": "2026-09-14T20:54:01Z",
+  "csv": "qkv_projection.tunable0.csv",
+  "csv_sha256": "sha256:fbc7effef8306bc2d6302d9301c450f7b9d2326cd502ef47391017a1fc43b827",
+  "device": {
+    "arch": "gfx942:sramecc+:xnack-",
+    "cu_count": 228
+  },
+  "job": "637209",
+  "kernel": "qkv_projection",
+  "notes": "produced by bench_qkv_projection.py; winners recorded as tuned, including Default where the autotuner chose it",
+  "op": "GemmTunableOp_BFloat16_TN",
+  "policy": {
+    "default_winners": "recorded"
+  },
+  "producer": {
+    "fingerprints": {
+      "meta/benchmarks/bench_qkv_projection.py": "sha256:12d44a235f443e4937cbc4f10e18c6260eee31059e9368be4b3e5797bd7532cf",
+      "src/python/vkernels/torch_ops/qkv_projection.py": "sha256:df9e950a4bf302a0aab634642b57db34ca68a98bcff3f8403850881dbec8ef07"
+    }
+  },
+  "quality_gates": {
+    "max_abs_vs_fp64_oracle": 0.008,
+    "max_rel_vs_fp64_oracle": 0.008,
+    "min_argmax_agreement": 0.95,
+    "model_nll_regression_max": 0.005,
+    "require_reference_repeat_identical": true
+  },
+  "schema": "vk-tuning-manifest/1",
+  "shapes": {
+    "tn_8192_1_4096_ld_4096_4096_8192": {
+      "K": 4096,
+      "M": 1,
+      "N": 8192,
+      "dtype": "bf16",
+      "layout": "TN",
+      "lda": 4096,
+      "ldb": 4096,
+      "ldc": 8192
+    },
+    "tn_8192_2_4096_ld_4096_4096_8192": {
+      "K": 4096,
+      "M": 2,
+      "N": 8192,
+      "dtype": "bf16",
+      "layout": "TN",
+      "lda": 4096,
+      "ldb": 4096,
+      "ldc": 8192
+    }
+  },
+  "software": {
+    "hip": 603,
+    "torch": "2.9.1"
+  },
+  "validators": {
+    "GCN_ARCH_NAME": "gfx942:sramecc+:xnack-",
+    "HIPBLASLT_VERSION": "1000-b4e5042b",
+    "HIP_VERSION": "603",
+    "PT_VERSION": "2.9.1",
+    "ROCBLAS_VERSION": "4.3.0.8ebd6c11"
+  }
+}
