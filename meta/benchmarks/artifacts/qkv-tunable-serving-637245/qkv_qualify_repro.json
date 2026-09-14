@@ -1,0 +1,38 @@
+{
+  "configured": {
+    "1": "Gemm_Hipblaslt_208015",
+    "2": "Gemm_Rocblas_-621289657"
+  },
+  "csv": "/iopsstor/scratch/cscs/xyao/floe-beverin/glm5-smoke/run-6nq15go2/work/qkv_report.tunable0.csv",
+  "default_winners_recorded": [],
+  "gates": [
+    {
+      "devices": 4,
+      "gate": "cold_warm_capture_parity",
+      "passed": true
+    }
+  ],
+  "manifest": {
+    "created": "2026-09-14T22:04:05Z",
+    "device": {
+      "arch": "gfx942:sramecc+:xnack-",
+      "cu_count": 228
+    },
+    "job": "637245",
+    "kernel": "qkv_projection",
+    "quality_gates": {
+      "max_abs_vs_fp64_oracle": 0.008,
+      "max_rel_vs_fp64_oracle": 0.008,
+      "min_argmax_agreement": 0.95,
+      "model_nll_regression_max": 0.005,
+      "require_reference_repeat_identical": true
+    },
+    "schema": "vk-tuning-manifest/1",
+    "software": {
+      "hip": 700,
+      "torch": "2.9.0a0"
+    }
+  },
+  "mode": "repro",
+  "passed": true
+}
