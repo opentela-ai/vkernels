@@ -320,7 +320,7 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   std::fprintf(stderr, "    [tol] out_rms=%.4g abs_tol=%.4g\n", out_rms,
                abs_tol);
 
-  bool ok = max_rel < 0.05;
+  bool ok = n_bad == 0;
   if (!ok) ++g_failures;
   std::printf("    EM=%d max_rel=%.4g -> %s", EM, max_rel, ok ? "PASS" : "FAIL");
   if (!ok) {
