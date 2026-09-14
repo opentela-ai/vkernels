@@ -77,6 +77,13 @@ uint16_t f2bf(float v) {
   return (uint16_t)(b >> 16);
 }
 
+float bf16_to_float(uint16_t v) {
+  uint32_t b = (uint32_t)v << 16;
+  float f;
+  std::memcpy(&f, &b, 4);
+  return f;
+}
+
 // Fill packed E2M1 weights + ue8m0 scales with deterministic random data.
 // Layouts match the kernel contract: w13 [E, 2*ispp, hidden/2] packed,
 // w13_scale [E, 2*ispp, hidden/32], w2 [E, hidden, ispp/2],
@@ -204,6 +211,34 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   std::fprintf(stderr, "[phase] launcher returned, syncing\n");
   CK(hipDeviceSynchronize(), "sync");
   std::fprintf(stderr, "[phase] device sync ok\n");
+
+  // Intermediate act comparison (matched by flat index across the two
+  // alignments): splits a gateup/A-load bug from a down/combine bug.
+  {
+    std::vector<uint16_t> act_gpu((size_t)EM * ispp);
+    CK(hipMemcpy(act_gpu.data(), dAct, (size_t)EM * ispp * 2,
+                 hipMemcpyDeviceToHost), "rdAct");
+    // per-alignment real-row lists keyed by flat
+    std::vector<int> pos_gpu(M * top_k, -1), pos_cpu(M * top_k, -1);
+    for (int i = 0; i < EM; ++i)
+      if (sids[i] < M * top_k) pos_gpu[sids[i]] = i;
+    for (int i = 0; i < EM_o; ++i)
+      if (sids_o[i] < M * top_k) pos_cpu[sids_o[i]] = i;
+    double act_rel = 0;
+    int act_bad = 0, act_worst_flat = -1;
+    for (int f = 0; f < M * top_k; ++f) {
+      if (pos_gpu[f] < 0 || pos_cpu[f] < 0) continue;
+      for (int c = 0; c < ispp; ++c) {
+        float g = bf16_to_float(act_gpu[(size_t)pos_gpu[f] * ispp + c]);
+        float x = bf16_to_float(act_cpu[(size_t)pos_cpu[f] * ispp + c]);
+        double r = std::fabs((double)g - x) / std::fmax(std::fabs((double)x), 1.0);
+        if (r > act_rel) { act_rel = r; act_worst_flat = f; }
+        if (r > 0.05) ++act_bad;
+      }
+    }
+    std::fprintf(stderr, "[act] max_rel=%.4g bad=%d/%d worst_flat=%d\n",
+                 act_rel, act_bad, M * top_k * ispp, act_worst_flat);
+  }
 
   std::vector<float> out_gpu((size_t)M * hidden);
   CK(hipMemcpy(out_gpu.data(), dOut, (size_t)M * hidden * 4,
