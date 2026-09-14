@@ -145,6 +145,75 @@ __device__ __forceinline__ void load_act_tile(
   }
 }
 
+// ---- A-tile staging (split form of load_a_tile / load_act_tile) ------
+// Same row/col ownership as load_a_tile; the global loads land in
+// registers so the next K-tile's A reads issue before the current
+// tile's LDS stores + MFMA (A is L2-hot at small M but still ~hundreds
+// of cycles on the critical path).
+struct PrefATile { uint2 v[4]; };
+
+__device__ __forceinline__ PrefATile prefetch_a_tile(
+    const uint16_t* __restrict__ A, const int32_t* __restrict__ sorted_ids,
+    int tk_base, int k_start, int stride, int M, int top_k, int lane,
+    int k_base = 0) {
+  int row = lane % kBM;
+  int base_col = (lane / kBM) * (kBK / (kWhreads / kBM));
+  int flat = sorted_ids[tk_base + row];
+  int N = M * top_k;
+  PrefATile p;
+  if (flat < N) {
+    int token = flat / top_k;
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      int col_off = base_col + g * 4;
+      const uint32_t* src =
+          (const uint32_t*)(&A[(size_t)token * stride + k_base + k_start + col_off]);
+      p.v[g] = *(const uint2*)(src);
+    }
+  } else {
+#pragma unroll
+    for (int g = 0; g < 4; ++g) p.v[g] = {};
+  }
+  return p;
+}
+
+__device__ __forceinline__ void store_a_tile_from_regs(
+    uint16_t sA[kBM][kBK], const PrefATile& p, int lane) {
+  int row = lane % kBM;
+  int base_col = (lane / kBM) * (kBK / (kWhreads / kBM));
+#pragma unroll
+  for (int g = 0; g < 4; ++g) {
+    int col_off = base_col + g * 4;
+    uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
+    dst[0] = p.v[g].x;
+    dst[1] = p.v[g].y;
+  }
+}
+
+__device__ __forceinline__ PrefATile prefetch_act_tile(
+    const uint16_t* __restrict__ act, const int32_t* __restrict__ sorted_ids,
+    int tk_base, int k_start, int ispp, int M, int top_k, int lane,
+    int k_base = 0) {
+  int row = lane % kBM;
+  int base_col = (lane / kBM) * (kBK / (kWhreads / kBM));
+  int flat = sorted_ids[tk_base + row];
+  int N = M * top_k;
+  PrefATile p;
+  if (flat < N) {
+    const uint16_t* src_row =
+        &act[(size_t)(tk_base + row) * ispp + k_base + k_start];
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      int col_off = base_col + g * 4;
+      p.v[g] = *(const uint2*)((const uint32_t*)(src_row + col_off));
+    }
+  } else {
+#pragma unroll
+    for (int g = 0; g < 4; ++g) p.v[g] = {};
+  }
+  return p;
+}
+
 // Dequant a packed fp4 weight column slice → sB[kBK][16].
 // packed/scale point at the [n_global, 0] origin; k_start selects the K tile.
 __device__ __forceinline__ void dequant_b_16cols(
@@ -520,34 +589,54 @@ void gateup_swiglu_kernel(
   v4f acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
   v4f acc_u = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  // Software pipeline: stage iter kb+1's packed weights in registers while
-  // iter kb dequants + MFMAs (see PrefBTile note above).
+  // Software pipeline, depth-2 (see PrefBTile note above): the loads for
+  // kb+2 issue while kb's dequant + MFMA run, so up to two iterations of
+  // DRAM latency hide behind compute.  A-tiles stage one deep (L2-hot).
+  // Ring validity: pbn0/pbu0/pa0 = tile kb (always valid in-loop); the
+  // kb+1 slots shift in only when the loop continues past kb; kb+2 slots
+  // are read only under the same condition they were written.
   const int nkb = hidden / kBK;
-  PrefBTile pbn = prefetch_b16<kKM>(bp_gate, sc_gate, 0, ispp, hidden / 2,
+  PrefATile pa0 = prefetch_a_tile(A, sorted_ids, tk_base, 0, hidden, M,
+                                  top_k, lane);
+  PrefBTile pbn0 = prefetch_b16<kKM>(bp_gate, sc_gate, 0, ispp, hidden / 2,
                                      hidden / kGroupSize, lane);
-  PrefBTile pbu = prefetch_b16<kKM>(bp_up, sc_up, 0, ispp, hidden / 2,
+  PrefBTile pbu0 = prefetch_b16<kKM>(bp_up, sc_up, 0, ispp, hidden / 2,
                                      hidden / kGroupSize, lane);
+  PrefATile pa1;
+  PrefBTile pbn1, pbu1;
+  if (nkb > 1) {
+    pa1 = prefetch_a_tile(A, sorted_ids, tk_base, kBK, hidden, M, top_k, lane);
+    pbn1 = prefetch_b16<kKM>(bp_gate, sc_gate, kBK, ispp, hidden / 2,
+                             hidden / kGroupSize, lane);
+    pbu1 = prefetch_b16<kKM>(bp_up, sc_up, kBK, ispp, hidden / 2,
+                             hidden / kGroupSize, lane);
+  }
   for (int kb = 0; kb < nkb; ++kb) {
     int ks = kb * kBK;
-    const bool has_next = kb + 1 < nkb;
-    PrefBTile pbn1, pbu1;
-    if (has_next) {
-      pbn1 = prefetch_b16<kKM>(bp_gate, sc_gate, ks + kBK, ispp, hidden / 2,
-                                hidden / kGroupSize, lane);
-      pbu1 = prefetch_b16<kKM>(bp_up, sc_up, ks + kBK, ispp, hidden / 2,
-                                hidden / kGroupSize, lane);
+    PrefATile pa2;
+    PrefBTile pbn2, pbu2;
+    if (kb + 2 < nkb) {
+      pa2 = prefetch_a_tile(A, sorted_ids, tk_base, ks + 2 * kBK, hidden, M,
+                            top_k, lane);
+      pbn2 = prefetch_b16<kKM>(bp_gate, sc_gate, ks + 2 * kBK, ispp,
+                               hidden / 2, hidden / kGroupSize, lane);
+      pbu2 = prefetch_b16<kKM>(bp_up, sc_up, ks + 2 * kBK, ispp,
+                               hidden / 2, hidden / kGroupSize, lane);
     }
-    // sA load and sB decode write different LDS buffers, so no barrier is
-    // needed between them; the barrier before MFMA orders both.
-    load_a_tile(sA, A, sorted_ids, tk_base, ks, hidden, M, top_k, lane);
-    dequant_b16_from_regs(sB_gate, pbn, lane);
-    dequant_b16_from_regs(sB_up, pbu, lane);
+    // sA store and sB decode write different LDS buffers, so no barrier
+    // is needed between them; the barrier before MFMA orders both.
+    store_a_tile_from_regs(sA, pa0, lane);
+    dequant_b16_from_regs(sB_gate, pbn0, lane);
+    dequant_b16_from_regs(sB_up, pbu0, lane);
     __syncthreads();
 
     mfma_k64(acc_g, sA, sB_gate, lane);
     mfma_k64(acc_u, sA, sB_up, lane);
     __syncthreads();
-    if (has_next) { pbn = pbn1; pbu = pbu1; }
+    // shift the ring (pa1/pbn1/pbu1 valid iff kb+1 < nkb, i.e. whenever
+    // the next iteration consumes them)
+    pa0 = pa1; pbn0 = pbn1; pbu0 = pbu1;
+    pa1 = pa2; pbn1 = pbn2; pbu1 = pbu2;
   }
 
   // Epilogue: bias + activation → act [EM, ispp] bf16 (single bf16 rounding).
@@ -611,25 +700,37 @@ void down_combine_kernel(
 
   v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  // Software pipeline (see PrefBTile note at gateup_swiglu_kernel): stage
-  // iter kb+1's packed weights in registers while iter kb dequants + MFMAs.
+  // Software pipeline, depth-2 (see gateup_swiglu_kernel).
   const int nkb = ispp / kBK;
-  PrefBTile pb = prefetch_b16_nmajor(bp, sc, 0, ispp / 2, ispp / kGroupSize,
-                                     lane);
+  PrefATile pa0 = prefetch_act_tile(act, sorted_ids, tk_base, 0, ispp, M,
+                                    top_k, lane);
+  PrefBTile pb0 = prefetch_b16_nmajor(bp, sc, 0, ispp / 2, ispp / kGroupSize,
+                                      lane);
+  PrefATile pa1;
+  PrefBTile pb1;
+  if (nkb > 1) {
+    pa1 = prefetch_act_tile(act, sorted_ids, tk_base, kBK, ispp, M, top_k,
+                            lane);
+    pb1 = prefetch_b16_nmajor(bp, sc, kBK, ispp / 2, ispp / kGroupSize, lane);
+  }
   for (int kb = 0; kb < nkb; ++kb) {
     int ks = kb * kBK;
-    const bool has_next = kb + 1 < nkb;
-    PrefBTile pb1;
-    if (has_next)
-      pb1 = prefetch_b16_nmajor(bp, sc, ks + kBK, ispp / 2, ispp / kGroupSize,
-                                lane);
-    load_act_tile(sA, act, sorted_ids, tk_base, ks, ispp, M, top_k, lane);
-    dequant_b16_from_regs(sB, pb, lane);
+    PrefATile pa2;
+    PrefBTile pb2;
+    if (kb + 2 < nkb) {
+      pa2 = prefetch_act_tile(act, sorted_ids, tk_base, ks + 2 * kBK, ispp,
+                              M, top_k, lane);
+      pb2 = prefetch_b16_nmajor(bp, sc, ks + 2 * kBK, ispp / 2,
+                                ispp / kGroupSize, lane);
+    }
+    store_a_tile_from_regs(sA, pa0, lane);
+    dequant_b16_from_regs(sB, pb0, lane);
     __syncthreads();
 
     mfma_k64(acc, sA, sB, lane);
     __syncthreads();
-    if (has_next) pb = pb1;
+    pa0 = pa1; pb0 = pb1;
+    pa1 = pa2; pb1 = pb2;
   }
 
   // Epilogue: bias + weight + scatter-add into out.
@@ -986,32 +1087,46 @@ __global__ void gateup_preact_kernel(
   v4f acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
   v4f acc_u = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  // Software pipeline (see PrefBTile note at gateup_swiglu_kernel).
+  // Software pipeline, depth-2 (see gateup_swiglu_kernel).
   const int nkb = hidden_k / kBK;
-  PrefBTile pbn = prefetch_b16_nmajor(bp_gate, sc_gate, 0, hidden_k / 2,
-                                      hidden_k / kGroupSize, lane);
-  PrefBTile pbu = prefetch_b16_nmajor(bp_up, sc_up, 0, hidden_k / 2,
-                                      hidden_k / kGroupSize, lane);
+  PrefATile pa0 = prefetch_a_tile(A, sorted_ids, tk_base, 0, a_stride, M,
+                                  top_k, lane, k_base);
+  PrefBTile pbn0 = prefetch_b16_nmajor(bp_gate, sc_gate, 0, hidden_k / 2,
+                                       hidden_k / kGroupSize, lane);
+  PrefBTile pbu0 = prefetch_b16_nmajor(bp_up, sc_up, 0, hidden_k / 2,
+                                       hidden_k / kGroupSize, lane);
+  PrefATile pa1;
+  PrefBTile pbn1, pbu1;
+  if (nkb > 1) {
+    pa1 = prefetch_a_tile(A, sorted_ids, tk_base, kBK, a_stride, M, top_k,
+                          lane, k_base);
+    pbn1 = prefetch_b16_nmajor(bp_gate, sc_gate, kBK, hidden_k / 2,
+                               hidden_k / kGroupSize, lane);
+    pbu1 = prefetch_b16_nmajor(bp_up, sc_up, kBK, hidden_k / 2,
+                               hidden_k / kGroupSize, lane);
+  }
   for (int kb = 0; kb < nkb; ++kb) {
     int ks = kb * kBK;
-    const bool has_next = kb + 1 < nkb;
-    PrefBTile pbn1, pbu1;
-    if (has_next) {
-      pbn1 = prefetch_b16_nmajor(bp_gate, sc_gate, ks + kBK, hidden_k / 2,
-                                 hidden_k / kGroupSize, lane);
-      pbu1 = prefetch_b16_nmajor(bp_up, sc_up, ks + kBK, hidden_k / 2,
-                                 hidden_k / kGroupSize, lane);
+    PrefATile pa2;
+    PrefBTile pbn2, pbu2;
+    if (kb + 2 < nkb) {
+      pa2 = prefetch_a_tile(A, sorted_ids, tk_base, ks + 2 * kBK, a_stride,
+                            M, top_k, lane, k_base);
+      pbn2 = prefetch_b16_nmajor(bp_gate, sc_gate, ks + 2 * kBK,
+                                 hidden_k / 2, hidden_k / kGroupSize, lane);
+      pbu2 = prefetch_b16_nmajor(bp_up, sc_up, ks + 2 * kBK,
+                                 hidden_k / 2, hidden_k / kGroupSize, lane);
     }
-    load_a_tile(sA, A, sorted_ids, tk_base, ks, a_stride, M, top_k, lane,
-                k_base);
-    dequant_b16_from_regs(sB_gate, pbn, lane);
-    dequant_b16_from_regs(sB_up, pbu, lane);
+    store_a_tile_from_regs(sA, pa0, lane);
+    dequant_b16_from_regs(sB_gate, pbn0, lane);
+    dequant_b16_from_regs(sB_up, pbu0, lane);
     __syncthreads();
 
     mfma_k64(acc_g, sA, sB_gate, lane);
     mfma_k64(acc_u, sA, sB_up, lane);
     __syncthreads();
-    if (has_next) { pbn = pbn1; pbu = pbu1; }
+    pa0 = pa1; pbn0 = pbn1; pbu0 = pbu1;
+    pa1 = pa2; pbn1 = pbn2; pbu1 = pbu2;
   }
 
   // Raw accumulators → gate_up (padding rows hold the zeroed-tile result).
@@ -1087,25 +1202,38 @@ __global__ void down_preact_kernel(
 
   v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  // Software pipeline (see PrefBTile note at gateup_swiglu_kernel).
+  // Software pipeline, depth-2 (see gateup_swiglu_kernel).
   const int nkb = ispp_k / kBK;
-  PrefBTile pb = prefetch_b16_nmajor(bp, sc, 0, ispp_k / 2,
-                                     ispp_k / kGroupSize, lane);
+  PrefATile pa0 = prefetch_act_tile(act, sorted_ids, tk_base, 0, a_stride, M,
+                                    top_k, lane, k_base);
+  PrefBTile pb0 = prefetch_b16_nmajor(bp, sc, 0, ispp_k / 2,
+                                      ispp_k / kGroupSize, lane);
+  PrefATile pa1;
+  PrefBTile pb1;
+  if (nkb > 1) {
+    pa1 = prefetch_act_tile(act, sorted_ids, tk_base, kBK, a_stride, M,
+                            top_k, lane, k_base);
+    pb1 = prefetch_b16_nmajor(bp, sc, kBK, ispp_k / 2, ispp_k / kGroupSize,
+                              lane);
+  }
   for (int kb = 0; kb < nkb; ++kb) {
     int ks = kb * kBK;
-    const bool has_next = kb + 1 < nkb;
-    PrefBTile pb1;
-    if (has_next)
-      pb1 = prefetch_b16_nmajor(bp, sc, ks + kBK, ispp_k / 2,
+    PrefATile pa2;
+    PrefBTile pb2;
+    if (kb + 2 < nkb) {
+      pa2 = prefetch_act_tile(act, sorted_ids, tk_base, ks + 2 * kBK,
+                              a_stride, M, top_k, lane, k_base);
+      pb2 = prefetch_b16_nmajor(bp, sc, ks + 2 * kBK, ispp_k / 2,
                                 ispp_k / kGroupSize, lane);
-    load_act_tile(sA, act, sorted_ids, tk_base, ks, a_stride, M, top_k, lane,
-                  k_base);
-    dequant_b16_from_regs(sB, pb, lane);
+    }
+    store_a_tile_from_regs(sA, pa0, lane);
+    dequant_b16_from_regs(sB, pb0, lane);
     __syncthreads();
 
     mfma_k64(acc, sA, sB, lane);
     __syncthreads();
-    if (has_next) pb = pb1;
+    pa0 = pa1; pb0 = pb1;
+    pa1 = pa2; pb1 = pb2;
   }
 
   // Raw accumulators → partial (padding rows hold the zeroed-tile result).
