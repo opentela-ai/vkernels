@@ -344,8 +344,20 @@ int main(int argc, char** argv) {
     run_case("bisect E=256 h7168 ispp=2048 M=64", 256, 7168, 2048, 16, 64,
              64, route_full, kSiTU);
   if (only == 0 || only == 12)
-    run_case("bisect E=8 h7168 ispp=4096 M=64", 8, 7168, 4096, 4, 64,
+    run_case("bisect E=8 h1024 ispp=512 M=64", 8, 1024, 512, 4, 64,
              64, route_small_full, kSiTU);
+  if (only == 0 || only == 13)
+    run_case("bisect E=8 h2048 ispp=512 M=64", 8, 2048, 512, 4, 64,
+             64, route_small_full, kSiTU);
+  if (only == 0 || only == 14)
+    run_case("bisect E=8 h4096 ispp=512 M=64", 8, 4096, 512, 4, 64,
+             64, route_small_full, kSiTU);
+  // 15. oracle sanity at M=64: the decode kernels were validated at M<=4;
+  //     if decode M=64 passes vs the same oracle, the oracle is right and
+  //     the prefill kernels are the wrong party.
+  if (only == 0 || only == 15)
+    run_case("decode E=256 h7168 ispp=4096 M=64 (oracle sanity)", 256, 7168,
+             4096, 16, 64, 16, route_full, kSiTU);
 
   if (g_failures) {
     std::printf("\n%d case(s) FAILED\n", g_failures);
