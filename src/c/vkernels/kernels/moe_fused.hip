@@ -46,6 +46,13 @@ static constexpr int kBM = 16,  kBN = 64, kBK = 64;
 // into spilling the prefetch ring (scr=332 B, 3x slower) — sB is left
 // unpadded and the launch_bounds hints untouched.
 static constexpr int kSA_P = kBK + 2;   // sA rows are [kSA_P]
+// sB row-pad (20 u16 = 10 words): the mfma B-fragment reads step k by 4
+// across lane groups; at stride 10 words the bank step is 40 = 8 mod 32,
+// so the four lane groups land on disjoint banks (was 8-way conflicted
+// at stride 8 words, where j*32 = 0 mod 32 erased the k difference).
+// Dequant stores drop 2-way -> ~1.25-way.  Hint unchanged: identical
+// allocator conditions to the known-good build.
+static constexpr int kSB_P = 16 + 4;    // sB rows are [kSB_P]
 static constexpr int kGroupSize = 32;
 static constexpr int kMfmaK    = 16;
 static constexpr int kWarps    = 4;
@@ -328,7 +335,7 @@ __device__ __forceinline__ PrefBTile prefetch_b16(
 // Decode a staged tile into sB[kBK][16].  Pure ALU + LDS; identical math
 // (and identical per-(kp,n) mapping) to dequant_b_16cols.
 __device__ __forceinline__ void dequant_b16_from_regs(
-    uint16_t sB[kBK][16], const PrefBTile& p, int lane) {
+    uint16_t sB[kBK][kSB_P], const PrefBTile& p, int lane) {
   constexpr int kPackedK = kBK / 2, kKpStep = kWhreads / 16;
   constexpr int kBytesPerThread = (kPackedK * 16) / kWhreads;
   int n = lane % 16;
@@ -351,7 +358,7 @@ __device__ __forceinline__ void dequant_b16_from_regs(
 
 // Run the K=64 MFMA loop (4 steps of K=16), accumulating into acc.
 __device__ __forceinline__ void mfma_k64(
-    v4f& acc, const uint16_t sA[kBM][kSA_P], const uint16_t sB[kBK][16],
+    v4f& acc, const uint16_t sA[kBM][kSA_P], const uint16_t sB[kBK][kSB_P],
     int lane) {
   for (int mf = 0; mf < kBK / kMfmaK; ++mf) {
     int m = lane % 16;
@@ -504,8 +511,8 @@ void gateup_swiglu_kernel(
     int activation, float beta, float linear_beta, int has_bias) {
 
   __shared__ uint16_t sA[kBM][kSA_P];
-  __shared__ uint16_t sB_gate[kBK][16];
-  __shared__ uint16_t sB_up[kBK][16];
+  __shared__ uint16_t sB_gate[kBK][kSB_P];
+  __shared__ uint16_t sB_up[kBK][kSB_P];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int warp_n = blockIdx.z;
@@ -635,7 +642,7 @@ void down_combine_kernel(
     int ispp, int hidden, int M, int top_k, int has_bias) {
 
   __shared__ uint16_t sA[kBM][kSA_P];
-  __shared__ uint16_t sB[kBK][16];
+  __shared__ uint16_t sB[kBK][kSB_P];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int warp_n = blockIdx.z;
@@ -1019,8 +1026,8 @@ __global__ void gateup_preact_kernel(
     int a_stride, int k_base, int hidden_k, int ispp, int M, int top_k) {
 
   __shared__ uint16_t sA[kBM][kSA_P];
-  __shared__ uint16_t sB_gate[kBK][16];
-  __shared__ uint16_t sB_up[kBK][16];
+  __shared__ uint16_t sB_gate[kBK][kSB_P];
+  __shared__ uint16_t sB_up[kBK][kSB_P];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int warp_n = blockIdx.z;
@@ -1140,7 +1147,7 @@ __global__ void down_preact_kernel(
     int a_stride, int k_base, int ispp_k, int hidden, int M, int top_k) {
 
   __shared__ uint16_t sA[kBM][kSA_P];
-  __shared__ uint16_t sB[kBK][16];
+  __shared__ uint16_t sB[kBK][kSB_P];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int warp_n = blockIdx.z;
