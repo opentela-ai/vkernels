@@ -134,23 +134,34 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   std::fprintf(stderr, "[phase] align ok EM=%d max_expert=%d\n", EM,
                *std::max_element(route.begin(), route.end()));
 
-  // Oracle inputs: per-sorted-row weights.
-  std::vector<float> tws(EM, 0.0f);
-  for (int i = 0; i < EM; ++i)
-    if (sids[i] < M * top_k) tws[i] = tw[sids[i]];
+  // Oracle alignment: the CPU oracle tiles per-16 (BLOCK_M=16) and indexes
+  // expert_ids per 16-row block, so it must be fed the decode alignment even
+  // when the GPU path runs the prefill (per-64) tiling — same contract as
+  // bench_moe_fused_prefill ("block_size=16 oracle") and
+  // test_moe_fused_prefill_correct.  The final out [M, hidden] is
+  // block-size invariant.
+  constexpr int kOracleBS = 16;
+  std::vector<int32_t> sids_o(E * kOracleBS), eids_o(E * kOracleBS / kOracleBS);
+  int EM_o = vkernels::kernels::moe_align_block_size(
+      tids.data(), M, top_k, kOracleBS, E, sids_o.data(), eids_o.data());
+
+  // Oracle inputs: per-sorted-row weights (per-16 alignment).
+  std::vector<float> tws_o(EM_o, 0.0f);
+  for (int i = 0; i < EM_o; ++i)
+    if (sids_o[i] < M * top_k) tws_o[i] = tw[sids_o[i]];
 
   std::vector<uint16_t> hA((size_t)M * hidden);
   for (size_t i = 0; i < hA.size(); ++i) hA[i] = f2bf(rnd(10, (int)i) * 0.1f);
 
-  // CPU oracle.
+  // CPU oracle (per-16 alignment).
   std::fprintf(stderr, "[phase] weights filled (w13=%.1f GB)\n",
                (double)w13.size() / (1 << 30));
-  std::vector<uint16_t> act_cpu((size_t)EM * ispp, 0);
+  std::vector<uint16_t> act_cpu((size_t)EM_o * ispp, 0);
   std::vector<float> out_cpu((size_t)M * hidden, 0.0f);
   vkernels::kernels::fused_moe_mxfp4_cpu(
       hA.data(), w13.data(), w13s.data(), w2.data(), w2s.data(),
-      sids.data(), tws.data(), eids.data(), act_cpu.data(), out_cpu.data(),
-      M, hidden, ispp, top_k, EM, group, LIMIT, activation, beta,
+      sids_o.data(), tws_o.data(), eids_o.data(), act_cpu.data(), out_cpu.data(),
+      M, hidden, ispp, top_k, EM_o, group, LIMIT, activation, beta,
       linear_beta, nullptr, nullptr);
   std::fprintf(stderr, "[phase] CPU oracle done\n");
 
