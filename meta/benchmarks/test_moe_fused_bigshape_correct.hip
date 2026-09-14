@@ -22,6 +22,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -161,17 +162,17 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   const size_t w13s_sz = (size_t)E * 2 * ispp * (hidden / group);
   const size_t w2_sz = (size_t)E * hidden * (ispp / 2);
   const size_t w2s_sz = (size_t)E * hidden * (ispp / group);
-  CK(hipMalloc(&dw13, w13_sz), "w13");
-  CK(hipMalloc(&dw13s, w13s_sz), "w13s");
-  CK(hipMalloc(&dw2, w2_sz), "w2");
-  CK(hipMalloc(&dw2s, w2s_sz), "w2s");
-  CK(hipMalloc(&dA, (size_t)M * hidden * 2), "A");
-  CK(hipMalloc(&dAct, (size_t)EM * ispp * 2), "act");
-  CK(hipMalloc(&dOut, (size_t)M * hidden * 4), "out");
-  CK(hipMalloc(&dTw, (size_t)M * top_k * 4), "tw");
-  CK(hipMalloc(&dTids, (size_t)M * top_k * 4), "tids");
-  CK(hipMalloc(&dSids, (size_t)EM * 4), "sids");
-  CK(hipMalloc(&dEids, (size_t)(EM / block_size) * 4), "eids");
+  CK(hipMalloc((void**)&dw13, w13_sz), "w13");
+  CK(hipMalloc((void**)&dw13s, w13s_sz), "w13s");
+  CK(hipMalloc((void**)&dw2, w2_sz), "w2");
+  CK(hipMalloc((void**)&dw2s, w2s_sz), "w2s");
+  CK(hipMalloc((void**)&dA, (size_t)M * hidden * 2), "A");
+  CK(hipMalloc((void**)&dAct, (size_t)EM * ispp * 2), "act");
+  CK(hipMalloc((void**)&dOut, (size_t)M * hidden * 4), "out");
+  CK(hipMalloc((void**)&dTw, (size_t)M * top_k * 4), "tw");
+  CK(hipMalloc((void**)&dTids, (size_t)M * top_k * 4), "tids");
+  CK(hipMalloc((void**)&dSids, (size_t)EM * 4), "sids");
+  CK(hipMalloc((void**)&dEids, (size_t)(EM / block_size) * 4), "eids");
   CK(hipMemcpy(dw13, w13.data(), w13_sz, hipMemcpyHostToDevice), "cpw13");
   CK(hipMemcpy(dw13s, w13s.data(), w13s_sz, hipMemcpyHostToDevice), "cpw13s");
   CK(hipMemcpy(dw2, w2.data(), w2_sz, hipMemcpyHostToDevice), "cpw2");
