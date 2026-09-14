@@ -1,0 +1,5 @@
+Investigate issues https://github.com/opentela-ai/vkernels/issues, close which are already landed
+
+---
+
+Can we start working on them one by one?

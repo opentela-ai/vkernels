@@ -1,0 +1,29 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M2FEYNE4CKRT5PMVDPE714WD",
+  "strategy": "manual-commit",
+  "branch": "feat/fp8-inplace-fnuz-71",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "src/python/vkernels/torch_ops/glm_expert_gather_dequant.py",
+    "src/python/vkernels/torch_ops/glm_expert_gemv.py",
+    "src/python/vkernels/torch_ops/glm_fp8_blockwise_gemm.py",
+    "tests/python/test_glm_fp8_fnuz_inplace.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 5173605,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 79988,
+    "api_call_count": 79
+  }
+}
