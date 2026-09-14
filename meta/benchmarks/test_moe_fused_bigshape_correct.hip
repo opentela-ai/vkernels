@@ -458,7 +458,7 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
         const uint8_t* sp = w2s.data() + (size_t)e0 * w2s_eb
                             + (size_t)nb2 * 64 * (ispp / group);
         for (int kb = 0; kb < ispp / 64; ++kb) {
-          dequant_weight_tile(bp + (size_t)kb * 32, sp + kb * (64 / group),
+          vkernels::kernels::dequant_weight_tile(bp + (size_t)kb * 32, sp + kb * (64 / group),
                               tile.data(), 64, 64, group,
                               ispp / 2, ispp / group, 1);
           for (int c = 0; c < 64; ++c) {
