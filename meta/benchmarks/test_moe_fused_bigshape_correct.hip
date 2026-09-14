@@ -263,18 +263,23 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
       if (sids_o[i] < M * top_k) pos_cpu[sids_o[i]] = i;
     double act_rel = 0;
     int act_bad = 0, act_worst_flat = -1;
+    int act_diff = 0;
     for (int f = 0; f < M * top_k; ++f) {
       if (pos_gpu[f] < 0 || pos_cpu[f] < 0) continue;
       for (int c = 0; c < ispp; ++c) {
         float g = bf16_to_float(act_gpu[(size_t)pos_gpu[f] * ispp + c]);
         float x = bf16_to_float(act_cpu[(size_t)pos_cpu[f] * ispp + c]);
+        if (g != x) ++act_diff;
         double r = std::fabs((double)g - x) / std::fmax(std::fabs((double)x), 1.0);
         if (r > act_rel) { act_rel = r; act_worst_flat = f; }
         if (r > 0.05) ++act_bad;
       }
     }
-    std::fprintf(stderr, "[act] max_rel=%.4g bad=%d/%d worst_flat=%d\n",
-                 act_rel, act_bad, M * top_k * ispp, act_worst_flat);
+    std::fprintf(stderr, "[act] max_rel=%.4g bad=%d/%d worst_flat=%d "
+                 "diff=%d/%d (%.3g%%)\n",
+                 act_rel, act_bad, M * top_k * ispp, act_worst_flat,
+                 act_diff, M * top_k * ispp,
+                 100.0 * act_diff / (M * top_k * ispp));
   }
 
   std::vector<float> out_gpu((size_t)M * hidden);
@@ -438,22 +443,6 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
       const int rg_row = pos_gpu[flat0], rc_row = pos_cpu[flat0];
       std::printf("    [fp64] slot=%d expert=%d flat=%d act_rows gpu=%d orc=%d\n",
                   s0, e0, flat0, rg_row, rc_row);
-      // act ULP histogram for this row pair
-      {
-        int ulp1 = 0, ulp2 = 0, ulpm = 0, same = 0;
-        for (int k = 0; k < ispp; ++k) {
-          float g = bf16_to_float(act_gpu[(size_t)rg_row * ispp + k]);
-          float x = bf16_to_float(act_cpu[(size_t)rc_row * ispp + k]);
-          if (g == x) { ++same; continue; }
-          double r = std::fabs((double)g - x) /
-                     std::fmax(std::fabs((double)x), 1e-30);
-          if (r <= 0.004) ++ulp1;
-          else if (r <= 0.008) ++ulp2;
-          else ++ulpm;
-        }
-        std::printf("    [fp64] act row: same=%d 1ulp=%d 2ulp=%d >2ulp=%d "
-                    "(of %d)\n", same, ulp1, ulp2, ulpm, ispp);
-      }
       std::vector<uint16_t> tile((size_t)64 * 64);
       std::vector<double> part_dg(64, 0.0), part_do(64, 0.0);
       double worst_g = 0, worst_o = 0, worst_x = 0;
@@ -501,6 +490,58 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
       std::printf("    [fp64] max|gpu_D - ref(gpu_act)|=%.4g "
                   "max|orc_D - ref(orc_act)|=%.4g worst col=%d\n",
                   worst_g, worst_o, wc);
+    } else {
+      // VKMOE_DELTA_SLOT unset: fp64-check ALL slots of t0 (vs each slot's
+      // own act row) and report the worst offender per slot.
+      const size_t w2_eb = (size_t)hidden * (ispp / 2);
+      const size_t w2s_eb = (size_t)hidden * (ispp / group);
+      std::vector<uint16_t> tile((size_t)64 * 64);
+      std::vector<double> part_dg(64, 0.0), part_do(64, 0.0);
+      for (int s0 = 0; s0 < top_k; ++s0) {
+        const int flat0 = t0 * top_k + s0;
+        const int e0 = route[(size_t)t0 * top_k + s0];
+        const double w0 = tw[(size_t)t0 * top_k + s0];
+        const int rg_row = pos_gpu[flat0], rc_row = pos_cpu[flat0];
+        double worst_g = 0, worst_o = 0;
+        int wc = -1;
+        for (int nb2 = 0; nb2 < hidden / 64; ++nb2) {
+          const uint8_t* bp = w2.data() + (size_t)e0 * w2_eb
+                              + (size_t)nb2 * 64 * (ispp / 2);
+          const uint8_t* sp = w2s.data() + (size_t)e0 * w2s_eb
+                              + (size_t)nb2 * 64 * (ispp / group);
+          for (int kb = 0; kb < ispp / 64; ++kb) {
+            vkernels::kernels::dequant_weight_tile(
+                bp + (size_t)kb * 32, sp + kb * (64 / group),
+                tile.data(), 64, 64, group, ispp / 2, ispp / group, 1);
+            for (int c = 0; c < 64; ++c) {
+              double dref_g = 0, dref_o = 0;
+              for (int k = 0; k < 64; ++k) {
+                double wv = bf16_to_float(tile[(size_t)k * 64 + c]);
+                dref_g += (double)bf16_to_float(
+                              act_gpu[(size_t)rg_row * ispp + kb * 64 + k]) * wv;
+                dref_o += (double)bf16_to_float(
+                              act_cpu[(size_t)rc_row * ispp + kb * 64 + k]) * wv;
+              }
+              part_dg[c] += dref_g;
+              part_do[c] += dref_o;
+            }
+          }
+          for (int c = 0; c < 64; ++c) {
+            const int col = nb2 * 64 + c;
+            const double gpu_d = singles[(size_t)s0 * hidden + col] / w0;
+            const double orc_d = osingles[(size_t)s0 * hidden + col] / w0;
+            double eg = std::fabs(gpu_d - part_dg[c]);
+            double eo = std::fabs(orc_d - part_do[c]);
+            if (eg > worst_g) worst_g = eg;
+            if (eo > worst_o) { worst_o = eo; wc = col; }
+            part_dg[c] = 0.0;
+            part_do[c] = 0.0;
+          }
+        }
+        std::printf("    [fp64] s=%2d e=%3d max|gpu_D-ref(gpu_act)|=%.3g "
+                    "max|orc_D-ref(orc_act)|=%.3g worst col=%d\n",
+                    s0, e0, worst_g, worst_o, wc);
+      }
     }
     // restore the full-weight device run for any later use
     CK(hipMemcpy(dTw, tw.data(), (size_t)M * top_k * 4, hipMemcpyHostToDevice),
