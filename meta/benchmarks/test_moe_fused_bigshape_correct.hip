@@ -273,6 +273,22 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
                 worst_c, worst_g, worst_c2);
     std::printf("\n      [rel>0.05: %d/%d elems, %d/%d tokens]", n_bad,
                 M * hidden, tokens_bad, M);
+    // Sparse-fault forensics: list every bad element (capped) with the
+    // slot layout of its token, so a dropped/swapped contribution is
+    // visible against the routing.
+    if (n_bad <= 64) {
+      for (int t = 0; t < M; ++t) {
+        for (int c = 0; c < hidden; ++c) {
+          int i = t * hidden + c;
+          double r = std::fabs((double)out_gpu[i] - (double)out_cpu[i]) /
+                     std::fmax(std::fabs((double)out_cpu[i]), 1.0);
+          if (r > 0.05)
+            std::printf("\n      BAD t=%d c=%d gpu=%.4f cpu=%.4f rel=%.3f",
+                        t, c, out_gpu[i], out_cpu[i], r);
+        }
+      }
+      std::printf("\n");
+    }
   }
   std::printf("\n");
 
