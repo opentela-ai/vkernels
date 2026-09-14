@@ -83,7 +83,7 @@ def main():
                   "including Default where the autotuner chose it")
         # store repo-root-relative source paths so the manifest is portable
         manifest["producer"]["fingerprints"] = {
-            str(path.relative_to(repo_root)): digest
+            str(Path(path).relative_to(repo_root)): digest
             for path, digest in manifest["producer"]["fingerprints"].items()}
         environment = tuning_manifest.collect_environment()
         if environment is not None:
