@@ -209,6 +209,117 @@ __device__ __forceinline__ void dequant_b_16cols_kmajor(
   }
 }
 
+// ======================================================================
+//  Decode software pipeline: register prefetch of the next K-tile's B
+//  bytes (issue #41, items 3/5 — latency-bound decode).
+//
+//  The decode K-loop is fully serial per block: 64 threads = one
+//  wavefront, so every __syncthreads() stalls the only wavefront, and at
+//  M<=8 there are too few blocks to hide the DRAM latency cross-block
+//  (the default harness runs 32 gateup blocks on 228 CUs).  Each
+//  iteration exposed the full global-read latency on the critical path:
+//  load → dequant → barrier → MFMA → barrier → (next load).
+//
+//  Fix: stage iter kb+1's packed fp4 bytes + ue8m0 scales in REGISTERS
+//  (the cold DRAM stream — A is L2-hot at small M, re-read by every
+//  N-tile) while iter kb's dequant + MFMA execute.  Zero extra LDS
+//  (the full sA+sB double-buffer was tried before and reverted: it
+//  halved occupancy), ~4 VGPRs per staged tile.
+//
+//  The (kp, n) each thread owns is layout-independent — only the byte
+//  addresses differ between N-major and K-major — so prefetch comes in
+//  two flavors and the register→LDS decode is shared.  Index math is
+//  identical to dequant_b_16cols / dequant_b_16cols_kmajor, so outputs
+//  are bit-identical; the old functions stay for the prefill kernels.
+// ======================================================================
+struct PrefBTile {
+  // 8 packed bytes (4 K-nibbles each) + 8 ue8m0 scale bytes, one per
+  // (it -> kp = lane/16 + it*4) pair; kBytesPerThread*kWhreads covers the
+  // full kBK x 16 tile (kp max = 3 + 7*4 = 31 < kPackedK, so no guard).
+  uint8_t pb[8];
+  uint8_t sc[8];
+};
+
+__device__ __forceinline__ PrefBTile prefetch_b16_nmajor(
+    const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scale,
+    int k_start, int stride_packed, int stride_scale_n, int lane) {
+  constexpr int kPackedK = kBK / 2, kKpStep = kWhreads / 16;
+  constexpr int kBytesPerThread = (kPackedK * 16) / kWhreads;
+  int n = lane % 16;
+  int kp_base = lane / 16;
+  int kp_off = k_start / 2;
+  int sc_off = k_start / kGroupSize;
+  PrefBTile p;
+#pragma unroll
+  for (int it = 0; it < kBytesPerThread; ++it) {
+    int kp = kp_base + it * kKpStep;
+    p.pb[it] = packed[n * stride_packed + kp_off + kp];
+    int gi = (kp * 2) / kGroupSize;
+    p.sc[it] = scale[n * stride_scale_n + sc_off + gi];
+  }
+  return p;
+}
+
+__device__ __forceinline__ PrefBTile prefetch_b16_kmajor(
+    const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scale,
+    int k_start, int stride_k, int stride_scale_k, int lane) {
+  constexpr int kPackedK = kBK / 2, kKpStep = kWhreads / 16;
+  constexpr int kBytesPerThread = (kPackedK * 16) / kWhreads;
+  int n = lane % 16;
+  int kp_base = lane / 16;
+  int kp_off = k_start / 2;
+  int sc_off = k_start / kGroupSize;
+  PrefBTile p;
+#pragma unroll
+  for (int it = 0; it < kBytesPerThread; ++it) {
+    int kp = kp_base + it * kKpStep;
+    p.pb[it] = packed[(kp_off + kp) * stride_k + n];
+    int gi = (kp * 2) / kGroupSize;
+    p.sc[it] = scale[(sc_off + gi) * stride_scale_k + n];
+  }
+  return p;
+}
+
+// Layout-dispatching flavor used by the gate/up kernel (template mirrors
+// the kKM switch of gateup_swiglu_kernel): kmajor uses stride_k for both
+// packed and scale (the N-fast slabs), nmajor uses the per-column strides.
+template <bool kKM>
+__device__ __forceinline__ PrefBTile prefetch_b16(
+    const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scale,
+    int k_start, int stride_k, int stride_packed, int stride_scale_n,
+    int lane) {
+  if constexpr (kKM)
+    return prefetch_b16_kmajor(packed, scale, k_start, stride_k, stride_k,
+                               lane);
+  else
+    return prefetch_b16_nmajor(packed, scale, k_start, stride_packed,
+                               stride_scale_n, lane);
+}
+
+// Decode a staged tile into sB[kBK][16].  Pure ALU + LDS; identical math
+// (and identical per-(kp,n) mapping) to dequant_b_16cols.
+__device__ __forceinline__ void dequant_b16_from_regs(
+    uint16_t sB[kBK][16], const PrefBTile& p, int lane) {
+  constexpr int kPackedK = kBK / 2, kKpStep = kWhreads / 16;
+  constexpr int kBytesPerThread = (kPackedK * 16) / kWhreads;
+  int n = lane % 16;
+  int kp_base = lane / 16;
+#pragma unroll
+  for (int it = 0; it < kBytesPerThread; ++it) {
+    int kp = kp_base + it * kKpStep;
+    uint8_t pb = p.pb[it];
+    float s = ue8m0_decode(p.sc[it]);
+    uint32_t flo = fp4nib_to_f32bits(pb & 0x0F);
+    float vlo; __builtin_memcpy(&vlo, &flo, sizeof(float));
+    vlo *= s; __builtin_memcpy(&flo, &vlo, sizeof(float));
+    sB[kp * 2][n] = f32bits_to_bf16(flo);
+    uint32_t fhi = fp4nib_to_f32bits((pb >> 4) & 0x0F);
+    float vhi; __builtin_memcpy(&vhi, &fhi, sizeof(float));
+    vhi *= s; __builtin_memcpy(&fhi, &vhi, sizeof(float));
+    sB[kp * 2 + 1][n] = f32bits_to_bf16(fhi);
+  }
+}
+
 // Run the K=64 MFMA loop (4 steps of K=16), accumulating into acc.
 __device__ __forceinline__ void mfma_k64(
     v4f& acc, const uint16_t sA[kBM][kBK], const uint16_t sB[kBK][16],
@@ -409,25 +520,34 @@ void gateup_swiglu_kernel(
   v4f acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
   v4f acc_u = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  for (int kb = 0; kb < hidden / kBK; ++kb) {
+  // Software pipeline: stage iter kb+1's packed weights in registers while
+  // iter kb dequants + MFMAs (see PrefBTile note above).
+  const int nkb = hidden / kBK;
+  PrefBTile pbn = prefetch_b16<kKM>(bp_gate, sc_gate, 0, ispp, hidden / 2,
+                                     hidden / kGroupSize, lane);
+  PrefBTile pbu = prefetch_b16<kKM>(bp_up, sc_up, 0, ispp, hidden / 2,
+                                     hidden / kGroupSize, lane);
+  for (int kb = 0; kb < nkb; ++kb) {
     int ks = kb * kBK;
-    // sA load and sB dequant write different LDS buffers, so no barrier is
+    const bool has_next = kb + 1 < nkb;
+    PrefBTile pbn1, pbu1;
+    if (has_next) {
+      pbn1 = prefetch_b16<kKM>(bp_gate, sc_gate, ks + kBK, ispp, hidden / 2,
+                                hidden / kGroupSize, lane);
+      pbu1 = prefetch_b16<kKM>(bp_up, sc_up, ks + kBK, ispp, hidden / 2,
+                                hidden / kGroupSize, lane);
+    }
+    // sA load and sB decode write different LDS buffers, so no barrier is
     // needed between them; the barrier before MFMA orders both.
     load_a_tile(sA, A, sorted_ids, tk_base, ks, hidden, M, top_k, lane);
-    if constexpr (kKM) {
-      dequant_b_16cols_kmajor(sB_gate, bp_gate, sc_gate, ks, ispp, ispp, lane);
-      dequant_b_16cols_kmajor(sB_up,   bp_up,   sc_up,   ks, ispp, ispp, lane);
-    } else {
-      dequant_b_16cols(sB_gate, bp_gate, sc_gate, ks,
-                       hidden / 2, hidden / kGroupSize, lane);
-      dequant_b_16cols(sB_up, bp_up, sc_up, ks,
-                       hidden / 2, hidden / kGroupSize, lane);
-    }
+    dequant_b16_from_regs(sB_gate, pbn, lane);
+    dequant_b16_from_regs(sB_up, pbu, lane);
     __syncthreads();
 
     mfma_k64(acc_g, sA, sB_gate, lane);
     mfma_k64(acc_u, sA, sB_up, lane);
     __syncthreads();
+    if (has_next) { pbn = pbn1; pbu = pbu1; }
   }
 
   // Epilogue: bias + activation → act [EM, ispp] bf16 (single bf16 rounding).
@@ -491,14 +611,25 @@ void down_combine_kernel(
 
   v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  for (int kb = 0; kb < ispp / kBK; ++kb) {
+  // Software pipeline (see PrefBTile note at gateup_swiglu_kernel): stage
+  // iter kb+1's packed weights in registers while iter kb dequants + MFMAs.
+  const int nkb = ispp / kBK;
+  PrefBTile pb = prefetch_b16_nmajor(bp, sc, 0, ispp / 2, ispp / kGroupSize,
+                                     lane);
+  for (int kb = 0; kb < nkb; ++kb) {
     int ks = kb * kBK;
+    const bool has_next = kb + 1 < nkb;
+    PrefBTile pb1;
+    if (has_next)
+      pb1 = prefetch_b16_nmajor(bp, sc, ks + kBK, ispp / 2, ispp / kGroupSize,
+                                lane);
     load_act_tile(sA, act, sorted_ids, tk_base, ks, ispp, M, top_k, lane);
-    dequant_b_16cols(sB, bp, sc, ks, ispp / 2, ispp / kGroupSize, lane);
+    dequant_b16_from_regs(sB, pb, lane);
     __syncthreads();
 
     mfma_k64(acc, sA, sB, lane);
     __syncthreads();
+    if (has_next) pb = pb1;
   }
 
   // Epilogue: bias + weight + scatter-add into out.
@@ -855,19 +986,32 @@ __global__ void gateup_preact_kernel(
   v4f acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
   v4f acc_u = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  for (int kb = 0; kb < hidden_k / kBK; ++kb) {
+  // Software pipeline (see PrefBTile note at gateup_swiglu_kernel).
+  const int nkb = hidden_k / kBK;
+  PrefBTile pbn = prefetch_b16_nmajor(bp_gate, sc_gate, 0, hidden_k / 2,
+                                      hidden_k / kGroupSize, lane);
+  PrefBTile pbu = prefetch_b16_nmajor(bp_up, sc_up, 0, hidden_k / 2,
+                                      hidden_k / kGroupSize, lane);
+  for (int kb = 0; kb < nkb; ++kb) {
     int ks = kb * kBK;
+    const bool has_next = kb + 1 < nkb;
+    PrefBTile pbn1, pbu1;
+    if (has_next) {
+      pbn1 = prefetch_b16_nmajor(bp_gate, sc_gate, ks + kBK, hidden_k / 2,
+                                 hidden_k / kGroupSize, lane);
+      pbu1 = prefetch_b16_nmajor(bp_up, sc_up, ks + kBK, hidden_k / 2,
+                                 hidden_k / kGroupSize, lane);
+    }
     load_a_tile(sA, A, sorted_ids, tk_base, ks, a_stride, M, top_k, lane,
                 k_base);
-    dequant_b_16cols(sB_gate, bp_gate, sc_gate, ks,
-                     hidden_k / 2, hidden_k / kGroupSize, lane);
-    dequant_b_16cols(sB_up, bp_up, sc_up, ks,
-                     hidden_k / 2, hidden_k / kGroupSize, lane);
+    dequant_b16_from_regs(sB_gate, pbn, lane);
+    dequant_b16_from_regs(sB_up, pbu, lane);
     __syncthreads();
 
     mfma_k64(acc_g, sA, sB_gate, lane);
     mfma_k64(acc_u, sA, sB_up, lane);
     __syncthreads();
+    if (has_next) { pbn = pbn1; pbu = pbu1; }
   }
 
   // Raw accumulators → gate_up (padding rows hold the zeroed-tile result).
@@ -943,15 +1087,25 @@ __global__ void down_preact_kernel(
 
   v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  for (int kb = 0; kb < ispp_k / kBK; ++kb) {
+  // Software pipeline (see PrefBTile note at gateup_swiglu_kernel).
+  const int nkb = ispp_k / kBK;
+  PrefBTile pb = prefetch_b16_nmajor(bp, sc, 0, ispp_k / 2,
+                                     ispp_k / kGroupSize, lane);
+  for (int kb = 0; kb < nkb; ++kb) {
     int ks = kb * kBK;
+    const bool has_next = kb + 1 < nkb;
+    PrefBTile pb1;
+    if (has_next)
+      pb1 = prefetch_b16_nmajor(bp, sc, ks + kBK, ispp_k / 2,
+                                ispp_k / kGroupSize, lane);
     load_act_tile(sA, act, sorted_ids, tk_base, ks, a_stride, M, top_k, lane,
                   k_base);
-    dequant_b_16cols(sB, bp, sc, ks, ispp_k / 2, ispp_k / kGroupSize, lane);
+    dequant_b16_from_regs(sB, pb, lane);
     __syncthreads();
 
     mfma_k64(acc, sA, sB, lane);
     __syncthreads();
+    if (has_next) pb = pb1;
   }
 
   // Raw accumulators → partial (padding rows hold the zeroed-tile result).
