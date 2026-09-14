@@ -212,25 +212,33 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   double max_rel = 0;
   int worst_t = -1, worst_c = -1;
   float worst_g = 0, worst_c2 = 0;
+  int n_bad = 0, tokens_bad = 0;
   for (int t = 0; t < M; ++t) {
+    int t_bad = 0;
     for (int c = 0; c < hidden; ++c) {
       int i = t * hidden + c;
       double e = std::fabs((double)out_gpu[i] - (double)out_cpu[i]);
       double r = e / std::fmax(std::fabs((double)out_cpu[i]), 1.0);
+      if (r > 0.05) ++t_bad;
       if (r > max_rel) {
         max_rel = r;
         worst_t = t; worst_c = c;
         worst_g = out_gpu[i]; worst_c2 = out_cpu[i];
       }
     }
+    if (t_bad) ++tokens_bad;
+    n_bad += t_bad;
   }
 
   bool ok = max_rel < 0.05;
   if (!ok) ++g_failures;
   std::printf("    EM=%d max_rel=%.4g -> %s", EM, max_rel, ok ? "PASS" : "FAIL");
-  if (!ok)
-    std::printf("  [worst token=%d col=%d gpu=%.4f cpu=%.4f]", worst_t,
+  if (!ok) {
+    std::printf("\n      [worst token=%d col=%d gpu=%.4f cpu=%.4f]", worst_t,
                 worst_c, worst_g, worst_c2);
+    std::printf("\n      [rel>0.05: %d/%d elems, %d/%d tokens]", n_bad,
+                M * hidden, tokens_bad, M);
+  }
   std::printf("\n");
 
   CK(hipFree(dw13), "f"); CK(hipFree(dw13s), "f"); CK(hipFree(dw2), "f");
@@ -322,6 +330,21 @@ int main(int argc, char** argv) {
                             route_small.end());
   if (only == 0 || only == 8)
     run_case("prefill small M=64 no-padding", 8, 512, 512, 4, 64,
+             64, route_small_full, kSiTU);
+
+  // 9-12. shape bisection of the case-6 failure: same M=64 no-padding
+  //  routing, growing one dimension at a time.
+  if (only == 0 || only == 9)
+    run_case("bisect E=256 h7168 ispp=512 M=64", 256, 7168, 512, 16, 64,
+             64, route_full, kSiTU);
+  if (only == 0 || only == 10)
+    run_case("bisect E=256 h7168 ispp=1024 M=64", 256, 7168, 1024, 16, 64,
+             64, route_full, kSiTU);
+  if (only == 0 || only == 11)
+    run_case("bisect E=256 h7168 ispp=2048 M=64", 256, 7168, 2048, 16, 64,
+             64, route_full, kSiTU);
+  if (only == 0 || only == 12)
+    run_case("bisect E=8 h7168 ispp=4096 M=64", 8, 7168, 4096, 4, 64,
              64, route_small_full, kSiTU);
 
   if (g_failures) {

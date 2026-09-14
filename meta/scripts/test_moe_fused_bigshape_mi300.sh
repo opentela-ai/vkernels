@@ -59,6 +59,10 @@ skip 5 "prefill small E=8 h512 ispp=512"
 case_n 6 "prefill ispp=4096 M=64 no-padding"
 case_n 7 "prefill ispp=4096 M=2 padded"
 case_n 8 "prefill small M=64 no-padding"
+case_n 9 "bisect E=256 h7168 ispp=512 M=64"
+case_n 10 "bisect E=256 h7168 ispp=1024 M=64"
+case_n 11 "bisect E=256 h7168 ispp=2048 M=64"
+case_n 12 "bisect E=8 h7168 ispp=4096 M=64"
 if [ "$CASE_RC" -ne 0 ]; then echo "cases failed rc=$CASE_RC"; exit "$CASE_RC"; fi
 
 echo; echo "###### 2. previously-faulting bench: E=256 ispp=4096 (with CPU oracle) ######"
