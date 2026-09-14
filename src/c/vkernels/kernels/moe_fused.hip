@@ -36,6 +36,16 @@ typedef float v4f __attribute__((ext_vector_type(4)));
 typedef short v4s __attribute__((ext_vector_type(4)));
 
 static constexpr int kBM = 16,  kBN = 64, kBK = 64;
+// LDS bank-spread pads for the decode-path tiles.  gfx942 LDS has 32
+// 4-byte banks; with natural strides the whole sA row group maps to one
+// bank ((row*64+n)*2/4 mod 32 = col/2, row term vanishes) and sB reads
+// collide 8-way — rocprof counted ~446 bank conflicts per K-iteration
+// per block (5.48M per gateup launch at the default shape).  Padded
+// strides spread rows across banks: sA 66 u16 = 33 words (odd → row*33
+// mod 32 unique per row), sB 20 u16 = 10 words (mfma B-fragment reads
+// at k-step 4 → bank step 40 ≡ 8 mod 32 → disjoint across lane groups).
+static constexpr int kSA_P = kBK + 2;   // sA rows are [kSA_P]
+static constexpr int kSB_P = 16 + 4;    // sB rows are [kSB_P]
 static constexpr int kGroupSize = 32;
 static constexpr int kMfmaK    = 16;
 static constexpr int kWarps    = 4;
@@ -88,62 +98,12 @@ __device__ __forceinline__ float epilogue_act(
 // `k_base` is the column offset into each A row where the calling rank's
 // weight shard starts (0 for the single-rank fused call; r*hidden/tp for a
 // TP rank consuming a w13 shard of width hidden/tp).
-__device__ __forceinline__ void load_a_tile(
-    uint16_t sA[kBM][kBK], const uint16_t* __restrict__ A,
-    const int32_t* __restrict__ sorted_ids, int tk_base,
-    int k_start, int stride, int M, int top_k, int lane, int k_base = 0) {
-  int row = lane % kBM;
-  int base_col = (lane / kBM) * (kBK / (kWhreads / kBM));
-  int flat = sorted_ids[tk_base + row];
-  int N = M * top_k;
-  if (flat < N) {
-    int token = flat / top_k;
-    for (int g = 0; g < 4; ++g) {
-      int col_off = base_col + g * 4;
-      const uint32_t* src = (const uint32_t*)(&A[(size_t)token * stride + k_base + k_start + col_off]);
-      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
-      uint2 v = *(const uint2*)(src);
-      dst[0] = v.x; dst[1] = v.y;
-    }
-  } else {
-    for (int g = 0; g < 4; ++g) {
-      int col_off = base_col + g * 4;
-      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
-      dst[0] = 0; dst[1] = 0;
-    }
-  }
-}
 
 // Load the act tile [EM, ispp] into shared memory, indexed by SORTED ROW
 // (tk_base + row).  Each expert's intermediate output occupies its own
 // sorted row, so top_k>1 does not overwrite.
 // `k_base` is the column offset into each act row where the calling rank's
 // w2 shard starts (0 for the fused call; r*ispp/tp for a TP rank).
-__device__ __forceinline__ void load_act_tile(
-    uint16_t sA[kBM][kBK], const uint16_t* __restrict__ act,
-    const int32_t* __restrict__ sorted_ids, int tk_base,
-    int k_start, int ispp, int M, int top_k, int lane, int k_base = 0) {
-  int row = lane % kBM;
-  int base_col = (lane / kBM) * (kBK / (kWhreads / kBM));
-  int flat = sorted_ids[tk_base + row];
-  int N = M * top_k;
-  if (flat < N) {
-    const uint16_t* src_row = &act[(size_t)(tk_base + row) * ispp + k_base + k_start];
-    for (int g = 0; g < 4; ++g) {
-      int col_off = base_col + g * 4;
-      const uint32_t* src = (const uint32_t*)(src_row + col_off);
-      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
-      uint2 v = *(const uint2*)(src);
-      dst[0] = v.x; dst[1] = v.y;
-    }
-  } else {
-    for (int g = 0; g < 4; ++g) {
-      int col_off = base_col + g * 4;
-      uint32_t* dst = (uint32_t*)(&sA[row][col_off]);
-      dst[0] = 0; dst[1] = 0;
-    }
-  }
-}
 
 // ---- A-tile staging (split form of load_a_tile / load_act_tile) ------
 // Same row/col ownership as load_a_tile; the global loads land in
@@ -178,7 +138,7 @@ __device__ __forceinline__ PrefATile prefetch_a_tile(
 }
 
 __device__ __forceinline__ void store_a_tile_from_regs(
-    uint16_t sA[kBM][kBK], const PrefATile& p, int lane) {
+    uint16_t sA[kBM][kSA_P], const PrefATile& p, int lane) {
   int row = lane % kBM;
   int base_col = (lane / kBM) * (kBK / (kWhreads / kBM));
 #pragma unroll
@@ -216,33 +176,6 @@ __device__ __forceinline__ PrefATile prefetch_act_tile(
 
 // Dequant a packed fp4 weight column slice → sB[kBK][16].
 // packed/scale point at the [n_global, 0] origin; k_start selects the K tile.
-__device__ __forceinline__ void dequant_b_16cols(
-    uint16_t sB[kBK][16],
-    const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scale,
-    int k_start, int stride_packed, int stride_scale_n, int lane) {
-  int n = lane % 16;
-  int kp_base = lane / 16;
-  constexpr int kPackedK = kBK/2, kKpStep = kWhreads/16;
-  constexpr int kBytesPerThread = (kPackedK * 16) / kWhreads;
-  int kp_off = k_start / 2;
-  int sc_off = k_start / kGroupSize;
-  for (int it = 0; it < kBytesPerThread; ++it) {
-    int kp = kp_base + it * kKpStep;
-    if (kp >= kPackedK) break;
-    uint8_t pb = packed[n * stride_packed + kp_off + kp];
-    int gi = (kp * 2) / kGroupSize;
-    uint8_t sval = scale[n * stride_scale_n + sc_off + gi];
-    float s = ue8m0_decode(sval);
-    uint32_t flo = fp4nib_to_f32bits(pb & 0x0F);
-    float vlo; __builtin_memcpy(&vlo, &flo, sizeof(float));
-    vlo *= s; __builtin_memcpy(&flo, &vlo, sizeof(float));
-    sB[kp*2][n] = f32bits_to_bf16(flo);
-    uint32_t fhi = fp4nib_to_f32bits((pb>>4) & 0x0F);
-    float vhi; __builtin_memcpy(&vhi, &fhi, sizeof(float));
-    vhi *= s; __builtin_memcpy(&fhi, &vhi, sizeof(float));
-    sB[kp*2+1][n] = f32bits_to_bf16(fhi);
-  }
-}
 
 // Dequant a packed fp4 weight column slice → sB[kBK][16], K-MAJOR layout.
 // packed is [E, 2, hidden/2, ispp] and scale is [E, 2, hidden/kGroupSize,
@@ -250,33 +183,6 @@ __device__ __forceinline__ void dequant_b_16cols(
 // columns owned by this block (lane % 16) read ONE coalesced 16-byte cache
 // line per (kp) instead of 16 scattered cache lines in the N-major layout
 // above (issue #41, item 4).  `stride_k` = ispp (the number of columns).
-__device__ __forceinline__ void dequant_b_16cols_kmajor(
-    uint16_t sB[kBK][16],
-    const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scale,
-    int k_start, int stride_k, int stride_scale_k, int lane) {
-  int n = lane % 16;
-  int kp_base = lane / 16;
-  constexpr int kPackedK = kBK/2, kKpStep = kWhreads/16;
-  constexpr int kBytesPerThread = (kPackedK * 16) / kWhreads;
-  int kp_off = k_start / 2;
-  int sc_off = k_start / kGroupSize;
-  for (int it = 0; it < kBytesPerThread; ++it) {
-    int kp = kp_base + it * kKpStep;
-    if (kp >= kPackedK) break;
-    uint8_t pb = packed[(kp_off + kp) * stride_k + n];
-    int gi = (kp * 2) / kGroupSize;
-    uint8_t sval = scale[(sc_off + gi) * stride_scale_k + n];
-    float s = ue8m0_decode(sval);
-    uint32_t flo = fp4nib_to_f32bits(pb & 0x0F);
-    float vlo; __builtin_memcpy(&vlo, &flo, sizeof(float));
-    vlo *= s; __builtin_memcpy(&flo, &vlo, sizeof(float));
-    sB[kp*2][n] = f32bits_to_bf16(flo);
-    uint32_t fhi = fp4nib_to_f32bits((pb>>4) & 0x0F);
-    float vhi; __builtin_memcpy(&vhi, &fhi, sizeof(float));
-    vhi *= s; __builtin_memcpy(&fhi, &vhi, sizeof(float));
-    sB[kp*2+1][n] = f32bits_to_bf16(fhi);
-  }
-}
 
 // ======================================================================
 //  Decode software pipeline: register prefetch of the next K-tile's B
@@ -368,7 +274,7 @@ __device__ __forceinline__ PrefBTile prefetch_b16(
 // Decode a staged tile into sB[kBK][16].  Pure ALU + LDS; identical math
 // (and identical per-(kp,n) mapping) to dequant_b_16cols.
 __device__ __forceinline__ void dequant_b16_from_regs(
-    uint16_t sB[kBK][16], const PrefBTile& p, int lane) {
+    uint16_t sB[kBK][kSB_P], const PrefBTile& p, int lane) {
   constexpr int kPackedK = kBK / 2, kKpStep = kWhreads / 16;
   constexpr int kBytesPerThread = (kPackedK * 16) / kWhreads;
   int n = lane % 16;
@@ -391,7 +297,7 @@ __device__ __forceinline__ void dequant_b16_from_regs(
 
 // Run the K=64 MFMA loop (4 steps of K=16), accumulating into acc.
 __device__ __forceinline__ void mfma_k64(
-    v4f& acc, const uint16_t sA[kBM][kBK], const uint16_t sB[kBK][16],
+    v4f& acc, const uint16_t sA[kBM][kSA_P], const uint16_t sB[kBK][kSB_P],
     int lane) {
   for (int mf = 0; mf < kBK / kMfmaK; ++mf) {
     int m = lane % 16;
@@ -531,7 +437,7 @@ __device__ __forceinline__ void mfma_k64_pf(
 // stride hidden/2 per column, scattered reads) or K-major
 // [E,2,hidden/2,ispp] (issue #41, item 4, coalesced 16-byte column reads).
 template <bool kKM = false>
-__global__ __launch_bounds__(kWhreads, 10)
+__global__ __launch_bounds__(kWhreads, 8)
 void gateup_swiglu_kernel(
     const uint16_t* __restrict__ A,
     const uint8_t*  __restrict__ w13,
@@ -543,9 +449,9 @@ void gateup_swiglu_kernel(
     int hidden, int ispp, int M, int top_k, float swiglu_limit,
     int activation, float beta, float linear_beta, int has_bias) {
 
-  __shared__ uint16_t sA[kBM][kBK];
-  __shared__ uint16_t sB_gate[kBK][16];
-  __shared__ uint16_t sB_up[kBK][16];
+  __shared__ uint16_t sA[kBM][kSA_P];
+  __shared__ uint16_t sB_gate[kBK][kSB_P];
+  __shared__ uint16_t sB_up[kBK][kSB_P];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int warp_n = blockIdx.z;
@@ -674,8 +580,8 @@ void down_combine_kernel(
     const int32_t*  __restrict__ expert_ids,
     int ispp, int hidden, int M, int top_k, int has_bias) {
 
-  __shared__ uint16_t sA[kBM][kBK];
-  __shared__ uint16_t sB[kBK][16];
+  __shared__ uint16_t sA[kBM][kSA_P];
+  __shared__ uint16_t sB[kBK][kSB_P];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int warp_n = blockIdx.z;
@@ -1058,9 +964,9 @@ __global__ void gateup_preact_kernel(
     const int32_t*  __restrict__ expert_ids,
     int a_stride, int k_base, int hidden_k, int ispp, int M, int top_k) {
 
-  __shared__ uint16_t sA[kBM][kBK];
-  __shared__ uint16_t sB_gate[kBK][16];
-  __shared__ uint16_t sB_up[kBK][16];
+  __shared__ uint16_t sA[kBM][kSA_P];
+  __shared__ uint16_t sB_gate[kBK][kSB_P];
+  __shared__ uint16_t sB_up[kBK][kSB_P];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int warp_n = blockIdx.z;
@@ -1179,8 +1085,8 @@ __global__ void down_preact_kernel(
     const int32_t*  __restrict__ expert_ids,
     int a_stride, int k_base, int ispp_k, int hidden, int M, int top_k) {
 
-  __shared__ uint16_t sA[kBM][kBK];
-  __shared__ uint16_t sB[kBK][16];
+  __shared__ uint16_t sA[kBM][kSA_P];
+  __shared__ uint16_t sB[kBK][kSB_P];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int warp_n = blockIdx.z;
