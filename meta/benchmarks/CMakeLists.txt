@@ -191,6 +191,17 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_moe_fused_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_moe_fused_correct)
 
+  # Big-shape fused-MoE correctness (issue #41 blocker): the kernels used to
+  # compute per-expert weight offsets in INT32, which wraps negative once
+  # expert * hidden * ispp/2 >= 2^31 — the "memory access fault at
+  # ispp >= 4096" on gfx942.  Validates GPU vs CPU oracle at and beyond the
+  # old wrap thresholds (ispp=4096 E=256; ispp=33792 E=32), decode + prefill
+  # regimes, with routing pinned to the previously-wrapping expert ids.
+  add_executable(test_moe_fused_bigshape_correct test_moe_fused_bigshape_correct.hip)
+  target_link_libraries(test_moe_fused_bigshape_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_moe_fused_bigshape_correct PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_moe_fused_bigshape_correct)
+
   # C ABI correctness: same data as test_moe_fused_correct, exercised
   # through the extern "C" boundary (vkernels::vkernels_hip) that ctypes /
   # torch.ops.load_library / Rust consumers use.

@@ -389,12 +389,21 @@ void gateup_swiglu_kernel(
     bp_up   = w13 + (size_t)(expert * 2 + 1) * slab + n_global;
     sc_up   = w13_scale + (size_t)(expert * 2 + 1) * slab_s + n_global;
   } else {
-    int w13_bytes = 2 * ispp * (hidden / 2);
-    int w13s_bytes = 2 * ispp * (hidden / kGroupSize);
-    bp_gate = w13 + expert * w13_bytes + n_global * (hidden / 2);
-    sc_gate = w13_scale + expert * w13s_bytes + n_global * (hidden / kGroupSize);
-    bp_up   = w13 + expert * w13_bytes + (n_global + ispp) * (hidden / 2);
-    sc_up   = w13_scale + expert * w13s_bytes + (n_global + ispp) * (hidden / kGroupSize);
+    // 64-bit byte offsets (issue #41): expert * w13_bytes exceeds INT32 at
+    // large shapes (E=256, hidden=7168, ispp=4096: 255 * 29.4 MB = 7.5 GB >
+    // 2^31) and wraps to a negative offset -> memory access fault. The
+    // K-major branch above is safe ((size_t) cast on the slab index); the
+    // down GEMM and the prefill/dist kernels had the same defect.
+    const size_t w13_bytes  = 2 * (size_t)ispp * (hidden / 2);
+    const size_t w13s_bytes = 2 * (size_t)ispp * (hidden / kGroupSize);
+    bp_gate = w13 + expert * w13_bytes
+                  + (size_t)n_global * (hidden / 2);
+    sc_gate = w13_scale + expert * w13s_bytes
+                  + (size_t)n_global * (hidden / kGroupSize);
+    bp_up   = w13 + expert * w13_bytes
+                  + (size_t)(n_global + ispp) * (hidden / 2);
+    sc_up   = w13_scale + expert * w13s_bytes
+                  + (size_t)(n_global + ispp) * (hidden / kGroupSize);
   }
 
   v4f acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -465,15 +474,20 @@ void down_combine_kernel(
   if (expert < 0) return;
 
   int tk_base = pid_m * kBM;
-  int w2_bytes = hidden * (ispp / 2);
-  int w2s_bytes = hidden * (ispp / kGroupSize);
+  // 64-bit byte offsets (issue #41): expert * w2_bytes = e * hidden * ispp/2
+  // exceeds INT32 at large shapes (E=32, hidden=7168, ispp=33792: 31 * 121 MB
+  // = 3.75 GB > 2^31) and wraps negative -> memory access fault. This kernel
+  // is shared by the N-major and K-major gate/up paths, which is why the
+  // fault was --kmajor-independent.
+  const size_t w2_bytes  = (size_t)hidden * (ispp / 2);
+  const size_t w2s_bytes = (size_t)hidden * (ispp / kGroupSize);
   int lane = threadIdx.x;
   int n_global = pid_n * kBN + warp_n * 16;
 
   const uint8_t* bp = w2 + expert * w2_bytes
-      + n_global * (ispp / 2);
+      + (size_t)n_global * (ispp / 2);
   const uint8_t* sc = w2_scale + expert * w2s_bytes
-      + n_global * (ispp / kGroupSize);
+      + (size_t)n_global * (ispp / kGroupSize);
 
   v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -532,21 +546,23 @@ void gateup_swiglu_kernel_prefill(
   if (expert < 0) return;
 
   int tk_base = pid_m * kBM_pf;
-  int w13_bytes = 2 * ispp * (hidden / 2);
-  int w13s_bytes = 2 * ispp * (hidden / kGroupSize);
+  // 64-bit byte offsets (issue #41): see gateup_swiglu_kernel — same
+  // INT32 wrap of expert * w13_bytes in the prefill (64x64-tile) regime.
+  const size_t w13_bytes  = 2 * (size_t)ispp * (hidden / 2);
+  const size_t w13s_bytes = 2 * (size_t)ispp * (hidden / kGroupSize);
   int tid = threadIdx.x;
   int lane = tid & 63;
   int warp = tid >> 6;
   int n_global = pid_n * kBN;
 
   const uint8_t* bp_gate = w13 + expert * w13_bytes
-      + n_global * (hidden / 2);
+      + (size_t)n_global * (hidden / 2);
   const uint8_t* sc_gate = w13_scale + expert * w13s_bytes
-      + n_global * (hidden / kGroupSize);
+      + (size_t)n_global * (hidden / kGroupSize);
   const uint8_t* bp_up = w13 + expert * w13_bytes
-      + (n_global + ispp) * (hidden / 2);
+      + (size_t)(n_global + ispp) * (hidden / 2);
   const uint8_t* sc_up = w13_scale + expert * w13s_bytes
-      + (n_global + ispp) * (hidden / kGroupSize);
+      + (size_t)(n_global + ispp) * (hidden / kGroupSize);
 
   v4f acc_g[kNF], acc_u[kNF];
 #pragma unroll
@@ -619,17 +635,19 @@ void down_combine_kernel_prefill(
   if (expert < 0) return;
 
   int tk_base = pid_m * kBM_pf;
-  int w2_bytes = hidden * (ispp / 2);
-  int w2s_bytes = hidden * (ispp / kGroupSize);
+  // 64-bit byte offsets (issue #41): see down_combine_kernel — same INT32
+  // wrap of expert * w2_bytes in the prefill (64x64-tile) regime.
+  const size_t w2_bytes  = (size_t)hidden * (ispp / 2);
+  const size_t w2s_bytes = (size_t)hidden * (ispp / kGroupSize);
   int tid = threadIdx.x;
   int lane = tid & 63;
   int warp = tid >> 6;
   int n_global = pid_n * kBN;
 
   const uint8_t* bp = w2 + expert * w2_bytes
-      + n_global * (ispp / 2);
+      + (size_t)n_global * (ispp / 2);
   const uint8_t* sc = w2_scale + expert * w2s_bytes
-      + n_global * (ispp / kGroupSize);
+      + (size_t)n_global * (ispp / kGroupSize);
 
   v4f acc[kNF];
 #pragma unroll
@@ -818,19 +836,21 @@ __global__ void gateup_preact_kernel(
   if (expert < 0) return;
 
   int tk_base = pid_m * kBM;
-  int w13_bytes = 2 * ispp * (hidden_k / 2);
-  int w13s_bytes = 2 * ispp * (hidden_k / kGroupSize);
+  // 64-bit byte offsets (issue #41): see gateup_swiglu_kernel — same INT32
+  // wrap in the TP-stage (distributed) gate/up kernel.
+  const size_t w13_bytes  = 2 * (size_t)ispp * (hidden_k / 2);
+  const size_t w13s_bytes = 2 * (size_t)ispp * (hidden_k / kGroupSize);
   int lane = threadIdx.x;
   int n_global = pid_n * kBN + warp_n * 16;
 
   const uint8_t* bp_gate = w13 + expert * w13_bytes
-      + n_global * (hidden_k / 2);
+      + (size_t)n_global * (hidden_k / 2);
   const uint8_t* sc_gate = w13_scale + expert * w13s_bytes
-      + n_global * (hidden_k / kGroupSize);
+      + (size_t)n_global * (hidden_k / kGroupSize);
   const uint8_t* bp_up = w13 + expert * w13_bytes
-      + (n_global + ispp) * (hidden_k / 2);
+      + (size_t)(n_global + ispp) * (hidden_k / 2);
   const uint8_t* sc_up = w13_scale + expert * w13s_bytes
-      + (n_global + ispp) * (hidden_k / kGroupSize);
+      + (size_t)(n_global + ispp) * (hidden_k / kGroupSize);
 
   v4f acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
   v4f acc_u = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -909,15 +929,17 @@ __global__ void down_preact_kernel(
   if (expert < 0) return;
 
   int tk_base = pid_m * kBM;
-  int w2_bytes = hidden * (ispp_k / 2);
-  int w2s_bytes = hidden * (ispp_k / kGroupSize);
+  // 64-bit byte offsets (issue #41): see down_combine_kernel — same INT32
+  // wrap in the TP-stage (distributed) down kernel.
+  const size_t w2_bytes  = (size_t)hidden * (ispp_k / 2);
+  const size_t w2s_bytes = (size_t)hidden * (ispp_k / kGroupSize);
   int lane = threadIdx.x;
   int n_global = pid_n * kBN + warp_n * 16;
 
   const uint8_t* bp = w2 + expert * w2_bytes
-      + n_global * (ispp_k / 2);
+      + (size_t)n_global * (ispp_k / 2);
   const uint8_t* sc = w2_scale + expert * w2s_bytes
-      + n_global * (ispp_k / kGroupSize);
+      + (size_t)n_global * (ispp_k / kGroupSize);
 
   v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
