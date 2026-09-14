@@ -202,6 +202,9 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   CK(hipMemcpy(dSids, sids.data(), (size_t)EM * 4, hipMemcpyHostToDevice), "cpSids");
   CK(hipMemcpy(dEids, eids.data(), (size_t)(EM / block_size) * 4, hipMemcpyHostToDevice), "cpEids");
   CK(hipMemset(dOut, 0, (size_t)M * hidden * 4), "zOut");
+  // Padding act rows are never written by gateup; zero them so the down
+  // GEMM cannot multiply garbage/NaN patterns into skipped rows.
+  CK(hipMemset(dAct, 0, (size_t)EM * ispp * 2), "zAct");
   std::fprintf(stderr, "[phase] device buffers ok, launching fused_moe_mxfp4\n");
 
   vkernels::kernels::hip::fused_moe_mxfp4(
@@ -211,6 +214,34 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   std::fprintf(stderr, "[phase] launcher returned, syncing\n");
   CK(hipDeviceSynchronize(), "sync");
   std::fprintf(stderr, "[phase] device sync ok\n");
+
+  // Determinism probe: identical inputs + fresh memset, run twice; the
+  // two outputs must be bitwise equal for a data-race-free kernel.
+  {
+    std::vector<float> out_run1((size_t)M * hidden);
+    CK(hipMemcpy(out_run1.data(), dOut, (size_t)M * hidden * 4,
+                 hipMemcpyDeviceToHost), "rdOut1");
+    CK(hipMemset(dOut, 0, (size_t)M * hidden * 4), "zOut2");
+    CK(hipMemset(dAct, 0, (size_t)EM * ispp * 2), "zAct2");
+    vkernels::kernels::hip::fused_moe_mxfp4(
+        dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
+        M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
+        linear_beta, nullptr, nullptr, block_size, false);
+    CK(hipDeviceSynchronize(), "sync2");
+    std::vector<float> out_run2((size_t)M * hidden);
+    CK(hipMemcpy(out_run2.data(), dOut, (size_t)M * hidden * 4,
+                 hipMemcpyDeviceToHost), "rdOut2");
+    int nd = 0;
+    double md = 0;
+    for (int i = 0; i < M * hidden; ++i)
+      if (out_run1[i] != out_run2[i]) {
+        ++nd;
+        md = std::fmax(md, std::fabs((double)out_run1[i] - out_run2[i]));
+      }
+    std::fprintf(stderr, "[determinism] differing elements: %d/%d "
+                 "(max |delta| = %.4g)%s\n", nd, M * hidden, md,
+                 nd ? "  -> NON-DETERMINISTIC (race)" : "");
+  }
 
   // Intermediate act comparison (matched by flat index across the two
   // alignments): splits a gateup/A-load bug from a down/combine bug.
