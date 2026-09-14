@@ -258,8 +258,13 @@ void moe_gateup_cpu(
   std::vector<float> acc_gate(BLOCK_M * BLOCK_N);
   std::vector<float> acc_up(BLOCK_M * BLOCK_N);
 
-  int w13_expert_bytes  = 2 * ispp * (hidden_k / 2);
-  int w13s_expert_bytes = 2 * ispp * (hidden_k / group_size);
+  // 64-bit per-expert offsets (issue #41): expert * w13_bytes exceeds INT32
+  // at large shapes (E=256, hidden=7168, ispp=4096: 255 * 29.4 MB = 7.5 GB),
+  // wrapping negative -> segfault — same defect as the HIP kernels.
+  const std::size_t w13_expert_bytes  =
+      2 * static_cast<std::size_t>(ispp) * (hidden_k / 2);
+  const std::size_t w13s_expert_bytes =
+      2 * static_cast<std::size_t>(ispp) * (hidden_k / group_size);
 
   int num_m_blocks = EM / BLOCK_M;
   int num_n_blocks = ispp / BLOCK_N;
@@ -437,8 +442,12 @@ void moe_down_cpu(
   std::vector<uint16_t> tile_down(BLOCK_K * BLOCK_N);
   std::vector<uint16_t> tile_A(BLOCK_M * BLOCK_K);
 
-  int w2_expert_bytes  = hidden * (ispp_k / 2);
-  int w2s_expert_bytes = hidden * (ispp_k / group_size);
+  // 64-bit per-expert offsets (issue #41): see moe_gateup_cpu — expert *
+  // w2_bytes exceeds INT32 at e >= 147 (h7168, ispp=4096).
+  const std::size_t w2_expert_bytes  =
+      static_cast<std::size_t>(hidden) * (ispp_k / 2);
+  const std::size_t w2s_expert_bytes =
+      static_cast<std::size_t>(hidden) * (ispp_k / group_size);
 
   int num_m_blocks = EM / BLOCK_M;
   int num_down_n_blocks = hidden / BLOCK_N;

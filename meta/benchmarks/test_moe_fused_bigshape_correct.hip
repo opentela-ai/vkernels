@@ -1,0 +1,688 @@
+// meta/benchmarks/test_moe_fused_bigshape_correct.hip
+//
+// Regression test for issue #41's "GPU memory-access fault at ispp >= 4096"
+// blocker: the fused-MoE HIP kernels computed per-expert weight byte offsets
+// (expert * w13_bytes, expert * w2_bytes) in INT32, which wraps negative once
+//   expert * hidden * ispp/2  >= 2^31   (down:   e >= 147 at h=7168, ispp=4096)
+//   expert * 2 * ispp * hidden/2 >= 2^31 (gateup: e >= 74  at h=7168, ispp=4096)
+// and faults (or silently reads the wrong expert) at large shapes.  The
+// kernels now compute those offsets in 64-bit; this test validates GPU vs
+// CPU oracle exactly at and beyond the old wrap thresholds:
+//
+//   1. decode, E=256 h7168 ispp=4096, routing bracketing the wrap thresholds
+//      (e = 73..255) — both stages previously wrapped;
+//   2. decode, all 16 top-k slots on expert 255 (worst-case offset);
+//   3. prefill (block_size=64) at the same shape — 64x64-tile kernels had
+//      the same defect;
+//   4. decode, E=32 h7168 ispp=33792 — the documented "~12 GB resident"
+//      per-GPU TP=8 shard shape that faulted on beverin (e >= 18 wraps).
+//
+// Weights are real (random E2M1 + ue8m0), so this validates numerics, not
+// just absence-of-fault.  GPU-only; run on a MI300A/gfx942 node.
+
+#include <hip/hip_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "vkernels/kernels/moe_fused.hpp"
+
+#define CK(e, m)                                                       \
+  do {                                                                 \
+    hipError_t r = (e);                                                \
+    if (r != hipSuccess) {                                             \
+      std::fprintf(stderr, "%s: %s\n", m, hipGetErrorString(r));       \
+      std::exit(1);                                                    \
+    }                                                                  \
+  } while (0)
+
+namespace {
+
+int g_failures = 0;
+
+float rnd(int seed, int i) {
+  unsigned x = (unsigned)(seed * 2654435761u + (unsigned)i * 40503u);
+  x ^= x >> 13;
+  x *= 0x5bd1e995u;
+  x ^= x >> 15;
+  return (float)((int)x % 200000) / 100000.0f;
+}
+
+uint32_t f2bits(float v) { uint32_t b; std::memcpy(&b, &v, 4); return b; }
+
+uint8_t e2m1_nibble(float v) {
+  bool neg = v < 0;
+  float af = std::fabs(v);
+  if (af == 0.0f || std::isnan(af)) return neg ? 0x8 : 0x0;
+  if (std::isinf(af)) return neg ? 0xE : 0x6;
+  float vals[5] = {0.25f, 1.0f, 1.5f, 2.0f, 3.0f};
+  uint8_t nibs[5] = {1, 2, 3, 4, 5};
+  float best_d = std::fabs(af - vals[0]);
+  uint8_t best_n = nibs[0];
+  for (int i = 1; i < 5; ++i) {
+    float d = std::fabs(af - vals[i]);
+    if (d < best_d) { best_d = d; best_n = nibs[i]; }
+  }
+  return neg ? (uint8_t)(best_n | 0x8) : best_n;
+}
+
+uint16_t f2bf(float v) {
+  uint32_t b = f2bits(v);
+  b += 0x7FFFu + ((b >> 16) & 1);
+  return (uint16_t)(b >> 16);
+}
+
+float bf16_to_float(uint16_t v) {
+  uint32_t b = (uint32_t)v << 16;
+  float f;
+  std::memcpy(&f, &b, 4);
+  return f;
+}
+
+// Fill packed E2M1 weights + ue8m0 scales with deterministic random data.
+// Layouts match the kernel contract: w13 [E, 2*ispp, hidden/2] packed,
+// w13_scale [E, 2*ispp, hidden/32], w2 [E, hidden, ispp/2],
+// w2_scale [E, hidden, ispp/32].
+void fill_weights(int E, int hidden, int ispp,
+                  std::vector<uint8_t>& w13, std::vector<uint8_t>& w13s,
+                  std::vector<uint8_t>& w2, std::vector<uint8_t>& w2s) {
+  const int group = 32;
+  w13.assign((size_t)E * 2 * ispp * (hidden / 2), 0);
+  w13s.assign((size_t)E * 2 * ispp * (hidden / group), 127);
+  w2.assign((size_t)E * hidden * (ispp / 2), 0);
+  w2s.assign((size_t)E * hidden * (ispp / group), 127);
+  for (size_t i = 0; i < w13.size() / 2; ++i) {
+    w13[2 * i] = e2m1_nibble(rnd(2, (int)i) * 1.5f) |
+                 (e2m1_nibble(rnd(3, (int)i) * 1.5f) << 4);
+  }
+  for (size_t i = 0; i < w2.size() / 2; ++i) {
+    w2[2 * i] = e2m1_nibble(rnd(6, (int)i) * 1.5f) |
+                (e2m1_nibble(rnd(7, (int)i) * 1.5f) << 4);
+  }
+  // Scales 127 = ue8m0 byte for 2^0 = 1.0 (bit-exact neutral), with some
+  // variation so the group-scale path is exercised.
+  for (size_t i = 0; i < w13s.size(); ++i)
+    if (rnd(11, (int)i) > 0.8f) w13s[i] = (uint8_t)(126 + (int)(rnd(12, (int)i) * 3.0f));
+  for (size_t i = 0; i < w2s.size(); ++i)
+    if (rnd(13, (int)i) > 0.8f) w2s[i] = (uint8_t)(126 + (int)(rnd(14, (int)i) * 3.0f));
+}
+
+// One GPU-vs-oracle case. `expert_ids_route` must hold exactly top_k entries.
+void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
+              int block_size, const std::vector<int>& route, int activation) {
+  const int group = 32;
+  const float LIMIT = 10.0f, beta = 4.0f, linear_beta = 25.0f;
+
+  std::printf("--- %s: E=%d hidden=%d ispp=%d top_k=%d M=%d block=%d %s\n",
+              name, E, hidden, ispp, top_k, M, block_size,
+              activation == vkernels::kernels::kSiTU ? "situ" : "swiglu");
+
+  std::vector<uint8_t> w13, w13s, w2, w2s;
+  fill_weights(E, hidden, ispp, w13, w13s, w2, w2s);
+
+  // Routing: explicit experts (covers the old INT32 wrap thresholds).
+  std::vector<int32_t> tids((size_t)M * top_k);
+  std::vector<float> tw((size_t)M * top_k);
+  for (int i = 0; i < M; ++i)
+    for (int s = 0; s < top_k; ++s) {
+      tids[(size_t)i * top_k + s] = route[(size_t)i * top_k + s];
+      tw[(size_t)i * top_k + s] = 0.5f + 0.5f * rnd(20, i * top_k + s);
+    }
+
+  const int EM_max = M * top_k + E * block_size;
+  std::vector<int32_t> sids(EM_max), eids(EM_max / block_size);
+  int EM = vkernels::kernels::moe_align_block_size(
+      tids.data(), M, top_k, block_size, E, sids.data(), eids.data());
+  std::fprintf(stderr, "[phase] align ok EM=%d max_expert=%d\n", EM,
+               *std::max_element(route.begin(), route.end()));
+
+  // Oracle alignment: the CPU oracle tiles per-16 (BLOCK_M=16) and indexes
+  // expert_ids per 16-row block, so it must be fed the decode alignment even
+  // when the GPU path runs the prefill (per-64) tiling — same contract as
+  // bench_moe_fused_prefill ("block_size=16 oracle") and
+  // test_moe_fused_prefill_correct.  The final out [M, hidden] is
+  // block-size invariant.
+  constexpr int kOracleBS = 16;
+  int EM_max_o = M * top_k + E * kOracleBS;
+  std::vector<int32_t> sids_o(EM_max_o), eids_o(EM_max_o / kOracleBS);
+  int EM_o = vkernels::kernels::moe_align_block_size(
+      tids.data(), M, top_k, kOracleBS, E, sids_o.data(), eids_o.data());
+
+  // Oracle inputs: per-sorted-row weights (per-16 alignment).
+  std::vector<float> tws_o(EM_o, 0.0f);
+  for (int i = 0; i < EM_o; ++i)
+    if (sids_o[i] < M * top_k) tws_o[i] = tw[sids_o[i]];
+
+  std::vector<uint16_t> hA((size_t)M * hidden);
+  // A ~ 0.002 keeps SwiGLU outputs ~O(0.01-0.1) so the 16-slot combine
+  // sums stay well-conditioned: bf16-ULP act differences (different fp32
+  // transcendental/accumulation orders between GPU and oracle) then perturb
+  // out by ~1e-6 relative instead of being amplified 1e5x by catastrophic
+  // cancellation.  Regression value (int32 offset wrap at E=256/h7168/
+  // ispp=4096) is data-independent - it is about byte offsets.
+  for (size_t i = 0; i < hA.size(); ++i) hA[i] = f2bf(rnd(10, (int)i) * 0.001f);
+
+  // CPU oracle (per-16 alignment).
+  std::fprintf(stderr, "[phase] weights filled (w13=%.1f GB)\n",
+               (double)w13.size() / (1 << 30));
+  std::vector<uint16_t> act_cpu((size_t)EM_o * ispp, 0);
+  std::vector<float> out_cpu((size_t)M * hidden, 0.0f);
+  vkernels::kernels::fused_moe_mxfp4_cpu(
+      hA.data(), w13.data(), w13s.data(), w2.data(), w2s.data(),
+      sids_o.data(), tws_o.data(), eids_o.data(), act_cpu.data(), out_cpu.data(),
+      M, hidden, ispp, top_k, EM_o, group, LIMIT, activation, beta,
+      linear_beta, nullptr, nullptr);
+  std::fprintf(stderr, "[phase] CPU oracle done\n");
+
+  // Device buffers (size_t products throughout — the same class of bug).
+  uint16_t *dA, *dAct; float *dOut, *dTw;
+  int32_t *dTids, *dSids, *dEids;
+  uint8_t *dw13, *dw13s, *dw2, *dw2s;
+  const size_t w13_sz = (size_t)E * 2 * ispp * (hidden / 2);
+  const size_t w13s_sz = (size_t)E * 2 * ispp * (hidden / group);
+  const size_t w2_sz = (size_t)E * hidden * (ispp / 2);
+  const size_t w2s_sz = (size_t)E * hidden * (ispp / group);
+  CK(hipMalloc((void**)&dw13, w13_sz), "w13");
+  CK(hipMalloc((void**)&dw13s, w13s_sz), "w13s");
+  CK(hipMalloc((void**)&dw2, w2_sz), "w2");
+  CK(hipMalloc((void**)&dw2s, w2s_sz), "w2s");
+  CK(hipMalloc((void**)&dA, (size_t)M * hidden * 2), "A");
+  CK(hipMalloc((void**)&dAct, (size_t)EM * ispp * 2), "act");
+  CK(hipMalloc((void**)&dOut, (size_t)M * hidden * 4), "out");
+  CK(hipMalloc((void**)&dTw, (size_t)M * top_k * 4), "tw");
+  CK(hipMalloc((void**)&dTids, (size_t)M * top_k * 4), "tids");
+  CK(hipMalloc((void**)&dSids, (size_t)EM * 4), "sids");
+  CK(hipMalloc((void**)&dEids, (size_t)(EM / block_size) * 4), "eids");
+  CK(hipMemcpy(dw13, w13.data(), w13_sz, hipMemcpyHostToDevice), "cpw13");
+  CK(hipMemcpy(dw13s, w13s.data(), w13s_sz, hipMemcpyHostToDevice), "cpw13s");
+  CK(hipMemcpy(dw2, w2.data(), w2_sz, hipMemcpyHostToDevice), "cpw2");
+  CK(hipMemcpy(dw2s, w2s.data(), w2s_sz, hipMemcpyHostToDevice), "cpw2s");
+  CK(hipMemcpy(dA, hA.data(), (size_t)M * hidden * 2, hipMemcpyHostToDevice), "cpA");
+  CK(hipMemcpy(dTw, tw.data(), (size_t)M * top_k * 4, hipMemcpyHostToDevice), "cpTw");
+  CK(hipMemcpy(dTids, tids.data(), (size_t)M * top_k * 4, hipMemcpyHostToDevice), "cpTids");
+  CK(hipMemcpy(dSids, sids.data(), (size_t)EM * 4, hipMemcpyHostToDevice), "cpSids");
+  CK(hipMemcpy(dEids, eids.data(), (size_t)(EM / block_size) * 4, hipMemcpyHostToDevice), "cpEids");
+  CK(hipMemset(dOut, 0, (size_t)M * hidden * 4), "zOut");
+  // Padding act rows are never written by gateup; zero them so the down
+  // GEMM cannot multiply garbage/NaN patterns into skipped rows.
+  CK(hipMemset(dAct, 0, (size_t)EM * ispp * 2), "zAct");
+  std::fprintf(stderr, "[phase] device buffers ok, launching fused_moe_mxfp4\n");
+
+  vkernels::kernels::hip::fused_moe_mxfp4(
+      dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
+      M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
+      linear_beta, nullptr, nullptr, block_size, false);
+  std::fprintf(stderr, "[phase] launcher returned, syncing\n");
+  CK(hipDeviceSynchronize(), "sync");
+  std::fprintf(stderr, "[phase] device sync ok\n");
+
+  // Determinism probe: identical inputs + fresh memset, run twice; the
+  // two outputs must be bitwise equal for a data-race-free kernel.
+  {
+    std::vector<float> out_run1((size_t)M * hidden);
+    CK(hipMemcpy(out_run1.data(), dOut, (size_t)M * hidden * 4,
+                 hipMemcpyDeviceToHost), "rdOut1");
+    CK(hipMemset(dOut, 0, (size_t)M * hidden * 4), "zOut2");
+    CK(hipMemset(dAct, 0, (size_t)EM * ispp * 2), "zAct2");
+    vkernels::kernels::hip::fused_moe_mxfp4(
+        dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
+        M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
+        linear_beta, nullptr, nullptr, block_size, false);
+    CK(hipDeviceSynchronize(), "sync2");
+    std::vector<float> out_run2((size_t)M * hidden);
+    CK(hipMemcpy(out_run2.data(), dOut, (size_t)M * hidden * 4,
+                 hipMemcpyDeviceToHost), "rdOut2");
+    int nd = 0;
+    double md = 0;
+    for (int i = 0; i < M * hidden; ++i)
+      if (out_run1[i] != out_run2[i]) {
+        ++nd;
+        md = std::fmax(md, std::fabs((double)out_run1[i] - out_run2[i]));
+      }
+    std::fprintf(stderr, "[determinism] differing elements: %d/%d "
+                 "(max |delta| = %.4g)%s\n", nd, M * hidden, md,
+                 nd ? "  -> NON-DETERMINISTIC (race)" : "");
+  }
+
+  // Intermediate act comparison (matched by flat index across the two
+  // alignments): splits a gateup/A-load bug from a down/combine bug.
+  std::vector<uint16_t> act_gpu((size_t)EM * ispp);
+  std::vector<int> pos_gpu(M * top_k, -1), pos_cpu(M * top_k, -1);
+  CK(hipMemcpy(act_gpu.data(), dAct, (size_t)EM * ispp * 2,
+               hipMemcpyDeviceToHost), "rdAct");
+  {
+    // per-alignment real-row lists keyed by flat
+    for (int i = 0; i < EM; ++i)
+      if (sids[i] < M * top_k) pos_gpu[sids[i]] = i;
+    for (int i = 0; i < EM_o; ++i)
+      if (sids_o[i] < M * top_k) pos_cpu[sids_o[i]] = i;
+    double act_rel = 0;
+    int act_bad = 0, act_worst_flat = -1;
+    int act_diff = 0;
+    for (int f = 0; f < M * top_k; ++f) {
+      if (pos_gpu[f] < 0 || pos_cpu[f] < 0) continue;
+      for (int c = 0; c < ispp; ++c) {
+        float g = bf16_to_float(act_gpu[(size_t)pos_gpu[f] * ispp + c]);
+        float x = bf16_to_float(act_cpu[(size_t)pos_cpu[f] * ispp + c]);
+        if (g != x) ++act_diff;
+        double r = std::fabs((double)g - x) / std::fmax(std::fabs((double)x), 1.0);
+        if (r > act_rel) { act_rel = r; act_worst_flat = f; }
+        if (r > 0.05) ++act_bad;
+      }
+    }
+    std::fprintf(stderr, "[act] max_rel=%.4g bad=%d/%d worst_flat=%d "
+                 "diff=%d/%d (%.3g%%)\n",
+                 act_rel, act_bad, M * top_k * ispp, act_worst_flat,
+                 act_diff, M * top_k * ispp,
+                 100.0 * act_diff / (M * top_k * ispp));
+  }
+
+  std::vector<float> out_gpu((size_t)M * hidden);
+  CK(hipMemcpy(out_gpu.data(), dOut, (size_t)M * hidden * 4,
+               hipMemcpyDeviceToHost), "rdOut");
+
+  // Cancellation-aware tolerance: out is a sum of 16 signed slot
+  // contributions, so a few elements land near zero where ANY 1-2 bf16-ULP
+  // act difference (GPU MFMA/expf vs oracle scalar/std::exp rounding
+  // paths - verified 0.02% of act elements, propagated through fp64-exact
+  // down GEMMs) exceeds any pure relative bound.  Structural bugs (bad
+  // offsets/races) corrupt O(1)-relative at many elements and still fail
+  // the 5% relative arm.
+  double sq = 0;
+  for (int i = 0; i < M * hidden; ++i) sq += (double)out_cpu[i] * out_cpu[i];
+  const double out_rms = std::sqrt(sq / (M * hidden));
+  const double abs_tol = 0.03 * out_rms;
+  double max_rel = 0;
+  int worst_t = -1, worst_c = -1;
+  float worst_g = 0, worst_c2 = 0;
+  int n_bad = 0, tokens_bad = 0;
+  for (int t = 0; t < M; ++t) {
+    int t_bad = 0;
+    for (int c = 0; c < hidden; ++c) {
+      int i = t * hidden + c;
+      double e = std::fabs((double)out_gpu[i] - (double)out_cpu[i]);
+      double r = e / std::fmax(std::fabs((double)out_cpu[i]), 1.0);
+      if (e > 0.05 * std::fabs((double)out_cpu[i]) + abs_tol) ++t_bad;
+      if (r > max_rel) {
+        max_rel = r;
+        worst_t = t; worst_c = c;
+        worst_g = out_gpu[i]; worst_c2 = out_cpu[i];
+      }
+    }
+    if (t_bad) ++tokens_bad;
+    n_bad += t_bad;
+  }
+  std::fprintf(stderr, "    [tol] out_rms=%.4g abs_tol=%.4g\n", out_rms,
+               abs_tol);
+
+  bool ok = n_bad == 0;
+  if (!ok) ++g_failures;
+  std::printf("    EM=%d max_rel=%.4g -> %s", EM, max_rel, ok ? "PASS" : "FAIL");
+  if (!ok) {
+    std::printf("\n      [worst token=%d col=%d gpu=%.4f cpu=%.4f]", worst_t,
+                worst_c, worst_g, worst_c2);
+    std::printf("\n      [rel>0.05: %d/%d elems, %d/%d tokens]", n_bad,
+                M * hidden, tokens_bad, M);
+    // Sparse-fault forensics: list every bad element (capped) with the
+    // slot layout of its token, so a dropped/swapped contribution is
+    // visible against the routing.
+    if (n_bad <= 64) {
+      for (int t = 0; t < M; ++t) {
+        for (int c = 0; c < hidden; ++c) {
+          int i = t * hidden + c;
+          double r = std::fabs((double)out_gpu[i] - (double)out_cpu[i]) /
+                     std::fmax(std::fabs((double)out_cpu[i]), 1.0);
+          if (r > 0.05)
+            std::printf("\n      BAD t=%d c=%d gpu=%.4f cpu=%.4f rel=%.3f",
+                        t, c, out_gpu[i], out_cpu[i], r);
+        }
+      }
+      std::printf("\n");
+    }
+  }
+  std::printf("\n");
+
+  // Delta forensics (VKMOE_DELTA_TOKEN=t): re-run the whole pipeline with
+  // topk_w = delta (only token t's slot s keeps its weight).  The oracle is
+  // linear in topk_w, so if every single-slot run matches but the full sum
+  // does not, the corruption is in the multi-slot combine; if some single
+  // slot already differs, the down GEMM for that (expert, flat) is wrong.
+  if (const char* dtok = std::getenv("VKMOE_DELTA_TOKEN")) {
+    const int t0 = std::atoi(dtok);
+    std::vector<float> singles((size_t)top_k * hidden, 0.0f);
+    std::vector<float> osingles((size_t)top_k * hidden, 0.0f);
+    double sum_gpu_rel = 0, sum_orc_rel = 0;
+    for (int s = 0; s < top_k; ++s) {
+      std::vector<float> tw_d((size_t)M * top_k, 0.0f);
+      tw_d[(size_t)t0 * top_k + s] = tw[(size_t)t0 * top_k + s];
+      std::vector<float> tws_d(EM, 0.0f);
+      for (int i = 0; i < EM; ++i)
+        if (sids[i] < M * top_k) tws_d[i] = tw_d[sids[i]];
+      std::vector<float> tws_do(EM_o, 0.0f);
+      for (int i = 0; i < EM_o; ++i)
+        if (sids_o[i] < M * top_k) tws_do[i] = tw_d[sids_o[i]];
+      std::vector<uint16_t> act_d((size_t)EM * ispp, 0);
+      std::vector<float> outd_cpu((size_t)M * hidden, 0.0f);
+      vkernels::kernels::fused_moe_mxfp4_cpu(
+          hA.data(), w13.data(), w13s.data(), w2.data(), w2s.data(),
+          sids_o.data(), tws_do.data(), eids_o.data(), act_d.data(),
+          outd_cpu.data(),
+          M, hidden, ispp, top_k, EM_o, group, LIMIT, activation, beta,
+          linear_beta, nullptr, nullptr);
+      CK(hipMemcpy(dTw, tw_d.data(), (size_t)M * top_k * 4,
+                   hipMemcpyHostToDevice), "cpTwd");
+      CK(hipMemset(dOut, 0, (size_t)M * hidden * 4), "zOutd");
+      vkernels::kernels::hip::fused_moe_mxfp4(
+          dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
+          M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
+          linear_beta, nullptr, nullptr, block_size, false);
+      CK(hipDeviceSynchronize(), "syncd");
+      std::vector<float> outd_gpu((size_t)M * hidden);
+      CK(hipMemcpy(outd_gpu.data(), dOut, (size_t)M * hidden * 4,
+                   hipMemcpyDeviceToHost), "rdOutd");
+      std::memcpy(&singles[(size_t)s * hidden], &outd_gpu[(size_t)t0 * hidden],
+                  (size_t)hidden * 4);
+      std::memcpy(&osingles[(size_t)s * hidden], &outd_cpu[(size_t)t0 * hidden],
+                  (size_t)hidden * 4);
+      double rg = 0, ro = 0, sg = 0, so = 0, sc = 0;
+      for (int c = 0; c < hidden; ++c) {
+        int i = t0 * hidden + c;
+        sg += outd_gpu[i]; so += outd_cpu[i]; sc += out_cpu[i];
+        rg = std::fmax(rg, std::fabs((double)outd_gpu[i] - (double)out_cpu[i]) /
+                               std::fmax(std::fabs((double)out_cpu[i]), 1.0));
+        ro = std::fmax(ro, std::fabs((double)outd_cpu[i] - (double)out_cpu[i]) /
+                               std::fmax(std::fabs((double)out_cpu[i]), 1.0));
+      }
+      sum_gpu_rel = std::fmax(sum_gpu_rel, rg);
+      sum_orc_rel = std::fmax(sum_orc_rel, ro);
+      std::printf("    [delta t=%d s=%d e=%d] gpu-vs-oracle_rel=%.4g "
+                  "oracle-self_rel=%.4g (rowsum gpu=%.3f orc=%.3f full=%.3f)\n",
+                  t0, s, route[(size_t)t0 * top_k + s], rg, ro, sg, so, sc);
+    }
+    std::printf("    [delta] worst gpu-vs-oracle=%.4g oracle-self=%.4g\n",
+                sum_gpu_rel, sum_orc_rel);
+    // Per-element reconstruction: full-run GPU row vs sum of its own
+    // single-slot runs.  A large |gpu_full - Σ singles| at a column where
+    // |Σ singles - cpu_full| ~ 0 pins the corruption on the multi-slot
+    // combine, and identifies the missing slot.
+    {
+      const float* gf = &out_gpu[(size_t)t0 * hidden];
+      const float* cf = &out_cpu[(size_t)t0 * hidden];
+      int n_rec_bad = 0, n_lin_bad = 0;
+      for (int c = 0; c < hidden; ++c) {
+        double ss = 0, so2 = 0;
+        for (int s = 0; s < top_k; ++s) {
+          ss += singles[(size_t)s * hidden + c];
+          so2 += osingles[(size_t)s * hidden + c];
+        }
+        double d_rec = std::fabs((double)gf[c] - ss);
+        double d_lin = std::fabs(so2 - (double)cf[c]);
+        if (d_rec > 1.0) ++n_rec_bad;
+        if (d_lin > 1.0) ++n_lin_bad;
+        if (std::fabs((double)gf[c] - (double)cf[c]) > 1.0) {
+          std::printf("    [col t=%d c=%d] gpu_full=%9.4f cpu_full=%9.4f "
+                      "| Sigpu=%9.4f Sorc=%9.4f | rec_dev=%7.4f lin_dev=%7.4f\n",
+                      t0, c, gf[c], cf[c], ss, so2, d_rec, d_lin);
+          for (int s = 0; s < top_k; ++s)
+            std::printf("        s=%2d e=%3d w=%.4f gpu_single=%12.4f "
+                        "orc_single=%12.4f\n",
+                        s, route[(size_t)t0 * top_k + s],
+                        tw[(size_t)t0 * top_k + s],
+                        singles[(size_t)s * hidden + c],
+                        osingles[(size_t)s * hidden + c]);
+        }
+      }
+      std::printf("    [recon] %d col(s) gpu_full!=Ssingles; %d col(s) "
+                  "oracle nonlinear\n", n_rec_bad, n_lin_bad);
+    }
+
+    // FP64 ground truth for one slot (VKMOE_DELTA_SLOT=s): dequantize w2
+    // for the slot's expert col-block by col-block and evaluate the down
+    // GEMM in double against BOTH sides' act rows.  Distinguishes
+    // "different act data" (legitimate bf16 rounding path) from "wrong
+    // down GEMM" (a real bug).
+    if (const char* dslot = std::getenv("VKMOE_DELTA_SLOT")) {
+      const int s0 = std::atoi(dslot);
+      const int flat0 = t0 * top_k + s0;
+      const int e0 = route[(size_t)t0 * top_k + s0];
+      const double w0 = tw[(size_t)t0 * top_k + s0];
+      const size_t w2_eb = (size_t)hidden * (ispp / 2);
+      const size_t w2s_eb = (size_t)hidden * (ispp / group);
+      const int rg_row = pos_gpu[flat0], rc_row = pos_cpu[flat0];
+      std::printf("    [fp64] slot=%d expert=%d flat=%d act_rows gpu=%d orc=%d\n",
+                  s0, e0, flat0, rg_row, rc_row);
+      std::vector<uint16_t> tile((size_t)64 * 64);
+      std::vector<double> part_dg(64, 0.0), part_do(64, 0.0);
+      double worst_g = 0, worst_o = 0, worst_x = 0;
+      int wc = -1;
+      for (int nb2 = 0; nb2 < hidden / 64; ++nb2) {
+        const uint8_t* bp = w2.data() + (size_t)e0 * w2_eb
+                            + (size_t)nb2 * 64 * (ispp / 2);
+        const uint8_t* sp = w2s.data() + (size_t)e0 * w2s_eb
+                            + (size_t)nb2 * 64 * (ispp / group);
+        for (int kb = 0; kb < ispp / 64; ++kb) {
+          vkernels::kernels::dequant_weight_tile(bp + (size_t)kb * 32, sp + kb * (64 / group),
+                              tile.data(), 64, 64, group,
+                              ispp / 2, ispp / group, 1);
+          for (int c = 0; c < 64; ++c) {
+            double dref_g = 0, dref_o = 0;
+            for (int k = 0; k < 64; ++k) {
+              double wv = bf16_to_float(tile[(size_t)k * 64 + c]);
+              dref_g += (double)bf16_to_float(
+                            act_gpu[(size_t)rg_row * ispp + kb * 64 + k]) * wv;
+              dref_o += (double)bf16_to_float(
+                            act_cpu[(size_t)rc_row * ispp + kb * 64 + k]) * wv;
+            }
+            // accumulate across k-blocks against the full-K singles
+            // (recompute incrementally per col)
+            // -- accumulate into per-col partials
+            part_dg[c] += dref_g;
+            part_do[c] += dref_o;
+          }
+        }
+        // compare this col-block's completed dot products
+        for (int c = 0; c < 64; ++c) {
+          const int col = nb2 * 64 + c;
+          const double gpu_d = singles[(size_t)s0 * hidden + col] / w0;
+          const double orc_d = osingles[(size_t)s0 * hidden + col] / w0;
+          double eg = std::fabs(gpu_d - part_dg[c]);
+          double eo = std::fabs(orc_d - part_do[c]);
+          double ex = std::fabs(gpu_d - part_do[c]);
+          if (eg > worst_g) { worst_g = eg; }
+          if (eo > worst_o) { worst_o = eo; }
+          if (eg + eo > worst_x) { worst_x = eg + eo; wc = col; }
+          part_dg[c] = 0.0;
+          part_do[c] = 0.0;
+        }
+      }
+      std::printf("    [fp64] max|gpu_D - ref(gpu_act)|=%.4g "
+                  "max|orc_D - ref(orc_act)|=%.4g worst col=%d\n",
+                  worst_g, worst_o, wc);
+    } else {
+      // VKMOE_DELTA_SLOT unset: fp64-check ALL slots of t0 (vs each slot's
+      // own act row) and report the worst offender per slot.
+      const size_t w2_eb = (size_t)hidden * (ispp / 2);
+      const size_t w2s_eb = (size_t)hidden * (ispp / group);
+      std::vector<uint16_t> tile((size_t)64 * 64);
+      std::vector<double> part_dg(64, 0.0), part_do(64, 0.0);
+      for (int s0 = 0; s0 < top_k; ++s0) {
+        const int flat0 = t0 * top_k + s0;
+        const int e0 = route[(size_t)t0 * top_k + s0];
+        const double w0 = tw[(size_t)t0 * top_k + s0];
+        const int rg_row = pos_gpu[flat0], rc_row = pos_cpu[flat0];
+        double worst_g = 0, worst_o = 0;
+        int wc = -1;
+        for (int nb2 = 0; nb2 < hidden / 64; ++nb2) {
+          const uint8_t* bp = w2.data() + (size_t)e0 * w2_eb
+                              + (size_t)nb2 * 64 * (ispp / 2);
+          const uint8_t* sp = w2s.data() + (size_t)e0 * w2s_eb
+                              + (size_t)nb2 * 64 * (ispp / group);
+          for (int kb = 0; kb < ispp / 64; ++kb) {
+            vkernels::kernels::dequant_weight_tile(
+                bp + (size_t)kb * 32, sp + kb * (64 / group),
+                tile.data(), 64, 64, group, ispp / 2, ispp / group, 1);
+            for (int c = 0; c < 64; ++c) {
+              double dref_g = 0, dref_o = 0;
+              for (int k = 0; k < 64; ++k) {
+                double wv = bf16_to_float(tile[(size_t)k * 64 + c]);
+                dref_g += (double)bf16_to_float(
+                              act_gpu[(size_t)rg_row * ispp + kb * 64 + k]) * wv;
+                dref_o += (double)bf16_to_float(
+                              act_cpu[(size_t)rc_row * ispp + kb * 64 + k]) * wv;
+              }
+              part_dg[c] += dref_g;
+              part_do[c] += dref_o;
+            }
+          }
+          for (int c = 0; c < 64; ++c) {
+            const int col = nb2 * 64 + c;
+            const double gpu_d = singles[(size_t)s0 * hidden + col] / w0;
+            const double orc_d = osingles[(size_t)s0 * hidden + col] / w0;
+            double eg = std::fabs(gpu_d - part_dg[c]);
+            double eo = std::fabs(orc_d - part_do[c]);
+            if (eg > worst_g) worst_g = eg;
+            if (eo > worst_o) { worst_o = eo; wc = col; }
+            part_dg[c] = 0.0;
+            part_do[c] = 0.0;
+          }
+        }
+        std::printf("    [fp64] s=%2d e=%3d max|gpu_D-ref(gpu_act)|=%.3g "
+                    "max|orc_D-ref(orc_act)|=%.3g worst col=%d\n",
+                    s0, e0, worst_g, worst_o, wc);
+      }
+    }
+    // restore the full-weight device run for any later use
+    CK(hipMemcpy(dTw, tw.data(), (size_t)M * top_k * 4, hipMemcpyHostToDevice),
+       "cpTwR");
+  }
+
+  CK(hipFree(dw13), "f"); CK(hipFree(dw13s), "f"); CK(hipFree(dw2), "f");
+  CK(hipFree(dw2s), "f"); CK(hipFree(dA), "f"); CK(hipFree(dAct), "f");
+  CK(hipFree(dOut), "f"); CK(hipFree(dTw), "f"); CK(hipFree(dTids), "f");
+  CK(hipFree(dSids), "f"); CK(hipFree(dEids), "f");
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  // Unbuffered: a GPU fault kills the process and we must not lose the log
+  // position (slurm pipes stdout through a block-buffered file).
+  setvbuf(stdout, nullptr, _IONBF, 0);
+  hipDeviceProp_t p;
+  CK(hipGetDeviceProperties(&p, 0), "props");
+  std::printf("GPU: %s (%s)\n\n", p.name, p.gcnArchName);
+
+  using vkernels::kernels::kSiTU;
+  int only = (argc > 1) ? std::atoi(argv[1]) : 0;  // 0 = all
+
+  // Wrap thresholds at h=7168, ispp=4096 (decode kernels):
+  //   down:    e * 7168*2048      >= 2^31 at e >= 147
+  //   gateup:  e * 2*4096*3584    >= 2^31 at e >= 74
+  // 16 distinct experts bracketing both thresholds, ending at 255.
+  const std::vector<int> route_thresholds = {
+      7, 73, 74, 100, 145, 146, 147, 180, 200, 220, 240, 250, 253, 254, 255, 74};
+
+  // 1. decode regime at the documented fault threshold.
+  if (only == 0 || only == 1)
+    run_case("decode ispp=4096 wrap-threshold experts", 256, 7168, 4096, 16, 1,
+             16, route_thresholds, kSiTU);
+
+  // 2. worst-case single expert (max offset, all 16 slots on expert 255).
+  const std::vector<int> route_e255(16, 255);
+  if (only == 0 || only == 2)
+    run_case("decode ispp=4096 all-slots expert 255", 256, 7168, 4096, 16, 1,
+             16, route_e255, kSiTU);
+
+  // 3. prefill regime (64x64 tiles) at the same shape.
+  if (only == 0 || only == 3)
+    run_case("prefill ispp=4096 wrap-threshold experts", 256, 7168, 4096, 16, 1,
+             64, route_thresholds, kSiTU);
+
+  // 4. the documented serving-shard shape that faulted on beverin
+  // (E=32, ~12 GB resident; down wraps at e >= 18, gateup at e >= 9).
+  const std::vector<int> route_shard = {
+      2, 5, 9, 12, 17, 18, 19, 20, 22, 24, 26, 28, 29, 30, 31, 8};
+  if (only == 0 || only == 4)
+    run_case("decode ispp=33792 E=32 serving shard", 32, 7168, 33792, 16, 1,
+             16, route_shard, kSiTU);
+
+  // 5. prefill at a small shape — isolates a general prefill-path bug from
+  //    a big-shape overflow (case 3 = big + padding).
+  const std::vector<int> route_small = {0, 1, 2, 3};
+  if (only == 0 || only == 5)
+    run_case("prefill small E=8 h512 ispp=512", 8, 512, 512, 4, 1,
+             64, route_small, kSiTU);
+
+  // 6. prefill big, NO padding: M=64 tokens all routed to the same 16
+  //    distinct experts -> EM = 64*16 = 1024 = N, every block full.
+  std::vector<int> route_full;
+  route_full.reserve(64 * 16);
+  for (int i = 0; i < 64; ++i)
+    route_full.insert(route_full.end(), route_thresholds.begin(),
+                      route_thresholds.end());
+  if (only == 0 || only == 6)
+    run_case("prefill ispp=4096 M=64 no-padding", 256, 7168, 4096, 16, 64,
+             64, route_full, kSiTU);
+
+  // 7. prefill big, M=2 (like case 3 but N=32: mostly-padding blocks).
+  std::vector<int> route_m2;
+  route_m2.reserve(2 * 16);
+  route_m2.insert(route_m2.end(), route_thresholds.begin(),
+                  route_thresholds.end());
+  route_m2.insert(route_m2.end(), route_thresholds.begin(),
+                  route_thresholds.end());
+  if (only == 0 || only == 7)
+    run_case("prefill ispp=4096 M=2 padded", 256, 7168, 4096, 16, 2,
+             64, route_m2, kSiTU);
+
+  // 8. prefill SMALL no-padding (M=64, full 64-row blocks): a small
+  //    reproduction of the case-6 failure, if it is block-row-related
+  //    rather than shape-related.
+  std::vector<int> route_small_full;
+  route_small_full.reserve(64 * 4);
+  for (int i = 0; i < 64; ++i)
+    route_small_full.insert(route_small_full.end(), route_small.begin(),
+                            route_small.end());
+  if (only == 0 || only == 8)
+    run_case("prefill small M=64 no-padding", 8, 512, 512, 4, 64,
+             64, route_small_full, kSiTU);
+
+  // 9-12. shape bisection of the case-6 failure: same M=64 no-padding
+  //  routing, growing one dimension at a time.
+  if (only == 0 || only == 9)
+    run_case("bisect E=256 h7168 ispp=512 M=64", 256, 7168, 512, 16, 64,
+             64, route_full, kSiTU);
+  if (only == 0 || only == 10)
+    run_case("bisect E=256 h7168 ispp=1024 M=64", 256, 7168, 1024, 16, 64,
+             64, route_full, kSiTU);
+  if (only == 0 || only == 11)
+    run_case("bisect E=256 h7168 ispp=2048 M=64", 256, 7168, 2048, 16, 64,
+             64, route_full, kSiTU);
+  if (only == 0 || only == 12)
+    run_case("bisect E=8 h1024 ispp=512 M=64", 8, 1024, 512, 4, 64,
+             64, route_small_full, kSiTU);
+  if (only == 0 || only == 13)
+    run_case("bisect E=8 h2048 ispp=512 M=64", 8, 2048, 512, 4, 64,
+             64, route_small_full, kSiTU);
+  if (only == 0 || only == 14)
+    run_case("bisect E=8 h4096 ispp=512 M=64", 8, 4096, 512, 4, 64,
+             64, route_small_full, kSiTU);
+  // 15. oracle sanity at M=64: the decode kernels were validated at M<=4;
+  //     if decode M=64 passes vs the same oracle, the oracle is right and
+  //     the prefill kernels are the wrong party.
+  if (only == 0 || only == 15)
+    run_case("decode E=256 h7168 ispp=4096 M=64 (oracle sanity)", 256, 7168,
+             4096, 16, 64, 16, route_full, kSiTU);
+
+  if (g_failures) {
+    std::printf("\n%d case(s) FAILED\n", g_failures);
+    return 1;
+  }
+  std::printf("\nAll cases PASS\n");
+  return 0;
+}
