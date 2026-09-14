@@ -218,6 +218,7 @@ def test_grouped_native_inplace_matches_reference(torch):
     down = torch.randn((e, h, i), generator=g).clamp(-4, 4).to(torch.float8_e4m3fn)
     gu_sc = torch.rand((e, (2 * i) // 128, h // 128), generator=g) * 0.1 + 0.01
     dn_sc = torch.rand((e, h // 128, i // 128), generator=g) * 0.1 + 0.01
+    gate_up, down, gu_sc, dn_sc = gate_up.cuda(), down.cuda(), gu_sc.cuda(), dn_sc.cuda()
     x = torch.randn((t, h), generator=g).to(torch.bfloat16).cuda()
     topk_index = torch.rand((t, e), generator=g).topk(k, dim=-1).indices.to(torch.int64).cuda()
     topk_weights = torch.softmax(torch.rand((t, k), generator=g), dim=-1).cuda()
