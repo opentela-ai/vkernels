@@ -156,13 +156,14 @@ def _set_kpool_prototypes(lib: ctypes.CDLL) -> None:
     ] + [v] * 6  # key, slot_score, tail_k(in-place), tail_score(in-place), ape,
     #              block_tables
     lib.vk_hip_dsa_kpool_decode_update.argtypes = (
-        decode_common + [v] * 5 + [v, v]  # req_pool_indices, positions,
-        #                                   seq_lens, out_cache_loc,
-        #                                   out(bf16), stream
+        decode_common + [v] * 4 + [v, v]  # req_pool_indices, positions,
+        #                                   seq_lens, out_cache_loc, out(bf16),
+        #                                   stream  (hip_capi.hpp: 8 + 12 args)
     )
     lib.vk_hip_dsa_kpool_decode_update.restype = None
     lib.vk_hip_dsa_kpool_decode_update_fp8.argtypes = (
-        decode_common + [v] * 5 + [v, v, v]  # + cache_u8, round_scale, stream
+        decode_common + [v] * 4 + [v, v, v]  # + cache_u8, round_scale, stream
+        #                                     (hip_capi.hpp: 8 + 13 args)
     )
     lib.vk_hip_dsa_kpool_decode_update_fp8.restype = None
 
