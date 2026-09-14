@@ -42,11 +42,16 @@ def _blas(x, weights):
 
 
 def _make_inputs(device, tokens, count, seed):
+    """``count`` activation samples of [1, tokens, 4096] plus one weight set.
+
+    The wrapper validates the TOTAL row count per call (one or two rows), so
+    each sample must be its own [1, tokens, 4096] tensor.
+    """
     generator = torch.Generator(device="cpu").manual_seed(seed)
     weights = [torch.randn(8192, 4096, generator=generator).to(device=device, dtype=torch.bfloat16) * 0.01
                for _ in range(3)]
-    inputs = [torch.randn(count, tokens, 4096, generator=generator).to(device=device, dtype=torch.bfloat16)
-              for _ in range(8)]
+    inputs = [torch.randn(1, tokens, 4096, generator=generator).to(device=device, dtype=torch.bfloat16)
+              for _ in range(count)]
     return inputs, weights
 
 
@@ -119,16 +124,19 @@ def mode_quality(args, report):
                                        for x in xs)
                 candidates = [qkv_tuned_blas(x, *weights) for x in xs]
                 oracles = [qkv_oracle_fp64(x, weights) for x in xs]
-                errors = [_oracle_error(c, o) for c, o in zip(candidates, oracles)]
-                evidence = [argmax_evidence(o, c) for c, o in zip(candidates, oracles)]
-                agreement = min(e["agreement"] for e in evidence)
-                worst_abs = max(e["max_abs"] for e in errors)
-                worst_rel = max(e["max_rel"] for e in errors)
+                stacked_c = torch.cat(candidates, dim=0)
+                stacked_o = torch.cat(oracles, dim=0)
+                errors = _oracle_error(stacked_c, stacked_o)
+                evidence = argmax_evidence(stacked_o, stacked_c)
+                agreement = evidence["agreement"]
+                worst_abs = errors["max_abs"]
+                worst_rel = errors["max_rel"]
                 report["numerics"][f"device{device}_tokens{tokens}"] = {
                     "max_abs_vs_fp64_oracle": worst_abs,
                     "max_rel_vs_fp64_oracle": worst_rel,
                     "min_argmax_agreement": agreement,
-                    "changed_argmax": [e["changed"] for e in evidence][:1],
+                    "changed_argmax": evidence["changed"][:8],
+                    "argmax_rows": evidence["rows"],
                     "reference_repeat_identical": repeat_identical,
                 }
                 _gate(report, f"reference_repeat_identical[d{device} t{tokens}]",
