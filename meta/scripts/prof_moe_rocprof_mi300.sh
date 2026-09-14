@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=vkmoe41prof
 #SBATCH --partition=mi300
+#SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
