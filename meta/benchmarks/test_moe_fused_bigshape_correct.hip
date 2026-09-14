@@ -209,14 +209,28 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
                hipMemcpyDeviceToHost), "rdOut");
 
   double max_rel = 0;
-  for (int i = 0; i < M * hidden; ++i) {
-    double e = std::fabs((double)out_gpu[i] - (double)out_cpu[i]);
-    max_rel = std::fmax(max_rel, e / std::fmax(std::fabs((double)out_cpu[i]), 1.0));
+  int worst_t = -1, worst_c = -1;
+  float worst_g = 0, worst_c2 = 0;
+  for (int t = 0; t < M; ++t) {
+    for (int c = 0; c < hidden; ++c) {
+      int i = t * hidden + c;
+      double e = std::fabs((double)out_gpu[i] - (double)out_cpu[i]);
+      double r = e / std::fmax(std::fabs((double)out_cpu[i]), 1.0);
+      if (r > max_rel) {
+        max_rel = r;
+        worst_t = t; worst_c = c;
+        worst_g = out_gpu[i]; worst_c2 = out_cpu[i];
+      }
+    }
   }
 
   bool ok = max_rel < 0.05;
   if (!ok) ++g_failures;
-  std::printf("    EM=%d max_rel=%.4g -> %s\n", EM, max_rel, ok ? "PASS" : "FAIL");
+  std::printf("    EM=%d max_rel=%.4g -> %s", EM, max_rel, ok ? "PASS" : "FAIL");
+  if (!ok)
+    std::printf("  [worst token=%d col=%d gpu=%.4f cpu=%.4f]", worst_t,
+                worst_c, worst_g, worst_c2);
+  std::printf("\n");
 
   CK(hipFree(dw13), "f"); CK(hipFree(dw13s), "f"); CK(hipFree(dw2), "f");
   CK(hipFree(dw2s), "f"); CK(hipFree(dA), "f"); CK(hipFree(dAct), "f");
@@ -296,6 +310,18 @@ int main(int argc, char** argv) {
   if (only == 0 || only == 7)
     run_case("prefill ispp=4096 M=2 padded", 256, 7168, 4096, 16, 2,
              64, route_m2, kSiTU);
+
+  // 8. prefill SMALL no-padding (M=64, full 64-row blocks): a small
+  //    reproduction of the case-6 failure, if it is block-row-related
+  //    rather than shape-related.
+  std::vector<int> route_small_full;
+  route_small_full.reserve(64 * 4);
+  for (int i = 0; i < 64; ++i)
+    route_small_full.insert(route_small_full.end(), route_small.begin(),
+                            route_small.end());
+  if (only == 0 || only == 8)
+    run_case("prefill small M=64 no-padding", 8, 512, 512, 4, 64,
+             64, route_small_full, kSiTU);
 
   if (g_failures) {
     std::printf("\n%d case(s) FAILED\n", g_failures);

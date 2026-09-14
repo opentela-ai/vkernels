@@ -55,6 +55,7 @@ case_n 4 "decode ispp=33792 E=32 shard"
 case_n 5 "prefill small E=8 h512 ispp=512"
 case_n 6 "prefill ispp=4096 M=64 no-padding"
 case_n 7 "prefill ispp=4096 M=2 padded"
+case_n 8 "prefill small M=64 no-padding"
 if [ "$CASE_RC" -ne 0 ]; then echo "cases failed rc=$CASE_RC"; exit "$CASE_RC"; fi
 
 echo; echo "###### 2. previously-faulting bench: E=256 ispp=4096 (with CPU oracle) ######"
