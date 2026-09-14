@@ -31,9 +31,10 @@ PYTHONPATH=src/python python meta/benchmarks/bench_qkv_projection.py --output /t
 ```
 
 On a **beverin `mi300`** node the pytest + this benchmark + the TunableOp
-preflight (#67) + roofline/counter references are driven by one
-self-bootstrapping script that also papers over the missing
-`python3.11-devel` package — see [`docs/torch-ops-mi300.md`](torch-ops-mi300.md):
+preflight and mode-based qualification (#67) + roofline/counter references
+are driven by one self-bootstrapping script that also papers over the missing
+`python3.11-devel` package — see [`docs/torch-ops-mi300.md`](torch-ops-mi300.md)
+and [`docs/tuning-qualification.md`](tuning-qualification.md):
 
 ```bash
 VK63_SECTIONS='2. torch_ops* 4. BENCH QKV* 5. CHECK frozen*' sbatch meta/scripts/run_issue63_torchops_mi300.sh

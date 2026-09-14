@@ -6,6 +6,7 @@ Compilation and tuning happen eagerly before graph capture.
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -14,6 +15,7 @@ import torch.nn.functional as F
 import triton
 
 from bench_mhc_projection import graph_time
+from vkernels.torch_ops import tuning_manifest
 from vkernels.torch_ops.qkv_projection import qkv_projection, qkv_projection_tuning_metadata
 
 
@@ -59,6 +61,36 @@ def main():
         report["shapes"][str(tokens)] = result
         args.output.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"tokens": tokens, **result}, indent=2), flush=True)
+
+    # Persist the artifact with its sidecar manifest (#67): the CSV records the
+    # winners; the manifest binds them to this source tree, device, software,
+    # pre-declared quality gates, and the exact CSV bytes (sha256).
+    # insert_device_ordinal embeds the device index: qkv_projection.tunable0.csv.
+    matches = sorted(args.output.parent.glob(args.output.stem + ".tunable*.csv"))
+    csv_path = matches[-1] if matches else None
+    if csv_path is not None:
+        repo_root = Path(__file__).resolve().parents[2]
+        producers = [Path(__file__).resolve(),
+                     repo_root / "src/python/vkernels/torch_ops/qkv_projection.py"]
+        manifest = tuning_manifest.build_manifest(
+            csv_path, kernel="qkv_projection", op="GemmTunableOp_BFloat16_TN",
+            shapes={f"tn_8192_{tokens}_4096_ld_4096_4096_8192":
+                    {"M": tokens, "K": 4096, "N": 8192, "lda": 4096, "ldb": 4096,
+                     "ldc": 8192, "dtype": "bf16", "layout": "TN"} for tokens in (1, 2)},
+            producer_paths=producers,
+            job=os.environ.get("SLURM_JOB_ID"),
+            notes="produced by bench_qkv_projection.py; winners recorded as tuned, "
+                  "including Default where the autotuner chose it")
+        # store repo-root-relative source paths so the manifest is portable
+        manifest["producer"]["fingerprints"] = {
+            str(path.relative_to(repo_root)): digest
+            for path, digest in manifest["producer"]["fingerprints"].items()}
+        environment = tuning_manifest.collect_environment()
+        if environment is not None:
+            manifest["device"] = {"arch": environment["arch"], "cu_count": environment["cu_count"]}
+            manifest["software"] = {"torch": environment["torch"], "hip": environment["hip"]}
+        manifest_path = tuning_manifest.write_manifest(csv_path, manifest)
+        print(f"manifest: {manifest_path}", flush=True)
 
 
 if __name__ == "__main__":

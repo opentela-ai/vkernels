@@ -126,7 +126,8 @@ EOF
 s_pytest() {
   "${PY}" -m pytest tests/python/test_mhc_projection.py \
                     tests/python/test_qkv_projection.py \
-                    tests/python/test_qkv_tuned_blas.py -q -rN 2>&1 | tail -45
+                    tests/python/test_qkv_tuned_blas.py \
+                    tests/python/test_bf16_oracle.py -q -rN 2>&1 | tail -45
 }
 
 s_mhc() {
@@ -138,13 +139,37 @@ s_qkv() {
 }
 
 s_tuned() {
-  # bench_qkv_projection writes qkv_projection.tunable0.csv (insert_device_ordinal).
+  # bench_qkv_projection writes qkv_projection.tunable0.csv (insert_device_ordinal)
+  # plus its sidecar manifest (tuning_manifest, #67).
   local csv; csv="$(ls -1t "${OUT}"/qkv_projection.tunable*.csv 2>/dev/null | head -1)"
   if [ -z "${csv}" ]; then
     echo "(no qkv_projection.tunable*.csv in ${OUT} — run section 4 first); skipping"
     return 0
   fi
   "${PY}" meta/benchmarks/check_qkv_tuned_blas.py "${csv}" 2>&1 | tail -20
+}
+
+s_qualify_repro() {
+  # Cold/warm artifact load + manifest validation + capture parity (#67).
+  local csv; csv="$(ls -1t "${OUT}"/qkv_projection.tunable*.csv 2>/dev/null | head -1)"
+  if [ -z "${csv}" ]; then
+    echo "(no artifact — run section 4 first); skipping"; return 0
+  fi
+  "${PY}" meta/benchmarks/qualify_qkv_tuned_blas.py "${csv}" --mode repro \
+      --report "${OUT}/qkv_qualify_repro.json" 2>&1 | tail -15
+}
+
+s_qualify_quality() {
+  # Pre-declared gates from the manifest: FP64-direct BF16 oracle, argmax IDs,
+  # baseline determinism. The model-NLL gate fails closed without a
+  # floe-side --nll-report; that expected failure must NOT abort the section
+  # review (the report JSON names every gate outcome).
+  local csv; csv="$(ls -1t "${OUT}"/qkv_projection.tunable*.csv 2>/dev/null | head -1)"
+  if [ -z "${csv}" ]; then
+    echo "(no artifact — run section 4 first); skipping"; return 0
+  fi
+  "${PY}" meta/benchmarks/qualify_qkv_tuned_blas.py "${csv}" --mode quality \
+      --report "${OUT}/qkv_qualify_quality.json" 2>&1 | tail -20
 }
 
 s_roofline() {
@@ -194,6 +219,8 @@ run_section "2. torch_ops pytest (mhc + qkv + tuned_blas)"      s_pytest
 run_section "3. BENCH mHC projection (default/tuned BLAS + Triton)" s_mhc
 run_section "4. BENCH QKV projection (default/tuned BLAS + fused Triton)" s_qkv
 run_section "5. CHECK frozen TunableOp QKV preflight (#67)"     s_tuned
+run_section "5b. QUALIFY artifact repro mode (#67)"             s_qualify_repro
+run_section "5c. QUALIFY artifact quality gates (#67)"          s_qualify_quality
 run_section "6. BENCH roofline (BW + BF16 GEMM + launch floor)" s_roofline
 run_section "7. COUNTER probe qkv (cold dispatch)"             s_counters_qkv
 run_section "7. COUNTER probe gate128 (cold dispatch)"         s_counters_gate128
@@ -206,6 +233,8 @@ for k in "1. ENV fingerprint" "2. torch_ops pytest (mhc + qkv + tuned_blas)" \
          "3. BENCH mHC projection (default/tuned BLAS + Triton)" \
          "4. BENCH QKV projection (default/tuned BLAS + fused Triton)" \
          "5. CHECK frozen TunableOp QKV preflight (#67)" \
+         "5b. QUALIFY artifact repro mode (#67)" \
+         "5c. QUALIFY artifact quality gates (#67)" \
          "6. BENCH roofline (BW + BF16 GEMM + launch floor)" \
          "7. COUNTER probe qkv (cold dispatch)" \
          "7. COUNTER probe gate128 (cold dispatch)"; do
