@@ -330,6 +330,7 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   // slot already differs, the down GEMM for that (expert, flat) is wrong.
   if (const char* dtok = std::getenv("VKMOE_DELTA_TOKEN")) {
     const int t0 = std::atoi(dtok);
+    std::vector<float> singles((size_t)top_k * hidden, 0.0f);
     double sum_gpu_rel = 0, sum_orc_rel = 0;
     for (int s = 0; s < top_k; ++s) {
       std::vector<float> tw_d((size_t)M * top_k, 0.0f);
@@ -359,6 +360,8 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
       std::vector<float> outd_gpu((size_t)M * hidden);
       CK(hipMemcpy(outd_gpu.data(), dOut, (size_t)M * hidden * 4,
                    hipMemcpyDeviceToHost), "rdOutd");
+      std::memcpy(&singles[(size_t)s * hidden], &outd_gpu[(size_t)t0 * hidden],
+                  (size_t)hidden * 4);
       double rg = 0, ro = 0, sg = 0, so = 0, sc = 0;
       for (int c = 0; c < hidden; ++c) {
         int i = t0 * hidden + c;
@@ -376,6 +379,37 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
     }
     std::printf("    [delta] worst gpu-vs-oracle=%.4g oracle-self=%.4g\n",
                 sum_gpu_rel, sum_orc_rel);
+    // Per-element reconstruction: full-run GPU row vs sum of its own
+    // single-slot runs.  A large |gpu_full - Σ singles| at a column where
+    // |Σ singles - cpu_full| ~ 0 pins the corruption on the multi-slot
+    // combine, and identifies the missing slot.
+    {
+      const float* gf = &out_gpu[(size_t)t0 * hidden];
+      const float* cf = &out_cpu[(size_t)t0 * hidden];
+      int n_rec_bad = 0;
+      for (int c = 0; c < hidden; ++c) {
+        double ss = 0;
+        for (int s = 0; s < top_k; ++s) ss += singles[(size_t)s * hidden + c];
+        double d_rec = std::fabs((double)gf[c] - ss);
+        double d_orc = std::fabs(ss - (double)cf[c]);
+        if (d_rec > 1.0 && d_orc <= 1.0) {
+          ++n_rec_bad;
+          int s_miss = -1;
+          double best = 1e30;
+          for (int s = 0; s < top_k; ++s) {
+            double d = std::fabs(((double)gf[c] - ss) +
+                                 singles[(size_t)s * hidden + c]);
+            if (d < best) { best = d; s_miss = s; }
+          }
+          std::printf("    [recon t=%d c=%d] gpu_full=%.4f Σsingles=%.4f "
+                      "cpu_full=%.4f | missing slot s=%d (single=%.4f)\n",
+                      t0, c, gf[c], ss, cf[c], s_miss,
+                      singles[(size_t)s_miss * hidden + c]);
+        }
+      }
+      std::printf("    [recon] %d column(s) where gpu_full != Σ singles "
+                  "but oracle is linear\n", n_rec_bad);
+    }
     // restore the full-weight device run for any later use
     CK(hipMemcpy(dTw, tw.data(), (size_t)M * top_k * 4, hipMemcpyHostToDevice),
        "cpTwR");
