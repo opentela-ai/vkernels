@@ -193,6 +193,28 @@ if(VKERNELS_HAS_HIP)
   target_compile_options(vkernels_hip PRIVATE -fno-lto)
   target_link_options(vkernels_hip PRIVATE -fno-lto)
   vkernels_set_warnings(vkernels_hip)
+
+  # Host (CPU-reference) C ABI shared library for HIP builds. The CUDA-only
+  # `vkernels_c` above needs .cu sources, but the attention CPU oracles
+  # (vk_mla_fwd, vk_kda_naive_delta_rule_fwd in capi/capi_attn.cpp) are pure
+  # host C++ already compiled into the static `vkernels` — expose them as
+  # libvkernels.so so serving validators can cross-check device output
+  # against the CPU oracle in-process (cookbook vkernels_attn.py,
+  # VKERNELS_MLA_VALIDATE / VKERNELS_KDA_VALIDATE, issues #42/#45). Output
+  # name `vkernels` -> build/hip/src/c/libvkernels.so, which is where the
+  # serving-side resolver globs for it.
+  add_library(vkernels_hostc SHARED
+    vkernels/capi/capi.cpp
+    vkernels/capi/capi_kernels.cpp
+    vkernels/capi/capi_attn.cpp
+    vkernels/capi/capi_moe.cpp)
+  set_target_properties(vkernels_hostc PROPERTIES OUTPUT_NAME vkernels)
+  target_link_libraries(vkernels_hostc PRIVATE vkernels)
+  target_include_directories(vkernels_hostc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_features(vkernels_hostc PRIVATE cxx_std_17)
+  target_compile_options(vkernels_hostc PRIVATE -fno-lto)
+  target_link_options(vkernels_hostc PRIVATE -fno-lto)
+  vkernels_set_warnings(vkernels_hostc)
 endif()
 
 # RCCL transport (issue #19): compile the HIP/RCCL path only when a usable
