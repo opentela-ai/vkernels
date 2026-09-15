@@ -1,0 +1,55 @@
+{
+  "base_url": "http://127.0.0.1:8080",
+  "base_url_kda_off": null,
+  "model": "SwissAI-Research/moonshot/kimi-k3-rocm",
+  "out_tok": 256,
+  "in_tok": 32,
+  "spec": "1:16 8:32 32:64 64:64",
+  "levels_measured": 2,
+  "peak_agg_out_tok_s": 29.2,
+  "elapsed_s": 1851.8,
+  "results": [
+    {
+      "tag": "measured",
+      "model": "SwissAI-Research/moonshot/kimi-k3-rocm",
+      "concurrency": 1,
+      "n": 16,
+      "ok": 16,
+      "wall_s": 1068.2,
+      "in_tok_avg": 50,
+      "out_tok_total": 4096,
+      "out_tok_per_req": 256,
+      "agg_out_tok_s": 3.8,
+      "per_req_out_tok_s_med": 3.8,
+      "lat_p50_s": 66.7,
+      "lat_max_s": 67.8
+    },
+    {
+      "tag": "measured",
+      "model": "SwissAI-Research/moonshot/kimi-k3-rocm",
+      "concurrency": 8,
+      "n": 32,
+      "ok": 32,
+      "wall_s": 280.3,
+      "in_tok_avg": 50,
+      "out_tok_total": 8192,
+      "out_tok_per_req": 256,
+      "agg_out_tok_s": 29.2,
+      "per_req_out_tok_s_med": 3.7,
+      "lat_p50_s": 70.5,
+      "lat_max_s": 71.4
+    },
+    {
+      "tag": "measured",
+      "server": "kda_on",
+      "concurrency": 32,
+      "error": "TimeoutError: "
+    },
+    {
+      "tag": "measured",
+      "server": "kda_on",
+      "concurrency": 64,
+      "error": "TimeoutError: "
+    }
+  ]
+}
