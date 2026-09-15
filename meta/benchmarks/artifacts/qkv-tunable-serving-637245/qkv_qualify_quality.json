@@ -1,5 +1,5 @@
 {
-  "csv": "/iopsstor/scratch/cscs/xyao/floe-beverin/glm5-smoke/run-6nq15go2/work/qkv_report.tunable0.csv",
+  "csv": "<cluster>/glm5-smoke/run-6nq15go2/work/qkv_report.tunable0.csv",
   "declared_gates": {
     "max_abs_vs_fp64_oracle": 0.008,
     "max_rel_vs_fp64_oracle": 0.008,
@@ -193,9 +193,10 @@
       "threshold": 0.95
     },
     {
-      "error": "gate declared but no --nll-report measurement supplied; quality mode never silently waives a declared gate",
       "gate": "model_nll_regression",
-      "passed": false,
+      "observed": 0.003766246333329226,
+      "passed": true,
+      "source": "<cluster>/glm5-smoke/run-5VTSEamZ/qkv-heldout-637400/heldout_nll.json",
       "threshold": 0.005
     }
   ],
@@ -266,5 +267,5 @@
       "reference_repeat_identical": true
     }
   },
-  "passed": false
+  "passed": true
 }

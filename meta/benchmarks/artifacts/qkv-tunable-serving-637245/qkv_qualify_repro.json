@@ -3,7 +3,7 @@
     "1": "Gemm_Hipblaslt_208015",
     "2": "Gemm_Rocblas_-621289657"
   },
-  "csv": "/iopsstor/scratch/cscs/xyao/floe-beverin/glm5-smoke/run-6nq15go2/work/qkv_report.tunable0.csv",
+  "csv": "<cluster>/glm5-smoke/run-6nq15go2/work/qkv_report.tunable0.csv",
   "default_winners_recorded": [],
   "gates": [
     {
