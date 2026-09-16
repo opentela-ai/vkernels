@@ -1,0 +1,67 @@
+{
+  "algos": {
+    "tn_8192_1_4096_ld_4096_4096_8192": "Gemm_Rocblas_621284994",
+    "tn_8192_2_4096_ld_4096_4096_8192": "Gemm_Rocblas_621284994"
+  },
+  "created": "2026-09-14T20:34:27Z",
+  "csv": "qkv_projection.tunable0.csv",
+  "csv_sha256": "sha256:4ae84e766f5e025f757686cd07d10e4655bd031823a243816e160e7d354938c8",
+  "device": {
+    "arch": "gfx942:sramecc+:xnack-",
+    "cu_count": 228
+  },
+  "job": "628932",
+  "kernel": "qkv_projection",
+  "notes": "Sanitized genuine TunableOp artifact from beverin job 628932 (nid002344, torch 2.9.1+rocm6.3, gfx942:sramecc+:xnack-, 2026-09-09). Manifest generated post-hoc from the checked-in CSV for format illustration: it validates today, and becomes stale (rejected) as soon as the fingerprinted sources change - by design.",
+  "op": "GemmTunableOp_BFloat16_TN",
+  "policy": {
+    "default_winners": "recorded"
+  },
+  "producer": {
+    "fingerprints": {
+      "meta/benchmarks/bench_qkv_projection.py": "sha256:65845b2545a098d280df4df0050f7029d195a36392f0886038e25c4679234e5b",
+      "src/python/vkernels/torch_ops/qkv_projection.py": "sha256:df9e950a4bf302a0aab634642b57db34ca68a98bcff3f8403850881dbec8ef07"
+    }
+  },
+  "quality_gates": {
+    "max_abs_vs_fp64_oracle": 0.008,
+    "max_rel_vs_fp64_oracle": 0.008,
+    "min_argmax_agreement": 0.95,
+    "model_nll_regression_max": 0.005,
+    "require_reference_repeat_identical": true
+  },
+  "schema": "vk-tuning-manifest/1",
+  "shapes": {
+    "tn_8192_1_4096_ld_4096_4096_8192": {
+      "K": 4096,
+      "M": 1,
+      "N": 8192,
+      "dtype": "bf16",
+      "layout": "TN",
+      "lda": 4096,
+      "ldb": 4096,
+      "ldc": 8192
+    },
+    "tn_8192_2_4096_ld_4096_4096_8192": {
+      "K": 4096,
+      "M": 2,
+      "N": 8192,
+      "dtype": "bf16",
+      "layout": "TN",
+      "lda": 4096,
+      "ldb": 4096,
+      "ldc": 8192
+    }
+  },
+  "software": {
+    "hip": 603,
+    "torch": "2.9.1"
+  },
+  "validators": {
+    "GCN_ARCH_NAME": "gfx942:sramecc+:xnack-",
+    "HIPBLASLT_VERSION": "1000-b4e5042b",
+    "HIP_VERSION": "603",
+    "PT_VERSION": "2.9.1",
+    "ROCBLAS_VERSION": "4.3.0.8ebd6c11"
+  }
+}

@@ -1,0 +1,270 @@
+{
+  "csv": "/users/xyao/vkernels-issue63/work/issue63/qkv_projection.tunable0.csv",
+  "declared_gates": {
+    "max_abs_vs_fp64_oracle": 0.008,
+    "max_rel_vs_fp64_oracle": 0.008,
+    "min_argmax_agreement": 0.95,
+    "model_nll_regression_max": 0.005,
+    "require_reference_repeat_identical": true
+  },
+  "gates": [
+    {
+      "gate": "reference_repeat_identical[d0 t1]",
+      "observed": true,
+      "passed": true
+    },
+    {
+      "gate": "max_abs_vs_fp64_oracle[d0 t1]",
+      "observed": 0.0078125,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "max_rel_vs_fp64_oracle[d0 t1]",
+      "observed": 0.007575757801532745,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "argmax_agreement[d0 t1]",
+      "observed": 1.0,
+      "passed": true,
+      "threshold": 0.95
+    },
+    {
+      "gate": "reference_repeat_identical[d0 t2]",
+      "observed": true,
+      "passed": true
+    },
+    {
+      "gate": "max_abs_vs_fp64_oracle[d0 t2]",
+      "observed": 0.0078125,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "max_rel_vs_fp64_oracle[d0 t2]",
+      "observed": 0.007575757801532745,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "argmax_agreement[d0 t2]",
+      "observed": 1.0,
+      "passed": true,
+      "threshold": 0.95
+    },
+    {
+      "gate": "reference_repeat_identical[d1 t1]",
+      "observed": true,
+      "passed": true
+    },
+    {
+      "gate": "max_abs_vs_fp64_oracle[d1 t1]",
+      "observed": 0.0078125,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "max_rel_vs_fp64_oracle[d1 t1]",
+      "observed": 0.007575757801532745,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "argmax_agreement[d1 t1]",
+      "observed": 1.0,
+      "passed": true,
+      "threshold": 0.95
+    },
+    {
+      "gate": "reference_repeat_identical[d1 t2]",
+      "observed": true,
+      "passed": true
+    },
+    {
+      "gate": "max_abs_vs_fp64_oracle[d1 t2]",
+      "observed": 0.0078125,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "max_rel_vs_fp64_oracle[d1 t2]",
+      "observed": 0.007575757801532745,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "argmax_agreement[d1 t2]",
+      "observed": 1.0,
+      "passed": true,
+      "threshold": 0.95
+    },
+    {
+      "gate": "reference_repeat_identical[d2 t1]",
+      "observed": true,
+      "passed": true
+    },
+    {
+      "gate": "max_abs_vs_fp64_oracle[d2 t1]",
+      "observed": 0.0078125,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "max_rel_vs_fp64_oracle[d2 t1]",
+      "observed": 0.007575757801532745,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "argmax_agreement[d2 t1]",
+      "observed": 1.0,
+      "passed": true,
+      "threshold": 0.95
+    },
+    {
+      "gate": "reference_repeat_identical[d2 t2]",
+      "observed": true,
+      "passed": true
+    },
+    {
+      "gate": "max_abs_vs_fp64_oracle[d2 t2]",
+      "observed": 0.0078125,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "max_rel_vs_fp64_oracle[d2 t2]",
+      "observed": 0.007575757801532745,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "argmax_agreement[d2 t2]",
+      "observed": 1.0,
+      "passed": true,
+      "threshold": 0.95
+    },
+    {
+      "gate": "reference_repeat_identical[d3 t1]",
+      "observed": true,
+      "passed": true
+    },
+    {
+      "gate": "max_abs_vs_fp64_oracle[d3 t1]",
+      "observed": 0.0078125,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "max_rel_vs_fp64_oracle[d3 t1]",
+      "observed": 0.007575757801532745,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "argmax_agreement[d3 t1]",
+      "observed": 1.0,
+      "passed": true,
+      "threshold": 0.95
+    },
+    {
+      "gate": "reference_repeat_identical[d3 t2]",
+      "observed": true,
+      "passed": true
+    },
+    {
+      "gate": "max_abs_vs_fp64_oracle[d3 t2]",
+      "observed": 0.0078125,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "max_rel_vs_fp64_oracle[d3 t2]",
+      "observed": 0.007575757801532745,
+      "passed": true,
+      "threshold": 0.008
+    },
+    {
+      "gate": "argmax_agreement[d3 t2]",
+      "observed": 1.0,
+      "passed": true,
+      "threshold": 0.95
+    },
+    {
+      "error": "gate declared but no --nll-report measurement supplied; quality mode never silently waives a declared gate",
+      "gate": "model_nll_regression",
+      "passed": false,
+      "threshold": 0.005
+    }
+  ],
+  "mode": "quality",
+  "numerics": {
+    "device0_tokens1": {
+      "argmax_rows": 64,
+      "changed_argmax": [],
+      "max_abs_vs_fp64_oracle": 0.0078125,
+      "max_rel_vs_fp64_oracle": 0.007575757801532745,
+      "min_argmax_agreement": 1.0,
+      "reference_repeat_identical": true
+    },
+    "device0_tokens2": {
+      "argmax_rows": 128,
+      "changed_argmax": [],
+      "max_abs_vs_fp64_oracle": 0.0078125,
+      "max_rel_vs_fp64_oracle": 0.007575757801532745,
+      "min_argmax_agreement": 1.0,
+      "reference_repeat_identical": true
+    },
+    "device1_tokens1": {
+      "argmax_rows": 64,
+      "changed_argmax": [],
+      "max_abs_vs_fp64_oracle": 0.0078125,
+      "max_rel_vs_fp64_oracle": 0.007575757801532745,
+      "min_argmax_agreement": 1.0,
+      "reference_repeat_identical": true
+    },
+    "device1_tokens2": {
+      "argmax_rows": 128,
+      "changed_argmax": [],
+      "max_abs_vs_fp64_oracle": 0.0078125,
+      "max_rel_vs_fp64_oracle": 0.007575757801532745,
+      "min_argmax_agreement": 1.0,
+      "reference_repeat_identical": true
+    },
+    "device2_tokens1": {
+      "argmax_rows": 64,
+      "changed_argmax": [],
+      "max_abs_vs_fp64_oracle": 0.0078125,
+      "max_rel_vs_fp64_oracle": 0.007575757801532745,
+      "min_argmax_agreement": 1.0,
+      "reference_repeat_identical": true
+    },
+    "device2_tokens2": {
+      "argmax_rows": 128,
+      "changed_argmax": [],
+      "max_abs_vs_fp64_oracle": 0.0078125,
+      "max_rel_vs_fp64_oracle": 0.007575757801532745,
+      "min_argmax_agreement": 1.0,
+      "reference_repeat_identical": true
+    },
+    "device3_tokens1": {
+      "argmax_rows": 64,
+      "changed_argmax": [],
+      "max_abs_vs_fp64_oracle": 0.0078125,
+      "max_rel_vs_fp64_oracle": 0.007575757801532745,
+      "min_argmax_agreement": 1.0,
+      "reference_repeat_identical": true
+    },
+    "device3_tokens2": {
+      "argmax_rows": 128,
+      "changed_argmax": [],
+      "max_abs_vs_fp64_oracle": 0.0078125,
+      "max_rel_vs_fp64_oracle": 0.007575757801532745,
+      "min_argmax_agreement": 1.0,
+      "reference_repeat_identical": true
+    }
+  },
+  "passed": false
+}

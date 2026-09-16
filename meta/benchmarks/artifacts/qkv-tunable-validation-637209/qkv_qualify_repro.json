@@ -1,0 +1,38 @@
+{
+  "configured": {
+    "1": "Gemm_Rocblas_621284994",
+    "2": "Gemm_Rocblas_621284994"
+  },
+  "csv": "/users/xyao/vkernels-issue63/work/issue63/qkv_projection.tunable0.csv",
+  "default_winners_recorded": [],
+  "gates": [
+    {
+      "devices": 4,
+      "gate": "cold_warm_capture_parity",
+      "passed": true
+    }
+  ],
+  "manifest": {
+    "created": "2026-09-14T20:54:01Z",
+    "device": {
+      "arch": "gfx942:sramecc+:xnack-",
+      "cu_count": 228
+    },
+    "job": "637209",
+    "kernel": "qkv_projection",
+    "quality_gates": {
+      "max_abs_vs_fp64_oracle": 0.008,
+      "max_rel_vs_fp64_oracle": 0.008,
+      "min_argmax_agreement": 0.95,
+      "model_nll_regression_max": 0.005,
+      "require_reference_repeat_identical": true
+    },
+    "schema": "vk-tuning-manifest/1",
+    "software": {
+      "hip": 603,
+      "torch": "2.9.1"
+    }
+  },
+  "mode": "repro",
+  "passed": true
+}

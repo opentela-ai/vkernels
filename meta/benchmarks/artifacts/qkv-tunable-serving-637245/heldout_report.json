@@ -1,0 +1,5069 @@
+{
+  "status": "heldout_promotion_evidence_complete",
+  "promotion": true,
+  "corpus": {
+    "file": "heldout_corpus.jsonl",
+    "sha256": "b97b8899a8120202742ed9819400775878ed1cc145339d69a7b66ce020eee76c",
+    "source": "wikitext-2-raw-v1 TEST split (Salesforce/wikitext), test-00000-of-00001.parquet; 618 headings parsed, 326 with >=1600 chars, every 11th taken from index 3, capped at 30 documents, text verbatim",
+    "dataset_sha256_raw_test": "bbf94c53a05abe9ee670d3b6343608095822c85e26de37c70b24fc571964574a",
+    "selection": "deterministic; no model, tuning, or human quality filter involved",
+    "held_out_from": [
+      "tuning (TunableOp is shape-keyed M=1/2 token GEMM; no text influence)",
+      "the authored diagnostic passages in qkv_quality_audit.py"
+    ],
+    "titles": [
+      "Early years",
+      "Ise @-@ class battleship",
+      "Professional career",
+      "North Korean advance",
+      "Early ironclad ships and battles",
+      "Background",
+      "Classification",
+      "Usage",
+      "Humanitarian work",
+      "Some Imagist Poets",
+      "Composition",
+      "Typhoon Soudelor ( Egay )",
+      "Other storms",
+      "WWE Championship reigns ( 2002 \u2013 2004 )",
+      "The Snowmen",
+      "Transfer to airborne role",
+      "San Lorenzo",
+      "Final Four",
+      "Conformity and beauty",
+      "Home media",
+      "Early rule",
+      "Architecture",
+      "Description",
+      "Internment and the third Free Derry",
+      "Post @-@ war period",
+      "Schism",
+      "Preparations and impact",
+      "Headstones",
+      "Operation Felix : 1940 \u2013 1941",
+      "Production"
+    ],
+    "documents": 30
+  },
+  "prefix": 256,
+  "steps": 128,
+  "skipped_documents": [
+    {
+      "index": 1,
+      "title": "Ise @-@ class battleship",
+      "tokens": 376
+    },
+    {
+      "index": 5,
+      "title": "Background",
+      "tokens": 359
+    },
+    {
+      "index": 26,
+      "title": "Preparations and impact",
+      "tokens": 376
+    }
+  ],
+  "declared_gates": {
+    "finite": true,
+    "baseline_repeat_max_abs_error": 0.0,
+    "model_nll_regression_max": 0.005
+  },
+  "per_document": [
+    {
+      "index": 0,
+      "title": "Early years",
+      "tokens": 825,
+      "nll_baseline": 0.25973603574828535,
+      "nll_candidate": 0.28238339172535276,
+      "nll_delta": 0.022647355977067404,
+      "greedy_matches": 127,
+      "greedy_tokens": 128,
+      "relative_l2": 0.04886864960408567,
+      "max_abs": 2.0
+    },
+    {
+      "index": 2,
+      "title": "Professional career",
+      "tokens": 714,
+      "nll_baseline": 1.9438870352051478,
+      "nll_candidate": 1.943436502586001,
+      "nll_delta": -0.0004505326191466697,
+      "greedy_matches": 125,
+      "greedy_tokens": 128,
+      "relative_l2": 0.04478310468950426,
+      "max_abs": 1.5
+    },
+    {
+      "index": 3,
+      "title": "North Korean advance",
+      "tokens": 533,
+      "nll_baseline": 2.2263726345892874,
+      "nll_candidate": 2.2229958479061196,
+      "nll_delta": -0.00337678668316755,
+      "greedy_matches": 121,
+      "greedy_tokens": 128,
+      "relative_l2": 0.0486754499418593,
+      "max_abs": 3.0
+    },
+    {
+      "index": 4,
+      "title": "Early ironclad ships and battles",
+      "tokens": 674,
+      "nll_baseline": 0.6792764745839871,
+      "nll_candidate": 0.6699914173055124,
+      "nll_delta": -0.009285057278474725,
+      "greedy_matches": 124,
+      "greedy_tokens": 128,
+      "relative_l2": 0.059750662671357764,
+      "max_abs": 2.1875
+    },
+    {
+      "index": 6,
+      "title": "Classification",
+      "tokens": 547,
+      "nll_baseline": 0.20611606909523503,
+      "nll_candidate": 0.22730658794345965,
+      "nll_delta": 0.02119051884822462,
+      "greedy_matches": 127,
+      "greedy_tokens": 128,
+      "relative_l2": 0.06366443317833095,
+      "max_abs": 2.875
+    },
+    {
+      "index": 7,
+      "title": "Usage",
+      "tokens": 529,
+      "nll_baseline": 0.99663390614449,
+      "nll_candidate": 1.0140053759841205,
+      "nll_delta": 0.017371469839630567,
+      "greedy_matches": 126,
+      "greedy_tokens": 128,
+      "relative_l2": 0.05446880885818498,
+      "max_abs": 1.890625
+    },
+    {
+      "index": 8,
+      "title": "Humanitarian work",
+      "tokens": 449,
+      "nll_baseline": 1.6365970392587166,
+      "nll_candidate": 1.6592567713425197,
+      "nll_delta": 0.022659732083803112,
+      "greedy_matches": 122,
+      "greedy_tokens": 128,
+      "relative_l2": 0.05435807865355807,
+      "max_abs": 3.3359375
+    },
+    {
+      "index": 9,
+      "title": "Some Imagist Poets",
+      "tokens": 592,
+      "nll_baseline": 0.18369902298992086,
+      "nll_candidate": 0.17752940965370329,
+      "nll_delta": -0.006169613336217592,
+      "greedy_matches": 128,
+      "greedy_tokens": 128,
+      "relative_l2": 0.04157924457824246,
+      "max_abs": 2.21875
+    },
+    {
+      "index": 10,
+      "title": "Composition",
+      "tokens": 563,
+      "nll_baseline": 1.83970800400377,
+      "nll_candidate": 1.840964837101827,
+      "nll_delta": 0.0012568330980571177,
+      "greedy_matches": 124,
+      "greedy_tokens": 128,
+      "relative_l2": 0.060051463997165926,
+      "max_abs": 3.5625
+    },
+    {
+      "index": 11,
+      "title": "Typhoon Soudelor ( Egay )",
+      "tokens": 442,
+      "nll_baseline": 1.2530790080181595,
+      "nll_candidate": 1.2582110431665865,
+      "nll_delta": 0.005132035148426787,
+      "greedy_matches": 127,
+      "greedy_tokens": 128,
+      "relative_l2": 0.04656997417860761,
+      "max_abs": 2.25390625
+    },
+    {
+      "index": 12,
+      "title": "Other storms",
+      "tokens": 982,
+      "nll_baseline": 1.6790669302689873,
+      "nll_candidate": 1.6807758838632387,
+      "nll_delta": 0.0017089535942511214,
+      "greedy_matches": 124,
+      "greedy_tokens": 128,
+      "relative_l2": 0.05414333466963635,
+      "max_abs": 2.25
+    },
+    {
+      "index": 13,
+      "title": "WWE Championship reigns ( 2002 \u2013 2004 )",
+      "tokens": 2455,
+      "nll_baseline": 1.0575743007469136,
+      "nll_candidate": 1.0440878824683697,
+      "nll_delta": -0.013486418278543695,
+      "greedy_matches": 124,
+      "greedy_tokens": 128,
+      "relative_l2": 0.06733248023448996,
+      "max_abs": 3.0380859375
+    },
+    {
+      "index": 14,
+      "title": "The Snowmen",
+      "tokens": 431,
+      "nll_baseline": 1.3338552093135516,
+      "nll_candidate": 1.3225117781876627,
+      "nll_delta": -0.011343431125889225,
+      "greedy_matches": 124,
+      "greedy_tokens": 128,
+      "relative_l2": 0.04837999092919447,
+      "max_abs": 1.828125
+    },
+    {
+      "index": 15,
+      "title": "Transfer to airborne role",
+      "tokens": 814,
+      "nll_baseline": 1.130849082563002,
+      "nll_candidate": 1.1211810903965713,
+      "nll_delta": -0.00966799216643084,
+      "greedy_matches": 124,
+      "greedy_tokens": 128,
+      "relative_l2": 0.04664040441909876,
+      "max_abs": 2.1875
+    },
+    {
+      "index": 16,
+      "title": "San Lorenzo",
+      "tokens": 3511,
+      "nll_baseline": 1.6000062661953898,
+      "nll_candidate": 1.6029889720740866,
+      "nll_delta": 0.0029827058786971086,
+      "greedy_matches": 120,
+      "greedy_tokens": 128,
+      "relative_l2": 0.05014903551078052,
+      "max_abs": 1.6875
+    },
+    {
+      "index": 17,
+      "title": "Final Four",
+      "tokens": 782,
+      "nll_baseline": 1.2272836521440311,
+      "nll_candidate": 1.2244994477567572,
+      "nll_delta": -0.0027842043872738677,
+      "greedy_matches": 122,
+      "greedy_tokens": 128,
+      "relative_l2": 0.07067911788994957,
+      "max_abs": 4.2734375
+    },
+    {
+      "index": 18,
+      "title": "Conformity and beauty",
+      "tokens": 1253,
+      "nll_baseline": 1.689686421180986,
+      "nll_candidate": 1.6993341256596097,
+      "nll_delta": 0.0096477044786233,
+      "greedy_matches": 121,
+      "greedy_tokens": 128,
+      "relative_l2": 0.06978304721939917,
+      "max_abs": 2.53125
+    },
+    {
+      "index": 19,
+      "title": "Home media",
+      "tokens": 527,
+      "nll_baseline": 1.6285318485433065,
+      "nll_candidate": 1.62710222612342,
+      "nll_delta": -0.0014296224198863832,
+      "greedy_matches": 120,
+      "greedy_tokens": 128,
+      "relative_l2": 0.051584290886742504,
+      "max_abs": 3.875
+    },
+    {
+      "index": 20,
+      "title": "Early rule",
+      "tokens": 1044,
+      "nll_baseline": 1.4942605946070457,
+      "nll_candidate": 1.5163908955502037,
+      "nll_delta": 0.022130300943158272,
+      "greedy_matches": 126,
+      "greedy_tokens": 128,
+      "relative_l2": 0.07002978640355602,
+      "max_abs": 3.55859375
+    },
+    {
+      "index": 21,
+      "title": "Architecture",
+      "tokens": 457,
+      "nll_baseline": 1.4592122429870096,
+      "nll_candidate": 1.4799586466782144,
+      "nll_delta": 0.02074640369120444,
+      "greedy_matches": 124,
+      "greedy_tokens": 128,
+      "relative_l2": 0.04488604756192571,
+      "max_abs": 2.9404296875
+    },
+    {
+      "index": 22,
+      "title": "Description",
+      "tokens": 399,
+      "nll_baseline": 1.4462057511017428,
+      "nll_candidate": 1.4325036653061733,
+      "nll_delta": -0.013702085795569367,
+      "greedy_matches": 118,
+      "greedy_tokens": 128,
+      "relative_l2": 0.05550382665138201,
+      "max_abs": 2.0625
+    },
+    {
+      "index": 23,
+      "title": "Internment and the third Free Derry",
+      "tokens": 455,
+      "nll_baseline": 1.6906275175766008,
+      "nll_candidate": 1.7131724967359783,
+      "nll_delta": 0.022544979159377476,
+      "greedy_matches": 119,
+      "greedy_tokens": 128,
+      "relative_l2": 0.057935624330209934,
+      "max_abs": 2.75
+    },
+    {
+      "index": 24,
+      "title": "Post @-@ war period",
+      "tokens": 433,
+      "nll_baseline": 1.6291907973542452,
+      "nll_candidate": 1.642609130950813,
+      "nll_delta": 0.013418333596567692,
+      "greedy_matches": 124,
+      "greedy_tokens": 128,
+      "relative_l2": 0.07787263728946642,
+      "max_abs": 6.234375
+    },
+    {
+      "index": 25,
+      "title": "Schism",
+      "tokens": 404,
+      "nll_baseline": 2.267518516095458,
+      "nll_candidate": 2.2674798566745675,
+      "nll_delta": -3.865942089006989e-05,
+      "greedy_matches": 120,
+      "greedy_tokens": 128,
+      "relative_l2": 0.050192810497462007,
+      "max_abs": 2.0625
+    },
+    {
+      "index": 27,
+      "title": "Headstones",
+      "tokens": 527,
+      "nll_baseline": 0.9191104362665894,
+      "nll_candidate": 0.9132105192511237,
+      "nll_delta": -0.005899917015465734,
+      "greedy_matches": 126,
+      "greedy_tokens": 128,
+      "relative_l2": 0.07634982892212311,
+      "max_abs": 3.46875
+    },
+    {
+      "index": 28,
+      "title": "Operation Felix : 1940 \u2013 1941",
+      "tokens": 478,
+      "nll_baseline": 0.5560006817900509,
+      "nll_candidate": 0.5513486046820351,
+      "nll_delta": -0.0046520771080159045,
+      "greedy_matches": 124,
+      "greedy_tokens": 128,
+      "relative_l2": 0.04545537946187852,
+      "max_abs": 1.5009765625
+    },
+    {
+      "index": 29,
+      "title": "Production",
+      "tokens": 700,
+      "nll_baseline": 1.6962553510428457,
+      "nll_candidate": 1.6967930733406345,
+      "nll_delta": 0.0005377222977888278,
+      "greedy_matches": 123,
+      "greedy_tokens": 128,
+      "relative_l2": 0.04474354672648133,
+      "max_abs": 1.828125
+    }
+  ],
+  "changed_rows": [
+    {
+      "position": 279,
+      "target": {
+        "id": 1154,
+        "text": " ,"
+      },
+      "reference": {
+        "greedy_id": 304,
+        "greedy_text": " in",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 304,
+            "text": " in",
+            "logit": 18.5,
+            "probability": 0.5082115094261959
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 18.375,
+            "probability": 0.44849508292645973
+          },
+          {
+            "id": 323,
+            "text": " and",
+            "logit": 14.875,
+            "probability": 0.013543377982154839
+          },
+          {
+            "id": 369,
+            "text": " for",
+            "logit": 13.375,
+            "probability": 0.0030219360981089275
+          },
+          {
+            "id": 320,
+            "text": " (",
+            "logit": 13.25,
+            "probability": 0.0026668492463897066
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 1154,
+        "greedy_text": " ,",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 18.75,
+            "probability": 0.511498983928198
+          },
+          {
+            "id": 304,
+            "text": " in",
+            "logit": 18.625,
+            "probability": 0.4513962689918025
+          },
+          {
+            "id": 323,
+            "text": " and",
+            "logit": 14.875,
+            "probability": 0.01061582273449994
+          },
+          {
+            "id": 369,
+            "text": " for",
+            "logit": 13.75,
+            "probability": 0.003446453043794269
+          },
+          {
+            "id": 1992,
+            "text": " place",
+            "logit": 13.375,
+            "probability": 0.002368710226856314
+          }
+        ]
+      },
+      "nll_delta": -0.13144788087049142,
+      "context": {
+        "ids": [
+          311,
+          2400,
+          504,
+          279,
+          835,
+          315,
+          419,
+          4168,
+          1154,
+          2163,
+          220,
+          22,
+          100235,
+          659,
+          758,
+          429,
+          1042,
+          1154,
+          566,
+          3867,
+          279,
+          8266,
+          2473,
+          7006
+        ],
+        "text": " to date from the end of this period , around 735 . In that year , he took the civil service exam"
+      },
+      "document": 0
+    },
+    {
+      "position": 257,
+      "target": {
+        "id": 572,
+        "text": " was"
+      },
+      "reference": {
+        "greedy_id": 1035,
+        "greedy_text": " would",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 1035,
+            "text": " would",
+            "logit": 22.625,
+            "probability": 0.5049992488748808
+          },
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 22.5,
+            "probability": 0.44566027293962956
+          },
+          {
+            "id": 1030,
+            "text": " had",
+            "logit": 20.125,
+            "probability": 0.04145286264896452
+          },
+          {
+            "id": 330,
+            "text": " \"",
+            "logit": 17.125,
+            "probability": 0.0020638165067476703
+          },
+          {
+            "id": 364,
+            "text": " '",
+            "logit": 16.875,
+            "probability": 0.001607301911570777
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 572,
+        "greedy_text": " was",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 1035,
+            "text": " would",
+            "logit": 22.625,
+            "probability": 0.47390737217795553
+          },
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 22.625,
+            "probability": 0.47390737217795553
+          },
+          {
+            "id": 1030,
+            "text": " had",
+            "logit": 20.25,
+            "probability": 0.04408025215630033
+          },
+          {
+            "id": 330,
+            "text": " \"",
+            "logit": 17.25,
+            "probability": 0.0021946265277784072
+          },
+          {
+            "id": 364,
+            "text": " '",
+            "logit": 16.875,
+            "probability": 0.001508343283492357
+          }
+        ]
+      },
+      "nll_delta": -0.061454943354753544,
+      "context": {
+        "ids": [
+          24,
+          1260,
+          62130,
+          54735,
+          13623,
+          20885,
+          22839,
+          1154,
+          879,
+          6342,
+          279,
+          1852,
+          2309,
+          659,
+          715,
+          758,
+          3217,
+          220,
+          122414,
+          16,
+          1154,
+          566,
+          7228,
+          566
+        ],
+        "text": "9 Heisman Trophy winner Leon Hart , who played the same position . \n In May 1951 , he announced he"
+      },
+      "document": 2
+    },
+    {
+      "position": 321,
+      "target": {
+        "id": 31258,
+        "text": " Buffalo"
+      },
+      "reference": {
+        "greedy_id": 8055,
+        "greedy_text": " station",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 32612,
+            "text": " Lions",
+            "logit": 14.3125,
+            "probability": 0.21299906576545688
+          },
+          {
+            "id": 8055,
+            "text": " station",
+            "logit": 14.3125,
+            "probability": 0.21299906576545688
+          },
+          {
+            "id": 12582,
+            "text": " NFL",
+            "logit": 13.875,
+            "probability": 0.1375225329419849
+          },
+          {
+            "id": 31258,
+            "text": " Buffalo",
+            "logit": 12.9375,
+            "probability": 0.05385459769492673
+          },
+          {
+            "id": 5055,
+            "text": " National",
+            "logit": 12.5625,
+            "probability": 0.03701368760932414
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 32612,
+        "greedy_text": " Lions",
+        "top1_top2_margin": 0.1875,
+        "top5": [
+          {
+            "id": 32612,
+            "text": " Lions",
+            "logit": 14.0625,
+            "probability": 0.204342656775337
+          },
+          {
+            "id": 8055,
+            "text": " station",
+            "logit": 13.875,
+            "probability": 0.16940601255309784
+          },
+          {
+            "id": 12582,
+            "text": " NFL",
+            "logit": 13.6875,
+            "probability": 0.14044251720135253
+          },
+          {
+            "id": 31258,
+            "text": " Buffalo",
+            "logit": 13.0625,
+            "probability": 0.0751734623819988
+          },
+          {
+            "id": 19724,
+            "text": " Detroit",
+            "logit": 12.1875,
+            "probability": 0.0313369613547864
+          }
+        ]
+      },
+      "nll_delta": -0.3335104951955663,
+      "context": {
+        "ids": [
+          279,
+          1156,
+          12419,
+          8055,
+          304,
+          31258,
+          323,
+          279,
+          1172,
+          825,
+          13471,
+          16230,
+          20508,
+          659,
+          1096,
+          572,
+          458,
+          4124,
+          369,
+          352,
+          1119,
+          12419,
+          553,
+          279
+        ],
+        "text": " the first television station in Buffalo and the only one serving Southern Ontario . This was an early foray into television by the"
+      },
+      "document": 2
+    },
+    {
+      "position": 351,
+      "target": {
+        "id": 94829,
+        "text": " pioneered"
+      },
+      "reference": {
+        "greedy_id": 10218,
+        "greedy_text": " served",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 10218,
+            "text": " served",
+            "logit": 17.375,
+            "probability": 0.16842106348860375
+          },
+          {
+            "id": 1521,
+            "text": " did",
+            "logit": 17.25,
+            "probability": 0.14863106685869631
+          },
+          {
+            "id": 20962,
+            "text": " hosted",
+            "logit": 16.875,
+            "probability": 0.10215253874724613
+          },
+          {
+            "id": 17583,
+            "text": " handled",
+            "logit": 16.5,
+            "probability": 0.07020834468226163
+          },
+          {
+            "id": 2598,
+            "text": " called",
+            "logit": 16.375,
+            "probability": 0.06195864671768754
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 1521,
+        "greedy_text": " did",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 1521,
+            "text": " did",
+            "logit": 17.375,
+            "probability": 0.16817869444050365
+          },
+          {
+            "id": 10218,
+            "text": " served",
+            "logit": 17.25,
+            "probability": 0.14841717692446557
+          },
+          {
+            "id": 20962,
+            "text": " hosted",
+            "logit": 16.75,
+            "probability": 0.09001956823268274
+          },
+          {
+            "id": 17583,
+            "text": " handled",
+            "logit": 16.625,
+            "probability": 0.07944199013734517
+          },
+          {
+            "id": 2598,
+            "text": " called",
+            "logit": 16.5,
+            "probability": 0.07010731023136309
+          }
+        ]
+      },
+      "nll_delta": 0.0014401025804566814,
+      "context": {
+        "ids": [
+          220,
+          122414,
+          15,
+          82,
+          1154,
+          88989,
+          54023,
+          20962,
+          264,
+          5411,
+          6945,
+          1473,
+          2598,
+          330,
+          6771,
+          364,
+          82,
+          18941,
+          13172,
+          330,
+          304,
+          31258,
+          323,
+          1083
+        ],
+        "text": " 1950s , Rifenburg hosted a popular panel show called \" Let 's Talk Sports \" in Buffalo and also"
+      },
+      "document": 2
+    },
+    {
+      "position": 303,
+      "target": {
+        "id": 949,
+        "text": " part"
+      },
+      "reference": {
+        "greedy_id": 825,
+        "greedy_text": " one",
+        "top1_top2_margin": 0.0625,
+        "top5": [
+          {
+            "id": 825,
+            "text": " one",
+            "logit": 15.9375,
+            "probability": 0.16648962384105595
+          },
+          {
+            "id": 264,
+            "text": " a",
+            "logit": 15.875,
+            "probability": 0.15640252745918984
+          },
+          {
+            "id": 1221,
+            "text": " then",
+            "logit": 15.625,
+            "probability": 0.12180641085956392
+          },
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 15.4375,
+            "probability": 0.10098106138362382
+          },
+          {
+            "id": 1378,
+            "text": " two",
+            "logit": 15.3125,
+            "probability": 0.08911547389075292
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 279,
+        "greedy_text": " the",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 17.375,
+            "probability": 0.28234587491283025
+          },
+          {
+            "id": 825,
+            "text": " one",
+            "logit": 17.25,
+            "probability": 0.24916936006811033
+          },
+          {
+            "id": 264,
+            "text": " a",
+            "logit": 16.875,
+            "probability": 0.1712514297780196
+          },
+          {
+            "id": 1378,
+            "text": " two",
+            "logit": 16.0,
+            "probability": 0.07138821689009751
+          },
+          {
+            "id": 949,
+            "text": " part",
+            "logit": 15.125,
+            "probability": 0.029759036274053456
+          }
+        ]
+      },
+      "nll_delta": -0.34069983797057457,
+      "context": {
+        "ids": [
+          220,
+          101220,
+          47587,
+          389,
+          419,
+          4787,
+          16120,
+          5344,
+          659,
+          758,
+          279,
+          13345,
+          1154,
+          2274,
+          14126,
+          12220,
+          3607,
+          323,
+          36477,
+          311,
+          279,
+          2813,
+          2587,
+          1172
+        ],
+        "text": " 300 casualties on this North Korean force . In the afternoon , US aircraft dropped food and ammunition to the company ; only"
+      },
+      "document": 3
+    },
+    {
+      "position": 306,
+      "target": {
+        "id": 572,
+        "text": " was"
+      },
+      "reference": {
+        "greedy_id": 572,
+        "greedy_text": " was",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 19.25,
+            "probability": 0.3117628495320084
+          },
+          {
+            "id": 8642,
+            "text": " reached",
+            "logit": 19.125,
+            "probability": 0.2751297490529447
+          },
+          {
+            "id": 11047,
+            "text": " fell",
+            "logit": 18.625,
+            "probability": 0.16687462819965382
+          },
+          {
+            "id": 26039,
+            "text": " landed",
+            "logit": 18.125,
+            "probability": 0.10121457833123648
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 17.375,
+            "probability": 0.04781038145346158
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 8642,
+        "greedy_text": " reached",
+        "top1_top2_margin": 0.875,
+        "top5": [
+          {
+            "id": 8642,
+            "text": " reached",
+            "logit": 19.625,
+            "probability": 0.4412754323936723
+          },
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 18.75,
+            "probability": 0.18395096798213334
+          },
+          {
+            "id": 26039,
+            "text": " landed",
+            "logit": 18.375,
+            "probability": 0.1264275281173416
+          },
+          {
+            "id": 11047,
+            "text": " fell",
+            "logit": 18.375,
+            "probability": 0.1264275281173416
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 17.25,
+            "probability": 0.041045008945312086
+          }
+        ]
+      },
+      "nll_delta": 0.5275735573956282,
+      "context": {
+        "ids": [
+          389,
+          419,
+          4787,
+          16120,
+          5344,
+          659,
+          758,
+          279,
+          13345,
+          1154,
+          2274,
+          14126,
+          12220,
+          3607,
+          323,
+          36477,
+          311,
+          279,
+          2813,
+          2587,
+          1172,
+          949,
+          315,
+          432
+        ],
+        "text": " on this North Korean force . In the afternoon , US aircraft dropped food and ammunition to the company ; only part of it"
+      },
+      "document": 3
+    },
+    {
+      "position": 323,
+      "target": {
+        "id": 659,
+        "text": " ."
+      },
+      "reference": {
+        "greedy_id": 311,
+        "greedy_text": " to",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 311,
+            "text": " to",
+            "logit": 18.375,
+            "probability": 0.24115121451288143
+          },
+          {
+            "id": 659,
+            "text": " .",
+            "logit": 18.375,
+            "probability": 0.24115121451288143
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 18.25,
+            "probability": 0.2128151998621312
+          },
+          {
+            "id": 3941,
+            "text": " across",
+            "logit": 16.875,
+            "probability": 0.05380810911424759
+          },
+          {
+            "id": 323,
+            "text": " and",
+            "logit": 16.25,
+            "probability": 0.028801405350397866
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 659,
+        "greedy_text": " .",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 659,
+            "text": " .",
+            "logit": 18.5,
+            "probability": 0.2625045894026787
+          },
+          {
+            "id": 311,
+            "text": " to",
+            "logit": 18.375,
+            "probability": 0.23165948706210493
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 18.25,
+            "probability": 0.20443877978664374
+          },
+          {
+            "id": 3941,
+            "text": " across",
+            "logit": 16.875,
+            "probability": 0.05169021844807059
+          },
+          {
+            "id": 504,
+            "text": " from",
+            "logit": 16.25,
+            "probability": 0.027667780166972928
+          }
+        ]
+      },
+      "nll_delta": -0.0848443824774352,
+      "context": {
+        "ids": [
+          279,
+          2813,
+          2587,
+          1172,
+          949,
+          315,
+          432,
+          572,
+          25257,
+          659,
+          576,
+          220,
+          16,
+          267,
+          73067,
+          11452,
+          362,
+          8187,
+          311,
+          14787,
+          279,
+          2813,
+          429,
+          3729
+        ],
+        "text": " the company ; only part of it was recovered . The 1st Battalion ordered A Company to withdraw the company that night"
+      },
+      "document": 3
+    },
+    {
+      "position": 335,
+      "target": {
+        "id": 264,
+        "text": " a"
+      },
+      "reference": {
+        "greedy_id": 4787,
+        "greedy_text": " North",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 4787,
+            "text": " North",
+            "logit": 16.75,
+            "probability": 0.2809553479840115
+          },
+          {
+            "id": 264,
+            "text": " a",
+            "logit": 16.625,
+            "probability": 0.2479422243604673
+          },
+          {
+            "id": 458,
+            "text": " an",
+            "logit": 16.625,
+            "probability": 0.2479422243604673
+          },
+          {
+            "id": 9172,
+            "text": " enemy",
+            "logit": 14.6875,
+            "probability": 0.0357194640871224
+          },
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 14.5,
+            "probability": 0.02961247581402356
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 264,
+        "greedy_text": " a",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 458,
+            "text": " an",
+            "logit": 16.75,
+            "probability": 0.2693999320390301
+          },
+          {
+            "id": 264,
+            "text": " a",
+            "logit": 16.75,
+            "probability": 0.2693999320390301
+          },
+          {
+            "id": 4787,
+            "text": " North",
+            "logit": 16.625,
+            "probability": 0.2377446055809446
+          },
+          {
+            "id": 9172,
+            "text": " enemy",
+            "logit": 14.625,
+            "probability": 0.0321752335342739
+          },
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 14.625,
+            "probability": 0.0321752335342739
+          }
+        ]
+      },
+      "nll_delta": -0.08300125897265787,
+      "context": {
+        "ids": [
+          16,
+          267,
+          73067,
+          11452,
+          362,
+          8187,
+          311,
+          14787,
+          279,
+          2813,
+          429,
+          3729,
+          659,
+          715,
+          11948,
+          279,
+          14787,
+          1154,
+          4764,
+          1154,
+          362,
+          8187,
+          10608,
+          1119
+        ],
+        "text": "1st Battalion ordered A Company to withdraw the company that night . \n During the withdraw , however , A Company ran into"
+      },
+      "document": 3
+    },
+    {
+      "position": 341,
+      "target": {
+        "id": 1030,
+        "text": " had"
+      },
+      "reference": {
+        "greedy_id": 1030,
+        "greedy_text": " had",
+        "top1_top2_margin": 0.3125,
+        "top5": [
+          {
+            "id": 1030,
+            "text": " had",
+            "logit": 16.125,
+            "probability": 0.19328843505549426
+          },
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 15.8125,
+            "probability": 0.14141283998123755
+          },
+          {
+            "id": 16242,
+            "text": " suffered",
+            "logit": 15.5,
+            "probability": 0.10345984386400392
+          },
+          {
+            "id": 6116,
+            "text": " became",
+            "logit": 15.375,
+            "probability": 0.09130299175186932
+          },
+          {
+            "id": 36775,
+            "text": " scattered",
+            "logit": 14.625,
+            "probability": 0.04312847946877181
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 572,
+        "greedy_text": " was",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 1030,
+            "text": " had",
+            "logit": 15.9375,
+            "probability": 0.15979186412066188
+          },
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 15.9375,
+            "probability": 0.15979186412066188
+          },
+          {
+            "id": 16242,
+            "text": " suffered",
+            "logit": 15.5625,
+            "probability": 0.10982323504815472
+          },
+          {
+            "id": 6116,
+            "text": " became",
+            "logit": 15.25,
+            "probability": 0.08034839518271059
+          },
+          {
+            "id": 36775,
+            "text": " scattered",
+            "logit": 14.625,
+            "probability": 0.043007396784706026
+          }
+        ]
+      },
+      "nll_delta": 0.19031143628154057,
+      "context": {
+        "ids": [
+          311,
+          14787,
+          279,
+          2813,
+          429,
+          3729,
+          659,
+          715,
+          11948,
+          279,
+          14787,
+          1154,
+          4764,
+          1154,
+          362,
+          8187,
+          10608,
+          1119,
+          264,
+          77471,
+          4787,
+          16120,
+          5344,
+          323
+        ],
+        "text": " to withdraw the company that night . \n During the withdraw , however , A Company ran into a sizable North Korean force and"
+      },
+      "document": 3
+    },
+    {
+      "position": 357,
+      "target": {
+        "id": 7425,
+        "text": " killed"
+      },
+      "reference": {
+        "greedy_id": 7425,
+        "greedy_text": " killed",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 7425,
+            "text": " killed",
+            "logit": 16.75,
+            "probability": 0.18391425852030088
+          },
+          {
+            "id": 7402,
+            "text": " missing",
+            "logit": 16.625,
+            "probability": 0.16230376348530806
+          },
+          {
+            "id": 2952,
+            "text": " able",
+            "logit": 15.9375,
+            "probability": 0.08161145750393985
+          },
+          {
+            "id": 5558,
+            "text": " lost",
+            "logit": 15.5,
+            "probability": 0.052692317277051294
+          },
+          {
+            "id": 537,
+            "text": " not",
+            "logit": 15.25,
+            "probability": 0.041036817957214464
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 7402,
+        "greedy_text": " missing",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 7402,
+            "text": " missing",
+            "logit": 16.75,
+            "probability": 0.17844016268060428
+          },
+          {
+            "id": 7425,
+            "text": " killed",
+            "logit": 16.625,
+            "probability": 0.15747289086232458
+          },
+          {
+            "id": 2952,
+            "text": " able",
+            "logit": 16.0,
+            "probability": 0.08428916451598291
+          },
+          {
+            "id": 5558,
+            "text": " lost",
+            "logit": 15.5,
+            "probability": 0.0511239625605058
+          },
+          {
+            "id": 537,
+            "text": " not",
+            "logit": 15.3125,
+            "probability": 0.04238325359942393
+          }
+        ]
+      },
+      "nll_delta": 0.1552163407588849,
+      "context": {
+        "ids": [
+          10608,
+          1119,
+          264,
+          77471,
+          4787,
+          16120,
+          5344,
+          323,
+          1030,
+          36775,
+          304,
+          279,
+          71113,
+          4367,
+          659,
+          7496,
+          315,
+          279,
+          2813,
+          1154,
+          2670,
+          1181,
+          27899,
+          1033
+        ],
+        "text": " ran into a sizable North Korean force and had scattered in the ensuing fight . Most of the company , including its commander were"
+      },
+      "document": 3
+    },
+    {
+      "position": 371,
+      "target": {
+        "id": 472,
+        "text": " H"
+      },
+      "reference": {
+        "greedy_id": 472,
+        "greedy_text": " H",
+        "top1_top2_margin": 0.375,
+        "top5": [
+          {
+            "id": 472,
+            "text": " H",
+            "logit": 16.375,
+            "probability": 0.5382844781338604
+          },
+          {
+            "id": 444,
+            "text": " L",
+            "logit": 16.0,
+            "probability": 0.3699571507609958
+          },
+          {
+            "id": 15094,
+            "text": " Story",
+            "logit": 12.75,
+            "probability": 0.014344795452438568
+          },
+          {
+            "id": 63903,
+            "text": " Hers",
+            "logit": 12.375,
+            "probability": 0.00985902412091052
+          },
+          {
+            "id": 431,
+            "text": " R",
+            "logit": 12.125,
+            "probability": 0.007678215705684982
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 444,
+        "greedy_text": " L",
+        "top1_top2_margin": 0.375,
+        "top5": [
+          {
+            "id": 444,
+            "text": " L",
+            "logit": 16.625,
+            "probability": 0.5463303837258598
+          },
+          {
+            "id": 472,
+            "text": " H",
+            "logit": 16.25,
+            "probability": 0.3754870154125413
+          },
+          {
+            "id": 15094,
+            "text": " Story",
+            "logit": 13.125,
+            "probability": 0.016497748072632185
+          },
+          {
+            "id": 431,
+            "text": " R",
+            "logit": 12.25,
+            "probability": 0.006877284581704672
+          },
+          {
+            "id": 63903,
+            "text": " Hers",
+            "logit": 12.1875,
+            "probability": 0.00646061097273908
+          }
+        ]
+      },
+      "nll_delta": 0.36016329903215594,
+      "context": {
+        "ids": [
+          659,
+          7496,
+          315,
+          279,
+          2813,
+          1154,
+          2670,
+          1181,
+          27899,
+          1033,
+          7425,
+          518,
+          3265,
+          2088,
+          659,
+          758,
+          419,
+          27304,
+          1917,
+          1154,
+          9675,
+          5512,
+          3228,
+          35028
+        ],
+        "text": " . Most of the company , including its commander were killed at close range . In this desperate action , Private First Class Luther"
+      },
+      "document": 3
+    },
+    {
+      "position": 308,
+      "target": {
+        "id": 659,
+        "text": " ."
+      },
+      "reference": {
+        "greedy_id": 569,
+        "greedy_text": " @",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 569,
+            "text": " @",
+            "logit": 17.75,
+            "probability": 0.507095449271679
+          },
+          {
+            "id": 659,
+            "text": " .",
+            "logit": 17.625,
+            "probability": 0.44751016329700055
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 14.125,
+            "probability": 0.013513635986463888
+          },
+          {
+            "id": 2587,
+            "text": " ;",
+            "logit": 14.0625,
+            "probability": 0.012694886171790445
+          },
+          {
+            "id": 31,
+            "text": "@",
+            "logit": 12.375,
+            "probability": 0.002348317815721676
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 659,
+        "greedy_text": " .",
+        "top1_top2_margin": 0.375,
+        "top5": [
+          {
+            "id": 659,
+            "text": " .",
+            "logit": 17.875,
+            "probability": 0.5628084006308078
+          },
+          {
+            "id": 569,
+            "text": " @",
+            "logit": 17.5,
+            "probability": 0.38681217976704846
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 14.375,
+            "probability": 0.01699534106715035
+          },
+          {
+            "id": 2587,
+            "text": " ;",
+            "logit": 14.125,
+            "probability": 0.013235984931662297
+          },
+          {
+            "id": 31,
+            "text": "@",
+            "logit": 12.5,
+            "probability": 0.002606319965871093
+          }
+        ]
+      },
+      "nll_delta": -0.22924000288758128,
+      "context": {
+        "ids": [
+          25051,
+          572,
+          803,
+          264,
+          3460,
+          1154,
+          7987,
+          1422,
+          63498,
+          1091,
+          264,
+          8283,
+          569,
+          12,
+          31,
+          315,
+          569,
+          12,
+          31,
+          279,
+          569,
+          12,
+          31,
+          1555
+        ],
+        "text": " specification was more a large , powerful frigate than a ship @-@ of @-@ the @-@ line"
+      },
+      "document": 4
+    },
+    {
+      "position": 343,
+      "target": {
+        "id": 95263,
+        "text": " HMS"
+      },
+      "reference": {
+        "greedy_id": 95263,
+        "greedy_text": " HMS",
+        "top1_top2_margin": 0.25,
+        "top5": [
+          {
+            "id": 95263,
+            "text": " HMS",
+            "logit": 18.375,
+            "probability": 0.5309435014015897
+          },
+          {
+            "id": 39010,
+            "text": " Warrior",
+            "logit": 18.125,
+            "probability": 0.41349921465823164
+          },
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 15.4375,
+            "probability": 0.02813897469616368
+          },
+          {
+            "id": 472,
+            "text": " H",
+            "logit": 14.0,
+            "probability": 0.006683592318339167
+          },
+          {
+            "id": 220,
+            "text": " ",
+            "logit": 14.0,
+            "probability": 0.006683592318339167
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 39010,
+        "greedy_text": " Warrior",
+        "top1_top2_margin": 0.375,
+        "top5": [
+          {
+            "id": 39010,
+            "text": " Warrior",
+            "logit": 18.25,
+            "probability": 0.557285591045597
+          },
+          {
+            "id": 95263,
+            "text": " HMS",
+            "logit": 17.875,
+            "probability": 0.38301641195032904
+          },
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 15.1875,
+            "probability": 0.02606459393881501
+          },
+          {
+            "id": 220,
+            "text": " ",
+            "logit": 14.5,
+            "probability": 0.013106100899426173
+          },
+          {
+            "id": 472,
+            "text": " H",
+            "logit": 13.1875,
+            "probability": 0.0035274592031568274
+          }
+        ]
+      },
+      "nll_delta": 0.32657777589955184,
+      "context": {
+        "ids": [
+          892,
+          1030,
+          311,
+          387,
+          5798,
+          504,
+          10996,
+          659,
+          576,
+          1102,
+          572,
+          279,
+          8085,
+          315,
+          1378,
+          39010,
+          569,
+          12,
+          31,
+          536,
+          10996,
+          564,
+          7664,
+          2587
+        ],
+        "text": " which had to be built from iron . The result was the construction of two Warrior @-@ class ironclads ;"
+      },
+      "document": 4
+    },
+    {
+      "position": 361,
+      "target": {
+        "id": 90682,
+        "text": " compromises"
+      },
+      "reference": {
+        "greedy_id": 1045,
+        "greedy_text": " some",
+        "top1_top2_margin": 1.5,
+        "top5": [
+          {
+            "id": 1045,
+            "text": " some",
+            "logit": 19.5,
+            "probability": 0.7751514666875058
+          },
+          {
+            "id": 90682,
+            "text": " compromises",
+            "logit": 18.0,
+            "probability": 0.17295967090127343
+          },
+          {
+            "id": 364,
+            "text": " '",
+            "logit": 16.625,
+            "probability": 0.04373105328119996
+          },
+          {
+            "id": 11793,
+            "text": " differences",
+            "logit": 12.375,
+            "probability": 0.0006237899730899452
+          },
+          {
+            "id": 1657,
+            "text": " many",
+            "logit": 12.3125,
+            "probability": 0.0005859964491727611
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 90682,
+        "greedy_text": " compromises",
+        "top1_top2_margin": 0.75,
+        "top5": [
+          {
+            "id": 90682,
+            "text": " compromises",
+            "logit": 18.875,
+            "probability": 0.6393506720018767
+          },
+          {
+            "id": 1045,
+            "text": " some",
+            "logit": 18.125,
+            "probability": 0.3020078729261777
+          },
+          {
+            "id": 364,
+            "text": " '",
+            "logit": 16.25,
+            "probability": 0.04631440733950134
+          },
+          {
+            "id": 1657,
+            "text": " many",
+            "logit": 12.625,
+            "probability": 0.0012342371492659887
+          },
+          {
+            "id": 56540,
+            "text": " sacrifices",
+            "logit": 12.0625,
+            "probability": 0.0007032471292966169
+          }
+        ]
+      },
+      "nll_delta": -1.3073946351826815,
+      "context": {
+        "ids": [
+          31,
+          536,
+          10996,
+          564,
+          7664,
+          2587,
+          95263,
+          39010,
+          323,
+          95263,
+          5235,
+          19315,
+          659,
+          576,
+          17701,
+          1030,
+          264,
+          6849,
+          2884,
+          1154,
+          3498,
+          1052,
+          1033,
+          14302
+        ],
+        "text": "@ class ironclads ; HMS Warrior and HMS Black Prince . The ships had a successful design , though there were necessarily"
+      },
+      "document": 4
+    },
+    {
+      "position": 371,
+      "target": {
+        "id": 18548,
+        "text": " strategic"
+      },
+      "reference": {
+        "greedy_id": 39977,
+        "greedy_text": " hull",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 39977,
+            "text": " hull",
+            "logit": 15.375,
+            "probability": 0.23878766471766802
+          },
+          {
+            "id": 892,
+            "text": " which",
+            "logit": 15.25,
+            "probability": 0.2107293744887509
+          },
+          {
+            "id": 2670,
+            "text": " including",
+            "logit": 14.8125,
+            "probability": 0.13605711011373345
+          },
+          {
+            "id": 536,
+            "text": " class",
+            "logit": 14.5625,
+            "probability": 0.10596138389900797
+          },
+          {
+            "id": 2088,
+            "text": " range",
+            "logit": 14.1875,
+            "probability": 0.07282612311964252
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 892,
+        "greedy_text": " which",
+        "top1_top2_margin": 0.4375,
+        "top5": [
+          {
+            "id": 892,
+            "text": " which",
+            "logit": 15.5,
+            "probability": 0.2547469082586212
+          },
+          {
+            "id": 536,
+            "text": " class",
+            "logit": 15.0625,
+            "probability": 0.16447696592924016
+          },
+          {
+            "id": 39977,
+            "text": " hull",
+            "logit": 15.0625,
+            "probability": 0.16447696592924016
+          },
+          {
+            "id": 2088,
+            "text": " range",
+            "logit": 14.5625,
+            "probability": 0.09976032265259437
+          },
+          {
+            "id": 2670,
+            "text": " including",
+            "logit": 14.5,
+            "probability": 0.09371615025033424
+          }
+        ]
+      },
+      "nll_delta": 0.18530418924333336,
+      "context": {
+        "ids": [
+          5235,
+          19315,
+          659,
+          576,
+          17701,
+          1030,
+          264,
+          6849,
+          2884,
+          1154,
+          3498,
+          1052,
+          1033,
+          14302,
+          90682,
+          1948,
+          364,
+          9392,
+          569,
+          12,
+          31,
+          10277,
+          364,
+          1154
+        ],
+        "text": " Black Prince . The ships had a successful design , though there were necessarily compromises between ' sea @-@ keeping ' ,"
+      },
+      "document": 4
+    },
+    {
+      "position": 353,
+      "target": {
+        "id": 2435,
+        "text": " Cl"
+      },
+      "reference": {
+        "greedy_id": 7297,
+        "greedy_text": " Super",
+        "top1_top2_margin": 0.375,
+        "top5": [
+          {
+            "id": 7297,
+            "text": " Super",
+            "logit": 17.375,
+            "probability": 0.4203704933184152
+          },
+          {
+            "id": 3719,
+            "text": " Sub",
+            "logit": 17.0,
+            "probability": 0.2889161331778188
+          },
+          {
+            "id": 12232,
+            "text": " Family",
+            "logit": 16.5,
+            "probability": 0.17523649285796547
+          },
+          {
+            "id": 2435,
+            "text": " Cl",
+            "logit": 15.5,
+            "probability": 0.06446590306543179
+          },
+          {
+            "id": 320,
+            "text": " (",
+            "logit": 14.1875,
+            "probability": 0.017350762427590462
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 3719,
+        "greedy_text": " Sub",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 3719,
+            "text": " Sub",
+            "logit": 17.75,
+            "probability": 0.39646701635522547
+          },
+          {
+            "id": 7297,
+            "text": " Super",
+            "logit": 17.625,
+            "probability": 0.3498809139104427
+          },
+          {
+            "id": 12232,
+            "text": " Family",
+            "logit": 17.0,
+            "probability": 0.18727775779123337
+          },
+          {
+            "id": 2435,
+            "text": " Cl",
+            "logit": 15.0,
+            "probability": 0.02534528839459432
+          },
+          {
+            "id": 320,
+            "text": " (",
+            "logit": 14.25,
+            "probability": 0.011972266507181365
+          }
+        ]
+      },
+      "nll_delta": 0.9335435987641998,
+      "context": {
+        "ids": [
+          41541,
+          715,
+          12232,
+          468,
+          884,
+          453,
+          4744,
+          68,
+          715,
+          12232,
+          393,
+          3290,
+          4130,
+          4744,
+          68,
+          715,
+          12232,
+          1863,
+          60550,
+          610,
+          39900,
+          4744,
+          68,
+          715
+        ],
+        "text": "idea \n Family Eryopidae \n Family Parioxyidae \n Family Zatrachydidae \n"
+      },
+      "document": 6
+    },
+    {
+      "position": 364,
+      "target": {
+        "id": 2319,
+        "text": " version"
+      },
+      "reference": {
+        "greedy_id": 2319,
+        "greedy_text": " version",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 2319,
+            "text": " version",
+            "logit": 16.625,
+            "probability": 0.3599880805585634
+          },
+          {
+            "id": 422,
+            "text": " D",
+            "logit": 16.5,
+            "probability": 0.31768836606030604
+          },
+          {
+            "id": 506,
+            "text": " O",
+            "logit": 15.8125,
+            "probability": 0.1597437424091136
+          },
+          {
+            "id": 53927,
+            "text": " Objective",
+            "logit": 14.9375,
+            "probability": 0.0665910990916665
+          },
+          {
+            "id": 16522,
+            "text": " objective",
+            "logit": 14.1875,
+            "probability": 0.031455407921165815
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 422,
+        "greedy_text": " D",
+        "top1_top2_margin": 0.25,
+        "top5": [
+          {
+            "id": 422,
+            "text": " D",
+            "logit": 16.875,
+            "probability": 0.41964280415836563
+          },
+          {
+            "id": 2319,
+            "text": " version",
+            "logit": 16.625,
+            "probability": 0.32681814448881535
+          },
+          {
+            "id": 506,
+            "text": " O",
+            "logit": 15.6875,
+            "probability": 0.12798382428189115
+          },
+          {
+            "id": 53927,
+            "text": " Objective",
+            "logit": 14.8125,
+            "probability": 0.05335159547632847
+          },
+          {
+            "id": 16522,
+            "text": " objective",
+            "logit": 13.8125,
+            "probability": 0.019626955129436567
+          }
+        ]
+      },
+      "nll_delta": 0.09666703820629885,
+      "context": {
+        "ids": [
+          476,
+          7469,
+          33883,
+          43234,
+          659,
+          576,
+          5616,
+          39417,
+          5729,
+          16365,
+          320,
+          356,
+          4835,
+          873,
+          374,
+          3601,
+          311,
+          1191,
+          1667,
+          279,
+          5297,
+          220,
+          100759,
+          19
+        ],
+        "text": " or weak tropical storms . The China Meteorological Agency ( CMA ) is expected to start using the standard 1984"
+      },
+      "document": 7
+    },
+    {
+      "position": 369,
+      "target": {
+        "id": 304,
+        "text": " in"
+      },
+      "reference": {
+        "greedy_id": 311,
+        "greedy_text": " to",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 369,
+            "text": " for",
+            "logit": 16.125,
+            "probability": 0.1448120049904307
+          },
+          {
+            "id": 311,
+            "text": " to",
+            "logit": 16.125,
+            "probability": 0.1448120049904307
+          },
+          {
+            "id": 304,
+            "text": " in",
+            "logit": 15.8125,
+            "probability": 0.1059467261100982
+          },
+          {
+            "id": 14752,
+            "text": " technique",
+            "logit": 15.5,
+            "probability": 0.07751228065787709
+          },
+          {
+            "id": 5916,
+            "text": " starting",
+            "logit": 15.0625,
+            "probability": 0.05004568978682354
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 369,
+        "greedy_text": " for",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 369,
+            "text": " for",
+            "logit": 16.125,
+            "probability": 0.14072669497775017
+          },
+          {
+            "id": 311,
+            "text": " to",
+            "logit": 16.0,
+            "probability": 0.12419087242883164
+          },
+          {
+            "id": 304,
+            "text": " in",
+            "logit": 15.8125,
+            "probability": 0.10295784945572889
+          },
+          {
+            "id": 14752,
+            "text": " technique",
+            "logit": 15.5625,
+            "probability": 0.08018365377946947
+          },
+          {
+            "id": 5916,
+            "text": " starting",
+            "logit": 15.125,
+            "probability": 0.05177045790631874
+          }
+        ]
+      },
+      "nll_delta": 0.02861670801985472,
+      "context": {
+        "ids": [
+          576,
+          5616,
+          39417,
+          5729,
+          16365,
+          320,
+          356,
+          4835,
+          873,
+          374,
+          3601,
+          311,
+          1191,
+          1667,
+          279,
+          5297,
+          220,
+          100759,
+          19,
+          2319,
+          315,
+          422,
+          35933,
+          585
+        ],
+        "text": " The China Meteorological Agency ( CMA ) is expected to start using the standard 1984 version of Dvorak"
+      },
+      "document": 7
+    },
+    {
+      "position": 296,
+      "target": {
+        "id": 1154,
+        "text": " ,"
+      },
+      "reference": {
+        "greedy_id": 1154,
+        "greedy_text": " ,",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 1526,
+            "text": " through",
+            "logit": 18.375,
+            "probability": 0.24987770780971777
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 18.375,
+            "probability": 0.24987770780971777
+          },
+          {
+            "id": 553,
+            "text": " by",
+            "logit": 17.75,
+            "probability": 0.13374989883728036
+          },
+          {
+            "id": 659,
+            "text": " .",
+            "logit": 17.375,
+            "probability": 0.09192487151023991
+          },
+          {
+            "id": 448,
+            "text": " with",
+            "logit": 17.375,
+            "probability": 0.09192487151023991
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 1526,
+        "greedy_text": " through",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 1526,
+            "text": " through",
+            "logit": 18.5,
+            "probability": 0.27425829138320046
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 18.375,
+            "probability": 0.24203209265381787
+          },
+          {
+            "id": 553,
+            "text": " by",
+            "logit": 17.75,
+            "probability": 0.12955044366132315
+          },
+          {
+            "id": 659,
+            "text": " .",
+            "logit": 17.375,
+            "probability": 0.08903863099104126
+          },
+          {
+            "id": 448,
+            "text": " with",
+            "logit": 17.375,
+            "probability": 0.08903863099104126
+          }
+        ]
+      },
+      "nll_delta": 0.031901297782881866,
+      "context": {
+        "ids": [
+          6686,
+          304,
+          18510,
+          1154,
+          323,
+          358,
+          3303,
+          10435,
+          659,
+          758,
+          220,
+          98546,
+          19,
+          1154,
+          730,
+          54621,
+          672,
+          8569,
+          311,
+          1824,
+          279,
+          2841,
+          315,
+          93214
+        ],
+        "text": " Street in Dallas , and I Am Second . In 2014 , Kershaw continued to support the children of Zambia"
+      },
+      "document": 8
+    },
+    {
+      "position": 318,
+      "target": {
+        "id": 7096,
+        "text": " equipment"
+      },
+      "reference": {
+        "greedy_id": 12780,
+        "greedy_text": " facilities",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 12780,
+            "text": " facilities",
+            "logit": 17.5,
+            "probability": 0.20215299850089571
+          },
+          {
+            "id": 27718,
+            "text": " clinic",
+            "logit": 17.5,
+            "probability": 0.20215299850089571
+          },
+          {
+            "id": 19974,
+            "text": " wing",
+            "logit": 17.0,
+            "probability": 0.12261199154363525
+          },
+          {
+            "id": 4126,
+            "text": " center",
+            "logit": 16.625,
+            "probability": 0.08426990723914984
+          },
+          {
+            "id": 12475,
+            "text": " facility",
+            "logit": 16.625,
+            "probability": 0.08426990723914984
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 27718,
+        "greedy_text": " clinic",
+        "top1_top2_margin": 0.25,
+        "top5": [
+          {
+            "id": 27718,
+            "text": " clinic",
+            "logit": 17.75,
+            "probability": 0.24214037123488433
+          },
+          {
+            "id": 12780,
+            "text": " facilities",
+            "logit": 17.5,
+            "probability": 0.1885791107309286
+          },
+          {
+            "id": 19974,
+            "text": " wing",
+            "logit": 16.75,
+            "probability": 0.08907846445493482
+          },
+          {
+            "id": 12475,
+            "text": " facility",
+            "logit": 16.75,
+            "probability": 0.08907846445493482
+          },
+          {
+            "id": 4126,
+            "text": " center",
+            "logit": 16.75,
+            "probability": 0.08907846445493482
+          }
+        ]
+      },
+      "nll_delta": 0.06950722460604553,
+      "context": {
+        "ids": [
+          315,
+          93214,
+          1154,
+          448,
+          15293,
+          448,
+          356,
+          4521,
+          7179,
+          1154,
+          18513,
+          10509,
+          311,
+          2291,
+          369,
+          220,
+          110743,
+          2841,
+          364,
+          82,
+          67231,
+          323,
+          501,
+          6457
+        ],
+        "text": " of Zambia , with partnership with CURE International , raising funds to pay for 170 children 's surgeries and new medical"
+      },
+      "document": 8
+    },
+    {
+      "position": 324,
+      "target": {
+        "id": 444,
+        "text": " L"
+      },
+      "reference": {
+        "greedy_id": 93214,
+        "greedy_text": " Zambia",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 93214,
+            "text": " Zambia",
+            "logit": 17.625,
+            "probability": 0.5026530220379029
+          },
+          {
+            "id": 444,
+            "text": " L",
+            "logit": 17.5,
+            "probability": 0.4435897350232356
+          },
+          {
+            "id": 730,
+            "text": " K",
+            "logit": 13.9375,
+            "probability": 0.012583672182116019
+          },
+          {
+            "id": 220,
+            "text": " ",
+            "logit": 13.625,
+            "probability": 0.00920641123797717
+          },
+          {
+            "id": 36476,
+            "text": " Kenya",
+            "logit": 13.1875,
+            "probability": 0.005944105849489146
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 444,
+        "greedy_text": " L",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 444,
+            "text": " L",
+            "logit": 17.75,
+            "probability": 0.4772286250697362
+          },
+          {
+            "id": 93214,
+            "text": " Zambia",
+            "logit": 17.75,
+            "probability": 0.4772286250697362
+          },
+          {
+            "id": 730,
+            "text": " K",
+            "logit": 13.8125,
+            "probability": 0.009304476923033711
+          },
+          {
+            "id": 220,
+            "text": " ",
+            "logit": 13.8125,
+            "probability": 0.009304476923033711
+          },
+          {
+            "id": 58945,
+            "text": " Ethiopia",
+            "logit": 13.0,
+            "probability": 0.004128836606307692
+          }
+        ]
+      },
+      "nll_delta": -0.07309555885749575,
+      "context": {
+        "ids": [
+          356,
+          4521,
+          7179,
+          1154,
+          18513,
+          10509,
+          311,
+          2291,
+          369,
+          220,
+          110743,
+          2841,
+          364,
+          82,
+          67231,
+          323,
+          501,
+          6457,
+          7096,
+          369,
+          356,
+          4521,
+          8776,
+          304
+        ],
+        "text": " CURE International , raising funds to pay for 170 children 's surgeries and new medical equipment for CURE hospital in"
+      },
+      "document": 8
+    },
+    {
+      "position": 328,
+      "target": {
+        "id": 730,
+        "text": " K"
+      },
+      "reference": {
+        "greedy_id": 730,
+        "greedy_text": " K",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 730,
+            "text": " K",
+            "logit": 14.3125,
+            "probability": 0.1901548086831665
+          },
+          {
+            "id": 758,
+            "text": " In",
+            "logit": 14.3125,
+            "probability": 0.1901548086831665
+          },
+          {
+            "id": 1260,
+            "text": " He",
+            "logit": 13.125,
+            "probability": 0.057993940035913884
+          },
+          {
+            "id": 715,
+            "text": " \n",
+            "logit": 13.0,
+            "probability": 0.051179472450370765
+          },
+          {
+            "id": 576,
+            "text": " The",
+            "logit": 13.0,
+            "probability": 0.051179472450370765
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 758,
+        "greedy_text": " In",
+        "top1_top2_margin": 0.0625,
+        "top5": [
+          {
+            "id": 758,
+            "text": " In",
+            "logit": 14.375,
+            "probability": 0.19349652514994933
+          },
+          {
+            "id": 730,
+            "text": " K",
+            "logit": 14.3125,
+            "probability": 0.18177316333487864
+          },
+          {
+            "id": 1260,
+            "text": " He",
+            "logit": 13.25,
+            "probability": 0.06281912431519801
+          },
+          {
+            "id": 715,
+            "text": " \n",
+            "logit": 13.0625,
+            "probability": 0.05207888323589355
+          },
+          {
+            "id": 220,
+            "text": " ",
+            "logit": 13.0,
+            "probability": 0.04892358320853614
+          }
+        ]
+      },
+      "nll_delta": 0.04507896852117188,
+      "context": {
+        "ids": [
+          18513,
+          10509,
+          311,
+          2291,
+          369,
+          220,
+          110743,
+          2841,
+          364,
+          82,
+          67231,
+          323,
+          501,
+          6457,
+          7096,
+          369,
+          356,
+          4521,
+          8776,
+          304,
+          444,
+          355,
+          13326,
+          659
+        ],
+        "text": " raising funds to pay for 170 children 's surgeries and new medical equipment for CURE hospital in Lusaka ."
+      },
+      "document": 8
+    },
+    {
+      "position": 331,
+      "target": {
+        "id": 702,
+        "text": " has"
+      },
+      "reference": {
+        "greedy_id": 364,
+        "greedy_text": " '",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 364,
+            "text": " '",
+            "logit": 17.0,
+            "probability": 0.17330914206501513
+          },
+          {
+            "id": 323,
+            "text": " and",
+            "logit": 16.875,
+            "probability": 0.15294478106196946
+          },
+          {
+            "id": 1083,
+            "text": " also",
+            "logit": 16.25,
+            "probability": 0.08186544199575399
+          },
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 16.125,
+            "probability": 0.07224599898997176
+          },
+          {
+            "id": 2765,
+            "text": " won",
+            "logit": 16.0,
+            "probability": 0.06375687033277988
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 323,
+        "greedy_text": " and",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 364,
+            "text": " '",
+            "logit": 16.875,
+            "probability": 0.15460793574357495
+          },
+          {
+            "id": 323,
+            "text": " and",
+            "logit": 16.875,
+            "probability": 0.15460793574357495
+          },
+          {
+            "id": 1083,
+            "text": " also",
+            "logit": 16.25,
+            "probability": 0.0827556645464782
+          },
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 16.125,
+            "probability": 0.07303161763359683
+          },
+          {
+            "id": 2765,
+            "text": " won",
+            "logit": 16.0,
+            "probability": 0.06445017635239172
+          }
+        ]
+      },
+      "nll_delta": 0.05168448250953528,
+      "context": {
+        "ids": [
+          2291,
+          369,
+          220,
+          110743,
+          2841,
+          364,
+          82,
+          67231,
+          323,
+          501,
+          6457,
+          7096,
+          369,
+          356,
+          4521,
+          8776,
+          304,
+          444,
+          355,
+          13326,
+          659,
+          730,
+          54621,
+          672
+        ],
+        "text": " pay for 170 children 's surgeries and new medical equipment for CURE hospital in Lusaka . Kershaw"
+      },
+      "document": 8
+    },
+    {
+      "position": 380,
+      "target": {
+        "id": 702,
+        "text": " has"
+      },
+      "reference": {
+        "greedy_id": 702,
+        "greedy_text": " has",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 702,
+            "text": " has",
+            "logit": 18.75,
+            "probability": 0.2773500808773537
+          },
+          {
+            "id": 323,
+            "text": " and",
+            "logit": 18.625,
+            "probability": 0.24476058730585162
+          },
+          {
+            "id": 1083,
+            "text": " also",
+            "logit": 17.75,
+            "probability": 0.1020313927620152
+          },
+          {
+            "id": 374,
+            "text": " is",
+            "logit": 17.125,
+            "probability": 0.054613469043578416
+          },
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 16.875,
+            "probability": 0.0425330124573848
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 323,
+        "greedy_text": " and",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 702,
+            "text": " has",
+            "logit": 18.625,
+            "probability": 0.2672863060868419
+          },
+          {
+            "id": 323,
+            "text": " and",
+            "logit": 18.625,
+            "probability": 0.2672863060868419
+          },
+          {
+            "id": 1083,
+            "text": " also",
+            "logit": 17.625,
+            "probability": 0.09832913691600648
+          },
+          {
+            "id": 374,
+            "text": " is",
+            "logit": 17.125,
+            "probability": 0.05963963628263926
+          },
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 16.625,
+            "probability": 0.0361732679395307
+          }
+        ]
+      },
+      "nll_delta": 0.03696014677810444,
+      "context": {
+        "ids": [
+          82,
+          8776,
+          304,
+          279,
+          65533,
+          5429,
+          659,
+          715,
+          758,
+          5256,
+          311,
+          17732,
+          364,
+          82,
+          5379,
+          323,
+          730,
+          54621,
+          672,
+          364,
+          82,
+          25179,
+          1154,
+          566
+        ],
+        "text": "s hospital in the Dominican Republic . \n In addition to Hope 's Home and Kershaw 's Challenge , he"
+      },
+      "document": 8
+    },
+    {
+      "position": 259,
+      "target": {
+        "id": 3845,
+        "text": " du"
+      },
+      "reference": {
+        "greedy_id": 3845,
+        "greedy_text": " du",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 3845,
+            "text": " du",
+            "logit": 16.625,
+            "probability": 0.37357536000963176
+          },
+          {
+            "id": 19421,
+            "text": " Latin",
+            "logit": 16.625,
+            "probability": 0.37357536000963176
+          },
+          {
+            "id": 5492,
+            "text": " song",
+            "logit": 14.5625,
+            "probability": 0.047494777200173595
+          },
+          {
+            "id": 20933,
+            "text": " mixture",
+            "logit": 13.875,
+            "probability": 0.023881873764941556
+          },
+          {
+            "id": 4935,
+            "text": " ball",
+            "logit": 13.875,
+            "probability": 0.023881873764941556
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 19421,
+        "greedy_text": " Latin",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 19421,
+            "text": " Latin",
+            "logit": 16.625,
+            "probability": 0.39416366685490484
+          },
+          {
+            "id": 3845,
+            "text": " du",
+            "logit": 16.5,
+            "probability": 0.3478482151108399
+          },
+          {
+            "id": 5492,
+            "text": " song",
+            "logit": 14.5,
+            "probability": 0.0470761367153757
+          },
+          {
+            "id": 4935,
+            "text": " ball",
+            "logit": 13.8125,
+            "probability": 0.023671368109368113
+          },
+          {
+            "id": 20933,
+            "text": " mixture",
+            "logit": 13.75,
+            "probability": 0.022237192416606735
+          }
+        ]
+      },
+      "nll_delta": 0.07135353016176982,
+      "context": {
+        "ids": [
+          361,
+          892,
+          4641,
+          311,
+          1281,
+          458,
+          5421,
+          304,
+          279,
+          3639,
+          4180,
+          659,
+          715,
+          576,
+          8016,
+          5646,
+          330,
+          29146,
+          16758,
+          350,
+          6654,
+          330,
+          1154,
+          264
+        ],
+        "text": "ue which failed to make an impact in the United States . \n The album includes \" Fuiste T\u00fa \" , a"
+      },
+      "document": 10
+    },
+    {
+      "position": 289,
+      "target": {
+        "id": 10977,
+        "text": " stated"
+      },
+      "reference": {
+        "greedy_id": 6139,
+        "greedy_text": " wrote",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 6139,
+            "text": " wrote",
+            "logit": 17.0,
+            "probability": 0.11485966065188626
+          },
+          {
+            "id": 1030,
+            "text": " had",
+            "logit": 16.875,
+            "probability": 0.10136329475720735
+          },
+          {
+            "id": 364,
+            "text": " '",
+            "logit": 16.875,
+            "probability": 0.10136329475720735
+          },
+          {
+            "id": 323,
+            "text": " and",
+            "logit": 16.625,
+            "probability": 0.07894181333161071
+          },
+          {
+            "id": 702,
+            "text": " has",
+            "logit": 16.625,
+            "probability": 0.07894181333161071
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 364,
+        "greedy_text": " '",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 364,
+            "text": " '",
+            "logit": 17.0,
+            "probability": 0.10689719845270015
+          },
+          {
+            "id": 6139,
+            "text": " wrote",
+            "logit": 17.0,
+            "probability": 0.10689719845270015
+          },
+          {
+            "id": 1030,
+            "text": " had",
+            "logit": 17.0,
+            "probability": 0.10689719845270015
+          },
+          {
+            "id": 702,
+            "text": " has",
+            "logit": 16.75,
+            "probability": 0.08325162186310225
+          },
+          {
+            "id": 323,
+            "text": " and",
+            "logit": 16.75,
+            "probability": 0.08325162186310225
+          }
+        ]
+      },
+      "nll_delta": 0.07184343047205077,
+      "context": {
+        "ids": [
+          22696,
+          479,
+          6115,
+          77547,
+          659,
+          11440,
+          76420,
+          17148,
+          315,
+          26196,
+          1154,
+          61602,
+          1154,
+          59082,
+          1154,
+          46010,
+          323,
+          1008,
+          83058,
+          659,
+          10323,
+          1644,
+          73,
+          6721
+        ],
+        "text": " singer Gaby Moreno . Its instrumentation consists of piano , violin , guitars , drums and other percussion . Although Arjona"
+      },
+      "document": 10
+    },
+    {
+      "position": 323,
+      "target": {
+        "id": 1154,
+        "text": " ,"
+      },
+      "reference": {
+        "greedy_id": 1033,
+        "greedy_text": " were",
+        "top1_top2_margin": 1.25,
+        "top5": [
+          {
+            "id": 1033,
+            "text": " were",
+            "logit": 18.375,
+            "probability": 0.4453063203037131
+          },
+          {
+            "id": 525,
+            "text": " are",
+            "logit": 17.125,
+            "probability": 0.12758239683917408
+          },
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 16.375,
+            "probability": 0.06026565698535679
+          },
+          {
+            "id": 330,
+            "text": " \"",
+            "logit": 15.9375,
+            "probability": 0.03891043262680441
+          },
+          {
+            "id": 3697,
+            "text": " came",
+            "logit": 15.75,
+            "probability": 0.03225788164861754
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 525,
+        "greedy_text": " are",
+        "top1_top2_margin": 0.375,
+        "top5": [
+          {
+            "id": 525,
+            "text": " are",
+            "logit": 18.125,
+            "probability": 0.3300723243072347
+          },
+          {
+            "id": 1033,
+            "text": " were",
+            "logit": 17.75,
+            "probability": 0.22685516972197922
+          },
+          {
+            "id": 330,
+            "text": " \"",
+            "logit": 16.5,
+            "probability": 0.0649950943178796
+          },
+          {
+            "id": 24226,
+            "text": " existed",
+            "logit": 15.9375,
+            "probability": 0.037033088434094204
+          },
+          {
+            "id": 1549,
+            "text": " again",
+            "logit": 15.3125,
+            "probability": 0.01982238381770336
+          }
+        ]
+      },
+      "nll_delta": -0.07554938942679268,
+      "context": {
+        "ids": [
+          5492,
+          448,
+          1602,
+          1632,
+          3881,
+          1251,
+          330,
+          566,
+          13294,
+          806,
+          22948,
+          448,
+          77547,
+          1154,
+          30500,
+          429,
+          330,
+          279,
+          23542,
+          315,
+          3730,
+          432,
+          448,
+          1059
+        ],
+        "text": " song with very well known people \" he expressed his happiness with Moreno , revealing that \" the possibilities of doing it with her"
+      },
+      "document": 10
+    },
+    {
+      "position": 327,
+      "target": {
+        "id": 525,
+        "text": " are"
+      },
+      "reference": {
+        "greedy_id": 572,
+        "greedy_text": " was",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 18.875,
+            "probability": 0.3162785780191511
+          },
+          {
+            "id": 1033,
+            "text": " were",
+            "logit": 18.75,
+            "probability": 0.27911486545576114
+          },
+          {
+            "id": 374,
+            "text": " is",
+            "logit": 17.875,
+            "probability": 0.11635238653618372
+          },
+          {
+            "id": 525,
+            "text": " are",
+            "logit": 17.875,
+            "probability": 0.11635238653618372
+          },
+          {
+            "id": 432,
+            "text": " it",
+            "logit": 16.875,
+            "probability": 0.04280365093789492
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 1033,
+        "greedy_text": " were",
+        "top1_top2_margin": 0.625,
+        "top5": [
+          {
+            "id": 1033,
+            "text": " were",
+            "logit": 18.875,
+            "probability": 0.3328486838169806
+          },
+          {
+            "id": 525,
+            "text": " are",
+            "logit": 18.25,
+            "probability": 0.17816106198054274
+          },
+          {
+            "id": 572,
+            "text": " was",
+            "logit": 18.25,
+            "probability": 0.17816106198054274
+          },
+          {
+            "id": 374,
+            "text": " is",
+            "logit": 17.75,
+            "probability": 0.10806014645816196
+          },
+          {
+            "id": 1035,
+            "text": " would",
+            "logit": 17.125,
+            "probability": 0.05784042835916708
+          }
+        ]
+      },
+      "nll_delta": -0.4260645825191438,
+      "context": {
+        "ids": [
+          3881,
+          1251,
+          330,
+          566,
+          13294,
+          806,
+          22948,
+          448,
+          77547,
+          1154,
+          30500,
+          429,
+          330,
+          279,
+          23542,
+          315,
+          3730,
+          432,
+          448,
+          1059,
+          1154,
+          369,
+          752,
+          1154
+        ],
+        "text": " known people \" he expressed his happiness with Moreno , revealing that \" the possibilities of doing it with her , for me ,"
+      },
+      "document": 10
+    },
+    {
+      "position": 291,
+      "target": {
+        "id": 18143,
+        "text": " northern"
+      },
+      "reference": {
+        "greedy_id": 1526,
+        "greedy_text": " through",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 1526,
+            "text": " through",
+            "logit": 17.625,
+            "probability": 0.2645869355573271
+          },
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 17.5,
+            "probability": 0.23349715109369112
+          },
+          {
+            "id": 6323,
+            "text": " Japan",
+            "logit": 17.125,
+            "probability": 0.16048008857492965
+          },
+          {
+            "id": 18143,
+            "text": " northern",
+            "logit": 16.75,
+            "probability": 0.1102962443369747
+          },
+          {
+            "id": 916,
+            "text": " over",
+            "logit": 16.5,
+            "probability": 0.0858988014594709
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 279,
+        "greedy_text": " the",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 17.625,
+            "probability": 0.2575929847989387
+          },
+          {
+            "id": 1526,
+            "text": " through",
+            "logit": 17.5,
+            "probability": 0.22732501121258422
+          },
+          {
+            "id": 6323,
+            "text": " Japan",
+            "logit": 17.25,
+            "probability": 0.17704089674407647
+          },
+          {
+            "id": 18143,
+            "text": " northern",
+            "logit": 16.875,
+            "probability": 0.12167831023974332
+          },
+          {
+            "id": 916,
+            "text": " over",
+            "logit": 16.5,
+            "probability": 0.08362819808917736
+          }
+        ]
+      },
+      "nll_delta": -0.09821088478503093,
+      "context": {
+        "ids": [
+          11477,
+          266,
+          49750,
+          3143,
+          279,
+          506,
+          6642,
+          22179,
+          659,
+          576,
+          11477,
+          266,
+          49750,
+          71785,
+          315,
+          328,
+          2950,
+          68737,
+          8569,
+          311,
+          279,
+          40602,
+          1154,
+          26552
+        ],
+        "text": " extratropical near the Oki Islands . The extratropical remnants of Soudelor continued to the northeast , crossing"
+      },
+      "document": 11
+    },
+    {
+      "position": 281,
+      "target": {
+        "id": 69719,
+        "text": " Tropical"
+      },
+      "reference": {
+        "greedy_id": 279,
+        "greedy_text": " the",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 825,
+            "text": " one",
+            "logit": 16.125,
+            "probability": 0.2712692033731884
+          },
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 16.125,
+            "probability": 0.2712692033731884
+          },
+          {
+            "id": 264,
+            "text": " a",
+            "logit": 15.5,
+            "probability": 0.1451999413107413
+          },
+          {
+            "id": 2441,
+            "text": " another",
+            "logit": 14.625,
+            "probability": 0.06052834079199649
+          },
+          {
+            "id": 47368,
+            "text": " Lak",
+            "logit": 13.9375,
+            "probability": 0.03043556111240247
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 825,
+        "greedy_text": " one",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 825,
+            "text": " one",
+            "logit": 16.5,
+            "probability": 0.29733126793839815
+          },
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 16.375,
+            "probability": 0.2623939229971868
+          },
+          {
+            "id": 264,
+            "text": " a",
+            "logit": 15.75,
+            "probability": 0.14044934605817613
+          },
+          {
+            "id": 2441,
+            "text": " another",
+            "logit": 15.1875,
+            "probability": 0.08002562512863852
+          },
+          {
+            "id": 393,
+            "text": " P",
+            "logit": 14.125,
+            "probability": 0.02765611601364903
+          }
+        ]
+      },
+      "nll_delta": 0.4707648007023657,
+      "context": {
+        "ids": [
+          389,
+          6156,
+          220,
+          99243,
+          1154,
+          448,
+          393,
+          1890,
+          78953,
+          34774,
+          432,
+          47368,
+          352,
+          659,
+          2619,
+          1033,
+          3807,
+          4225,
+          7455,
+          304,
+          279,
+          5537,
+          1154,
+          448
+        ],
+        "text": " on August 18 , with PAGASA naming it Lakay . There were several circulations in the region , with"
+      },
+      "document": 12
+    },
+    {
+      "position": 282,
+      "target": {
+        "id": 21810,
+        "text": " Storm"
+      },
+      "reference": {
+        "greedy_id": 21810,
+        "greedy_text": " Storm",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 21810,
+            "text": " Storm",
+            "logit": 19.625,
+            "probability": 0.49776032657354585
+          },
+          {
+            "id": 45533,
+            "text": " Depression",
+            "logit": 19.625,
+            "probability": 0.49776032657354585
+          },
+          {
+            "id": 4148,
+            "text": " Dep",
+            "logit": 13.8125,
+            "probability": 0.0014882764258756093
+          },
+          {
+            "id": 70901,
+            "text": " Cycl",
+            "logit": 13.25,
+            "probability": 0.0008479943459158468
+          },
+          {
+            "id": 18181,
+            "text": " depression",
+            "logit": 13.1875,
+            "probability": 0.0007966169657453156
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 45533,
+        "greedy_text": " Depression",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 45533,
+            "text": " Depression",
+            "logit": 19.625,
+            "probability": 0.5285703860480375
+          },
+          {
+            "id": 21810,
+            "text": " Storm",
+            "logit": 19.5,
+            "probability": 0.46646172848533696
+          },
+          {
+            "id": 4148,
+            "text": " Dep",
+            "logit": 13.875,
+            "probability": 0.0016823236743173952
+          },
+          {
+            "id": 18181,
+            "text": " depression",
+            "logit": 13.3125,
+            "probability": 0.0009585591352642708
+          },
+          {
+            "id": 70901,
+            "text": " Cycl",
+            "logit": 13.25,
+            "probability": 0.0009004829731464455
+          }
+        ]
+      },
+      "nll_delta": 0.06494271200196344,
+      "context": {
+        "ids": [
+          6156,
+          220,
+          99243,
+          1154,
+          448,
+          393,
+          1890,
+          78953,
+          34774,
+          432,
+          47368,
+          352,
+          659,
+          2619,
+          1033,
+          3807,
+          4225,
+          7455,
+          304,
+          279,
+          5537,
+          1154,
+          448,
+          69719
+        ],
+        "text": " August 18 , with PAGASA naming it Lakay . There were several circulations in the region , with Tropical"
+      },
+      "document": 12
+    },
+    {
+      "position": 357,
+      "target": {
+        "id": 1913,
+        "text": " On"
+      },
+      "reference": {
+        "greedy_id": 576,
+        "greedy_text": " The",
+        "top1_top2_margin": 0.0625,
+        "top5": [
+          {
+            "id": 576,
+            "text": " The",
+            "logit": 14.4375,
+            "probability": 0.21008377540188503
+          },
+          {
+            "id": 1913,
+            "text": " On",
+            "logit": 14.375,
+            "probability": 0.19735544289770315
+          },
+          {
+            "id": 758,
+            "text": " In",
+            "logit": 13.9375,
+            "probability": 0.12742225088942602
+          },
+          {
+            "id": 362,
+            "text": " A",
+            "logit": 13.4375,
+            "probability": 0.07728550189403226
+          },
+          {
+            "id": 69719,
+            "text": " Tropical",
+            "logit": 13.125,
+            "probability": 0.05654328107665929
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 1913,
+        "greedy_text": " On",
+        "top1_top2_margin": 0.25,
+        "top5": [
+          {
+            "id": 1913,
+            "text": " On",
+            "logit": 14.6875,
+            "probability": 0.2338855219133136
+          },
+          {
+            "id": 576,
+            "text": " The",
+            "logit": 14.4375,
+            "probability": 0.18215022761515287
+          },
+          {
+            "id": 758,
+            "text": " In",
+            "logit": 14.125,
+            "probability": 0.13326395333943405
+          },
+          {
+            "id": 362,
+            "text": " A",
+            "logit": 13.625,
+            "probability": 0.08082867353488053
+          },
+          {
+            "id": 69719,
+            "text": " Tropical",
+            "logit": 13.1875,
+            "probability": 0.05218691396091677
+          }
+        ]
+      },
+      "nll_delta": -0.16982539140558184,
+      "context": {
+        "ids": [
+          104160,
+          569,
+          58061,
+          220,
+          19,
+          9461,
+          320,
+          220,
+          18,
+          569,
+          58061,
+          220,
+          99590,
+          304,
+          873,
+          304,
+          1599,
+          4932,
+          268,
+          1154,
+          29146,
+          93909,
+          659,
+          715
+        ],
+        "text": "82 @.@ 4 mm ( 3 @.@ 24 in ) in Xiamen , Fujuan . \n"
+      },
+      "document": 12
+    },
+    {
+      "position": 382,
+      "target": {
+        "id": 13762,
+        "text": " largely"
+      },
+      "reference": {
+        "greedy_id": 14888,
+        "greedy_text": " exposed",
+        "top1_top2_margin": 0.1875,
+        "top5": [
+          {
+            "id": 14888,
+            "text": " exposed",
+            "logit": 15.5625,
+            "probability": 0.1985332347483154
+          },
+          {
+            "id": 81748,
+            "text": " weakening",
+            "logit": 15.375,
+            "probability": 0.16458983253289836
+          },
+          {
+            "id": 30337,
+            "text": " poorly",
+            "logit": 15.0625,
+            "probability": 0.12041649384677884
+          },
+          {
+            "id": 7469,
+            "text": " weak",
+            "logit": 14.4375,
+            "probability": 0.06445430451367504
+          },
+          {
+            "id": 10449,
+            "text": " becoming",
+            "logit": 13.6875,
+            "probability": 0.030446057632444304
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 81748,
+        "greedy_text": " weakening",
+        "top1_top2_margin": 0.25,
+        "top5": [
+          {
+            "id": 81748,
+            "text": " weakening",
+            "logit": 15.3125,
+            "probability": 0.1659939247660723
+          },
+          {
+            "id": 14888,
+            "text": " exposed",
+            "logit": 15.0625,
+            "probability": 0.12927619859291295
+          },
+          {
+            "id": 7469,
+            "text": " weak",
+            "logit": 14.9375,
+            "probability": 0.1140858448361567
+          },
+          {
+            "id": 30337,
+            "text": " poorly",
+            "logit": 14.875,
+            "probability": 0.10717373292119693
+          },
+          {
+            "id": 827,
+            "text": " dis",
+            "logit": 13.6875,
+            "probability": 0.032686141799406244
+          }
+        ]
+      },
+      "nll_delta": -0.008494674317039319,
+      "context": {
+        "ids": [
+          6122,
+          220,
+          20,
+          1154,
+          4741,
+          36907,
+          11382,
+          7157,
+          26943,
+          279,
+          7179,
+          2631,
+          7083,
+          1119,
+          279,
+          56824,
+          659,
+          3216,
+          429,
+          882,
+          1154,
+          279,
+          34583,
+          572
+        ],
+        "text": " September 5 , former Hurricane Jimena crossed the International Date Line into the basin . By that time , the circulation was"
+      },
+      "document": 12
+    },
+    {
+      "position": 284,
+      "target": {
+        "id": 56328,
+        "text": " feud"
+      },
+      "reference": {
+        "greedy_id": 2432,
+        "greedy_text": " match",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 2432,
+            "text": " match",
+            "logit": 14.1875,
+            "probability": 0.2890869226116623
+          },
+          {
+            "id": 56328,
+            "text": " feud",
+            "logit": 14.1875,
+            "probability": 0.2890869226116623
+          },
+          {
+            "id": 9809,
+            "text": " brief",
+            "logit": 13.0,
+            "probability": 0.08816653005626447
+          },
+          {
+            "id": 1887,
+            "text": " main",
+            "logit": 12.9375,
+            "probability": 0.08282479003779178
+          },
+          {
+            "id": 1550,
+            "text": " high",
+            "logit": 12.6875,
+            "probability": 0.06450401133915692
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 56328,
+        "greedy_text": " feud",
+        "top1_top2_margin": 0.4375,
+        "top5": [
+          {
+            "id": 56328,
+            "text": " feud",
+            "logit": 14.3125,
+            "probability": 0.3261074358568223
+          },
+          {
+            "id": 2432,
+            "text": " match",
+            "logit": 13.875,
+            "probability": 0.21055078541813566
+          },
+          {
+            "id": 1550,
+            "text": " high",
+            "logit": 13.0625,
+            "probability": 0.09343134466475632
+          },
+          {
+            "id": 1887,
+            "text": " main",
+            "logit": 13.0625,
+            "probability": 0.09343134466475632
+          },
+          {
+            "id": 9809,
+            "text": " brief",
+            "logit": 13.0,
+            "probability": 0.08777062565430024
+          }
+        ]
+      },
+      "nll_delta": -0.12049947174477627,
+      "context": {
+        "ids": [
+          27191,
+          279,
+          33278,
+          18588,
+          659,
+          715,
+          11610,
+          51317,
+          364,
+          82,
+          11043,
+          9995,
+          311,
+          279,
+          1909,
+          315,
+          33278,
+          304,
+          220,
+          98867,
+          17,
+          6069,
+          311,
+          264
+        ],
+        "text": " renamed the WWE Championship . \n Lesnar 's rapid rise to the top of WWE in 2002 led to a"
+      },
+      "document": 13
+    },
+    {
+      "position": 292,
+      "target": {
+        "id": 264,
+        "text": " a"
+      },
+      "reference": {
+        "greedy_id": 264,
+        "greedy_text": " a",
+        "top1_top2_margin": 0.0625,
+        "top5": [
+          {
+            "id": 264,
+            "text": " a",
+            "logit": 14.375,
+            "probability": 0.23493901795560815
+          },
+          {
+            "id": 13365,
+            "text": " Matt",
+            "logit": 14.3125,
+            "probability": 0.220704782432068
+          },
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 14.25,
+            "probability": 0.2073329556420908
+          },
+          {
+            "id": 11610,
+            "text": " Les",
+            "logit": 13.75,
+            "probability": 0.1257537943657675
+          },
+          {
+            "id": 56887,
+            "text": " Hardy",
+            "logit": 13.0,
+            "probability": 0.05940188633866004
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 279,
+        "greedy_text": " the",
+        "top1_top2_margin": 0.0625,
+        "top5": [
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 14.3125,
+            "probability": 0.22948858395632904
+          },
+          {
+            "id": 264,
+            "text": " a",
+            "logit": 14.25,
+            "probability": 0.21558457353514254
+          },
+          {
+            "id": 13365,
+            "text": " Matt",
+            "logit": 14.1875,
+            "probability": 0.20252296451998525
+          },
+          {
+            "id": 11610,
+            "text": " Les",
+            "logit": 13.9375,
+            "probability": 0.15772504335810686
+          },
+          {
+            "id": 56887,
+            "text": " Hardy",
+            "logit": 12.875,
+            "probability": 0.054508316434364074
+          }
+        ]
+      },
+      "nll_delta": 0.08597269725377621,
+      "context": {
+        "ids": [
+          364,
+          82,
+          11043,
+          9995,
+          311,
+          279,
+          1909,
+          315,
+          33278,
+          304,
+          220,
+          98867,
+          17,
+          6069,
+          311,
+          264,
+          56328,
+          448,
+          576,
+          97836,
+          4407,
+          1154,
+          892,
+          6398
+        ],
+        "text": " 's rapid rise to the top of WWE in 2002 led to a feud with The Undertaker , which involved"
+      },
+      "document": 13
+    },
+    {
+      "position": 336,
+      "target": {
+        "id": 659,
+        "text": " ."
+      },
+      "reference": {
+        "greedy_id": 311,
+        "greedy_text": " to",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 311,
+            "text": " to",
+            "logit": 18.875,
+            "probability": 0.36184601745291955
+          },
+          {
+            "id": 659,
+            "text": " .",
+            "logit": 18.875,
+            "probability": 0.36184601745291955
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 18.25,
+            "probability": 0.1936822162057572
+          },
+          {
+            "id": 448,
+            "text": " with",
+            "logit": 16.375,
+            "probability": 0.02970212984468617
+          },
+          {
+            "id": 369,
+            "text": " for",
+            "logit": 15.25,
+            "probability": 0.009642869739875442
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 659,
+        "greedy_text": " .",
+        "top1_top2_margin": 0.375,
+        "top5": [
+          {
+            "id": 659,
+            "text": " .",
+            "logit": 19.0,
+            "probability": 0.3955014031209777
+          },
+          {
+            "id": 311,
+            "text": " to",
+            "logit": 18.625,
+            "probability": 0.27182387411183434
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 18.5,
+            "probability": 0.23988372695223878
+          },
+          {
+            "id": 448,
+            "text": " with",
+            "logit": 16.625,
+            "probability": 0.036787360993398445
+          },
+          {
+            "id": 369,
+            "text": " for",
+            "logit": 15.1875,
+            "probability": 0.008737764115512305
+          }
+        ]
+      },
+      "nll_delta": -0.08893557973587418,
+      "context": {
+        "ids": [
+          279,
+          2265,
+          659,
+          11610,
+          51317,
+          16585,
+          576,
+          97836,
+          4407,
+          1549,
+          1154,
+          518,
+          2308,
+          63241,
+          1154,
+          419,
+          882,
+          304,
+          264,
+          23820,
+          304,
+          264,
+          13963,
+          2432
+        ],
+        "text": " the title . Lesnar faced The Undertaker again , at No Mercy , this time in a Hell in a Cell match"
+      },
+      "document": 13
+    },
+    {
+      "position": 373,
+      "target": {
+        "id": 806,
+        "text": " his"
+      },
+      "reference": {
+        "greedy_id": 806,
+        "greedy_text": " his",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 806,
+            "text": " his",
+            "logit": 16.125,
+            "probability": 0.4824682292464476
+          },
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 16.0,
+            "probability": 0.4257767179054645
+          },
+          {
+            "id": 264,
+            "text": " a",
+            "logit": 13.5,
+            "probability": 0.0349498813033582
+          },
+          {
+            "id": 11610,
+            "text": " Les",
+            "logit": 12.5,
+            "probability": 0.01285734280288765
+          },
+          {
+            "id": 429,
+            "text": " that",
+            "logit": 11.5625,
+            "probability": 0.005035007785723249
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 279,
+        "greedy_text": " the",
+        "top1_top2_margin": 0.5625,
+        "top5": [
+          {
+            "id": 279,
+            "text": " the",
+            "logit": 15.9375,
+            "probability": 0.5825318533591942
+          },
+          {
+            "id": 806,
+            "text": " his",
+            "logit": 15.375,
+            "probability": 0.3319166449027415
+          },
+          {
+            "id": 264,
+            "text": " a",
+            "logit": 13.125,
+            "probability": 0.034983756991924624
+          },
+          {
+            "id": 11610,
+            "text": " Les",
+            "logit": 11.6875,
+            "probability": 0.008309370615758397
+          },
+          {
+            "id": 23820,
+            "text": " Hell",
+            "logit": 11.3125,
+            "probability": 0.005710941337711485
+          }
+        ]
+      },
+      "nll_delta": 0.3740312046665457,
+      "context": {
+        "ids": [
+          14412,
+          279,
+          97836,
+          4407,
+          364,
+          82,
+          1424,
+          448,
+          264,
+          90181,
+          12889,
+          659,
+          17689,
+          27461,
+          1515,
+          58697,
+          79186,
+          537,
+          311,
+          1077,
+          576,
+          97836,
+          4407,
+          990
+        ],
+        "text": " broke the Undertaker 's hand with a propane tank . Despite Heyman begging McMahon not to let The Undertaker use"
+      },
+      "document": 13
+    },
+    {
+      "position": 274,
+      "target": {
+        "id": 3668,
+        "text": " character"
+      },
+      "reference": {
+        "greedy_id": 879,
+        "greedy_text": " who",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 879,
+            "text": " who",
+            "logit": 17.125,
+            "probability": 0.19411942522861336
+          },
+          {
+            "id": 429,
+            "text": " that",
+            "logit": 17.0,
+            "probability": 0.17130979149575326
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 16.875,
+            "probability": 0.1511803603774151
+          },
+          {
+            "id": 304,
+            "text": " in",
+            "logit": 16.5,
+            "probability": 0.10390464085115289
+          },
+          {
+            "id": 11518,
+            "text": " introduced",
+            "logit": 16.0,
+            "probability": 0.063021350362654
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 429,
+        "greedy_text": " that",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 879,
+            "text": " who",
+            "logit": 17.0,
+            "probability": 0.16633113083709036
+          },
+          {
+            "id": 1154,
+            "text": " ,",
+            "logit": 17.0,
+            "probability": 0.16633113083709036
+          },
+          {
+            "id": 429,
+            "text": " that",
+            "logit": 17.0,
+            "probability": 0.16633113083709036
+          },
+          {
+            "id": 304,
+            "text": " in",
+            "logit": 16.5,
+            "probability": 0.10088493051736878
+          },
+          {
+            "id": 6342,
+            "text": " played",
+            "logit": 15.75,
+            "probability": 0.04765466685200628
+          }
+        ]
+      },
+      "nll_delta": -0.158007001910347,
+      "context": {
+        "ids": [
+          576,
+          18867,
+          5676,
+          330,
+          38711,
+          50225,
+          438,
+          279,
+          18602,
+          364,
+          82,
+          501,
+          21689,
+          1154,
+          3498,
+          13644,
+          432,
+          1035,
+          387,
+          264,
+          4843,
+          2319,
+          315,
+          1059
+        ],
+        "text": " The Snowmen \" introduces Clara as the Doctor 's new companion , though ultimately it would be a third version of her"
+      },
+      "document": 14
+    },
+    {
+      "position": 277,
+      "target": {
+        "id": 5821,
+        "text": " travel"
+      },
+      "reference": {
+        "greedy_id": 5138,
+        "greedy_text": " join",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 5138,
+            "text": " join",
+            "logit": 18.75,
+            "probability": 0.23920961227267512
+          },
+          {
+            "id": 5821,
+            "text": " travel",
+            "logit": 18.625,
+            "probability": 0.2111017418990978
+          },
+          {
+            "id": 3635,
+            "text": " become",
+            "logit": 18.375,
+            "probability": 0.16440620189875496
+          },
+          {
+            "id": 19190,
+            "text": " accompany",
+            "logit": 17.375,
+            "probability": 0.060481661679633314
+          },
+          {
+            "id": 387,
+            "text": " be",
+            "logit": 17.25,
+            "probability": 0.05337487909544581
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 5821,
+        "greedy_text": " travel",
+        "top1_top2_margin": 0.125,
+        "top5": [
+          {
+            "id": 5821,
+            "text": " travel",
+            "logit": 18.75,
+            "probability": 0.24822655512262973
+          },
+          {
+            "id": 5138,
+            "text": " join",
+            "logit": 18.625,
+            "probability": 0.21905916603496506
+          },
+          {
+            "id": 3635,
+            "text": " become",
+            "logit": 18.125,
+            "probability": 0.1328661004912867
+          },
+          {
+            "id": 19190,
+            "text": " accompany",
+            "logit": 17.5,
+            "probability": 0.07111809875071383
+          },
+          {
+            "id": 387,
+            "text": " be",
+            "logit": 17.125,
+            "probability": 0.04887870679936324
+          }
+        ]
+      },
+      "nll_delta": -0.1620016515163396,
+      "context": {
+        "ids": [
+          330,
+          38711,
+          50225,
+          438,
+          279,
+          18602,
+          364,
+          82,
+          501,
+          21689,
+          1154,
+          3498,
+          13644,
+          432,
+          1035,
+          387,
+          264,
+          4843,
+          2319,
+          315,
+          1059,
+          3668,
+          429,
+          1035
+        ],
+        "text": " \" introduces Clara as the Doctor 's new companion , though ultimately it would be a third version of her character that would"
+      },
+      "document": 14
+    },
+    {
+      "position": 331,
+      "target": {
+        "id": 304,
+        "text": " in"
+      },
+      "reference": {
+        "greedy_id": 304,
+        "greedy_text": " in",
+        "top1_top2_margin": 0.0,
+        "top5": [
+          {
+            "id": 304,
+            "text": " in",
+            "logit": 19.375,
+            "probability": 0.4353540366629387
+          },
+          {
+            "id": 438,
+            "text": " as",
+            "logit": 19.375,
+            "probability": 0.4353540366629387
+          },
+          {
+            "id": 448,
+            "text": " with",
+            "logit": 16.5,
+            "probability": 0.024560994065908955
+          },
+          {
+            "id": 2337,
+            "text": " during",
+            "logit": 16.25,
+            "probability": 0.019128121411542024
+          },
+          {
+            "id": 518,
+            "text": " at",
+            "logit": 15.9375,
+            "probability": 0.013994432577073041
+          }
+        ]
+      },
+      "candidate": {
+        "greedy_id": 438,
+        "greedy_text": " as",
+        "top1_top2_margin": 0.375,
+        "top5": [
+          {
+            "id": 438,
+            "text": " as",
+            "logit": 19.5,
+            "probability": 0.5167445869992335
+          },
+          {
+            "id": 304,
+            "text": " in",
+            "logit": 19.125,
+            "probability": 0.35515301451784204
+          },
+          {
+            "id": 448,
+            "text": " with",
+            "logit": 16.5,
+            "probability": 0.02572719808165446
+          },
+          {
+            "id": 2337,
+            "text": " during",
+            "logit": 16.125,
+            "probability": 0.017682027414852777
+          },
+          {
+            "id": 518,
+            "text": " at",
+            "logit": 16.0,
+            "probability": 0.015604334425023477
+          }
+        ]
+      },
+      "nll_delta": 0.20361085403527723,
+      "context": {
+        "ids": [
+          7376,
+          1637,
+          1154,
+          31595,
+          2265,
+          8499,
+          323,
+          6912,
+          4627,
+          1154,
+          323,
+          15622,
+          4344,
+          311,
+          279,
+          18602,
+          364,
+          82,
+          31288,
+          659,
+          576,
+          3281,
+          572,
+          8944
+        ],
+        "text": "ARDIS , revised title sequence and theme music , and sees changes to the Doctor 's costume . The special was produced"
+      },
+      "document": 14
+    }
+  ],
+  "modes": {
+    "baseline": {
+      "documents": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        27,
+        28,
+        29
+      ]
+    },
+    "baseline_repeat": {
+      "documents": [
+        0,
+        8,
+        16,
+        24
+      ]
+    },
+    "tuned_blas": {
+      "documents": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        27,
+        28,
+        29
+      ]
+    }
+  },
+  "nll_report": {
+    "baseline": 1.3233459566449912,
+    "candidate": 1.3271122029783204
+  },
+  "nll_regression": 0.003766246333329226,
+  "nll_regression_standard_error": 0.0025028468428044703,
+  "baseline_repeat_max_abs_error": 0.0,
+  "paired_greedy_agreement": 0.9646990740740741,
+  "free_generation": {
+    "steps": 32,
+    "documents": [
+      {
+        "index": 0,
+        "agreement": 32,
+        "steps": 32,
+        "first_divergence": null,
+        "baseline_text": " be from the end of this period , around 735 . In that year , travelling in Shandong , he passed the imperial examination , of which his",
+        "candidate_text": " be from the end of this period , around 735 . In that year , travelling in Shandong , he passed the imperial examination , of which his"
+      },
+      {
+        "index": 3,
+        "agreement": 32,
+        "steps": 32,
+        "first_divergence": null,
+        "baseline_text": " The result was the Warrior , begun in 1859 and launched in 1860 , at a cost of \u00a3 377 , 000 . \n Warrior",
+        "candidate_text": " The result was the Warrior , begun in 1859 and launched in 1860 , at a cost of \u00a3 377 , 000 . \n Warrior"
+      },
+      {
+        "index": 6,
+        "agreement": 18,
+        "steps": 32,
+        "first_divergence": 18,
+        "baseline_text": " while the remaining 30 percent went to the International Justice Mission , a human rights agency that combats slavery and sex trafficking . Kershaw 's Challenge raised",
+        "candidate_text": " while the remaining 30 percent went to the International Justice Mission , a human rights agency that rescues victims of slavery , sexual exploitation and other forms of oppression ."
+      },
+      {
+        "index": 9,
+        "agreement": 32,
+        "steps": 32,
+        "first_divergence": null,
+        "baseline_text": " and Soudelor made landfall in eastern China near Fuzhou with winds of 85 km / h ( 50 mph ) . The storm dissipated",
+        "candidate_text": " and Soudelor made landfall in eastern China near Fuzhou with winds of 85 km / h ( 50 mph ) . The storm dissipated"
+      },
+      {
+        "index": 12,
+        "agreement": 22,
+        "steps": 32,
+        "first_divergence": 19,
+        "baseline_text": " as the Doctor 's new companion . The episode also introduces the Doctor 's new costume and title sequence , and features the first appearance of the TARDIS",
+        "candidate_text": " as the Doctor 's new companion . The episode also introduces the Doctor 's new costume and a redesigned title sequence , the first change to the sequence since "
+      },
+      {
+        "index": 15,
+        "agreement": 10,
+        "steps": 32,
+        "first_divergence": 10,
+        "baseline_text": " Lucious intentionally missed the second , but the rebound was tipped out of bounds by Michigan State . Butler inbounded the ball and ran out the clock , winning ",
+        "candidate_text": " Lucious intentionally missed the second , but the rebound went to Butler and the Bulldogs advanced to the national championship game with a 52 \u2013 50 win . The"
+      },
+      {
+        "index": 18,
+        "agreement": 12,
+        "steps": 32,
+        "first_divergence": 12,
+        "baseline_text": " burned except with a low rampart of stone . \" \n Agrippina had become the fourth wife of Emperor Claudius in 49 . She had a son",
+        "candidate_text": " burned except with a low rampart of stone . \" \n Suetonius ' account is that Nero and Agrippina were not the instigators , but"
+      },
+      {
+        "index": 21,
+        "agreement": 32,
+        "steps": 32,
+        "first_divergence": null,
+        "baseline_text": " and Hugh Logue , were batoned . The barricades were removed , but the army withdrew from the Bogside and Creggan , leaving them under the",
+        "candidate_text": " and Hugh Logue , were batoned . The barricades were removed , but the army withdrew from the Bogside and Creggan , leaving them under the"
+      }
+    ]
+  },
+  "chunked_continuation": {
+    "split": 128,
+    "steps": 32,
+    "documents": [
+      {
+        "index": 0,
+        "max_abs_nll_delta": 0.6934131309079024,
+        "mean_abs_nll_delta": 0.040393662038050775,
+        "mean_nll_delta": 0.016009050795782666,
+        "guard_0p1_exceeded": true
+      },
+      {
+        "index": 8,
+        "max_abs_nll_delta": 25.733813082780426,
+        "mean_abs_nll_delta": 14.473048660291385,
+        "mean_nll_delta": -14.404461974112108,
+        "guard_0p1_exceeded": true
+      },
+      {
+        "index": 16,
+        "max_abs_nll_delta": 23.194795939934096,
+        "mean_abs_nll_delta": 14.875003945568356,
+        "mean_nll_delta": -14.875003945568356,
+        "guard_0p1_exceeded": true
+      },
+      {
+        "index": 24,
+        "max_abs_nll_delta": 26.84157029508685,
+        "mean_abs_nll_delta": 14.14436772634719,
+        "mean_nll_delta": -14.117196448104375,
+        "guard_0p1_exceeded": true
+      }
+    ]
+  },
+  "gates": {
+    "finite": true,
+    "baseline_repeat_identical": true,
+    "model_nll_regression": true,
+    "all": true
+  }
+}
