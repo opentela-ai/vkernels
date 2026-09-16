@@ -38,3 +38,47 @@ Files:
    CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is
    pinned". ENFORCE_EAGER=1 avoids it; capture-safety still needs the #69
    treatment for the K3 MoE bridge.
+
+## ERRATUM — the vkernels MoE backend has never passed a correctness gate
+
+Discovered 2026-09-16 while triaging why the acceptance serve returned `!`
+for every prompt (token id 0 = the argmax of all-NaN logits). A scan of every
+`gen_correctness_*.json` under
+`/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/run-*/` shows the raw
+continuations, independent of any verdict field:
+
+| jobs | MoE backend | weights | raw `capital -> Paris` continuation | real? |
+|---|---|---|---|---|
+| 588856, 589458 | `TRITON_UNFUSED` | `auto` (real) | `' Paris.",\n+  "The Eiffel Tower is locate'` | **coherent** |
+| 589456 | `TRITON_UNFUSED` | `dummy` | `'.dartampionship.dartampionship…'` | negative control |
+| 597880–603711 | `VKERNELS_MXFP4_BF16` | `auto` (real) | `'.dartampionship…'` (597880: `'!!!!…'`) | **degenerate** |
+| 639143, 639260 | `VKERNELS_MXFP4_BF16` | `auto` (real) | `'!!!!…'` (NaN logits) | **degenerate** |
+
+Decisive points:
+
+- **The `VkernelFusedExperts` "PASS"es were smoke-only.** Jobs 597880 and
+  603711 ran with `GEN_CORRECTNESS_SMOKE=1` (real weights, `load_format=auto`,
+  `[SMOKE] probing` in the log), whose matcher is `_nonempty` — *non-empty*,
+  not correct. `.dartampionship…` and `!!!!…` are both non-empty, so the gate
+  passed while the model emitted garbage. This is why the earlier "597880
+  passed 6/6 with real weights" reading was wrong. `gen_correctness.py` now
+  records `"smoke": true/false` in the report so this cannot be misread again.
+- **589456 is the negative control**: same `TRITON_UNFUSED` backend, same
+  garbage, but `load_format=dummy` — so random weights, as expected. 589458
+  is the same backend with real weights and is coherent. The MoE backend, not
+  the pipeline, is the variable.
+- Therefore the acceptance runs must use the **known-good MoE backend**:
+  `VKERNELS_MOE=0` removes `VKERNELS_MXFP4_BF16` from
+  `_get_priority_backends`, so selection falls through to `TRITON_UNFUSED`.
+  This is orthogonal to #45 (attention) and is the correct control.
+- Job **639740** (`VKERNELS_KDA=1 VKERNELS_MOE=0`): the log confirms
+  `Using 'TRITON_UNFUSED' Mxfp4 MoE backend`, weights loaded 96/96, and the
+  KDA leaf patch applied — then the engine died on a pipeline-parallel
+  **NCCL RECV timeout** (`[PG ID 5 Rank 1] … remote process exited`, first
+  error 04:59:14) during the post-load memory-profiling forward, before the
+  probe could run. That is a boot-phase hang unrelated to the kernels; it
+  needs a re-run after the 2026-09-16 07:00 maintenance.
+
+The MoE correctness defect is tracked separately; it is NOT an attention
+(#45) defect and must not block the attention acceptance once the run
+completes with `VKERNELS_MOE=0`.
