@@ -1,0 +1,91 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M2NWDMV8PSNE1HQF9SPGCREX",
+  "session_id": "01a09ffd-0c22-7539-99e0-82512967e89c",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-16T19:52:09.557826522Z",
+  "branch": "main",
+  "checkpoints_count": 7,
+  "save_step_count": 2,
+  "files_touched": [
+    ".omx/logs/omx-2026-08-28.jsonl",
+    ".omx/logs/omx-2026-08-30.jsonl",
+    ".omx/state/native-stop-state.json",
+    ".omx/state/session.json",
+    ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json",
+    ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json"
+  ],
+  "agent": "Pi",
+  "model": "zai-org/GLM-5.3-Flash",
+  "turn_id": "84b72883b8ab",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 202327,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 8640,
+    "output_tokens": 5346,
+    "api_call_count": 26
+  },
+  "session_metrics": {
+    "turn_count": 7
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-16T19:52:09.549499566Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 9530,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 9530,
+    "total_lines_changed": 9727,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 60,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12
+      }
+    }
+  ]
+}
