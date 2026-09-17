@@ -183,6 +183,73 @@ def _t_rms_heads(
 
 
 @triton.jit
+def _t_rms2d_gated(
+    worker: tl.int32,
+    P: tl.int32,
+    x_ptr,
+    gate_ptr,
+    g_ptr,
+    y_ptr,
+    B: tl.constexpr,
+    C: tl.constexpr,
+    BC: tl.constexpr,
+    eps: tl.constexpr,
+):
+    """Sigmoid-gated RMSNorm over one hidden row (issue #100, GLM o_norm):
+    one task per batch row. Strict-fp32 math (floe Glm53RMSNormGated):
+
+        y = x * rsqrt(mean(x^2) + eps) * g * sigmoid(gate)
+
+    Same task decomposition as ``_t_rms2d`` with a second elementwise
+    input stream; the gate multiply folds after the weight multiply so a
+    saturated gate (sigmoid fp32 -> 0) zeroes the row exactly.
+    """
+    task = worker
+    while task < B:
+        offs = tl.arange(0, BC)
+        m = offs < C
+        x = tl.load(x_ptr + task * C + offs, mask=m, other=0.0, cache_modifier=".cg").to(tl.float32)
+        var = tl.sum(x * x, axis=0) / C
+        g = tl.load(g_ptr + offs, mask=m, other=0.0).to(tl.float32)
+        gate = tl.load(gate_ptr + task * C + offs, mask=m, other=0.0, cache_modifier=".cg").to(tl.float32)
+        sig = 1.0 / (1.0 + tl.exp(-gate))
+        tl.store(y_ptr + task * C + offs, x * (1.0 / tl.sqrt(var + eps)) * g * sig, mask=m)
+        task += P
+
+
+@triton.jit
+def _t_rms_heads_gated(
+    worker: tl.int32,
+    P: tl.int32,
+    x_ptr,
+    gate_ptr,
+    g_ptr,
+    y_ptr,
+    B: tl.constexpr,
+    NHEAD: tl.constexpr,
+    D: tl.constexpr,
+    ROWSTRIDE: tl.constexpr,
+    eps: tl.constexpr,
+):
+    """Per-head sigmoid-gated RMSNorm (issue #100): the linear-attention
+    output norm folded before ``o_proj`` — one task per (batch, head), the
+    ``_t_rms_heads`` decomposition with a second per-head gate stream.
+    """
+    task = worker
+    while task < B * NHEAD:
+        b = task // NHEAD
+        h = task % NHEAD
+        offs = tl.arange(0, D)
+        x = tl.load(x_ptr + b * ROWSTRIDE + h * D + offs, cache_modifier=".cg").to(tl.float32)
+        var = tl.sum(x * x, axis=0) / D
+        g = tl.load(g_ptr + offs).to(tl.float32)
+        gate = tl.load(gate_ptr + (b * NHEAD + h) * D + offs, cache_modifier=".cg").to(tl.float32)
+        sig = 1.0 / (1.0 + tl.exp(-gate))
+        tl.store(y_ptr + (b * NHEAD + h) * D + offs, x * (1.0 / tl.sqrt(var + eps)) * g * sig)
+        task += P
+
+
+@triton.jit
 def _t_rope(
     worker: tl.int32,
     P: tl.int32,

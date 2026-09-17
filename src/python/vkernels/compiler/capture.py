@@ -70,6 +70,13 @@ class UnsupportedOperator(CaptureError):
         self.missing_contract = missing_contract
 
 
+# Gated-RMSNorm activations in the supported subset (issue #100). GLM's
+# o_norm uses sigmoid (floe Glm53RMSNormGated); silu is deliberately NOT
+# here — vkernels' kda_layer_norm_gated hardcodes silu and does not cover
+# this variant, which is exactly why the op exists.
+_RMS_GATED_ACTIVATIONS = ("sigmoid",)
+
+
 class SymbolicTensor:
     """Handle passed to model bodies; wraps a :class:`TensorValue`."""
 
@@ -596,6 +603,66 @@ class RecordingBackend:
             numerical_contract={
                 "formula": "x * rsqrt(mean(x^2) + eps) * gamma",
                 "upcast": "statistics accumulated in fp32",
+            },
+        )
+        return out
+
+    def rms_norm_gated(
+        self,
+        x: SymbolicTensor,
+        gate: SymbolicTensor,
+        gamma: SymbolicTensor,
+        eps: float,
+        *,
+        activation: str = "sigmoid",
+        out: Optional[SymbolicTensor] = None,
+        name: str = "rms_gated",
+    ) -> SymbolicTensor:
+        """Sigmoid-gated RMSNorm over the last dim (GLM ``o_norm``).
+
+        ``o = rmsnorm(x) * gamma * activation(gate)`` with the gate applied
+        per element after the weight multiply. ``activation`` is an IR
+        attribute — only ``"sigmoid"`` is in the supported subset (floe
+        ``Glm53RMSNormGated``); vkernels' ``kda_layer_norm_gated`` hardcodes
+        silu and does *not* cover this op.
+
+        Works on [B, C] hidden states (one task per row) and on [B, H, D]
+        head views (one task per head row — the linear-attention output
+        norm sits per-head before ``o_proj``); ``gate`` must match ``x``
+        shape for elementwise multiplication.
+        """
+        if activation not in _RMS_GATED_ACTIVATIONS:
+            raise UnsupportedOperator(
+                f"rms_norm_gated activation {activation!r} is outside the supported subset {_RMS_GATED_ACTIVATIONS}",
+                node=name,
+                missing_contract="a gated-norm activation the device task implements (sigmoid for GLM o_norm)",
+            )
+        xv, gv = x.value, gate.value
+        if gv.shape != xv.shape:
+            raise CaptureError(
+                f"rms_norm_gated gate shape {gv.shape} must match the normalized tensor {xv.shape} (elementwise gate)"
+            )
+        if len(xv.shape) not in (2, 3):
+            raise CaptureError(
+                f"rms_norm_gated input must be [B, C] or [B, H, D] (row-wise norm); got shape {xv.shape}"
+            )
+        if gv.shape[-1] != gamma.value.shape[-1] or len(gamma.value.shape) != 1:
+            raise CaptureError(
+                f"rms_norm_gated weight must be [width]={xv.shape[-1]}; got shape {gamma.value.shape}"
+            )
+        out = out or self.fresh_buffer(f"{name}{self._suffix()}", xv.shape)
+        self._record(
+            "rms_norm_gated",
+            inputs=(x, gate, gamma),
+            outputs=(out,),
+            attributes={"eps": eps, "activation": activation},
+            reads=(_regional_reads(xv), _regional_reads(gv), _regional_reads(gamma.value)),
+            writes=(_regional_reads(out.value),),
+            source_location=name,
+            numerical_contract={
+                "formula": "x * rsqrt(mean(x^2) + eps) * gamma * activation(gate)",
+                "activation": "sigmoid(g) = 1 / (1 + exp(-g))" if activation == "sigmoid" else activation,
+                "upcast": "strict fp32 statistics and math (floe Glm53RMSNormGated): x/gate upcast before the row reduction, gate sigmoid in fp32, output cast back to the storage dtype",
             },
         )
         return out

@@ -57,6 +57,7 @@ TEMPLATE_NAMES = {
     "compressor_append": "compressor_append_task",
     "layernorm": "layernorm_task",
     "rms_norm": "rms_norm_task",
+    "rms_norm_gated": "rms_norm_gated_task",  # sigmoid-gated RMSNorm (issue #100)
     "rope": "rope_task",
     "elementwise": "elementwise_task",
     "embedding": "embedding_task",

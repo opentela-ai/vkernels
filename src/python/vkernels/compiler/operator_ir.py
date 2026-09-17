@@ -453,6 +453,11 @@ class Region:
 OP_EMBEDDING = "embedding"
 OP_LAYER_NORM = "layer_norm"
 OP_RMS_NORM = "rms_norm"
+# rms_norm_gated attributes: eps, activation ("sigmoid" for the GLM o_norm;
+# NOT silu — vkernels' kda_layer_norm_gated hardcodes silu and does not cover
+# this variant). Optional per-element gate stream: row-wise RMSNorm whose
+# output is additionally multiplied by activation(gate), elementwise.
+OP_RMS_NORM_GATED = "rms_norm_gated"
 OP_ROPE = "rope"
 # rope attributes: layer, which, position, convention ("rotate_half" —
 # full-width Qwen3 form, default — or "neox_partial" — partial rotation over
@@ -499,6 +504,7 @@ ARITHMETIC_OP_KINDS = (
     OP_EMBEDDING,
     OP_LAYER_NORM,
     OP_RMS_NORM,
+    OP_RMS_NORM_GATED,
     OP_ROPE,
     OP_LINEAR,
     OP_LINEAR_FP8,

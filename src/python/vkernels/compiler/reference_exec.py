@@ -152,6 +152,7 @@ class ReferenceExecutor:
             "index_topk": self._body_index_topk,
             "layernorm": self._body_layernorm,
             "rms_norm": self._body_rms_norm,
+            "rms_norm_gated": self._body_rms_norm_gated,
             "rope": self._body_rope,
             "elementwise": self._body_elementwise,
             "embedding": self._body_embedding,
@@ -431,6 +432,32 @@ class ReferenceExecutor:
             r = coords[0]
             row = x[r]
             y[r] = (row * np.reciprocal(np.sqrt((row * row).mean() + eps)) * g).astype(y.dtype)
+
+    def _body_rms_norm_gated(self, fam: TaskFamily, coords, scalars) -> None:
+        """Sigmoid-gated RMSNorm (issue #100, GLM o_norm), one task per row
+        or head row. Strict-fp32 semantics in the device contract (floe
+        Glm53RMSNormGated); the reference body runs the same math in fp64
+        for oracle stability:
+
+            o = x * rsqrt(mean(x^2) + eps) * gamma * sigmoid(gate)
+        """
+        x = self.tensor(fam.inputs[0]).astype(np.float64)
+        gate = self.tensor(fam.inputs[1]).astype(np.float64)
+        g = self.tensor(fam.inputs[2])
+        y = self.tensor(fam.outputs[0])
+        eps = fam.params["eps"]
+        if len(x.shape) == 3:
+            b, h = coords
+            row, g_row = x[b, h], gate[b, h]
+            y[b, h] = (
+                row * np.reciprocal(np.sqrt((row * row).mean() + eps)) * g * _stable_sigmoid(g_row)
+            ).astype(y.dtype)
+        else:
+            r = coords[0]
+            row, g_row = x[r], gate[r]
+            y[r] = (
+                row * np.reciprocal(np.sqrt((row * row).mean() + eps)) * g * _stable_sigmoid(g_row)
+            ).astype(y.dtype)
 
     def _body_rope(self, fam: TaskFamily, coords, scalars) -> None:
         x = self.tensor(fam.inputs[0]).astype(np.float64)
