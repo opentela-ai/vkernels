@@ -330,8 +330,9 @@ class Region:
 
     storage_id: int
     view: TensorValue
-    # (lo, hi) per dimension; hi may be a str symbolic expression or a
-    # per-row ValidLength (row-tensor form, stored as the object itself).
+    # (lo, hi) per dimension; hi may be a str symbolic expression, a
+    # per-row ValidLength (row-tensor form, stored as the object itself),
+    # or a plain int.
     boxes: tuple[tuple[int, int | str | ValidLength], ...]
     # Paged indirection (#94): when set, the position axis is addressed
     # through an external i32 [B, S] slot table rather than a static box.
@@ -484,6 +485,16 @@ OP_ATTENTION_SCORES_PAGED = "attention_scores_paged"
 OP_SOFTMAX = "softmax"
 OP_ATTENTION_VALUES = "attention_values"
 OP_ATTENTION_VALUES_PAGED = "attention_values_paged"
+# MoE decode ops (issue #98): routed-expert decode with a static task grid and
+# runtime indirection. ``moe_route`` writes the routing table (external scratch
+# [B, k]: i32 expert ids + fp32 weights); ``moe_expert`` runs the k·B per-(row,
+# slot) expert FFN tasks with the weight base indirected through the table (the
+# #94 slot-table pattern); ``moe_combine`` does the weighted scatter-add per row
+# (+ optional shared-expert path). Phase order route ≺ experts ≺ combine falls
+# out of the RAW hazards on the table and the partials buffer.
+OP_MOE_ROUTE = "moe_route"
+OP_MOE_EXPERT = "moe_expert"
+OP_MOE_COMBINE = "moe_combine"
 
 ARITHMETIC_OP_KINDS = (
     OP_EMBEDDING,
@@ -505,6 +516,9 @@ ARITHMETIC_OP_KINDS = (
     OP_SOFTMAX,
     OP_ATTENTION_VALUES,
     OP_ATTENTION_VALUES_PAGED,
+    OP_MOE_ROUTE,
+    OP_MOE_EXPERT,
+    OP_MOE_COMBINE,
 )
 
 

@@ -1459,3 +1459,178 @@ def _t_gdn_heads(
         og = on * (z * (1.0 / (1.0 + tl.exp(-z))))
         tl.store(out_ptr + h * HV + offs_v, og)
         task += P
+
+
+
+
+# ---------------------------------------------------------------------------
+# MoE decode task templates (issue #98)
+#
+# * ``_t_moe_expert`` — one task per (row, slot): the expert weight base is
+#   loaded from the routing table at run time (the #94 slot-table indirection
+#   applied to a read-only weight pool); gate/up row GEMVs as [I, H] block
+#   reductions, swiglu_limit clamp folded into the activation, down GEMV as an
+#   [H, I] block reduction;
+# * ``_t_moe_combine`` — per-row weighted scatter-add over the k slots in slot
+#   order (+ the dense shared-expert path when wired);
+# * ``_t_moe_route`` — per-row router for the degenerate-group and hash paths
+#   (n_group == 1 noaux_tc, sqrtsoftplus global top-k, frozen tid2eid gather):
+#   E-wide fp32 logits GEMV, score fn, K rounds of masked ``tl.argmax`` whose
+#   first-maximal-index semantics realize the documented tie rule (ties to the
+#   lower expert index). The general n_group > 1 noaux_tc group restriction is
+#   reference-executor-only in this slice (CUDA-gated gap, flagged in the PR).
+#
+# ``I``/``H``/``EP`` must be powers of two (``EP >= E``, masked). CPU mirrors
+# of these exact task decompositions live in
+# ``tests/python/test_moe_decode_compiler.py`` (triton is not importable in
+# the bare test environment — §15.1 division of labor).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _t_moe_expert(
+    worker: tl.int32,
+    P: tl.int32,
+    x_ptr,
+    gate_up_ptr,
+    down_ptr,
+    ids_ptr,
+    partials_ptr,
+    B: tl.constexpr,
+    K: tl.constexpr,
+    H: tl.constexpr,
+    I: tl.constexpr,
+    LIMIT: tl.constexpr,  # 0.0 encodes "unclamped"
+):
+    """partials[b, s, :] = down[e] @ (silu(clamp(g, ≤L)) · clamp(u, ±L)),
+    (g, u) = gate_up[e] @ x[b, :], e = ids[b, s] loaded at run time.
+
+    gate_up is the Mixtral-layout stack [E, 2I, H] row-major: the gate rows
+    sit at e·2I·H + i·H + h, the up rows I slots later. down is [E, H, I]."""
+    offs_i = tl.arange(0, I)
+    offs_h = tl.arange(0, H)
+    ntask: tl.constexpr = B * K
+    task = worker
+    while task < ntask:
+        b = task // K
+        s = task % K
+        e = tl.load(ids_ptr + b * K + s).to(tl.int32)
+        xb = tl.load(x_ptr + b * H + offs_h, cache_modifier=".cg").to(tl.float32)
+        wbase = (e * 2 * I) * H
+        wg = tl.load(gate_up_ptr + wbase + offs_i[:, None] * H + offs_h[None, :], cache_modifier=".cg").to(tl.float32)
+        wu = tl.load(gate_up_ptr + wbase + (I + offs_i)[:, None] * H + offs_h[None, :], cache_modifier=".cg").to(tl.float32)
+        g = tl.sum(wg * xb[None, :], axis=1)
+        u = tl.sum(wu * xb[None, :], axis=1)
+        if LIMIT > 0.0:
+            g = tl.minimum(g, LIMIT)
+            u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
+        act = g / (1.0 + tl.exp(-g)) * u
+        wd = tl.load(down_ptr + (e * H) * I + offs_h[:, None] * I + offs_i[None, :], cache_modifier=".cg").to(tl.float32)
+        acc = tl.sum(wd * act[None, :], axis=1)
+        tl.store(partials_ptr + (b * K + s) * H + offs_h, acc)
+        task += P
+
+
+@triton.jit
+def _t_moe_combine(
+    worker: tl.int32,
+    P: tl.int32,
+    partials_ptr,
+    weights_ptr,
+    shared_ptr,
+    y_ptr,
+    B: tl.constexpr,
+    K: tl.constexpr,
+    H: tl.constexpr,
+    HAS_SHARED: tl.constexpr,
+):
+    """y[b, :] = Σ_k weights[b, k] · partials[b, k, :] (slot order, fp32
+    accumulate) + shared[b, :] when HAS_SHARED."""
+    offs_h = tl.arange(0, H)
+    task = worker
+    while task < B:
+        b = task
+        acc = tl.zeros([H], tl.float32)
+        for s in range(K):
+            w = tl.load(weights_ptr + b * K + s).to(tl.float32)
+            acc += w * tl.load(partials_ptr + (b * K + s) * H + offs_h, cache_modifier=".cg").to(tl.float32)
+        if HAS_SHARED:
+            acc += tl.load(shared_ptr + b * H + offs_h, cache_modifier=".cg").to(tl.float32)
+        tl.store(y_ptr + b * H + offs_h, acc)
+        task += P
+
+
+@triton.jit
+def _t_moe_route(
+    worker: tl.int32,
+    P: tl.int32,
+    x_ptr,
+    w_ptr,
+    bias_ptr,
+    tok_ptr,
+    t2e_ptr,
+    ids_ptr,
+    weights_ptr,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    E: tl.constexpr,
+    EP: tl.constexpr,  # padded expert block, power of two, E <= EP
+    K: tl.constexpr,  # power of two (block width for the selection state)
+    MODE_HASH: tl.constexpr,
+    SQRTSP: tl.constexpr,  # sqrtsoftplus (DeepSeek-V4) vs sigmoid noaux_tc
+    NORM_TOPK: tl.constexpr,
+    RSF: tl.constexpr,
+):
+    """Router decode step — degenerate-group and hash device paths.
+
+    scores = sqrt(softplus(logits)) (SQRTSP) or sigmoid(logits) + bias
+    (noaux_tc, n_group == 1: the single group always wins — floe's own
+    degeneracy note). Selection = K masked-argmax rounds over the choice
+    scores; ``tl.argmax`` returns the first maximal index, which IS the
+    documented tie rule (ties resolve to the lower expert index). Weights
+    gather the UNBIASED scores, renorm w/(Σw+1e-20) iff NORM_TOPK, × RSF.
+    Hash mode replaces selection with the frozen tid2eid[token_id] gather
+    (renorm unconditional, floe semantics)."""
+    offs_e = tl.arange(0, EP)
+    offs_k = tl.arange(0, K)
+    emask = offs_e < E
+    neg_inf: tl.constexpr = -1.0e38
+    task = worker
+    while task < B:
+        b = task
+        se = tl.zeros([EP], tl.float32)
+        for h in range(H):
+            xv = tl.load(x_ptr + b * H + h, cache_modifier=".cg").to(tl.float32)
+            wv = tl.load(w_ptr + offs_e * H + h, mask=emask, other=0.0, cache_modifier=".cg").to(tl.float32)
+            se += wv * xv
+        if SQRTSP:
+            scores = tl.sqrt(tl.where(se > 20.0, se, tl.log(1.0 + tl.exp(se))))
+            choice = scores
+        else:
+            sig = 1.0 / (1.0 + tl.exp(-se))
+            bias = tl.load(bias_ptr + offs_e, mask=emask, other=0.0).to(tl.float32)
+            scores = sig  # weights gather the UNBIASED scores (floe semantics)
+            choice = sig + bias
+        if MODE_HASH:
+            tok = tl.load(tok_ptr + b).to(tl.int32)
+            sel = tl.load(t2e_ptr + tok * K + offs_k).to(tl.int32)
+            # gather scores at the selected experts: one [EP, K] masked sum
+            wsel = tl.sum(tl.where(offs_e[:, None] == sel[None, :], scores[:, None], 0.0), axis=0)
+            wsel = wsel / (tl.sum(wsel, axis=0) + 1e-20)
+        else:
+            choice = tl.where(emask, choice, neg_inf)
+            sel = tl.zeros([K], tl.int32)
+            wsel = tl.zeros([K], tl.float32)
+            for kk in range(K):
+                best = tl.argmax(choice, axis=0)  # first max index: ties -> lower expert
+                hit = offs_e == best
+                w_best = tl.sum(tl.where(hit, scores, 0.0), axis=0)
+                sel = tl.where(offs_k == kk, best + tl.zeros([K], tl.int32), sel)
+                wsel = tl.where(offs_k == kk, w_best + tl.zeros([K], tl.float32), wsel)
+                choice = tl.where(hit, neg_inf, choice)
+            if NORM_TOPK:
+                wsel = wsel / (tl.sum(wsel, axis=0) + 1e-20)
+        wsel = wsel * RSF
+        tl.store(ids_ptr + b * K + offs_k, sel)
+        tl.store(weights_ptr + b * K + offs_k, wsel)
+        task += P

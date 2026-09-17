@@ -51,6 +51,9 @@ TEMPLATE_NAMES = {
     # selection producing the i32 indirection table for #95/#96 via #94.
     "indexer_scores": "indexer_scores_task",
     "index_topk": "index_topk_task",
+    "moe_route": "moe_route_task",  # MoE decode ops (issue #98)
+    "moe_expert": "moe_expert_task",
+    "moe_combine": "moe_combine_task",
     "layernorm": "layernorm_task",
     "rms_norm": "rms_norm_task",
     "rope": "rope_task",

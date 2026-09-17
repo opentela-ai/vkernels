@@ -882,6 +882,137 @@ def lower_index_topk(op: Operator, graph: OperatorGraph) -> TaskFamily:
 
 
 # ---------------------------------------------------------------------------
+# MoE decode (issue #98): route ≺ experts ≺ combine via RAW on the routing
+# table and the partials buffer. Static task grid + runtime indirection:
+# the expert tasks' weight base is the routing table's expert id (#94 pattern
+# applied to a read-only weight pool).
+# ---------------------------------------------------------------------------
+
+
+def lower_moe_route(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    x, router_w, ids, weights = (graph.tensor(op.inputs[i]) for i in range(4))
+    b, h = x.shape
+    e, h_w = router_w.shape
+    k = ids.shape[1]
+    if h_w != h:
+        raise ValueError(f"moe_route {op.source_location!r}: contraction mismatch")
+    mode = op.attributes["mode"]
+    score_fn = op.attributes["score_fn"]
+    extra: list[str] = []
+    if mode == "hash":
+        extra = [op.inputs[4], op.inputs[5]]  # tid2eid, token_ids
+    elif score_fn == "sigmoid_noaux_tc":
+        extra = [op.inputs[4]]  # e_score_correction_bias
+    domain = TileDomain(((b, 1),))
+
+    def reads(coords):
+        regions = [
+            _tile_region(x, ((coords[0], coords[0] + 1), (0, h))),
+            _whole(router_w),
+        ]
+        for name in extra:
+            regions.append(_whole(graph.tensor(name)))
+        return tuple(regions)
+
+    def writes(coords):
+        r = coords[0]
+        return (
+            _tile_region(ids, ((r, r + 1), (0, k))),
+            _tile_region(weights, ((r, r + 1), (0, k))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_moe_route",
+        kind="moe_route",
+        op=op,
+        domain=domain,
+        inputs=(x.name, router_w.name, ids.name, weights.name, *extra),
+        outputs=(ids.name, weights.name),
+        params=dict(op.attributes),
+        threads=THREADS_PER_WORKER,
+        # Per-worker score scratch: one E-wide fp32 choice-score vector.
+        scratch_bytes=e * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_moe_expert(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    x, gate_up, down, ids = (graph.tensor(op.inputs[i]) for i in range(4))
+    partials = graph.tensor(op.outputs[0])
+    b, h = x.shape
+    e, two_i, h_w = gate_up.shape
+    inter = two_i // 2
+    k = ids.shape[1]
+    if h_w != h or down.shape != (e, h, inter):
+        raise ValueError(f"moe_expert {op.source_location!r}: expert stack shape mismatch")
+    # The static k·B grid: one task per (row, slot); the weight base is read
+    # from ids[b, slot] at run time (runtime indirection, #94 pattern).
+    domain = TileDomain(((b, 1), (k, 1)))
+
+    def reads(coords):
+        r, s = coords
+        return (
+            _tile_region(x, ((r, r + 1), (0, h))),
+            # Indirected weight pool: slots are runtime data — whole-pool
+            # declaration is the conservative sound choice (#94).
+            _whole(gate_up),
+            _whole(down),
+            _whole(ids),
+        )
+
+    def writes(coords):
+        r, s = coords
+        return (_tile_region(partials, ((r, r + 1), (s, s + 1), (0, h))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_moe_expert",
+        kind="moe_expert",
+        op=op,
+        domain=domain,
+        inputs=(x.name, gate_up.name, down.name, ids.name),
+        outputs=(partials.name,),
+        params=dict(op.attributes),
+        threads=THREADS_PER_WORKER,
+        # In-register gate/up rows: 2·inter fp32 values + the h-wide activation.
+        scratch_bytes=(two_i + h) * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_moe_combine(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    partials, weights = graph.tensor(op.inputs[0]), graph.tensor(op.inputs[1])
+    shared = graph.tensor(op.inputs[2]) if len(op.inputs) > 2 else None
+    y = graph.tensor(op.outputs[0])
+    b, k, h = partials.shape
+    domain = TileDomain(((b, 1),))
+
+    def reads(coords):
+        regions = [_whole(partials), _whole(weights)]
+        if shared is not None:
+            regions.append(_whole(shared))
+        return tuple(regions)
+
+    def writes(coords):
+        r = coords[0]
+        return (_tile_region(y, ((r, r + 1), (0, h))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_moe_combine",
+        kind="moe_combine",
+        op=op,
+        domain=domain,
+        inputs=(partials.name, weights.name) + ((shared.name,) if shared is not None else ()),
+        outputs=(y.name,),
+        params=dict(op.attributes),
+        threads=THREADS_PER_WORKER,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registry (§3.1)
 # ---------------------------------------------------------------------------
 
@@ -905,6 +1036,9 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "softmax": lower_softmax,
     "attention_values": lower_attention_values,
     "attention_values_paged": lower_attention_values_paged,
+    "moe_route": lower_moe_route,
+    "moe_expert": lower_moe_expert,
+    "moe_combine": lower_moe_combine,
 }
 
 LOWERINGS_VERSION = "0.1.0"
