@@ -1491,6 +1491,14 @@ def _t_gdn_heads_batched(
 # ``tests/python/test_moe_decode_compiler.py`` (triton is not importable in
 # the bare test environment — §15.1 division of labor).
 # ---------------------------------------------------------------------------
+# mHC hyper-connection mixing (issue #99): per-token data-dependent
+# pre/post/comb weights and stream collapse (pre), then the composed stream
+# update (post). Mirrors floe DeepseekV4HyperConnection /
+# Glm53HyperConnection exactly; all mixing math fp32 (Sinkhorn numerics
+# demand it), no tl.dot — the [mix, hc·C] fn projection is a per-row
+# K-reduction GEMV folded into the pre task, and the hc×hc Sinkhorn chain
+# is register-resident elementwise work.
+# ---------------------------------------------------------------------------
 
 
 @triton.jit
@@ -1534,6 +1542,103 @@ def _t_moe_expert(
         wd = tl.load(down_ptr + (e * H) * I + offs_h[:, None] * I + offs_i[None, :], cache_modifier=".cg").to(tl.float32)
         acc = tl.sum(wd * act[None, :], axis=1)
         tl.store(partials_ptr + (b * K + s) * H + offs_h, acc)
+def _t_mhc_pre(
+    worker: tl.int32,
+    P: tl.int32,
+    streams_ptr,
+    fn_ptr,
+    base_ptr,
+    scale_ptr,
+    hin_ptr,
+    post_ptr,
+    comb_ptr,
+    B: tl.constexpr,
+    HC: tl.constexpr,
+    C: tl.constexpr,
+    MIX: tl.constexpr,  # (2 + HC) * HC
+    EPS: tl.constexpr,
+    RMS_EPS: tl.constexpr,
+    ITERS: tl.constexpr,
+    MIXP: tl.constexpr,  # pow2 pad of MIX
+    HCP: tl.constexpr,  # pow2 pad of HC
+    BLOCK_K: tl.constexpr,
+):
+    """mhc_pre task body (issue #99): one task per batch row over the
+    [B, HC, C] stream stack. fp32 throughout: unweighted RMSNorm over the
+    flattened hc·C row, the folded [MIX, hc·C] fn GEMV (one K-reduction
+    per mix row), sigmoid pre/post gates, softmax + Sinkhorn-Knopp
+    alternate row/col normalization (eps inside every denominator, floe
+    DeepseekV4HyperConnection.forward verbatim) and the pre-weighted
+    stream collapse."""
+    HCK: tl.constexpr = HC * C
+    offs_m = tl.arange(0, MIXP)
+    offs_h = tl.arange(0, HCP)
+    offs_k = tl.arange(0, HCP)
+    m_mask = offs_m < MIX
+    h_mask = offs_h < HC
+    kj_mask = (offs_k[:, None] < HC) & (offs_h[None, :] < HC)
+    task = worker
+    while task < B:
+        b = task.to(tl.int64)
+        # pass 1: sqrsum over the flattened [HC, C] row (unweighted RMSNorm)
+        ss = 0.0
+        for k0 in range(0, HCK, BLOCK_K):
+            offs = k0 + tl.arange(0, BLOCK_K)
+            v = tl.load(streams_ptr + b * HCK + offs, mask=offs < HCK, other=0.0).to(tl.float32)
+            ss += tl.sum(v * v, axis=0)
+        rstd = 1.0 / tl.sqrt(ss / HCK + RMS_EPS)
+        # pass 2: the folded fn projection — logits[m] = <fn[m, :], flat>
+        # with flat = streams * rstd. NO projection bias: floe's F.linear
+        # carries none; base enters only inside the gates below.
+        logits = tl.zeros([MIXP], dtype=tl.float32)
+        for k0 in range(0, HCK, BLOCK_K):
+            offs = k0 + tl.arange(0, BLOCK_K)
+            kmask = offs < HCK
+            flat = tl.load(streams_ptr + b * HCK + offs, mask=kmask, other=0.0).to(tl.float32) * rstd
+            frows = tl.load(fn_ptr + offs_m[:, None] * HCK + offs[None, :],
+                            mask=m_mask[:, None] & kmask[None, :], other=0.0).to(tl.float32)
+            logits += tl.sum(frows * flat[None, :], axis=1)
+        # split [MIX] -> pre_w [HC] | post_w [HC] | comb_w [HC, HC]
+        pre_w = tl.sum(tl.where((offs_m[:, None] == offs_h[None, :]) & h_mask[None, :],
+                                logits[:, None], 0.0), axis=0)
+        post_w = tl.sum(tl.where((offs_m[:, None] == HC + offs_h[None, :]) & h_mask[None, :],
+                                 logits[:, None], 0.0), axis=0)
+        comb_rows = HC + offs_k[:, None] * HC + offs_h[None, :]
+        comb_w = tl.sum(tl.where(offs_m[:, None, None] == comb_rows[None, :, :],
+                                 logits[:, None, None], 0.0), axis=0)
+        pre_s = tl.load(scale_ptr).to(tl.float32)
+        post_s = tl.load(scale_ptr + 1).to(tl.float32)
+        comb_s = tl.load(scale_ptr + 2).to(tl.float32)
+        pre = 1.0 / (1.0 + tl.exp(-(pre_w * pre_s + tl.load(base_ptr + offs_h, mask=h_mask, other=0.0).to(tl.float32)))) + EPS
+        post = 2.0 / (1.0 + tl.exp(-(post_w * post_s + tl.load(base_ptr + HC + offs_h, mask=h_mask, other=0.0).to(tl.float32))))
+        comb_b = tl.load(base_ptr + 2 * HC + offs_k[:, None] * HC + offs_h[None, :],
+                         mask=kj_mask, other=0.0).to(tl.float32)
+        # softmax over j (rows), masked to the valid hc×hc block
+        cl = comb_w * comb_s + comb_b
+        cl = tl.where(kj_mask, cl, float("-inf"))
+        cm = tl.max(cl, axis=1)
+        ce = tl.exp(cl - cm[:, None])
+        ce = tl.where(kj_mask, ce, 0.0)
+        comb = ce / tl.sum(ce, axis=1)[:, None] + EPS
+        # Sinkhorn-Knopp: initial column normalization, then (ITERS−1)
+        # alternate row/col passes — eps inside every denominator (floe).
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+        for _ in tl.static_range(ITERS - 1):
+            comb = comb / (tl.sum(comb, axis=1)[:, None] + EPS)
+            comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+        comb = tl.where(kj_mask, comb, 0.0)
+        tl.store(post_ptr + b * HC + offs_h, post, mask=h_mask)
+        tl.store(comb_ptr + b * HC * HC + offs_k[:, None] * HC + offs_h[None, :], comb, mask=kj_mask)
+        # stream collapse: h_in[c] = Σ_h pre[h] · streams[b, h, c]
+        for c0 in range(0, C, BLOCK_K):
+            offs_c = c0 + tl.arange(0, BLOCK_K)
+            cmask = offs_c < C
+            acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+            for h in tl.static_range(HC):
+                ph = tl.sum(tl.where(offs_h == h, pre, 0.0), axis=0)
+                sv = tl.load(streams_ptr + b * HCK + h * C + offs_c, mask=cmask, other=0.0).to(tl.float32)
+                acc += ph * sv
+            tl.store(hin_ptr + b * C + offs_c, acc, mask=cmask)
         task += P
 
 
@@ -1710,4 +1815,41 @@ def _t_moe_route(
         wsel = wsel * RSF
         tl.store(ids_ptr + b * K + offs_k, sel)
         tl.store(weights_ptr + b * K + offs_k, wsel)
+def _t_mhc_post(
+    worker: tl.int32,
+    P: tl.int32,
+    streams_ptr,
+    body_out_ptr,
+    post_ptr,
+    comb_ptr,
+    out_ptr,
+    B: tl.constexpr,
+    HC: tl.constexpr,
+    C: tl.constexpr,
+    HCP: tl.constexpr,  # pow2 pad of HC
+    BLOCK_C: tl.constexpr,
+):
+    """mhc_post task body (issue #99): one task per (batch, stream j);
+    streams'[j] = post[j]·body_out + Σ_k comb[k, j]·streams[k] (floe
+    _mhc_compose), fp32 compose arithmetic, one output stream row per task."""
+    offs_k = tl.arange(0, HCP)
+    k_mask = offs_k < HC
+    task = worker
+    while task < B * HC:
+        b = (task // HC).to(tl.int64)
+        j = task % HC
+        pj = tl.load(post_ptr + b * HC + j).to(tl.float32)
+        # comb column j: comb[k, j] weights source stream k
+        ck = tl.load(comb_ptr + b * HC * HC + offs_k * HC + j, mask=k_mask, other=0.0).to(tl.float32)
+        for c0 in range(0, C, BLOCK_C):
+            offs_c = c0 + tl.arange(0, BLOCK_C)
+            cmask = offs_c < C
+            acc = tl.zeros([BLOCK_C], dtype=tl.float32)
+            for k in tl.static_range(HC):
+                w = tl.sum(tl.where(offs_k == k, ck, 0.0), axis=0)
+                sv = tl.load(streams_ptr + b * HC * C + k * C + offs_c, mask=cmask, other=0.0).to(tl.float32)
+                acc += w * sv
+            bo = tl.load(body_out_ptr + b * C + offs_c, mask=cmask, other=0.0).to(tl.float32)
+            acc = pj * bo + acc
+            tl.store(out_ptr + b * HC * C + j * C + offs_c, acc, mask=cmask)
         task += P
