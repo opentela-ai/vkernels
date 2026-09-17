@@ -63,7 +63,7 @@ class DeepseekV4Config:
 
     rms_eps: float = 1e-6
     max_positions: int = 8
-    cache_capacity: int = 8  # S — per-row latent slots (paged, #94)
+    cache_capacity: int = 9  # S — per-row latent slots (paged, #94; slot 0 reserved)
 
     def validate(self) -> None:
         if self.batch < 1 or self.layers < 1:
@@ -76,8 +76,8 @@ class DeepseekV4Config:
             raise ValueError("compress_r must be a multiple of compress_m")
         if self.window < 1 or self.index_k < 1:
             raise ValueError("window and index_k must be >= 1")
-        if self.cache_capacity < self.max_positions:
-            raise ValueError("cache_capacity must cover max_positions")
+        if self.cache_capacity <= self.max_positions:
+            raise ValueError("cache_capacity must EXCEED max_positions (slot 0 is the reserved null page)")
         if self.moe_top_k > self.n_experts:
             raise ValueError("moe_top_k exceeds n_experts")
         if self.heads * self.latent_dim % self.heads:
@@ -119,7 +119,7 @@ class LayerWeights:
     attn_ln_gamma: np.ndarray  # [C]
     q_proj_w: np.ndarray  # [C, H*D]
     kv_a_w: np.ndarray  # [C, D]  (single shared latent head, MQA)
-    o_proj_w: np.ndarray  # [H*(C//H), H*D] block-diagonal (grouped, #95)
+    o_proj_w: np.ndarray  # [H*D, H*(C//H)] block-diagonal, [Cin, Cout] (grouped, #95)
     # DSA indexer
     idx_q_w: np.ndarray  # [C, H_i*D]
     idx_mix_w: np.ndarray  # [C, H_i]  (1/sqrt(H_i) folded in)
@@ -130,14 +130,16 @@ class LayerWeights:
     router_w: np.ndarray  # [E, C]
     expert_gate_up: np.ndarray  # [E, 2I, C] fp32 stack
     expert_down: np.ndarray  # [E, C, I] fp32 stack
-    shared_gate_up: np.ndarray  # [2I_s, C]  (same layout as the expert stack)
-    shared_down: np.ndarray  # [C, I_s]
+    shared_gate_up: np.ndarray  # [C, 2I_s]  ([Cin, Cout] — plain linear convention)
+    shared_down: np.ndarray  # [I_s, C]
 
 
 @dataclass
 class DeepseekV4Weights:
     token_emb: np.ndarray  # [V, hc*C] — embedding writes the stream stack
     final_gamma: np.ndarray  # [hc*C]
+    rope_cos: np.ndarray  # [max_positions, D/2] — interleaved query tables
+    rope_sin: np.ndarray  # [max_positions, D/2]
     layers: list  # [LayerWeights] * layers
 
 
@@ -166,7 +168,7 @@ def random_deepseek_weights(config: DeepseekV4Config, seed: int = 0) -> Deepseek
                 # block-diagonal grouped o-proj: only w[g*N:(g+1)*N, g*K:(g+1)*K]
                 # is ever read; fill the off-blocks too (they must be IGNORED —
                 # the grouped-linear contract is exercised by the numerics).
-                o_proj_w=_rng_weights(rng, H * (C // H), H * D),
+                o_proj_w=_rng_weights(rng, H * D, H * (C // H)),
                 idx_q_w=_rng_weights(rng, C, HI * D),
                 idx_mix_w=_rng_weights(rng, C, HI) * (HI**-0.5),
                 compressor_rms_w=(1.0 + 0.05 * rng.standard_normal(D)).astype(np.float32),
@@ -175,13 +177,16 @@ def random_deepseek_weights(config: DeepseekV4Config, seed: int = 0) -> Deepseek
                 router_w=_rng_weights(rng, cfg.n_experts, C),
                 expert_gate_up=_rng_weights(rng, cfg.n_experts, 2 * cfg.moe_intermediate, C),
                 expert_down=_rng_weights(rng, cfg.n_experts, C, cfg.moe_intermediate),
-                shared_gate_up=_rng_weights(rng, 2 * cfg.shared_intermediate, C),
-                shared_down=_rng_weights(rng, C, cfg.shared_intermediate),
+                shared_gate_up=_rng_weights(rng, C, 2 * cfg.shared_intermediate),
+                shared_down=_rng_weights(rng, cfg.shared_intermediate, C),
             )
         )
+    idx = np.arange(cfg.max_positions)[:, None] * 0.1 + np.arange(cfg.latent_dim // 2)[None, :] * 0.3
     return DeepseekV4Weights(
         token_emb=_rng_weights(rng, cfg.vocab, cfg.hc * C),
         final_gamma=(1.0 + 0.05 * rng.standard_normal(cfg.hc * C)).astype(np.float32),
+        rope_cos=np.cos(idx).astype(np.float32),
+        rope_sin=np.sin(idx).astype(np.float32),
         layers=layers,
     )
 
@@ -219,17 +224,20 @@ def initial_state(config: DeepseekV4Config, seed: int = 1) -> DeepseekV4DecodeSt
     B, S, L, D = cfg.batch, cfg.cache_capacity, cfg.layers, cfg.latent_dim
     # positions (5, 2): ragged rows; positions small enough that some rows sit
     # on a compression boundary and others do not.
-    row_positions = np.array([5, 2][:B], dtype=np.int32)
+    row_positions = np.array([5, 7][:B], dtype=np.int32)
     if B > 2:
         row_positions = np.concatenate([row_positions, rng.integers(0, 6, size=B - 2).astype(np.int32)])
     ids = rng.integers(0, cfg.vocab, size=B).astype(np.int32)
-    # #94 non-identity per-row slot permutation (slot 0 reserved as null)
+    # #94 non-identity per-row slot permutation over the LIVE slots
+    # 1..S-1 (slot 0 is the reserved null/sink page, never written)
     local = np.zeros((B, S), dtype=np.int32)
     glob = np.zeros((B, S), dtype=np.int32)
     for b in range(B):
-        perm = rng.permutation(S)  # includes the reserved slot 0
-        local[b] = perm
-        glob[b] = b * S + perm
+        # positions 0..max_positions-1 map into live slots 1..max_positions;
+        # the tail of the table stays 0 (never dereferenced beyond p)
+        perm = rng.permutation(S - 1) + 1  # live slots only
+        local[b, : S - 1] = perm
+        glob[b, : S - 1] = b * S + perm
     carved = lambda *shape: np.full(shape, np.nan, dtype=np.float32)  # noqa: E731
     st = DeepseekV4DecodeState(
         row_positions=row_positions,
@@ -277,7 +285,7 @@ def _seed_history(config: DeepseekV4Config, st: DeepseekV4DecodeState, rng: np.r
                 for l in range(L):
                     st.series_state[b, l, 0] = (nxt // R) % 2
                     st.series_state[b, l, 1] = nxt % R
-        st.valid_counts[b] = p // m  # emissions at t = m-1, 2m-1, … < p
+        st.valid_counts[b] = (p + 1) // m  # emissions through this step's boundary (if p % m == m-1)
         # window = the row's last m latents (t = p-m .. p-1); t < 0 rows zero
         win = np.zeros((m, D), dtype=np.float32)
         for i, t in enumerate(range(p - m, p)):
@@ -337,119 +345,234 @@ def _silu(x: np.ndarray) -> np.ndarray:
 def deepseek_reference_decode_step(
     W: DeepseekV4Weights, st: DeepseekV4DecodeState, cfg: DeepseekV4Config
 ) -> tuple[np.ndarray, DeepseekV4DecodeState]:
-    """One DeepSeek-V4 decode step in fp64 straight-line numpy.
+    """One DeepSeek-V4 decode step — the storage-precision oracle of record.
 
-    Returns (logits [B, V], post-step state). Transcribes the landed op
-    contracts in program order: per layer — mhc_pre, compressor emission,
-    indexer scores + top-k, latent paged append, MLA scores/values +
-    conjugate rope + grouped o-proj, mhc compose; then the MoE sublayer;
-    finally the flattened-stream head.
+    Per-op fp64 arithmetic with **fp32 rounding at every op boundary**,
+    exactly as the reference executor stores each op's output into its
+    F32 workspace buffer (there is no F64 tensor dtype in the IR). The
+    compiled whole-step graph and this mirror are two readings of the same
+    landed op contracts; numerics disagreements localize the bug.
+
+    Returns (logits [B, V], post-step state).
     """
-    B, C, D, H = cfg.batch, cfg.hidden, cfg.latent_dim, cfg.heads
+    B, C, D = cfg.batch, cfg.hidden, cfg.latent_dim
     L, S = cfg.layers, cfg.cache_capacity
     m, R = cfg.compress_m, cfg.entries_per_series
     M = 2 * R
     HI, K = cfg.index_heads, cfg.index_k
+    H = cfg.heads
+    f32 = lambda a: np.asarray(a, dtype=np.float32)  # noqa: E731 — op-boundary store
 
-    # pools we mutate (fp64 working copies)
-    lat_k = st.latent_k.astype(np.float64).copy()
-    lat_v = st.latent_v.astype(np.float64).copy()
-    entry = st.entry_pool.astype(np.float64).copy()
+    lat_k = st.latent_k.copy()  # fp32 pools, mutated in place semantics
+    lat_v = st.latent_v.copy()
+    entry = st.entry_pool.copy()
     series = st.series_state.copy()
 
     logits_out = None
     for b in range(B):
         p = int(st.row_positions[b])
-        cos_q = np.cos(np.arange(D // 2) * 0.3 + p * 0.1).astype(np.float64)
-        sin_q = np.sin(np.arange(D // 2) * 0.3 + p * 0.1).astype(np.float64)
+        cos_q = W.rope_cos[p].astype(np.float64)  # [D/2] pair-indexed
+        sin_q = W.rope_sin[p].astype(np.float64)
+        vc = int(st.valid_counts[b])
 
-        # embedding → initial stream stack [hc, C]
-        streams = W.token_emb[st.ids[b]].astype(np.float64).reshape(cfg.hc, C)
+        # embedding (no positional row) → initial stream stack [hc, C]
+        emb = f32(W.token_emb[int(st.ids[b])])
+        streams = emb.reshape(cfg.hc, C)
 
         for l in range(L):
             lw = W.layers[l]
-            # ---- mHC pre (attention sublayer) ----
-            streams, h_in, post_a, comb_a = _mhc_pre(streams, lw.mhc_attn, cfg)
-            # ---- compressor emission (boundary rows only, #96) ----
+            # ================= attention sublayer =================
+            flat = streams.reshape(-1).astype(np.float64)
+            flat_n = flat / np.sqrt(np.mean(flat * flat) + cfg.mhc_rms_eps)
+            lg = lw.mhc_attn.fn.astype(np.float64) @ flat_n  # no bias on projection
+            pre_w, post_w, comb_w = lg[: cfg.hc], lg[cfg.hc : 2 * cfg.hc], lg[2 * cfg.hc :].reshape(cfg.hc, cfg.hc)
+            base = lw.mhc_attn.base.astype(np.float64)
+            sc = lw.mhc_attn.scale.astype(np.float64)
+            pre = 1.0 / (1.0 + np.exp(-(pre_w * sc[0] + base[: cfg.hc]))) + cfg.mhc_eps
+            post = 2.0 / (1.0 + np.exp(-(post_w * sc[1] + base[cfg.hc : 2 * cfg.hc])))
+            cl = comb_w * sc[2] + base[2 * cfg.hc :].reshape(cfg.hc, cfg.hc)
+            cl = cl - cl.max(axis=-1, keepdims=True)
+            comb = np.exp(cl) / np.exp(cl).sum(axis=-1, keepdims=True) + cfg.mhc_eps
+            comb = comb / (comb.sum(axis=-2, keepdims=True) + cfg.mhc_eps)
+            for _ in range(cfg.mhc_iters - 1):
+                comb = comb / (comb.sum(axis=-1, keepdims=True) + cfg.mhc_eps)
+                comb = comb / (comb.sum(axis=-2, keepdims=True) + cfg.mhc_eps)
+            h_in = f32((pre[:, None] * streams.astype(np.float64)).sum(axis=0))
+            post_a, comb_a = f32(post), f32(comb)
+
+            n1 = f32(
+                h_in.astype(np.float64)
+                / np.sqrt(np.mean(h_in.astype(np.float64) ** 2) + cfg.rms_eps)
+                * lw.attn_ln_gamma.astype(np.float64)
+            )
+
+            # --- DSA compressor emission (#96): boundary rows only ---
             if p % m == m - 1:
-                e = _compressor_emit(st.comp_window[b], st.comp_gates[b], lw.compressor_rms_w, st.comp_cos[b], st.comp_sin[b], cfg)
-                slot_active = int(series[b, l, 0])
-                off = int(series[b, l, 1])
-                entry[b, l, slot_active, off, :] = e
-                nxt = (slot_active * R + off) + 1
-                series[b, l, 0] = (nxt // R) % 2
-                series[b, l, 1] = nxt % R
-            # ---- latent paged append (current token, #94) ----
-            n1 = _rms(h_in, lw.attn_ln_gamma, cfg.rms_eps)
-            lat = n1 @ lw.kv_a_w.astype(np.float64)  # [D]
-            slot = int(st.slot_table_global[b, p])
-            lat_k[l, slot, 0, :] = lat
-            lat_v[l, slot, 0, :] = lat
-            kv_rows = lat_k[l].reshape(B, S, D)[b]  # row-local [S, D]
-            # ---- indexer scores over this layer's entries (#97) ----
-            entries = entry[b, l].reshape(M, D)  # flat Ca|Cb view
-            q_idx = (n1 @ lw.idx_q_w.astype(np.float64)).reshape(HI, D)
-            mix = n1 @ lw.idx_mix_w.astype(np.float64)  # [HI]
-            hscores = np.maximum(q_idx @ entries.T, 0.0) * (D**-0.5)  # [HI, M]
-            idx_scores = hscores.T @ mix  # [M]
-            vc = int(st.valid_counts[b])
-            # deterministic top-k over the valid prefix (NaN-excluded), ties → lowest j
-            cand = [j for j in range(min(vc, M)) if np.isfinite(idx_scores[j])]
-            order = sorted(cand, key=lambda j: (-idx_scores[j], j))
-            sel = order[:K]
-            comp_idx = np.full(K, -1, dtype=np.int64)
-            comp_idx[: len(sel)] = sel
-            valid_scores = np.array([idx_scores[j] for j in cand]) if cand else np.zeros(1)
-            norm = np.linalg.norm(valid_scores)
-            block_bias = np.zeros(K)
-            for i, j in enumerate(sel):
-                block_bias[i] = idx_scores[j] / norm if norm > 0 else 0.0
-            # ---- MLA scores + softmax + sink (#95) ----
-            q = (n1 @ lw.q_proj_w.astype(np.float64)).reshape(H, D)
-            q_rot = _rope_interleaved(q, cos_q, sin_q)
+                g = st.comp_gates[b].astype(np.float64)
+                ex = np.exp(g - g.max())
+                wgt = ex / ex.sum()
+                e = (wgt[:, None] * st.comp_window[b].astype(np.float64)).sum(axis=0)
+                e = e * np.reciprocal(np.sqrt((e * e).mean() + cfg.compressor_eps)) * lw.compressor_rms_w.astype(np.float64)
+                ch, sh = st.comp_cos[b].astype(np.float64), st.comp_sin[b].astype(np.float64)
+                half = e.shape[0] // 2
+                e_rot = np.concatenate([e[:half] * ch - e[half:] * sh, e[half:] * ch + e[:half] * sh])
+                slot, cb = int(series[b, l, 0]), int(series[b, l, 1])
+                entry[b, l, slot, cb, :] = f32(e_rot)
+                cb += 1
+                if cb == R:
+                    series[b, l, 0], series[b, l, 1] = 1 - slot, 0
+                else:
+                    series[b, l, 1] = cb
+            entries = entry[b, l].reshape(M, D)  # flat slot-major view
+
+            # --- paged latent append (#94): the current token's latent row ---
+            lat = f32(n1.astype(np.float64) @ lw.kv_a_w.astype(np.float64))  # [D]
+            slot_p = int(st.slot_table_global[b, p])
+            lat_k[l, slot_p, 0, :] = lat
+            lat_v[l, slot_p, 0, :] = lat
+            kv_rows_k = lat_k[l].reshape(B, S, D)[b]  # row-local [S, D]
+            kv_rows_v = lat_v[l].reshape(B, S, D)[b]
+
+            # --- Lightning indexer (#97) ---
+            q_idx = f32(n1.astype(np.float64) @ lw.idx_q_w.astype(np.float64)).reshape(HI, D)
+            mix = f32(n1.astype(np.float64) @ lw.idx_mix_w.astype(np.float64))  # [HI]
+            hs = np.maximum(q_idx.astype(np.float64) @ entries.astype(np.float64).T, 0.0) * (D**-0.5)
+            idx_scores = f32((hs * mix.astype(np.float64)[:, None]).sum(axis=0))  # [M]
+            # rank-by-comparison top-k (descending, ties → lowest j), NaN excluded
+            row = idx_scores.astype(np.float64)
+            cand = np.array([j for j in range(min(vc, M)) if np.isfinite(row[j])], dtype=int)
+            rank = {j: i for i, j in enumerate(sorted(cand, key=lambda j: (-row[j], j)))}
+            comp_idx = np.full(K, -1, dtype=np.int32)
+            block_bias = np.zeros(K, dtype=np.float32)
+            valid_fin = row[[j for j in range(min(vc, M)) if np.isfinite(row[j])]] if vc > 0 else np.zeros(0)
+            norm = np.sqrt((valid_fin**2).sum()) if valid_fin.size else 0.0
+            for j, rk in rank.items():
+                if rk < K:
+                    comp_idx[rk] = j
+                    if norm > 0:
+                        block_bias[rk] = f32(row[j] / norm)
+            sel_bias = block_bias.astype(np.float64)
+
+            # --- MLA (#95) ---
+            q = f32(n1.astype(np.float64) @ lw.q_proj_w.astype(np.float64)).reshape(H, D)
+            q_rot = np.empty_like(q, dtype=np.float64)
+            for h in range(H):
+                xe, xo = q[h][0::2], q[h][1::2]
+                q_rot[h][0::2] = xe * cos_q - xo * sin_q
+                q_rot[h][1::2] = xo * cos_q + xe * sin_q
+            q_rot = f32(q_rot)
             width = cfg.window + K + 1
-            logits = np.full((H, width), -np.inf)
+            logits = np.full((H, width), -np.inf, dtype=np.float64)
+            t_lo = max(0, p - cfg.window + 1)
             for i in range(cfg.window):
                 t = p - cfg.window + 1 + i
-                if 0 <= t <= p:
-                    kslot = int(st.slot_table_local[b, t])
-                    logits[:, i] = cfg.attention_scale * (q_rot * kv_rows[kslot]).sum(axis=1)
+                if t_lo <= t <= p:
+                    krow = kv_rows_k[int(st.slot_table_local[b, t])].astype(np.float64)
+                    logits[:, i] = (q_rot.astype(np.float64) * krow).sum(axis=1) * cfg.attention_scale
             for j in range(K):
                 if comp_idx[j] >= 0:
                     logits[:, cfg.window + j] = (
-                        cfg.attention_scale * (q_rot * entries[comp_idx[j]]).sum(axis=1) + block_bias[j]
+                        (q_rot.astype(np.float64) * entries[comp_idx[j]].astype(np.float64)).sum(axis=1)
+                        * cfg.attention_scale
+                        + sel_bias[j]
                     )
-            logits[:, -1] = lw.mla_sink  # sink column is ALWAYS valid [H]
-            valid = np.isfinite(logits)
-            masked = np.where(valid, logits, -np.inf)
-            mx = masked.max(axis=1, keepdims=True)  # finite: the sink is always valid
-            e = np.where(valid, np.exp(masked - mx), 0.0)
-            probs = e / e.sum(axis=1, keepdims=True)  # invalid candidates exact 0.0
-            # ---- MLA values: sink contributes NO value (#95) ----
-            ctx = np.zeros((H, D))
+            logits[:, -1] = lw.mla_sink.astype(np.float64)  # sink ALWAYS valid
+            mx = logits.max(axis=1, keepdims=True)
+            e = np.exp(logits - mx)
+            e[~np.isfinite(logits)] = 0.0  # invalid slots exact zero
+            probs = f32(e / e.sum(axis=1, keepdims=True))
+
+            ctx = np.zeros((H, D), dtype=np.float64)
             for i in range(cfg.window):
                 t = p - cfg.window + 1 + i
-                if 0 <= t <= p:
-                    vslot = int(st.slot_table_local[b, t])
-                    ctx += probs[:, i, None] * lat_v[l].reshape(B, S, D)[b][vslot]
+                if t_lo <= t <= p:
+                    vrow = kv_rows_v[int(st.slot_table_local[b, t])].astype(np.float64)
+                    ctx += probs[:, i].astype(np.float64)[:, None] * vrow
             for j in range(K):
                 if comp_idx[j] >= 0:
-                    ctx += probs[:, cfg.window + j, None] * entries[comp_idx[j]]
-            # ---- conjugate rope (inverse of the q rotation) + grouped o-proj ----
-            ctx_c = _rope_interleaved_inverse(ctx, cos_q, sin_q)
-            flat = ctx_c.reshape(H * D)
-            attn_out = _grouped_linear(flat, lw.o_proj_w.astype(np.float64), H)
-            # ---- mHC compose (attention sublayer) ----
-            streams = _mhc_post(streams, attn_out, (post_a, comb_a), cfg)
-            # ---- MoE sublayer: second mHC pre pair on the updated streams ----
-            streams, h_in2, post_m, comb_m = _mhc_pre(streams, lw.mhc_moe, cfg)
-            n2 = _rms(h_in2, lw.moe_ln_gamma, cfg.rms_eps)
-            moe_out = _moe_block(n2, lw, cfg)
-            streams = _mhc_post(streams, moe_out, (post_m, comb_m), cfg)
-        # ---- head: flattened streams → rms → tied logits ----
-        flat = streams.reshape(cfg.hc * C)
-        n = _rms(flat, W.final_gamma, cfg.rms_eps)
-        row_logits = n @ W.token_emb.astype(np.float64).T
+                    ctx += probs[:, cfg.window + j].astype(np.float64)[:, None] * entries[comp_idx[j]].astype(np.float64)
+            ctx = f32(ctx)
+            # conjugate rope: sin NEGATED (inverse of the q rotation)
+            ctx_c = np.empty_like(ctx)
+            for h in range(H):
+                xe, xo = ctx[h][0::2], ctx[h][1::2]
+                ctx_c[h][0::2] = xe * cos_q + xo * sin_q
+                ctx_c[h][1::2] = xo * cos_q - xe * sin_q
+            ctx_c = f32(ctx_c)
+            # grouped o-proj: block-diagonal [Cin, Cout] = [H*D, H*(C//H)]
+            xf = ctx_c.reshape(H * D).astype(np.float64)
+            ow = lw.o_proj_w.astype(np.float64)
+            Kg, Ng = ow.shape[0] // H, ow.shape[1] // H
+            attn = np.zeros(H * Ng, dtype=np.float64)
+            for h in range(H):
+                attn[h * Ng : (h + 1) * Ng] = xf[h * Kg : (h + 1) * Kg] @ ow[h * Kg : (h + 1) * Kg, h * Ng : (h + 1) * Ng]
+            attn = f32(attn)
+            # mhc compose (attention sublayer)
+            streams = np.empty_like(streams)
+            for j in range(cfg.hc):
+                acc = (comb_a[:, j].astype(np.float64)[:, None] * streams.astype(np.float64)).sum(axis=0)
+                acc = acc + float(post_a[j]) * attn.astype(np.float64)
+                streams[j] = f32(acc)
+
+            # ================= MoE sublayer =================
+            flat = streams.reshape(-1).astype(np.float64)
+            flat_n = flat / np.sqrt(np.mean(flat * flat) + cfg.mhc_rms_eps)
+            lg = lw.mhc_moe.fn.astype(np.float64) @ flat_n
+            pre_w, post_w, comb_w = lg[: cfg.hc], lg[cfg.hc : 2 * cfg.hc], lg[2 * cfg.hc :].reshape(cfg.hc, cfg.hc)
+            base = lw.mhc_moe.base.astype(np.float64)
+            sc = lw.mhc_moe.scale.astype(np.float64)
+            pre = 1.0 / (1.0 + np.exp(-(pre_w * sc[0] + base[: cfg.hc]))) + cfg.mhc_eps
+            post = 2.0 / (1.0 + np.exp(-(post_w * sc[1] + base[cfg.hc : 2 * cfg.hc])))
+            cl = comb_w * sc[2] + base[2 * cfg.hc :].reshape(cfg.hc, cfg.hc)
+            cl = cl - cl.max(axis=-1, keepdims=True)
+            comb = np.exp(cl) / np.exp(cl).sum(axis=-1, keepdims=True) + cfg.mhc_eps
+            comb = comb / (comb.sum(axis=-2, keepdims=True) + cfg.mhc_eps)
+            for _ in range(cfg.mhc_iters - 1):
+                comb = comb / (comb.sum(axis=-1, keepdims=True) + cfg.mhc_eps)
+                comb = comb / (comb.sum(axis=-2, keepdims=True) + cfg.mhc_eps)
+            h_in2 = f32((pre[:, None] * streams.astype(np.float64)).sum(axis=0))
+            post_m, comb_m = f32(post), f32(comb)
+
+            n2 = f32(
+                h_in2.astype(np.float64)
+                / np.sqrt(np.mean(h_in2.astype(np.float64) ** 2) + cfg.rms_eps)
+                * lw.moe_ln_gamma.astype(np.float64)
+            )
+            # router: sqrt(softplus(l)) stable, global top-k, unconditional renorm
+            lgr = lw.router_w.astype(np.float64) @ n2.astype(np.float64)
+            scores = np.sqrt(np.logaddexp(0.0, lgr))
+            order = np.argsort(-scores, kind="stable")
+            sel = order[: cfg.moe_top_k]
+            wsel = scores[sel]
+            wsel = wsel / (wsel.sum() + 1e-20) * cfg.routed_scaling_factor
+            partials = np.zeros((cfg.moe_top_k, C), dtype=np.float64)
+            for i, e_idx in enumerate(sel):
+                gu = lw.expert_gate_up[e_idx].astype(np.float64) @ n2.astype(np.float64)
+                g, u = gu[: cfg.moe_intermediate], gu[cfg.moe_intermediate :]
+                act = g / (1.0 + np.exp(-g)) * u
+                partials[i] = lw.expert_down[e_idx].astype(np.float64) @ act
+            partials = f32(partials)
+            r_w = f32(wsel)
+            acc = np.zeros(C, dtype=np.float64)
+            for i in range(cfg.moe_top_k):  # slot order
+                acc += r_w[i].astype(np.float64) * partials[i].astype(np.float64)
+            sgu = f32(n2.astype(np.float64) @ lw.shared_gate_up.astype(np.float64))
+            sg = sgu[: cfg.shared_intermediate].astype(np.float64)
+            su = sgu[cfg.shared_intermediate :].astype(np.float64)
+            shared = f32((sg / (1.0 + np.exp(-sg)) * su) @ lw.shared_down.astype(np.float64))
+            moe = f32(acc + shared.astype(np.float64))
+            # mhc compose (MoE sublayer)
+            new_streams = np.empty_like(streams)
+            for j in range(cfg.hc):
+                accc = (comb_m[:, j].astype(np.float64)[:, None] * streams.astype(np.float64)).sum(axis=0)
+                accc = accc + float(post_m[j]) * moe.astype(np.float64)
+                new_streams[j] = f32(accc)
+            streams = new_streams
+
+        # ---- head: flattened streams → RMSNorm → tied logits ----
+        flat = streams.reshape(-1).astype(np.float64)
+        n = f32(flat / np.sqrt(np.mean(flat * flat) + cfg.rms_eps) * W.final_gamma.astype(np.float64))
+        row_logits = f32(n.astype(np.float64) @ W.token_emb.astype(np.float64).T)
         logits_out = row_logits if logits_out is None else np.vstack([logits_out, row_logits])
 
     st_out = DeepseekV4DecodeState(
@@ -457,9 +580,9 @@ def deepseek_reference_decode_step(
         ids=st.ids,
         slot_table_global=st.slot_table_global,
         slot_table_local=st.slot_table_local,
-        latent_k=lat_k.astype(np.float32),
-        latent_v=lat_v.astype(np.float32),
-        entry_pool=entry.astype(np.float32),
+        latent_k=lat_k,
+        latent_v=lat_v,
+        entry_pool=entry,
         series_state=series,
         comp_window=st.comp_window,
         comp_gates=st.comp_gates,
@@ -468,83 +591,3 @@ def deepseek_reference_decode_step(
         valid_counts=st.valid_counts,
     )
     return logits_out, st_out
-
-
-# ---------------------------------------------------------------------------
-# Mirror internals (mHC / MoE / compressor) — transcriptions of the landed
-# #96/#98/#99 contracts.
-# ---------------------------------------------------------------------------
-
-
-def _sinkhorn(comb: np.ndarray, iters: int, eps: float) -> np.ndarray:
-    c = comb / (comb.sum(axis=0, keepdims=True) + eps)
-    for _ in range(iters - 1):
-        c = c / (c.sum(axis=1, keepdims=True) + eps)
-        c = c / (c.sum(axis=0, keepdims=True) + eps)
-    return c
-
-
-def _mhc_pre(streams: np.ndarray, w: MHCWeights, cfg: DeepseekV4Config):
-    """#99 mhc_pre in fp64. Returns (streams_unchanged, h_in, post, comb)."""
-    hc, C = cfg.hc, cfg.hidden
-    flat = streams.reshape(hc * C)
-    flat_n = flat / np.sqrt(np.mean(flat * flat) + cfg.mhc_rms_eps)
-    lg = w.fn.astype(np.float64) @ flat_n + w.base.astype(np.float64)
-    pre_w, post_w, comb_w = lg[:hc], lg[hc : 2 * hc], lg[2 * hc :].reshape(hc, hc)
-    pre = 1.0 / (1.0 + np.exp(-(pre_w * w.scale[0]))) + cfg.mhc_eps
-    post = 2.0 / (1.0 + np.exp(-(post_w * w.scale[1])))
-    comb = _softmax((comb_w * w.scale[2]).reshape(hc, hc)) + cfg.mhc_eps
-    comb = _sinkhorn(comb, cfg.mhc_iters, cfg.mhc_eps)
-    h_in = (pre[:, None] * streams).sum(axis=0)
-    return streams, h_in, post, comb
-
-
-def _mhc_post(streams: np.ndarray, body_out: np.ndarray, gates, cfg: DeepseekV4Config) -> np.ndarray:
-    """#99 mhc_post: streams'[j] = post[j]·body_out + Σ_k comb[k, j]·streams[k]."""
-    post, comb = gates
-    hc, C = cfg.hc, cfg.hidden
-    out = np.zeros((hc, C))
-    for j in range(hc):
-        out[j] = post[j] * body_out + (comb[:, j, None] * streams).sum(axis=0)
-    return out
-
-
-def _compressor_emit(window, gates, rms_w, cos_row, sin_row, cfg) -> np.ndarray:
-    """#96 emission: w=softmax(gates); e=Σ w_t·window_t; rms; rotate_half."""
-    g = np.asarray(gates, dtype=np.float64)
-    w = _softmax(g)
-    e = (w[:, None] * np.asarray(window, dtype=np.float64)).sum(axis=0)
-    e = e / np.sqrt(np.mean(e * e) + cfg.compressor_eps) * np.asarray(rms_w, dtype=np.float64)
-    return _rotate_half(e, np.asarray(cos_row, dtype=np.float64), np.asarray(sin_row, dtype=np.float64))
-
-
-def _grouped_linear(x: np.ndarray, w: np.ndarray, H: int) -> np.ndarray:
-    """#95 grouped-linear: block-diagonal per-head projection (fp64)."""
-    N, K = w.shape[0] // H, w.shape[1] // H
-    y = np.zeros(N * H)
-    for h in range(H):
-        y[h * N : (h + 1) * N] = w[h * N : (h + 1) * N, h * K : (h + 1) * K] @ x[h * K : (h + 1) * K]
-    return y
-
-
-def _moe_block(x: np.ndarray, lw: LayerWeights, cfg: DeepseekV4Config) -> np.ndarray:
-    """#98 router (sqrtsoftplus) + indirected expert FFN + combine (+ shared)."""
-    E, k, I = cfg.n_experts, cfg.moe_top_k, cfg.moe_intermediate
-    lg = x @ lw.router_w.astype(np.float64).T  # [E]
-    sp = np.log1p(np.exp(lg))  # softplus
-    scores = np.sqrt(sp)
-    order = sorted(range(E), key=lambda e: (-scores[e], e))
-    sel = order[:k]
-    w = scores[sel]
-    w = w / (w.sum() + 1e-20) * cfg.routed_scaling_factor
-    C = cfg.hidden
-    partials = np.zeros((k, C))
-    for i, e in enumerate(sel):
-        gu = lw.expert_gate_up[e].astype(np.float64) @ x  # [2I]
-        g, u = gu[:I], gu[I:]
-        act = _silu(g) * u
-        partials[i] = lw.expert_down[e].astype(np.float64) @ act
-    y = (w[:, None] * partials).sum(axis=0)
-    gu = lw.shared_gate_up.astype(np.float64) @ x
-    y += lw.shared_down.astype(np.float64) @ (_silu(gu[: cfg.shared_intermediate]) * gu[cfg.shared_intermediate :])
-    return y

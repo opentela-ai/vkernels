@@ -943,7 +943,7 @@ class RecordingBackend:
             },
         )
         pool_post = self.graph.add_tensor(
-            f"entry_pool_v{self.graph.storage_versions[entry_pool.value.storage_id]}",
+            f"entry_pool_s{entry_pool.value.storage_id}_v{self.graph.storage_versions[entry_pool.value.storage_id]}",
             entry_pool.value.shape,
             entry_pool.value.dtype,
             storage_id=entry_pool.value.storage_id,
@@ -952,7 +952,7 @@ class RecordingBackend:
             valid_length=valid,
         )
         state_post = self.graph.add_tensor(
-            f"series_state_v{self.graph.storage_versions[series_state.value.storage_id]}",
+            f"series_state_s{series_state.value.storage_id}_v{self.graph.storage_versions[series_state.value.storage_id]}",
             series_state.value.shape,
             series_state.value.dtype,
             storage_id=series_state.value.storage_id,
