@@ -414,6 +414,134 @@ class RecordingBackend:
         )
         return out
 
+    def indexer_scores(
+        self,
+        q: SymbolicTensor,
+        entries: SymbolicTensor,
+        mix_w: SymbolicTensor,
+        *,
+        out: Optional[SymbolicTensor] = None,
+        name: str = "indexer_scores",
+    ) -> SymbolicTensor:
+        """Lightning-indexer scoring over the compressed entries (issue #97).
+
+        Per floe ``IndexerScorer``/``LightningIndexer`` (deepseek_v4) and
+        ``Glm53Indexer`` (glm53flash), for a single decode token per batch
+        row:
+
+            scores[b, h, j] = relu(<q[b, h, :], c[b, j, :]>) * head_dim**-0.5
+            s[b, j]         = sum_h scores[b, h, j] * mix_w[b, h]
+
+        ``q`` is the indexer query [B, H, D], ``entries`` the compressed
+        token pool [B, M, D] (M = capacity, an upper bound — the per-row
+        valid candidate count masks it at selection time), and ``mix_w``
+        the per-head mixing weights [B, H] (``weights_proj(x) * n_heads**-0.5``
+        computed upstream). Activation is ReLU, not softmax. Scoring and
+        mixing accumulate in f32 (the q/entries may be stored bf16, ``.cg``
+        streamed on device).
+        """
+        b, h, d = q.value.shape
+        b_c, m, d_c = entries.value.shape
+        if (b_c, d_c) != (b, d):
+            raise ValueError(
+                f"indexer_scores shape mismatch: q {q.value.shape} vs entries {entries.value.shape} (shared B and head_dim required)"
+            )
+        if tuple(mix_w.value.shape) != (b, h):
+            raise ValueError(
+                f"indexer_scores mix weights must be [B, H] = {(b, h)}, got {tuple(mix_w.value.shape)}"
+            )
+        out = out or self.fresh_buffer(f"{name}{self._suffix()}", (b, m))
+        self._record(
+            "indexer_scores",
+            inputs=(q, entries, mix_w),
+            outputs=(out,),
+            attributes={"heads": h, "head_dim": d, "capacity": m, "scale": d ** -0.5, "activation": "relu"},
+            reads=(_regional_reads(q.value), _regional_reads(entries.value), _regional_reads(mix_w.value)),
+            writes=(_regional_reads(out.value),),
+            source_location=name,
+            numerical_contract={
+                "scale": f"1/sqrt(head_dim) = {d ** -0.5}",
+                "activation": "relu (elementwise, after the per-head dot, before mixing)",
+                "accumulation": "f32 dot over head_dim, then f32 weighted sum over heads ascending",
+                "validity": "the full capacity M is scored; row masking happens in index_topk via the per-row valid candidate count",
+            },
+        )
+        return out
+
+    def index_topk(
+        self,
+        scores: SymbolicTensor,
+        valid_counts: SymbolicTensor,
+        *,
+        k: int,
+        idx: Optional[SymbolicTensor] = None,
+        bias: Optional[SymbolicTensor] = None,
+        name: str = "index_topk",
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """Fixed-count top-k selection over the fused indexer scores (issue
+        #97). Produces the static-count indirection table the attention
+        scores/values tasks consume via #94: the output count is ``k`` at
+        decode even though selection is data-dependent.
+
+        ``scores`` is the fused score [B, M] (f32); ``valid_counts`` is the
+        per-row number of valid candidates [B] (i32) — candidates at or
+        beyond a row's valid count are uninitialized storage and are never
+        read (masked loads, §5.3; multiplying an uninitialized NaN by zero
+        still produces NaN, so the mask is a hard exclude).
+
+        Semantics (deterministic):
+
+        * candidates are ordered by descending score, ties resolved to the
+          *lowest* candidate index j (``tie_break="lowest_index"``);
+        * a candidate whose score is NaN inside the valid prefix is
+          excluded from selection (canary semantics — corrupt scores must
+          not win);
+        * the first ``min(k, valid_counts[b])`` slots of ``idx`` receive
+          the selected candidate indices (i32); slots beyond a row's valid
+          count are filled with ``-1`` (no candidate);
+        * ``bias`` carries the selected rows' scores normalized by the
+          L2 norm of the row's valid scores (the block_bias consumed by
+          #95/#96), with 0.0 in the ``-1`` slots.
+
+        k must satisfy 1 <= k <= M; rows may have any valid count in
+        [0, M] (ragged candidate counts, including k > valid_count).
+        """
+        b, m = scores.value.shape
+        if scores.value.dtype != F32:
+            raise ValueError(f"index_topk scores must be f32, got {scores.value.dtype}")
+        if tuple(valid_counts.value.shape) != (b,) or valid_counts.value.dtype != I32:
+            raise ValueError(
+                f"index_topk valid_counts must be i32 [B] = {(b,)}, got {valid_counts.value.shape}/{valid_counts.value.dtype}"
+            )
+        if not isinstance(k, int) or k < 1 or k > m:
+            raise ValueError(f"index_topk requires 1 <= k <= capacity M={m}; got k={k!r}")
+        idx = idx or self.fresh_buffer(f"{name}_idx{self._suffix()}", (b, k), I32)
+        bias = bias or self.fresh_buffer(f"{name}_bias{self._suffix()}", (b, k), F32)
+        self._record(
+            "index_topk",
+            inputs=(scores, valid_counts),
+            outputs=(idx, bias),
+            attributes={
+                "k": k,
+                "capacity": m,
+                "tie_break": "lowest_index",
+                "score_dtype": "f32",
+                "index_dtype": "i32",
+                "nan_policy": "exclude",
+                "pad": "idx=-1, bias=0.0 beyond a row's valid count",
+            },
+            reads=(_regional_reads(scores.value), _regional_reads(valid_counts.value)),
+            writes=(_regional_reads(idx.value), _regional_reads(bias.value)),
+            source_location=name,
+            numerical_contract={
+                "selection": f"descending score, ties to the lowest candidate index; top-{k}",
+                "normalization": "bias = s_j / ||s_valid||_2 per row (fp32)",
+                "masking": "candidates j >= valid_counts[b] are never observed (uninitialized storage)",
+                "ordering": "one task per batch row; the consumer (#95/#96) is a later phase (RAW on the indirection table)",
+            },
+        )
+        return idx, bias
+
     def gelu(self, x: SymbolicTensor, *, out: Optional[SymbolicTensor] = None, name: str = "gelu") -> SymbolicTensor:
         out = out or self.fresh_buffer(f"{name}{self._suffix()}", x.value.shape)
         self._record(
