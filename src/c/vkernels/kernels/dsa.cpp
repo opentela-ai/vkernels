@@ -252,14 +252,16 @@ bool dsa_topk_logits_fits_lds_fp8q(int num_heads, int head_dim, int block,
 // under the MFMA kernel (dsa_topk_logits_kernel_mfma) -- the launcher's
 // FAST path for shapes the fp32-Q kernel refuses (H>=64 at D=128, B=64).
 // The kernel stages Q transposed as bf16 sQt[D][H] ONCE per block (reused
-// across every page in the split -- fp8->bf16 is lossless), one bf16 K-tile
-// sK[B][BK=64] (reloaded per K-tile per page), the gate sGate[H] and the
-// per-token scales sKscale[B] as fp32:
+// across every page in the split -- fp8->bf16 is lossless), a
+// DOUBLE-BUFFERED raw-fp8 K-tile ring the loader prefetches across K-tiles
+// AND pages (issue #81 -- one barrier per tile, loads overlap MFMAs), the
+// gate sGate[H] and the page-parity per-token scale ring sKscale[2][block]
+// as fp32:
 //
-//   bytes = (head_dim*num_heads + block*kBK)*2 + (num_heads + block)*4
+//   bytes = D*num_heads*2 + 2*block*BK + (num_heads + 2*block)*4
 //
-// the SMALLEST of the three variants at every GLM-5.3 width (16,768 B at
-// H=32; 25,088 B at H=64; 41,728 B at H=128). The verified 16x16x16bf16_1k
+// the SMALLEST of the three variants at every GLM-5.3 width (17,024 B at
+// H=32; 25,344 B at H=64; 41,984 B at H=128). The verified 16x16x16bf16_1k
 // fragment needs exact multiples, so this is FALSE unless num_heads % 16,
 // head_dim % 64 and block % 16 are all zero (e.g. H=246 -- not a multiple
 // of 16 -- is refused, exactly as under the other two variants). All-int.
@@ -271,8 +273,8 @@ bool dsa_topk_logits_fits_lds_mfma(int num_heads, int head_dim, int block,
   if (num_heads <= 0 || head_dim <= 0 || block <= 0) return false;
   if (num_heads % 16 != 0 || head_dim % kBK != 0 || block % 16 != 0)
     return false;   // 16x16x16bf16_1k fragment needs exact multiples
-  const int bytes =
-      (head_dim * num_heads + block * kBK) * 2 + (num_heads + block) * 4;
+  const int bytes = head_dim * num_heads * 2 + 2 * block * kBK +
+                    (num_heads + 2 * block) * 4;
   return bytes <= lds_cap;
 }
 

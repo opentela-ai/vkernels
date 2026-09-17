@@ -580,11 +580,25 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
 //                        14-bit product exactly in 23, so the ONLY residual
 //                        vs the CPU oracle is fp32 reassociation across the
 //                        D/kBK K-tiles -- well within the 1e-3 cross-check.
-//   sK[B][kBK]  bf16  -- one K-tile, reloaded per K-tile per page
+//   sK8[2][B][kBK] fp8  -- DOUBLE-BUFFERED K-tile ring as RAW fp8 (issue
+//                        #81 tiled-key prefetch): tile gt computes from
+//                        ring slot gt&1 while tile gt+1 is byte-copied into
+//                        slot (gt+1)&1, so the coalesced global loads (which
+//                        may belong to the NEXT page -- the page table is
+//                        walked per tile) overlap MFMAs behind ONE barrier
+//                        per tile; the pre-prefetch loop barriered twice
+//                        per tile. fp8 pairing vs the single-bf16-tile
+//                        layout keeps the footprint IDENTICAL (each 2-byte
+//                        bf16 K became 1-byte fp8 x 2 slots); the per-lane
+//                        fragment converts fp8->f32->bf16 losslessly, so
+//                        the dots see the same values and outputs stay
+//                        bit-identical to the pre-prefetch kernel.
 //   sGate[H]    fp32  -- the per-head gate, loaded once per block
-//   sKscale[B]  fp32  -- per-token scales, loaded once per page
-//   shmem = (D*H + B*kBK)*2 + (H + B)*4   bytes   (kBK = 64, fixed)
-// At the GLM-5.3 widths: 16,768 B (H=32) / 25,088 B (H=64) / 41,728 B
+//   sKscale[2][B] fp32 -- per-token scales, page-parity ring filled on the
+//                        prefetch side, read only by the epilogue >=1
+//                        barrier later
+//   shmem = D*H*2 + 2*B*kBK + (H + 2*B)*4   bytes   (kBK = 64, fixed)
+// At the GLM-5.3 widths: 17,024 B (H=32) / 25,344 B (H=64) / 41,984 B
 // (H=128) -- vs the fp8-Q kernel's 37,248 / 41,472 / 49,920 B and the
 // fp32-Q kernel's 49,536 / 66,048 B+ (the latter refused). BM = B, BN = H;
 // THREADS = (B/16)*64 (one wavefront per 16-row fragment), so at B=64 the
@@ -597,6 +611,33 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
 // different head (nf*16 + (tid&15)), so a 4-step __shfl_xor (off 1,2,4,8)
 // collapses them to the full sum on every lane. Only (tid&15)==0 writes the
 // 4 outputs (one per j-group) to avoid redundant stores.
+
+// K-tile + scale filler for the double-buffered prefetch (issue #81):
+// copies block*kBK RAW fp8 bytes for global tile `gt` of this block's page
+// range into ring slot gt&1 -- a pure byte copy, fully coalesced (the
+// fragment load does the lossless fp8 -> f32 -> bf16 conversion per lane)
+// -- and the page's per-token scales (the trailing B*4 kvcache bytes; they
+// do not change across K-tiles) into the page-parity sKscale slot. Walking
+// the page table per tile is what lets the prefetch cross K-tile AND page
+// boundaries ("more keys in flight, fewer serial page loops"); the scale
+// slot's page parity keeps every epilogue read >=1 barrier behind its fill
+// even for single-tile pages (D == kBK).
+__device__ __forceinline__ void dsa_topk_fill_ktile(
+    uint8_t* sKring, float* sKscale, const int32_t* page_table,
+    const uint8_t* kvcache_u8, int b, int i_start, int gt, int tilesPerPg,
+    int max_table_len, int D, int B, int kTh, int tid) {
+  const int page = i_start + gt / tilesPerPg;
+  const int32_t page_id = page_table[(size_t)b * max_table_len + page];
+  const uint8_t* kbase = kvcache_u8 + (size_t)page_id * (B * (D + 4));
+  const int kt = gt % tilesPerPg;
+  uint8_t* dst = sKring + (size_t)(gt & 1) * B * kBK;
+  for (int idx = tid; idx < B * kBK; idx += kTh)
+    dst[idx] = kbase[(idx / kBK) * D + kt * kBK + (idx % kBK)];
+  float* sdst = sKscale + (size_t)(page & 1) * B;
+  for (int j = tid; j < B; j += kTh)
+    sdst[j] = reinterpret_cast<const float*>(kbase + B * D)[j];
+}
+
 __global__ void dsa_topk_logits_kernel_mfma(
     const uint8_t* __restrict__ q_fp8,
     const uint8_t* __restrict__ kvcache_u8,
@@ -628,8 +669,9 @@ __global__ void dsa_topk_logits_kernel_mfma(
   extern __shared__ float smem[];
   uint16_t* sQt = reinterpret_cast<uint16_t*>(smem);             // D * H
   float*    sGate = reinterpret_cast<float*>(sQt + (size_t)D * H);      // H
-  uint16_t* sK = reinterpret_cast<uint16_t*>(sGate + H);         // B * kBK
-  float*    sKscale = reinterpret_cast<float*>(sK + (size_t)B * kBK);   // B
+  uint8_t*  sKring = reinterpret_cast<uint8_t*>(sGate + H);      // 2 * B * kBK
+  float*    sKscale = reinterpret_cast<float*>(sKring +
+              (size_t)2 * B * kBK);                             // 2 * B
 
   // --- cooperative load Q transposed as bf16 sQt[D][H] once per block ---
   // Q is laid out [H][D] (q[h*D + d] = Q[h,d]); sQt is the TRANSPOSE
@@ -646,88 +688,98 @@ __global__ void dsa_topk_logits_kernel_mfma(
   for (int h = tid; h < H; h += kTh) sGate[h] = gp[h];
   __syncthreads();
 
-  // kMaxNF covers every shape dsa_topk_logits_fits_lds_mfma admits (the
-  // loosest is D=64, B=16 -> H<=480 -> kNF=30; kMaxNF=32 is a safe upper
-  // bound, used [0,kNF) only). The accumulators are ZEROED PER PAGE --
-  // each page is an independent [H,B] = Q@K^T dot matrix; carrying acc
-  // across pages would sum prior pages' K into the current output.
   v4f acc[32];
 
-  for (int it = 0; it < n_iters; ++it) {
-    const int pg = i_start + it;
-    const int32_t page = page_table[(size_t)b * max_table_len + pg];
-    const uint8_t* kbase = kvcache_u8 + (size_t)page * (B * (D + 4));
+  // Tiled-key prefetch (issue #81): this block's page range is ONE FLAT
+  // sequence of n_iters * D/kBK K-tiles. Tile `gt` computes from ring slot
+  // `gt & 1` while tile `gt + 1` (a raw-fp8 byte copy that may live on the
+  // NEXT page) is already prefetched into slot `(gt + 1) & 1`, so global
+  // loads overlap Matrix-Core work behind ONE barrier per tile -- the
+  // pre-prefetch loop barriered twice per tile and serialized every
+  // L2-resident load against the wavefront's MFMAs. The page table is
+  // walked per tile (dsa_topk_fill_ktile), which also re-loads the page's
+  // per-token scales into a page-parity slot so the epilogue read stays
+  // settled even for single-tile pages (D == kBK).
+  const int tilesPerPg = D / kBK;
+  const int totalTiles = n_iters * tilesPerPg;
 
-    // Per-token scales: load ONCE per page (the trailing B*4 bytes; they do
-    // not change across K-tiles).
-    for (int j = tid; j < B; j += kTh)
-      sKscale[j] = reinterpret_cast<const float*>(kbase + B * D)[j];
+  dsa_topk_fill_ktile(sKring, sKscale, page_table, kvcache_u8, b, i_start,
+                      0, tilesPerPg, max_table_len, D, B, kTh, tid);
+  for (int gt = 0; gt < totalTiles; ++gt) {
+    // The one barrier per tile: publishes the previous iteration's
+    // prefetch (RAW for slot gt&1) and orders the previous tile's ring
+    // reads away from this iteration's overwrite (WAR for (gt+1)&1).
+    __syncthreads();
+    if (gt + 1 < totalTiles)
+      dsa_topk_fill_ktile(sKring, sKscale, page_table, kvcache_u8, b,
+                          i_start, gt + 1, tilesPerPg, max_table_len, D, B,
+                          kTh, tid);
 
-    for (int nf = 0; nf < kNF; ++nf)
-      acc[nf] = (v4f){0.0f, 0.0f, 0.0f, 0.0f};
+    const int pg = i_start + gt / tilesPerPg;
+    const int kt = gt % tilesPerPg;
+    const uint8_t* sKcur = sKring + (size_t)(gt & 1) * B * kBK;
 
-    // K-tiles: D/kBK of them, each kBK wide. A K-tile is consumed by
-    // kBK/kMfmaK = 4 MFMAs; per MFMA, kq in [0,4) selects this lane's 4 K.
-    for (int kt = 0; kt < D / kBK; ++kt) {
-      // cooperative load sK[B][kBK] for THIS K-tile (bf16). col is the LOCAL
-      // K-column; gcol = kt*kBK + col is the global D-column. (D is a
-      // multiple of kBK so no D-bound check.)
-      for (int idx = tid; idx < B * kBK; idx += kTh) {
-        const int row = idx / kBK;          // 0..B-1 (KV token j)
-        const int col = idx % kBK;          // 0..kBK-1 (local K-col)
-        const int gcol = kt * kBK + col;
-        sK[(size_t)row * kBK + col] =
-            f2bf(fp8e4m3fnuz_to_f32(kbase[(size_t)row * D + gcol]));
-      }
-      __syncthreads();
-
-      // --- kBK/kMfmaK = 4 MFMAs consume the K-tile; acc is preserved across
-      //     K-tiles -> the full D-dot per (j, h). ---
-      // A fragment (sK, the M=B side): a[i] = sK[row_base+m][k0+i].
-      // B fragment (sQt, the N=H side): b[i] = sQt[gd0+i][nb],
-      //   nb = nf*16 + m (head h), gd0 = kt*kBK + k0 (global D-row).
-      #pragma unroll
-      for (int mf = 0; mf < kBK / kMfmaK; ++mf) {
-        const int k0 = mf * kMfmaK + kq * 4;       // 4 local K-cols
-        v4s a = {(short)sK[(size_t)(row_base + m) * kBK + k0],
-                 (short)sK[(size_t)(row_base + m) * kBK + k0 + 1],
-                 (short)sK[(size_t)(row_base + m) * kBK + k0 + 2],
-                 (short)sK[(size_t)(row_base + m) * kBK + k0 + 3]};
-        const int gd0 = kt * kBK + k0;
-        #pragma unroll
-        for (int nf = 0; nf < kNF; ++nf) {
-          const int nb = nf * 16 + m;
-          v4s b = {(short)sQt[(size_t)(gd0)     * H + nb],
-                   (short)sQt[(size_t)(gd0 + 1) * H + nb],
-                   (short)sQt[(size_t)(gd0 + 2) * H + nb],
-                   (short)sQt[(size_t)(gd0 + 3) * H + nb]};
-          acc[nf] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc[nf], 0, 0, 0);
-        }
-      }
-      __syncthreads();                       // before reloading sK next tile
+    if (kt == 0) {
+      // The accumulators are ZEROED PER PAGE -- each page is an
+      // independent [H,B] = Q@K^T dot matrix; carrying acc across pages
+      // would sum prior pages' K into the current output.
+      for (int nf = 0; nf < kNF; ++nf)
+        acc[nf] = (v4f){0.0f, 0.0f, 0.0f, 0.0f};
     }
 
-    // --- per-token gated reduce (fp32) + k_scale, then write ---
+    // --- kBK/kMfmaK = 4 MFMAs consume ring slot gt&1; acc is preserved
+    //     across the page's K-tiles -> the full D-dot per (j, h). ---
+    // A fragment (sKcur, the M=B side): a[i] = bf16(K[row_base+m][gd0+i]),
+    // converted losslessly per lane from the slot's raw fp8 (the same
+    // values the pre-prefetch fill produced). B fragment (sQt, the N=H
+    // side): b[i] = sQt[gd0+i][nb],
+    //   nb = nf*16 + m (head h), gd0 = kt*kBK + k0 (global D-row).
+    #pragma unroll
+    for (int mf = 0; mf < kBK / kMfmaK; ++mf) {
+      const int k0 = mf * kMfmaK + kq * 4;       // 4 local K-cols
+      const uint8_t* kl = sKcur + (size_t)(row_base + m) * kBK + k0;
+      v4s a = {(short)f2bf(fp8e4m3fnuz_to_f32(kl[0])),
+               (short)f2bf(fp8e4m3fnuz_to_f32(kl[1])),
+               (short)f2bf(fp8e4m3fnuz_to_f32(kl[2])),
+               (short)f2bf(fp8e4m3fnuz_to_f32(kl[3]))};
+      const int gd0 = kt * kBK + k0;
+      #pragma unroll
+      for (int nf = 0; nf < kNF; ++nf) {
+        const int nb = nf * 16 + m;
+        v4s b = {(short)sQt[(size_t)(gd0)     * H + nb],
+                 (short)sQt[(size_t)(gd0 + 1) * H + nb],
+                 (short)sQt[(size_t)(gd0 + 2) * H + nb],
+                 (short)sQt[(size_t)(gd0 + 3) * H + nb]};
+        acc[nf] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc[nf], 0, 0, 0);
+      }
+    }
+
+    // --- per-token gated reduce (fp32) + k_scale, once per page ---
     // acc[nf][i] = dot[j=(tid>>4)*4+i, h=nf*16+(tid&15)]. The 16 lanes
     // sharing (tid>>4) each hold a different head; __shfl_xor(1/2/4/8)
     // collapses them to sum_h gate[h]*max(0,dot) on every lane. Only
-    // (tid&15)==0 writes the 4 outputs (one per j-group).
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      float partial = 0.0f;
+    // (tid&15)==0 writes the 4 outputs (one per j-group). sKscale[pg&1]
+    // was filled on the prefetch side at least one barrier ago, so
+    // single-tile pages (D == kBK) still read settled scales here.
+    if (kt == tilesPerPg - 1) {
       #pragma unroll
-      for (int nf = 0; nf < kNF; ++nf) {
-        float d = acc[nf][i];
-        if (d < 0.0f) d = 0.0f;             // ReLU (max(0, raw))
-        partial += sGate[nf * 16 + m] * d;
-      }
-      for (int off = 1; off < 16; off <<= 1)
-        partial += __shfl_xor(partial, off);
-      if ((tid & 15) == 0) {
-        const int j = (tid >> 4) * 4 + i;   // 0..B-1 (kWarps*4 groups)
-        const int t = pg * B + j;
-        if (t < seq_len)
-          out[(size_t)b * max_seq_len + t] = sKscale[j] * partial;
+      for (int i = 0; i < 4; ++i) {
+        float partial = 0.0f;
+        #pragma unroll
+        for (int nf = 0; nf < kNF; ++nf) {
+          float d = acc[nf][i];
+          if (d < 0.0f) d = 0.0f;             // ReLU (max(0, raw))
+          partial += sGate[nf * 16 + m] * d;
+        }
+        for (int off = 1; off < 16; off <<= 1)
+          partial += __shfl_xor(partial, off);
+        if ((tid & 15) == 0) {
+          const int j = (tid >> 4) * 4 + i;   // 0..B-1 (kWarps*4 groups)
+          const int t = pg * B + j;
+          if (t < seq_len)
+            out[(size_t)b * max_seq_len + t] =
+                sKscale[(size_t)(pg & 1) * B + j] * partial;
+        }
       }
     }
   }
@@ -759,14 +811,15 @@ void dsa_topk_logits_dispatch(int batch_size, int num_heads, int head_dim,
   const bool want_fp32q = (variant == 1) || (variant == 0);
   const bool want_fp8q  = (variant == 2) || (variant == 0);
 
-  // Fast path: the bf16-MFMA kernel (smallest footprint, Matrix-Core).
+  // Fast path: the bf16-MFMA kernel w/ the double-buffered fp8 K-tile
+  // prefetch ring (smallest footprint, Matrix-Core).
   // Shapes need H%16==0, D%64==0, B%16==0 (the verified 16x16x16bf16_1k
   // fragment); the block runs (B/16)*64 threads (one wavefront per 16-row
   // fragment). See dsa.hpp::dsa_topk_logits_fits_lds_mfma.
   if (want_mfma && ::vkernels::kernels::dsa_topk_logits_fits_lds_mfma(
                        num_heads, head_dim, block)) {
-    const int shmem = (head_dim * num_heads + block * kBK) * 2 +
-                      (num_heads + block) * sizeof(float);
+    const int shmem = (head_dim * num_heads) * 2 + 2 * block * kBK +
+                      (num_heads + 2 * block) * sizeof(float);
     dim3 blockdim((block / 16) * 64);
     dsa_topk_logits_kernel_mfma<<<grid, blockdim, shmem, 0>>>(
         reinterpret_cast<const uint8_t*>(q_fp8),

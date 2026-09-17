@@ -626,18 +626,18 @@ TEST(DsaTopk, FitsLdsFp8q) {
 // 41,728 B at H=32/64/128). The verified 16x16x16bf16_1k fragment needs exact
 // multiples, so this is FALSE unless H%16==0, D%64==0 AND B%16==0.
 TEST(DsaTopk, FitsLdsMfma) {
-  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(32, 128, 64));    // GLM-5.3: 16,768 B
-  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(64, 128, 64));    // 2x: 25,088 B
-  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(128, 128, 64));   // 4x: 41,728 B
-  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(208, 128, 64));   // edge H: 62,528 B
-  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(224, 128, 64));  // 66,688 B (1st mult-16 over)
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(32, 128, 64));    // GLM-5.3: 17,024 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(64, 128, 64));    // 2x: 25,344 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(128, 128, 64));   // 4x: 41,984 B
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(208, 128, 64));   // edge H: 62,784 B
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(224, 128, 64));  // 66,944 B (1st mult-16 over)
   // Shape constraints -- the verified fragment needs exact multiples.
   EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(246, 128, 64));  // H not mult of 16
   EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(32, 130, 64));   // D not mult of 64
   EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(32, 128, 72));   // B not mult of 16
-  // Bigger B is fine for the MFMA kernel (32,128,128 stages 25,216 B) --
+  // Bigger B is fine for the MFMA kernel (32,128,128 stages 25,728 B) --
   // it fits where the fp32-Q (82,560 B) and fp8-Q (70,272 B) BOTH refuse.
-  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(32, 128, 128));   // 25,216 B (fits!)
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(32, 128, 128));   // 25,728 B (fits!)
   // Same SMALLEST-footprint win at the tiny end (D must be >= 64).
   EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(2, 8, 4));       // D=8 not mult of 64
 }

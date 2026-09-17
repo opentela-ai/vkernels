@@ -212,15 +212,16 @@ bool dsa_topk_logits_fits_lds_fp8q(int num_heads, int head_dim, int block,
 // smallest-footprint variant; e.g. H=32 which the fp32-Q kernel ALSO fits).
 // The kernel stages Q transposed as bf16 sQt[D][H] (loaded ONCE per block,
 // reused across every page in the split -- fp8->bf16 is lossless, verified
-// by meta/benchmarks/check_fp8_bf16_exact before this kernel existed), one
-// bf16 K-tile sK[B][BK=64] (reloaded per K-tile per page), the per-head
-// gate sGate[H] and the per-token scales sKscale[B] as fp32, so the request
-// is
+// by meta/benchmarks/check_fp8_bf16_exact before this kernel existed), a
+// DOUBLE-BUFFERED raw-fp8 K-tile ring prefetched across K-tiles and pages
+// (issue #81; 2*block*BK bytes), the per-head gate sGate[H] and the
+// page-parity per-token scale ring sKscale[2][block] as fp32, so the
+// request is
 //
-//   shmem = (D*H + B*BK)*2 + (H + B)*4   bytes   (BK = 64, fixed)
+//   shmem = D*H*2 + 2*block*BK + (H + 2*block)*4   bytes   (BK = 64, fixed)
 //
 // -- the SMALLEST of the three variants at every GLM-5.3 indexer width:
-// 16,768 B at H=32, 25,088 B at H=64, 41,728 B at H=128 (vs the fp8-Q
+// 17,024 B at H=32, 25,344 B at H=64, 41,984 B at H=128 (vs the fp8-Q
 // kernel's 37,248 / 41,472 / 49,920 B and the fp32-Q kernel's
 // 49,536 / 66,048 / 99,072 B). Shape constraints (the verified
 // 16x16x16bf16_1k fragment needs exact multiples): num_heads % 16 == 0
@@ -383,8 +384,9 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
 // Dispatches on the staged-bytes cap (gfx942's 64 KB NON-OPTIN dynamic-LDS
 // limit; NO hipFuncSetAttribute opt-in past it -- see dsa_topk_logits_fits_lds
 // and the KB note mi300a-dynamic-lds-no-optin): shapes that fit the MFMA
-// kernel (bf16 sQt[D][H] staged once, bf16 K-tile reloaded -- the SMALLEST
-// variant; see dsa_topk_logits_fits_lds_mfma) take the fast path; shapes
+// kernel (bf16 sQt[D][H] staged once + fp8 K-tile prefetch ring -- the
+// SMALLEST variant; see dsa_topk_logits_fits_lds_mfma) take the fast path;
+// shapes
 // the MFMA kernel refuses but the fp32-Q kernel fits take that (the verified
 // GLM-5.3 indexer H=32, D=128, B=64 -> 49,536 B); shapes fitting NEITHER but
 // the fp8-Q kernel (Q staged raw, dequantised on the fly -- bit-identical
