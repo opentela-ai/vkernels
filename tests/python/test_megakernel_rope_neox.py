@@ -41,6 +41,16 @@ from vkernels.compiler.schedule_phase import PhaseSchedule  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def _floe_partial_rope():
+    # floe is a sibling repo on this stack, not a venv dependency; probe
+    # FLOE_ROOT then known checkout locations.
+    if "floe" not in sys.modules:
+        import os
+        from pathlib import Path
+        for cand in (os.environ.get("FLOE_ROOT"), "/local/home/xiayao/Documents/code/floe"):
+            if cand and (Path(cand) / "floe" / "engine").is_dir():
+                if cand not in sys.path:
+                    sys.path.insert(0, cand)
+                break
     if "kvaas_runtime" not in sys.modules:
         kv = types.ModuleType("kvaas_runtime")
         for name in ("CudaVmm", "ElasticControlSession", "ManagedResidencyAdmissionDeferred", "ManagedResidencySession", "allocate_device_pool"):
@@ -51,7 +61,12 @@ def _floe_partial_rope():
         sys.modules["kvaas_runtime"] = kv
         sys.modules["kvaas_runtime.kv_pool_import"] = sub
     try:
-        from floe.engine.runner.models.qwen35.qwen35_arch import PartialRotaryEmbedding
+        # floe moved the qwen35 model modules (qwen35_arch -> forward/…); try
+        # the historical path first, then the current layout.
+        try:
+            from floe.engine.runner.models.qwen35.qwen35_arch import PartialRotaryEmbedding
+        except ModuleNotFoundError:
+            from floe.engine.runner.models.qwen35.forward import PartialRotaryEmbedding
     except ModuleNotFoundError as exc:  # floe not on this stack (vkernels-only venv)
         pytest.skip(f"floe qwen35 oracle unavailable: {exc}")
 
@@ -234,7 +249,9 @@ def test_device_t_rope_partial_matches_floe_oracle():
     sin = torch.from_numpy(sin_np).to(dev)
 
     y = torch.empty_like(x)
-    _t_rope[(4,)](x, cos, sin, positions, y, B, H, D, ROT=ROTARY_DIM, TSTRIDE=ROTARY_DIM // 2)
+    # worker=0, P=1: a single program covers every (b, head) task via the
+    # kernel's task-striding loop (the compiled path passes worker=pid, P=grid).
+    _t_rope[(1,)](0, 1, x, cos, sin, positions, y, B, H, D, ROT=ROTARY_DIM, TSTRIDE=ROTARY_DIM // 2)
 
     rope = PartialRotaryEmbedding(D, ROTARY_DIM, MAX_POS, THETA, dev, torch.float32)
     rope._build(dev)
@@ -260,7 +277,9 @@ def test_device_t_rope_full_width_matches_oracle():
     sin = torch.from_numpy(np.sin(np.concatenate([freqs, freqs], -1)).astype(np.float32)).to(dev)
 
     y = torch.empty_like(x)
-    _t_rope[(4,)](x, cos, sin, positions, y, B, H, D, ROT=D, TSTRIDE=D)
+    # worker=0, P=1: single program sweeps all tasks (stateless kernel; the
+    # compiled path passes worker=pid, P=grid).
+    _t_rope[(1,)](0, 1, x, cos, sin, positions, y, B, H, D, ROT=D, TSTRIDE=D)
 
     for b in range(B):
         p = int(positions[b])
