@@ -46,6 +46,7 @@ __all__ = ["emit_megakernel_source", "TEMPLATE_NAMES"]
 # the reusable task bodies of §3.1.
 TEMPLATE_NAMES = {
     "gemm": "linear_task",
+    "gemv_fp8": "linear_fp8_task",  # fp8-blockwise GEMV (issue #91)
     "layernorm": "layernorm_task",
     "rms_norm": "rms_norm_task",
     "rms_norm_gated": "rms_norm_gated_task",  # sigmoid-gated RMSNorm (issue #100)

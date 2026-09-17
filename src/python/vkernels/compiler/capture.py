@@ -39,6 +39,7 @@ from .operator_ir import (
     ARITHMETIC_OP_KINDS,
     DType,
     F32,
+    I32,
     OperatorGraph,
     Region,
     SymbolicScalar,
@@ -140,6 +141,33 @@ class RecordingBackend:
     def define_position(self, capacity: int) -> SymbolicScalar:
         """The decode position p with the host-side guard 0 <= p < S."""
         return self.graph.add_scalar(SymbolicScalar("p", 0, capacity))
+
+    def define_row_positions(
+        self,
+        name: str,
+        batch: int,
+        capacity: int,
+        *,
+        storage_id: int,
+    ) -> SymbolicTensor:
+        """Per-row decode positions for ragged batches (issue #93).
+
+        Registers an external **i32 [B]** tensor of per-row decode
+        positions (host tensors may be i64; they narrow on upload). Each
+        row ``b`` then carries its own valid length ``pos[b] + 1``: ops
+        that accept this tensor as their ``position`` record per-row
+        :class:`ValidLength` regions instead of the shared scalar form
+        ``p+1``, and legality scopes it exactly like the scalar ``p`` —
+        only attention/append/rope/embedding consumers may read it.
+        """
+        if not (isinstance(batch, int) and batch > 0):
+            raise CaptureError(f"row-position tensor needs a static batch > 0; got {batch!r}")
+        if capacity <= 0:
+            raise CaptureError(f"row-position tensor needs capacity > 0; got {capacity!r}")
+        sym = self.external_tensor(name, (batch,), I32, storage_id=storage_id)
+        self.graph.row_position_tensors.add(name)
+        self.graph.row_position_capacity[name] = capacity
+        return sym
 
     def external_tensor(
         self,
@@ -257,6 +285,8 @@ class RecordingBackend:
         runtime-bound contract explicit."""
         self._require_position(position, "embedding")
         out = out or self.fresh_buffer(f"hidden{self._suffix()}", (ids.value.shape[0], token.value.shape[1]))
+        p = self._position_name(position)
+        position_form = "row" if isinstance(position, SymbolicTensor) else "scalar"
         reads = [_regional_reads(token.value), _regional_reads(ids.value)]
         inputs = [ids, token]
         if position_emb is not None:
@@ -267,11 +297,11 @@ class RecordingBackend:
             "embedding",
             inputs=tuple(inputs),
             outputs=(out,),
-            attributes={"position": self._position_name(position), "pos_table": position_emb is not None},
+            attributes={"position": p, "position_form": position_form, "pos_table": position_emb is not None},
             reads=tuple(reads),
             writes=(_regional_reads(out.value),),
             source_location="embedding lookup",
-            numerical_contract={"sum": "token_row(ids[b]) + position_row(p)" if position_emb is not None else "token_row(ids[b])", "dtype": "f32"},
+            numerical_contract={"sum": "token_row(ids[b]) + position_row(pos[b])" if position_emb is not None else "token_row(ids[b])", "dtype": "f32"},
         )
         return out
 
@@ -331,6 +361,62 @@ class RecordingBackend:
             numerical_contract={
                 "accumulation": "f32, full-K reduction per output tile, k ascending",
                 "bias": "added after the K reduction" if b is not None else "none",
+            },
+        )
+        return out
+
+    def linear_fp8(
+        self,
+        x: SymbolicTensor,
+        w: SymbolicTensor,
+        scale: SymbolicTensor,
+        *,
+        out: Optional[SymbolicTensor] = None,
+        name: str = "linear_fp8",
+        quant_block: int = 128,
+    ) -> SymbolicTensor:
+        """fp8-blockwise decode projection (issue #91):
+
+            y = x @ dequant(w_fp8, scale)^T
+
+        ``w`` is stored [N, K] row-major (the checkpoint's ``nn.Linear``
+        layout) in fp8 e4m3; ``scale`` is the second weight external, fp32
+        [ceil(N/quant_block), K/quant_block] in block-major order
+        (DeepSeek-style 128x128 block-FP8; ragged trailing N block
+        allowed). Numerics: fp32 accumulation over K, dequant
+        in-register per block — the scale for one block multiplies the
+        products of that block only.
+        """
+        m, k = x.value.shape
+        n, k_w = w.value.shape
+        if k_w != k:
+            raise ValueError(f"linear_fp8 weight contraction mismatch: x K={k}, w K={k_w}")
+        if k % quant_block:
+            raise ValueError(
+                f"linear_fp8 requires K divisible by the {quant_block}-wide quant block; got K={k}"
+            )
+        if n % 16:
+            raise ValueError(
+                f"linear_fp8 requires N divisible by the 16-wide output tile (ragged trailing scale block allowed); got N={n}"
+            )
+        expected_scale = (-(-n // quant_block), k // quant_block)  # ceil rows for ragged N
+        if tuple(scale.value.shape) != expected_scale:
+            raise ValueError(
+                f"linear_fp8 scale shape {tuple(scale.value.shape)} != {expected_scale} (block-major [N/{quant_block}, K/{quant_block}])"
+            )
+        out = out or self.fresh_buffer(f"{name}{self._suffix()}", (m, n))
+        self._record(
+            "linear_fp8",
+            inputs=(x, w, scale),
+            outputs=(out,),
+            attributes={"weight_layout": "fp8_block", "quant_block": quant_block, "bias": False},
+            reads=(_regional_reads(x.value), _regional_reads(w.value), _regional_reads(scale.value)),
+            writes=(_regional_reads(out.value),),
+            source_location=name,
+            numerical_contract={
+                "dequant": f"per {quant_block}x{quant_block} block: w_fp8 * scale (fp32 scale, e4m3 weights)",
+                "accumulation": "f32, full-K reduction per output tile, k ascending within each block",
+                "bias": "none (checkpoint fp8 projections are bias-free)",
             },
         )
         return out
@@ -462,27 +548,64 @@ class RecordingBackend:
         *,
         layer: int,
         which: str = "q",
+        rotary_dim: Optional[int] = None,
+        convention: str = "rotate_half",
     ) -> SymbolicTensor:
-        """Rotate-half RoPE at the runtime position p (Qwen3 convention).
+        """RoPE at the runtime position p.
 
-        Tables are precomputed [max_positions, D] externals with
-        cos = cat([f, f]) so x' = x*cos[p] + rotate_half(x)*sin[p].
+        ``convention="rotate_half"`` (default — Qwen3): full-width
+        rotate-half form ``x' = x*cos[p] + rotate_half(x)*sin[p]`` where
+        rotate_half(x) = cat(-x[D/2:], x[:D/2]). Tables are precomputed
+        [max_positions, D] externals with cos = cat([f, f]).
+
+        ``convention="neox_partial"`` (Qwen3.5 ``PartialRotaryEmbedding``):
+        NeoX split-half over the first ``rotary_dim`` dims only — with
+        ``half = rotary_dim // 2``, ``x1 = x[:half]``, ``x2 = x[half:rotary_dim]``::
+
+            x1' = x1*c - x2*s ;  x2' = x2*c + x1*s      (c,s = tables[p])
+
+        and dims ``[rotary_dim, head_dim)`` pass through unchanged. Tables
+        are fp32 externals of shape [max_positions, rotary_dim // 2].
         """
+        if convention not in ("rotate_half", "neox_partial"):
+            raise CaptureError(f"rope convention {convention!r} not supported (expected 'rotate_half' or 'neox_partial')")
+        if convention == "neox_partial":
+            head_dim = x.value.shape[-1]
+            if rotary_dim is None or rotary_dim % 2 != 0 or not 0 < rotary_dim <= head_dim:
+                raise CaptureError(f"neox_partial rope requires an even 0 < rotary_dim <= head_dim ({head_dim}); got {rotary_dim!r}")
+            for t in (cos_table, sin_table):
+                if t.value.shape[-1] != rotary_dim // 2:
+                    raise CaptureError(
+                        f"neox_partial rope tables must be [max_positions, rotary_dim//2] = [.., {rotary_dim // 2}]; got shape {t.value.shape}"
+                    )
         self._require_position(position, "rope")
         out = self.fresh_buffer(f"rope_{which}_l{layer}{self._suffix()}", x.value.shape)
         p = self._position_name(position)
+        attributes = {"layer": layer, "which": which, "position": p, "convention": convention,
+                      "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"}
+        if rotary_dim is not None:
+            attributes["rotary_dim"] = rotary_dim
+        if convention == "rotate_half":
+            numerical_contract = {
+                "rotate_half": "cat(-x[D/2:], x[:D/2])",
+                "tables": "full-width cos/sin (HF rotate_half convention)",
+            }
+        else:
+            numerical_contract = {
+                "neox_partial": "x1' = x1*c - x2*s ; x2' = x2*c + x1*s over dims [0, rotary_dim), half = rotary_dim//2",
+                "pass_through": f"dims [{rotary_dim}, {x.value.shape[-1]}) unchanged",
+                "tables": "cos/sin [max_positions, rotary_dim//2], fp32, indexed at the runtime position",
+                "upcast": "rotation math in fp32 (bf16 activations in/out)",
+            }
         self._record(
             "rope",
             inputs=(x, cos_table, sin_table),
             outputs=(out,),
-            attributes={"layer": layer, "which": which, "position": p},
+            attributes=attributes,
             reads=(_regional_reads(x.value), _regional_reads(cos_table.value), _regional_reads(sin_table.value)),
             writes=(_regional_reads(out.value),),
             source_location=f"layer {layer} rope {which}",
-            numerical_contract={
-                "rotate_half": "cat(-x[D/2:], x[:D/2])",
-                "tables": "full-width cos/sin (HF rotate_half convention)",
-            },
+            numerical_contract=numerical_contract,
         )
         return out
 
@@ -524,26 +647,27 @@ class RecordingBackend:
         views* — same storage, bumped version — without touching real cache
         storage. Consumers must use the returned views.
         """
-        self._require_position(position, "cache_append")
+        valid = self._valid_plus_one(position, "cache_append")
         p = self._position_name(position)
         writes = [
-            Region.prefix(k_cache.value, axis=2, valid=ValidLength(f"{p}+1")),
-            Region.prefix(v_cache.value, axis=2, valid=ValidLength(f"{p}+1")),
+            Region.prefix(k_cache.value, axis=2, valid=valid),
+            Region.prefix(v_cache.value, axis=2, valid=valid),
         ]
+        position_form = "row" if valid.is_row else "scalar"
         self._record(
             "cache_append",
             inputs=(k_cache, v_cache, k_new, v_new),
             outputs=(),  # mutation through storage effects; views returned below
-            attributes={"layer": layer, "position": p},
+            attributes={"layer": layer, "position": p, "position_form": position_form},
             reads=(_regional_reads(k_new.value), _regional_reads(v_new.value)),
             writes=tuple(writes),
             source_location=f"layer {layer} kv cache append",
             numerical_contract={
-                "write": "K[l,b,h,p,:] = k_new[b,h,:]; same for V",
-                "valid_length": "p+1",
+                "write": "K[l,b,h,pos[b],:] = k_new[b,h,:]; same for V",
+                "valid_length": str(valid),
             },
         )
-        # Post-append versions: same storages, prefix now valid to p+1.
+        # Post-append versions: same storages, prefix now valid to pos[b]+1.
         k_post = self.graph.add_tensor(
             f"k_cache_l{layer}_v{self.graph.storage_versions[k_cache.value.storage_id]}",
             k_cache.value.shape,
@@ -551,7 +675,7 @@ class RecordingBackend:
             storage_id=k_cache.value.storage_id,
             strides=k_cache.value.strides,
             offset=k_cache.value.offset,
-            valid_length=ValidLength(f"{p}+1"),
+            valid_length=valid,
         )
         v_post = self.graph.add_tensor(
             f"v_cache_l{layer}_v{self.graph.storage_versions[v_cache.value.storage_id]}",
@@ -560,9 +684,81 @@ class RecordingBackend:
             storage_id=v_cache.value.storage_id,
             strides=v_cache.value.strides,
             offset=v_cache.value.offset,
-            valid_length=ValidLength(f"{p}+1"),
+            valid_length=valid,
         )
         return SymbolicTensor(k_post), SymbolicTensor(v_post)
+
+    def gdn_conv(
+        self,
+        conv_state: SymbolicTensor,
+        x: SymbolicTensor,
+        w: SymbolicTensor,
+        *,
+        layer: int,
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """GDN short-conv decode step (Qwen3.5 ``GatedDeltaNet``, seq==1 path).
+
+        Causal depthwise conv1d over the packed qkv row, folding the
+        persistent conv state::
+
+            full = cat(conv_state[b], x[b])      # [K, C]
+            out[b] = silu(sum_k full[:, k] * w[:, k])   # depthwise FIR
+            conv_state'[b] = full[1:]            # time-major shift
+
+        ``conv_state`` is an external caller-owned pool [B, K-1, C], fp32,
+        time-major (floe's eager init uses the embed dtype — the compiled
+        pool is fp32; oracle tolerance ~1e-3). ``x`` is the mixed qkv row
+        [B, C] and ``w`` the FIR weights [C, K] (grouped conv, one tap
+        vector per channel).
+
+        The op is position-independent: it consumes no decode-position
+        scalar, and its ordering obligation is the read-modify-write on
+        the state pool (RAW/WAR/WAW hazards vs any other op touching that
+        storage). Records write effects on the pool and returns
+        ``(out, conv_state_post)`` — the post-step state view (same
+        storage, bumped version) that later layers must read.
+        """
+        sv, xv, wv = conv_state.value, x.value, w.value
+        if len(sv.shape) != 3:
+            raise CaptureError(f"gdn_conv state pool must be [B, K-1, C]; got shape {sv.shape}")
+        if len(xv.shape) != 2:
+            raise CaptureError(f"gdn_conv input row must be [B, C]; got shape {xv.shape}")
+        B, Km1, C = sv.shape
+        K = Km1 + 1
+        if xv.shape != (B, C):
+            raise CaptureError(f"gdn_conv input row shape {xv.shape} does not match state pool [B, C] = {(B, C)}")
+        if tuple(wv.shape) != (C, K):
+            raise CaptureError(f"gdn_conv FIR weights must be [C, K] = [{C}, {K}]; got shape {wv.shape}")
+        out = self.fresh_buffer(f"gdn_conv_l{layer}{self._suffix()}", (B, C), dtype=xv.dtype)
+        self._record(
+            "gdn_conv",
+            inputs=(conv_state, x, w),
+            outputs=(out,),
+            attributes={"layer": layer, "conv_kernel": K},
+            reads=(_regional_reads(sv), _regional_reads(xv), _regional_reads(wv)),
+            writes=(_regional_reads(sv), _regional_reads(out.value)),
+            source_location=f"layer {layer} gdn conv",
+            numerical_contract={
+                "fir": "out[b] = silu(sum_{j<K-1} w[:, j] * state[b, j, :] + w[:, K-1] * x[b, :])",
+                "state_shift": "state'[b, j, :] = state[b, j+1, :] for j < K-2; state'[b, K-2, :] = x[b, :]",
+                "silu": "x / (1 + exp(-x))",
+                "accumulate": "fp32 accumulation",
+                "dtypes": "x/w bf16 (.cg loads), state pool fp32 [B, K-1, C] time-major (floe eager init uses the embed dtype — compiled pool is fp32; oracle tolerance ~1e-3)",
+                "pool": "external caller-owned state pool; read-modify-write per decode step",
+            },
+        )
+        # Post-step state view: same pool, bumped version (cache_append's
+        # §4.3 pattern). Later layers must consume this view.
+        sid = sv.storage_id
+        post = self.graph.add_tensor(
+            f"conv_state_l{layer}_v{self.graph.storage_versions[sid]}",
+            sv.shape,
+            sv.dtype,
+            storage_id=sid,
+            strides=sv.strides,
+            offset=sv.offset,
+        )
+        return out, SymbolicTensor(post)
 
     def attention_scores(
         self,
@@ -583,17 +779,18 @@ class RecordingBackend:
         b, h, s = q.value.shape[0], q.value.shape[1], k_cache.value.shape[2]
         out = self.fresh_buffer(f"scores_l{layer}{self._suffix()}", (b, h, s))
         p = self._position_name(position)
+        valid = self._valid_plus_one(position, "attention_scores")
         kvh = kv_heads if kv_heads is not None else h
 
         def k_regions() -> tuple[Region, ...]:
             if kvh == h:
-                return (Region.prefix(k_cache.value, axis=2, valid=ValidLength(f"{p}+1")),)
+                return (Region.prefix(k_cache.value, axis=2, valid=valid),)
             group = h // kvh
             return tuple(
                 Region(
                     k_cache.value.storage_id,
                     k_cache.value,
-                    ((0, b), (g * group, (g + 1) * group), (0, f"{p}+1"), (0, k_cache.value.shape[3])),
+                    ((0, b), (g * group, (g + 1) * group), (0, valid if valid.is_row else f"{p}+1"), (0, k_cache.value.shape[3])),
                 )
                 for g in range(kvh)
             )
@@ -602,35 +799,36 @@ class RecordingBackend:
             "attention_scores",
             inputs=(q, k_cache),
             outputs=(out,),
-            attributes={"scale": float(scale), "layer": layer, "position": p, "kv_heads": kvh},
+            attributes={"scale": float(scale), "layer": layer, "position": p, "position_form": "row" if valid.is_row else "scalar", "kv_heads": kvh},
             reads=(_regional_reads(q.value),) + k_regions(),
             writes=(Region.tile(out.value, ((0, b), (0, h), (0, s))),),
             source_location=f"layer {layer} attention scores",
             numerical_contract={
                 "scale": f"1/sqrt(D) = {scale}",
                 "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
-                "valid": "only positions [0, p] are read; scores beyond p are not observed by consumers",
+                "valid": "only each row's positions [0, pos[b]] are read; scores beyond a row's valid length are not observed by consumers",
                 "reduction": "f32 dot over D, k ascending",
             },
         )
         return out
 
     def softmax(self, scores: SymbolicTensor, position, *, layer: int) -> SymbolicTensor:
-        """Row softmax over the valid prefix [0, p]; invalid tail forced to 0."""
+        """Row softmax over each row's valid prefix [0, pos[b]]; invalid tail forced to 0."""
         self._require_position(position, "softmax")
         out = self.fresh_buffer(f"probs_l{layer}{self._suffix()}", scores.value.shape)
         p = self._position_name(position)
+        valid = self._valid_plus_one(position, "softmax")
         self._record(
             "softmax",
             inputs=(scores,),
             outputs=(out,),
-            attributes={"layer": layer, "position": p},
-            reads=(Region.prefix(scores.value, axis=2, valid=ValidLength(f"{p}+1")),),
+            attributes={"layer": layer, "position": p, "position_form": "row" if valid.is_row else "scalar"},
+            reads=(Region.prefix(scores.value, axis=2, valid=valid),),
             writes=(_regional_reads(out.value),),
             source_location=f"layer {layer} softmax",
             numerical_contract={
                 "stability": "max-subtraction",
-                "invalid_tail": "probabilities beyond p are exactly 0 (written, not read from cache)",
+                "invalid_tail": "probabilities beyond each row's valid length are exactly 0 (written, not read from cache)",
             },
         )
         return out
@@ -649,17 +847,18 @@ class RecordingBackend:
         b, h, d = probs.value.shape[0], probs.value.shape[1], v_cache.value.shape[3]
         out = self.fresh_buffer(f"ctx_l{layer}{self._suffix()}", (b, h, d))
         p = self._position_name(position)
+        valid = self._valid_plus_one(position, "attention_values")
         kvh = kv_heads if kv_heads is not None else h
 
         def v_regions() -> tuple[Region, ...]:
             if kvh == h:
-                return (Region.prefix(v_cache.value, axis=2, valid=ValidLength(f"{p}+1")),)
+                return (Region.prefix(v_cache.value, axis=2, valid=valid),)
             group = h // kvh
             return tuple(
                 Region(
                     v_cache.value.storage_id,
                     v_cache.value,
-                    ((0, b), (g * group, (g + 1) * group), (0, f"{p}+1"), (0, v_cache.value.shape[3])),
+                    ((0, b), (g * group, (g + 1) * group), (0, valid if valid.is_row else f"{p}+1"), (0, v_cache.value.shape[3])),
                 )
                 for g in range(kvh)
             )
@@ -668,13 +867,165 @@ class RecordingBackend:
             "attention_values",
             inputs=(probs, v_cache),
             outputs=(out,),
-            attributes={"layer": layer, "position": p, "kv_heads": kvh},
-            reads=(Region.prefix(probs.value, axis=2, valid=ValidLength(f"{p}+1")),) + v_regions(),
+            attributes={"layer": layer, "position": p, "position_form": "row" if valid.is_row else "scalar", "kv_heads": kvh},
+            reads=(Region.prefix(probs.value, axis=2, valid=valid),) + v_regions(),
             writes=(_regional_reads(out.value),),
             source_location=f"layer {layer} attention values",
             numerical_contract={
                 "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
-                "valid": "only positions [0, p] contribute; V beyond p is never loaded (NaN tails must not leak)",
+                "valid": "only each row's positions [0, pos[b]] contribute; V beyond a row's valid length is never loaded (NaN tails must not leak)",
+                "reduction": "f32, t ascending",
+            },
+        )
+        return out
+
+    # ------------------------------------------------------------------
+    # Paged decode (#94): pools addressed through external slot tables
+    # ------------------------------------------------------------------
+
+    def cache_append_paged(
+        self,
+        k_pool: SymbolicTensor,
+        v_pool: SymbolicTensor,
+        slot_table: SymbolicTensor,
+        k_new: SymbolicTensor,
+        v_new: SymbolicTensor,
+        position,
+        *,
+        layer: int,
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """Append new K/V rows into token-slot-major pools at
+        ``slot_table[b, p]`` (paged decode, §4.3 + #94).
+
+        Pool layout ``[slots, KVH, D]`` — element address
+        ``slot * KVH * D + kvh * D``, exactly the addressing the device
+        kernels already use. The slot table is an external i32 ``[B, S]``
+        input; slot 0 is the reserved null/sink page, never written by a
+        live row. Returns post-append pool views (bumped versions).
+        """
+        self._require_position(position, "cache_append_paged")
+        p = self._position_name(position)
+        b_new, kvh_new, d_new = k_new.value.shape
+        if k_pool.value.shape != (k_pool.value.shape[0], kvh_new, d_new):
+            raise CaptureError(
+                f"paged pool {k_pool.value.shape} does not match k_new {(b_new, kvh_new, d_new)} "
+                "on (KVH, D); pools are token-slot-major [slots, KVH, D]"
+            )
+        if slot_table.value.shape[0] != b_new:
+            raise CaptureError(
+                f"slot table rows {slot_table.value.shape[0]} != batch {b_new}"
+            )
+        self._record(
+            "cache_append_paged",
+            inputs=(k_pool, v_pool, slot_table, k_new, v_new),
+            outputs=(),  # mutation through storage effects; pool views returned below
+            attributes={"layer": layer, "position": p},
+            reads=(_regional_reads(k_new.value), _regional_reads(v_new.value)),
+            writes=(
+                Region.indirect(k_pool.value, slot_table.value, axis=0),
+                Region.indirect(v_pool.value, slot_table.value, axis=0),
+            ),
+            source_location=f"layer {layer} paged kv cache append",
+            numerical_contract={
+                "write": "K_pool[slot_table[b, p], h, :] = k_new[b, h, :]; same for V",
+                "slot0": "reserved null/sink page — never written by a live row",
+                "table": "external i32 [B, S]; row b maps positions through table[b, :]",
+            },
+        )
+        # Post-append versions: same storages, bumped (§4.3).
+        k_post = self.graph.add_tensor(
+            f"k_pool_l{layer}_v{self.graph.storage_versions[k_pool.value.storage_id]}",
+            k_pool.value.shape,
+            k_pool.value.dtype,
+            storage_id=k_pool.value.storage_id,
+            strides=k_pool.value.strides,
+            offset=k_pool.value.offset,
+        )
+        v_post = self.graph.add_tensor(
+            f"v_pool_l{layer}_v{self.graph.storage_versions[v_pool.value.storage_id]}",
+            v_pool.value.shape,
+            v_pool.value.dtype,
+            storage_id=v_pool.value.storage_id,
+            strides=v_pool.value.strides,
+            offset=v_pool.value.offset,
+        )
+        return SymbolicTensor(k_post), SymbolicTensor(v_post)
+
+    def attention_scores_paged(
+        self,
+        q: SymbolicTensor,
+        k_pool: SymbolicTensor,
+        slot_table: SymbolicTensor,
+        position,
+        *,
+        scale: float,
+        layer: int,
+        kv_heads: Optional[int] = None,
+    ) -> SymbolicTensor:
+        """scores[b, h, t] = scale * <q[b, h, :], K_pool[table[b, t], kv(h), :]>
+        for t in [0, p] (GQA-aware; #94).
+        """
+        self._require_position(position, "attention_scores_paged")
+        b, h = q.value.shape[0], q.value.shape[1]
+        s = slot_table.value.shape[1]
+        d = k_pool.value.shape[2]
+        out = self.fresh_buffer(f"scores_l{layer}{self._suffix()}", (b, h, s))
+        p = self._position_name(position)
+        kvh = kv_heads if kv_heads is not None else h
+        self._record(
+            "attention_scores_paged",
+            inputs=(q, k_pool, slot_table),
+            outputs=(out,),
+            attributes={"scale": float(scale), "layer": layer, "position": p, "kv_heads": kvh},
+            reads=(
+                _regional_reads(q.value),
+                Region.indirect(k_pool.value, slot_table.value, axis=0),
+            ),
+            writes=(Region.tile(out.value, ((0, b), (0, h), (0, s))),),
+            source_location=f"layer {layer} paged attention scores",
+            numerical_contract={
+                "scale": f"1/sqrt(D) = {scale}",
+                "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
+                "gather": f"K rows gathered from slots table[b, t], t in [0, {p}]",
+                "reduction": "f32 dot over D, t ascending",
+            },
+        )
+        return out
+
+    def attention_values_paged(
+        self,
+        probs: SymbolicTensor,
+        v_pool: SymbolicTensor,
+        slot_table: SymbolicTensor,
+        position,
+        *,
+        layer: int,
+        kv_heads: Optional[int] = None,
+    ) -> SymbolicTensor:
+        """ctx[b, h, :] = sum_{t<=p} probs[b, h, t] * V_pool[table[b, t], kv(h), :]
+        (GQA-aware; #94). V rows beyond p are never gathered (NaN slots
+        must not leak).
+        """
+        self._require_position(position, "attention_values_paged")
+        b, h = probs.value.shape[0], probs.value.shape[1]
+        d = v_pool.value.shape[2]
+        out = self.fresh_buffer(f"ctx_l{layer}{self._suffix()}", (b, h, d))
+        p = self._position_name(position)
+        kvh = kv_heads if kv_heads is not None else h
+        self._record(
+            "attention_values_paged",
+            inputs=(probs, v_pool, slot_table),
+            outputs=(out,),
+            attributes={"layer": layer, "position": p, "kv_heads": kvh},
+            reads=(
+                Region.prefix(probs.value, axis=2, valid=ValidLength(f"{p}+1")),
+                Region.indirect(v_pool.value, slot_table.value, axis=0),
+            ),
+            writes=(_regional_reads(out.value),),
+            source_location=f"layer {layer} paged attention values",
+            numerical_contract={
+                "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
+                "gather": f"V rows gathered from slots table[b, t], t in [0, {p}]",
                 "reduction": "f32, t ascending",
             },
         )
@@ -685,6 +1036,16 @@ class RecordingBackend:
     # ------------------------------------------------------------------
 
     def _require_position(self, position, op: str) -> None:
+        """Accepts the symbolic scalar ``p`` or a per-row positions tensor
+        registered via :meth:`define_row_positions` (issue #93)."""
+        if isinstance(position, SymbolicTensor):
+            if position.name not in self.graph.row_position_tensors:
+                raise CaptureError(
+                    f"{op} accepts a per-row position tensor only when registered via define_row_positions; got {position!r}"
+                )
+            if position.value.dtype != I32 or len(position.value.shape) != 1:
+                raise CaptureError(f"per-row positions must be an i32 [B] tensor; got {position.value.shape} {position.value.dtype.name}")
+            return
         if not isinstance(position, SymbolicScalar):
             raise CaptureError(f"{op} requires the symbolic decode position; got {position!r}. A concrete position would freeze the cache length into the graph (§4.2).")
         if position.name not in self.graph.scalars:
@@ -692,8 +1053,17 @@ class RecordingBackend:
 
     @staticmethod
     def _position_name(position) -> str:
-        assert isinstance(position, SymbolicScalar)
+        assert isinstance(position, (SymbolicScalar, SymbolicTensor))
         return position.name
+
+    def _valid_plus_one(self, position, op: str) -> ValidLength:
+        """The valid cache length implied by ``position``: scalar ``p+1`` or
+        the per-row form ``pos[b]+1`` (issue #93)."""
+        self._require_position(position, op)
+        p = self._position_name(position)
+        if isinstance(position, SymbolicTensor):
+            return ValidLength.from_positions(p)
+        return ValidLength(f"{p}+1")
 
     def _suffix(self) -> str:
         return f"_t{self._op_counter:02d}"
