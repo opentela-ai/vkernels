@@ -1,0 +1,177 @@
+=== node: nid002670 job=640395 date: Thu Sep 17 07:32:10 PM UTC 2026 ===
+=== src md5: 072266d1 ===
+
+=== build test_moe_fused_bigshape_correct (incremental) ===
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_bigshape_correct
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+--- decode ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=240 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5088/7168 (max |delta| = 4.578e-05, run_rms = 62.47) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=240 max_rel=0.0002422 -> PASS
+--- decode ispp=4096 all-slots expert 255: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=16 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 0/7168 (max |delta| = 0, run_rms = 167.8) -> WITHIN atomic-order bound (PASS)
+[act] max_rel=0 bad=0/65536 worst_flat=-1 diff=0/65536 (0%)
+    [tol] out_rms=167.8 abs_tol=5.034
+    EM=16 max_rel=5.52e-05 -> PASS
+--- prefill ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 4160/7168 (max |delta| = 3.815e-05, run_rms = 62.47) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=960 max_rel=0.0002422 -> PASS
+--- decode ispp=33792 E=32 serving shard: E=32 hidden=7168 ispp=33792 top_k=16 M=1 block=16 situ
+[phase] align ok EM=256 max_expert=31
+[phase] weights filled (w13=7.2 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5060/7168 (max |delta| = 0.0001221, run_rms = 187.5) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=0.001953 bad=0/540672 worst_flat=4 diff=84/540672 (0.0155%)
+    [tol] out_rms=187.5 abs_tol=5.625
+    EM=256 max_rel=0.05809 -> PASS
+--- prefill small E=8 h512 ispp=512: E=8 hidden=512 ispp=512 top_k=4 M=1 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 159/512 (max |delta| = 2.384e-07, run_rms = 0.5633) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=0 bad=0/2048 worst_flat=-1 diff=0/2048 (0%)
+    [tol] out_rms=0.5633 abs_tol=0.0169
+    EM=256 max_rel=2.384e-07 -> PASS
+--- prefill ispp=4096 M=64 no-padding: E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 307970/458752 (max |delta| = 6.104e-05, run_rms = 54.19) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09553 -> PASS
+--- prefill ispp=4096 M=2 padded: E=256 hidden=7168 ispp=4096 top_k=16 M=2 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 8173/14336 (max |delta| = 4.578e-05, run_rms = 58.51) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=0.0004883 bad=0/131072 worst_flat=21 diff=10/131072 (0.00763%)
+    [tol] out_rms=58.51 abs_tol=1.755
+    EM=960 max_rel=0.0002431 -> PASS
+--- prefill small M=64 no-padding: E=8 hidden=512 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 7041/32768 (max |delta| = 2.384e-07, run_rms = 0.6496) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=3.815e-06 bad=0/131072 worst_flat=217 diff=2/131072 (0.00153%)
+    [tol] out_rms=0.6496 abs_tol=0.01949
+    EM=256 max_rel=1.062e-05 -> PASS
+--- bisect E=256 h7168 ispp=512 M=64: E=256 hidden=7168 ispp=512 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=0.9 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 318058/458752 (max |delta| = 3.052e-05, run_rms = 19.06) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=0.0004883 bad=0/524288 worst_flat=4 diff=84/524288 (0.016%)
+    [tol] out_rms=19.06 abs_tol=0.5717
+    EM=1024 max_rel=0.03031 -> PASS
+--- bisect E=256 h7168 ispp=1024 M=64: E=256 hidden=7168 ispp=1024 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=1.8 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 320256/458752 (max |delta| = 4.578e-05, run_rms = 27.02) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=0.0009766 bad=0/1048576 worst_flat=693 diff=158/1048576 (0.0151%)
+    [tol] out_rms=27.02 abs_tol=0.8106
+    EM=1024 max_rel=0.03555 -> PASS
+--- bisect E=256 h7168 ispp=2048 M=64: E=256 hidden=7168 ispp=2048 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=3.5 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 315989/458752 (max |delta| = 6.104e-05, run_rms = 38.53) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=0.001953 bad=0/2097152 worst_flat=210 diff=317/2097152 (0.0151%)
+    [tol] out_rms=38.53 abs_tol=1.156
+    EM=1024 max_rel=0.04959 -> PASS
+--- bisect E=8 h1024 ispp=512 M=64: E=8 hidden=1024 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 17285/65536 (max |delta| = 1.907e-06, run_rms = 1.366) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=6.104e-05 bad=0/131072 worst_flat=24 diff=3/131072 (0.00229%)
+    [tol] out_rms=1.366 abs_tol=0.04099
+    EM=256 max_rel=0.0006905 -> PASS
+--- bisect E=8 h2048 ispp=512 M=64: E=8 hidden=2048 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 35353/131072 (max |delta| = 1.907e-06, run_rms = 2.655) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=25 diff=3/131072 (0.00229%)
+    [tol] out_rms=2.655 abs_tol=0.07966
+    EM=256 max_rel=0.0001258 -> PASS
+--- bisect E=8 h4096 ispp=512 M=64: E=8 hidden=4096 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 48012/262144 (max |delta| = 3.815e-06, run_rms = 5.343) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=233 diff=11/131072 (0.00839%)
+    [tol] out_rms=5.343 abs_tol=0.1603
+    EM=256 max_rel=4.768e-06 -> PASS
+--- decode E=256 h7168 ispp=4096 M=64 (oracle sanity): E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=16 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 323927/458752 (max |delta| = 6.104e-05, run_rms = 54.19) -> WITHIN atomic-order bound (PASS) [float atomicAdd combine: order-only]
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09553 -> PASS
+
+All cases PASS
+
+===== DONE rc=0 =====
