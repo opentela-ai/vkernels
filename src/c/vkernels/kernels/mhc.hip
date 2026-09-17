@@ -248,6 +248,98 @@ void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
       num_tokens, hc_mult3, hc_hidden_size);
 }
 
+// ---------------------------------------------------------------------------
+//  mhc_pre_gemm_sqrsum_blocked (issue #79 gate experiment)
+//
+//  Same GEMM as mhc_pre_gemm_sqrsum, but out[n,o] is accumulated as 256
+//  contiguous-slice left-to-right fp32 chains (thread t owns h in
+//  [t*S, (t+1)*S), S = ceil(hc_hidden/256)) combined by tid 0 strictly in
+//  thread order. This is the closest parallel regrouping to the CPU
+//  oracle's strict left-to-right chain: each partial preserves the oracle's
+//  order within its slice and the combine replays slice order. It exists
+//  because the strictly-sequential variant has a hard latency floor
+//  (hc_hidden DEPENDENT adds x ~4 cyc = 66 us at the ~1 GHz sustained sclk
+//  observed on beverin) that cannot meet the issue's <=50 us target no
+//  matter how well the loads are pipelined. Slices read x/fn directly from
+//  global -- lane-local sequential walks are L1-sector-friendly (each 128 B
+//  sector is fully consumed by its own lane) -- so no staging buffer is
+//  needed: static shared is two 1 KB reduction scratch arrays.
+//  Gate compliance is empirical: test_mhc_correct measures max_rel of this
+//  variant against the same CPU oracle (report-only rows).
+// ---------------------------------------------------------------------------
+__global__ void mhc_pre_gemm_sqrsum_blocked_kernel(
+    const uint16_t* __restrict__ x,   // [num_tokens, hc_hidden_size] bf16
+    const float* __restrict__ fn,     // [hc_mult3, hc_hidden_size] fp32
+    float* __restrict__ out,          // [num_tokens, hc_mult3] fp32
+    float* __restrict__ sqrsum,       // [num_tokens] fp32
+    int num_tokens, int hc_mult3, int hc_hidden_size) {
+// Strict mul+add rounding for the out chain -- no FMA contraction (the
+// CPU oracle is a two-rounding mul-then-add chain).
+// Must be the first statement of the compound block (clang restriction).
+#pragma clang fp contract(off)
+  const int n = blockIdx.x;
+  const int o = blockIdx.y;
+  if (n >= num_tokens || o >= hc_mult3) return;
+  const int tid = threadIdx.x;
+  const uint16_t* x_row = x + (size_t)n * hc_hidden_size;
+  const float* fn_row = fn + (size_t)o * hc_hidden_size;
+
+  __shared__ float sRed[256];   // sqrsum tree-reduction scratch (o == 0)
+  __shared__ float sPart[256];  // per-thread slice partials for the combine
+
+  // Per-token squared-sum (order-free gate), cooperative, o == 0 block.
+  if (o == 0) {
+    float sq = 0.0f;
+    for (int h = tid; h < hc_hidden_size; h += 256) {
+      float xv = bf16_to_f32(x_row[h]);
+      sq += xv * xv;
+    }
+    sRed[tid] = sq;
+    __syncthreads();
+#pragma unroll
+    for (int off = 128; off > 0; off >>= 1) {
+      if (tid < off) sRed[tid] += sRed[tid + off];
+      __syncthreads();
+    }
+    if (tid == 0) sqrsum[n] = sRed[0];
+  }
+
+  // out[n,o]: blocked left-to-right. Thread t chains its contiguous slice
+  // in ascending h (oracle order within the slice); tid 0 then combines
+  // the 256 partials strictly in thread order.
+  const int slice = (hc_hidden_size + 255) / 256;
+  const int h0 = tid * slice;
+  const int h1 = (h0 + slice < hc_hidden_size) ? h0 + slice : hc_hidden_size;
+  float part = 0.0f;
+#pragma unroll 4
+  for (int h = h0; h < h1; ++h) {
+    float p = bf16_to_f32(x_row[h]) * fn_row[h];
+    part += p;
+  }
+  sPart[tid] = part;
+  __syncthreads();
+  if (tid == 0) {
+    float acc = 0.0f;
+#pragma unroll 8
+    for (int t = 0; t < 256; ++t) acc += sPart[t];
+    out[(size_t)n * hc_mult3 + o] = acc;
+  }
+}
+
+void mhc_pre_gemm_sqrsum_blocked(int num_tokens, int hc_mult3,
+                                 int hc_hidden_size,
+                                 const void* x, const void* fn,
+                                 void* out, void* sqrsum, void* stream) {
+  if (num_tokens <= 0 || hc_mult3 <= 0 || hc_hidden_size <= 0) return;
+  dim3 grid(num_tokens, hc_mult3);  // one block per (token, column)
+  dim3 block(256);                  // one chain per thread + in-order combine
+  mhc_pre_gemm_sqrsum_blocked_kernel<<<grid, block, 0,
+      static_cast<hipStream_t>(stream)>>>(
+      reinterpret_cast<const uint16_t*>(x), reinterpret_cast<const float*>(fn),
+      reinterpret_cast<float*>(out), reinterpret_cast<float*>(sqrsum),
+      num_tokens, hc_mult3, hc_hidden_size);
+}
+
 void mhc_post(int num_tokens, int hc, int hidden,
               const void* a, const void* b, const void* c, const void* d,
               void* out, void* stream) {

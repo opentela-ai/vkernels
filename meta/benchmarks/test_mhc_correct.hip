@@ -91,7 +91,8 @@ void cmp(const std::vector<float>& got, const std::vector<float>& ref,
 Stats run_pre(int num_tokens, int hc_mult, int hidden,
               const std::vector<float>& x_src,   // fp32 source
               const std::vector<float>& fn,      // fp32 source (no rounding)
-              uint16_t* dx, float* dfn, float* dout, float* dsqrsum) {
+              uint16_t* dx, float* dfn, float* dout, float* dsqrsum,
+              int variant = 0) {
   const int hc_hidden = hc_mult * hidden;
   const int hc_mult3 = hc_mult * (2 + hc_mult);
   const size_t nx = (size_t)num_tokens * hc_hidden;
@@ -112,8 +113,14 @@ Stats run_pre(int num_tokens, int hc_mult, int hidden,
   // Device.
   CK(hipMemcpy(dx, xb.data(), nx * 2, hipMemcpyHostToDevice), "cpyx");
   CK(hipMemcpy(dfn, fn.data(), nfn * 4, hipMemcpyHostToDevice), "cpyfn");
-  vkernels::kernels::hip::mhc_pre_gemm_sqrsum(num_tokens, hc_mult3, hc_hidden,
-                                              dx, dfn, dout, dsqrsum);
+  if (variant == 0)
+    vkernels::kernels::hip::mhc_pre_gemm_sqrsum(num_tokens, hc_mult3,
+                                                hc_hidden, dx, dfn, dout,
+                                                dsqrsum);
+  else
+    vkernels::kernels::hip::mhc_pre_gemm_sqrsum_blocked(num_tokens, hc_mult3,
+                                                        hc_hidden, dx, dfn,
+                                                        dout, dsqrsum);
   CK(hipDeviceSynchronize(), "sync");
 
   std::vector<float> got(nout), gsq(num_tokens);
@@ -225,6 +232,18 @@ int main() {
                 c.num_tokens, c.hc_mult, c.hidden, hc_hidden, hc_mult3,
                 s.max_abs, s.max_rel, ok ? "PASS" : "FAIL");
     if (!ok) ++fails;
+
+    // Blocked-order variant (issue #79 gate experiment): REPORT-ONLY for
+    // now -- it decides whether the parallel path is adoptable, but must
+    // not fail the suite while the experiment is running.
+    auto sb = run_pre(c.num_tokens, c.hc_mult, c.hidden, x, fn,
+                      dx, dfn, dout, dsqrsum, 1);
+    const bool okb = sb.max_rel < PRE_THRESH;
+    std::printf("  n=%-2d hc_mult=%d hidden=%-4d (hc_hidden=%-5d hc_mult3=%-2d)"
+                "  abs=%.4e rel=%.4e  %s (blocked; within 2e-5: %s)\n",
+                c.num_tokens, c.hc_mult, c.hidden, hc_hidden, hc_mult3,
+                sb.max_abs, sb.max_rel, okb ? "PASS" : "FAIL",
+                sb.max_rel < 2e-5f ? "yes" : "no");
   }
 
   // --- mhc_post ---

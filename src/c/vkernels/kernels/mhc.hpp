@@ -99,6 +99,17 @@ void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
                          const void* x, const void* fn,
                          void* out, void* sqrsum, void* stream = nullptr);
 
+// Blocked-order variant (issue #79 gate experiment): same GEMM, but out[n,o]
+// is accumulated as 256 contiguous-slice left-to-right chains combined in
+// thread order -- the closest parallel regrouping to the CPU oracle's strict
+// sequential chain. Whether it stays inside the associativity envelope is
+// decided empirically by test_mhc_correct (report-only rows).
+void mhc_pre_gemm_sqrsum_blocked(int num_tokens, int hc_mult3,
+                                 int hc_hidden_size,
+                                 const void* x, const void* fn,
+                                 void* out, void* sqrsum,
+                                 void* stream = nullptr);
+
 // HIP post-attention combine (gfx942). `a` (`comb_res_mix`) and `c`
 // (`post_layer_mix`) are fp32 device pointers; `b` (`residual`) and `d`
 // (`x`) are bf16 device pointers; `out` is bf16. fp32 accumulation, bf16
