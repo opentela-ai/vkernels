@@ -194,22 +194,40 @@ def _t_rope(
     B: tl.constexpr,
     NHEAD: tl.constexpr,
     D: tl.constexpr,
+    ROT: tl.constexpr,
+    TSTRIDE: tl.constexpr,
 ):
-    """Rotate-half RoPE at row b's runtime position: one task per (b, head)."""
+    """RoPE at row b's runtime position: one task per (b, head).
+
+    Ported from the 27B-validated ``_h_rope_append`` (device_triton_hybrid):
+    fp32 loads from the (bf16) workspace, NeoX split-half over the first
+    ``ROT`` dims — ``x1' = x1*c - x2*s ; x2' = x2*c + x1*s`` with
+    ``half = ROT // 2`` — and dims ``[ROT, D)`` pass through unchanged.
+
+    ``TSTRIDE`` is the cos/sin table row stride (fp32 tables indexed at the
+    per-row runtime position). The Qwen3 call passes ``ROT=D, TSTRIDE=D``:
+    with the full-width cat([f, f]) tables this reduces exactly to the
+    full-width rotate-half form.
+    """
     task = worker
     while task < B * NHEAD:
         b = task // NHEAD
         h = task % NHEAD
-        half: tl.constexpr = D // 2
+        half: tl.constexpr = ROT // 2
         d = tl.arange(0, half)
         p = tl.load(pos_ptr + b).to(tl.int64)
         base = (b * NHEAD + h) * D
         x1 = tl.load(x_ptr + base + d, cache_modifier=".cg").to(tl.float32)
         x2 = tl.load(x_ptr + base + half + d, cache_modifier=".cg").to(tl.float32)
-        c = tl.load(cos_ptr + p * D + d).to(tl.float32)  # cos = cat([f, f])
-        s = tl.load(sin_ptr + p * D + d).to(tl.float32)
+        c = tl.load(cos_ptr + p * TSTRIDE + d).to(tl.float32)
+        s = tl.load(sin_ptr + p * TSTRIDE + d).to(tl.float32)
         tl.store(y_ptr + base + d, x1 * c - x2 * s)
         tl.store(y_ptr + base + half + d, x2 * c + x1 * s)
+        if ROT < D:  # pass-through tail (empty for the full-width Qwen3 form)
+            offs_d = tl.arange(0, D)
+            mt = offs_d >= ROT
+            tail = tl.load(x_ptr + base + offs_d, mask=mt, other=0.0, cache_modifier=".cg").to(tl.float32)
+            tl.store(y_ptr + base + offs_d, tail, mask=mt)
         task += P
 
 
@@ -559,9 +577,10 @@ def qwen3_megakernel(
         _t_rms_heads(worker, P, base + O_QKV + HD, kn_ptr + li * D, base + O_KN, B, KVH, D, QKVW, EPS)
         grid_barrier(bar_ptr, bar_base + (5 + 17 * l) * P)
         # phases 5-6: rope q/k at each row's runtime position
-        _t_rope(worker, P, base + O_QN, cos_ptr, sin_ptr, pos_ptr, base + O_RQ, B, H, D)
+        # (ROT=D, TSTRIDE=D: full-width rotate_half via the partial template)
+        _t_rope(worker, P, base + O_QN, cos_ptr, sin_ptr, pos_ptr, base + O_RQ, B, H, D, D, D)
         grid_barrier(bar_ptr, bar_base + (6 + 17 * l) * P)
-        _t_rope(worker, P, base + O_KN, cos_ptr, sin_ptr, pos_ptr, base + O_RK, B, KVH, D)
+        _t_rope(worker, P, base + O_KN, cos_ptr, sin_ptr, pos_ptr, base + O_RK, B, KVH, D, D, D)
         grid_barrier(bar_ptr, bar_base + (7 + 17 * l) * P)
         # phase 7: cache append (k roped; v straight from the qkv buffer)
         kcl = k_cache_ptr + li * KCBASE_L
