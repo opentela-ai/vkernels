@@ -149,14 +149,30 @@ static void bench_pre(const GpuInfo& info, hipEvent_t start, hipEvent_t stop,
     check_hip(hipMemcpy(dx, x.data(), nx * 2, hipMemcpyHostToDevice), "cpyx");
     check_hip(hipMemcpy(dfn, fn.data(), nfn * 4, hipMemcpyHostToDevice),
               "cpyfn");
+    if (variant != 0) {  // blocked ladder: one row per NSLICE
+      std::printf("  %4s %8s %6s %6s %8s %9s\n", "n", "hc_hidden", "hc_mult3",
+                  "ns", "us(min)", "us(med)");
+      for (int ns : {256, 128, 64, 32, 16, 8, 4, 2, 1}) {
+        auto L = [&] {
+          vkernels::kernels::hip::mhc_pre_gemm_sqrsum_blocked(
+              c.num_tokens, hc_mult3, hc_hidden, dx, dfn, dout, dsq, nullptr,
+              ns);
+        };
+        auto r = bench_us(L, start, stop);
+        std::printf("  %4d %8d %6d %6d %8.2f %9.2f\n",
+                    c.num_tokens, hc_hidden, hc_mult3, ns, r.min_us,
+                    r.median_us);
+      }
+      check_hip(hipFree(dx), "fx");
+      check_hip(hipFree(dfn), "ffn");
+      check_hip(hipFree(dout), "fout");
+      check_hip(hipFree(dsq), "fsq");
+      continue;
+    }
     auto L = [&] {
-      if (variant == 0)
-        vkernels::kernels::hip::mhc_pre_gemm_sqrsum(c.num_tokens, hc_mult3,
-                                                    hc_hidden, dx, dfn, dout,
-                                                    dsq);
-      else
-        vkernels::kernels::hip::mhc_pre_gemm_sqrsum_blocked(
-            c.num_tokens, hc_mult3, hc_hidden, dx, dfn, dout, dsq);
+      vkernels::kernels::hip::mhc_pre_gemm_sqrsum(c.num_tokens, hc_mult3,
+                                                  hc_hidden, dx, dfn, dout,
+                                                  dsq);
     };
     auto r = bench_us(L, start, stop);
     double flops = 2.0 * c.num_tokens * hc_hidden * hc_mult3

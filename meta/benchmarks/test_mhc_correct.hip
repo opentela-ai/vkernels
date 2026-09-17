@@ -92,7 +92,7 @@ Stats run_pre(int num_tokens, int hc_mult, int hidden,
               const std::vector<float>& x_src,   // fp32 source
               const std::vector<float>& fn,      // fp32 source (no rounding)
               uint16_t* dx, float* dfn, float* dout, float* dsqrsum,
-              int variant = 0) {
+              int variant = 0, int nslice = 256) {
   const int hc_hidden = hc_mult * hidden;
   const int hc_mult3 = hc_mult * (2 + hc_mult);
   const size_t nx = (size_t)num_tokens * hc_hidden;
@@ -120,7 +120,8 @@ Stats run_pre(int num_tokens, int hc_mult, int hidden,
   else
     vkernels::kernels::hip::mhc_pre_gemm_sqrsum_blocked(num_tokens, hc_mult3,
                                                         hc_hidden, dx, dfn,
-                                                        dout, dsqrsum);
+                                                        dout, dsqrsum, nullptr,
+                                                        nslice);
   CK(hipDeviceSynchronize(), "sync");
 
   std::vector<float> got(nout), gsq(num_tokens);
@@ -233,17 +234,19 @@ int main() {
                 s.max_abs, s.max_rel, ok ? "PASS" : "FAIL");
     if (!ok) ++fails;
 
-    // Blocked-order variant (issue #79 gate experiment): REPORT-ONLY for
-    // now -- it decides whether the parallel path is adoptable, but must
-    // not fail the suite while the experiment is running.
-    auto sb = run_pre(c.num_tokens, c.hc_mult, c.hidden, x, fn,
-                      dx, dfn, dout, dsqrsum, 1);
-    const bool okb = sb.max_rel < PRE_THRESH;
-    std::printf("  n=%-2d hc_mult=%d hidden=%-4d (hc_hidden=%-5d hc_mult3=%-2d)"
-                "  abs=%.4e rel=%.4e  %s (blocked; within 2e-5: %s)\n",
-                c.num_tokens, c.hc_mult, c.hidden, hc_hidden, hc_mult3,
-                sb.max_abs, sb.max_rel, okb ? "PASS" : "FAIL",
-                sb.max_rel < 2e-5f ? "yes" : "no");
+    // Blocked-order ladder (issue #79 gate experiment): REPORT-ONLY --
+    // sweeps NSLICE to find the fastest gate-compliant point. NSLICE=1 is
+    // the oracle's own strict chain (bitwise-exact anchor).
+    std::printf("  blocked ladder n=%-2d hc_mult=%d hidden=%-4d:\n",
+                c.num_tokens, c.hc_mult, c.hidden);
+    for (int ns : {256, 128, 64, 32, 16, 8, 4, 2, 1}) {
+      auto sb = run_pre(c.num_tokens, c.hc_mult, c.hidden, x, fn,
+                        dx, dfn, dout, dsqrsum, 1, ns);
+      std::printf("    ns=%-3d abs=%.4e rel=%.4e  %s (2e-5: %s)\n",
+                  ns, sb.max_abs, sb.max_rel,
+                  sb.max_rel < PRE_THRESH ? "PASS" : "FAIL",
+                  sb.max_rel < 2e-5f ? "yes" : "no");
+    }
   }
 
   // --- mhc_post ---

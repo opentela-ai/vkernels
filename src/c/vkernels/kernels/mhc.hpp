@@ -108,7 +108,7 @@ void mhc_pre_gemm_sqrsum_blocked(int num_tokens, int hc_mult3,
                                  int hc_hidden_size,
                                  const void* x, const void* fn,
                                  void* out, void* sqrsum,
-                                 void* stream = nullptr);
+                                 void* stream = nullptr, int nslice = 256);
 
 // HIP post-attention combine (gfx942). `a` (`comb_res_mix`) and `c`
 // (`post_layer_mix`) are fp32 device pointers; `b` (`residual`) and `d`

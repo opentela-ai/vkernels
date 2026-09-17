@@ -251,22 +251,22 @@ void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
 // ---------------------------------------------------------------------------
 //  mhc_pre_gemm_sqrsum_blocked (issue #79 gate experiment)
 //
-//  Same GEMM as mhc_pre_gemm_sqrsum, but out[n,o] is accumulated as 256
-//  contiguous-slice left-to-right fp32 chains (thread t owns h in
-//  [t*S, (t+1)*S), S = ceil(hc_hidden/256)) combined by tid 0 strictly in
-//  thread order. This is the closest parallel regrouping to the CPU
-//  oracle's strict left-to-right chain: each partial preserves the oracle's
-//  order within its slice and the combine replays slice order. It exists
-//  because the strictly-sequential variant has a hard latency floor
-//  (hc_hidden DEPENDENT adds x ~4 cyc = 66 us at the ~1 GHz sustained sclk
-//  observed on beverin) that cannot meet the issue's <=50 us target no
-//  matter how well the loads are pipelined. Slices read x/fn directly from
-//  global -- lane-local sequential walks are L1-sector-friendly (each 128 B
-//  sector is fully consumed by its own lane) -- so no staging buffer is
-//  needed: static shared is two 1 KB reduction scratch arrays.
-//  Gate compliance is empirical: test_mhc_correct measures max_rel of this
-//  variant against the same CPU oracle (report-only rows).
+//  Same GEMM as mhc_pre_gemm_sqrsum, but out[n,o] is accumulated as NSLICE
+//  contiguous-slice left-to-right fp32 chains (thread t owns
+//  [t*S, (t+1)*S), S = ceil(hc_hidden/NSLICE)) combined by tid 0 strictly
+//  in thread order (idle threads contribute exact +0.0 -- a bitwise no-op
+//  on the chain). NSLICE=1 IS the oracle's strict chain (bitwise-exact by
+//  construction); larger NSLICE trades gate margin for latency. The ladder
+//  {256..1} is swept by test_mhc_correct (drift) and bench_mhc (latency) to
+//  pin the fastest gate-compliant point. Motivation: the strictly-
+//  sequential variant has a hard latency floor (hc_hidden DEPENDENT adds x
+//  ~4 cyc = 66 us at the ~1 GHz sustained sclk observed on beverin) and the
+//  256-slice variant drifts to 1.16e-4 rel on the n=7 row (FAIL at 1e-4) --
+//  the sweet spot is in between. Threads read x/fn directly from global --
+//  lane-local sequential walks are L1-sector-friendly -- so no staging
+//  buffer: static shared is two 1 KB reduction scratch arrays.
 // ---------------------------------------------------------------------------
+template <int NSLICE>
 __global__ void mhc_pre_gemm_sqrsum_blocked_kernel(
     const uint16_t* __restrict__ x,   // [num_tokens, hc_hidden_size] bf16
     const float* __restrict__ fn,     // [hc_mult3, hc_hidden_size] fp32
@@ -287,7 +287,9 @@ __global__ void mhc_pre_gemm_sqrsum_blocked_kernel(
   __shared__ float sRed[256];   // sqrsum tree-reduction scratch (o == 0)
   __shared__ float sPart[256];  // per-thread slice partials for the combine
 
-  // Per-token squared-sum (order-free gate), cooperative, o == 0 block.
+  // Per-token squared-sum (order-free gate), cooperative over all 256
+  // threads regardless of NSLICE (at small NSLICE a serial sqrsum would
+  // dominate the kernel).
   if (o == 0) {
     float sq = 0.0f;
     for (int h = tid; h < hc_hidden_size; h += 256) {
@@ -304,17 +306,19 @@ __global__ void mhc_pre_gemm_sqrsum_blocked_kernel(
     if (tid == 0) sqrsum[n] = sRed[0];
   }
 
-  // out[n,o]: blocked left-to-right. Thread t chains its contiguous slice
-  // in ascending h (oracle order within the slice); tid 0 then combines
-  // the 256 partials strictly in thread order.
-  const int slice = (hc_hidden_size + 255) / 256;
+  // out[n,o]: NSLICE blocked left-to-right chains + in-order combine.
+  // blockDim is always 256; threads >= NSLICE contribute exact +0.0.
+  const int slice = (hc_hidden_size + NSLICE - 1) / NSLICE;
   const int h0 = tid * slice;
-  const int h1 = (h0 + slice < hc_hidden_size) ? h0 + slice : hc_hidden_size;
   float part = 0.0f;
+  if (tid < NSLICE && h0 < hc_hidden_size) {
+    const int h1 = (h0 + slice < hc_hidden_size) ? h0 + slice
+                                                 : hc_hidden_size;
 #pragma unroll 4
-  for (int h = h0; h < h1; ++h) {
-    float p = bf16_to_f32(x_row[h]) * fn_row[h];
-    part += p;
+    for (int h = h0; h < h1; ++h) {
+      float p = bf16_to_f32(x_row[h]) * fn_row[h];
+      part += p;
+    }
   }
   sPart[tid] = part;
   __syncthreads();
@@ -329,15 +333,34 @@ __global__ void mhc_pre_gemm_sqrsum_blocked_kernel(
 void mhc_pre_gemm_sqrsum_blocked(int num_tokens, int hc_mult3,
                                  int hc_hidden_size,
                                  const void* x, const void* fn,
-                                 void* out, void* sqrsum, void* stream) {
+                                 void* out, void* sqrsum, void* stream,
+                                 int nslice) {
   if (num_tokens <= 0 || hc_mult3 <= 0 || hc_hidden_size <= 0) return;
+  if (nslice <= 0) nslice = 256;
   dim3 grid(num_tokens, hc_mult3);  // one block per (token, column)
-  dim3 block(256);                  // one chain per thread + in-order combine
-  mhc_pre_gemm_sqrsum_blocked_kernel<<<grid, block, 0,
-      static_cast<hipStream_t>(stream)>>>(
-      reinterpret_cast<const uint16_t*>(x), reinterpret_cast<const float*>(fn),
-      reinterpret_cast<float*>(out), reinterpret_cast<float*>(sqrsum),
-      num_tokens, hc_mult3, hc_hidden_size);
+  dim3 block(256);                  // sqrsum coop + idle-thread +0.0 padding
+  hipStream_t s = static_cast<hipStream_t>(stream);
+  const uint16_t* xp = reinterpret_cast<const uint16_t*>(x);
+  const float* fp = reinterpret_cast<const float*>(fn);
+  float* op = reinterpret_cast<float*>(out);
+  float* sp = reinterpret_cast<float*>(sqrsum);
+#define VK_MHC_BLOCKED_CASE(N)                                                \
+  do {                                                                        \
+    if (nslice == N)                                                          \
+      mhc_pre_gemm_sqrsum_blocked_kernel<N>                                   \
+          <<<grid, block, 0, s>>>(xp, fp, op, sp, num_tokens, hc_mult3,       \
+                                  hc_hidden_size);                            \
+  } while (0)
+  VK_MHC_BLOCKED_CASE(1);
+  VK_MHC_BLOCKED_CASE(2);
+  VK_MHC_BLOCKED_CASE(4);
+  VK_MHC_BLOCKED_CASE(8);
+  VK_MHC_BLOCKED_CASE(16);
+  VK_MHC_BLOCKED_CASE(32);
+  VK_MHC_BLOCKED_CASE(64);
+  VK_MHC_BLOCKED_CASE(128);
+  VK_MHC_BLOCKED_CASE(256);
+#undef VK_MHC_BLOCKED_CASE
 }
 
 void mhc_post(int num_tokens, int hc, int hidden,
