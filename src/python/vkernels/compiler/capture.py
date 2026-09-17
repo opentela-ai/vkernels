@@ -820,6 +820,155 @@ class RecordingBackend:
             offset=sv.offset,
         )
         return out, SymbolicTensor(post)
+    def mhc_pre(
+        self,
+        streams: SymbolicTensor,
+        fn: SymbolicTensor,
+        base: SymbolicTensor,
+        scale: SymbolicTensor,
+        *,
+        layer: int,
+        iters: int,
+        eps: float,
+        rms_eps: float,
+    ) -> tuple[SymbolicTensor, SymbolicTensor, SymbolicTensor]:
+        """mHC hyper-connection pre-mix (issue #99; floe
+        ``DeepseekV4HyperConnection.forward`` / ``Glm53HyperConnection.forward``
+        — one op family, family attributes).
+
+        Per decode token (row ``b`` of the ``[B, hc, C]`` stream stack), with
+        ``mix = (2 + hc)·hc``:
+
+            flat    = unweighted_rms_norm(flatten(streams[b]))    # [hc·C], fp32
+            logits  = fn @ flat + base                            # [mix] GEMV
+            pre_w, post_w, comb_w = split(logits, [hc, hc, hc²])
+            pre     = sigmoid(pre_w·pre_s + pre_b) + eps          # [hc]
+            post    = 2·sigmoid(post_w·post_s + post_b)           # [hc], (0, 2)
+            comb    = softmax((comb_w·comb_s + comb_b).view(hc, hc), -1) + eps
+            comb    = comb / (colsum(comb) + eps)                 # Sinkhorn-Knopp:
+            for _ in range(iters − 1):                            # alternate row/col
+                comb = comb / (rowsum(comb) + eps)                # normalization to
+                comb = comb / (colsum(comb) + eps)                # doubly-stochastic
+            h_in   = Σ_h pre_h · streams[b, h, :]                 # stream collapse
+
+        ``pre``/``post``/``comb`` are DATA-DEPENDENT — computed from the stream
+        contents every step, so the Sinkhorn projection runs per token, not at
+        load time. ``base`` splits into (pre_b, post_b, comb_b) with comb_b
+        viewed ``[hc, hc]``; ``scale`` = (pre_s, post_s, comb_s) scalars. All
+        mixing math is fp32 (Sinkhorn numerics demand it); ``h_in`` follows the
+        streams dtype.
+
+        Stream state is intermediate workspace: ``streams`` is read-only here
+        (the composing ``mhc_post`` writes the updated stack to a fresh buffer),
+        and ``h_in``/``post``/``comb`` are fresh compiler-planned buffers — no
+        persistent state pool, no read-modify-write effects.
+
+        Returns ``(h_in, post, comb)``; the block body consumes ``h_in`` and
+        ``mhc_post`` consumes ``(streams, body_out, post, comb)``.
+        """
+        sv, fnv, bv, scv = (
+            streams.value, fn.value, base.value, scale.value,
+        )
+        if len(sv.shape) != 3:
+            raise CaptureError(f"mhc_pre streams must be [B, hc, C]; got shape {sv.shape}")
+        B, hc, C = sv.shape
+        mix = (2 + hc) * hc
+        if fnv.shape != (mix, hc * C):
+            raise CaptureError(
+                f"mhc_pre fn must be [{mix}, {hc * C}] = [(2+hc)·hc, hc·C]; got shape {fnv.shape}"
+            )
+        if bv.shape != (mix,):
+            raise CaptureError(f"mhc_pre base must be [{mix}]; got shape {bv.shape}")
+        if scv.shape != (3,):
+            raise CaptureError(f"mhc_pre scale must be [3] = (pre_s, post_s, comb_s); got shape {scv.shape}")
+        if iters < 1:
+            raise CaptureError(f"mhc_pre Sinkhorn iters must be >= 1; got {iters}")
+        h_in = self.fresh_buffer(f"mhc_h_in_l{layer}{self._suffix()}", (B, C), dtype=sv.dtype)
+        post = self.fresh_buffer(f"mhc_post_w_l{layer}{self._suffix()}", (B, hc), dtype=F32)
+        comb = self.fresh_buffer(f"mhc_comb_l{layer}{self._suffix()}", (B, hc, hc), dtype=F32)
+        self._record(
+            "mhc_pre",
+            inputs=(streams, fn, base, scale),
+            outputs=(h_in, post, comb),
+            attributes={"layer": layer, "hc": hc, "iters": iters, "eps": eps, "rms_eps": rms_eps},
+            reads=(
+                _regional_reads(sv), _regional_reads(fnv),
+                _regional_reads(bv), _regional_reads(scv),
+            ),
+            writes=(
+                _regional_reads(h_in.value), _regional_reads(post.value),
+                _regional_reads(comb.value),
+            ),
+            source_location=f"layer {layer} mhc pre-mix",
+            numerical_contract={
+                "input_norm": "flat = flatten(streams[b]) * rsqrt(mean(flat²) + rms_eps), fp32 (unweighted RMSNorm over the full hc·C vector)",
+                "projection": "logits = fn @ flat (F.linear, NO projection bias), one [mix=(2+hc)·hc, hc·C] GEMV per token (data-dependent); base enters only inside the gates",
+                "pre": "pre = sigmoid(pre_w·pre_s + pre_b) + eps, [hc]",
+                "post": "post = 2·sigmoid(post_w·post_s + post_b), [hc], range (0, 2)",
+                "comb": "comb = softmax((comb_w·comb_s + comb_b.view(hc, hc)), dim=-1) + eps",
+                "sinkhorn": "comb /= (colsum(comb) + eps); then (iters−1)× [comb /= (rowsum+eps); comb /= (colsum+eps)] — alternate normalization to doubly-stochastic, eps inside every denominator",
+                "collapse": "h_in = Σ_h pre_h · streams[b, h, :] (raw streams, not the normalized flat)",
+                "dtypes": "streams bf16 workspace loads, all mixing math fp32 (Sinkhorn numerics demand it), h_in follows the streams dtype",
+                "state": "streams read-only workspace; h_in/post/comb fresh buffers — intermediate, NOT a persistent state pool",
+            },
+        )
+        return h_in, post, comb
+
+    def mhc_post(
+        self,
+        streams: SymbolicTensor,
+        body_out: SymbolicTensor,
+        post: SymbolicTensor,
+        comb: SymbolicTensor,
+        *,
+        layer: int,
+    ) -> SymbolicTensor:
+        """mHC hyper-connection post-compose (issue #99; floe
+        ``_mhc_compose``): place the sublayer output back onto the hc parallel
+        residual streams with the Sinkhorn-projected mixer —
+
+            streams'[j, :] = post[j]·body_out[:] + Σ_k comb[k, j]·streams[k, :]
+
+        (floe torch reference: ``post.unsqueeze(-1)·sublayer_out.unsqueeze(-2)
+        + combᵀ @ residual``). ``post``/``comb`` are the data-dependent weights
+        this token's ``mhc_pre`` produced. The updated stream stack is written
+        to a FRESH ``[B, hc, C]`` workspace buffer (intermediate, NOT a
+        persistent state pool — the next layer's ``mhc_pre`` consumes the
+        returned view through an ordinary RAW dependency).
+        """
+        sv, ov, pv, cv = (
+            streams.value, body_out.value, post.value, comb.value,
+        )
+        if len(sv.shape) != 3:
+            raise CaptureError(f"mhc_post streams must be [B, hc, C]; got shape {sv.shape}")
+        B, hc, C = sv.shape
+        if ov.shape != (B, C):
+            raise CaptureError(f"mhc_post body_out must be [B, {C}]; got shape {ov.shape}")
+        if pv.shape != (B, hc):
+            raise CaptureError(f"mhc_post post weights must be [B, {hc}]; got shape {pv.shape}")
+        if cv.shape != (B, hc, hc):
+            raise CaptureError(f"mhc_post comb must be [B, {hc}, {hc}]; got shape {cv.shape}")
+        streams_post = self.fresh_buffer(
+            f"mhc_streams_l{layer}{self._suffix()}", (B, hc, C), dtype=sv.dtype
+        )
+        self._record(
+            "mhc_post",
+            inputs=(streams, body_out, post, comb),
+            outputs=(streams_post,),
+            attributes={"layer": layer, "hc": hc},
+            reads=(
+                _regional_reads(sv), _regional_reads(ov),
+                _regional_reads(pv), _regional_reads(cv),
+            ),
+            writes=(_regional_reads(streams_post.value),),
+            source_location=f"layer {layer} mhc post-compose",
+            numerical_contract={
+                "compose": "streams'[j] = post[j]·body_out + Σ_k comb[k, j]·streams[k] (combᵀ @ streams + post ⊙ body_out)",
+                "dtypes": "fp32 compose arithmetic, streams' follows the streams dtype",
+                "state": "fresh [B, hc, C] workspace buffer per layer — intermediate, NOT a persistent state pool",
+            },
+        )
+        return streams_post
 
     def attention_scores(
         self,

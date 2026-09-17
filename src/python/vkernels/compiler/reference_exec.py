@@ -143,6 +143,8 @@ class ReferenceExecutor:
             "cache_append": self._body_cache_append,
             "gdn_conv": self._body_gdn_conv,
             "cache_append_paged": self._body_cache_append_paged,
+            "mhc_pre": self._body_mhc_pre,
+            "mhc_post": self._body_mhc_post,
             "attention_scores": self._body_attention_scores,
             "attention_scores_paged": self._body_attention_scores_paged,
             "softmax": self._body_softmax,
@@ -558,6 +560,76 @@ class ReferenceExecutor:
         # Gathered masked: V rows beyond p are never gathered (NaN slots must not leak).
         slots = table[b, : p + 1].astype(np.int64)
         y[b, h, :] = (probs[b, h, : p + 1] @ v_pool[slots, kvh, :]).astype(y.dtype)
+    def _body_mhc_pre(self, fam: TaskFamily, coords, scalars) -> None:
+        """mHC hyper-connection pre-mix over one batch row.
+
+        fp64 oracle arithmetic mirroring floe
+        ``DeepseekV4HyperConnection.forward`` / ``Glm53HyperConnection``
+        (device math is fp32; the fp64 mirror is the bare-environment
+        oracle pin — issue #99 validation doctrine): unweighted RMSNorm
+        over the flattened streams, one [mix, hc·C] GEMV projection,
+        sigmoid pre/post gates, softmax + Sinkhorn-Knopp alternate row/col
+        normalization (eps inside every denominator) and the pre-weighted
+        stream collapse.
+        """
+        streams = self.tensor(fam.inputs[0])  # [B, hc, C]
+        fn = self.tensor(fam.inputs[1])  # [mix, hc·C]
+        base = self.tensor(fam.inputs[2])  # [mix]
+        scale = self.tensor(fam.inputs[3])  # [3]
+        h_in = self.tensor(fam.outputs[0])  # [B, C]
+        post_o = self.tensor(fam.outputs[1])  # [B, hc]
+        comb_out = self.tensor(fam.outputs[2])  # [B, hc, hc]
+        (bb,) = coords
+        hc, C = streams.shape[1], streams.shape[2]
+        iters, eps = int(fam.params["iters"]), float(fam.params["eps"])
+        rms_eps = float(fam.params["rms_eps"])
+
+        flat = streams[bb].astype(np.float64).reshape(-1)  # [hc·C]
+        flat = flat / np.sqrt(np.mean(flat * flat) + rms_eps)  # unweighted RMSNorm
+        # floe F.linear(flat, fn) — NO bias on the projection; base enters
+        # only inside the gates below (adding it here double-counts it)
+        logits = fn.astype(np.float64) @ flat  # [mix]
+        pre_w, post_w, comb_w = (
+            logits[:hc], logits[hc : 2 * hc], logits[2 * hc :].reshape(hc, hc),
+        )
+        pre_s, post_s, comb_s = (float(scale[0]), float(scale[1]), float(scale[2]))
+        pre_b, post_b, comb_b = (
+            base.astype(np.float64)[:hc],
+            base.astype(np.float64)[hc : 2 * hc],
+            base.astype(np.float64)[2 * hc :].reshape(hc, hc),
+        )
+
+        pre = 1.0 / (1.0 + np.exp(-(pre_w * pre_s + pre_b))) + eps
+        post = 2.0 / (1.0 + np.exp(-(post_w * post_s + post_b)))
+        comb_logits = comb_w * comb_s + comb_b
+        comb_logits = comb_logits - comb_logits.max(axis=-1, keepdims=True)
+        comb = np.exp(comb_logits)
+        comb = comb / comb.sum(axis=-1, keepdims=True) + eps
+        # Sinkhorn-Knopp: initial column normalization, then (iters−1)
+        # alternate row/col passes — eps inside every denominator, exactly
+        # as floe conditions them.
+        comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
+        for _ in range(iters - 1):
+            comb = comb / (comb.sum(axis=-1, keepdims=True) + eps)
+            comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
+
+        h_in[bb] = (pre[:, None] * streams[bb].astype(np.float64)).sum(axis=0).astype(h_in.dtype)
+        post_o[bb] = post.astype(post_o.dtype)
+        comb_out[bb] = comb.astype(comb_out.dtype)
+
+    def _body_mhc_post(self, fam: TaskFamily, coords, scalars) -> None:
+        """mHC post-compose over one (batch, stream j) task (fp64 mirror of
+        floe ``_mhc_compose``):
+        ``streams'[j] = post[j]·body_out + Σ_k comb[k, j]·streams[k]``."""
+        streams = self.tensor(fam.inputs[0])  # [B, hc, C]
+        body_out = self.tensor(fam.inputs[1])  # [B, C]
+        post_w = self.tensor(fam.inputs[2])  # [B, hc]
+        comb = self.tensor(fam.inputs[3])  # [B, hc, hc]
+        streams_post = self.tensor(fam.outputs[0])  # [B, hc, C]
+        bb, j = coords
+        acc = (comb[bb, :, j].astype(np.float64)[:, None] * streams[bb].astype(np.float64)).sum(axis=0)
+        acc = acc + float(post_w[bb, j]) * body_out[bb].astype(np.float64)
+        streams_post[bb, j] = acc.astype(streams_post.dtype)
 
     def _body_attention_scores(self, fam: TaskFamily, coords, scalars) -> None:
         q = self.tensor(fam.inputs[0]).astype(np.float64)
