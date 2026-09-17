@@ -480,6 +480,77 @@ def lower_gdn_conv(op: Operator, graph: OperatorGraph) -> TaskFamily:
 # ---------------------------------------------------------------------------
 
 
+def lower_gdn_delta(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    """One task per (batch, value head): the task owns the head's [HV, HK]
+    state slice (read-modify-write, in registers on device) and its v/z
+    rows; q/k are read per key head (group-expanded). The state WAW/WAR is
+    phase-ordered like the KV append — two gdn_delta ops on one pool chain
+    through the state-storage hazards."""
+    state = graph.tensor(op.inputs[0])
+    q = graph.tensor(op.inputs[1])
+    k = graph.tensor(op.inputs[2])
+    v = graph.tensor(op.inputs[3])
+    z = graph.tensor(op.inputs[4])
+    a = graph.tensor(op.inputs[5])
+    b = graph.tensor(op.inputs[6])
+    a_log = graph.tensor(op.inputs[7])
+    dt_bias = graph.tensor(op.inputs[8])
+    norm_w = graph.tensor(op.inputs[9])
+    out = graph.tensor(op.outputs[0])
+    B, NV, HV, HK = state.shape
+    NK = q.shape[1]
+    if NV % NK:
+        raise ValueError(f"gdn_delta head group must divide: NV={NV} not divisible by NK={NK}")
+    domain = TileDomain(((B, 1), (NV, 1)))
+
+    def reads(coords):
+        bb, h = coords
+        kh = h // (NV // NK)
+        return (
+            _tile_region(state, ((bb, bb + 1), (h, h + 1), (0, HV), (0, HK))),
+            _tile_region(q, ((bb, bb + 1), (kh, kh + 1), (0, HK))),
+            _tile_region(k, ((bb, bb + 1), (kh, kh + 1), (0, HK))),
+            _tile_region(v, ((bb, bb + 1), (h, h + 1), (0, HV))),
+            _tile_region(z, ((bb, bb + 1), (h, h + 1), (0, HV))),
+            _tile_region(a, ((bb, bb + 1), (h, h + 1))),
+            _tile_region(b, ((bb, bb + 1), (h, h + 1))),
+            _whole(a_log),
+            _whole(dt_bias),
+            _whole(norm_w),
+        )
+
+    def writes(coords):
+        bb, h = coords
+        # Read-modify-write: the task updates its own state slice in place.
+        return (
+            _tile_region(state, ((bb, bb + 1), (h, h + 1), (0, HV), (0, HK))),
+            _tile_region(out, ((bb, bb + 1), (h, h + 1), (0, HV))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_gdn_delta",
+        kind="gdn_delta",
+        op=op,
+        domain=domain,
+        inputs=(state.name, q.name, k.name, v.name, z.name, a.name, b.name, a_log.name, dt_bias.name, norm_w.name),
+        outputs=(out.name,),
+        params={
+            "layer": op.attributes.get("layer", 0),
+            "scale": op.attributes.get("scale", 1.0),
+            "eps": op.attributes.get("eps", 1e-6),
+        },
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=HV * HK * 4,  # the [HV, HK] fp32 state slice (registers/scratch budget)
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Attention: one task per (batch, head); valid prefix [0, p] (§5.3, §10.3)
+# ---------------------------------------------------------------------------
+
+
 def lower_attention_scores(op: Operator, graph: OperatorGraph) -> TaskFamily:
     q = graph.tensor(op.inputs[0])
     k_cache = graph.tensor(op.inputs[1])
@@ -602,6 +673,7 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "embedding": lower_embedding,
     "cache_append": lower_cache_append,
     "gdn_conv": lower_gdn_conv,
+    "gdn_delta": lower_gdn_delta,
     "attention_scores": lower_attention_scores,
     "softmax": lower_softmax,
     "attention_values": lower_attention_values,
