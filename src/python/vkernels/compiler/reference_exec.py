@@ -139,10 +139,13 @@ class ReferenceExecutor:
             "elementwise": self._body_elementwise,
             "embedding": self._body_embedding,
             "cache_append": self._body_cache_append,
+            "cache_append_paged": self._body_cache_append_paged,
             "attention_scores": self._body_attention_scores,
+            "attention_scores_paged": self._body_attention_scores_paged,
             "softmax": self._body_softmax,
             "attention_values": self._body_attention_values,
             "gemv_fp8": self._body_gemv_fp8,
+            "attention_values_paged": self._body_attention_values_paged,
         }
         self._barrier_state = None
 
@@ -391,6 +394,44 @@ class ReferenceExecutor:
         p = scalars["p"]
         k_cache[b, h, p, :] = k_new[b, h, :]
         v_cache[b, h, p, :] = v_new[b, h, :]
+
+    def _body_cache_append_paged(self, fam: TaskFamily, coords, scalars) -> None:
+        k_pool = self.tensor(fam.inputs[0])
+        v_pool = self.tensor(fam.inputs[1])
+        table = self.tensor(fam.inputs[2])
+        k_new = self.tensor(fam.inputs[3])
+        v_new = self.tensor(fam.inputs[4])
+        b, h = coords
+        p = int(scalars["p"])
+        slot = int(table[b, p])  # write lands at slot_table[b, p_row] (#94)
+        k_pool[slot, h, :] = k_new[b, h, :]
+        v_pool[slot, h, :] = v_new[b, h, :]
+
+    def _body_attention_scores_paged(self, fam: TaskFamily, coords, scalars) -> None:
+        q = self.tensor(fam.inputs[0]).astype(np.float64)
+        k_pool = self.tensor(fam.inputs[1]).astype(np.float64)
+        table = self.tensor(fam.inputs[2])
+        y = self.tensor(fam.outputs[0])
+        b, h = coords
+        kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
+        p = int(scalars["p"])
+        scale = fam.params["scale"]
+        # Gathered masked load: only positions [0, p] map through the table;
+        # slot 0 is the reserved null/sink page (never written by a live row).
+        slots = table[b, : p + 1].astype(np.int64)
+        y[b, h, : p + 1] = (k_pool[slots, kvh, :] @ q[b, h, :] * scale).astype(y.dtype)
+
+    def _body_attention_values_paged(self, fam: TaskFamily, coords, scalars) -> None:
+        probs = self.tensor(fam.inputs[0]).astype(np.float64)
+        v_pool = self.tensor(fam.inputs[1]).astype(np.float64)
+        table = self.tensor(fam.inputs[2])
+        y = self.tensor(fam.outputs[0])
+        b, h = coords
+        kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
+        p = int(scalars["p"])
+        # Gathered masked: V rows beyond p are never gathered (NaN slots must not leak).
+        slots = table[b, : p + 1].astype(np.int64)
+        y[b, h, :] = (probs[b, h, : p + 1] @ v_pool[slots, kvh, :]).astype(y.dtype)
 
     def _body_attention_scores(self, fam: TaskFamily, coords, scalars) -> None:
         q = self.tensor(fam.inputs[0]).astype(np.float64)

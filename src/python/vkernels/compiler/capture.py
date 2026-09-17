@@ -670,6 +670,158 @@ class RecordingBackend:
         return out
 
     # ------------------------------------------------------------------
+    # Paged decode (#94): pools addressed through external slot tables
+    # ------------------------------------------------------------------
+
+    def cache_append_paged(
+        self,
+        k_pool: SymbolicTensor,
+        v_pool: SymbolicTensor,
+        slot_table: SymbolicTensor,
+        k_new: SymbolicTensor,
+        v_new: SymbolicTensor,
+        position,
+        *,
+        layer: int,
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """Append new K/V rows into token-slot-major pools at
+        ``slot_table[b, p]`` (paged decode, §4.3 + #94).
+
+        Pool layout ``[slots, KVH, D]`` — element address
+        ``slot * KVH * D + kvh * D``, exactly the addressing the device
+        kernels already use. The slot table is an external i32 ``[B, S]``
+        input; slot 0 is the reserved null/sink page, never written by a
+        live row. Returns post-append pool views (bumped versions).
+        """
+        self._require_position(position, "cache_append_paged")
+        p = self._position_name(position)
+        b_new, kvh_new, d_new = k_new.value.shape
+        if k_pool.value.shape != (k_pool.value.shape[0], kvh_new, d_new):
+            raise CaptureError(
+                f"paged pool {k_pool.value.shape} does not match k_new {(b_new, kvh_new, d_new)} "
+                "on (KVH, D); pools are token-slot-major [slots, KVH, D]"
+            )
+        if slot_table.value.shape[0] != b_new:
+            raise CaptureError(
+                f"slot table rows {slot_table.value.shape[0]} != batch {b_new}"
+            )
+        self._record(
+            "cache_append_paged",
+            inputs=(k_pool, v_pool, slot_table, k_new, v_new),
+            outputs=(),  # mutation through storage effects; pool views returned below
+            attributes={"layer": layer, "position": p},
+            reads=(_regional_reads(k_new.value), _regional_reads(v_new.value)),
+            writes=(
+                Region.indirect(k_pool.value, slot_table.value, axis=0),
+                Region.indirect(v_pool.value, slot_table.value, axis=0),
+            ),
+            source_location=f"layer {layer} paged kv cache append",
+            numerical_contract={
+                "write": "K_pool[slot_table[b, p], h, :] = k_new[b, h, :]; same for V",
+                "slot0": "reserved null/sink page — never written by a live row",
+                "table": "external i32 [B, S]; row b maps positions through table[b, :]",
+            },
+        )
+        # Post-append versions: same storages, bumped (§4.3).
+        k_post = self.graph.add_tensor(
+            f"k_pool_l{layer}_v{self.graph.storage_versions[k_pool.value.storage_id]}",
+            k_pool.value.shape,
+            k_pool.value.dtype,
+            storage_id=k_pool.value.storage_id,
+            strides=k_pool.value.strides,
+            offset=k_pool.value.offset,
+        )
+        v_post = self.graph.add_tensor(
+            f"v_pool_l{layer}_v{self.graph.storage_versions[v_pool.value.storage_id]}",
+            v_pool.value.shape,
+            v_pool.value.dtype,
+            storage_id=v_pool.value.storage_id,
+            strides=v_pool.value.strides,
+            offset=v_pool.value.offset,
+        )
+        return SymbolicTensor(k_post), SymbolicTensor(v_post)
+
+    def attention_scores_paged(
+        self,
+        q: SymbolicTensor,
+        k_pool: SymbolicTensor,
+        slot_table: SymbolicTensor,
+        position,
+        *,
+        scale: float,
+        layer: int,
+        kv_heads: Optional[int] = None,
+    ) -> SymbolicTensor:
+        """scores[b, h, t] = scale * <q[b, h, :], K_pool[table[b, t], kv(h), :]>
+        for t in [0, p] (GQA-aware; #94).
+        """
+        self._require_position(position, "attention_scores_paged")
+        b, h = q.value.shape[0], q.value.shape[1]
+        s = slot_table.value.shape[1]
+        d = k_pool.value.shape[2]
+        out = self.fresh_buffer(f"scores_l{layer}{self._suffix()}", (b, h, s))
+        p = self._position_name(position)
+        kvh = kv_heads if kv_heads is not None else h
+        self._record(
+            "attention_scores_paged",
+            inputs=(q, k_pool, slot_table),
+            outputs=(out,),
+            attributes={"scale": float(scale), "layer": layer, "position": p, "kv_heads": kvh},
+            reads=(
+                _regional_reads(q.value),
+                Region.indirect(k_pool.value, slot_table.value, axis=0),
+            ),
+            writes=(Region.tile(out.value, ((0, b), (0, h), (0, s))),),
+            source_location=f"layer {layer} paged attention scores",
+            numerical_contract={
+                "scale": f"1/sqrt(D) = {scale}",
+                "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
+                "gather": f"K rows gathered from slots table[b, t], t in [0, {p}]",
+                "reduction": "f32 dot over D, t ascending",
+            },
+        )
+        return out
+
+    def attention_values_paged(
+        self,
+        probs: SymbolicTensor,
+        v_pool: SymbolicTensor,
+        slot_table: SymbolicTensor,
+        position,
+        *,
+        layer: int,
+        kv_heads: Optional[int] = None,
+    ) -> SymbolicTensor:
+        """ctx[b, h, :] = sum_{t<=p} probs[b, h, t] * V_pool[table[b, t], kv(h), :]
+        (GQA-aware; #94). V rows beyond p are never gathered (NaN slots
+        must not leak).
+        """
+        self._require_position(position, "attention_values_paged")
+        b, h = probs.value.shape[0], probs.value.shape[1]
+        d = v_pool.value.shape[2]
+        out = self.fresh_buffer(f"ctx_l{layer}{self._suffix()}", (b, h, d))
+        p = self._position_name(position)
+        kvh = kv_heads if kv_heads is not None else h
+        self._record(
+            "attention_values_paged",
+            inputs=(probs, v_pool, slot_table),
+            outputs=(out,),
+            attributes={"layer": layer, "position": p, "kv_heads": kvh},
+            reads=(
+                Region.prefix(probs.value, axis=2, valid=ValidLength(f"{p}+1")),
+                Region.indirect(v_pool.value, slot_table.value, axis=0),
+            ),
+            writes=(_regional_reads(out.value),),
+            source_location=f"layer {layer} paged attention values",
+            numerical_contract={
+                "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
+                "gather": f"V rows gathered from slots table[b, t], t in [0, {p}]",
+                "reduction": "f32, t ascending",
+            },
+        )
+        return out
+
+    # ------------------------------------------------------------------
     # Guards
     # ------------------------------------------------------------------
 

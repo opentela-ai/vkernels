@@ -287,6 +287,10 @@ class Region:
     view: TensorValue
     # (lo, hi) per dimension; hi may be a str symbolic expression.
     boxes: tuple[tuple[int, int | str], ...]
+    # Paged indirection (#94): when set, the position axis is addressed
+    # through an external i32 [B, S] slot table rather than a static box.
+    indirect_table: Optional[TensorValue] = None
+    indirect_axis: int = -1
 
     @staticmethod
     def whole(view: TensorValue) -> "Region":
@@ -303,6 +307,33 @@ class Region:
             else:
                 boxes.append((0, d))
         return Region(view.storage_id, view, tuple(boxes))
+
+    @staticmethod
+    def indirect(
+        view: TensorValue,
+        table: TensorValue,
+        axis: int,
+        valid: Optional[ValidLength] = None,
+    ) -> "Region":
+        """Paged region (#94): ``axis`` of ``view`` is indexed through
+        ``table`` — an external i32 ``[B, S]`` slot table. Element
+        addresses become ``slot = table[b, t]``,
+        ``addr = pool_base + slot * row_stride``; writes land at
+        ``table[b, p_row]`` and slot 0 is the reserved null/sink page
+        (never written by a live row).
+
+        The static boxes keep the view extent (optionally bounded by
+        ``valid`` on ``axis``), but storage-span analysis overapproximates
+        to the *whole pool*: indirected regions on one pool conflict with
+        everything on that pool. Sound under phase order — same reasoning
+        as today's prefix regions, whose symbolic bounds are likewise
+        treated as full extent (§5.2).
+        """
+        assert 0 <= axis < len(view.shape), f"indirect axis {axis} out of range for {view.shape}"
+        boxes = []
+        for i, d in enumerate(view.shape):
+            boxes.append((0, valid.expr) if (i == axis and valid is not None) else (0, d))
+        return Region(view.storage_id, view, tuple(boxes), indirect_table=table, indirect_axis=axis)
 
     @staticmethod
     def tile(view: TensorValue, tile: Sequence[tuple[int, int]]) -> "Region":
@@ -329,6 +360,13 @@ class Region:
         Strides must be non-negative (asserted at view creation sites we
         control).
         """
+        if self.indirect_table is not None:
+            # Paged (#94): addressed slots are runtime data — overapproximate
+            # to the whole pool extent (conservative, never unsound).
+            total = 1
+            for d in self.view.shape:
+                total *= d
+            return (self.view.offset, self.view.offset + max(total - 1, 0))
         lo_addr = self.view.offset
         hi_addr = self.view.offset
         for (lo, hi), stride, extent in zip(self.boxes, self.view.strides, self.view.shape):
@@ -346,7 +384,8 @@ class Region:
         return a0 <= b1 and b0 <= a1
 
     def __repr__(self) -> str:  # pragma: no cover - trivial
-        return f"Region(s{self.storage_id}, {self.boxes})"
+        ind = f" via table[{self.indirect_table.name}]" if self.indirect_table is not None else ""
+        return f"Region(s{self.storage_id}, {self.boxes}){ind}"
 
 
 # ---------------------------------------------------------------------------
@@ -368,9 +407,12 @@ OP_GELU = "gelu"
 OP_SWIGLU = "swiglu"
 OP_ADD = "add"
 OP_CACHE_APPEND = "cache_append"
+OP_CACHE_APPEND_PAGED = "cache_append_paged"
 OP_ATTENTION_SCORES = "attention_scores"
+OP_ATTENTION_SCORES_PAGED = "attention_scores_paged"
 OP_SOFTMAX = "softmax"
 OP_ATTENTION_VALUES = "attention_values"
+OP_ATTENTION_VALUES_PAGED = "attention_values_paged"
 
 ARITHMETIC_OP_KINDS = (
     OP_EMBEDDING,
@@ -383,9 +425,12 @@ ARITHMETIC_OP_KINDS = (
     OP_SWIGLU,
     OP_ADD,
     OP_CACHE_APPEND,
+    OP_CACHE_APPEND_PAGED,
     OP_ATTENTION_SCORES,
+    OP_ATTENTION_SCORES_PAGED,
     OP_SOFTMAX,
     OP_ATTENTION_VALUES,
+    OP_ATTENTION_VALUES_PAGED,
 )
 
 
