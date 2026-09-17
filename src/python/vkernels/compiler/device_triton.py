@@ -1978,7 +1978,15 @@ def _t_mhc_pre(
         cm = tl.max(cl, axis=1)
         ce = tl.exp(cl - cm[:, None])
         ce = tl.where(kj_mask, ce, 0.0)
-        comb = ce / tl.sum(ce, axis=1)[:, None] + EPS
+        # Padded rows (k or j >= HC) must stay EXACTLY 0 through the whole
+        # Sinkhorn recursion: an unmasked 0/0 here becomes NaN and the
+        # unmasked column sums below poison the entire valid block; even
+        # without the NaN, EPS-floored padding inflates the column
+        # denominators (~17-20% at hc=3, HCP=4). All denominators therefore
+        # sum only the valid hc×hc block, matching the reference recursion
+        # on the exact matrix.
+        row_den = tl.sum(ce, axis=1)[:, None]
+        comb = tl.where(kj_mask, ce / row_den + EPS, 0.0)
         # Sinkhorn-Knopp: initial column normalization, then (ITERS−1)
         # alternate row/col passes — eps inside every denominator (floe).
         comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)

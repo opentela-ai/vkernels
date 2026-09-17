@@ -660,9 +660,12 @@ def test_floe_glm_hc_parity():
         torch.from_numpy(got_streams), streams_ref.squeeze(1).to(torch.float32), rtol=1e-3, atol=1e-4)
 
 
-def test_triton_device_templates_match_mirror():
+@pytest.mark.parametrize("hc", [4, 3], ids=["pow2", "non-pow2"])
+def test_triton_device_templates_match_mirror(hc):
     """ATTESTED-NOT-VERIFIED (needs torch + triton + CUDA): the _t_mhc_pre /
-    _t_mhc_post device templates vs the fp64 numpy mirror on a tiny config."""
+    _t_mhc_post device templates vs the fp64 numpy mirror on a tiny config.
+    hc=3 (non-pow2) exercises the padded-tile masking: unmasked Sinkhorn
+    normalization sums produce NaN/polluted comb on the padded rows."""
     torch = pytest.importorskip("torch")
     pytest.importorskip("triton")
     if not torch.cuda.is_available():
@@ -676,7 +679,7 @@ def test_triton_device_templates_match_mirror():
 
     dev = torch.device("cuda")
     rng = np.random.default_rng(111)
-    hc, c = 4, 64
+    c = 64
     mix = (2 + hc) * hc
     w = _weights(rng, hc=hc, c=c)
     streams_t = torch.from_numpy(w["streams"]).to(dev)
