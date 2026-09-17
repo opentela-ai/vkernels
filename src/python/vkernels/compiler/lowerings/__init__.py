@@ -1014,6 +1014,12 @@ def lower_cache_append_paged(op: Operator, graph: OperatorGraph) -> TaskFamily:
         outputs=(),
         params={"layer": op.attributes.get("layer", 0), "position": p},
         threads=THREADS_PER_WORKER,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Lightning-indexer (issue #97): fused ReLU scoring over the compressed
 # entries + per-head mix, then the fixed-count top-k selection.
 #
