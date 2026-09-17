@@ -194,22 +194,40 @@ def _t_rope(
     B: tl.constexpr,
     NHEAD: tl.constexpr,
     D: tl.constexpr,
+    ROT: tl.constexpr,
+    TSTRIDE: tl.constexpr,
 ):
-    """Rotate-half RoPE at row b's runtime position: one task per (b, head)."""
+    """RoPE at row b's runtime position: one task per (b, head).
+
+    Ported from the 27B-validated ``_h_rope_append`` (device_triton_hybrid):
+    fp32 loads from the (bf16) workspace, NeoX split-half over the first
+    ``ROT`` dims — ``x1' = x1*c - x2*s ; x2' = x2*c + x1*s`` with
+    ``half = ROT // 2`` — and dims ``[ROT, D)`` pass through unchanged.
+
+    ``TSTRIDE`` is the cos/sin table row stride (fp32 tables indexed at the
+    per-row runtime position). The Qwen3 call passes ``ROT=D, TSTRIDE=D``:
+    with the full-width cat([f, f]) tables this reduces exactly to the
+    full-width rotate-half form.
+    """
     task = worker
     while task < B * NHEAD:
         b = task // NHEAD
         h = task % NHEAD
-        half: tl.constexpr = D // 2
+        half: tl.constexpr = ROT // 2
         d = tl.arange(0, half)
         p = tl.load(pos_ptr + b).to(tl.int64)
         base = (b * NHEAD + h) * D
         x1 = tl.load(x_ptr + base + d, cache_modifier=".cg").to(tl.float32)
         x2 = tl.load(x_ptr + base + half + d, cache_modifier=".cg").to(tl.float32)
-        c = tl.load(cos_ptr + p * D + d).to(tl.float32)  # cos = cat([f, f])
-        s = tl.load(sin_ptr + p * D + d).to(tl.float32)
+        c = tl.load(cos_ptr + p * TSTRIDE + d).to(tl.float32)
+        s = tl.load(sin_ptr + p * TSTRIDE + d).to(tl.float32)
         tl.store(y_ptr + base + d, x1 * c - x2 * s)
         tl.store(y_ptr + base + half + d, x2 * c + x1 * s)
+        if ROT < D:  # pass-through tail (empty for the full-width Qwen3 form)
+            offs_d = tl.arange(0, D)
+            mt = offs_d >= ROT
+            tail = tl.load(x_ptr + base + offs_d, mask=mt, other=0.0, cache_modifier=".cg").to(tl.float32)
+            tl.store(y_ptr + base + offs_d, tail, mask=mt)
         task += P
 
 
@@ -610,9 +628,10 @@ def qwen3_megakernel(
         _t_rms_heads(worker, P, base + O_QKV + HD, kn_ptr + li * D, base + O_KN, B, KVH, D, QKVW, EPS)
         grid_barrier(bar_ptr, bar_base + (5 + 17 * l) * P)
         # phases 5-6: rope q/k at each row's runtime position
-        _t_rope(worker, P, base + O_QN, cos_ptr, sin_ptr, pos_ptr, base + O_RQ, B, H, D)
+        # (ROT=D, TSTRIDE=D: full-width rotate_half via the partial template)
+        _t_rope(worker, P, base + O_QN, cos_ptr, sin_ptr, pos_ptr, base + O_RQ, B, H, D, D, D)
         grid_barrier(bar_ptr, bar_base + (6 + 17 * l) * P)
-        _t_rope(worker, P, base + O_KN, cos_ptr, sin_ptr, pos_ptr, base + O_RK, B, KVH, D)
+        _t_rope(worker, P, base + O_KN, cos_ptr, sin_ptr, pos_ptr, base + O_RK, B, KVH, D, D, D)
         grid_barrier(bar_ptr, bar_base + (7 + 17 * l) * P)
         # phase 7: cache append (k roped; v straight from the qkv buffer)
         kcl = k_cache_ptr + li * KCBASE_L
@@ -1246,6 +1265,51 @@ def _t_gdn_conv(
             sj1 = tl.load(state_ptr + (j + 1) * C + offs, cache_modifier=".cg")
             tl.store(state_ptr + j * C + offs, sj1)
         tl.store(state_ptr + (KTAPS - 2) * C + offs, xn)
+        task += P
+
+
+@triton.jit
+def _t_gdn_conv_tiled(
+    worker: tl.int32,
+    P: tl.int32,
+    state_ptr,
+    w_ptr,
+    x_ptr,
+    out_ptr,
+    B: tl.constexpr,
+    C: tl.constexpr,
+    ELEM: tl.constexpr,
+    KTAPS: tl.constexpr,
+):
+    """Generic gdn_conv decode-step task body (issue #89): one task per
+    (batch, ELEM-channel tile) over the batched persistent state pool
+    [B, KTAPS-1, C] (fp32, time-major), the mixed qkv rows [B, C] and the
+    FIR weights [C, KTAPS]. Same arithmetic as the 27B-validated
+    ``_t_gdn_conv`` (which is a single flattened batch row of this
+    template), generalized to per-task (b, tile) addressing. Requires
+    C % ELEM == 0 (the lowering picks an exact tiling).
+    """
+    NTILE: tl.constexpr = C // ELEM
+    task = worker
+    while task < B * NTILE:
+        b = task // NTILE
+        t = task % NTILE
+        offs = t * ELEM + tl.arange(0, ELEM)
+        sbase = state_ptr + b.to(tl.int64) * ((KTAPS - 1) * C)
+        acc = tl.zeros([ELEM], tl.float32)
+        for j in tl.static_range(KTAPS - 1):
+            wj = tl.load(w_ptr + offs * KTAPS + j).to(tl.float32)
+            sj = tl.load(sbase + j * C + offs, cache_modifier=".cg")
+            acc += wj * sj
+        wj = tl.load(w_ptr + offs * KTAPS + (KTAPS - 1)).to(tl.float32)
+        xn = tl.load(x_ptr + b.to(tl.int64) * C + offs, cache_modifier=".cg").to(tl.float32)
+        acc += wj * xn
+        tl.store(out_ptr + b.to(tl.int64) * C + offs, acc / (1.0 + tl.exp(-acc)))
+        # state shift: drop the oldest tap, append the new row
+        for j in tl.static_range(KTAPS - 2):
+            sj1 = tl.load(sbase + (j + 1) * C + offs, cache_modifier=".cg")
+            tl.store(sbase + j * C + offs, sj1)
+        tl.store(sbase + (KTAPS - 2) * C + offs, xn)
         task += P
 
 

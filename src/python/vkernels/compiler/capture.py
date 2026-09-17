@@ -481,27 +481,64 @@ class RecordingBackend:
         *,
         layer: int,
         which: str = "q",
+        rotary_dim: Optional[int] = None,
+        convention: str = "rotate_half",
     ) -> SymbolicTensor:
-        """Rotate-half RoPE at the runtime position p (Qwen3 convention).
+        """RoPE at the runtime position p.
 
-        Tables are precomputed [max_positions, D] externals with
-        cos = cat([f, f]) so x' = x*cos[p] + rotate_half(x)*sin[p].
+        ``convention="rotate_half"`` (default — Qwen3): full-width
+        rotate-half form ``x' = x*cos[p] + rotate_half(x)*sin[p]`` where
+        rotate_half(x) = cat(-x[D/2:], x[:D/2]). Tables are precomputed
+        [max_positions, D] externals with cos = cat([f, f]).
+
+        ``convention="neox_partial"`` (Qwen3.5 ``PartialRotaryEmbedding``):
+        NeoX split-half over the first ``rotary_dim`` dims only — with
+        ``half = rotary_dim // 2``, ``x1 = x[:half]``, ``x2 = x[half:rotary_dim]``::
+
+            x1' = x1*c - x2*s ;  x2' = x2*c + x1*s      (c,s = tables[p])
+
+        and dims ``[rotary_dim, head_dim)`` pass through unchanged. Tables
+        are fp32 externals of shape [max_positions, rotary_dim // 2].
         """
+        if convention not in ("rotate_half", "neox_partial"):
+            raise CaptureError(f"rope convention {convention!r} not supported (expected 'rotate_half' or 'neox_partial')")
+        if convention == "neox_partial":
+            head_dim = x.value.shape[-1]
+            if rotary_dim is None or rotary_dim % 2 != 0 or not 0 < rotary_dim <= head_dim:
+                raise CaptureError(f"neox_partial rope requires an even 0 < rotary_dim <= head_dim ({head_dim}); got {rotary_dim!r}")
+            for t in (cos_table, sin_table):
+                if t.value.shape[-1] != rotary_dim // 2:
+                    raise CaptureError(
+                        f"neox_partial rope tables must be [max_positions, rotary_dim//2] = [.., {rotary_dim // 2}]; got shape {t.value.shape}"
+                    )
         self._require_position(position, "rope")
         out = self.fresh_buffer(f"rope_{which}_l{layer}{self._suffix()}", x.value.shape)
         p = self._position_name(position)
+        attributes = {"layer": layer, "which": which, "position": p, "convention": convention,
+                      "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"}
+        if rotary_dim is not None:
+            attributes["rotary_dim"] = rotary_dim
+        if convention == "rotate_half":
+            numerical_contract = {
+                "rotate_half": "cat(-x[D/2:], x[:D/2])",
+                "tables": "full-width cos/sin (HF rotate_half convention)",
+            }
+        else:
+            numerical_contract = {
+                "neox_partial": "x1' = x1*c - x2*s ; x2' = x2*c + x1*s over dims [0, rotary_dim), half = rotary_dim//2",
+                "pass_through": f"dims [{rotary_dim}, {x.value.shape[-1]}) unchanged",
+                "tables": "cos/sin [max_positions, rotary_dim//2], fp32, indexed at the runtime position",
+                "upcast": "rotation math in fp32 (bf16 activations in/out)",
+            }
         self._record(
             "rope",
             inputs=(x, cos_table, sin_table),
             outputs=(out,),
-            attributes={"layer": layer, "which": which, "position": p, "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"},
+            attributes=attributes,
             reads=(_regional_reads(x.value), _regional_reads(cos_table.value), _regional_reads(sin_table.value)),
             writes=(_regional_reads(out.value),),
             source_location=f"layer {layer} rope {which}",
-            numerical_contract={
-                "rotate_half": "cat(-x[D/2:], x[:D/2])",
-                "tables": "full-width cos/sin (HF rotate_half convention)",
-            },
+            numerical_contract=numerical_contract,
         )
         return out
 
@@ -583,6 +620,78 @@ class RecordingBackend:
             valid_length=valid,
         )
         return SymbolicTensor(k_post), SymbolicTensor(v_post)
+
+    def gdn_conv(
+        self,
+        conv_state: SymbolicTensor,
+        x: SymbolicTensor,
+        w: SymbolicTensor,
+        *,
+        layer: int,
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """GDN short-conv decode step (Qwen3.5 ``GatedDeltaNet``, seq==1 path).
+
+        Causal depthwise conv1d over the packed qkv row, folding the
+        persistent conv state::
+
+            full = cat(conv_state[b], x[b])      # [K, C]
+            out[b] = silu(sum_k full[:, k] * w[:, k])   # depthwise FIR
+            conv_state'[b] = full[1:]            # time-major shift
+
+        ``conv_state`` is an external caller-owned pool [B, K-1, C], fp32,
+        time-major (floe's eager init uses the embed dtype — the compiled
+        pool is fp32; oracle tolerance ~1e-3). ``x`` is the mixed qkv row
+        [B, C] and ``w`` the FIR weights [C, K] (grouped conv, one tap
+        vector per channel).
+
+        The op is position-independent: it consumes no decode-position
+        scalar, and its ordering obligation is the read-modify-write on
+        the state pool (RAW/WAR/WAW hazards vs any other op touching that
+        storage). Records write effects on the pool and returns
+        ``(out, conv_state_post)`` — the post-step state view (same
+        storage, bumped version) that later layers must read.
+        """
+        sv, xv, wv = conv_state.value, x.value, w.value
+        if len(sv.shape) != 3:
+            raise CaptureError(f"gdn_conv state pool must be [B, K-1, C]; got shape {sv.shape}")
+        if len(xv.shape) != 2:
+            raise CaptureError(f"gdn_conv input row must be [B, C]; got shape {xv.shape}")
+        B, Km1, C = sv.shape
+        K = Km1 + 1
+        if xv.shape != (B, C):
+            raise CaptureError(f"gdn_conv input row shape {xv.shape} does not match state pool [B, C] = {(B, C)}")
+        if tuple(wv.shape) != (C, K):
+            raise CaptureError(f"gdn_conv FIR weights must be [C, K] = [{C}, {K}]; got shape {wv.shape}")
+        out = self.fresh_buffer(f"gdn_conv_l{layer}{self._suffix()}", (B, C), dtype=xv.dtype)
+        self._record(
+            "gdn_conv",
+            inputs=(conv_state, x, w),
+            outputs=(out,),
+            attributes={"layer": layer, "conv_kernel": K},
+            reads=(_regional_reads(sv), _regional_reads(xv), _regional_reads(wv)),
+            writes=(_regional_reads(sv), _regional_reads(out.value)),
+            source_location=f"layer {layer} gdn conv",
+            numerical_contract={
+                "fir": "out[b] = silu(sum_{j<K-1} w[:, j] * state[b, j, :] + w[:, K-1] * x[b, :])",
+                "state_shift": "state'[b, j, :] = state[b, j+1, :] for j < K-2; state'[b, K-2, :] = x[b, :]",
+                "silu": "x / (1 + exp(-x))",
+                "accumulate": "fp32 accumulation",
+                "dtypes": "x/w bf16 (.cg loads), state pool fp32 [B, K-1, C] time-major (floe eager init uses the embed dtype — compiled pool is fp32; oracle tolerance ~1e-3)",
+                "pool": "external caller-owned state pool; read-modify-write per decode step",
+            },
+        )
+        # Post-step state view: same pool, bumped version (cache_append's
+        # §4.3 pattern). Later layers must consume this view.
+        sid = sv.storage_id
+        post = self.graph.add_tensor(
+            f"conv_state_l{layer}_v{self.graph.storage_versions[sid]}",
+            sv.shape,
+            sv.dtype,
+            storage_id=sid,
+            strides=sv.strides,
+            offset=sv.offset,
+        )
+        return out, SymbolicTensor(post)
 
     def attention_scores(
         self,

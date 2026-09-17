@@ -154,6 +154,7 @@ class ReferenceExecutor:
             "elementwise": self._body_elementwise,
             "embedding": self._body_embedding,
             "cache_append": self._body_cache_append,
+            "gdn_conv": self._body_gdn_conv,
             "cache_append_paged": self._body_cache_append_paged,
             "attention_scores": self._body_attention_scores,
             "attention_scores_paged": self._body_attention_scores_paged,
@@ -374,6 +375,20 @@ class ReferenceExecutor:
         # Row b rotates at its OWN runtime position (issue #93 ragged form).
         p = self._row_pos_value(fam, b, scalars)
         row = x[b, h]
+        if fam.params.get("convention", "rotate_half") == "neox_partial":
+            # NeoX split-half over the first rotary_dim dims (floe Qwen3.5
+            # PartialRotaryEmbedding): x1' = x1*c - x2*s / x2' = x2*c + x1*s
+            # with half = rotary_dim//2; dims [rotary_dim, D) pass through.
+            rot = fam.params["rotary_dim"]
+            half = rot // 2
+            c = cos_t[p][:half].astype(np.float64)
+            s = sin_t[p][:half].astype(np.float64)
+            x1, x2 = row[:half], row[half:rot]
+            out = row.copy()
+            out[:half] = x1 * c - x2 * s
+            out[half:rot] = x2 * c + x1 * s
+            y[b, h] = out.astype(y.dtype)
+            return
         half = row.shape[-1] // 2
         rotated = np.concatenate((-row[half:], row[:half]), axis=-1)
         out = row * cos_t[p].astype(np.float64) + rotated * sin_t[p].astype(np.float64)
@@ -429,6 +444,29 @@ class ReferenceExecutor:
         p = self._row_pos_value(fam, b, scalars)
         k_cache[b, h, p, :] = k_new[b, h, :]
         v_cache[b, h, p, :] = v_new[b, h, :]
+
+    def _body_gdn_conv(self, fam: TaskFamily, coords, scalars) -> None:
+        """GDN short-conv decode step over one (batch, channel-tile) task:
+        fp32-accumulated depthwise FIR + silu, then the time-major state
+        shift (drop oldest tap, append the new row) — in place, since the
+        pool is external persistent storage.
+        """
+        state = self.tensor(fam.inputs[0])
+        x = self.tensor(fam.inputs[1]).astype(np.float64)
+        w = self.tensor(fam.inputs[2]).astype(np.float64)
+        out = self.tensor(fam.outputs[0])
+        b, c = coords
+        tile = fam.params["tile"]
+        K = fam.params["conv_kernel"]
+        C = state.shape[-1]
+        c0, c1 = c * tile, min((c + 1) * tile, C)
+        st = state[b, :, c0:c1].astype(np.float64)  # [K-1, T] time-major
+        xs = x[b, c0:c1]  # [T]
+        ws = w[c0:c1, :]  # [T, K]
+        acc = np.einsum("jt,tj->t", st, ws[:, :-1]) + xs * ws[:, K - 1]
+        out[b, c0:c1] = (acc / (1.0 + np.exp(-acc))).astype(out.dtype)
+        # state shift: state[j] <- state[j+1]; state[K-2] <- x
+        state[b, :, c0:c1] = np.concatenate([st[1:], xs[None, :]], axis=0).astype(state.dtype)
 
     def _body_cache_append_paged(self, fam: TaskFamily, coords, scalars) -> None:
         k_pool = self.tensor(fam.inputs[0])

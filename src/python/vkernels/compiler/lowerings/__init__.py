@@ -401,7 +401,14 @@ def lower_rope(op: Operator, graph: OperatorGraph) -> TaskFamily:
         domain=domain,
         inputs=(x.name, cos_t.name, sin_t.name),
         outputs=(y.name,),
-        params={"layer": op.attributes.get("layer", 0), "which": op.attributes.get("which", "q"), "position": op.attributes.get("position", "p"), "position_form": op.attributes.get("position_form", "scalar")},
+        params={
+            "layer": op.attributes.get("layer", 0),
+            "which": op.attributes.get("which", "q"),
+            "position": op.attributes.get("position", "p"),
+            "position_form": op.attributes.get("position_form", "scalar"),
+            "convention": op.attributes.get("convention", "rotate_half"),
+            "rotary_dim": op.attributes.get("rotary_dim", D),
+        },
         threads=THREADS_PER_WORKER,
         scratch_bytes=D * 4,
         read_regions=reads,
@@ -475,6 +482,66 @@ def lower_cache_append(op: Operator, graph: OperatorGraph) -> TaskFamily:
         outputs=(),
         params={"layer": op.attributes.get("layer", 0), "position": p, "position_form": op.attributes.get("position_form", "scalar")},
         threads=THREADS_PER_WORKER,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GDN conv: decode-step FIR + state shift; one task per (batch, channel tile)
+# ---------------------------------------------------------------------------
+
+
+def _gdn_tile(C: int) -> int:
+    """Channel-tile width for gdn_conv: ELEM_TILE when it divides C, else the
+    largest power-of-two divisor that does (the device template requires an
+    exact tiling, no channel masking)."""
+    tile = ELEM_TILE
+    while C % tile:
+        tile //= 2
+    return tile
+
+
+def lower_gdn_conv(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    state = graph.tensor(op.inputs[0])
+    x = graph.tensor(op.inputs[1])
+    w = graph.tensor(op.inputs[2])
+    out = graph.tensor(op.outputs[0])
+    B, Km1, C = state.shape
+    K = Km1 + 1
+    if tuple(w.shape) != (C, K):
+        raise ValueError(f"gdn_conv FIR weights {w.shape} do not match state pool {[B, Km1, C]} (need [{C}, {K}])")
+    tile = _gdn_tile(C)
+    domain = TileDomain(((B, 1), (C, tile)))
+
+    def reads(coords):
+        b, c = coords
+        c0, c1 = c * tile, min((c + 1) * tile, C)
+        return (
+            _tile_region(state, ((b, b + 1), (0, Km1), (c0, c1))),
+            _tile_region(x, ((b, b + 1), (c0, c1))),
+            _tile_region(w, ((c0, c1), (0, K))),
+        )
+
+    def writes(coords):
+        b, c = coords
+        c0, c1 = c * tile, min((c + 1) * tile, C)
+        # Read-modify-write: the task shifts its own state tile in place.
+        return (
+            _tile_region(state, ((b, b + 1), (0, Km1), (c0, c1))),
+            _tile_region(out, ((b, b + 1), (c0, c1))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_gdn_conv",
+        kind="gdn_conv",
+        op=op,
+        domain=domain,
+        inputs=(state.name, x.name, w.name),
+        outputs=(out.name,),
+        params={"layer": op.attributes.get("layer", 0), "conv_kernel": K, "tile": tile},
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=tile * 4,  # fp32 accumulator for one channel tile
         read_regions=reads,
         write_regions=writes,
     )
@@ -740,6 +807,7 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "add": lower_add,
     "embedding": lower_embedding,
     "cache_append": lower_cache_append,
+    "gdn_conv": lower_gdn_conv,
     "cache_append_paged": lower_cache_append_paged,
     "attention_scores": lower_attention_scores,
     "attention_scores_paged": lower_attention_scores_paged,
