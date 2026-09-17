@@ -678,8 +678,10 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
                        hipStream_t stream) {
   // Issue #80 A/B diagnostics (bench-only, same pattern as VK_MOE_KTIME):
   // VK_DSA_DB=0 forces the serial kernel (this returns false, so
-  // launch_partial_auto falls back); VK_DSA_KTI=<n> overrides the
-  // auto-sized keys-per-tile (0 = auto). Read once per process.
+  // launch_partial_auto falls back); VK_DSA_DB=2 forces the db kernel,
+  // bypassing the occupancy gate below (correctness coverage for both
+  // kernels at every shape); VK_DSA_KTI=<n> overrides the auto-sized
+  // keys-per-tile (0 = auto). Read once per process.
   static const int db_mode = [] {
     const char* e = std::getenv("VK_DSA_DB");
     return e ? std::atoi(e) : 1;
@@ -707,6 +709,31 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
   if (new_kti < 1) return false;
   kti = new_kti;
   const size_t shmem = shq + (size_t)kti * per_key;
+  // Issue #80 occupancy gate. The staged kernel buys ILP with LDS: at the
+  // GLM decode width (BQ=1, W=256, kti=8) a block wants 9.3 KB, capping
+  // residency at 7 blocks/CU (64 KB LDS/CU on gfx942) vs the serial
+  // kernel's 1 KB (wave-limited, ~32 blocks/CU). Measured crossover
+  // (docs/performance/dsa/gfx942.md, 4 decode shapes x split sweep): the
+  // db kernel wins while the WHOLE grid fits one LDS-limited residency
+  // wave (all four shapes at split<=16, -5..-13%) and strictly loses once
+  // it spills (split>=32 rows, up to +43% at topk=2048 split=64) -- with
+  // thousands of tiny blocks, TLP already hides the serial chain and
+  // staging is pure overhead. Engage the db kernel only in its win region;
+  // VK_DSA_DB=2 bypasses this gate for diagnostics.
+  static const int num_cu = [] {
+    int dev = 0, n = 0;
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount,
+                              dev) != hipSuccess || n <= 0)
+      return 228;  // gfx942 CU count, same default as dsa_sparse_fwd_split_for
+    return n;
+  }();
+  if (db_mode == 1) {
+    const int blocks_per_cu = (int)(64u * 1024u / shmem);  // LDS 64 KB/CU
+    const long total_blocks =
+        (long)((S_q + BQ - 1) / BQ) * (long)H * (long)split_kv;
+    if ((long)blocks_per_cu * num_cu < total_blocks) return false;
+  }
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, split_kv);
   dsa_sparse_fwd_partial_db_kernel<BQ><<<grid, block, shmem, stream>>>(
