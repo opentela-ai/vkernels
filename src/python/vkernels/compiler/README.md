@@ -70,6 +70,30 @@ GB10 it serves dense-Qwen3 decode in exactly one kernel launch per step,
 validated against the HF-checked oracle (7.6e-7 logits at the real 0.6B
 dims). Benchmarks: `bench/bench_megakernel_qwen3.py` (floe repo).
 
+## Lightning-indexer lane (issue #97)
+
+DSA/GLM-indexer decode support (`indexer_scores` + `index_topk`), the
+static-task-grid + runtime-indirection pattern of #94: selection is
+data-dependent but the decode output count is static (`k = index_topk`),
+and the i32 indirection table orders the attention scores/values tasks
+(#95/#96) through the existing RAW-hazard phase barrier.
+
+- `ops.indexer_scores(q, entries, mix_w)` — per-(batch, head) ReLU scoring
+  of the compressed entries (`scale = head_dim**-0.5`), f32 fused head mix;
+  q/entries may be stored bf16 (`.cg` streamed on device).
+- `ops.index_topk(scores, valid_counts, k)` — fixed-count selection over
+  the fused scores, masked by per-row valid candidate counts: descending
+  score, deterministic lowest-index tie-break, NaN scores in the valid
+  prefix excluded; outputs the i32 indirection table `[B, k]` plus the
+  normalized block_bias `[B, k]` (`s_j / ||s_valid||_2`); `-1/0.0` slots
+  beyond a row's valid count (ragged candidates, `k > valid_count` ok).
+  HCA variant (no indexer): `k = capacity` — same ops, selection trivial.
+- Device templates `_t_indexer_scores` (one task per batch × 64-entry tile)
+  and `_t_index_topk` (one task per batch row; rank-by-comparison-counting
+  sweep, no sort/scratch, M ≤ ~1k). CPU oracle suite:
+  `tests/python/test_megakernel_indexer_topk.py`. The Triton templates are
+  CUDA-gated and unverified on CPU-only stacks.
+
 ## kvaas integration
 
 The device backend addresses its KV cache through the **kvaas data
