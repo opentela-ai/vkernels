@@ -1382,3 +1382,73 @@ def _t_gdn_heads(
         og = on * (z * (1.0 / (1.0 + tl.exp(-z))))
         tl.store(out_ptr + h * HV + offs_v, og)
         task += P
+
+
+@triton.jit
+def _t_gdn_heads_batched(
+    worker: tl.int32,
+    P: tl.int32,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    z_ptr,
+    a_ptr,
+    b_ptr,
+    alog_ptr,
+    dtb_ptr,
+    normw_ptr,
+    state_ptr,
+    out_ptr,
+    B: tl.constexpr,
+    NH: tl.constexpr,
+    NK: tl.constexpr,
+    HV: tl.constexpr,
+    HK: tl.constexpr,
+    eps: tl.constexpr,
+    scale: tl.constexpr,
+):
+    """Batched gdn_delta decode-step task body (issue #90): one task per
+    (batch, value head) over the batched persistent state pool
+    [B, NH, HV, HK] (fp32, read-modify-write). Arithmetic identical to the
+    27B-validated ``_t_gdn_heads`` (which is the B=1, task==head flattening
+    of this template), generalized to per-task (b, head) addressing:
+    A_log/dt_bias/norm_w are per-layer params broadcast over the batch.
+    """
+    GROUP: tl.constexpr = NH // NK
+    offs_v = tl.arange(0, HV)
+    offs_k = tl.arange(0, HK)
+    task = worker
+    while task < B * NH:
+        bb = task // NH
+        h = task % NH
+        kh = h // GROUP
+        q = tl.load(q_ptr + bb.to(tl.int64) * (NK * HK) + kh * HK + offs_k, cache_modifier=".cg").to(tl.float32)
+        k = tl.load(k_ptr + bb.to(tl.int64) * (NK * HK) + kh * HK + offs_k, cache_modifier=".cg").to(tl.float32)
+        v = tl.load(v_ptr + bb.to(tl.int64) * (NH * HV) + h * HV + offs_v, cache_modifier=".cg").to(tl.float32)
+        z = tl.load(z_ptr + bb.to(tl.int64) * (NH * HV) + h * HV + offs_v, cache_modifier=".cg").to(tl.float32)
+        # per-head scalars
+        a_ = tl.load(a_ptr + bb.to(tl.int64) * NH + h).to(tl.float32)
+        b_ = tl.load(b_ptr + bb.to(tl.int64) * NH + h).to(tl.float32)
+        A = tl.exp(tl.load(alog_ptr + h).to(tl.float32))
+        x_dt = a_ + tl.load(dtb_ptr + h).to(tl.float32)
+        sp = tl.where(x_dt <= 20.0, tl.log(1.0 + tl.exp(x_dt)), x_dt)
+        beta = 1.0 / (1.0 + tl.exp(-b_))
+        # per-key-head normalization (computed redundantly per value head)
+        qn = q * (1.0 / tl.sqrt(tl.sum(q * q, axis=0) + 1e-6)) * scale
+        kn = k * (1.0 / tl.sqrt(tl.sum(k * k, axis=0) + 1e-6))
+        # state update over this head's [HV, HK] slice
+        sbase = state_ptr + bb.to(tl.int64) * (NH * HV * HK) + h * HV * HK
+        s = tl.load(sbase + offs_v[:, None] * HK + offs_k[None, :], cache_modifier=".cg")
+        s = s * tl.exp(-A * sp)
+        sk = tl.sum(s * kn[None, :], axis=1)
+        vd = beta * (v - sk)
+        s = s + vd[:, None] * kn[None, :]
+        o = tl.sum(s * qn[None, :], axis=1)
+        tl.store(sbase + offs_v[:, None] * HK + offs_k[None, :], s)
+        # per-head RMSNorm over hv + z gate
+        var = tl.sum(o * o, axis=0) / HV
+        nw = tl.load(normw_ptr + offs_v).to(tl.float32)
+        on = o * (1.0 / tl.sqrt(var + eps)) * nw
+        og = on * (z * (1.0 / (1.0 + tl.exp(-z))))
+        tl.store(out_ptr + bb.to(tl.int64) * (NH * HV) + h * HV + offs_v, og)
+        task += P

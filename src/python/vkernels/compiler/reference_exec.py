@@ -156,6 +156,7 @@ class ReferenceExecutor:
             "cache_append": self._body_cache_append,
             "gdn_conv": self._body_gdn_conv,
             "cache_append_paged": self._body_cache_append_paged,
+            "gdn_delta": self._body_gdn_delta,
             "attention_scores": self._body_attention_scores,
             "attention_scores_paged": self._body_attention_scores_paged,
             "softmax": self._body_softmax,
@@ -505,6 +506,55 @@ class ReferenceExecutor:
         # Gathered masked: V rows beyond p are never gathered (NaN slots must not leak).
         slots = table[b, : p + 1].astype(np.int64)
         y[b, h, :] = (probs[b, h, : p + 1] @ v_pool[slots, kvh, :]).astype(y.dtype)
+    def _body_gdn_delta(self, fam: TaskFamily, coords, scalars) -> None:
+        """Gated delta rule decode step over one (batch, value head) task.
+
+        fp64 oracle arithmetic mirroring floe ``qwen35_gdn.py`` seq==1:
+        guarded softplus decay, per-key-head L2 q/k (group-expanded),
+        delta-rule outer-product state update, per-head RMSNorm + z-gate.
+        The head's ``[HV, HK]`` fp32 state slice is updated in place (the
+        pool is external persistent storage).
+        """
+        state = self.tensor(fam.inputs[0])  # [B, NV, HV, HK]
+        q = self.tensor(fam.inputs[1])  # [B, NK, HK]
+        k = self.tensor(fam.inputs[2])
+        v = self.tensor(fam.inputs[3])  # [B, NV, HV]
+        z = self.tensor(fam.inputs[4])
+        a = self.tensor(fam.inputs[5])  # [B, NV]
+        b = self.tensor(fam.inputs[6])
+        a_log = self.tensor(fam.inputs[7])  # [NV]
+        dt_bias = self.tensor(fam.inputs[8])  # [NV]
+        norm_w = self.tensor(fam.inputs[9])  # [HV]
+        out = self.tensor(fam.outputs[0])
+        bb, h = coords
+        NV, HV, HK = state.shape[1], state.shape[2], state.shape[3]
+        NK = q.shape[1]
+        kh = h // (NV // NK)
+        scale, eps = fam.params["scale"], fam.params["eps"]
+        s = state[bb, h].astype(np.float64)  # [HV, HK]
+        qf = q[bb, kh].astype(np.float64)
+        kf = k[bb, kh].astype(np.float64)
+        vf = v[bb, h].astype(np.float64)
+        zf = z[bb, h].astype(np.float64)
+        # per-head gating scalars (floe: log(1+exp) with the x>20 guard)
+        x_dt = float(a[bb, h]) + float(dt_bias[h])
+        softplus_x = np.log(1.0 + np.exp(x_dt)) if x_dt <= 20.0 else x_dt
+        decay = float(np.exp(-float(np.exp(a_log[h])) * softplus_x))
+        beta = 1.0 / (1.0 + np.exp(-float(b[bb, h])))
+        # per-key-head normalization (group-expanded)
+        qn = qf / np.sqrt(np.dot(qf, qf) + 1e-6) * scale
+        kn = kf / np.sqrt(np.dot(kf, kf) + 1e-6)
+        # delta-rule state update
+        s = s * decay
+        sk = s @ kn
+        s = s + (beta * (vf - sk))[:, None] * kn[None, :]
+        state[bb, h] = s.astype(state.dtype)
+        # readout + per-head RMSNorm over HV + z gate
+        o = s @ qn
+        var = np.mean(o * o)
+        on = o / np.sqrt(var + eps) * norm_w.astype(np.float64)
+        og = on * (zf / (1.0 + np.exp(-zf)))
+        out[bb, h] = og.astype(out.dtype)
 
     def _body_attention_scores(self, fam: TaskFamily, coords, scalars) -> None:
         q = self.tensor(fam.inputs[0]).astype(np.float64)
