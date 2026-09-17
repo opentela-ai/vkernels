@@ -304,6 +304,77 @@ def lower_rms_norm(op: Operator, graph: OperatorGraph) -> TaskFamily:
 
 
 # ---------------------------------------------------------------------------
+# Gated RMSNorm (issue #100, GLM o_norm): same per-row/per-head task domain
+# as rms_norm with a second elementwise input stream (the gate).
+# ---------------------------------------------------------------------------
+
+
+def lower_rms_norm_gated(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    x = graph.tensor(op.inputs[0])
+    gate = graph.tensor(op.inputs[1])
+    gamma = graph.tensor(op.inputs[2])
+    y = graph.tensor(op.outputs[0])
+    activation = op.attributes.get("activation", "sigmoid")
+    if activation not in ("sigmoid",):
+        raise ValueError(f"rms_norm_gated {op.source_location!r}: unsupported activation {activation!r}")
+    if gate.shape != x.shape:
+        raise ValueError(f"rms_norm_gated {op.source_location!r}: gate {gate.shape} != x {x.shape}")
+    if len(x.shape) == 3:
+        B, H, D = x.shape
+        if tuple(gamma.shape) != (D,):
+            raise ValueError(f"rms_norm_gated {op.source_location!r}: weight {gamma.shape} != [{D}]")
+        domain = TileDomain(((B, 1), (H, 1)))
+
+        def reads3(coords):
+            b, h = coords
+            return (
+                _tile_region(x, ((b, b + 1), (h, h + 1), (0, D))),
+                _tile_region(gate, ((b, b + 1), (h, h + 1), (0, D))),
+                _whole(gamma),
+            )
+
+        def writes3(coords):
+            b, h = coords
+            return (_tile_region(y, ((b, b + 1), (h, h + 1), (0, D))),)
+
+        reads, writes, width = reads3, writes3, D
+    else:
+        rows, width = x.shape
+        if tuple(gamma.shape) != (width,):
+            raise ValueError(f"rms_norm_gated {op.source_location!r}: weight {gamma.shape} != [{width}]")
+        domain = TileDomain(((rows, 1), (width, width)))
+
+        def reads2(coords):
+            r = coords[0]
+            return (
+                _tile_region(x, ((r, r + 1), (0, width))),
+                _tile_region(gate, ((r, r + 1), (0, width))),
+                _whole(gamma),
+            )
+
+        def writes2(coords):
+            r = coords[0]
+            return (_tile_region(y, ((r, r + 1), (0, width))),)
+
+        reads, writes = reads2, writes2
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_rmsnorm_gated",
+        kind="rms_norm_gated",
+        op=op,
+        domain=domain,
+        inputs=(x.name, gate.name, gamma.name),
+        outputs=(y.name,),
+        params={"eps": op.attributes.get("eps", 1e-6), "activation": activation},
+        threads=THREADS_PER_WORKER,
+        # x row + gate row in fp32 registers alongside the fp32 accumulator.
+        scratch_bytes=2 * width * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
 # RoPE: one task per (batch, head); reads row p of the cos/sin tables
 # ---------------------------------------------------------------------------
 
@@ -535,6 +606,7 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "linear": lower_linear,
     "layer_norm": lower_layer_norm,
     "rms_norm": lower_rms_norm,
+    "rms_norm_gated": lower_rms_norm_gated,
     "rope": lower_rope,
     "gelu": lower_gelu,
     "swiglu": lower_swiglu,
