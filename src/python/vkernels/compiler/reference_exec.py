@@ -38,11 +38,34 @@ from .memory import WorkspacePlan
 from .schedule_phase import PhasePlan, PhaseSchedule, worker_task_ids
 from .task_ir import TaskFamily
 
-__all__ = ["ExecutionTrace", "PhaseStat", "ReferenceExecutor", "ExecutorError"]
+__all__ = ["ExecutionTrace", "PhaseStat", "ReferenceExecutor", "ExecutorError", "decode_e4m3"]
 
 
 class ExecutorError(Exception):
     """The executed schedule violated an obligation (§12)."""
+
+
+def decode_e4m3(bytes_u8):
+    """Decode fp8 e4m3fn bytes (uint8 array) to float64, vectorized.
+
+    e4m3fn: 1 sign bit, 4 exponent bits (bias 7), 3 mantissa bits; no
+    infinities — exponent 0xF with mantissa 0x7 encodes NaN, and the
+    maximum finite magnitude is 448. Subnormals (exponent 0) are
+    mant/8 * 2^-6. This is the numpy-side counterpart of the checkpoint's
+    ``torch.float8_e4m3fn`` weights and of ``_fp8_e4m3fn_encode``.
+    """
+    b = np.asarray(bytes_u8, dtype=np.uint8).astype(np.int32)
+    sign = np.where(b & 0x80, -1.0, 1.0)
+    exp = (b >> 3) & 0xF
+    mant = b & 0x7
+    is_nan = (exp == 0xF) & (mant == 0x7)
+    normal = np.exp2((exp - 7).astype(np.float64)) * (1.0 + mant / 8.0)
+    sub = np.exp2(-6.0) * (mant / 8.0)
+    val = sign * np.where(exp == 0, sub, normal)
+    return np.where(is_nan, np.nan, val)
+
+
+_decode_e4m3 = decode_e4m3
 
 
 @dataclass
@@ -119,6 +142,7 @@ class ReferenceExecutor:
             "attention_scores": self._body_attention_scores,
             "softmax": self._body_softmax,
             "attention_values": self._body_attention_values,
+            "gemv_fp8": self._body_gemv_fp8,
         }
         self._barrier_state = None
 
@@ -257,6 +281,28 @@ class ReferenceExecutor:
         m0 = coords[0] * m_tile
         n0 = coords[1] * n_tile
         return (m0, min(m0 + m_tile, m_extent)), (n0, min(n0 + n_tile, n_extent))
+
+    def _body_gemv_fp8(self, fam: TaskFamily, coords, scalars) -> None:
+        """fp8-blockwise GEMV reference (issue #91): dequant-then-matmul in fp64.
+
+        Mirrors the device contract of ``_t_gemv_fp8`` / ``_h_gemv_fp8``:
+        weights are e4m3 bytes [N, K] row-major (decoded tile-exactly for the
+        task's 16-column N tile), one fp32 scale per 128x128 block, fp64
+        accumulation standing in for the device's fp32 (oracle stability).
+        """
+        x = self.tensor(fam.inputs[0]).astype(np.float64)
+        w = self.tensor(fam.inputs[1])  # e4m3 bytes materialize as uint8 storage
+        scale = self.tensor(fam.inputs[2]).astype(np.float64)
+        y = self.tensor(fam.outputs[0])
+        qb = int(fam.params.get("quant_block", 128))
+        (m0, m1), (n0, n1) = self._gemm_box(fam, coords)
+        wt = _decode_e4m3(w[n0:n1, :])
+        # Broadcast each 128-deep k-block's scale over its columns, exactly as
+        # the device loads one scale per k-chunk of the tile.
+        k = wt.shape[1]
+        s = np.repeat(scale[n0 // qb, :], qb)[:k]
+        acc = (x[m0:m1, :] @ (wt * s[None, :]).T)
+        y[m0:m1, n0:n1] = acc.astype(y.dtype)
 
     def _body_layernorm(self, fam: TaskFamily, coords, scalars) -> None:
         x = self.tensor(fam.inputs[0]).astype(np.float64)
