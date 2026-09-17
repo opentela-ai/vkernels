@@ -1252,6 +1252,215 @@ class RecordingBackend:
         return out
 
     # ------------------------------------------------------------------
+    # MoE decode (issue #98)
+    # ------------------------------------------------------------------
+
+    def moe_route(
+        self,
+        x: SymbolicTensor,
+        router_w: SymbolicTensor,
+        ids: SymbolicTensor,
+        weights: SymbolicTensor,
+        *,
+        mode: str = "learned",
+        score_fn: str = "sqrtsoftplus",
+        top_k: Optional[int] = None,
+        routed_scaling_factor: float = 1.0,
+        bias: Optional[SymbolicTensor] = None,
+        n_group: int = 1,
+        topk_group: int = 1,
+        norm_topk_prob: bool = True,
+        tid2eid: Optional[SymbolicTensor] = None,
+        token_ids: Optional[SymbolicTensor] = None,
+        name: str = "moe_route",
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """Routed-MoE router decode step (issue #98).
+
+        Computes per-row expert scores and writes the **routing table** —
+        external scratch ``ids`` i32 [B, k] and ``weights`` f32 [B, k] — that
+        the expert and combine phases consume (RAW-ordered). Two families,
+        both floe-exact:
+
+        * ``mode="learned", score_fn="sqrtsoftplus"`` (DeepSeek-V4
+          ``DeepseekV4TopKRouter``): global top-k over sqrt(softplus(logits)),
+          unconditional renorm ``w / (Σw + 1e-20)``, × ``routed_scaling_factor``.
+        * ``mode="learned", score_fn="sigmoid_noaux_tc"`` (GLM-5.3
+          ``Glm53TopkRouter``): fp32 sigmoid scores; biased choice scores
+          ``s + bias`` restricted to the top-2-sum ``topk_group`` expert groups;
+          top-k over the masked choice scores (``sorted=False``); weights gather
+          the *unbiased* scores, renorm iff ``norm_topk_prob``, × scaling factor.
+        * ``mode="hash"`` (``DeepseekV4HashRouter``): expert selection is the
+          frozen ``tid2eid[token_id]`` gather; weights are the gathered scores
+          renormed (unconditionally), × scaling factor.
+
+        Selection ties resolve to the **lower expert index** (stable descending
+        order) — the documented determinism contract of this lowering.
+        """
+        b, h = x.value.shape
+        e, h_w = router_w.value.shape
+        if h_w != h:
+            raise ValueError(f"{name}: router weight contraction mismatch ({h_w} != {h})")
+        k = top_k if top_k is not None else int(weights.value.shape[1])
+        if ids.value.dtype != I32 or weights.value.dtype != F32:
+            raise ValueError(f"{name}: routing table must be i32 ids + f32 weights, got {ids.value.dtype}/{weights.value.dtype}")
+        if tuple(ids.value.shape) != (b, k) or tuple(weights.value.shape) != (b, k):
+            raise ValueError(f"{name}: routing table must be [B={b}, k={k}], got {tuple(ids.value.shape)}/{tuple(weights.value.shape)}")
+        if k < 1 or k > e:
+            raise ValueError(f"{name}: top_k={k} outside [1, E={e}]")
+        attrs = {
+            "mode": mode,
+            "score_fn": score_fn,
+            "top_k": k,
+            "num_experts": e,
+            "routed_scaling_factor": float(routed_scaling_factor),
+        }
+        inputs: list[SymbolicTensor] = [x, router_w, ids, weights]
+        if mode == "hash":
+            if tid2eid is None or token_ids is None:
+                raise ValueError(f"{name}: hash routing requires tid2eid [V, k] and token_ids [B]")
+            if tid2eid.value.dtype != I32 or tuple(tid2eid.value.shape)[1] != k:
+                raise ValueError(f"{name}: tid2eid must be i32 [V, k={k}], got {tid2eid.value.shape}")
+            if token_ids.value.dtype != I32 or tuple(token_ids.value.shape) != (b,):
+                raise ValueError(f"{name}: token_ids must be i32 [B={b}], got {token_ids.value.shape}")
+            inputs += [tid2eid, token_ids]
+            if score_fn != "sqrtsoftplus":
+                raise ValueError(f"{name}: hash routing (DeepSeek-V4) uses the sqrtsoftplus score; got {score_fn!r}")
+        elif mode == "learned" and score_fn == "sigmoid_noaux_tc":
+            if bias is None:
+                raise ValueError(f"{name}: sigmoid_noaux_tc requires the e_score_correction_bias [E]")
+            if tuple(bias.value.shape) != (e,):
+                raise ValueError(f"{name}: bias must be [E={e}], got {tuple(bias.value.shape)}")
+            if n_group < 1 or e % n_group:
+                raise ValueError(f"{name}: n_group={n_group} must divide E={e}")
+            if not (1 <= topk_group <= n_group):
+                raise ValueError(f"{name}: topk_group={topk_group} outside [1, n_group={n_group}]")
+            if k > 2 * topk_group * (e // n_group):
+                raise ValueError(f"{name}: top_k={k} exceeds the group-restricted selection pool ({2 * topk_group * (e // n_group)})")
+            if bias.value.dtype != F32:
+                raise ValueError(f"{name}: bias must be f32, got {bias.value.dtype}")
+            inputs.append(bias)
+            attrs.update({"n_group": n_group, "topk_group": topk_group, "norm_topk_prob": bool(norm_topk_prob), "routed_bias": True})
+        elif mode == "learned" and score_fn == "sqrtsoftplus":
+            attrs.update({"norm_topk_prob": True, "routed_bias": False})
+        else:
+            raise ValueError(f"{name}: unsupported router family mode={mode!r} score_fn={score_fn!r}")
+        route_reads = [_regional_reads(x.value), _regional_reads(router_w.value)]
+        if mode == "hash":
+            route_reads += [_regional_reads(tid2eid.value), _regional_reads(token_ids.value)]
+        elif mode == "learned" and score_fn == "sigmoid_noaux_tc":
+            route_reads.append(_regional_reads(bias.value))
+        self._record(
+            "moe_route",
+            inputs=inputs,
+            outputs=(ids, weights),
+            attributes=attrs,
+            reads=tuple(route_reads),
+            writes=(_regional_reads(ids.value), _regional_reads(weights.value)),
+            source_location=name,
+            numerical_contract={
+                "scores": "fp32 (f64 in the reference body): sigmoid(logits) + bias for noaux_tc, sqrt(softplus(logits)) for sqrtsoftplus",
+                "selection": f"top-{k} by choice scores, stable descending, ties to the lower expert index; sorted=False semantics",
+                "weights": "unbiased score gather" + (", renorm w/(Σw+1e-20)" if attrs.get("norm_topk_prob") else "") + f", × {routed_scaling_factor}",
+            },
+        )
+        return ids, weights
+
+    def moe_expert(
+        self,
+        x: SymbolicTensor,
+        gate_up: SymbolicTensor,
+        down: SymbolicTensor,
+        ids: SymbolicTensor,
+        *,
+        out: Optional[SymbolicTensor] = None,
+        swiglu_limit: Optional[float] = None,
+        name: str = "moe_expert",
+    ) -> SymbolicTensor:
+        """Routed-expert FFN decode tasks (issue #98): the static k·B grid.
+
+        One task per (row, slot) computes the full expert FFN for that row's
+        routed expert — the weight base ``e = ids[b, slot]`` is **runtime
+        indirection** through the routing table (the #94 slot-table pattern
+        applied to a read-only weight pool):
+
+            g, u = gate_up[e] @ x ;  act = silu(clamp(g, ≤L)) · clamp(u, ±L)
+            partials[b, slot] = down[e] @ act
+
+        ``swiglu_limit=L`` (GLM-5.3 ``Glm53Experts`` / DeepSeek-V4 experts:
+        gate clamped to ≤L, up clamped to ±L) folds into the activation.
+        Weights are fp32 in this slice (bf16/fp8-block variants are dtype
+        follow-ups on the same task shape).
+        """
+        b, h = x.value.shape
+        e, two_i, h_w = gate_up.value.shape
+        e_d, h_d, i_d = down.value.shape
+        k = int(ids.value.shape[1])
+        if h_w != h or e_d != e or h_d != h or two_i != 2 * i_d:
+            raise ValueError(f"{name}: expert stack shape mismatch gate_up={gate_up.value.shape} down={down.value.shape} x H={h}")
+        if ids.value.dtype != I32:
+            raise ValueError(f"{name}: routing ids must be i32, got {ids.value.dtype}")
+        if gate_up.value.dtype != F32 or down.value.dtype != F32 or x.value.dtype != F32:
+            raise ValueError(f"{name}: this slice runs fp32 expert weights; got {x.value.dtype}/{gate_up.value.dtype}/{down.value.dtype}")
+        out = out or self.fresh_buffer(f"{name}{self._suffix()}_partials", (b, k, h))
+        if tuple(out.value.shape) != (b, k, h):
+            raise ValueError(f"{name}: partials must be [B={b}, k={k}, H={h}], got {tuple(out.value.shape)}")
+        attrs = {"num_experts": e, "intermediate": i_d, "top_k": k}
+        if swiglu_limit is not None:
+            attrs["swiglu_limit"] = float(swiglu_limit)
+        self._record(
+            "moe_expert",
+            inputs=(x, gate_up, down, ids),
+            outputs=(out,),
+            attributes=attrs,
+            reads=(_regional_reads(x.value), _regional_reads(gate_up.value), _regional_reads(down.value), _regional_reads(ids.value)),
+            writes=(_regional_reads(out.value),),
+            source_location=name,
+            numerical_contract={
+                "indirection": f"weight base = gate_up[ids[b, slot]] / down[ids[b, slot]] — runtime slot gather (#94 pattern)",
+                "activation": "g ≤ L, u ∈ [−L, L], silu(g)·u, fp32" + (f" (L={swiglu_limit})" if swiglu_limit is not None else " (unclamped)"),
+                "reduction": "f32, h ascending over the full K/H sweep per task",
+            },
+        )
+        return out
+
+    def moe_combine(
+        self,
+        partials: SymbolicTensor,
+        weights: SymbolicTensor,
+        *,
+        shared: Optional[SymbolicTensor] = None,
+        out: Optional[SymbolicTensor] = None,
+        name: str = "moe_combine",
+    ) -> SymbolicTensor:
+        """Weighted scatter-add per row (issue #98): ``y = Σ_k w_k·h_k`` (+ the
+        dense shared-expert path when given). One task per row; fp32
+        accumulation in slot order. RAW on the routing ``weights`` (after the
+        router) and on the expert ``partials`` (after the expert phase).
+        """
+        b, k, h = partials.value.shape
+        if weights.value.dtype != F32 or tuple(weights.value.shape) != (b, k):
+            raise ValueError(f"{name}: weights must be f32 [B={b}, k={k}], got {weights.value.dtype}/{tuple(weights.value.shape)}")
+        if shared is not None and tuple(shared.value.shape) != (b, h):
+            raise ValueError(f"{name}: shared path must be [B={b}, H={h}], got {tuple(shared.value.shape)}")
+        out = out or self.fresh_buffer(f"{name}{self._suffix()}", (b, h))
+        if tuple(out.value.shape) != (b, h):
+            raise ValueError(f"{name}: output must be [B={b}, H={h}], got {tuple(out.value.shape)}")
+        inputs = (partials, weights, shared) if shared is not None else (partials, weights)
+        self._record(
+            "moe_combine",
+            inputs=inputs,
+            outputs=(out,),
+            attributes={"top_k": k, "shared": shared is not None},
+            reads=(_regional_reads(partials.value), _regional_reads(weights.value)) + ((_regional_reads(shared.value),) if shared is not None else ()),
+            writes=(_regional_reads(out.value),),
+            source_location=name,
+            numerical_contract={
+                "combine": f"Σ over k={k} slots in slot order, fp32 accumulate" + ("; + shared expert row" if shared is not None else ""),
+            },
+        )
+        return out
+
+    # ------------------------------------------------------------------
     # Guards
     # ------------------------------------------------------------------
 
