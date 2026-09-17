@@ -81,9 +81,12 @@ static constexpr int kFnChunk = 512;
 //  the n=7 hc_hidden=16384 gate row, i.e. a FAIL at the unchanged 1e-4
 //  PRE_THRESH, and above the documented <= 2e-5 envelope. So out[n,o] is
 //  computed by ONE thread (tid 0) as the same strict sequential chain,
-//  consuming x from the staged row and fn from shared: the product is
-//  materialized with a compiler barrier (no mul+add -> FMA contraction),
-//  making the device sum BITWISE identical to the oracle. The parallel
+//  consuming x from the staged row and fn from shared: each step is an
+//  EXPLICIT single-rounding fmaf, matching the oracle's std::fma chain
+//  (mhc_pre_gemm_sqrsum_cpu) step for step, so the device sum is BITWISE
+//  identical to the oracle regardless of either compiler's -ffp-contract
+//  default (the old "compiler barrier" two-rounding chain was the n=7
+//  1.19e-5-rel residual -- the contract-mismatch signature). The parallel
 //  speedup comes from (a) one block per column (24 blocks at decode
 //  instead of 1) and (b) the shared double buffer, which hides the global
 //  fn load latency that dominated the old serial walk (~278 us was
@@ -105,10 +108,6 @@ __global__ void mhc_pre_gemm_sqrsum_kernel(
     float* __restrict__ out,          // [num_tokens, hc_mult3] fp32
     float* __restrict__ sqrsum,       // [num_tokens] fp32
     int num_tokens, int hc_mult3, int hc_hidden_size) {
-  // Strict mul+add rounding for the out chain -- no FMA contraction (the
-  // CPU oracle is a two-rounding mul-then-add chain; see block comment).
-  // Must be the first statement of the compound block (clang restriction).
-#pragma clang fp contract(off)
   const int n = blockIdx.x;
   const int o = blockIdx.y;              // output column (issue #79 split)
   if (n >= num_tokens || o >= hc_mult3) return;
@@ -164,11 +163,12 @@ __global__ void mhc_pre_gemm_sqrsum_kernel(
       for (int j = 0; j < kFnChunk; ++j) {
         const int h = base + j;
         if (h < hc_hidden_size) {
-          float p = bf16_to_f32(sX[h]) * sFN[c & 1][j];
-          // contract(off) below keeps hipcc's default -ffp-contract=fast from
-          // fusing this mul+add into an FMA (one rounding instead of the
-          // oracle's two): the chain then matches the CPU oracle bitwise.
-          acc += p;
+          // Explicit single-rounding FMA: replays the oracle's std::fma
+          // chain exactly (same h order, same acc association) -- no
+          // dependence on hipcc's implicit contraction behavior (v_fma
+          // vs v_fmac are BOTH single-rounding here; the historical trap
+          // was contract(off) forcing two roundings vs the oracle's one).
+          acc = fmaf(bf16_to_f32(sX[h]), sFN[c & 1][j], acc);
         }
       }
       if (c == nc - 1) out[(size_t)n * hc_mult3 + o] = acc;
@@ -274,13 +274,15 @@ __global__ void mhc_pre_gemm_sqrsum_blocked_kernel(
     float* __restrict__ out,          // [num_tokens, hc_mult3] fp32
     float* __restrict__ sqrsum,       // [num_tokens] fp32
     int num_tokens, int hc_mult3, int hc_hidden_size) {
-// NOTE: FMA contraction is REQUIRED here, not forbidden: the CPU oracle's
-// `acc += xn[h] * fo[h]` is contracted into an FMA by the host compiler's
-// default -ffp-contract=on, so the device must also contract to replay the
-// oracle's one-rounding-per-step path. (The predecessor's contract(off)
-// two-rounding chain measured 1.19e-5 rel on the n=7 row -- the
-// two-rounding-vs-FMA mismatch signature; tiny shapes still matched at 0.0
-// because both roundings agree on short non-cancelling sums.)
+// NOTE: an EXPLICIT single-rounding fmaf chain is REQUIRED here, matching
+// the oracle's std::fma chain (mhc_pre_gemm_sqrsum_cpu) step for step --
+// bitwise agreement must not depend on either compiler's implicit
+// mul+add contraction (the predecessor's contract(off) two-rounding chain
+// measured 1.19e-5 rel on the n=7 row -- the two-rounding-vs-FMA mismatch
+// signature; tiny shapes still matched at 0.0 because both roundings agree
+// on short non-cancelling sums). NSLICE>1 additionally regroups the chain
+// into blocked partials (measured below); NSLICE=1 is bitwise-exact by
+// construction.
   const int n = blockIdx.x;
   const int o = blockIdx.y;
   if (n >= num_tokens || o >= hc_mult3) return;
@@ -320,8 +322,7 @@ __global__ void mhc_pre_gemm_sqrsum_blocked_kernel(
                                                  : hc_hidden_size;
 #pragma unroll 4
     for (int h = h0; h < h1; ++h) {
-      float p = bf16_to_f32(x_row[h]) * fn_row[h];
-      part += p;
+      part = fmaf(bf16_to_f32(x_row[h]), fn_row[h], part);
     }
   }
   sPart[tid] = part;
