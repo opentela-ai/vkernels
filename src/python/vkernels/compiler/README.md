@@ -171,3 +171,26 @@ standard `×w` instead of the model's gemma `×(1+w)`** convention (every
 layer was ~18% off). The out-projection GEMV and the residual add are in
 *separate* barrier phases (GDN 6→7, FA 9→10) to avoid the within-phase
 read-after-write race that fused them.
+
+## fp8-blockwise GEMV linear in the compiler IR (issue #91)
+
+The compiler lane gained a first-class fp8 decode projection:
+`ops.linear_fp8(x, w_fp8, scale)` records the `linear_fp8` op variant
+(`weight_layout="fp8_block"`, the scale tensor as the second weight
+external — DeepSeek-style 128×128 block-FP8, e4m3 weights [N, K]
+row-major, fp32 scales [ceil(N/128), K/128] block-major; ragged trailing
+N blocks allowed). The lowering (`gemv_fp8` kind) reuses the dense
+linear's GEMV tile domain — one task per (m, 16-column) output tile with
+a full-K sweep — and each task reads exactly one scale row (a 16-column
+tile always lies inside one 128-wide N block) plus one fp32 scale per
+128-deep k-block. The reference body dequantizes tile-exactly and runs
+the matmul in fp64; the device side is the already-validated
+`_t_gemv_fp8` / `_h_gemv_fp8` Triton template (dequant-in-register, fp32
+accumulate, no intermediate dequantized tensor). The CPU oracle suite
+(`tests/python/test_linear_fp8_compiler.py`) proves reference-executor ↔
+fp64-oracle equivalence (1e-12), the worker-stride device-template
+mirror (1e-5, odd m / ragged N / block boundaries), and the bf16-reference
+vs fp8 GEMV rel-err bound (measured 2.6–3.1e-2 for a single K=512 GEMV;
+the 27B end-to-end logits gate is 1.4–3.4e-3 across 64 layers). MXFP4
+expert weights (glm/deepseek checkpoints) are a dtype follow-up on the
+same task shape.
