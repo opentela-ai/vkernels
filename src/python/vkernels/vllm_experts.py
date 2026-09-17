@@ -23,10 +23,15 @@ Two layers:
 * :class:`VkernelFusedExperts` — the vLLM expert backend that drives the
   gfx942 HIP C ABI :c:func:`vk_hip_fused_moe_mxfp4` (PR #44) via ctypes on
   MI300A, replacing the broken AITER/Triton MoE path for Kimi-K3.
-  ``moe_align_block_size`` is done on CPU (routing metadata is small,
-  ``O(M*top_k)``) and ``apply`` issues the kernels on PyTorch's *current*
-  stream (no per-launch device sync), so each MoE layer is no longer a
-  cross-stream TP barrier.
+  ``moe_align_block_size`` runs **on-device** by default (issue #78: the
+  HIP kernel + ``vk_hip_moe_align_block_size`` C ABI keep ``topk_ids`` /
+  ``sids`` / ``eids`` on the GPU, removing the ``topk_ids.cpu()`` host
+  round-trip that was 97-100% of PP0's per-call ``moe:vkernel_apply``);
+  prefill batches (``M*top_k > 1024``, single-block kernel limit) and
+  builds without the on-device symbol fall back to the CPU helper
+  automatically. ``apply`` issues every kernel on PyTorch's *current*
+  stream (no per-launch device sync), so the MoE region is stream-ordered
+  and no longer a per-step host barrier.
 
 Validated on MI300A (gfx942): all 8 C++ GPU tests + 4 Python ctypes tests
 pass, and the breakable piecewise cudagraph path (issue #42) runs 0 faults
@@ -503,11 +508,15 @@ def resolve_align_fn(lib):
     return fn
 
 
-# Opt-in: do moe_align_block_size on the GPU (no topk_ids.cpu() host
-# round-trip). Defaults to the CPU path; the GPU path requires the
-# on-device align symbol (PR #47) AND M*top_k <= 1024 (single-block
-# shared memory). Larger N falls back to CPU automatically.
-_GPU_ALIGN = os.environ.get("VKERNELS_GPU_ALIGN", "0") not in ("0", "", "false")
+# On-device moe_align_block_size is the DEFAULT (issue #78: the
+# topk_ids.cpu() host round-trip was 97-100% of PP0's per-call
+# moe:vkernel_apply and the ~3x breakable regression floor on PP1/PP2).
+# Set VKERNELS_GPU_ALIGN=0 to force the legacy CPU align path (e.g. to A/B
+# the host round-trip in a profile). The GPU path requires the on-device
+# align symbol (PR #47) AND M*top_k <= 1024 (single-block shared memory,
+# the decode regime that dominates PP0); larger N (prefill) and
+# symbol-absent builds fall back to CPU automatically.
+_GPU_ALIGN = os.environ.get("VKERNELS_GPU_ALIGN", "1") not in ("0", "false")
 
 
 def _align_em_bound(M: int, top_k: int, local_n: int, block_size: int) -> int:
@@ -573,8 +582,9 @@ def _build_vllm_experts():
         (SwiGLU / SiTU) → down GEMM → routing-weight application → top-k
         summation. Output is fp32, converted to bf16.
 
-        ``moe_align_block_size`` is done on CPU (routing metadata is
-        small). Weight format: ``[E, 2*ispp, hidden/2]`` uint8 (w13),
+        ``moe_align_block_size`` runs on-device by default (issue #78);
+        prefill (``M*top_k > 1024``) falls back to the CPU helper. Weight
+        format: ``[E, 2*ispp, hidden/2]`` uint8 (w13),
         ``[E, hidden, ispp/2]`` uint8 (w2) — matches vLLM's
         ``Mxfp4MoEMethod.create_weights()`` exactly.
 
@@ -705,16 +715,19 @@ def _build_vllm_experts():
                 local_n = _local_n(E, global_num_experts)
             cap_em = max_em_count(max_M, top_k, local_n)
 
-            # On-device moe_align_block_size (issue #46 follow-up): when
-            # the symbol is present (PR #47), VKERNELS_GPU_ALIGN is set, and
-            # M*top_k <= 1024 (single-block shared memory — the decode
-            # regime that dominates PP0), do the routing sort on the GPU on
-            # `stream` and read topk_ids/expert_map on-device — removing the
-            # ~4 ms topk_ids.cpu() host sync (97-100% of PP0's per-call
-            # moe:vkernel_apply). Larger N (prefill) falls back to the CPU
-            # path automatically. The GEMM is launched with max_EM/block_size
-            # blocks (a constant for the batch shape; the kernels early-out
-            # the padding blocks/rows), so NO host read of out_em is needed.
+            # On-device moe_align_block_size (issue #46 follow-up, default
+            # since issue #78): when the symbol is present and M*top_k <=
+            # 1024 (single-block shared memory — the decode regime that
+            # dominates PP0), do the routing sort on the GPU on `stream`
+            # and read topk_ids/expert_map on-device — removing the ~4 ms
+            # topk_ids.cpu() host sync (97-100% of PP0's per-call
+            # moe:vkernel_apply, and the same gate that regressed PP1/PP2
+            # ~3x under breakable). VKERNELS_GPU_ALIGN=0 forces the CPU
+            # path (A/B profiling). Larger N (prefill) falls back to the
+            # CPU path automatically. The GEMM is launched with
+            # max_EM/block_size blocks (a constant for the batch shape;
+            # the kernels early-out the padding blocks/rows), so NO host
+            # read of out_em is needed.
             align_fn = resolve_align_fn(lib)
             use_gpu = (
                 _GPU_ALIGN
