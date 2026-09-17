@@ -32,6 +32,7 @@
 //   mla.hip  -- this file, compiled with VKERNELS_HAS_HIP, online softmax.
 //               Cross-checked against the oracle by test_mla_correct.hip.
 #include <cstdint>
+#include <mutex>
 
 #include "vkernels/kernels/mla.hpp"
 
@@ -134,6 +135,174 @@ __global__ void mla_fwd_kernel(const float* __restrict__ q,
 }
 
 // ---------------------------------------------------------------------------
+//  Split-K decode (issue #82)
+//
+//  A decode grid of B*H*S_q blocks (one 64-thread block per row) leaves CUs
+//  idle when B*H*S_q << kMlaCus — the H=1 S_q=1 S_kv=8192 case runs on ONE
+//  block: 6.5 GB/s = 0.12% of HBM. mla_fwd_split_for splits the S_kv window
+//  across `split` blocks per row; each writes the per-split NORMALIZED
+//  partial-softmax output (softmax_causal restricted to its visible keys:
+//  Σ exp(score − row_max) · v_c / row_sum) and a per-split lse
+//  (row_max + log(row_sum), −inf when its slice has no visible keys), and a
+//  combine kernel folds the splits in FIXED ascending order:
+//
+//    out = Σ_sp exp(lse_sp − lse_g) · partial_out_sp ,
+//    lse_g = m_g + log( Σ_sp exp(lse_sp − m_g) )
+//
+//  That sum is exactly the softmax numerator over lse_g, so no second
+//  normalisation is needed and the result matches mla_fwd_cpu within the
+//  same fp tolerance (the fixed ascending order keeps it deterministic).
+// ---------------------------------------------------------------------------
+__global__ void mla_fwd_split_kernel(const float* __restrict__ q,
+                                     const float* __restrict__ k_c,
+                                     const float* __restrict__ k_pe,
+                                     const float* __restrict__ v_c,
+                                     float* __restrict__ partial_out,
+                                     float* __restrict__ partial_lse,
+                                     int H, int S_q, int S_kv,
+                                     int q_start, int kv_start,
+                                     int lr, int rhd, float scale,
+                                     int split, int kvs) {
+  const int gi = blockIdx.x;          // one query row per block (decode)
+  const int h = blockIdx.y;
+  const int z = blockIdx.z;           // b * split + sp
+  const int b = z / split;
+  const int sp = z - b * split;
+  const int lane = threadIdx.x;       // 64 threads: one wavefront
+
+  const int Dq = lr + rhd;
+  const int gqi = q_start + gi;
+
+  // Stage this block's single query row in shared memory.
+  extern __shared__ float sQ[];       // sQ[Dq]
+  for (int c = lane; c < Dq; c += 64)
+    sQ[c] = q[(((size_t)b * H + h) * S_q + gi) * Dq + c];
+  __syncthreads();
+
+  // Key slice [lo, hi) of the S_kv window owned by this split.
+  const int lo = sp * kvs;
+  const int hi = min(lo + kvs, S_kv);
+
+  float o[kPerLane];                  // lane-local no-ropes output slice
+  for (int t = 0; t < kPerLane; ++t) o[t] = 0.0f;
+  float row_max = -INFINITY;          // running max (same on every lane)
+  float row_sum = 0.0f;               // running denominator (same on every lane)
+
+  const int nope_tiles = (lr + 63) / 64;
+  for (int j = lo; j < hi; ++j) {
+    const int gkj = kv_start + j;
+
+    float partial = 0.0f;
+    if (gkj <= gqi) {
+      const float* kc = k_c + ((size_t)b * S_kv + j) * lr;
+      for (int t = 0; t < nope_tiles; ++t) {
+        const int idx = lane + t * 64;
+        if (idx < lr) partial += sQ[idx] * kc[idx];
+      }
+      if (lane < rhd) {               // one rope element per lane (rhd <= 64)
+        const float* kp = k_pe + ((size_t)b * S_kv + j) * rhd;
+        partial += sQ[lr + lane] * kp[lane];
+      }
+    }
+    float score = partial;
+    for (int off = 32; off > 0; off >>= 1)   // warp-wide sum → broadcast
+      score += __shfl_xor(score, off);
+    // Masked keys must contribute ZERO weight, exactly as the CPU oracle
+    // does: clamp their score to -inf.
+    score = (gkj <= gqi) ? (score * scale) : -INFINITY;
+
+    const float new_max = fmaxf(row_max, score);
+    const float exp_old = (row_max == -INFINITY) ? 0.0f
+                                                 : expf(row_max - new_max);
+    const float exp_s = (score == -INFINITY) ? 0.0f : expf(score - new_max);
+    row_sum = row_sum * exp_old + exp_s;
+    for (int t = 0; t < kPerLane; ++t) o[t] *= exp_old;
+    if (gkj <= gqi) {
+      const float* vc = v_c + ((size_t)b * S_kv + j) * lr;
+      for (int t = 0; t < nope_tiles; ++t) {
+        const int idx = lane + t * 64;
+        if (idx < lr) o[t] += exp_s * vc[idx];
+      }
+    }
+    row_max = new_max;
+  }
+
+  // Per-split partial: normalized partial-softmax output slice (this split's
+  // attention restricted to its visible keys) + lse = row_max + log(row_sum).
+  // Normalizing here makes the combine exact:
+  // out = Σ_sp exp(lse_sp − lse_g) · partial_out_sp.
+  const size_t row = (size_t)((size_t)b * H + h) * S_q + gi;
+  const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
+  float* porow = partial_out + (row * split + sp) * lr;
+  for (int t = 0; t < nope_tiles; ++t) {
+    const int idx = lane + t * 64;
+    if (idx < lr) porow[idx] = o[t] * inv;
+  }
+  if (lane == 0) {
+    const float lse = (row_sum > 0.0f) ? row_max + logf(row_sum) : -INFINITY;
+    partial_lse[row * split + sp] = lse;
+  }
+}
+
+// Fixed-order (ascending split) combine over the split-K partials. One block
+// per (b, h, query row); lane `d` owns the strided output slice
+// {d, d+64, ...}, matching the split kernel's layout.
+__global__ void mla_fwd_split_combine_kernel(
+    const float* __restrict__ partial_out, const float* __restrict__ partial_lse,
+    float* __restrict__ out, int S_q, int split, int lr) {
+  const int gi = blockIdx.x;
+  const int h = blockIdx.y;
+  const int b = blockIdx.z;
+  const int lane = threadIdx.x;
+  const size_t row = (size_t)((size_t)b * gridDim.y + h) * S_q + gi;
+
+  extern __shared__ float sLse[];     // sLse[split]
+  for (int sp = lane; sp < split; sp += 64)
+    sLse[sp] = partial_lse[row * split + sp];
+  __syncthreads();
+
+  const int nope_tiles = (lr + 63) / 64;
+  float* orow = out + row * lr;
+
+  // Global max over the per-split lses.
+  float m_g = -INFINITY;
+  for (int sp = 0; sp < split; ++sp) m_g = fmaxf(m_g, sLse[sp]);
+  if (m_g == -INFINITY) {   // every key masked: zero row, as the CPU oracle
+    for (int t = 0; t < nope_tiles; ++t) {
+      const int idx = lane + t * 64;
+      if (idx < lr) orow[idx] = 0.0f;
+    }
+    return;
+  }
+
+  // lse_g = m_g + log(Σ exp(lse_sp − m_g)), summed in fixed ascending order.
+  float sum = 0.0f;
+  for (int sp = 0; sp < split; ++sp) {
+    if (sLse[sp] == -INFINITY) continue;  // split slice fully masked
+    sum += expf(sLse[sp] - m_g);
+  }
+  const float lse_g = m_g + logf(sum);
+
+  // out = Σ_sp exp(lse_sp − lse_g) · partial_out_sp (fixed ascending order;
+  // already the softmax numerator over lse_g — no extra normalisation).
+  float o[kPerLane];
+  for (int t = 0; t < kPerLane; ++t) o[t] = 0.0f;
+  for (int sp = 0; sp < split; ++sp) {
+    const float w = (sLse[sp] == -INFINITY) ? 0.0f : expf(sLse[sp] - lse_g);
+    if (w == 0.0f) continue;
+    const float* p = partial_out + (row * split + sp) * lr;
+    for (int t = 0; t < nope_tiles; ++t) {
+      const int idx = lane + t * 64;
+      if (idx < lr) o[t] += w * p[idx];
+    }
+  }
+  for (int t = 0; t < nope_tiles; ++t) {
+    const int idx = lane + t * 64;
+    if (idx < lr) orow[idx] = o[t];
+  }
+}
+
+// ---------------------------------------------------------------------------
 //  Launchers
 // ---------------------------------------------------------------------------
 namespace {
@@ -148,6 +317,69 @@ void launch(const float* q, const float* k_c, const float* k_pe,
   mla_fwd_kernel<BQ><<<grid, block, shmem, 0>>>(
       q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start, lr, rhd,
       scale);
+}
+
+// Device workspace for the split-K partials (issue #82): grow-only, shared
+// across consecutive mla_fwd launches. Both kernels of one launch are
+// enqueued under the same lock that (re)sizes the buffers, so a later
+// resize's hipFree — which synchronises the device — can never race a
+// not-yet-launched kernel against a freed buffer. The resize path runs only
+// on first use / shape growth; steady-state decode just enqueues.
+struct SplitWorkspace {
+  std::mutex mu;
+  float* partial_out = nullptr;
+  float* partial_lse = nullptr;
+  size_t cap_out = 0;
+  size_t cap_lse = 0;
+};
+SplitWorkspace& split_ws() {
+  static SplitWorkspace w;
+  return w;
+}
+
+// Split-K decode launch: allocates (grow-only) the per-split partial buffers
+// and enqueues the split kernel + fixed-order combine kernel on the default
+// stream. Returns false when the buffers cannot be sized; the caller then
+// falls back to the plain single-block path.
+bool launch_split(const float* q, const float* k_c, const float* k_pe,
+                  const float* v_c, float* out, int B, int H, int S_q,
+                  int S_kv, int q_start, int kv_start, int lr, int rhd,
+                  float scale, int split) {
+  const int Dq = lr + rhd;
+  const int kvs = (S_kv + split - 1) / split;  // every split keeps >= 1 key
+  const size_t rows = (size_t)B * H * S_q;
+  const size_t n_out = rows * split * lr;
+  const size_t n_lse = rows * split;
+
+  auto& w = split_ws();
+  std::lock_guard<std::mutex> lock(w.mu);
+  if (w.cap_out < n_out) {
+    float* p = nullptr;
+    if (hipMalloc(&p, n_out * sizeof(float)) == hipSuccess) {
+      if (w.partial_out) hipFree(w.partial_out);
+      w.partial_out = p;
+      w.cap_out = n_out;
+    }
+  }
+  if (w.cap_lse < n_lse) {
+    float* p = nullptr;
+    if (hipMalloc(&p, n_lse * sizeof(float)) == hipSuccess) {
+      if (w.partial_lse) hipFree(w.partial_lse);
+      w.partial_lse = p;
+      w.cap_lse = n_lse;
+    }
+  }
+  if (w.cap_out < n_out || w.cap_lse < n_lse) return false;
+
+  const dim3 block(64);
+  const dim3 gridS(S_q, H, B * split);
+  mla_fwd_split_kernel<<<gridS, block, Dq * sizeof(float), 0>>>(
+      q, k_c, k_pe, v_c, w.partial_out, w.partial_lse, H, S_q, S_kv, q_start,
+      kv_start, lr, rhd, scale, split, kvs);
+  const dim3 gridC(S_q, H, B);
+  mla_fwd_split_combine_kernel<<<gridC, block, split * sizeof(float), 0>>>(
+      w.partial_out, w.partial_lse, out, S_q, split, lr);
+  return true;
 }
 }  // namespace
 
@@ -176,6 +408,15 @@ void mla_fwd(int B, int H, int S_q, int S_kv, int q_start, int kv_start,
              int kv_lora_rank, int qk_rope_head_dim, float scale,
              const float* q, const float* k_c, const float* k_pe,
              const float* v_c, float* out) {
+  // Decode shaped grids that cannot fill the CUs take the split-K path
+  // (issue #82); mla_fwd_split_for returns 1 for prefill shapes and for
+  // grids that already fill them, which then run exactly as before.
+  const int split = ::vkernels::kernels::mla_fwd_split_for(B, H, S_q, S_kv);
+  if (split > 1 &&
+      launch_split(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
+                   kv_lora_rank, qk_rope_head_dim, scale, split)) {
+    return;
+  }
   int bq = 0, bn = 0, th = 0;
   ::vkernels::kernels::mla_config_for(S_q, kv_lora_rank, qk_rope_head_dim,
                                       &bq, &bn, &th);

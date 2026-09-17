@@ -195,6 +195,19 @@ int main() {
   CK(hipMalloc(&dpart_out, (size_t)128 * Hmax * Dvmax * 4), "alloc part_out");
   CK(hipMalloc(&dpart_lse, (size_t)128 * Hmax * 4), "alloc part_lse");
 
+  // Issue #80 diagnostics: VK_DSA_TEST_SPLIT=<s> runs only the rows with
+  // that split value (0 also keeps the plain rows), VK_DSA_TEST_REPS=<n>
+  // repeats the whole sweep n times (nondeterminism probe: the db-kernel
+  // corruption varies across reps on identical inputs).
+  const int only_split = [] {
+    const char* e = std::getenv("VK_DSA_TEST_SPLIT");
+    return e ? std::atoi(e) : -1;
+  }();
+  const int reps = [] {
+    const char* e = std::getenv("VK_DSA_TEST_REPS");
+    return e ? std::atoi(e) : 1;
+  }();
+
   int fails = 0;
   const float OUT_THRESH = 2e-2f;
   const float LSE_THRESH = 1e-3f;
@@ -233,9 +246,16 @@ int main() {
       {1, 256, 16, 576, 64, 256, 64, 14},  // DSv3 decode, split=14
       {1, 2048, 64, 256, 0, 2048, 64, 3},  // full-topk decode, split=3
       {1, 128, 64, 256, 0, 128, 64, 128},  // split == topk (1 key/split)
+      // Issue #80: the double-buffered partial kernel with BQ > 1 (S_q > 8
+      // -> dsa_config_for picks bq = 4): exercises the per-warp LDS
+      // staging slices + uneven split on a multi-warp block.
+      {64, 256, 1, 256, 0, 128, 64, 7},    // short, BQ=4, uneven split
   };
 
+  for (int rep = 0; rep < reps; ++rep) {
+    if (reps > 1) std::printf("########## rep=%d ##########\n", rep);
   for (const auto& c : cfgs) {
+    if (only_split >= 0 && c.split != only_split) continue;
     const int W = c.dim + c.tail_dim;
     const float sm_scale = (1.0f / std::sqrt((float)W)) * LOG2E;
     std::vector<float> q((size_t)c.S_q * c.H * W);
@@ -262,6 +282,7 @@ int main() {
     if (!ok) ++fails;
   }
 
+  }  // reps
   hipFree(dq); hipFree(dkv); hipFree(didx); hipFree(dout); hipFree(dlse);
   std::printf("\n%s (%d failure(s))\n", fails ? "FAIL" : "PASS", fails);
   return fails ? 1 : 0;

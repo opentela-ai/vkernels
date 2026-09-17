@@ -199,6 +199,29 @@ TEST(MlaConfig, DecodeVsPrefill) {
   EXPECT_EQ(th, 256);
 }
 
+TEST(MlaSplitFor, DecodeSplits) {
+  using vkernels::kernels::kMlaCus;
+  using vkernels::kernels::kMlaMinSplitKeys;
+  using vkernels::kernels::mla_fwd_split_for;
+  // The documented worst case: a single query row -> fill the machine with
+  // splits, capped only by the min-keys-per-split floor.
+  EXPECT_EQ(mla_fwd_split_for(1, 1, 1, 8192), kMlaCus);
+  // Prefill shapes never split (S_q > 8).
+  EXPECT_EQ(mla_fwd_split_for(1, 1, 64, 8192), 1);
+  EXPECT_EQ(mla_fwd_split_for(1, 1, 9, 8192), 1);
+  // Grids that already fill the CUs keep the plain single-block path.
+  EXPECT_EQ(mla_fwd_split_for(8, 32, 1, 8192), 1);   // 8*32*1 = 256 > 228
+  EXPECT_EQ(mla_fwd_split_for(1, 228, 1, 8192), 1);  // exactly 228 rows
+  // Splits respect the min-keys-per-split floor (S_kv=256 -> 8 splits).
+  EXPECT_EQ(mla_fwd_split_for(1, 1, 1, 256), 256 / kMlaMinSplitKeys);
+  // Multi-row decode: fewer splits so rows x splits fill the machine.
+  EXPECT_EQ(mla_fwd_split_for(1, 1, 8, 8192), kMlaCus / 8);
+  // Zero dims fall back to the plain path.
+  EXPECT_EQ(mla_fwd_split_for(0, 1, 1, 8192), 1);
+  EXPECT_EQ(mla_fwd_split_for(1, 0, 1, 8192), 1);
+  EXPECT_EQ(mla_fwd_split_for(1, 1, 1, 0), 1);
+}
+
 TEST(MlaFwd, NullArgsThrow) {
   std::vector<float> q(4, 1), c(4, 1);
   EXPECT_THROW(mla_fwd_cpu(1, 1, 1, 1, 0, 0, 2, 2, 1.0f, nullptr,
