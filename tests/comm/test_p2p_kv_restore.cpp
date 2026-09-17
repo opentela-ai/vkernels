@@ -198,6 +198,42 @@ TEST(KvRestorePlan, TwoStreamsSharePlan) {
   }
 }
 
+// Regression for issue #84: the plan kernel grid.y used to be capped at the
+// 65535 CUDA grid.y limit with a plain `if (p >= num_pages) return`, so a
+// plan with more than 65535 pages silently dropped every page past 65534.
+// The page grid-stride loop must cover all of them.
+TEST(KvRestorePlan, CoversMorePagesThanGridYLimit) {
+  constexpr std::size_t kPageSize = 1, kHeads = 1, kHeadDim = 8, kElem = 2;
+  constexpr std::size_t kNumPages = 70000;  // > 65535
+  constexpr std::size_t kSb = kHeads * kHeadDim * kElem;   // 16
+  constexpr std::size_t kPageBytes = kPageSize * 2 * kSb;  // 32
+
+  std::vector<std::uint8_t> peer(kNumPages * kPageBytes);
+  for (std::size_t i = 0; i < peer.size(); ++i)
+    peer[i] = static_cast<std::uint8_t>(i % 251);
+  std::vector<int> slot_ids(kNumPages);
+  std::vector<const void*> ptrs(kNumPages);
+  for (std::size_t p = 0; p < kNumPages; ++p) {
+    slot_ids[p] = static_cast<int>(p);  // unique, in range
+    ptrs[p] = peer.data() + p * kPageBytes;
+  }
+
+  auto kp = make_dst(kNumPages, kHeads, kHeadDim, kElem);
+  auto vp = make_dst(kNumPages, kHeads, kHeadDim, kElem);
+
+  P2PKvRestorePlan plan(kNumPages, kHeads, kHeadDim, kElem, slot_ids.data(),
+                        ptrs.data(), kNumPages, kPageSize);
+  EXPECT_EQ(plan.num_pages(), kNumPages);
+  plan.execute(kp.data(), vp.data(), 0);
+
+  for (std::size_t p = 0; p < kNumPages; ++p) {
+    for (std::size_t j = 0; j < kSb; ++j) {
+      ASSERT_EQ(kp[p * kSb + j], peer[p * kPageBytes + j]);
+      ASSERT_EQ(vp[p * kSb + j], peer[p * kPageBytes + kSb + j]);
+    }
+  }
+}
+
 TEST(KvRestorePlan, ZeroPagesIsNoOp) {
   auto k_dst = make_dst(4, 2, 8, 2);
   auto v_dst = make_dst(4, 2, 8, 2);

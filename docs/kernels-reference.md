@@ -75,7 +75,7 @@ serving shape, not a theoretical optimum.
 | 30 | torch_ops `glm_projection` (Triton) | MI300A | N∈{64..1536}, M=1 | 5.9–9.7 µs | — | **no win** (BLAS already near-optimal; honest negative) | none | [glm53-decode-kernels](glm53-decode-kernels.md) |
 | 31 | `p2p_gather_runs` (adaptive) | H100 NVL | 48 MiB, real NVLink peer | ~210 µs flat (240 GB/s) | 265 GB/s NVLink unidir | **~90% of NVLink roof** | NVLink bandwidth | [p2p-gather/h100-nvl](performance/p2p-gather/h100-nvl.md) |
 | 32 | `p2p_gather_runs` | GB10 | 2048 runs × 2 KiB | 53.3 µs vs 4096.5 µs loop | dispatch floor | **76.8× vs per-run loop** | per-run driver cost removed | [p2p-gather/gb10](performance/p2p-gather/gb10.md) |
-| 33 | `p2p_kv_donate` (prepared plan) | H100 NVL (D2D) | 48 MiB/layer × 40 layers | 36.5 µs/layer = 1.34 TB/s effective | HBM3 ~3.35 TB/s | **~40% of HBM** | grid under-coverage (no grid-stride) | [p2p-kv-donate/h100-nvl](performance/p2p-kv-donate/h100-nvl.md) |
+| 33 | `p2p_kv_donate` (prepared plan) | H100 NVL (D2D) | 48 MiB/layer × 40 layers | 36.9 µs/layer = 1.37 TB/s payload (2.73 TB/s touched) | measured D2D copy roof ~1.46 TB/s payload | **~94% of D2D copy roof** | copy/gather bound; page grid-stride landed, fixed >65535-page truncation (#84) | [p2p-kv-donate/h100-nvl](performance/p2p-kv-donate/h100-nvl.md) |
 | 34 | `pipeline_boundary` (PP transfer) | H100 NVL | NVLink pair | 265 GB/s unidirectional | 600 GB/s bidir datasheet | **44% of NVLink roof** | NVLink; graph replay 3.3 µs, 1.6–1.7× host win | [comm-pipeline-boundary](comm-pipeline-boundary.md) |
 | 35 | cross-node KV (donate/restore) | GH200 + IB HDR | 2 nodes | ~24 GB/s per hop | one HDR-200 port ~25 GB/s | **~96% of one port** | fabric (2-rank p2p can't stripe 4 HCAs) | [comm-cross-node-kv](comm-cross-node-kv.md) |
 | 36 | K3 PP=3 serving profile | MI300A ×6 | Kimi-K3 dummy, PP3/TP8 | breakable cudagraph 35.2 tok/s vs eager 25.3 | — | **1.39× throughput**; MoE region unchanged | host sync (`topk_ids.cpu()`) on PP0 | [moe-fused/gfx942-pp-pipeline](performance/moe-fused/gfx942-pp-pipeline.md) |
@@ -250,10 +250,15 @@ runs. Prepared plan: 0.158 ms prepare once, 206.5 µs/execute, 4.2 µs host
 enqueue.
 
 **p2p_kv_donate (H100 NVL):** same-device D2D prepared plan: 6.0 µs/layer
-(1 page) to 36.5 µs/layer (48 MiB) = 1.34 TB/s effective ≈ 40% of HBM3 —
-grid under-coverage is the documented next step. One-shot fused beats the
-two-stage gather+copy by 4–48×; real-peer numbers were taken against a
-contended GPU (valid ordering, inflated absolutes).
+(1 page) to 36.9 µs/layer (48 MiB) = 1.37 TB/s payload / 2.73 TB/s touched.
+The binding roof is a copy, not the HBM read peak: a pure D2D streaming
+copy kernel measures 34.5 µs (1.46 TB/s payload) on the same box, so the
+plan is ~94% of the copy roof (the remaining gap is the two-stream K/V
+gather + slot indirection). "~40% of HBM" counted payload against the
+read-only peak. Over an idle NVLink pair the plan is 207.6 µs = 100% of
+the measured 206.7 µs peer copy-kernel roof. The page grid-stride (#84)
+removed a latent `num_pages > 65535` truncation. One-shot fused beats the
+two-stage gather+copy by 4–48×.
 
 **pipeline_boundary:** peer copy saturates at ~265 GB/s (44% of the
 600 GB/s bidirectional NVLink roof); captured graph replay is

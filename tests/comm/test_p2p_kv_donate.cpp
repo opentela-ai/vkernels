@@ -704,6 +704,45 @@ TEST(KvDonatePlan, PrepareOnceExecuteFortyTimes) {
   }
 }
 
+// Regression for issue #84: the plan kernel grid.y used to be capped at the
+// 65535 CUDA grid.y limit with a plain `if (p >= num_pages) return`, so a
+// plan with more than 65535 pages silently dropped every page past 65534.
+// The page grid-stride loop must cover all of them.
+TEST(KvDonatePlan, CoversMorePagesThanGridYLimit) {
+  constexpr std::size_t kPageSize = 1, kHeads = 1, kHeadDim = 8, kElem = 2;
+  constexpr std::size_t kNumPages = 70000;  // > 65535
+  constexpr std::size_t kSb = kHeads * kHeadDim * kElem;   // 16
+  constexpr std::size_t kPageBytes = kPageSize * 2 * kSb;  // 32
+
+  auto k_src = make_src(kNumPages, kHeads, kHeadDim, kElem, 0x10);
+  auto v_src = make_src(kNumPages, kHeads, kHeadDim, kElem, 0x20);
+  std::vector<int> slot_ids(kNumPages);
+  for (std::size_t i = 0; i < kNumPages; ++i)
+    slot_ids[i] = static_cast<int>(i);
+
+  std::vector<std::uint8_t> dst(kNumPages * kPageBytes, 0xDD);
+  std::vector<std::uint8_t> ref(kNumPages * kPageBytes, 0xDD);
+  std::vector<const void*> ptrs(kNumPages);
+  std::vector<const void*> rptrs(kNumPages);
+  std::vector<std::size_t> offs(kNumPages, 0);
+  for (std::size_t p = 0; p < kNumPages; ++p) {
+    ptrs[p] = dst.data() + p * kPageBytes;
+    rptrs[p] = ref.data() + p * kPageBytes;
+  }
+
+  P2PKvDonatePlan plan(kNumPages, kHeads, kHeadDim, kElem, slot_ids.data(),
+                       ptrs.data(), kNumPages, kPageSize);
+  EXPECT_EQ(plan.num_pages(), kNumPages);
+  plan.execute(k_src.data(), v_src.data(), 0);
+  pack_pages_ref(k_src.data(), v_src.data(), slot_ids.data(), rptrs.data(),
+                 offs.data(), kNumPages, kPageSize, kHeads, kHeadDim, kElem);
+
+  ASSERT_EQ(dst.size(), ref.size());
+  for (std::size_t i = 0; i < dst.size(); ++i) {
+    ASSERT_EQ(dst[i], ref[i]);
+  }
+}
+
 TEST(KvDonatePlan, ZeroPagesIsNoOp) {
   auto k_src = make_src(4, 2, 8, 2, 0x10);
   auto v_src = make_src(4, 2, 8, 2, 0x20);
