@@ -339,11 +339,11 @@ class RecordingBackend:
 
         ``grouped_heads=H`` (issue #95, DeepSeek-V4 ``GroupedLinear``):
         block-diagonal per-head projection — ``x`` is [B, H*K_g], ``w``
-        [H*N_g, H*K_g] with only the per-head diagonal blocks
-        ``w[h*N_g:(h+1)*N_g, h*K_g:(h+1)*K_g]`` ever read (off-block
-        storage is never touched), and ``y[b, h*N_g + n] = <w[h*N_g+n,
-        h*K_g:(h+1)*K_g], x[b, h*K_g:(h+1)*K_g]>``. Requires H | K and
-        H | N.
+        stays [H*K_g, H*N_g] = [Cin, Cout] with only the per-head
+        diagonal blocks ``w[h*K_g:(h+1)*K_g, h*N_g:(h+1)*N_g]`` ever
+        read (off-block storage is never touched), and ``y[b, h*N_g +
+        n] = <w[h*K_g:(h+1)*K_g, h*N_g + n], x[b, h*K_g:(h+1)*K_g]>``.
+        Requires H | K and H | N.
         """
         m = x.value.shape[0]
         n = w.value.shape[1]
