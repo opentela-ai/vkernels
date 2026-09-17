@@ -53,6 +53,7 @@ class DType:
 F32 = DType("f32", 4)
 F16 = DType("f16", 2)
 BF16 = DType("bf16", 2)
+F8_E4M3 = DType("f8e4m3", 1)
 I32 = DType("i32", 4)
 I64 = DType("i64", 8)
 
@@ -84,16 +85,58 @@ class SymbolicScalar:
 class ValidLength:
     """Number of leading valid entries along a cache axis (§5.3).
 
-    ``expr`` is either a concrete int or the string name of a symbolic
-    scalar (e.g. ``"p+1"``). Positions at or beyond the valid length are
-    *uninitialized storage*: implementations must use masked loads or
-    control flow that never reads them, because multiplying an
-    uninitialized NaN by zero still produces NaN.
+    Two forms:
+
+    * **Scalar form** (``row_tensor is None``): ``expr`` is either a
+      concrete int or the string name of a symbolic scalar (e.g.
+      ``"p+1"``). One valid length for the whole batch.
+    * **Per-row form** (ragged decode, floe ``forward_batch``): the valid
+      length is a runtime **tensor** — an external i32 ``[B]`` array named
+      by ``row_tensor``. With ``mode="positions"`` row ``b``'s valid
+      length is ``pos[b] + 1``; with ``mode="lengths"`` it is the value
+      ``lengths[b]`` itself. Resolution happens per task at execution —
+      :meth:`resolve` deliberately does *not* collapse it to one int.
+
+    Entries at or beyond the valid length are *uninitialized storage*:
+    implementations must use masked loads or control flow that never
+    reads them, because multiplying an uninitialized NaN by zero still
+    produces NaN. In per-row form the mask is per row: row ``b`` never
+    reads beyond its own valid length (§5.3 NaN-tail contract, per row).
     """
 
-    expr: int | str
+    expr: int | str | None = None
+    row_tensor: Optional[str] = None
+    mode: str = "positions"  # "positions" (len = pos[b] + 1) | "lengths"
+
+    def __post_init__(self):
+        if self.row_tensor is None:
+            if self.expr is None:
+                raise ValueError("ValidLength needs an int/str expr or a row_tensor")
+        else:
+            if self.expr is not None:
+                raise ValueError("ValidLength row form takes row_tensor, not expr")
+            if self.mode not in ("positions", "lengths"):
+                raise ValueError(f"ValidLength row mode {self.mode!r} not supported")
+
+    @property
+    def is_row(self) -> bool:
+        return self.row_tensor is not None
+
+    @classmethod
+    def from_positions(cls, tensor_name: str) -> "ValidLength":
+        """Per-row lengths from an external i32 [B] decode-position tensor."""
+        return cls(row_tensor=tensor_name, mode="positions")
+
+    @classmethod
+    def from_lengths(cls, tensor_name: str) -> "ValidLength":
+        """Per-row lengths from an external i32 [B] cache-seqlen tensor."""
+        return cls(row_tensor=tensor_name, mode="lengths")
 
     def resolve(self, scalars: dict[str, int]) -> int:
+        if self.is_row:
+            raise ValueError(
+                f"ValidLength row tensor {self.row_tensor!r} resolves per row at execution, not to a single int"
+            )
         if isinstance(self.expr, int):
             return self.expr
         # Support the single supported symbolic form "<name>+1".
@@ -104,6 +147,9 @@ class ValidLength:
         return scalars[expr] + add
 
     def __str__(self) -> str:  # pragma: no cover - trivial
+        if self.is_row:
+            tail = "pos[b]+1" if self.mode == "positions" else "len[b]"
+            return f"row:{self.row_tensor}[{tail}]"
         return str(self.expr)
 
 
@@ -284,8 +330,13 @@ class Region:
 
     storage_id: int
     view: TensorValue
-    # (lo, hi) per dimension; hi may be a str symbolic expression.
-    boxes: tuple[tuple[int, int | str], ...]
+    # (lo, hi) per dimension; hi may be a str symbolic expression or a
+    # per-row ValidLength (row-tensor form, stored as the object itself).
+    boxes: tuple[tuple[int, int | str | ValidLength], ...]
+    # Paged indirection (#94): when set, the position axis is addressed
+    # through an external i32 [B, S] slot table rather than a static box.
+    indirect_table: Optional[TensorValue] = None
+    indirect_axis: int = -1
 
     @staticmethod
     def whole(view: TensorValue) -> "Region":
@@ -294,14 +345,46 @@ class Region:
 
     @staticmethod
     def prefix(view: TensorValue, axis: int, valid: ValidLength) -> "Region":
-        """Whole view, but the extent on ``axis`` is the valid prefix."""
+        """Whole view, but the extent on ``axis`` is the valid prefix.
+
+        Per-row (row-tensor) valid lengths are stored as the
+        :class:`ValidLength` object itself; :meth:`resolved_boxes` treats
+        them conservatively as the full extent.
+        """
         boxes = []
         for i, d in enumerate(view.shape):
             if i == axis:
-                boxes.append((0, valid.expr))
+                boxes.append((0, valid if valid.is_row else valid.expr))
             else:
                 boxes.append((0, d))
         return Region(view.storage_id, view, tuple(boxes))
+
+    @staticmethod
+    def indirect(
+        view: TensorValue,
+        table: TensorValue,
+        axis: int,
+        valid: Optional[ValidLength] = None,
+    ) -> "Region":
+        """Paged region (#94): ``axis`` of ``view`` is indexed through
+        ``table`` — an external i32 ``[B, S]`` slot table. Element
+        addresses become ``slot = table[b, t]``,
+        ``addr = pool_base + slot * row_stride``; writes land at
+        ``table[b, p_row]`` and slot 0 is the reserved null/sink page
+        (never written by a live row).
+
+        The static boxes keep the view extent (optionally bounded by
+        ``valid`` on ``axis``), but storage-span analysis overapproximates
+        to the *whole pool*: indirected regions on one pool conflict with
+        everything on that pool. Sound under phase order — same reasoning
+        as today's prefix regions, whose symbolic bounds are likewise
+        treated as full extent (§5.2).
+        """
+        assert 0 <= axis < len(view.shape), f"indirect axis {axis} out of range for {view.shape}"
+        boxes = []
+        for i, d in enumerate(view.shape):
+            boxes.append((0, valid.expr) if (i == axis and valid is not None) else (0, d))
+        return Region(view.storage_id, view, tuple(boxes), indirect_table=table, indirect_axis=axis)
 
     @staticmethod
     def tile(view: TensorValue, tile: Sequence[tuple[int, int]]) -> "Region":
@@ -315,7 +398,12 @@ class Region:
         """Boxes with symbolic bounds resolved (defaults: full extent)."""
         out = []
         for (lo, hi), extent in zip(self.boxes, self.view.shape):
-            if isinstance(hi, str):
+            if isinstance(hi, ValidLength):
+                # Per-row form: exact extent depends on runtime row data.
+                # Conservative full-extent, exactly like the symbolic case
+                # — never unsound for overlap analysis.
+                hi = extent
+            elif isinstance(hi, str):
                 hi = ValidLength(hi).resolve(scalars or {})
                 hi = min(hi, extent)
             out.append((lo, hi))
@@ -328,6 +416,13 @@ class Region:
         Strides must be non-negative (asserted at view creation sites we
         control).
         """
+        if self.indirect_table is not None:
+            # Paged (#94): addressed slots are runtime data — overapproximate
+            # to the whole pool extent (conservative, never unsound).
+            total = 1
+            for d in self.view.shape:
+                total *= d
+            return (self.view.offset, self.view.offset + max(total - 1, 0))
         lo_addr = self.view.offset
         hi_addr = self.view.offset
         for (lo, hi), stride, extent in zip(self.boxes, self.view.strides, self.view.shape):
@@ -345,7 +440,8 @@ class Region:
         return a0 <= b1 and b0 <= a1
 
     def __repr__(self) -> str:  # pragma: no cover - trivial
-        return f"Region(s{self.storage_id}, {self.boxes})"
+        ind = f" via table[{self.indirect_table.name}]" if self.indirect_table is not None else ""
+        return f"Region(s{self.storage_id}, {self.boxes}){ind}"
 
 
 # ---------------------------------------------------------------------------
@@ -363,13 +459,20 @@ OP_ROPE = "rope"
 # the first rotary_dim dims with a pass-through tail; rotary_dim is present
 # iff convention == "neox_partial").
 OP_LINEAR = "linear"
+# fp8-blockwise decode projection (issue #91): y = x @ dequant(w_fp8, scales)^T
+# with DeepSeek-style 128x128 block scales; same task shape as ``linear``, the
+# scale tensor is the second weight external.
+OP_LINEAR_FP8 = "linear_fp8"
 OP_GELU = "gelu"
 OP_SWIGLU = "swiglu"
 OP_ADD = "add"
 OP_CACHE_APPEND = "cache_append"
+OP_CACHE_APPEND_PAGED = "cache_append_paged"
 OP_ATTENTION_SCORES = "attention_scores"
+OP_ATTENTION_SCORES_PAGED = "attention_scores_paged"
 OP_SOFTMAX = "softmax"
 OP_ATTENTION_VALUES = "attention_values"
+OP_ATTENTION_VALUES_PAGED = "attention_values_paged"
 
 ARITHMETIC_OP_KINDS = (
     OP_EMBEDDING,
@@ -377,13 +480,17 @@ ARITHMETIC_OP_KINDS = (
     OP_RMS_NORM,
     OP_ROPE,
     OP_LINEAR,
+    OP_LINEAR_FP8,
     OP_GELU,
     OP_SWIGLU,
     OP_ADD,
     OP_CACHE_APPEND,
+    OP_CACHE_APPEND_PAGED,
     OP_ATTENTION_SCORES,
+    OP_ATTENTION_SCORES_PAGED,
     OP_SOFTMAX,
     OP_ATTENTION_VALUES,
+    OP_ATTENTION_VALUES_PAGED,
 )
 
 
@@ -487,6 +594,10 @@ class OperatorGraph:
         # storage_id -> version, bumped by each effectful write; expresses
         # ordering without copying the cache (§4.3).
         self.storage_versions: dict[int, int] = {}
+        # Per-row decode-position tensors (issue #93): name -> declared
+        # capacity. Legality scopes consumers exactly like the scalar p.
+        self.row_position_tensors: set[str] = set()
+        self.row_position_capacity: dict[str, int] = {}
         self._next_vid = 0
         self._next_opid = 0
         self._next_storage = 0

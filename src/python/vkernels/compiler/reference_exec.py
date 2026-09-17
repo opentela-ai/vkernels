@@ -38,11 +38,34 @@ from .memory import WorkspacePlan
 from .schedule_phase import PhasePlan, PhaseSchedule, worker_task_ids
 from .task_ir import TaskFamily
 
-__all__ = ["ExecutionTrace", "PhaseStat", "ReferenceExecutor", "ExecutorError"]
+__all__ = ["ExecutionTrace", "PhaseStat", "ReferenceExecutor", "ExecutorError", "decode_e4m3"]
 
 
 class ExecutorError(Exception):
     """The executed schedule violated an obligation (§12)."""
+
+
+def decode_e4m3(bytes_u8):
+    """Decode fp8 e4m3fn bytes (uint8 array) to float64, vectorized.
+
+    e4m3fn: 1 sign bit, 4 exponent bits (bias 7), 3 mantissa bits; no
+    infinities — exponent 0xF with mantissa 0x7 encodes NaN, and the
+    maximum finite magnitude is 448. Subnormals (exponent 0) are
+    mant/8 * 2^-6. This is the numpy-side counterpart of the checkpoint's
+    ``torch.float8_e4m3fn`` weights and of ``_fp8_e4m3fn_encode``.
+    """
+    b = np.asarray(bytes_u8, dtype=np.uint8).astype(np.int32)
+    sign = np.where(b & 0x80, -1.0, 1.0)
+    exp = (b >> 3) & 0xF
+    mant = b & 0x7
+    is_nan = (exp == 0xF) & (mant == 0x7)
+    normal = np.exp2((exp - 7).astype(np.float64)) * (1.0 + mant / 8.0)
+    sub = np.exp2(-6.0) * (mant / 8.0)
+    val = sign * np.where(exp == 0, sub, normal)
+    return np.where(is_nan, np.nan, val)
+
+
+_decode_e4m3 = decode_e4m3
 
 
 @dataclass
@@ -116,9 +139,13 @@ class ReferenceExecutor:
             "elementwise": self._body_elementwise,
             "embedding": self._body_embedding,
             "cache_append": self._body_cache_append,
+            "cache_append_paged": self._body_cache_append_paged,
             "attention_scores": self._body_attention_scores,
+            "attention_scores_paged": self._body_attention_scores_paged,
             "softmax": self._body_softmax,
             "attention_values": self._body_attention_values,
+            "attention_values_paged": self._body_attention_values_paged,
+            "gemv_fp8": self._body_gemv_fp8,
         }
         self._barrier_state = None
 
@@ -240,6 +267,23 @@ class ReferenceExecutor:
     # Task bodies: tile-exact reference semantics
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Position resolution: shared scalar p or per-row ragged decode (#93)
+    # ------------------------------------------------------------------
+
+    def _row_pos_value(self, fam: TaskFamily, b: int, scalars) -> int:
+        """Row ``b``'s decode position: the scalar ``p`` or, in per-row form
+        (issue #93), ``positions[b]`` read from the external row tensor."""
+        if fam.params.get("position_form", "scalar") == "row":
+            pos_t = self.tensor(fam.params["position"])
+            return int(pos_t[b])
+        return scalars["p"]
+
+    def _valid_len(self, fam: TaskFamily, b: int, scalars) -> int:
+        """Row ``b``'s valid cache length: ``pos[b] + 1`` per row (§5.3,
+        per-row NaN-tail contract) or the scalar form ``p + 1``."""
+        return self._row_pos_value(fam, b, scalars) + 1
+
     def _body_gemm(self, fam: TaskFamily, coords, scalars) -> None:
         x = self.tensor(fam.inputs[0])
         w = self.tensor(fam.inputs[1])
@@ -257,6 +301,28 @@ class ReferenceExecutor:
         m0 = coords[0] * m_tile
         n0 = coords[1] * n_tile
         return (m0, min(m0 + m_tile, m_extent)), (n0, min(n0 + n_tile, n_extent))
+
+    def _body_gemv_fp8(self, fam: TaskFamily, coords, scalars) -> None:
+        """fp8-blockwise GEMV reference (issue #91): dequant-then-matmul in fp64.
+
+        Mirrors the device contract of ``_t_gemv_fp8`` / ``_h_gemv_fp8``:
+        weights are e4m3 bytes [N, K] row-major (decoded tile-exactly for the
+        task's 16-column N tile), one fp32 scale per 128x128 block, fp64
+        accumulation standing in for the device's fp32 (oracle stability).
+        """
+        x = self.tensor(fam.inputs[0]).astype(np.float64)
+        w = self.tensor(fam.inputs[1])  # e4m3 bytes materialize as uint8 storage
+        scale = self.tensor(fam.inputs[2]).astype(np.float64)
+        y = self.tensor(fam.outputs[0])
+        qb = int(fam.params.get("quant_block", 128))
+        (m0, m1), (n0, n1) = self._gemm_box(fam, coords)
+        wt = _decode_e4m3(w[n0:n1, :])
+        # Broadcast each 128-deep k-block's scale over its columns, exactly as
+        # the device loads one scale per k-chunk of the tile.
+        k = wt.shape[1]
+        s = np.repeat(scale[n0 // qb, :], qb)[:k]
+        acc = (x[m0:m1, :] @ (wt * s[None, :]).T)
+        y[m0:m1, n0:n1] = acc.astype(y.dtype)
 
     def _body_layernorm(self, fam: TaskFamily, coords, scalars) -> None:
         x = self.tensor(fam.inputs[0]).astype(np.float64)
@@ -290,7 +356,8 @@ class ReferenceExecutor:
         sin_t = self.tensor(fam.inputs[2])
         y = self.tensor(fam.outputs[0])
         b, h = coords
-        p = scalars["p"]
+        # Row b rotates at its OWN runtime position (issue #93 ragged form).
+        p = self._row_pos_value(fam, b, scalars)
         row = x[b, h]
         if fam.params.get("convention", "rotate_half") == "neox_partial":
             # NeoX split-half over the first rotary_dim dims (floe Qwen3.5
@@ -347,7 +414,8 @@ class ReferenceExecutor:
         c1 = width if fam.domain.task_grid[1] == 1 else min(c0 + tile_c, width)
         row = token[int(ids[b]), c0:c1].astype(np.float64)
         if pos is not None:
-            row = row + pos[scalars["p"], c0:c1].astype(np.float64)
+            # Row b adds its own position row (issue #93 ragged form).
+            row = row + pos[self._row_pos_value(fam, b, scalars), c0:c1].astype(np.float64)
         y[b, c0:c1] = row.astype(y.dtype)
 
     def _body_cache_append(self, fam: TaskFamily, coords, scalars) -> None:
@@ -356,9 +424,48 @@ class ReferenceExecutor:
         k_new = self.tensor(fam.inputs[2])
         v_new = self.tensor(fam.inputs[3])
         b, h = coords
-        p = scalars["p"]
+        # Row b appends at its own position (issue #93 ragged form).
+        p = self._row_pos_value(fam, b, scalars)
         k_cache[b, h, p, :] = k_new[b, h, :]
         v_cache[b, h, p, :] = v_new[b, h, :]
+
+    def _body_cache_append_paged(self, fam: TaskFamily, coords, scalars) -> None:
+        k_pool = self.tensor(fam.inputs[0])
+        v_pool = self.tensor(fam.inputs[1])
+        table = self.tensor(fam.inputs[2])
+        k_new = self.tensor(fam.inputs[3])
+        v_new = self.tensor(fam.inputs[4])
+        b, h = coords
+        p = int(scalars["p"])
+        slot = int(table[b, p])  # write lands at slot_table[b, p_row] (#94)
+        k_pool[slot, h, :] = k_new[b, h, :]
+        v_pool[slot, h, :] = v_new[b, h, :]
+
+    def _body_attention_scores_paged(self, fam: TaskFamily, coords, scalars) -> None:
+        q = self.tensor(fam.inputs[0]).astype(np.float64)
+        k_pool = self.tensor(fam.inputs[1]).astype(np.float64)
+        table = self.tensor(fam.inputs[2])
+        y = self.tensor(fam.outputs[0])
+        b, h = coords
+        kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
+        p = int(scalars["p"])
+        scale = fam.params["scale"]
+        # Gathered masked load: only positions [0, p] map through the table;
+        # slot 0 is the reserved null/sink page (never written by a live row).
+        slots = table[b, : p + 1].astype(np.int64)
+        y[b, h, : p + 1] = (k_pool[slots, kvh, :] @ q[b, h, :] * scale).astype(y.dtype)
+
+    def _body_attention_values_paged(self, fam: TaskFamily, coords, scalars) -> None:
+        probs = self.tensor(fam.inputs[0]).astype(np.float64)
+        v_pool = self.tensor(fam.inputs[1]).astype(np.float64)
+        table = self.tensor(fam.inputs[2])
+        y = self.tensor(fam.outputs[0])
+        b, h = coords
+        kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
+        p = int(scalars["p"])
+        # Gathered masked: V rows beyond p are never gathered (NaN slots must not leak).
+        slots = table[b, : p + 1].astype(np.int64)
+        y[b, h, :] = (probs[b, h, : p + 1] @ v_pool[slots, kvh, :]).astype(y.dtype)
 
     def _body_attention_scores(self, fam: TaskFamily, coords, scalars) -> None:
         q = self.tensor(fam.inputs[0]).astype(np.float64)
@@ -366,21 +473,22 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         b, h = coords
         kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
-        p = scalars["p"]
+        vlen = self._valid_len(fam, b, scalars)
         scale = fam.params["scale"]
-        # Masked load: only rows [0, p] are read (§5.3); the tail is never touched.
-        y[b, h, : p + 1] = (k_cache[b, kvh, : p + 1, :] @ q[b, h, :] * scale).astype(y.dtype)
+        # Masked load: only rows [0, pos[b]] are read (§5.3, per-row); the
+        # NaN tail beyond each row's valid length is never touched.
+        y[b, h, :vlen] = (k_cache[b, kvh, :vlen, :] @ q[b, h, :] * scale).astype(y.dtype)
 
     def _body_softmax(self, fam: TaskFamily, coords, scalars) -> None:
         x = self.tensor(fam.inputs[0]).astype(np.float64)
         y = self.tensor(fam.outputs[0])
         b, h = coords
-        p = scalars["p"]
-        row = x[b, h, : p + 1]
+        vlen = self._valid_len(fam, b, scalars)
+        row = x[b, h, :vlen]
         row = row - row.max()
         e = np.exp(row)
-        y[b, h, : p + 1] = (e / e.sum()).astype(y.dtype)
-        y[b, h, p + 1 :] = 0.0  # invalid tail written to exact zero (§4.3 contract)
+        y[b, h, :vlen] = (e / e.sum()).astype(y.dtype)
+        y[b, h, vlen:] = 0.0  # invalid tail written to exact zero (§4.3 contract)
 
     def _body_attention_values(self, fam: TaskFamily, coords, scalars) -> None:
         probs = self.tensor(fam.inputs[0]).astype(np.float64)
@@ -388,6 +496,7 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         b, h = coords
         kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
-        p = scalars["p"]
-        # Masked: V rows beyond p are never loaded (NaN tails must not leak).
-        y[b, h, :] = (probs[b, h, : p + 1] @ v_cache[b, kvh, : p + 1, :]).astype(y.dtype)
+        vlen = self._valid_len(fam, b, scalars)
+        # Masked: V rows beyond pos[b] are never loaded (per-row NaN-tail
+        # contract, issue #93).
+        y[b, h, :] = (probs[b, h, :vlen] @ v_cache[b, kvh, :vlen, :]).astype(y.dtype)

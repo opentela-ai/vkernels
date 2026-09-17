@@ -10,6 +10,7 @@
 // and the causal mask (q_start, kv_start).
 #include "vkernels/kernels/mla.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <vector>
@@ -114,6 +115,21 @@ void mla_config_for(int S_q, int kv_lora_rank, int qk_rope_head_dim,
     *bn_kv = 64;
     *threads = 256;  // four wavefronts
   }
+}
+
+int mla_fwd_split_for(int B, int H, int S_q, int S_kv) {
+  // Decode only: the split re-launches the shared latent reads from a grid
+  // that would otherwise leave CUs idle. Prefill keeps its single-block path
+  // exactly as before (documented tuning target untouched).
+  const int row_blocks = B * H * S_q;  // plain-grid blocks (decode tile BQ=1)
+  if (S_q > 8 || row_blocks <= 0) return 1;
+  // Occupancy rule (same shape as dsa_topk_logits_split_for): one wavefront
+  // per block, so fill the CUs the plain grid leaves idle, and never shrink a
+  // split's key slice below kMlaMinSplitKeys (coalescing floor).
+  if (row_blocks >= kMlaCus) return 1;
+  const int cu_cap = kMlaCus / row_blocks;
+  const int kv_cap = (S_kv + kMlaMinSplitKeys - 1) / kMlaMinSplitKeys;
+  return std::max(1, std::min(cu_cap, kv_cap));
 }
 
 }  // namespace vkernels::kernels
