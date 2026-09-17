@@ -53,6 +53,7 @@
 //               Cross-checked against the oracle by test_dsa_correct.hip.
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 #include "vkernels/kernels/dsa.hpp"
 #include "vkernels/util/error.hpp"  // VK_EXPECTS (host: throws std::invalid_argument)
@@ -664,15 +665,30 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
                        int H, int dim, int tail_dim, int topk, int kv_group,
                        float sm_scale, int split_kv, int& kti,
                        hipStream_t stream) {
+  // Issue #80 A/B diagnostics (bench-only, same pattern as VK_MOE_KTIME):
+  // VK_DSA_DB=0 forces the serial kernel (this returns false, so
+  // launch_partial_auto falls back); VK_DSA_KTI=<n> overrides the
+  // auto-sized keys-per-tile (0 = auto). Read once per process.
+  static const int db_mode = [] {
+    const char* e = std::getenv("VK_DSA_DB");
+    return e ? std::atoi(e) : 1;
+  }();
+  static const int kti_ovr = [] {
+    const char* e = std::getenv("VK_DSA_KTI");
+    return e ? std::atoi(e) : 0;
+  }();
+  if (db_mode == 0) return false;
   const int W = dim + tail_dim;
   const size_t shq = (size_t)BQ * (size_t)W * 4u;                // sQ
   const size_t per_key = (size_t)2 * BQ * ((size_t)W * 2u + 4u); // 2 key bufs + idx
   // gfx942 caps no-attribute dynamic shmem at 48 KB/block; budget 44 KB
-  // with margin. kti <= 8 (more adds little once the chain is pipelined).
+  // with margin. Auto picks kti <= 8 (more adds little once the chain is
+  // pipelined) but VK_DSA_KTI can go deeper for A/B (up to the budget).
   constexpr size_t kCap = 44u * 1024u;
   if (shq >= kCap) return false;
-  int new_kti = (int)((kCap - shq) / per_key);
-  if (new_kti > 8) new_kti = 8;
+  const int budget = (int)((kCap - shq) / per_key);
+  int new_kti = (kti_ovr > 0) ? kti_ovr : 8;
+  if (new_kti > budget) new_kti = budget;
   if (new_kti < 1) return false;
   kti = new_kti;
   const size_t shmem = shq + (size_t)kti * per_key;
