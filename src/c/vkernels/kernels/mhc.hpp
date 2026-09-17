@@ -79,9 +79,12 @@ namespace vkernels::kernels::hip {
 // (`const uint16_t*` IEEE-754 bit pattern); `fn`, `out`, `sqrsum` are fp32
 // device pointers. Online accumulation in fp32, bf16 storage for `x`.
 // `hc_mult3 <= 32`; `hc_hidden_size <= 28672` (static shared memory budget).
-// No dynamic-shared-memory workaround: per-block shared is a single static
-// `hc_hidden_size`-wide bf16 staging buffer (<= 56 KB), well within MI300A's
-// 64 KB non-optin cap.
+// Grid is (num_tokens, hc_mult3) -- one block per (token, output column),
+// so the decode n=1 GEMM uses hc_mult3 blocks (issue #79 column split) and
+// each block streams its own fn row coalesced. No dynamic-shared-memory
+// workaround: per-block shared is a single static `hc_hidden_size`-wide
+// bf16 staging buffer (<= 56 KB) + a 1 KB reduction scratch, well within
+// MI300A's 64 KB non-optin cap.
 // stream (issue #69): caller hipStream_t (as void*); nullptr = legacy.
 void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
                          const void* x, const void* fn,

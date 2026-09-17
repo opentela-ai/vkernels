@@ -57,18 +57,25 @@ static constexpr int kMaxHcHidden = 28672;
 // ---------------------------------------------------------------------------
 //  mhc_pre_gemm_sqrsum
 //
-//  One block per token, 32 threads (one warp). The token row x[n,:] is
-//  staged once in static shared memory as bf16 (<= 56 KB). Lane o (the
-//  warp lane) owns output column o (hc_mult3 <= 32) and streams its fn
-//  column from global memory. The per-token squared-sum is a strided
-//  lane partial + warp-shuffle reduction.
+//  Grid (num_tokens, hc_mult3): one block per (token, output column o),
+//  256 threads (issue #79). The token row x[n,:] is staged once per block
+//  in static shared memory as bf16 (<= 56 KB); the block then streams ITS
+//  OWN fn row fn[o,:] contiguously -- threads read consecutive fp32
+//  elements, so the fn walk is fully coalesced (the old one-warp-per-token
+//  layout had each lane striding a different fn row: un-coalesced, and at
+//  decode n=1 the whole GEMM ran on ONE block = 0.1% of MI300A HBM).
 //
-//  This is a correctness-first baseline: each lane reads its own contiguous
-//  fn row (stride hc_hidden_size across the warp at a fixed h), so the fn
-//  reads are not coalesced and the kernel is memory-bound -- exactly the
-//  binding resource the tiled, swizzled-shared tilelang version targets.
-//  No dynamic-shared-memory workaround is needed: there is no dynamic
-//  shared memory at all (a single static staging buffer, no pipelining).
+//  Static shared budget (no dynamic-shared request, no hipFuncSetAttribute
+//  opt-in): sX 28672*2 = 57344 B + sRed 256*4 = 1024 B = 58368 B < 65536 B,
+//  so the wider hc_hidden=28672 branch still fits MI300A's 64 KB non-optin
+//  cap.
+//
+//  Per-output accumulation is a strided-lane partial + shared tree reduce,
+//  fp32 end to end -- the same associativity class as the CPU oracle's
+//  left-to-right sum (max_rel <= 2e-5, fp32 storage, gate unchanged).
+//  Block o == 0 additionally computes sqrsum[n] off the staged row; no
+//  atomics, no second kernel/pass. No dynamic-shared-memory workaround is
+//  needed: there is no dynamic shared memory at all.
 // ---------------------------------------------------------------------------
 __global__ void mhc_pre_gemm_sqrsum_kernel(
     const uint16_t* __restrict__ x,   // [num_tokens, hc_hidden_size] bf16
@@ -77,30 +84,48 @@ __global__ void mhc_pre_gemm_sqrsum_kernel(
     float* __restrict__ sqrsum,       // [num_tokens] fp32
     int num_tokens, int hc_mult3, int hc_hidden_size) {
   const int n = blockIdx.x;
-  if (n >= num_tokens) return;
-  const int o = threadIdx.x;  // warp lane == output column (hc_mult3 <= 32)
+  const int o = blockIdx.y;              // output column (issue #79 split)
+  if (n >= num_tokens || o >= hc_mult3) return;
+  const int tid = threadIdx.x;
 
   __shared__ uint16_t sX[kMaxHcHidden];  // staged token row (bf16)
-  for (int h = o; h < hc_hidden_size; h += 32)
+  __shared__ float sRed[256];            // tree-reduction scratch
+  for (int h = tid; h < hc_hidden_size; h += 256)
     sX[h] = x[(size_t)n * hc_hidden_size + h];
   __syncthreads();
 
-  // Per-token squared-sum: strided lane partial + warp-shuffle reduce.
-  float sq = 0.0f;
-  for (int h = o; h < hc_hidden_size; h += 32) {
-    float xv = bf16_to_f32(sX[h]);
-    sq += xv * xv;
+  // GEMM: out[n, o] = sum_h x[n, h] * fn[o, h]. Each block owns exactly one
+  // output element; the fn row walk is coalesced (256 consecutive fp32 =
+  // 1 KB per iteration).
+  const float* fn_row = fn + (size_t)o * hc_hidden_size;
+  float acc = 0.0f;
+  for (int h = tid; h < hc_hidden_size; h += 256)
+    acc += bf16_to_f32(sX[h]) * fn_row[h];
+  sRed[tid] = acc;
+  __syncthreads();
+#pragma unroll
+  for (int off = 128; off > 0; off >>= 1) {
+    if (tid < off) sRed[tid] += sRed[tid + off];
+    __syncthreads();
   }
-  for (int off = 16; off > 0; off >>= 1) sq += __shfl_xor(sq, off);
-  if (o == 0) sqrsum[n] = sq;
+  if (tid == 0) out[(size_t)n * hc_mult3 + o] = sRed[0];
 
-  // GEMM: out[n, o] = sum_h x[n, h] * fn[o, h], for o in [0, hc_mult3).
-  if (o < hc_mult3) {
-    const float* fn_row = fn + (size_t)o * hc_hidden_size;
-    float acc = 0.0f;
-    for (int h = 0; h < hc_hidden_size; ++h)
-      acc += bf16_to_f32(sX[h]) * fn_row[h];
-    out[(size_t)n * hc_mult3 + o] = acc;
+  // Per-token squared-sum, computed by the o == 0 block off the staged row.
+  if (o == 0) {
+    float sq = 0.0f;
+    for (int h = tid; h < hc_hidden_size; h += 256) {
+      float xv = bf16_to_f32(sX[h]);
+      sq += xv * xv;
+    }
+    __syncthreads();  // all threads past the out reduction before reusing sRed
+    sRed[tid] = sq;
+    __syncthreads();
+#pragma unroll
+    for (int off = 128; off > 0; off >>= 1) {
+      if (tid < off) sRed[tid] += sRed[tid + off];
+      __syncthreads();
+    }
+    if (tid == 0) sqrsum[n] = sRed[0];
   }
 }
 
@@ -160,8 +185,8 @@ void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
                          void* out, void* sqrsum, void* stream) {
   if (num_tokens <= 0 || hc_mult3 <= 0 || hc_hidden_size <= 0) return;
   if (hc_mult3 > 32 || hc_hidden_size > kMaxHcHidden) return;
-  dim3 grid(num_tokens);
-  dim3 block(32);  // one warp per token; lane == output column
+  dim3 grid(num_tokens, hc_mult3);  // one block per (token, column) (#79)
+  dim3 block(256);                  // coalesced fn-row walk + tree reduce
   mhc_pre_gemm_sqrsum_kernel<<<grid, block, 0, static_cast<hipStream_t>(stream)>>>(
       reinterpret_cast<const uint16_t*>(x), reinterpret_cast<const float*>(fn),
       reinterpret_cast<float*>(out), reinterpret_cast<float*>(sqrsum),
