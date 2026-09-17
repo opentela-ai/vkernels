@@ -622,8 +622,10 @@ def lower_softmax(op: Operator, graph: OperatorGraph) -> TaskFamily:
 
 
 def lower_attention_values(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    gated = op.attributes.get("gated", False)
     probs = graph.tensor(op.inputs[0])
     v_cache = graph.tensor(op.inputs[1])
+    gate = graph.tensor(op.inputs[2]) if gated else None
     y = graph.tensor(op.outputs[0])
     B = probs.shape[0]
     Hq = probs.shape[1]  # query heads drive the task domain
@@ -635,10 +637,13 @@ def lower_attention_values(op: Operator, graph: OperatorGraph) -> TaskFamily:
 
     def reads(coords):
         b, h = coords
-        return (
+        regions = (
             _tile_region(probs, ((b, b + 1), (h, h + 1), (0, f"{p}+1"))),
             _tile_region(v_cache, ((b, b + 1), (h // group, h // group + 1), (0, f"{p}+1"), (0, D))),
         )
+        if gated:
+            regions = regions + (_tile_region(gate, ((b, b + 1), (h, h + 1), (0, D))),)
+        return regions
 
     def writes(coords):
         b, h = coords
@@ -649,9 +654,16 @@ def lower_attention_values(op: Operator, graph: OperatorGraph) -> TaskFamily:
         kind="attention_values",
         op=op,
         domain=domain,
-        inputs=(probs.name, v_cache.name),
+        inputs=(probs.name, v_cache.name) + ((gate.name,) if gated else ()),
         outputs=(y.name,),
-        params={"layer": op.attributes.get("layer", 0), "position": p, "position_form": op.attributes.get("position_form", "scalar"), "kv_heads": kvh, "group": group},
+        params={
+            "layer": op.attributes.get("layer", 0),
+            "position": p,
+            "position_form": op.attributes.get("position_form", "scalar"),
+            "kv_heads": kvh,
+            "group": group,
+            "gated": gated,
+        },
         threads=THREADS_PER_WORKER,
         scratch_bytes=D * 4,  # per-task context accumulator
         read_regions=reads,

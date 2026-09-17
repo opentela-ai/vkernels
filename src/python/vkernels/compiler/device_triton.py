@@ -388,6 +388,57 @@ def _t_values(
 
 
 @triton.jit
+def _t_values_gated(
+    worker: tl.int32,
+    P: tl.int32,
+    probs_ptr,
+    v_ptr,
+    gate_ptr,
+    table_ptr,
+    pos_ptr,
+    y_ptr,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    KVH: tl.constexpr,
+    D: tl.constexpr,
+    SCAP: tl.constexpr,
+    BT: tl.constexpr,
+):
+    """Issue #92: _t_values + per-head sigmoid output gate fused —
+
+    ``y[b,h,:] = (sum_{t<=pos[b]} probs * V[table[b,t]]) * sigmoid(gate[b,h,:])``
+
+    Gate epilogue is the validated ``_h_values_gate`` one
+    (device_triton_hybrid.py, 27B): gate loaded once per head, sigmoid and
+    multiply in f32, single bf16 store — no extra grid barrier per FA layer.
+    """
+    task = worker
+    GROUP: tl.constexpr = H // KVH
+    while task < B * H:
+        b = task // H
+        h = task % H
+        kvh = h // GROUP
+        offs_d = tl.arange(0, D)
+        acc = tl.zeros([D], tl.float32)
+        p1 = tl.load(pos_ptr + b).to(tl.int64) + 1
+        vbase = v_ptr + kvh * D
+        trow = table_ptr + b * SCAP
+        prow = probs_ptr + (b * H + h) * SCAP
+        t0 = tl.zeros((), tl.int64)
+        while t0 < p1:
+            offs_t = t0 + tl.arange(0, BT)
+            m = offs_t < p1
+            slots = tl.load(trow + offs_t, mask=m, other=0)
+            pv = tl.load(prow + offs_t, mask=m, other=0.0, cache_modifier=".cg")
+            vv = tl.load(vbase + slots[:, None] * (KVH * D) + offs_d[None, :], mask=m[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
+            acc += tl.sum(pv[:, None] * vv, axis=0)
+            t0 += BT
+        gate = tl.load(gate_ptr + (b * H + h) * D + offs_d, cache_modifier=".cg").to(tl.float32)
+        tl.store(y_ptr + (b * H + h) * D + offs_d, acc * (1.0 / (1.0 + tl.exp(-gate))))
+        task += P
+
+
+@triton.jit
 def _t_gemv(
     worker: tl.int32,
     P: tl.int32,
