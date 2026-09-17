@@ -19,11 +19,11 @@
 # prefill rows + the unchanged mla_fwd_with_tile path are the evidence).
 set -euo pipefail
 
-# SRC = the scratch checkout containing this script (meta/scripts/... -> the
-# checkout root). Overridable via the SRC env var.
-SRC=${SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
+# My dedicated scratch checkout (sbatch copies the script into /var/spool, so
+# it cannot be derived from the script path). Overridable via SRC=.
+SRC=${SRC:-/capstor/scratch/cscs/xyao/vk-issue-82}
 if [ ! -f "$SRC/CMakeLists.txt" ]; then
-  echo "ERROR: SRC scratch checkout missing at $SRC (runner copies the worktree there)" >&2
+  echo "ERROR: SRC scratch checkout missing at $SRC (runner expects the worktree synced there)" >&2
   exit 1
 fi
 
