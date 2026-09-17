@@ -479,6 +479,10 @@ OP_CACHE_APPEND = "cache_append"
 # read-modify-write per row (time-major state shift), position-independent —
 # ordering comes from the state-storage hazards, not the decode position.
 OP_GDN_CONV = "gdn_conv"
+# DSA compressor entry emission (issue #96): every m-th token appends one
+# rope-rotated compressed entry to the per-layer two-series (Ca/Cb) entry
+# pool; masked per-row on the boundary condition (issue #93 positions).
+OP_COMPRESSOR_APPEND = "compressor_append"
 OP_CACHE_APPEND_PAGED = "cache_append_paged"
 # mHC hyper-connection mixing family (issue #99; floe DeepseekV4HyperConnection
 # / Glm53HyperConnection — one op family, family attributes hc/iters/eps/
@@ -521,6 +525,7 @@ ARITHMETIC_OP_KINDS = (
     OP_ADD,
     OP_CACHE_APPEND,
     OP_GDN_CONV,
+    OP_COMPRESSOR_APPEND,
     OP_CACHE_APPEND_PAGED,
     OP_MHC_PRE,
     OP_MHC_POST,

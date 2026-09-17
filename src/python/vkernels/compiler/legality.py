@@ -21,6 +21,7 @@ POSITION_CONSUMERS = frozenset(
     {
         "embedding",
         "cache_append",
+        "compressor_append",
         "attention_scores",
         "softmax",
         "attention_values",

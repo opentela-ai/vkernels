@@ -1132,6 +1132,177 @@ def lower_moe_combine(op: Operator, graph: OperatorGraph) -> TaskFamily:
 # Registry (§3.1)
 # ---------------------------------------------------------------------------
 
+
+# Lightning-indexer (issue #97): fused ReLU scoring over the compressed
+# entries + per-head mix, then the fixed-count top-k selection.
+#
+# indexer_scores: one task per (batch, entry tile). Each task streams the
+# row's full indexer query block [H, D] against its entry tile and reduces
+# the head mix in registers — H is the small indexer head count (e.g. 4),
+# so per-task reads stay bounded and no cross-task reduction is needed.
+#
+# index_topk: one task per batch row (M <= ~1k candidates fit in one
+# block's sweep). The device template computes ranks by comparison
+# counting (rank(j) = #{valid i : s_i > s_j} + #{valid i < j : s_i == s_j}),
+# which yields the slot positions directly and tie-breaks to the lowest
+# candidate index with no shared-memory sort.
+# ---------------------------------------------------------------------------
+
+INDEXER_TILE_M = 64  # compressed-entry candidates per indexer_scores task
+
+
+def lower_indexer_scores(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    q, c, w = (graph.tensor(op.inputs[i]) for i in range(3))
+    s = graph.tensor(op.outputs[0])
+    b, h, d = q.shape
+    m = c.shape[1]
+    if op.attributes.get("activation") != "relu":
+        raise ValueError(f"indexer_scores {op.source_location!r}: unsupported activation {op.attributes.get('activation')!r}")
+    if not c.is_contiguous():
+        raise ValueError(f"indexer_scores {op.source_location!r}: entries must be row-major contiguous")
+    domain = TileDomain(((b, 1), (m, INDEXER_TILE_M)))
+
+    def reads(coords):
+        bi, t = coords
+        m0 = t * INDEXER_TILE_M
+        m1 = min(m0 + INDEXER_TILE_M, m)
+        return (
+            _tile_region(q, ((bi, bi + 1), (0, h), (0, d))),
+            _tile_region(c, ((bi, bi + 1), (m0, m1), (0, d))),
+            _tile_region(w, ((bi, bi + 1), (0, h))),
+        )
+
+    def writes(coords):
+        bi, t = coords
+        m0 = t * INDEXER_TILE_M
+        m1 = min(m0 + INDEXER_TILE_M, m)
+        return (_tile_region(s, ((bi, bi + 1), (m0, m1))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_indexer_scores",
+        kind="indexer_scores",
+        op=op,
+        domain=domain,
+        inputs=(q.name, c.name, w.name),
+        outputs=(s.name,),
+        params={"heads": h, "head_dim": d, "capacity": m, "scale": op.attributes["scale"], "tile_m": INDEXER_TILE_M},
+        threads=THREADS_PER_WORKER,
+        # In-register staging: one entry tile [TILE_M, D] + one query row [D] (f32).
+        scratch_bytes=(INDEXER_TILE_M + 1) * d * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_index_topk(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    s, valid = graph.tensor(op.inputs[0]), graph.tensor(op.inputs[1])
+    idx, bias = graph.tensor(op.outputs[0]), graph.tensor(op.outputs[1])
+    b, m = s.shape
+    k = op.attributes.get("k")
+    if not isinstance(k, int) or not 1 <= k <= m:
+        raise ValueError(f"index_topk {op.source_location!r}: k must be an int in [1, M={m}], got {k!r}")
+    if op.attributes.get("tie_break") != "lowest_index":
+        raise ValueError(f"index_topk {op.source_location!r}: unsupported tie_break {op.attributes.get('tie_break')!r}")
+    domain = TileDomain(((b, 1),))  # one task per batch row, full-candidate sweep
+
+    def reads(coords):
+        (bi,) = coords
+        return (
+            _tile_region(s, ((bi, bi + 1), (0, m))),
+            _tile_region(valid, ((bi, bi + 1),)),
+        )
+
+    def writes(coords):
+        (bi,) = coords
+        return (
+            _tile_region(idx, ((bi, bi + 1), (0, k))),
+            _tile_region(bias, ((bi, bi + 1), (0, k))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_index_topk",
+        kind="index_topk",
+        op=op,
+        domain=domain,
+        inputs=(s.name, valid.name),
+        outputs=(idx.name, bias.name),
+        params={"k": k, "capacity": m, "tie_break": "lowest_index"},
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=0,  # rank counting works in registers
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DSA compressor append (issue #96): one RMW task per (batch, layer); masked
+# per-row on the m-token boundary (issue #93 positions). Emission = gated
+# softmax fold of the m-token window + rms_norm + rope rotated ONCE at the
+# emitting row's position; series bookkeeping ping-pongs Ca/Cb slot roles
+# at the r-boundary (width 2r stride r).
+# ---------------------------------------------------------------------------
+
+
+def lower_compressor_append(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    pool, state = graph.tensor(op.inputs[0]), graph.tensor(op.inputs[1])
+    window, gates = graph.tensor(op.inputs[2]), graph.tensor(op.inputs[3])
+    rms_w, cos, sin = graph.tensor(op.inputs[4]), graph.tensor(op.inputs[5]), graph.tensor(op.inputs[6])
+    b, mw, d = window.shape
+    m = op.attributes.get("m")
+    r = op.attributes.get("r")
+    if not isinstance(m, int) or m <= 0 or not isinstance(r, int) or r <= 0 or r % m:
+        raise ValueError(f"compressor_append {op.source_location!r}: needs r % m == 0; got m={m!r}, r={r!r}")
+    if mw != m:
+        raise ValueError(f"compressor_append {op.source_location!r}: window token axis {mw} != m={m}")
+    _, layers, _, _, _ = pool.shape
+    domain = TileDomain(((b, 1), (layers, 1)))  # one task per (batch, layer)
+    p = op.attributes.get("position", "p")
+
+    def reads(coords):
+        bi, _ = coords
+        return (
+            _tile_region(window, ((bi, bi + 1), (0, m), (0, d))),
+            _tile_region(gates, ((bi, bi + 1), (0, m))),
+            _tile_region(rms_w, ((0, d),)),
+            _tile_region(cos, ((bi, bi + 1), (0, d // 2))),
+            _tile_region(sin, ((bi, bi + 1), (0, d // 2))),
+            _tile_region(state, ((bi, bi + 1), (0, layers), (0, 2))),
+        )
+
+    def writes(coords):
+        bi, _ = coords
+        # Conservative per-row slab: this task owns its row's whole pool slab
+        # and series state (the slot/cb_len it writes are runtime values).
+        return (
+            _tile_region(pool, ((bi, bi + 1), (0, layers), (0, 2), (0, r // m), (0, d))),
+            _tile_region(state, ((bi, bi + 1), (0, layers), (0, 2))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_compressor_append",
+        kind="compressor_append",
+        op=op,
+        domain=domain,
+        inputs=(pool.name, state.name, window.name, gates.name, rms_w.name, cos.name, sin.name),
+        outputs=(),
+        params={
+            "m": m,
+            "r": r,
+            "eps": op.attributes.get("eps", 1e-6),
+            "position": p,
+            "position_form": op.attributes.get("position_form", "scalar"),
+        },
+        threads=THREADS_PER_WORKER,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Registry (§3.1)
+# ---------------------------------------------------------------------------
+
+
 LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "linear": lower_linear,
     "linear_fp8": lower_linear_fp8,
@@ -1157,6 +1328,13 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "moe_route": lower_moe_route,
     "moe_expert": lower_moe_expert,
     "moe_combine": lower_moe_combine,
+    "compressor_append": lower_compressor_append,
+    "moe_route": lower_moe_route,
+    "moe_expert": lower_moe_expert,
+    "moe_combine": lower_moe_combine,
+    "indexer_scores": lower_indexer_scores,
+    "index_topk": lower_index_topk,
+    "compressor_append": lower_compressor_append,
 }
 
 LOWERINGS_VERSION = "0.1.0"

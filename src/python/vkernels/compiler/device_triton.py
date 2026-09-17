@@ -1391,6 +1391,96 @@ def _t_index_topk(
 
 
 @triton.jit
+def _t_compressor_append(
+    worker: tl.int32,
+    P: tl.int32,
+    pool_ptr,
+    state_ptr,
+    win_ptr,
+    gates_ptr,
+    rmsw_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    p_scalar,
+    B: tl.constexpr,
+    L: tl.constexpr,
+    M: tl.constexpr,
+    R: tl.constexpr,
+    D: tl.constexpr,
+    EPS: tl.constexpr,
+    POS_ROW: tl.constexpr,
+):
+    """Issue #96: DSA compressor entry emission — one task per (b, layer).
+
+    Rows at the m-token boundary (``p[b] % m == m-1``, per-row positions
+    from issue #93) fold their m-token window: fp32 softmax over the gates,
+    weighted latent fold, rms_norm, rotate_half rope at the emitting row's
+    own position (entries rotate ONCE at emission — decode rotates only the
+    query), stored bf16 into the row's active Ca/Cb series slot. Series
+    bookkeeping ping-pongs slot roles at ``cb_len == R``. Non-boundary rows
+    are exact no-ops (masked stores only).
+    """
+    task = worker
+    while task < B * L:
+        b = task // L
+        l = task % L
+        if POS_ROW:
+            p = tl.load(pos_ptr + b)
+        else:
+            p = p_scalar
+        boundary = (p % M) == (M - 1)
+        # --- gated softmax fold over the m-token window (fp32) ---
+        gmax = tl.zeros([1], tl.float32) - float("inf")
+        t = 0
+        while t < M:
+            gt = tl.load(gates_ptr + b * M + t, mask=boundary, other=0.0).to(tl.float32)
+            gmax = tl.maximum(gmax, gt)
+            t += 1
+        denom = tl.zeros([1], tl.float32)
+        t = 0
+        while t < M:
+            gt = tl.load(gates_ptr + b * M + t, mask=boundary, other=0.0).to(tl.float32)
+            denom += tl.exp(gt - gmax)
+            t += 1
+        acc = tl.zeros([D], tl.float32)
+        t = 0
+        while t < M:
+            gt = tl.load(gates_ptr + b * M + t, mask=boundary, other=0.0).to(tl.float32)
+            wt = tl.exp(gt - gmax) / denom
+            offs = tl.arange(0, D)
+            wv = tl.load(win_ptr + (b * M + t) * D + offs, mask=boundary, other=0.0, cache_modifier=".cg").to(tl.float32)
+            acc += wt * wv
+            t += 1
+        # --- rms_norm ---
+        ms = tl.sum(acc * acc, axis=0) / D
+        rmsw = tl.load(rmsw_ptr + tl.arange(0, D), cache_modifier=".cg").to(tl.float32)
+        e = acc * (1.0 / tl.sqrt(ms + EPS)) * rmsw
+        # --- rotate_half rope at the emitting row's position (once) ---
+        # out[i] = e[i]*cos[i mod D/2] + sign·e[partner(i)]·sin[i mod D/2],
+        # partner(i) = i+D/2 for the first half, i-D/2 for the second;
+        # partner gather via lane-compare reduction (D small: head_dim ≤ 128).
+        i = tl.arange(0, D)
+        pair = tl.where(i < D // 2, i + D // 2, i - D // 2)
+        cmp = tl.arange(0, D)[None, :] == pair[:, None]
+        pv = tl.sum(tl.where(cmp, e[None, :], 0.0), axis=1)
+        chf = tl.load(cos_ptr + b * (D // 2) + (i % (D // 2)), mask=boundary, other=0.0).to(tl.float32)
+        shf = tl.load(sin_ptr + b * (D // 2) + (i % (D // 2)), mask=boundary, other=0.0).to(tl.float32)
+        sign = tl.where(i < D // 2, -1.0, 1.0)
+        e_rot = e * chf + sign * pv * shf
+        # --- store entry + series bookkeeping (masked: boundary rows only) ---
+        slot = tl.load(state_ptr + (b * L + l) * 2 + 0, mask=boundary, other=0)
+        cb = tl.load(state_ptr + (b * L + l) * 2 + 1, mask=boundary, other=0)
+        dst = ((b * L + l) * 2 + slot) * R * D + cb * D + i
+        tl.store(pool_ptr + dst, e_rot.to(pool_ptr.dtype.element_ty), mask=boundary)
+        ncb = tl.where(cb + 1 == R, 0, cb + 1)
+        nslot = tl.where(cb + 1 == R, 1 - slot, slot)
+        tl.store(state_ptr + (b * L + l) * 2 + 0, nslot, mask=boundary)
+        tl.store(state_ptr + (b * L + l) * 2 + 1, ncb, mask=boundary)
+        task += P
+
+
+@triton.jit
 def _t_gdn_heads(
     worker: tl.int32,
     P: tl.int32,

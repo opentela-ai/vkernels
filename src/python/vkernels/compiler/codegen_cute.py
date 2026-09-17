@@ -54,6 +54,10 @@ TEMPLATE_NAMES = {
     "moe_route": "moe_route_task",  # MoE decode ops (issue #98)
     "moe_expert": "moe_expert_task",
     "moe_combine": "moe_combine_task",
+    # DSA compressor lane (issue #96): per-(row, layer) entry emission into
+    # the two-series Ca/Cb pool; consumes #97's block_bias alignment and
+    # #93's per-row boundary cadence; reads fold into #95 via #94.
+    "compressor_append": "compressor_append_task",
     "layernorm": "layernorm_task",
     "rms_norm": "rms_norm_task",
     "rope": "rope_task",
