@@ -282,15 +282,20 @@ void vk_hip_dsa_config(int S_q, int H, int dim, int topk, int* bq,
  * Dispatches on the staged-bytes cap (gfx942's 64 KB NON-OPTIN dynamic-LDS
  * limit; NO hipFuncSetAttribute opt-in past it -- see the KB note
  * mi300a-dynamic-lds-no-optin). The AUTO dispatcher (dsa_topk_logits in
- * dsa.hip, via dsa_topk_logits_with_variant(0)) picks the SMALLEST-
- * footprint variant that fits the shape's cap:
+ * dsa.hip, via dsa_topk_logits_with_variant(0)) picks the FASTEST variant
+ * that admits the shape:
+ *   0. fp8-MFMA (dsa_topk_logits_kernel_mfma_fp8, issue #81) -- NO staged
+ *      tile at all: the 16x16x32 fp8 fragment IS the raw global 8-byte
+ *      load, shared memory is just the gate (H*4 B). Needs H%16==0 &&
+ *      H<=128, head_dim%32==0, block%16==0 && block<=256 (see
+ *      dsa_topk_logits_fits_lds_mfma_fp8). At the GLM-5.3 indexer (H=32,
+ *      D=128, B=64) that is ~8x faster than the bf16-MFMA variant (33.8
+ *      vs 266 us at msl=512; 216 us unsplit vs 893 at msl=4096) and
+ *      admits D%32 widths (96/160/192) the bf16-MFMA kernel refuses.
  *   1. bf16-MFMA (dsa_topk_logits_kernel_mfma) -- Q transposed as bf16
  *      sQt[D][H] staged once, one bf16 K-tile reloaded, gated via Matrix
  *      Cores. Needs H%16==0, head_dim%64==0, block%16==0 and fits
- *      dsa_topk_logits_fits_lds_mfma. At the GLM-5.3 indexer (H=32, D=128,
- *      B=64) that is 16,768 B and runs ~10x faster than the fp32-Q kernel;
- *      it also fits H=64 (25,088 B) and H=128 (41,728 B), so those now
- *      take the MFMA fast path instead of the fp8-Q fallback.
+ *      dsa_topk_logits_fits_lds_mfma.
  *   2. fp32-Q (dsa_topk_logits_kernel) -- Q dequanted once into shared.
  *      Fallback for shapes the MFMA kernel refuses but that fit
  *      dsa_topk_logits_fits_lds (e.g. H not a multiple of 16).
