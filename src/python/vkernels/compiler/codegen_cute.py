@@ -51,6 +51,11 @@ TEMPLATE_NAMES = {
     # selection producing the i32 indirection table for #95/#96 via #94.
     "indexer_scores": "indexer_scores_task",
     "index_topk": "index_topk_task",
+    # MLA decode lane (issue #95): fused latent-attention scores + softmax +
+    # sink, the context gather, and the conjugate (output-side) rope.
+    "mla_scores": "mla_scores_task",
+    "mla_values": "mla_values_task",
+    "conjugate_rope": "conjugate_rope_task",
     "layernorm": "layernorm_task",
     "rms_norm": "rms_norm_task",
     "rope": "rope_task",

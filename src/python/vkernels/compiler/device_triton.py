@@ -618,6 +618,222 @@ def qwen3_megakernel(
     _t_gemv_transposed(worker, P, ws_ptr + O_FINAL, tok_ptr, logits_ptr, B, C, V, TILE, BK)
 
 
+
+@triton.jit
+def _t_rope_interleaved(
+    worker: tl.int32,
+    P: tl.int32,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    y_ptr,
+    B: tl.constexpr,
+    NHEAD: tl.constexpr,
+    D: tl.constexpr,
+    ROT: tl.constexpr,
+    TSTRIDE: tl.constexpr,
+    NEGATE_SIN: tl.constexpr,
+):
+    """Interleaved (GPT-J style) rope — issue #95, DeepSeek-V4 q/latent-k.
+
+    One task per (b, head); pairs ``(2i, 2i+1)`` over the first ``ROT``
+    dims, cos/sin indexed by PAIR index at the row's runtime position::
+
+        x[2i]'   = x[2i]*c_i - x[2i+1]*s_i
+        x[2i+1]' = x[2i+1]*c_i + x[2i]*s_i
+
+    dims ``[ROT, D)`` pass through. ``NEGATE_SIN=True`` turns this into the
+    CONJUGATE rotation (output-side, negative angle) — the exact inverse of
+    the q/k rotation at the same position; implemented as one template so
+    the round-trip property is structurally guaranteed on device.
+    UNVERIFIED in this environment: CUDA-gated (same flagged gap as PRs
+    #88/#113/#114/#115/#117).
+    """
+    task = worker
+    while task < B * NHEAD:
+        b = task // NHEAD
+        h = task % NHEAD
+        half: tl.constexpr = ROT // 2
+        i = tl.arange(0, half)
+        p = tl.load(pos_ptr + b).to(tl.int64)
+        base = (b * NHEAD + h) * D
+        x_even = tl.load(x_ptr + base + 2 * i, cache_modifier=".cg").to(tl.float32)
+        x_odd = tl.load(x_ptr + base + 2 * i + 1, cache_modifier=".cg").to(tl.float32)
+        c = tl.load(cos_ptr + p * TSTRIDE + i).to(tl.float32)
+        s = tl.load(sin_ptr + p * TSTRIDE + i).to(tl.float32)
+        if NEGATE_SIN:
+            s = -s
+        tl.store(y_ptr + base + 2 * i, x_even * c - x_odd * s)
+        tl.store(y_ptr + base + 2 * i + 1, x_odd * c + x_even * s)
+        if ROT < D:
+            offs_d = tl.arange(0, D)
+            mt = offs_d >= ROT
+            tail = tl.load(x_ptr + base + offs_d, mask=mt, other=0.0, cache_modifier=".cg").to(tl.float32)
+            tl.store(y_ptr + base + offs_d, tail, mask=mt)
+        task += P
+
+
+@triton.jit
+def _t_mla_scores(
+    worker: tl.int32,
+    P: tl.int32,
+    q_ptr,
+    latent_ptr,
+    wtable_ptr,
+    comp_ptr,
+    compidx_ptr,
+    sink_ptr,
+    bias_ptr,
+    pos_ptr,
+    probs_ptr,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    K: tl.constexpr,
+    SPOOL: tl.constexpr,
+    MPOOL: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    scale: tl.constexpr,
+):
+    """MLA fused scores + softmax + sink (issue #95). One task per (b, head).
+
+    Candidate layout per (b, h): [W window | K compressed | 1 sink (last)].
+    Window slot i -> logical cache position t = p - W + 1 + i, gathered from
+    the per-row latent pool via the slot table (masked to [0, p]);
+    compressed slot j -> comp_idx[b, j] (masked to >= 0; logits + bias when
+    HAS_BIAS); sink logit per head, always valid. fp32 two-pass softmax over
+    valid candidates; invalid slots exact 0.0. UNVERIFIED: CUDA-gated.
+    """
+    task = worker
+    WIDTH: tl.constexpr = W + K + 1
+    while task < B * H:
+        b = task // H
+        h = task % H
+        offs_w = tl.arange(0, W)
+        offs_k = tl.arange(0, K)
+        offs_d = tl.arange(0, D)
+        p = tl.load(pos_ptr + b).to(tl.int64)
+        qb = tl.load(q_ptr + (b * H + h) * D + offs_d, cache_modifier=".cg").to(tl.float32)
+        # window logits: logical t = p - W + 1 + i
+        t = p - W + 1 + offs_w.to(tl.int64)
+        m_w = (t >= 0) & (t <= p)
+        slots_w = tl.load(wtable_ptr + b * SPOOL + t, mask=m_w, other=0).to(tl.int64)
+        lat = tl.load(latent_ptr + b * SPOOL * D + slots_w[:, None] * D + offs_d[None, :],
+                      mask=m_w[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
+        lw = tl.sum(lat * qb[None, :], axis=1) * scale
+        # compressed logits
+        e = tl.load(compidx_ptr + b * K + offs_k).to(tl.int64)
+        m_k = e >= 0
+        comp = tl.load(comp_ptr + b * MPOOL * D + e[:, None] * D + offs_d[None, :],
+                       mask=m_k[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
+        lc = tl.sum(comp * qb[None, :], axis=1) * scale
+        if HAS_BIAS:
+            lc += tl.load(bias_ptr + b * K + offs_k, mask=m_k, other=0.0).to(tl.float32)
+        # sink (per-head, always valid, LAST slot)
+        lsink = tl.load(sink_ptr + (b * H + h) * D // D + h).to(tl.float32) if False else tl.load(sink_ptr + h).to(tl.float32)
+        # fused two-pass softmax over valid candidates ∪ sink
+        m_all = tl.join(tl.join(m_w, m_k).reshape(W + K), tl.full((1,), 1, tl.int1) >= 0).reshape(WIDTH)
+        logits = tl.join(tl.join(lw, lc).reshape(W + K), lsink[None]).reshape(WIDTH)
+        mx = tl.max(tl.where(m_all, logits, -float("inf")))
+        ex = tl.exp(logits - mx)
+        ex = tl.where(m_all, ex, 0.0)
+        denom = tl.sum(ex)
+        prow = probs_ptr + (b * H + h) * WIDTH
+        tl.store(prow + tl.arange(0, WIDTH), ex / denom)
+        task += P
+
+
+@triton.jit
+def _t_mla_values(
+    worker: tl.int32,
+    P: tl.int32,
+    probs_ptr,
+    latent_ptr,
+    wtable_ptr,
+    comp_ptr,
+    compidx_ptr,
+    pos_ptr,
+    y_ptr,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    K: tl.constexpr,
+    SPOOL: tl.constexpr,
+    MPOOL: tl.constexpr,
+):
+    """MLA context gather (issue #95): window + compressed pools; the sink
+    column (W+K) contributes NO value. fp32 accumulation, single store.
+    UNVERIFIED: CUDA-gated."""
+    task = worker
+    while task < B * H:
+        b = task // H
+        h = task % H
+        offs_w = tl.arange(0, W)
+        offs_k = tl.arange(0, K)
+        offs_d = tl.arange(0, D)
+        p = tl.load(pos_ptr + b).to(tl.int64)
+        prow = probs_ptr + (b * H + h) * (W + K + 1)
+        t = p - W + 1 + offs_w.to(tl.int64)
+        m_w = (t >= 0) & (t <= p)
+        slots_w = tl.load(wtable_ptr + b * SPOOL + t, mask=m_w, other=0).to(tl.int64)
+        pw = tl.load(prow + offs_w, mask=m_w, other=0.0, cache_modifier=".cg")
+        lat = tl.load(latent_ptr + b * SPOOL * D + slots_w[:, None] * D + offs_d[None, :],
+                      mask=m_w[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
+        acc = tl.sum(pw[:, None] * lat, axis=0)
+        e = tl.load(compidx_ptr + b * K + offs_k).to(tl.int64)
+        m_k = e >= 0
+        pc = tl.load(prow + W + offs_k, mask=m_k, other=0.0, cache_modifier=".cg")
+        comp = tl.load(comp_ptr + b * MPOOL * D + e[:, None] * D + offs_d[None, :],
+                       mask=m_k[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
+        acc += tl.sum(pc[:, None] * comp, axis=0)
+        tl.store(y_ptr + (b * H + h) * D + offs_d, acc)
+        task += P
+
+
+@triton.jit
+def _t_linear_grouped(
+    worker: tl.int32,
+    P: tl.int32,
+    x_ptr,
+    w_ptr,
+    y_ptr,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    GH: tl.constexpr,
+    TILE_N: tl.constexpr,
+):
+    """Block-diagonal per-head GEMV (issue #95 GroupedLinear). One task per
+    (row, N tile): each output n reads only its owning head's diagonal
+    blocks — off-block weight storage is never touched. fp32 accumulation.
+    UNVERIFIED: CUDA-gated."""
+    task = worker
+    K_G: tl.constexpr = K // GH
+    N_G: tl.constexpr = N // GH
+    while task < M * (N // TILE_N):
+        m = task // (N // TILE_N)
+        nt = task % (N // TILE_N)
+        n0 = nt * TILE_N
+        offs_n = n0 + tl.arange(0, TILE_N)
+        acc = tl.zeros([TILE_N], tl.float32)
+        for h in range(GH):
+            lo = h * N_G
+            hi = (h + 1) * N_G
+            sel = (offs_n >= lo) & (offs_n < hi)
+            if tl.sum(sel.to(tl.int32)) > 0:
+                offs_k = h * K_G + tl.arange(0, K_G)
+                xv = tl.load(x_ptr + m * K + offs_k, cache_modifier=".cg").to(tl.float32)
+                nn = tl.where(sel, offs_n, 0) - h * N_G
+                wv = tl.load(w_ptr + (h * N_G + nn)[:, None] * K + offs_k[None, :],
+                             mask=sel[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
+                acc += tl.sum(wv * xv[None, :], axis=1)
+        tl.store(y_ptr + m * N + offs_n, acc)
+        task += P
+
+
 # ---------------------------------------------------------------------------
 # Host side
 # ---------------------------------------------------------------------------
