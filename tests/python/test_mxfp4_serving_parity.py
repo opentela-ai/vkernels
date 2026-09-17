@@ -358,6 +358,57 @@ class VkernelBackendShimTest(unittest.TestCase):
     def test_shim_installed(self):
         self.assertTrue(self.installed)
 
+    def test_each_wrapper_dispatches_to_its_own_original(self):
+        """Regression for the loop-closure misrouting: _patch_oracle_converters
+        wraps BOTH convert_* names in one loop. With a closure over the loop
+        variable, both wrappers dispatched to the LAST original — a
+        non-AITER backend on convert_weight_to_... reached the gpt-oss
+        converter (silently-wrong weights, the exact failure class issue #74
+        exists to eliminate). Each wrapper must dispatch to ITS OWN original
+        for non-AITER backends."""
+        import types
+        import unittest.mock as mock
+        from vkernels import vllm_experts as ve
+
+        class _Backend:
+            AITER_MXFP4_BF16 = "aiter-mxfp4-bf16"
+            TRITON_UNFUSED = "triton-unfused"
+
+        stub = types.SimpleNamespace(Mxfp4MoeBackend=_Backend)
+        stub.backend_to_kernel_cls = lambda backend, *a, **k: []
+        mocks = {}
+        for name in ("convert_weight_to_mxfp4_moe_kernel_format",
+                     "convert_gpt_oss_weight_to_mxfp4_moe_kernel_format"):
+            m = mock.MagicMock(return_value=name)
+            mocks[name] = m
+            setattr(stub, name, m)
+
+        with mock.patch.object(ve, "convert_weights_for_vkernel",
+                               return_value="vk-raw") as raw_mock:
+            ve._patch_oracle_converters(stub, _Backend.AITER_MXFP4_BF16)
+
+            # distinct wrapper objects (a shared closure cell would still
+            # install one function twice — catch that too)
+            w1 = getattr(stub, "convert_weight_to_mxfp4_moe_kernel_format")
+            w2 = getattr(stub, "convert_gpt_oss_weight_to_mxfp4_moe_kernel_format")
+            self.assertNotEqual(w1, w2)
+
+            # non-AITER backend: each wrapper reaches ITS OWN original
+            self.assertEqual(
+                w1(_Backend.TRITON_UNFUSED, layer=None),
+                "convert_weight_to_mxfp4_moe_kernel_format")
+            self.assertEqual(mocks["convert_weight_to_mxfp4_moe_kernel_format"].call_count, 1)
+            self.assertEqual(mocks["convert_gpt_oss_weight_to_mxfp4_moe_kernel_format"].call_count, 0)
+            self.assertEqual(
+                w2(_Backend.TRITON_UNFUSED, layer=None),
+                "convert_gpt_oss_weight_to_mxfp4_moe_kernel_format")
+            self.assertEqual(mocks["convert_weight_to_mxfp4_moe_kernel_format"].call_count, 1)
+            self.assertEqual(mocks["convert_gpt_oss_weight_to_mxfp4_moe_kernel_format"].call_count, 1)
+
+            # AITER backend: routes to convert_weights_for_vkernel
+            self.assertEqual(w1(_Backend.AITER_MXFP4_BF16, layer=None), "vk-raw")
+            self.assertEqual(raw_mock.call_count, 1)
+
     def test_aiter_enum_resolves_to_vkernel_experts(self):
         from vkernels.vllm_experts import VkernelFusedExperts
 
