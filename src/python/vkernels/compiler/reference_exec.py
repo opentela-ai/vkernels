@@ -475,8 +475,8 @@ class ReferenceExecutor:
     def _moe_scores(self, logits: np.ndarray, fam: TaskFamily) -> np.ndarray:
         """Router scores, fp64 standing in for the fp32 device math."""
         if fam.params["score_fn"] == "sigmoid_noaux_tc":
-            # Stable sigmoid: no overflow for large |logit|.
-            return 1.0 / (1.0 + np.exp(-np.logaddexp(0.0, -logits)))
+            # Stable sigmoid: exp(-softplus(-l)) == sigmoid(l), no overflow.
+            return np.exp(-np.logaddexp(0.0, -logits))
         # sqrtsoftplus (DeepSeek-V4): sqrt(softplus(l)), stable softplus.
         return np.sqrt(np.logaddexp(0.0, logits))
 
@@ -554,7 +554,7 @@ class ReferenceExecutor:
         if limit is not None:
             g = np.minimum(g, float(limit))
             u = np.clip(u, -float(limit), float(limit))
-        act = g / (1.0 + np.exp(-np.logaddexp(0.0, -g))) * u  # silu(g) · u
+        act = g / (1.0 + np.exp(-g)) * u  # silu(g) · u
         partials[r, s, :] = (down[e] @ act).astype(partials.dtype)
 
     def _body_moe_combine(self, fam: TaskFamily, coords, scalars) -> None:

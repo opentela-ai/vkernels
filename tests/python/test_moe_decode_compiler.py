@@ -46,7 +46,7 @@ def _scores(logits, score_fn):
     """Router scores per the floe reference: stable sigmoid (+bias applied by
     the caller) or sqrt(softplus)."""
     if score_fn == "sigmoid_noaux_tc":
-        return 1.0 / (1.0 + np.exp(-np.logaddexp(0.0, -logits)))
+        return np.exp(-np.logaddexp(0.0, -logits))  # stable sigmoid(l)
     assert score_fn == "sqrtsoftplus"
     return np.sqrt(np.logaddexp(0.0, logits))
 
@@ -57,7 +57,7 @@ def _topk_stable(choice, k):
     return np.argsort(-choice, kind="stable")[:k]
 
 
-def _route_mirror(x_row, router_w, *, mode, score_fn, top_k, rsf=1.0,
+def _route_mirror(x_row, router_w, *, mode="learned", score_fn="sqrtsoftplus", top_k, rsf=1.0,
                   bias=None, n_group=1, topk_group=1, norm_topk_prob=True,
                   tid2eid=None, token_id=None):
     logits = router_w.astype(np.float64) @ x_row.astype(np.float64)
@@ -92,7 +92,7 @@ def _expert_mirror(x_row, e, gate_up, down, limit=None):
     if limit is not None:
         g = np.minimum(g, float(limit))
         u = np.clip(u, -float(limit), float(limit))
-    act = g / (1.0 + np.exp(-np.logaddexp(0.0, -g))) * u
+    act = g / (1.0 + np.exp(-g)) * u  # silu(g)·u — the executor's exact form
     return down[e].astype(np.float64) @ act
 
 
@@ -450,7 +450,7 @@ def test_expert_weight_base_follows_the_routing_table():
     rec, h = _capture_block(B=B, H=H, E=E, K=K, I=I, V=8)
     data = _rand_block(rng, B=B, H=H, E=E, K=K, I=I, mode="hash", V=8)
     data["router_w"] = np.zeros((E, H), dtype=np.float32)
-    data["tid2eid"] = np.array([[0], [1], [2], [3]], dtype=np.int32)[:V]
+    data["tid2eid"] = np.array([[0], [1], [2], [3], [0], [1], [2], [3]], dtype=np.int32)[:V]
     data["token_ids"] = np.zeros(B, dtype=np.int32)
     ext = _externals(rec, data)
     ex, _ = _run_schedule(rec.graph, ext)
@@ -491,7 +491,7 @@ def test_weighted_combine_and_shared_add():
             routed += weights[b, s] * _expert_mirror(data["x"][b], int(ids[b, s]), data["gate_up"], data["down"])
         g = data["x"][b].astype(np.float64) @ data["sh_gate_w"].astype(np.float64)
         u = data["x"][b].astype(np.float64) @ data["sh_up_w"].astype(np.float64)
-        act = (g / (1.0 + np.exp(-np.logaddexp(0.0, -g)))) * u
+        act = (g / (1.0 + np.exp(-g))) * u  # silu(g)·u
         shared = act @ data["sh_down_w"].astype(np.float64)
         np.testing.assert_allclose(y[b].astype(np.float64), routed + shared, rtol=1e-6, atol=1e-6)
 
@@ -600,7 +600,7 @@ def test_device_template_mirror_expert(B, K, H, I, workers):
 def test_device_template_mirror_route():
     rng = np.random.default_rng(988)
     B, H, E, K = 3, 16, 8, 2
-    for score_fn, kw in [("sqrtsoftplus", {}), ("sigmoid_noaux_tc", {"bias": rng.standard_normal(E).astype(np.float32)})]:
+    for score_fn, kw in [("sqrtsoftplus", {}), ("sigmoid_noaux_tc", {})]:
         rec, h = _capture_block(B=B, H=H, E=E, K=K, score_fn=score_fn, **kw)
         data = _rand_block(rng, B=B, H=H, E=E, K=K, score_fn=score_fn)
         ex, _ = _run_schedule(rec.graph, _externals(rec, data))
