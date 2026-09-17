@@ -463,6 +463,12 @@ OP_LINEAR = "linear"
 # with DeepSeek-style 128x128 block scales; same task shape as ``linear``, the
 # scale tensor is the second weight external.
 OP_LINEAR_FP8 = "linear_fp8"
+# Lightning-indexer (DSA / GLM indexer, issue #97): per-(batch, head) ReLU
+# scoring of the compressed entries plus the fused head mix, then the fixed-
+# count top-k selection producing the i32 indirection table consumed by the
+# attention scores/values tasks via #94.
+OP_INDEXER_SCORES = "indexer_scores"
+OP_INDEX_TOPK = "index_topk"
 OP_GELU = "gelu"
 OP_SWIGLU = "swiglu"
 OP_ADD = "add"
@@ -472,6 +478,10 @@ OP_CACHE_APPEND = "cache_append"
 # read-modify-write per row (time-major state shift), position-independent —
 # ordering comes from the state-storage hazards, not the decode position.
 OP_GDN_CONV = "gdn_conv"
+# DSA compressor entry emission (issue #96): every m-th token appends one
+# rope-rotated compressed entry to the per-layer two-series (Ca/Cb) entry
+# pool; masked per-row on the boundary condition (issue #93 positions).
+OP_COMPRESSOR_APPEND = "compressor_append"
 OP_CACHE_APPEND_PAGED = "cache_append_paged"
 # gdn_delta attributes: layer, scale, eps. Per-value-head gated delta rule
 # decode step (Qwen3.5 GatedDeltaNet, seq==1 path): decays the fp32 SSM
@@ -492,11 +502,14 @@ ARITHMETIC_OP_KINDS = (
     OP_ROPE,
     OP_LINEAR,
     OP_LINEAR_FP8,
+    OP_INDEXER_SCORES,
+    OP_INDEX_TOPK,
     OP_GELU,
     OP_SWIGLU,
     OP_ADD,
     OP_CACHE_APPEND,
     OP_GDN_CONV,
+    OP_COMPRESSOR_APPEND,
     OP_CACHE_APPEND_PAGED,
     OP_GDN_DELTA,
     OP_ATTENTION_SCORES,
