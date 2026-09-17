@@ -135,6 +135,33 @@ class RecordingBackend:
         """The decode position p with the host-side guard 0 <= p < S."""
         return self.graph.add_scalar(SymbolicScalar("p", 0, capacity))
 
+    def define_row_positions(
+        self,
+        name: str,
+        batch: int,
+        capacity: int,
+        *,
+        storage_id: int,
+    ) -> SymbolicTensor:
+        """Per-row decode positions for ragged batches (issue #93).
+
+        Registers an external **i32 [B]** tensor of per-row decode
+        positions (host tensors may be i64; they narrow on upload). Each
+        row ``b`` then carries its own valid length ``pos[b] + 1``: ops
+        that accept this tensor as their ``position`` record per-row
+        :class:`ValidLength` regions instead of the shared scalar form
+        ``p+1``, and legality scopes it exactly like the scalar ``p`` —
+        only attention/append/rope/embedding consumers may read it.
+        """
+        if not (isinstance(batch, int) and batch > 0):
+            raise CaptureError(f"row-position tensor needs a static batch > 0; got {batch!r}")
+        if capacity <= 0:
+            raise CaptureError(f"row-position tensor needs capacity > 0; got {capacity!r}")
+        sym = self.external_tensor(name, (batch,), I32, storage_id=storage_id)
+        self.graph.row_position_tensors.add(name)
+        self.graph.row_position_capacity[name] = capacity
+        return sym
+
     def external_tensor(
         self,
         name: str,
@@ -251,6 +278,8 @@ class RecordingBackend:
         runtime-bound contract explicit."""
         self._require_position(position, "embedding")
         out = out or self.fresh_buffer(f"hidden{self._suffix()}", (ids.value.shape[0], token.value.shape[1]))
+        p = self._position_name(position)
+        position_form = "row" if isinstance(position, SymbolicTensor) else "scalar"
         reads = [_regional_reads(token.value), _regional_reads(ids.value)]
         inputs = [ids, token]
         if position_emb is not None:
@@ -261,11 +290,11 @@ class RecordingBackend:
             "embedding",
             inputs=tuple(inputs),
             outputs=(out,),
-            attributes={"position": self._position_name(position), "pos_table": position_emb is not None},
+            attributes={"position": p, "position_form": position_form, "pos_table": position_emb is not None},
             reads=tuple(reads),
             writes=(_regional_reads(out.value),),
             source_location="embedding lookup",
-            numerical_contract={"sum": "token_row(ids[b]) + position_row(p)" if position_emb is not None else "token_row(ids[b])", "dtype": "f32"},
+            numerical_contract={"sum": "token_row(ids[b]) + position_row(pos[b])" if position_emb is not None else "token_row(ids[b])", "dtype": "f32"},
         )
         return out
 
@@ -465,7 +494,7 @@ class RecordingBackend:
             "rope",
             inputs=(x, cos_table, sin_table),
             outputs=(out,),
-            attributes={"layer": layer, "which": which, "position": p},
+            attributes={"layer": layer, "which": which, "position": p, "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"},
             reads=(_regional_reads(x.value), _regional_reads(cos_table.value), _regional_reads(sin_table.value)),
             writes=(_regional_reads(out.value),),
             source_location=f"layer {layer} rope {which}",
@@ -514,26 +543,27 @@ class RecordingBackend:
         views* — same storage, bumped version — without touching real cache
         storage. Consumers must use the returned views.
         """
-        self._require_position(position, "cache_append")
+        valid = self._valid_plus_one(position, "cache_append")
         p = self._position_name(position)
         writes = [
-            Region.prefix(k_cache.value, axis=2, valid=ValidLength(f"{p}+1")),
-            Region.prefix(v_cache.value, axis=2, valid=ValidLength(f"{p}+1")),
+            Region.prefix(k_cache.value, axis=2, valid=valid),
+            Region.prefix(v_cache.value, axis=2, valid=valid),
         ]
+        position_form = "row" if valid.is_row else "scalar"
         self._record(
             "cache_append",
             inputs=(k_cache, v_cache, k_new, v_new),
             outputs=(),  # mutation through storage effects; views returned below
-            attributes={"layer": layer, "position": p},
+            attributes={"layer": layer, "position": p, "position_form": position_form},
             reads=(_regional_reads(k_new.value), _regional_reads(v_new.value)),
             writes=tuple(writes),
             source_location=f"layer {layer} kv cache append",
             numerical_contract={
-                "write": "K[l,b,h,p,:] = k_new[b,h,:]; same for V",
-                "valid_length": "p+1",
+                "write": "K[l,b,h,pos[b],:] = k_new[b,h,:]; same for V",
+                "valid_length": str(valid),
             },
         )
-        # Post-append versions: same storages, prefix now valid to p+1.
+        # Post-append versions: same storages, prefix now valid to pos[b]+1.
         k_post = self.graph.add_tensor(
             f"k_cache_l{layer}_v{self.graph.storage_versions[k_cache.value.storage_id]}",
             k_cache.value.shape,
@@ -541,7 +571,7 @@ class RecordingBackend:
             storage_id=k_cache.value.storage_id,
             strides=k_cache.value.strides,
             offset=k_cache.value.offset,
-            valid_length=ValidLength(f"{p}+1"),
+            valid_length=valid,
         )
         v_post = self.graph.add_tensor(
             f"v_cache_l{layer}_v{self.graph.storage_versions[v_cache.value.storage_id]}",
@@ -550,7 +580,7 @@ class RecordingBackend:
             storage_id=v_cache.value.storage_id,
             strides=v_cache.value.strides,
             offset=v_cache.value.offset,
-            valid_length=ValidLength(f"{p}+1"),
+            valid_length=valid,
         )
         return SymbolicTensor(k_post), SymbolicTensor(v_post)
 
@@ -573,17 +603,18 @@ class RecordingBackend:
         b, h, s = q.value.shape[0], q.value.shape[1], k_cache.value.shape[2]
         out = self.fresh_buffer(f"scores_l{layer}{self._suffix()}", (b, h, s))
         p = self._position_name(position)
+        valid = self._valid_plus_one(position, "attention_scores")
         kvh = kv_heads if kv_heads is not None else h
 
         def k_regions() -> tuple[Region, ...]:
             if kvh == h:
-                return (Region.prefix(k_cache.value, axis=2, valid=ValidLength(f"{p}+1")),)
+                return (Region.prefix(k_cache.value, axis=2, valid=valid),)
             group = h // kvh
             return tuple(
                 Region(
                     k_cache.value.storage_id,
                     k_cache.value,
-                    ((0, b), (g * group, (g + 1) * group), (0, f"{p}+1"), (0, k_cache.value.shape[3])),
+                    ((0, b), (g * group, (g + 1) * group), (0, valid if valid.is_row else f"{p}+1"), (0, k_cache.value.shape[3])),
                 )
                 for g in range(kvh)
             )
@@ -592,35 +623,36 @@ class RecordingBackend:
             "attention_scores",
             inputs=(q, k_cache),
             outputs=(out,),
-            attributes={"scale": float(scale), "layer": layer, "position": p, "kv_heads": kvh},
+            attributes={"scale": float(scale), "layer": layer, "position": p, "position_form": "row" if valid.is_row else "scalar", "kv_heads": kvh},
             reads=(_regional_reads(q.value),) + k_regions(),
             writes=(Region.tile(out.value, ((0, b), (0, h), (0, s))),),
             source_location=f"layer {layer} attention scores",
             numerical_contract={
                 "scale": f"1/sqrt(D) = {scale}",
                 "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
-                "valid": "only positions [0, p] are read; scores beyond p are not observed by consumers",
+                "valid": "only each row's positions [0, pos[b]] are read; scores beyond a row's valid length are not observed by consumers",
                 "reduction": "f32 dot over D, k ascending",
             },
         )
         return out
 
     def softmax(self, scores: SymbolicTensor, position, *, layer: int) -> SymbolicTensor:
-        """Row softmax over the valid prefix [0, p]; invalid tail forced to 0."""
+        """Row softmax over each row's valid prefix [0, pos[b]]; invalid tail forced to 0."""
         self._require_position(position, "softmax")
         out = self.fresh_buffer(f"probs_l{layer}{self._suffix()}", scores.value.shape)
         p = self._position_name(position)
+        valid = self._valid_plus_one(position, "softmax")
         self._record(
             "softmax",
             inputs=(scores,),
             outputs=(out,),
-            attributes={"layer": layer, "position": p},
-            reads=(Region.prefix(scores.value, axis=2, valid=ValidLength(f"{p}+1")),),
+            attributes={"layer": layer, "position": p, "position_form": "row" if valid.is_row else "scalar"},
+            reads=(Region.prefix(scores.value, axis=2, valid=valid),),
             writes=(_regional_reads(out.value),),
             source_location=f"layer {layer} softmax",
             numerical_contract={
                 "stability": "max-subtraction",
-                "invalid_tail": "probabilities beyond p are exactly 0 (written, not read from cache)",
+                "invalid_tail": "probabilities beyond each row's valid length are exactly 0 (written, not read from cache)",
             },
         )
         return out
@@ -639,17 +671,18 @@ class RecordingBackend:
         b, h, d = probs.value.shape[0], probs.value.shape[1], v_cache.value.shape[3]
         out = self.fresh_buffer(f"ctx_l{layer}{self._suffix()}", (b, h, d))
         p = self._position_name(position)
+        valid = self._valid_plus_one(position, "attention_values")
         kvh = kv_heads if kv_heads is not None else h
 
         def v_regions() -> tuple[Region, ...]:
             if kvh == h:
-                return (Region.prefix(v_cache.value, axis=2, valid=ValidLength(f"{p}+1")),)
+                return (Region.prefix(v_cache.value, axis=2, valid=valid),)
             group = h // kvh
             return tuple(
                 Region(
                     v_cache.value.storage_id,
                     v_cache.value,
-                    ((0, b), (g * group, (g + 1) * group), (0, f"{p}+1"), (0, v_cache.value.shape[3])),
+                    ((0, b), (g * group, (g + 1) * group), (0, valid if valid.is_row else f"{p}+1"), (0, v_cache.value.shape[3])),
                 )
                 for g in range(kvh)
             )
@@ -658,13 +691,13 @@ class RecordingBackend:
             "attention_values",
             inputs=(probs, v_cache),
             outputs=(out,),
-            attributes={"layer": layer, "position": p, "kv_heads": kvh},
-            reads=(Region.prefix(probs.value, axis=2, valid=ValidLength(f"{p}+1")),) + v_regions(),
+            attributes={"layer": layer, "position": p, "position_form": "row" if valid.is_row else "scalar", "kv_heads": kvh},
+            reads=(Region.prefix(probs.value, axis=2, valid=valid),) + v_regions(),
             writes=(_regional_reads(out.value),),
             source_location=f"layer {layer} attention values",
             numerical_contract={
                 "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
-                "valid": "only positions [0, p] contribute; V beyond p is never loaded (NaN tails must not leak)",
+                "valid": "only each row's positions [0, pos[b]] contribute; V beyond a row's valid length is never loaded (NaN tails must not leak)",
                 "reduction": "f32, t ascending",
             },
         )
@@ -1036,6 +1069,16 @@ class RecordingBackend:
     # ------------------------------------------------------------------
 
     def _require_position(self, position, op: str) -> None:
+        """Accepts the symbolic scalar ``p`` or a per-row positions tensor
+        registered via :meth:`define_row_positions` (issue #93)."""
+        if isinstance(position, SymbolicTensor):
+            if position.name not in self.graph.row_position_tensors:
+                raise CaptureError(
+                    f"{op} accepts a per-row position tensor only when registered via define_row_positions; got {position!r}"
+                )
+            if position.value.dtype != I32 or len(position.value.shape) != 1:
+                raise CaptureError(f"per-row positions must be an i32 [B] tensor; got {position.value.shape} {position.value.dtype.name}")
+            return
         if not isinstance(position, SymbolicScalar):
             raise CaptureError(f"{op} requires the symbolic decode position; got {position!r}. A concrete position would freeze the cache length into the graph (§4.2).")
         if position.name not in self.graph.scalars:
@@ -1043,8 +1086,17 @@ class RecordingBackend:
 
     @staticmethod
     def _position_name(position) -> str:
-        assert isinstance(position, SymbolicScalar)
+        assert isinstance(position, (SymbolicScalar, SymbolicTensor))
         return position.name
+
+    def _valid_plus_one(self, position, op: str) -> ValidLength:
+        """The valid cache length implied by ``position``: scalar ``p+1`` or
+        the per-row form ``pos[b]+1`` (issue #93)."""
+        self._require_position(position, op)
+        p = self._position_name(position)
+        if isinstance(position, SymbolicTensor):
+            return ValidLength.from_positions(p)
+        return ValidLength(f"{p}+1")
 
     def _suffix(self) -> str:
         return f"_t{self._op_counter:02d}"

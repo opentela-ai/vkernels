@@ -270,6 +270,23 @@ class ReferenceExecutor:
     # Task bodies: tile-exact reference semantics
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Position resolution: shared scalar p or per-row ragged decode (#93)
+    # ------------------------------------------------------------------
+
+    def _row_pos_value(self, fam: TaskFamily, b: int, scalars) -> int:
+        """Row ``b``'s decode position: the scalar ``p`` or, in per-row form
+        (issue #93), ``positions[b]`` read from the external row tensor."""
+        if fam.params.get("position_form", "scalar") == "row":
+            pos_t = self.tensor(fam.params["position"])
+            return int(pos_t[b])
+        return scalars["p"]
+
+    def _valid_len(self, fam: TaskFamily, b: int, scalars) -> int:
+        """Row ``b``'s valid cache length: ``pos[b] + 1`` per row (§5.3,
+        per-row NaN-tail contract) or the scalar form ``p + 1``."""
+        return self._row_pos_value(fam, b, scalars) + 1
+
     def _body_gemm(self, fam: TaskFamily, coords, scalars) -> None:
         x = self.tensor(fam.inputs[0])
         w = self.tensor(fam.inputs[1])
@@ -342,7 +359,8 @@ class ReferenceExecutor:
         sin_t = self.tensor(fam.inputs[2])
         y = self.tensor(fam.outputs[0])
         b, h = coords
-        p = scalars["p"]
+        # Row b rotates at its OWN runtime position (issue #93 ragged form).
+        p = self._row_pos_value(fam, b, scalars)
         row = x[b, h]
         half = row.shape[-1] // 2
         rotated = np.concatenate((-row[half:], row[:half]), axis=-1)
@@ -385,7 +403,8 @@ class ReferenceExecutor:
         c1 = width if fam.domain.task_grid[1] == 1 else min(c0 + tile_c, width)
         row = token[int(ids[b]), c0:c1].astype(np.float64)
         if pos is not None:
-            row = row + pos[scalars["p"], c0:c1].astype(np.float64)
+            # Row b adds its own position row (issue #93 ragged form).
+            row = row + pos[self._row_pos_value(fam, b, scalars), c0:c1].astype(np.float64)
         y[b, c0:c1] = row.astype(y.dtype)
 
     def _body_cache_append(self, fam: TaskFamily, coords, scalars) -> None:
@@ -394,7 +413,8 @@ class ReferenceExecutor:
         k_new = self.tensor(fam.inputs[2])
         v_new = self.tensor(fam.inputs[3])
         b, h = coords
-        p = scalars["p"]
+        # Row b appends at its own position (issue #93 ragged form).
+        p = self._row_pos_value(fam, b, scalars)
         k_cache[b, h, p, :] = k_new[b, h, :]
         v_cache[b, h, p, :] = v_new[b, h, :]
 
@@ -442,10 +462,11 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         b, h = coords
         kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
-        p = scalars["p"]
+        vlen = self._valid_len(fam, b, scalars)
         scale = fam.params["scale"]
-        # Masked load: only rows [0, p] are read (§5.3); the tail is never touched.
-        y[b, h, : p + 1] = (k_cache[b, kvh, : p + 1, :] @ q[b, h, :] * scale).astype(y.dtype)
+        # Masked load: only rows [0, pos[b]] are read (§5.3, per-row); the
+        # NaN tail beyond each row's valid length is never touched.
+        y[b, h, :vlen] = (k_cache[b, kvh, :vlen, :] @ q[b, h, :] * scale).astype(y.dtype)
 
     # ------------------------------------------------------------------
     # MoE decode reference bodies (issue #98)
@@ -555,12 +576,12 @@ class ReferenceExecutor:
         x = self.tensor(fam.inputs[0]).astype(np.float64)
         y = self.tensor(fam.outputs[0])
         b, h = coords
-        p = scalars["p"]
-        row = x[b, h, : p + 1]
+        vlen = self._valid_len(fam, b, scalars)
+        row = x[b, h, :vlen]
         row = row - row.max()
         e = np.exp(row)
-        y[b, h, : p + 1] = (e / e.sum()).astype(y.dtype)
-        y[b, h, p + 1 :] = 0.0  # invalid tail written to exact zero (§4.3 contract)
+        y[b, h, :vlen] = (e / e.sum()).astype(y.dtype)
+        y[b, h, vlen:] = 0.0  # invalid tail written to exact zero (§4.3 contract)
 
     def _body_attention_values(self, fam: TaskFamily, coords, scalars) -> None:
         probs = self.tensor(fam.inputs[0]).astype(np.float64)
@@ -568,6 +589,7 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         b, h = coords
         kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
-        p = scalars["p"]
-        # Masked: V rows beyond p are never loaded (NaN tails must not leak).
-        y[b, h, :] = (probs[b, h, : p + 1] @ v_cache[b, kvh, : p + 1, :]).astype(y.dtype)
+        vlen = self._valid_len(fam, b, scalars)
+        # Masked: V rows beyond pos[b] are never loaded (per-row NaN-tail
+        # contract, issue #93).
+        y[b, h, :] = (probs[b, h, :vlen] @ v_cache[b, kvh, :vlen, :]).astype(y.dtype)
