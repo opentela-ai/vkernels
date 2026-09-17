@@ -261,8 +261,9 @@ void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
 //  pin the fastest gate-compliant point. Motivation: the strictly-
 //  sequential variant has a hard latency floor (hc_hidden DEPENDENT adds x
 //  ~4 cyc = 66 us at the ~1 GHz sustained sclk observed on beverin) and the
-//  256-slice variant drifts to 1.16e-4 rel on the n=7 row (FAIL at 1e-4) --
-//  the sweet spot is in between. Threads read x/fn directly from global --
+//  256-slice two-rounding variant drifted to 1.16e-4 rel on the n=7 row
+//  (FAIL at 1e-4) -- the sweet spot is in between. Threads read x/fn
+//  directly from global --
 //  lane-local sequential walks are L1-sector-friendly -- so no staging
 //  buffer: static shared is two 1 KB reduction scratch arrays.
 // ---------------------------------------------------------------------------
@@ -273,10 +274,13 @@ __global__ void mhc_pre_gemm_sqrsum_blocked_kernel(
     float* __restrict__ out,          // [num_tokens, hc_mult3] fp32
     float* __restrict__ sqrsum,       // [num_tokens] fp32
     int num_tokens, int hc_mult3, int hc_hidden_size) {
-// Strict mul+add rounding for the out chain -- no FMA contraction (the
-// CPU oracle is a two-rounding mul-then-add chain).
-// Must be the first statement of the compound block (clang restriction).
-#pragma clang fp contract(off)
+// NOTE: FMA contraction is REQUIRED here, not forbidden: the CPU oracle's
+// `acc += xn[h] * fo[h]` is contracted into an FMA by the host compiler's
+// default -ffp-contract=on, so the device must also contract to replay the
+// oracle's one-rounding-per-step path. (The predecessor's contract(off)
+// two-rounding chain measured 1.19e-5 rel on the n=7 row -- the
+// two-rounding-vs-FMA mismatch signature; tiny shapes still matched at 0.0
+// because both roundings agree on short non-cancelling sums.)
   const int n = blockIdx.x;
   const int o = blockIdx.y;
   if (n >= num_tokens || o >= hc_mult3) return;
