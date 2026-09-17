@@ -55,26 +55,28 @@ jobs:
   # CUDA build + test (needs self-hosted runner with toolkit + GPU)
   # ------------------------------------------------------------------
   cuda:
+    # Self-hosted on the ds6 runner (labels self-hosted,cuda). Runs inside
+    # the runner-local `vkernels-ci:cuda13` image (CUDA 13.0 toolkit +
+    # cmake + git + python3-dev + upgraded setuptools) with the host NVIDIA
+    # driver injected by ~/runners/nvidia-docker.sh (--privileged +
+    # SONAME-mapped lib mounts — no nvidia-container-runtime needed on the
+    # runner). The `cuda` preset compiles for the native arch (GB10: sm_121).
     runs-on: [self-hosted, cuda]
-    if: ${{ false }}  # opt-in: change to `true` or remove to activate
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - uses: jdx/mise-action@v2
-        with:
-          install: true
-
       - name: Configure (CUDA release)
-        run: cmake --preset cuda
+        run: ~/runners/cuda-run.sh vkernels-ci:cuda13 cmake --preset cuda
 
       - name: Build
-        run: cmake --build --preset cuda -j$(nproc)
+        run: ~/runners/cuda-run.sh vkernels-ci:cuda13 cmake --build --preset cuda -j$(nproc)
 
       - name: Test
-        run: ctest --preset cuda --output-on-failure
+        run: ~/runners/cuda-run.sh vkernels-ci:cuda13 ctest --preset cuda --output-on-failure
 
       - name: Build wheel (CUDA)
-        run: bash meta/scripts/build_wheel.sh --cuda --output-dir dist
+        run: ~/runners/cuda-run.sh vkernels-ci:cuda13 bash -c "bash meta/scripts/build_wheel.sh --cuda --output-dir dist"
 
       - uses: actions/upload-artifact@v4
         with:

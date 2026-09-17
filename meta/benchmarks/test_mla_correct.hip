@@ -145,6 +145,41 @@ int main() {
     if (!ok) ++fails;
   }
 
+  // Split-K decode cases (issue #82): long-KV decode shapes that exercise
+  // mla_fwd's split path. Decode causality is q0 = S_kv - 1 with kv0 = 0
+  // (the query attends exactly the S_kv cached keys); the offset cases also
+  // exercise masked slices across split boundaries, incl. a row whose keys
+  // are ALL masked (zero-output branch in the combine kernel).
+  struct SplitCfg { int B, H, S_q, S_kv, q0, kv0; };
+  const SplitCfg scfgs[] = {
+      {1, 1, 1, 2048, 2047, 0},  // the target decode shape (halved)
+      {1, 2, 1, 2048, 2047, 0},  // multi-head decode
+      {1, 1, 8, 2048, 2047, 0},  // multi-row decode
+      {1, 1, 1, 64, 32, 0},      // query offset: masked keys in the last split
+      {1, 1, 1, 64, 50, 100},    // every key masked: combine zero-row branch
+  };
+  for (const auto& c : scfgs) {
+    std::vector<float> q((size_t)c.B * c.H * c.S_q * Dq);
+    std::vector<float> kc((size_t)c.B * c.S_kv * kv_lora_rank);
+    std::vector<float> kp((size_t)c.B * c.S_kv * qk_rope_head_dim);
+    std::vector<float> vc((size_t)c.B * c.S_kv * kv_lora_rank);
+    for (size_t i = 0; i < q.size(); ++i) q[i] = rnd(1, (int)i);
+    for (size_t i = 0; i < kc.size(); ++i) kc[i] = rnd(2, (int)i);
+    for (size_t i = 0; i < kp.size(); ++i) kp[i] = rnd(3, (int)i);
+    for (size_t i = 0; i < vc.size(); ++i) vc[i] = rnd(4, (int)i);
+
+    auto st = run_case(c.B, c.H, c.S_q, c.S_kv, c.q0, c.kv0, kv_lora_rank,
+                       qk_rope_head_dim, scale, q, kc, kp, vc,
+                       dq, dkc, dkp, dvc, dout);
+    bool ok = st.max_rel < THRESH;
+    std::printf(
+        "  B=%d H=%-3d S_q=%-4d S_kv=%-5d q0=%-5d kv0=%-4d "
+        "max_abs=%.4f max_rel=%.6f  %s\n",
+        c.B, c.H, c.S_q, c.S_kv, c.q0, c.kv0, st.max_abs, st.max_rel,
+        ok ? "PASS" : "FAIL");
+    if (!ok) ++fails;
+  }
+
   hipFree(dq); hipFree(dkc); hipFree(dkp); hipFree(dvc); hipFree(dout);
   std::printf("\n%s (%d failure(s))\n", fails ? "FAIL" : "PASS", fails);
   return fails ? 1 : 0;

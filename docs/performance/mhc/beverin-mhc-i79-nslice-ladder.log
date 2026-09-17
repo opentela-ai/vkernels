@@ -1,0 +1,162 @@
+=== node: nid002706  date: 2026-09-17T19:14:24Z ===
+GPU[0]		: Card Series: 		Aqua Vanjaram [Instinct MI300A]
+GPU[0]		: Card Model: 		0x74a0
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+=== lock perf level high ===
+(setperflevel not permitted; continuing)
+GPU[0]		: mclk clock level: 3: (1300Mhz)
+GPU[0]		: sclk clock level: S: (96Mhz)
+GPU[1]		: mclk clock level: 3: (1300Mhz)
+GPU[1]		: sclk clock level: S: (97Mhz)
+=== configure (HIP, gfx942, Release, tests + benchmarks ON) ===
+-- =================================
+-- Configuring done (5.5s)
+-- Generating done (1.2s)
+-- Build files have been written to: /capstor/scratch/cscs/xyao/vkernels-i79/build-i79
+=== build (vkernels + hip C ABI + mhc correctness test + mhc bench) ===
+/capstor/scratch/cscs/xyao/vkernels-i79/meta/benchmarks/bench_mhc.hip:273:27: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i79/meta/benchmarks/bench_mhc.hip:279:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i79/meta/benchmarks/bench_mhc.hip:279:27: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i79/meta/benchmarks/bench_mhc.hip:67:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i79/meta/benchmarks/bench_mhc.hip:69:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i79/meta/benchmarks/bench_mhc.hip:70:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i79/meta/benchmarks/bench_mhc.hip:72:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i79/meta/benchmarks/bench_mhc.hip:273:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i79/meta/benchmarks/bench_mhc.hip:273:27: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i79/meta/benchmarks/bench_mhc.hip:279:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i79/meta/benchmarks/bench_mhc.hip:279:27: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+[100%] Built target mhc_bench
+
+############ 1. MHC CORRECTNESS (test_mhc_correct) ############
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+
+mhc_pre_gemm_sqrsum (vs CPU reference, fp32 both paths):
+  n=1  hc_mult=2 hidden=2    (hc_hidden=4     hc_mult3=8 )  abs=2.3842e-07 rel=7.1973e-08  PASS
+  blocked ladder n=1  hc_mult=2 hidden=2   :
+    ns=256 abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=128 abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=64  abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=32  abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=16  abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=8   abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=4   abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=2   abs=4.7684e-07 rel=1.4395e-07  PASS (2e-5: yes)
+    ns=1   abs=2.3842e-07 rel=7.1973e-08  PASS (2e-5: yes)
+  n=7  hc_mult=3 hidden=3    (hc_hidden=9     hc_mult3=15)  abs=9.5367e-07 rel=3.5932e-07  PASS
+  blocked ladder n=7  hc_mult=3 hidden=3   :
+    ns=256 abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=128 abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=64  abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=32  abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=16  abs=0.0000e+00 rel=0.0000e+00  PASS (2e-5: yes)
+    ns=8   abs=9.5367e-07 rel=4.7684e-07  PASS (2e-5: yes)
+    ns=4   abs=9.5367e-07 rel=3.0050e-07  PASS (2e-5: yes)
+    ns=2   abs=9.5367e-07 rel=2.9016e-07  PASS (2e-5: yes)
+    ns=1   abs=9.5367e-07 rel=3.5932e-07  PASS (2e-5: yes)
+  n=1  hc_mult=4 hidden=4096 (hc_hidden=16384 hc_mult3=24)  abs=1.8359e-01 rel=9.7448e-06  PASS
+  blocked ladder n=1  hc_mult=4 hidden=4096:
+    ns=256 abs=1.8359e-01 rel=2.8331e-05  PASS (2e-5: no)
+    ns=128 abs=1.8359e-01 rel=4.4271e-05  PASS (2e-5: no)
+    ns=64  abs=1.8359e-01 rel=2.3491e-05  PASS (2e-5: no)
+    ns=32  abs=1.8359e-01 rel=1.0595e-05  PASS (2e-5: yes)
+    ns=16  abs=1.8359e-01 rel=4.4916e-05  PASS (2e-5: no)
+    ns=8   abs=1.8359e-01 rel=1.3940e-05  PASS (2e-5: yes)
+    ns=4   abs=1.8359e-01 rel=2.8395e-05  PASS (2e-5: no)
+    ns=2   abs=1.8359e-01 rel=1.1100e-05  PASS (2e-5: yes)
+    ns=1   abs=1.8359e-01 rel=9.7448e-06  PASS (2e-5: yes)
+  n=7  hc_mult=4 hidden=4096 (hc_hidden=16384 hc_mult3=24)  abs=2.5977e-01 rel=1.9263e-05  PASS
+  blocked ladder n=7  hc_mult=4 hidden=4096:
+    ns=256 abs=2.5977e-01 rel=1.0775e-04  FAIL (2e-5: no)
+    ns=128 abs=2.5977e-01 rel=1.1109e-04  FAIL (2e-5: no)
+    ns=64  abs=2.5977e-01 rel=1.1319e-04  FAIL (2e-5: no)
+    ns=32  abs=2.5977e-01 rel=1.1814e-04  FAIL (2e-5: no)
+    ns=16  abs=2.5977e-01 rel=1.0633e-04  FAIL (2e-5: no)
+    ns=8   abs=2.5977e-01 rel=7.1265e-05  PASS (2e-5: no)
+    ns=4   abs=2.5977e-01 rel=7.5076e-05  PASS (2e-5: no)
+    ns=2   abs=2.5977e-01 rel=1.2386e-04  FAIL (2e-5: no)
+    ns=1   abs=2.5977e-01 rel=1.9263e-05  PASS (2e-5: yes)
+  n=1  hc_mult=4 hidden=7168 (hc_hidden=28672 hc_mult3=24)  abs=6.9531e-01 rel=1.8138e-05  PASS
+  blocked ladder n=1  hc_mult=4 hidden=7168:
+    ns=256 abs=6.9531e-01 rel=5.2647e-05  PASS (2e-5: no)
+    ns=128 abs=6.9531e-01 rel=5.0379e-05  PASS (2e-5: no)
+    ns=64  abs=6.9531e-01 rel=4.9893e-05  PASS (2e-5: no)
+    ns=32  abs=6.9531e-01 rel=4.3414e-05  PASS (2e-5: no)
+    ns=16  abs=6.9531e-01 rel=5.6859e-05  PASS (2e-5: no)
+    ns=8   abs=6.9531e-01 rel=4.1956e-05  PASS (2e-5: no)
+    ns=4   abs=6.9531e-01 rel=3.8716e-05  PASS (2e-5: no)
+    ns=2   abs=6.9531e-01 rel=5.4267e-05  PASS (2e-5: no)
+    ns=1   abs=6.9531e-01 rel=1.8138e-05  PASS (2e-5: yes)
+
+mhc_post (vs CPU reference, bf16 store):
+  n=1  hc=2 hidden=2     abs=7.1509e-03 rel=2.4019e-03  PASS
+  n=7  hc=4 hidden=5     abs=1.4932e-02 rel=3.7855e-03  PASS
+  n=1  hc=4 hidden=4096  abs=3.0088e-02 rel=3.8722e-03  PASS
+  n=7  hc=4 hidden=4096  abs=3.1231e-02 rel=3.8845e-03  PASS
+  n=1  hc=4 hidden=7168  abs=2.9481e-02 rel=3.8721e-03  PASS
+  n=4  hc=8 hidden=1024  abs=3.1247e-02 rel=3.8870e-03  PASS
+
+PASS (0 failure(s))
+
+############ 2. BENCHMARK: MHC pre/post (mhc_bench) ############
+GPU: AMD Instinct MI300A  arch=942  bf16=1307 TFLOP/s  HBM=5300 GB/s
+
+=== hip::mhc_pre_gemm_sqrsum ===
+     n hc_hidden hc_mult3  us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+     1        4      8      0.0       0.0      <res      <res   0.4  mem
+     1    16384     24    812.3     815.4     0.001       2.0   0.5  mem
+     7    16384     24    815.3     817.4     0.007       2.2   3.2  mem
+     1    28672     24   1418.9    1421.6     0.001       2.0   0.5  mem
+
+=== hip::mhc_pre_gemm_sqrsum (blocked, issue #79 experiment) ===
+     n hc_hidden hc_mult3  us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+     n hc_hidden hc_mult3     ns  us(min)   us(med)
+     1        4      8    256     0.00      0.00
+     1        4      8    128     0.00      0.00
+     1        4      8     64     0.00      0.00
+     1        4      8     32     0.00      0.00
+     1        4      8     16     0.00      0.00
+     1        4      8      8     0.00      0.00
+     1        4      8      4     0.00      0.00
+     1        4      8      2     0.00      0.00
+     1        4      8      1     0.00      0.00
+     n hc_hidden hc_mult3     ns  us(min)   us(med)
+     1    16384     24    256     0.00      0.00
+     1    16384     24    128     0.00      0.00
+     1    16384     24     64    24.72     26.60
+     1    16384     24     32    29.32     31.44
+     1    16384     24     16    42.08     44.04
+     1    16384     24      8    65.88     68.76
+     1    16384     24      4   117.04    119.52
+     1    16384     24      2   216.80    219.92
+     1    16384     24      1   413.96    418.32
+     n hc_hidden hc_mult3     ns  us(min)   us(med)
+     7    16384     24    256     0.00      0.00
+     7    16384     24    128    20.96     23.12
+     7    16384     24     64    25.08     27.16
+     7    16384     24     32    31.60     32.60
+     7    16384     24     16    42.20     44.56
+     7    16384     24      8    68.00     69.68
+     7    16384     24      4   119.56    122.08
+     7    16384     24      2   220.84    223.84
+     7    16384     24      1   421.64    423.64
+     n hc_hidden hc_mult3     ns  us(min)   us(med)
+     1    28672     24    256    26.24     28.44
+     1    28672     24    128     0.00      0.00
+     1    28672     24     64    35.08     37.08
+     1    28672     24     32    45.72     48.00
+     1    28672     24     16    67.72     69.36
+     1    28672     24      8   110.92    114.36
+     1    28672     24      4   200.48    203.36
+     1    28672     24      2   371.44    378.20
+     1    28672     24      1   718.88    724.80
+
+=== hip::mhc_post ===
+     n   hc hidden  us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+     1    2      2      0.0       0.0      <res      <res   0.5  mem
+     1    4   4096      0.0       0.0      <res      <res   2.2  mem
+     7    4   4096      0.0       0.0      <res      <res   2.2  mem
+     1    4   7168      0.0       0.0      <res      <res   2.2  mem
+     4    8   1024      0.0       0.0      <res      <res   4.2  mem
+
+Roof: 1307 TFLOP/s bf16, 5300 GB/s HBM, ridge ~247 FLOP/B
+===== DONE 2026-09-17T19:14:42Z =====

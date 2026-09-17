@@ -93,7 +93,7 @@ validated on GPU machines against `kda_naive_delta_rule_fwd_cpu` /
 `meta/benchmarks/bench_kda.hip` (+ `bench_kda.sh` driver). Roof: 1307
 TFLOP/s bf16, 5300 GB/s HBM3, ridge ~247 FLOP/B.
 
-### `kda_delta_rule_fwd` (DxD state in gmem, row-parallel)
+### `kda_delta_rule_fwd` (LDS-resident state, row-parallel)
 
 | H | S | D | us(med) | TFLOP/s | GB/s | AI | bound |
 |--:|--:|--:|--:|--:|--:|--:|:--|
@@ -104,11 +104,77 @@ TFLOP/s bf16, 5300 GB/s HBM3, ridge ~247 FLOP/B.
 | 1 | 512 | 64 | 1023 | 0.014 | 33 | 0.43 | mem |
 | 1 | 512 | 128 | 2640 | 0.022 | 51 | 0.43 | mem |
 
-Every config is **memory-bound** (AI ~0.43 << ridge 247). The baseline
-writes the full DxD state to HBM every token (~16 KB/token/head at D=128),
-so the achievable GB/s is low because a single (b,h) block re-reads its
-own state three times per token — the dominant cost and the target of the
-LDS-resident-state and chunked intra/inter/output follow-ons.
+Every config is tagged **memory-bound**, but that verdict is the roofline
+MODEL's legacy gmem bytes: the model still counts the per-token DxD state
+HBM round-trip that the committed kernel no longer performs. The kernel
+caches this block's `Db` state rows in LDS (`srow[Db·D]` — 4 KB at
+D=64/Db=16, 16 KB at D=128/Db=32, both far under the 64 KB static-smem
+cap), runs all four per-token phases on-chip, and touches HBM state only
+once per 256-token chunk (the between-chunk handoff; the decode-with-
+scratch multi-turn path keeps the same once-per-call residency). Actual
+state traffic is ~250x lower than the model; the residual cost of each
+(b,h) D-row block is the serial 64-token × 4-barrier recurrence, whose
+intra-block headroom is exhaustively disproven (4→3 barriers = cross-
+thread GATE-vs-OUTPUT race; parallel dots regress low-H — see
+[kda-lds-optimization](kda-lds-optimization.md)).
+
+### `kda_delta_rule_fwd_chunkedWY` — chunked-vs-baseline at the bench_kda shapes (issue #83, job 640235)
+
+`meta/benchmarks/bench_kda_chunked.hip` (+ `meta/scripts/ab_kda_chunked_mi300.sh`)
+re-measures the committed cooperative per-token kernel (above) against
+`kda_delta_rule_fwd_chunked[_with_scratch]` (#70) with identical inputs/events
+and the same roofline columns (`ab` rows; one short-lived process per shape,
+MI300A per-context fault workaround; `sbatch -A a-infra02`). beverin
+nid002768, 2026-09-17 — `setperflevel` not permitted on that node, so treat
+small deltas as ±few %; raw log:
+`meta/benchmarks/artifacts/issue-83/run-640235-ab-k3-shapes.out`.
+
+K3 six-config set:
+
+| H | S | D | coop us(med) | chunked us(med) | speedup | chunked GB/s |
+|--:|--:|--:|--:|--:|--:|--:|
+| 16 | 64 | 64 | 150.2 | 384.8 | 0.39x | 177 |
+| 1 | 64 | 16 | 64.2 | 348.5 | 0.18x | 0.8 |
+| 1 | 64 | 32 | 113.9 | 345.9 | 0.33x | 3.1 |
+| 1 | 64 | 64 | 149.1 | 379.1 | 0.39x | 11.2 |
+| 1 | 512 | 64 | 1032.6 | 529.8 | 1.95x | 64.4 |
+| 1 | 512 | 128 | 1897.7 | 719.0 | 2.64x | 188.2 |
+
+H sweep at S=512 D=128 + long-S:
+
+| H | S | D | coop us(med) | chunked us(med) | speedup | chunked GB/s |
+|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 512 | 128 | 1894.8 | 720.3 | 2.63x | 188 |
+| 8 | 512 | 128 | 1920.0 | 738.2 | 2.60x | 1466 |
+| 16 | 512 | 128 | 2892.9 | 740.0 | 3.91x | 2925 |
+| 32 | 512 | 128 | 3024.3 | 1107.4 | 2.73x | 3909 |
+| 64 | 512 | 128 | 2928.3 | 1754.6 | 1.67x | 4935 |
+| 128 | 512 | 128 | 3201.5 | 2935.5 | 1.09x | 5899 |
+| 32 | 1024 | 128 | 5826.7 | 1825.1 | 3.19x | 4744 |
+| 32 | 2048 | 128 | 11628.2 | 3311.1 | 3.51x | 5230 |
+
+Phase decomposition (`kda_chunked_bench phases`): the gram (M/N) launch is
+the largest single block cost (269 us of 748 at H=1 S=512 D=128; 1324 us of
+2922 at H=128 S=512), then the state pass (339–1333 us); cumsum is ~23–36 us.
+
+**Finding — the chunked WY kernel LOSES at the decode shapes.** At S=64
+(cs=64, nc=1) it is 2.5–5x slower than the row-parallel kernel
+(0.18–0.39x): the four fixed launches (cumsum, gram, inverse+GEMMs, state)
+plus the 8·S·D scratch traffic and the gmem M/N round-trip cannot amortize
+over a single 64-token chunk, and the B·H-block precompute (16–32 blocks at
+these shapes) has no occupancy to hide it. The S≥512 prefill shapes are
+where the WY form wins (1.95–3.91x; 3.19x/3.51x at S=1024/2048), consistent
+with the S=512+ table in [kda-lds-optimization](kda-lds-optimization.md).
+The re-measured coop entries also update the single-shape numbers of the
+record table above (150.2 vs 143 us at 16 64 64; 1897.7 vs 2640 us at
+1 512 128 — different node/day; the record table stays as bench_kda
+measured it).
+
+Correctness on the same job: `test_kda_chunked` **12/12 PASS** — chunked vs
+`kda_naive_delta_rule_fwd_cpu` at 10 shapes incl. H=128 S=512 D=128
+(max_rel ≤ 6e-6) and the nonzero-initial-state (multi-turn decode-with-
+scratch) contract vs the cooperative kernel (out + final state,
+max_rel ≤ 5e-6).
 
 ### Supporting kernels
 
