@@ -507,12 +507,14 @@ def deepseek_reference_decode_step(
             for h in range(H):
                 attn[h * Ng : (h + 1) * Ng] = xf[h * Kg : (h + 1) * Kg] @ ow[h * Kg : (h + 1) * Kg, h * Ng : (h + 1) * Ng]
             attn = f32(attn)
-            # mhc compose (attention sublayer)
-            streams = np.empty_like(streams)
+            # mhc compose (attention sublayer) — fresh array: every output
+            # stream reads the ORIGINAL streams (in-place would corrupt k<j)
+            new_streams = np.empty_like(streams)
             for j in range(cfg.hc):
                 acc = (comb_a[:, j].astype(np.float64)[:, None] * streams.astype(np.float64)).sum(axis=0)
                 acc = acc + float(post_a[j]) * attn.astype(np.float64)
-                streams[j] = f32(acc)
+                new_streams[j] = f32(acc)
+            streams = new_streams
 
             # ================= MoE sublayer =================
             flat = streams.reshape(-1).astype(np.float64)

@@ -82,6 +82,11 @@ TEMPLATE_NAMES = {
     "cache_append_paged": "cache_append_paged_task",
     "attention_scores_paged": "attention_scores_paged_task",
     "attention_values_paged": "attention_values_paged_task",
+    # --- deepseek stage-2 additions (issue #102): mHC hyper-connection
+    # mixing lanes (issue #99) — pre-mix collapse and post-compose over the
+    # [B, hc, C] stream stack
+    "mhc_pre": "mhc_pre_task",
+    "mhc_post": "mhc_post_task",
 }
 
 _TEMPLATE_MODULE = "vkernels.compiler.device_templates"
