@@ -11,7 +11,16 @@
 // and prints the per-column badness map keyed by pid_n so a boundary/stride
 // defect in the ispp dimension is directly visible.
 //
-//   probe [E] [hidden] [ispp] [kmajor|nmajor] [M]  (defaults 32 7168 4096 kmajor 1)
+//   probe [E] [hidden] [ispp] [kmajor|nmajor] [M] [seed]  (defaults 32 7168 4096 kmajor 1 0)
+//
+// Issue #86 audit additions (fe8b5ec follow-up):
+//   - [seed] shifts every rnd() stream so the mismatch can be quantified
+//     across reps: if the benign-bf16-ULP hypothesis holds, the act stage
+//     stays within ~1 bf16 ulp of the oracle, the down-stage-on-GPU-act
+//     isolation stays small, and the GPU-vs-GPU rerun spread (atomic
+//     accumulation-order noise only) stays orders of magnitude below the
+//     vs-oracle residual.  A wandering/growing spread across seeds would
+//     indicate a real indexing/race defect instead.
 
 #include <hip/hip_runtime.h>
 
@@ -34,7 +43,9 @@
     }                                                                 \
   } while (0)
 
+static int g_seed = 0;
 static float rnd(int seed, int i) {
+  seed += 7919 * g_seed;
   unsigned x = (unsigned)(seed * 2654435761u + (unsigned)i * 40503u);
   x ^= x >> 13; x *= 0x5bd1e995u; x ^= x >> 15;
   return (float)((int)x % 200000) / 100000.0f;
@@ -84,6 +95,7 @@ int main(int argc, char** argv) {
   const int ispp = (argc > 3) ? atoi(argv[3]) : 4096;
   const bool kmajor = (argc <= 4) || std::strcmp(argv[4], "kmajor") == 0;
   const int M = (argc > 5) ? atoi(argv[5]) : 1;
+  g_seed = (argc > 6) ? atoi(argv[6]) : 0;
   const int top_k = 16;
   const int BLOCK_M = 16;
   const int group_size = 32;
@@ -93,8 +105,8 @@ int main(int argc, char** argv) {
   const float beta = 4.0f, linear_beta = 25.0f;
   const int N = M * top_k;
 
-  std::printf("probe: E=%d hidden=%d ispp=%d top_k=%d M=%d %s\n", E, hidden,
-              ispp, top_k, M, kmajor ? "kmajor" : "nmajor");
+  std::printf("probe: E=%d hidden=%d ispp=%d top_k=%d M=%d %s seed=%d\n", E,
+              hidden, ispp, top_k, M, kmajor ? "kmajor" : "nmajor", g_seed);
 
   // ---- host data (identical recipe to bench_moe_fused) -------------------
   std::vector<int32_t> h_tids(N), h_sids(E * BLOCK_M), h_eids((E * BLOCK_M) / BLOCK_M);
@@ -176,10 +188,13 @@ int main(int argc, char** argv) {
   CK(hipMemcpy(dEids, h_eids.data(), (size_t)(EM / BLOCK_M) * 4, hipMemcpyHostToDevice), "cpEids");
   CK(hipMemset(dOut, 0, M * hidden * 4), "zOut");
 
-  vkernels::kernels::hip::fused_moe_mxfp4(
-      dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
-      M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
-      linear_beta, db13, db2, BLOCK_M, kmajor);
+  auto launch = [&]() {
+    vkernels::kernels::hip::fused_moe_mxfp4(
+        dA, dw13, dw13s, dw2, dw2s, dTids, dTw, dAct, dOut,
+        M, hidden, ispp, top_k, dSids, dEids, EM, LIMIT, activation, beta,
+        linear_beta, db13, db2, BLOCK_M, kmajor);
+  };
+  launch();
   CK(hipDeviceSynchronize(), "sync");
 
   // ---- compare ------------------------------------------------------------
@@ -188,22 +203,55 @@ int main(int argc, char** argv) {
   CK(hipMemcpy(act_gpu.data(), dAct, (size_t)EM * ispp * 2, hipMemcpyDeviceToHost), "rdAct");
   CK(hipMemcpy(out_gpu.data(), dOut, M * hidden * 4, hipMemcpyDeviceToHost), "rdOut");
 
+  // GPU-vs-GPU rerun spread: combine_kernel accumulates via float atomicAdd,
+  // so two identical launches differ by accumulation-order noise alone.
+  // This is the noise floor any "real fault" signal must exceed.
+  {
+    CK(hipMemset(dOut, 0, M * hidden * 4), "zOut2");
+    launch();
+    CK(hipDeviceSynchronize(), "sync2");
+    std::vector<float> out_gpu2(M * hidden);
+    CK(hipMemcpy(out_gpu2.data(), dOut, M * hidden * 4, hipMemcpyDeviceToHost), "rdOut2");
+    double mx_abs = 0.0, mx_rel = 0.0;
+    for (int c = 0; c < M * hidden; ++c) {
+      double d = std::fabs((double)out_gpu[c] - (double)out_gpu2[c]);
+      if (d > mx_abs) mx_abs = d;
+      double r = d / std::fmax(std::fabs((double)out_gpu[c]), 1.0);
+      if (r > mx_rel) mx_rel = r;
+    }
+    std::printf("[det]    rerun spread: max|delta|=%.3e worst_rel=%.6f\n",
+                mx_abs, mx_rel);
+  }
+
   // Stage 1: act rows for the real flat indices only.
   double act_worst = 0.0; int act_bad = 0;
+  int act_ulp_max = 0; size_t act_ulp_gt1 = 0, act_ulp_n = 0;
+  // Monotonic integer map of a bf16 pattern (classic IEEE trick) so the
+  // distance between two bf16 values can be counted in ulps.
+  auto bf16_ord = [](uint16_t b) -> int32_t {
+    return (b & 0x8000u) ? (int32_t)(0xFFFFu - b) : (int32_t)(b | 0x8000u);
+  };
   for (int i = 0; i < N; ++i) {
     int r = i;  // real sorted row for flat i (moe_align keeps order)
     double mx = 0.0;
     for (int c = 0; c < ispp; ++c) {
-      float g = bf2f(act_gpu[(size_t)r * ispp + c]);
-      float u = bf2f(act_cpu[(size_t)r * ispp + c]);
+      uint16_t gb = act_gpu[(size_t)r * ispp + c];
+      uint16_t ub = act_cpu[(size_t)r * ispp + c];
+      float g = bf2f(gb), u = bf2f(ub);
       double e = std::fabs((double)g - u);
       mx = std::fmax(mx, e / std::fmax(std::fabs((double)u), 1.0));
+      if (std::fabs(u) > 1e-30f) {  // skip exact zeros/subnormals for ulp count
+        int d = std::abs(bf16_ord(gb) - bf16_ord(ub));
+        if (d > act_ulp_max) act_ulp_max = d;
+        ++act_ulp_n;
+        if (d > 1) ++act_ulp_gt1;
+      }
     }
     if (mx > 0.02) ++act_bad;
     act_worst = std::fmax(act_worst, mx);
   }
-  std::printf("[gateup] act rows=16 real only: worst_rel=%.6f bad_rows=%d/%d\n",
-              act_worst, act_bad, N);
+  std::printf("[gateup] act rows=16 real only: worst_rel=%.6f bad_rows=%d/%d | bf16-ulp max=%d >1ulp=%zu/%zu\n",
+              act_worst, act_bad, N, act_ulp_max, act_ulp_gt1, act_ulp_n);
 
   // Stage 2: out per-column map.
   int bad_cols = 0; double out_worst = 0.0; int worst_col = -1;
