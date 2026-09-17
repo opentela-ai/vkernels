@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from ..operator_ir import Operator, OperatorGraph, Region, TensorValue
+from ..operator_ir import F32, F8_E4M3, Operator, OperatorGraph, Region, TensorValue
 from ..task_ir import TaskFamily, TileDomain
 
 __all__ = [
@@ -100,6 +100,71 @@ def _pair_box(domain: TileDomain, coords):
     (m_extent, m_tile), (n_extent, n_tile) = domain.dims
     m0, n0 = m_idx * m_tile, n_idx * n_tile
     return (m0, min(m0 + m_tile, m_extent)), (n0, min(n0 + n_tile, n_extent))
+
+
+# ---------------------------------------------------------------------------
+# fp8-blockwise linear (issue #91): y = x @ dequant(w_fp8, scale)^T
+#
+# Same tile shape as the dense linear lowering — one task per (m, 16-column)
+# output tile with a full-K sweep — but the weight is fp8 e4m3 [N, K] row-major
+# (checkpoint nn.Linear layout) with fp32 scales [ceil(N/128), K/128]
+# block-major (DeepSeek-style 128x128 block-FP8; ragged trailing N block
+# allowed). A 16-column tile always lies within a single 128-wide N block
+# (128 = 8 * 16), so each task reads exactly one row of the scale tensor and
+# one fp32 scale per 128-deep k-block.
+# ---------------------------------------------------------------------------
+
+GEMV_FP8_TILE_N = 16  # output columns per task (within one 128-wide scale block)
+
+
+def lower_linear_fp8(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    x, w, scale = (graph.tensor(op.inputs[i]) for i in range(3))
+    y = graph.tensor(op.outputs[0])
+    if op.attributes.get("weight_layout") != "fp8_block":
+        raise ValueError(f"linear_fp8 {op.source_location!r}: unsupported weight_layout {op.attributes.get('weight_layout')!r}")
+    qb = int(op.attributes.get("quant_block", 128))
+    m, k = x.shape
+    n, k_w = w.shape
+    if k_w != k:
+        raise ValueError(f"linear_fp8 {op.source_location!r}: weight contraction mismatch ({k_w} != {k})")
+    if k % qb or n % GEMV_FP8_TILE_N or not w.is_contiguous():
+        raise ValueError(
+            f"linear_fp8 {op.source_location!r}: K={k} must be a multiple of the {qb}-wide quant block, N={n} a multiple of the {GEMV_FP8_TILE_N}-wide output tile, and w row-major contiguous"
+        )
+    if scale.dtype != F32 or w.dtype != F8_E4M3:
+        raise ValueError(
+            f"linear_fp8 {op.source_location!r}: dtypes must be e4m3 weights + fp32 scales, got {w.dtype}/{scale.dtype}"
+        )
+    domain = TileDomain(((m, GEMM_TILE_M), (n, GEMV_FP8_TILE_N)))
+    kb = k // qb
+
+    def reads(coords):
+        (m0, m1), (n0, n1) = _pair_box(domain, coords)
+        sb = n0 // qb  # the tile's 128-wide N block (tile is block-aligned)
+        return (
+            _tile_region(x, ((m0, m1), (0, k))),
+            _tile_region(w, ((n0, n1), (0, k))),
+            _tile_region(scale, ((sb, sb + 1), (0, kb))),
+        )
+
+    def writes(coords):
+        (m0, m1), (n0, n1) = _pair_box(domain, coords)
+        return (_tile_region(y, ((m0, m1), (n0, n1))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_linear_fp8",
+        kind="gemv_fp8",
+        op=op,
+        domain=domain,
+        inputs=(x.name, w.name, scale.name),
+        outputs=(y.name,),
+        params={"bias": False, "tile_m": GEMM_TILE_M, "tile_n": GEMV_FP8_TILE_N, "quant_block": qb},
+        threads=THREADS_PER_WORKER,
+        # In-register dequant: the 16-column weight tile + one x K-slice in fp32.
+        scratch_bytes=(GEMV_FP8_TILE_N + 1) * qb * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +598,7 @@ def lower_attention_values(op: Operator, graph: OperatorGraph) -> TaskFamily:
 
 LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "linear": lower_linear,
+    "linear_fp8": lower_linear_fp8,
     "layer_norm": lower_layer_norm,
     "rms_norm": lower_rms_norm,
     "rope": lower_rope,
