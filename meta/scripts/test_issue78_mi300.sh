@@ -14,12 +14,15 @@
 #   SRC=/capstor/scratch/cscs/xyao/vk-issue-78 sbatch meta/scripts/test_issue78_mi300.sh
 set -euo pipefail
 ulimit -c 0
-: "${SRC:=$HOME/vkernels}"
+# SRC must be a readable checkout/rsync of the repo (job 640262 died on the
+# old $HOME/vkernels default: no such checkout exists on beverin).
+: "${SRC:?usage: SRC=/capstor/scratch/cscs/xyao/vk-issue-78 sbatch meta/scripts/test_issue78_mi300.sh}"
 B="$SRC/build-i78"
 echo "=== node: $(hostname) job=$SLURM_JOB_ID ==="
+test -d "$SRC" || { echo "SRC=$SRC not found"; exit 1; }
+test -f "$SRC/src/c/vkernels/kernels/moe_fused.hip" || { echo "SRC=$SRC missing src/c/vkernels/kernels/moe_fused.hip"; exit 1; }
 echo "=== src: $(md5sum "$SRC/src/c/vkernels/kernels/moe_fused.hip" | cut -c1-8) ==="
 date
-test -d "$SRC" || { echo "SRC=$SRC not found"; exit 1; }
 
 echo "=== configure (HIP, gfx942, tests+benchmarks ON) ==="
 cmake -S "$SRC" -B "$B" -DVKERNELS_BUILD_HIP=ON \
