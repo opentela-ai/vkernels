@@ -494,11 +494,16 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
         const int c = (ch - r * rpp) * 8;                                     \
         const int32_t kv_idx = idx_i[(tb_) + r];                              \
         idst[r] = kv_idx;                                                     \
-        uint2 v = {0u, 0u};                                                   \
+        /* one chunk = 8 bf16 = 16 B = uint4. The original uint2 copy moved */\
+        /* only the FIRST 4 of every 8-element chunk, leaving the odd half */ \
+        /* of every staged key row as uninitialized LDS garbage -- the     */ \
+        /* nondeterministic split-LSE corruption of issue #80 (present in */  \
+        /* both VK_DSA_DBPIPE modes; the overlap was never the culprit).   */  \
+        uint4 v = {0u, 0u, 0u, 0u};                                           \
         if (kv_idx >= 0 && kv_idx < S_kv)                                     \
-          v = *reinterpret_cast<const uint2*>(                                \
+          v = *reinterpret_cast<const uint4*>(                                \
               kv + (size_t)kv_idx * W + c);                                   \
-        *reinterpret_cast<uint2*>(sdst + (size_t)r * W + c) = v;              \
+        *reinterpret_cast<uint4*>(sdst + (size_t)r * W + c) = v;              \
       }                                                                       \
     } else {                                                                  \
       for (int e = lane; e < (tlen_) * W; e += 64) {                          \
