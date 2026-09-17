@@ -363,6 +363,12 @@ OP_GELU = "gelu"
 OP_SWIGLU = "swiglu"
 OP_ADD = "add"
 OP_CACHE_APPEND = "cache_append"
+# gdn_delta attributes: layer, scale, eps. Per-value-head gated delta rule
+# decode step (Qwen3.5 GatedDeltaNet, seq==1 path): decays the fp32 SSM
+# state, applies the delta-rule outer-product update, reads out through the
+# per-head RMSNorm + z-gate. Position-independent — ordering comes from the
+# state-storage hazards (read-modify-write per (b, head) row), like gdn_conv.
+OP_GDN_DELTA = "gdn_delta"
 OP_ATTENTION_SCORES = "attention_scores"
 OP_SOFTMAX = "softmax"
 OP_ATTENTION_VALUES = "attention_values"
@@ -377,6 +383,7 @@ ARITHMETIC_OP_KINDS = (
     OP_SWIGLU,
     OP_ADD,
     OP_CACHE_APPEND,
+    OP_GDN_DELTA,
     OP_ATTENTION_SCORES,
     OP_SOFTMAX,
     OP_ATTENTION_VALUES,
