@@ -35,6 +35,8 @@ POSITION_CONSUMERS = frozenset(
         "mla_scores",
         "mla_values",
         "conjugate_rope",
+        # #94 paged trio: same runtime-bound contracts as their dense twins,
+        # extended to the per-row form (issue #93 x #94 composition).
     }
 )
 

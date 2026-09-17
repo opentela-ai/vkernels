@@ -41,6 +41,21 @@ from .task_ir import TaskFamily
 __all__ = ["ExecutionTrace", "PhaseStat", "ReferenceExecutor", "ExecutorError", "decode_e4m3"]
 
 
+def _stable_sigmoid(g: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid, fp64 mirror of the device epilogue
+    ``1 / (1 + exp(-g))`` (issue #92). Overflow-safe for large |g|: the
+    device computes exp(-g) directly, so huge negative g overflows to inf
+    and the ratio still rounds to 0; huge positive g underflows to 0 and
+    the ratio rounds to 1 — same saturating semantics, no NaN."""
+    g = np.asarray(g, dtype=np.float64)
+    out = np.empty_like(g)
+    pos = g >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-g[pos]))
+    eg = np.exp(g[~pos])
+    out[~pos] = eg / (1.0 + eg)
+    return out
+
+
 class ExecutorError(Exception):
     """The executed schedule violated an obligation (§12)."""
 
@@ -146,6 +161,7 @@ class ReferenceExecutor:
             "cache_append_paged": self._body_cache_append_paged,
             "mhc_pre": self._body_mhc_pre,
             "mhc_post": self._body_mhc_post,
+            "gdn_delta": self._body_gdn_delta,
             "attention_scores": self._body_attention_scores,
             "attention_scores_paged": self._body_attention_scores_paged,
             "softmax": self._body_softmax,
@@ -722,7 +738,7 @@ class ReferenceExecutor:
         k_new = self.tensor(fam.inputs[3])
         v_new = self.tensor(fam.inputs[4])
         b, h = coords
-        p = int(scalars["p"])
+        p = self._row_pos_value(fam, b, scalars)  # #93 ragged: per-row bound
         slot = int(table[b, p])  # write lands at slot_table[b, p_row] (#94)
         k_pool[slot, h, :] = k_new[b, h, :]
         v_pool[slot, h, :] = v_new[b, h, :]
@@ -734,7 +750,7 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         b, h = coords
         kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
-        p = int(scalars["p"])
+        p = self._row_pos_value(fam, b, scalars)  # #93 ragged: per-row bound
         scale = fam.params["scale"]
         # Gathered masked load: only positions [0, p] map through the table;
         # slot 0 is the reserved null/sink page (never written by a live row).
@@ -748,7 +764,7 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         b, h = coords
         kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
-        p = int(scalars["p"])
+        p = self._row_pos_value(fam, b, scalars)  # #93 ragged: per-row bound
         # Gathered masked: V rows beyond p are never gathered (NaN slots must not leak).
         slots = table[b, : p + 1].astype(np.int64)
         y[b, h, :] = (probs[b, h, : p + 1] @ v_pool[slots, kvh, :]).astype(y.dtype)
@@ -822,6 +838,56 @@ class ReferenceExecutor:
         acc = (comb[bb, :, j].astype(np.float64)[:, None] * streams[bb].astype(np.float64)).sum(axis=0)
         acc = acc + float(post_w[bb, j]) * body_out[bb].astype(np.float64)
         streams_post[bb, j] = acc.astype(streams_post.dtype)
+
+    def _body_gdn_delta(self, fam: TaskFamily, coords, scalars) -> None:
+        """Gated delta rule decode step over one (batch, value head) task.
+
+        fp64 oracle arithmetic mirroring floe ``qwen35_gdn.py`` seq==1:
+        guarded softplus decay, per-key-head L2 q/k (group-expanded),
+        delta-rule outer-product state update, per-head RMSNorm + z-gate.
+        The head's ``[HV, HK]`` fp32 state slice is updated in place (the
+        pool is external persistent storage).
+        """
+        state = self.tensor(fam.inputs[0])  # [B, NV, HV, HK]
+        q = self.tensor(fam.inputs[1])  # [B, NK, HK]
+        k = self.tensor(fam.inputs[2])
+        v = self.tensor(fam.inputs[3])  # [B, NV, HV]
+        z = self.tensor(fam.inputs[4])
+        a = self.tensor(fam.inputs[5])  # [B, NV]
+        b = self.tensor(fam.inputs[6])
+        a_log = self.tensor(fam.inputs[7])  # [NV]
+        dt_bias = self.tensor(fam.inputs[8])  # [NV]
+        norm_w = self.tensor(fam.inputs[9])  # [HV]
+        out = self.tensor(fam.outputs[0])
+        bb, h = coords
+        NV, HV, HK = state.shape[1], state.shape[2], state.shape[3]
+        NK = q.shape[1]
+        kh = h // (NV // NK)
+        scale, eps = fam.params["scale"], fam.params["eps"]
+        s = state[bb, h].astype(np.float64)  # [HV, HK]
+        qf = q[bb, kh].astype(np.float64)
+        kf = k[bb, kh].astype(np.float64)
+        vf = v[bb, h].astype(np.float64)
+        zf = z[bb, h].astype(np.float64)
+        # per-head gating scalars (floe: log(1+exp) with the x>20 guard)
+        x_dt = float(a[bb, h]) + float(dt_bias[h])
+        softplus_x = np.log(1.0 + np.exp(x_dt)) if x_dt <= 20.0 else x_dt
+        decay = float(np.exp(-float(np.exp(a_log[h])) * softplus_x))
+        beta = 1.0 / (1.0 + np.exp(-float(b[bb, h])))
+        # per-key-head normalization (group-expanded)
+        qn = qf / np.sqrt(np.dot(qf, qf) + 1e-6) * scale
+        kn = kf / np.sqrt(np.dot(kf, kf) + 1e-6)
+        # delta-rule state update
+        s = s * decay
+        sk = s @ kn
+        s = s + (beta * (vf - sk))[:, None] * kn[None, :]
+        state[bb, h] = s.astype(state.dtype)
+        # readout + per-head RMSNorm over HV + z gate
+        o = s @ qn
+        var = np.mean(o * o)
+        on = o / np.sqrt(var + eps) * norm_w.astype(np.float64)
+        og = on * (zf / (1.0 + np.exp(-zf)))
+        out[bb, h] = og.astype(out.dtype)
 
     def _body_attention_scores(self, fam: TaskFamily, coords, scalars) -> None:
         q = self.tensor(fam.inputs[0]).astype(np.float64)
@@ -959,4 +1025,11 @@ class ReferenceExecutor:
         vlen = self._valid_len(fam, b, scalars)
         # Masked: V rows beyond pos[b] are never loaded (per-row NaN-tail
         # contract, issue #93).
-        y[b, h, :] = (probs[b, h, :vlen] @ v_cache[b, kvh, :vlen, :]).astype(y.dtype)
+        acc = probs[b, h, :vlen] @ v_cache[b, kvh, :vlen, :]
+        if fam.params.get("gated", False):
+            # Issue #92: per-head sigmoid output gate fused into the values
+            # task — fp64 reference of the device's fp32 epilogue
+            # y = acc * sigmoid(gate[b,h,:]) with no extra barrier.
+            gate = self.tensor(fam.inputs[2]).astype(np.float64)
+            acc = acc * _stable_sigmoid(gate[b, h, :])
+        y[b, h, :] = acc.astype(y.dtype)
