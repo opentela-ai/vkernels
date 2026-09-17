@@ -1148,6 +1148,7 @@ class RecordingBackend:
         which: str = "o",
         convention: str = "interleaved",
         rotary_dim: Optional[int] = None,
+        out: Optional[SymbolicTensor] = None,
     ) -> SymbolicTensor:
         """Conjugate (output-side) rope — issue #95, DeepSeek-V4 attention.
 
@@ -1180,7 +1181,9 @@ class RecordingBackend:
                 f"conjugate_rope tables must be [max_positions, rotary_dim//2] = [.., {rot // 2}]; got shape {cos_table.value.shape}"
             )
         self._require_position(position, "conjugate_rope")
-        out = self.fresh_buffer(f"crope_{which}_l{layer}{self._suffix()}", x.value.shape)
+        out = out or self.fresh_buffer(f"crope_{which}_l{layer}{self._suffix()}", x.value.shape)
+        if out.value.shape != x.value.shape:
+            raise ValueError(f"conjugate_rope out must match x {x.value.shape}; got {out.value.shape}")
         p = self._position_name(position)
         self._record(
             "conjugate_rope",
@@ -1314,6 +1317,7 @@ class RecordingBackend:
         *,
         layer: int,
         window: int,
+        out: Optional[SymbolicTensor] = None,
     ) -> SymbolicTensor:
         """MLA decode context gather (issue #95).
 
@@ -1335,7 +1339,11 @@ class RecordingBackend:
         k = comp_idx.value.shape[1]
         if width != window + k + 1:
             raise ValueError(f"mla_values probs width {width} != window {window} + K {k} + 1 (sink last)")
-        out = self.fresh_buffer(f"mla_ctx_l{layer}{self._suffix()}", (b, h, d))
+        # Epilogue: fp32 accumulation, ONE store — bf16 activations round to
+        # bf16 here (default fp32 for fp32 chains).
+        out = out or self.fresh_buffer(f"mla_ctx_l{layer}{self._suffix()}", (b, h, d))
+        if out.value.shape != (b, h, d):
+            raise ValueError(f"mla_values out must be [B, H, D] = ({b}, {h}, {d}); got {out.value.shape}")
         p = self._position_name(position)
         self._record(
             "mla_values",

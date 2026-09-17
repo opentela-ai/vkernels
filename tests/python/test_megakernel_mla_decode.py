@@ -445,7 +445,11 @@ def test_reference_full_chain_matches_eager_oracle(workers):
 
 def test_reference_window_geometry_row_start():
     """p < W-1: only p+1 window candidates are valid; the masked prefix is
-    exact 0.0 and the softmax renormalizes over the survivors."""
+    exact 0.0 and the softmax renormalizes over the survivors.
+
+    PINNED window bound (issue #95): candidate logical position t is live
+    iff |q - t| < W and t <= q (i.e. t in (p-W, p]) — slot i maps to
+    t = p - W + 1 + i, so the FIRST slots die at row start."""
     rng = np.random.default_rng(5)
     b, h, d, s, m, k, w, rot = 1, 2, 16, 32, 4, 2, 8, 8
     p0 = 2  # valid window: t in {0, 1, 2} -> slots 6, 7; slots 0..5 exact 0
@@ -622,7 +626,10 @@ def test_reference_block_bias_affects_only_compressed_columns():
 
 def test_reference_rope_round_trip_is_identity():
     """rope(...) -> conjugate_rope(...) at the SAME position is the identity
-    (the conjugate rotation is the exact inverse)."""
+    (the conjugate rotation is the exact inverse). The task arithmetic is
+    fp64 — identity to ~1e-12 there — but the workspace/output storages are
+    fp32 (no F64 tensor dtype in the IR), so the OBSERVABLE round-trip bound
+    is two fp32 store roundings, ~1e-6; asserted at 1e-6."""
     rng = np.random.default_rng(13)
     b, h, d, s, rot, p0 = 2, 3, 16, 32, 8, 21
     recorder = RecordingBackend()
@@ -639,7 +646,7 @@ def test_reference_rope_round_trip_is_identity():
             103: rng.standard_normal((b, h, d)).astype(np.float32)}
     executor, *_ = _run(recorder, {"back": back}, data, p0)
     out = np.array(executor.tensor(back.value.name), copy=True)
-    assert np.abs(out - data[103]).max() < 1e-5  # fp32 storage rounding only
+    assert np.abs(out - data[103]).max() < 1e-6  # two fp32 store roundings (fp64 task math)
 
 
 def test_reference_interleaved_convention_pinned():
@@ -785,6 +792,67 @@ def test_reference_bf16_pools_streamed_single_store():
     values_fam = families[kinds.index("mla_values")]
     assert values_fam.task_count == b * h
     assert trace.task_executions >= b * h * 2  # both MLA families at full fanout
+
+
+def test_reference_bf16_single_store_epilogue():
+    """fp32 accumulation, ONE bf16 store: mla_values/conjugate_rope accept
+    an explicit bf16 out; the gathered context round-trips through bf16
+    storage within bf16 rounding of the fp64 oracle, and the downstream
+    conjugate rope consumes the bf16 rows."""
+    rng = np.random.default_rng(19)
+    b, h, d, s, m, k, w, rot = 2, 2, 16, 32, 4, 2, 8, 8
+    p0 = 12
+    recorder = RecordingBackend()
+    p = recorder.define_position(s)
+    cos_t = recorder.external_tensor("cos", (64, rot // 2), F32, storage_id=101)
+    sin_t = recorder.external_tensor("sin", (64, rot // 2), F32, storage_id=102)
+    latent = recorder.external_tensor("latent", (b, s, d), BF16, storage_id=103)
+    wtable = recorder.external_tensor("wtable", (b, s), I32, storage_id=104)
+    comp = recorder.external_tensor("comp", (b, m, d), BF16, storage_id=105)
+    compidx = recorder.external_tensor("compidx", (b, k), I32, storage_id=106)
+    sink = recorder.external_tensor("sink", (h,), F32, storage_id=107)
+    q_in = recorder.external_tensor("q_in", (b, h, d), F32, storage_id=108)
+    q = recorder.rope(q_in, cos_t, sin_t, p, layer=0, which="q", convention="interleaved", rotary_dim=rot)
+    probs = recorder.mla_scores(q, latent, wtable, comp, compidx, sink, p,
+                                scale=d**-0.5, layer=0, window=w)
+    ctx_bf16 = recorder.fresh_buffer("mla_ctx_bf16", (b, h, d), BF16)
+    ctx = recorder.mla_values(probs, latent, wtable, comp, compidx, p, layer=0, window=w, out=ctx_bf16)
+    assert recorder.graph.tensors[ctx.value.name].dtype == BF16
+    o = recorder.conjugate_rope(ctx, cos_t, sin_t, p, layer=0, which="o", convention="interleaved")
+    data = _standard_data(rng, b, h, d, s, m, k, rot)
+    arrays = {101: data["cos"], 102: data["sin"], 103: data["latent"],
+              104: np.tile(np.arange(s, dtype=np.int32), (b, 1)), 105: data["comp"],
+              106: np.tile(np.array([0, 1], dtype=np.int32), (b, 1)), 107: data["sink"],
+              108: data["q_in"]}
+    # manual run: the bf16 buffer's backing storage must be fp16 (the
+    # generic _run fill uses fp32 NaN for every workspace storage)
+    families = lower_graph(recorder.graph)
+    schedule = PhaseSchedule.from_families(families, workers=4)
+    plan, _ = plan_memory(recorder.graph, schedule, families)
+    storage = dict(arrays)
+    ctx_sid = recorder.graph.tensors[ctx.value.name].storage_id
+    for buf in plan.buffers:
+        dt = np.float16 if buf.storage_id == ctx_sid else np.float32
+        storage[buf.storage_id] = np.full(buf.numel, np.nan, dtype=dt)
+    from vkernels.compiler.reference_exec import ReferenceExecutor as _RE
+
+    executor = _RE(schedule, workers=4, storage_arrays=storage, graph=recorder.graph,
+                   workspace_plan=plan, canary=False)
+    executor.run({"p": p0})
+    ctx_out = np.array(executor.tensor(ctx.value.name), copy=True)
+    assert ctx_out.dtype == np.float16
+    q_ref = _rope_il(data["q_in"], data["cos"], data["sin"], p0, rot)
+    probs_ref = _oracle_scores(q_ref, data["latent"], wtable=None, comp=data["comp"], compidx=None,
+                               sink=data["sink"], bias=None, pos=p0, W=w, K=k, scale=d**-0.5) \
+        if False else None
+    # oracle via the standard path (wtable/compidx from the arrays above)
+    wtable_a = arrays[104]
+    compidx_a = arrays[106]
+    probs_ref = _oracle_scores(q_ref, data["latent"], wtable_a, data["comp"], compidx_a,
+                               data["sink"], None, p0, w, k, d**-0.5)
+    ctx_ref = _oracle_values(probs_ref, data["latent"], wtable_a, data["comp"], compidx_a, p0, w, k)
+    bf16_eps = 2**-8  # bf16 relative rounding, values O(1..4)
+    assert np.abs(ctx_out.astype(np.float64) - ctx_ref).max() / max(np.abs(ctx_ref).max(), 1e-30) < 8 * bf16_eps
 
 
 # ===========================================================================
