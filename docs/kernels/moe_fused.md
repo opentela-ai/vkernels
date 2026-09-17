@@ -136,6 +136,62 @@ block = 256 threads = 4 wavefronts
 warp  = tid / 64,  lane = tid % 64
 ```
 
+### Prefill variants (issue #76)
+
+The prefill path is selected by `VK_MOE_PF_VARIANT` (read once into a
+function-local `static`).  **The default is 5.**
+
+| variant | gateup | down | what it is |
+|---|---|---|---|
+| 0 | `gateup_swiglu_kernel_prefill` | `down_combine_kernel_prefill` | baseline: 64×64 tile, A staged in LDS, gate/up share one `sB` |
+| 1 | `_prefill_pipe<64>` | `_prefill_pipe<64>` | register-staged A (never through LDS on the load path) + 2-halfword-padded `sA` rows; one barrier pair per K-block instead of two |
+| 2 | `_prefill_pipe<32>` | `_prefill_pipe<64>` | variant 1 with a 32-wide gateup N tile |
+| 3 | `_prefill_ws<32>` | `_prefill_pipe<64>` | producer/consumer wavefront specialisation: 8 warps, 0-3 MFMA-only, 4-7 stage+dequant only |
+| 4 | `_prefill_pipe<16>` | `_prefill_pipe<64>` | variant 2 with a 16-wide gateup N tile |
+| 5 | `_prefill_pipe<16>` | `_prefill_pipe<32>` | variant 4 plus a 32-wide down N tile |
+
+**Why the N tile, and not the pipeline, is the lever.** At the prefill shape
+(E=8, hidden=4096, ispp=512, M=2048) the baseline launches
+`(EM/64) × (ispp/64) = 64 × 8 = 512` blocks over 304 CUs — only ~1.7
+workgroups per CU of total work, and the 107-VGPR baseline admits just 2
+resident blocks/CU (~2 wavefronts per SIMD), so the kernel is
+**latency-bound, not throughput-bound**. Total dequant and MFMA
+work is *independent of the N tile* (the same fp4 bytes are decoded and the
+same MFMAs issued either way), but the grid size is proportional to
+`ispp / kBN`. The 16-wide gateup tile therefore quadruples the grid
+(512 → 2048 blocks) and cuts the live accumulator footprint from 32 to 4
+VGPRs for free. That is what produces the win; the register-staged pipeline
+(variant 1) is real but secondary, and the narrow tile multiplies it.
+
+The pipeline changes in variants 1-5 are:
+
+- **A is staged from registers.** `prefetch_a_pf` reads the global A tile
+  into VGPRs; `store_a_pf_from_regs` writes LDS only after the loads have
+  landed. The baseline instead issues a global→LDS copy and then waits, so
+  the load latency sits on the critical path of every K-block.
+- **One barrier pair per K-block.** The baseline's `load A → sync →
+  dequant gate → sync → MFMA gate → dequant up → sync → MFMA up` chain is
+  replaced by one stage/prefetch sync and one consume sync. `prefetch_a_pf`
+  / `prefetch_b_pfT<kBN>` / `dequant_b_pf_from_regsT<kBN>` are templated on
+  the N tile so the same movers serve every variant.
+- **`sA` rows padded by 2 halfwords** (`kSA_P_pf = kBK_pf + 2`). The MFMA
+  A-fragment read makes all 16 lanes of a row group touch the same bank when
+  the row stride is a multiple of 32 banks; the padding removes the
+  conflict. (The decode kernels already used `kSA_P`; the prefill kernel had
+  not inherited it.)
+
+**Variant 3 is a measured dead end and is kept only as evidence.** The
+split is the mechanism the issue asks for, and it is correct (the oracle
+passes), but it cannot help here: the dequant ALU demand is ~30× the MFMA
+issue demand (counted off the gfx942 ISA — 511 VALU warp-instructions
+against 16 MFMA per kb loop body in the specialised kernel, 249 against 8
+in the shipped `_prefill_pipe<16>`; ~4 lane-ALU ops per fp4 element).
+Moving the MFMA onto its own wavefronts therefore parks half the resident
+wavefronts while the producer half still issues all the ALU on the same
+four SIMDs, and the result is a slowdown (see the performance doc). It
+would only pay off after the dequant ALU cost is reduced to the point
+where the critical resource moves — e.g. to a hardware fp4→bf16 convert.
+
 ---
 
 ## MFMA fragment layout
@@ -361,6 +417,38 @@ is occupancy-bound (prefill: ~3 blocks/CU at 16 KB LDS + 32 accumulator
 VGPRs; the earlier BN=128 prefill was ~2 blocks/CU at 24 KB LDS + 64
 accumulator VGPRs and ~1.5× slower).
 
+### Prefill variants, issue #76 (MI300A, E=8 hidden=4096 ispp=512 top_k=2)
+
+Same harness as above, `VK_MOE_PF_VARIANT` swept on one build.  Variant 5
+is the shipped default.
+
+| M | v0 baseline µs | v1 pipe µs | v2 pipe/BN32 µs | v3 ws µs | v4 pipe/BN16 µs | v5 (default) µs | v5 vs v0 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128  | 602  | 596  | 362  | 348  | 237  | **227** | **2.66×** |
+| 256  | 614  | 596  | 369  | 356  | 247  | **238** | **2.57×** |
+| 512  | 699  | 638  | 420  | 681  | 391  | **379** | **1.81×** |
+| 1024 | 1148 | 817  | 690  | 1047 | 626  | **622** | **1.83×** |
+| 2048 | 1930 | 1485 | **1140** | 1815 | 1156 | 1159 | **1.70×** |
+
+Prefill effective TFLOP/s at M=2048 rises 13.12 → 22.24.  The decode column
+is bit-for-bit unchanged across variants (`VK_MOE_PF_VARIANT` only selects
+prefill kernels), and the prefill correctness oracle
+(`test_moe_fused_prefill_correct`) PASSes on the default path and on
+baseline.  The 32-wide gateup tile (v2) is ~1.4% faster than the 16-wide one
+at M=2048 and much slower below it; the two are within run-to-run variance
+at the largest M, so 16-wide is the single better default.  See the
+*Prefill variants (issue #76)* section above for why the N tile, not the
+pipeline, is the lever, and why variant 3 is a dead end.
+
+The acceptance run on the frozen final source (MI300A, default path, job
+640199, md5 568210e3) gives **1.67× at M=2048** (1933 → 1158 µs, ≈26.8 →
+44.6 TFLOP/s in the issue's scale) and 2.61× at M=128; the decode oracle, the prefill oracle
+on clean *and* padded routing, and all 11 big-shape cases PASS; and the
+decode kernels show no regression (3169.3 → 3172.3 µs at M=2048).  Raw logs
+and the full acceptance table are in
+[`docs/performance/moe-fused/gfx942.md`](../performance/moe-fused/gfx942.md#issue-76--prefill-variants-mi300a--gfx942)
+and `docs/performance/moe-fused/beverin-issue76-prefill-variants.txt`.
+
 ---
 
 ## Current limitations / future work
@@ -374,12 +462,15 @@ accumulator VGPRs and ~1.5× slower).
   `flat < M*top_k` guard already makes `topk_w[flat]` in bounds), so the
   atomic-add scatter is the only remaining combine cost. Items 3-4 of
   issue #41 are also done (see below); item 5 (wavefront-specialized
-  producer/consumer prefill) remains open.
+  producer/consumer prefill) was picked up by issue #76 and is now
+  answered: implemented as variant 3, measured, and rejected — the win
+  came from the small N tile instead. See *Prefill variants (issue #76)*.
 - **`__launch_bounds__` for decode + prefill (issue #41, item 3 - done)**:
-  Both prefill kernels carry `__launch_bounds__(256, 4)` and both decode
-  kernels carry `__launch_bounds__(64, 10/16)`.  On gfx942 the prefill
-  kernels are **LDS-limited at 4 blocks/CU** (16 KB x 4 = 64 KB, the full
-  CU scratch); `__launch_bounds__` reduced gateup-prefill VGPRs 112->107
+  The two baseline prefill kernels carry `__launch_bounds__(256, 4)` and both
+  decode kernels carry `__launch_bounds__(64, 10/16)`.  On gfx942 the
+  baseline prefill kernels are **LDS-limited at 4 blocks/CU** (16 KB x 4 =
+  64 KB, the full CU scratch); `__launch_bounds__` reduced gateup-prefill
+  VGPRs 112->107
   and down-prefill 81->75 but did not change occupancy because VGPRs were
   never the binding resource.  The decode kernels are **grid-limited**, not
   occupancy-limited: at M=1 the gateup grid is only 192 blocks for 228 CUs
@@ -414,15 +505,43 @@ accumulator VGPRs and ~1.5× slower).
   to 3 blocks/CU and measuring ~1.5× faster — confirming that the lever is
   **more occupancy** (fewer VGPRs / less LDS per block), not deeper
   software pipelining.
-- **No wavefront specialization**: every wavefront both dequantizes and
-  issues MFMA. A producer/consumer split could overlap them without
-  doubling LDS, but costs VGPRs and is only worth it once occupancy is
-  already saturated.
-- **Prefill is now a solid win** (BN=64): from M ≥ 256 on gfx90a (1.13×)
-  and M ≥ 512 on gfx942 (1.50×), rising to 1.77× and 2.51× at M=2048.
-  The 64-row block still wastes compute when routing is sparse
+- **Prefill variants (issue #76 — done, default is variant 5)**: the
+  prefill path now takes `VK_MOE_PF_VARIANT`; the default is 5 (16-wide
+  gateup N tile + 32-wide down N tile + register-staged A + padded `sA`
+  rows), which is 1.67× at M=2048 and 2.61× at M=128 on gfx942 over the
+  v0 baseline, with decode bit-identical and the oracle passing. The
+  mechanism is grid parallelism, not deeper pipelining: see *Prefill
+  variants (issue #76)*.
+
+  The narrow-tile pipeline kernels relax `__launch_bounds__` to
+  `(256, 2)`: the depth-2 register ring costs VGPRs, and at 4 blocks/CU the
+  VGPR budget is 65536/(256x4) = 64, which the 82/88 VGPR pipeline kernels
+  would miss (forcing spills), while LDS would fit.  `(256, 2)` is a floor,
+  not a cap, so the compiler still lands at 3 blocks/CU for the gateup
+  tile (82 VGPR / 12.25 KB LDS at kBN=16) and 4 for the down tile (63 VGPR
+  / 12.25 KB LDS at kBN=32) — against 16.25 KB and 107 VGPR for the
+  64-wide baseline.  The variant-3 ws kernel carries
+  `__launch_bounds__(512)` (8 warps, no min-blocks hint).
+- **Wavefront specialization (issue #76, variant 3 — measured and
+  rejected)**: implemented and correct, but slower than the pipelined
+  variants (1815 µs vs 1140 µs at M=2048 on gfx942). The dequant ALU
+  demand is ~30× the MFMA issue demand (measured: 511 vs 16 VALU/MFMA warp
+  instructions per kb loop body, ~4 lane-ALU ops per fp4 element), so
+  splitting them onto separate
+  wavefronts parks half the resident wavefronts without shortening the
+  critical resource. It stays in the tree as variant 3, selectable for
+  the record, and would only pay off once a hardware fp4→bf16 convert
+  collapses the dequant VALU cost (none is exposed for gfx942 by ROCm
+  6.3/6.4; checked).
+- **Prefill is now a solid win**: from M ≥ 256 on gfx90a (1.13×) and
+  M ≥ 512 on gfx942 (1.50×), rising to 1.77× and 2.51× at M=2048 before
+  issue #76; with the issue #76 variants the gfx942 numbers become
+  2.66× at M=128 and 1.70× at M=2048 against the same baseline. The
+  64-row block still wastes compute when routing is sparse
   (tokens/expert < 64); a smaller prefill tile (e.g. BM=32) or a
-  padding-aware launch heuristic could close the remaining small-M gap.
+  padding-aware launch heuristic could close the remaining small-M gap,
+  and is now the larger of the two remaining levers since the N-tile
+  knob is spent.
 - **Padding overhead in decode**: per-expert block padding (16 rows) makes
   small-M latency scale with the number of routed experts, not the number
   of tokens.

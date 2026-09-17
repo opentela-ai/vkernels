@@ -1,7 +1,13 @@
 // meta/benchmarks/test_moe_fused_prefill_correct.hip
 //
-// Correctness test for the PREFILL tile config (BM=64, BN=64, 256 threads)
-// of the fused MXFP4 MoE HIP kernel, checked against the CPU reference.
+// Correctness test for the PREFILL tile config (BM=64, 256 threads) of the
+// fused MXFP4 MoE HIP kernel, checked against the CPU reference.
+//
+// This runs the *shipped* prefill path, i.e. whichever kernel
+// VK_MOE_PF_VARIANT selects (default 5: 16-wide gateup N tile, 32-wide down N
+// tile — see the prefill-variants section of docs/kernels/moe_fused.md), so it
+// is the regression guard for that default.  Set VK_MOE_PF_VARIANT to a
+// non-default value to exercise a specific variant.
 //
 // The CPU oracle always uses the decode tiling (BLOCK_M=16); the GPU prefill
 // path aligns with block_size=64.  `out [M, hidden]` is block-size
