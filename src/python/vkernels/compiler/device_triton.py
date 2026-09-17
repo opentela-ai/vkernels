@@ -183,6 +183,73 @@ def _t_rms_heads(
 
 
 @triton.jit
+def _t_rms2d_gated(
+    worker: tl.int32,
+    P: tl.int32,
+    x_ptr,
+    gate_ptr,
+    g_ptr,
+    y_ptr,
+    B: tl.constexpr,
+    C: tl.constexpr,
+    BC: tl.constexpr,
+    eps: tl.constexpr,
+):
+    """Sigmoid-gated RMSNorm over one hidden row (issue #100, GLM o_norm):
+    one task per batch row. Strict-fp32 math (floe Glm53RMSNormGated):
+
+        y = x * rsqrt(mean(x^2) + eps) * g * sigmoid(gate)
+
+    Same task decomposition as ``_t_rms2d`` with a second elementwise
+    input stream; the gate multiply folds after the weight multiply so a
+    saturated gate (sigmoid fp32 -> 0) zeroes the row exactly.
+    """
+    task = worker
+    while task < B:
+        offs = tl.arange(0, BC)
+        m = offs < C
+        x = tl.load(x_ptr + task * C + offs, mask=m, other=0.0, cache_modifier=".cg").to(tl.float32)
+        var = tl.sum(x * x, axis=0) / C
+        g = tl.load(g_ptr + offs, mask=m, other=0.0).to(tl.float32)
+        gate = tl.load(gate_ptr + task * C + offs, mask=m, other=0.0, cache_modifier=".cg").to(tl.float32)
+        sig = 1.0 / (1.0 + tl.exp(-gate))
+        tl.store(y_ptr + task * C + offs, x * (1.0 / tl.sqrt(var + eps)) * g * sig, mask=m)
+        task += P
+
+
+@triton.jit
+def _t_rms_heads_gated(
+    worker: tl.int32,
+    P: tl.int32,
+    x_ptr,
+    gate_ptr,
+    g_ptr,
+    y_ptr,
+    B: tl.constexpr,
+    NHEAD: tl.constexpr,
+    D: tl.constexpr,
+    ROWSTRIDE: tl.constexpr,
+    eps: tl.constexpr,
+):
+    """Per-head sigmoid-gated RMSNorm (issue #100): the linear-attention
+    output norm folded before ``o_proj`` — one task per (batch, head), the
+    ``_t_rms_heads`` decomposition with a second per-head gate stream.
+    """
+    task = worker
+    while task < B * NHEAD:
+        b = task // NHEAD
+        h = task % NHEAD
+        offs = tl.arange(0, D)
+        x = tl.load(x_ptr + b * ROWSTRIDE + h * D + offs, cache_modifier=".cg").to(tl.float32)
+        var = tl.sum(x * x, axis=0) / D
+        g = tl.load(g_ptr + offs).to(tl.float32)
+        gate = tl.load(gate_ptr + (b * NHEAD + h) * D + offs, cache_modifier=".cg").to(tl.float32)
+        sig = 1.0 / (1.0 + tl.exp(-gate))
+        tl.store(y_ptr + (b * NHEAD + h) * D + offs, x * (1.0 / tl.sqrt(var + eps)) * g * sig)
+        task += P
+
+
+@triton.jit
 def _t_rope(
     worker: tl.int32,
     P: tl.int32,
@@ -1330,4 +1397,149 @@ def _t_gdn_heads(
         on = o * (1.0 / tl.sqrt(var + eps)) * nw
         og = on * (z * (1.0 / (1.0 + tl.exp(-z))))
         tl.store(out_ptr + h * HV + offs_v, og)
+        task += P
+
+
+@triton.jit
+def _t_gdn_heads_batched(
+    worker: tl.int32,
+    P: tl.int32,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    z_ptr,
+    a_ptr,
+    b_ptr,
+    alog_ptr,
+    dtb_ptr,
+    normw_ptr,
+    state_ptr,
+    out_ptr,
+    B: tl.constexpr,
+    NH: tl.constexpr,
+    NK: tl.constexpr,
+    HV: tl.constexpr,
+    HK: tl.constexpr,
+    eps: tl.constexpr,
+    scale: tl.constexpr,
+):
+    """Batched gdn_delta decode-step task body (issue #90): one task per
+    (batch, value head) over the batched persistent state pool
+    [B, NH, HV, HK] (fp32, read-modify-write). Arithmetic identical to the
+    27B-validated ``_t_gdn_heads`` (which is the B=1, task==head flattening
+    of this template), generalized to per-task (b, head) addressing:
+    A_log/dt_bias/norm_w are per-layer params broadcast over the batch.
+    """
+    GROUP: tl.constexpr = NH // NK
+    offs_v = tl.arange(0, HV)
+    offs_k = tl.arange(0, HK)
+    task = worker
+    while task < B * NH:
+        bb = task // NH
+        h = task % NH
+        kh = h // GROUP
+        q = tl.load(q_ptr + bb.to(tl.int64) * (NK * HK) + kh * HK + offs_k, cache_modifier=".cg").to(tl.float32)
+        k = tl.load(k_ptr + bb.to(tl.int64) * (NK * HK) + kh * HK + offs_k, cache_modifier=".cg").to(tl.float32)
+        v = tl.load(v_ptr + bb.to(tl.int64) * (NH * HV) + h * HV + offs_v, cache_modifier=".cg").to(tl.float32)
+        z = tl.load(z_ptr + bb.to(tl.int64) * (NH * HV) + h * HV + offs_v, cache_modifier=".cg").to(tl.float32)
+        # per-head scalars
+        a_ = tl.load(a_ptr + bb.to(tl.int64) * NH + h).to(tl.float32)
+        b_ = tl.load(b_ptr + bb.to(tl.int64) * NH + h).to(tl.float32)
+        A = tl.exp(tl.load(alog_ptr + h).to(tl.float32))
+        x_dt = a_ + tl.load(dtb_ptr + h).to(tl.float32)
+        sp = tl.where(x_dt <= 20.0, tl.log(1.0 + tl.exp(x_dt)), x_dt)
+        beta = 1.0 / (1.0 + tl.exp(-b_))
+        # per-key-head normalization (computed redundantly per value head)
+        qn = q * (1.0 / tl.sqrt(tl.sum(q * q, axis=0) + 1e-6)) * scale
+        kn = k * (1.0 / tl.sqrt(tl.sum(k * k, axis=0) + 1e-6))
+        # state update over this head's [HV, HK] slice
+        sbase = state_ptr + bb.to(tl.int64) * (NH * HV * HK) + h * HV * HK
+        s = tl.load(sbase + offs_v[:, None] * HK + offs_k[None, :], cache_modifier=".cg")
+        s = s * tl.exp(-A * sp)
+        sk = tl.sum(s * kn[None, :], axis=1)
+        vd = beta * (v - sk)
+        s = s + vd[:, None] * kn[None, :]
+        o = tl.sum(s * qn[None, :], axis=1)
+        tl.store(sbase + offs_v[:, None] * HK + offs_k[None, :], s)
+        # per-head RMSNorm over hv + z gate
+        var = tl.sum(o * o, axis=0) / HV
+        nw = tl.load(normw_ptr + offs_v).to(tl.float32)
+        on = o * (1.0 / tl.sqrt(var + eps)) * nw
+        og = on * (z * (1.0 / (1.0 + tl.exp(-z))))
+        tl.store(out_ptr + bb.to(tl.int64) * (NH * HV) + h * HV + offs_v, og)
+        task += P
+
+
+@triton.jit
+def _t_kda_heads_batched(
+    worker: tl.int32,
+    P: tl.int32,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    f_ptr,
+    b_ptr,
+    dtb_ptr,
+    alog_ptr,
+    state_ptr,
+    out_ptr,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    scale: tl.constexpr,
+    lower_bound: tl.constexpr,  # float; NaN sentinel selects the softplus branch
+):
+    """Batched KDA gated delta-rule decode-step task body (issue #101):
+    one task per (batch, head) over the persistent fp32 state pool
+    [B, H, K, V] (read-modify-write). GLM-5.3 ``Glm53LinearAttention``
+    seq==1 arithmetic, ported from floe's eager ``Glm53ForgetGate`` +
+    ``_kda_recurrent`` (the fused kda_decode Triton path no longer ships in
+    floe — kernels live in vkernels):
+
+        g    = lower_bound * sigmoid(exp(A_log[h]) * (f + dt_bias))  # [K]
+           (lower_bound NaN sentinel -> g = -exp(A_log)*softplus(f + dt_bias))
+        s   *= exp(g)[:, None]                     # element-wise row decay
+        kv   = sum_k s * k_n
+        s   += k_n outer (sigmoid(b) * (v - kv))
+        o    = sum_k s * q_n
+
+    q/k L2-normalized per head (eps 1e-6 inside the sqrt); q carries the
+    1/sqrt(K) scale. Plain readout — the gated norm is the separate
+    rms_norm_gated op. Unlike _t_gdn_heads_batched the decay is
+    element-wise per k-row (broadcast over V), and there is no group
+    expansion (KDA: one q/k/v head each).
+    """
+    offs_k = tl.arange(0, K)
+    offs_v = tl.arange(0, V)
+    task = worker
+    while task < B * H:
+        bb = task // H
+        h = task % H
+        q = tl.load(q_ptr + bb.to(tl.int64) * (H * K) + h * K + offs_k, cache_modifier=".cg").to(tl.float32)
+        k = tl.load(k_ptr + bb.to(tl.int64) * (H * K) + h * K + offs_k, cache_modifier=".cg").to(tl.float32)
+        v = tl.load(v_ptr + bb.to(tl.int64) * (H * V) + h * V + offs_v, cache_modifier=".cg").to(tl.float32)
+        f = tl.load(f_ptr + bb.to(tl.int64) * (H * K) + h * K + offs_k, cache_modifier=".cg").to(tl.float32)
+        # gate conditioning: per-(head, k-dim) log gate, folded in-task
+        A = tl.exp(tl.load(alog_ptr + h).to(tl.float32))
+        x_dt = f + tl.load(dtb_ptr + h * K + offs_k).to(tl.float32)
+        if lower_bound == lower_bound:  # NaN sentinel: finite -> lower_bound branch
+            g = lower_bound * (1.0 / (1.0 + tl.exp(-A * x_dt)))
+        else:
+            sp = tl.where(x_dt <= 20.0, tl.log(1.0 + tl.exp(x_dt)), x_dt)
+            g = -A * sp
+        beta = 1.0 / (1.0 + tl.exp(-tl.load(b_ptr + bb.to(tl.int64) * H + h).to(tl.float32)))
+        # L2 conditioning (floe _l2norm)
+        qn = q * (1.0 / tl.sqrt(tl.sum(q * q, axis=0) + 1e-6)) * scale
+        kn = k * (1.0 / tl.sqrt(tl.sum(k * k, axis=0) + 1e-6))
+        # state update over this head's [K, V] slice — element-wise decay
+        sbase = state_ptr + bb.to(tl.int64) * (H * K * V) + h * K * V
+        s = tl.load(sbase + offs_k[:, None] * V + offs_v[None, :], cache_modifier=".cg")
+        s = s * tl.exp(g)[:, None]
+        kv = tl.sum(s * kn[:, None], axis=0)
+        s = s + kn[:, None] * (beta * (v - kv))[None, :]
+        tl.store(sbase + offs_k[:, None] * V + offs_v[None, :], s)
+        # plain readout (gated norm is the separate rms_norm_gated op)
+        o = tl.sum(s * qn[:, None], axis=0)
+        tl.store(out_ptr + bb.to(tl.int64) * (H * V) + h * V + offs_v, o)
         task += P

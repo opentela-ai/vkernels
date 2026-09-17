@@ -41,6 +41,19 @@ from .task_ir import TaskFamily
 __all__ = ["ExecutionTrace", "PhaseStat", "ReferenceExecutor", "ExecutorError", "decode_e4m3"]
 
 
+def _sigmoid(g):
+    """Overflow-stable elementwise sigmoid in fp64: 1/(1+e^-g) for g>=0,
+    e^g/(1+e^g) otherwise (avoids exp overflow warnings for gate <= -103,
+    where the device fp32 sigmoid saturates to exactly 0)."""
+    g = np.asarray(g, dtype=np.float64)
+    out = np.empty_like(g)
+    pos = g >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-g[pos]))
+    eg = np.exp(g[~pos])
+    out[~pos] = eg / (1.0 + eg)
+    return out
+
+
 class ExecutorError(Exception):
     """The executed schedule violated an obligation (§12)."""
 
@@ -135,12 +148,15 @@ class ReferenceExecutor:
             "gemm": self._body_gemm,
             "layernorm": self._body_layernorm,
             "rms_norm": self._body_rms_norm,
+            "rms_norm_gated": self._body_rms_norm_gated,
             "rope": self._body_rope,
             "elementwise": self._body_elementwise,
             "embedding": self._body_embedding,
             "cache_append": self._body_cache_append,
             "gdn_conv": self._body_gdn_conv,
             "cache_append_paged": self._body_cache_append_paged,
+            "gdn_delta": self._body_gdn_delta,
+            "kda_delta": self._body_kda_delta,
             "attention_scores": self._body_attention_scores,
             "attention_scores_paged": self._body_attention_scores_paged,
             "softmax": self._body_softmax,
@@ -351,6 +367,32 @@ class ReferenceExecutor:
             row = x[r]
             y[r] = (row * np.reciprocal(np.sqrt((row * row).mean() + eps)) * g).astype(y.dtype)
 
+    def _body_rms_norm_gated(self, fam: TaskFamily, coords, scalars) -> None:
+        """Sigmoid-gated RMSNorm (issue #100, GLM o_norm), one task per row
+        or head row. Strict-fp32 semantics in the device contract (floe
+        Glm53RMSNormGated); the reference body runs the same math in fp64
+        for oracle stability:
+
+            o = x * rsqrt(mean(x^2) + eps) * gamma * sigmoid(gate)
+        """
+        x = self.tensor(fam.inputs[0]).astype(np.float64)
+        gate = self.tensor(fam.inputs[1]).astype(np.float64)
+        g = self.tensor(fam.inputs[2])
+        y = self.tensor(fam.outputs[0])
+        eps = fam.params["eps"]
+        if len(x.shape) == 3:
+            b, h = coords
+            row, g_row = x[b, h], gate[b, h]
+            y[b, h] = (
+                row * np.reciprocal(np.sqrt((row * row).mean() + eps)) * g * _sigmoid(g_row)
+            ).astype(y.dtype)
+        else:
+            r = coords[0]
+            row, g_row = x[r], gate[r]
+            y[r] = (
+                row * np.reciprocal(np.sqrt((row * row).mean() + eps)) * g * _sigmoid(g_row)
+            ).astype(y.dtype)
+
     def _body_rope(self, fam: TaskFamily, coords, scalars) -> None:
         x = self.tensor(fam.inputs[0]).astype(np.float64)
         cos_t = self.tensor(fam.inputs[1])
@@ -490,6 +532,106 @@ class ReferenceExecutor:
         # Gathered masked: V rows beyond p are never gathered (NaN slots must not leak).
         slots = table[b, : p + 1].astype(np.int64)
         y[b, h, :] = (probs[b, h, : p + 1] @ v_pool[slots, kvh, :]).astype(y.dtype)
+    def _body_gdn_delta(self, fam: TaskFamily, coords, scalars) -> None:
+        """Gated delta rule decode step over one (batch, value head) task.
+
+        fp64 oracle arithmetic mirroring floe ``qwen35_gdn.py`` seq==1:
+        guarded softplus decay, per-key-head L2 q/k (group-expanded),
+        delta-rule outer-product state update, per-head RMSNorm + z-gate.
+        The head's ``[HV, HK]`` fp32 state slice is updated in place (the
+        pool is external persistent storage).
+        """
+        state = self.tensor(fam.inputs[0])  # [B, NV, HV, HK]
+        q = self.tensor(fam.inputs[1])  # [B, NK, HK]
+        k = self.tensor(fam.inputs[2])
+        v = self.tensor(fam.inputs[3])  # [B, NV, HV]
+        z = self.tensor(fam.inputs[4])
+        a = self.tensor(fam.inputs[5])  # [B, NV]
+        b = self.tensor(fam.inputs[6])
+        a_log = self.tensor(fam.inputs[7])  # [NV]
+        dt_bias = self.tensor(fam.inputs[8])  # [NV]
+        norm_w = self.tensor(fam.inputs[9])  # [HV]
+        out = self.tensor(fam.outputs[0])
+        bb, h = coords
+        NV, HV, HK = state.shape[1], state.shape[2], state.shape[3]
+        NK = q.shape[1]
+        kh = h // (NV // NK)
+        scale, eps = fam.params["scale"], fam.params["eps"]
+        s = state[bb, h].astype(np.float64)  # [HV, HK]
+        qf = q[bb, kh].astype(np.float64)
+        kf = k[bb, kh].astype(np.float64)
+        vf = v[bb, h].astype(np.float64)
+        zf = z[bb, h].astype(np.float64)
+        # per-head gating scalars (floe: log(1+exp) with the x>20 guard)
+        x_dt = float(a[bb, h]) + float(dt_bias[h])
+        softplus_x = np.log(1.0 + np.exp(x_dt)) if x_dt <= 20.0 else x_dt
+        decay = float(np.exp(-float(np.exp(a_log[h])) * softplus_x))
+        beta = 1.0 / (1.0 + np.exp(-float(b[bb, h])))
+        # per-key-head normalization (group-expanded)
+        qn = qf / np.sqrt(np.dot(qf, qf) + 1e-6) * scale
+        kn = kf / np.sqrt(np.dot(kf, kf) + 1e-6)
+        # delta-rule state update
+        s = s * decay
+        sk = s @ kn
+        s = s + (beta * (vf - sk))[:, None] * kn[None, :]
+        state[bb, h] = s.astype(state.dtype)
+        # readout + per-head RMSNorm over HV + z gate
+        o = s @ qn
+        var = np.mean(o * o)
+        on = o / np.sqrt(var + eps) * norm_w.astype(np.float64)
+        og = on * (zf / (1.0 + np.exp(-zf)))
+        out[bb, h] = og.astype(out.dtype)
+
+    def _body_kda_delta(self, fam: TaskFamily, coords, scalars) -> None:
+        """KDA gated delta rule decode step over one (batch, head) task.
+
+        fp64 oracle arithmetic mirroring floe ``Glm53LinearAttention``
+        seq==1: the per-(head, k-dim) forget gate (lower_bound·sigmoid of
+        exp(A_log)·(f + dt_bias); lower_bound None -> guarded softplus),
+        element-wise exp(g) row decay over the [K, V] state, L2 q/k with
+        the 1/sqrt(D) scale on q, delta-rule outer-product update, plain
+        state readout (the gated norm lives in the separate rms_norm_gated
+        op). The head's ``[K, V]`` fp32 state slice is updated in place
+        (the pool is external persistent storage).
+        """
+        state = self.tensor(fam.inputs[0])  # [B, H, K, V]
+        q = self.tensor(fam.inputs[1])  # [B, H, K]
+        k = self.tensor(fam.inputs[2])  # [B, H, K]
+        v = self.tensor(fam.inputs[3])  # [B, H, V]
+        f = self.tensor(fam.inputs[4])  # [B, H, K] f_b projection row
+        b = self.tensor(fam.inputs[5])  # [B, H] beta logits
+        dt_bias = self.tensor(fam.inputs[6])  # [H, K]
+        a_log = self.tensor(fam.inputs[7])  # [H]
+        out = self.tensor(fam.outputs[0])
+        bb, h = coords
+        K, V = state.shape[2], state.shape[3]
+        scale = fam.params["scale"]
+        lower_bound = fam.params.get("lower_bound")
+        s = state[bb, h].astype(np.float64)  # [K, V]
+        qf = q[bb, h].astype(np.float64)
+        kf = k[bb, h].astype(np.float64)
+        vf = v[bb, h].astype(np.float64)
+        ff = f[bb, h].astype(np.float64)
+        dt = dt_bias[h].astype(np.float64)
+        A = float(np.exp(a_log[h]))
+        x_dt = ff + dt
+        if lower_bound is not None:
+            g = lower_bound / (1.0 + np.exp(-A * x_dt))  # log-space [K]
+        else:
+            sp = np.where(x_dt <= 20.0, np.log(1.0 + np.exp(x_dt)), x_dt)
+            g = -A * sp
+        beta = 1.0 / (1.0 + np.exp(-float(b[bb, h])))
+        # L2 conditioning (floe _l2norm, eps 1e-6 inside the sqrt)
+        qn = qf / np.sqrt(np.dot(qf, qf) + 1e-6) * scale
+        kn = kf / np.sqrt(np.dot(kf, kf) + 1e-6)
+        # element-wise decay: exp(g) broadcasts over the value axis
+        s = s * np.exp(g)[:, None]
+        kv_mem = (s * kn[:, None]).sum(axis=0)  # [V] = sum_k s[k,v]*kn[k]
+        s = s + kn[:, None] * ((beta * (vf - kv_mem))[None, :])
+        state[bb, h] = s.astype(state.dtype)
+        # plain readout; gated norm (rms_norm_gated) is a separate op
+        o = (s * qn[:, None]).sum(axis=0)  # [V] = sum_k s[k,v]*qn[k]
+        out[bb, h] = o.astype(out.dtype)
 
     def _body_attention_scores(self, fam: TaskFamily, coords, scalars) -> None:
         q = self.tensor(fam.inputs[0]).astype(np.float64)

@@ -70,6 +70,13 @@ class UnsupportedOperator(CaptureError):
         self.missing_contract = missing_contract
 
 
+# Gated-RMSNorm activations in the supported subset (issue #100). GLM's
+# o_norm uses sigmoid (floe Glm53RMSNormGated); silu is deliberately NOT
+# here — vkernels' kda_layer_norm_gated hardcodes silu and does not cover
+# this variant, which is exactly why the op exists.
+_RMS_GATED_ACTIVATIONS = ("sigmoid",)
+
+
 class SymbolicTensor:
     """Handle passed to model bodies; wraps a :class:`TensorValue`."""
 
@@ -472,6 +479,66 @@ class RecordingBackend:
         )
         return out
 
+    def rms_norm_gated(
+        self,
+        x: SymbolicTensor,
+        gate: SymbolicTensor,
+        gamma: SymbolicTensor,
+        eps: float,
+        *,
+        activation: str = "sigmoid",
+        out: Optional[SymbolicTensor] = None,
+        name: str = "rms_gated",
+    ) -> SymbolicTensor:
+        """Sigmoid-gated RMSNorm over the last dim (GLM ``o_norm``).
+
+        ``o = rmsnorm(x) * gamma * activation(gate)`` with the gate applied
+        per element after the weight multiply. ``activation`` is an IR
+        attribute — only ``"sigmoid"`` is in the supported subset (floe
+        ``Glm53RMSNormGated``); vkernels' ``kda_layer_norm_gated`` hardcodes
+        silu and does *not* cover this op.
+
+        Works on [B, C] hidden states (one task per row) and on [B, H, D]
+        head views (one task per head row — the linear-attention output
+        norm sits per-head before ``o_proj``); ``gate`` must match ``x``
+        shape for elementwise multiplication.
+        """
+        if activation not in _RMS_GATED_ACTIVATIONS:
+            raise UnsupportedOperator(
+                f"rms_norm_gated activation {activation!r} is outside the supported subset {_RMS_GATED_ACTIVATIONS}",
+                node=name,
+                missing_contract="a gated-norm activation the device task implements (sigmoid for GLM o_norm)",
+            )
+        xv, gv = x.value, gate.value
+        if gv.shape != xv.shape:
+            raise CaptureError(
+                f"rms_norm_gated gate shape {gv.shape} must match the normalized tensor {xv.shape} (elementwise gate)"
+            )
+        if len(xv.shape) not in (2, 3):
+            raise CaptureError(
+                f"rms_norm_gated input must be [B, C] or [B, H, D] (row-wise norm); got shape {xv.shape}"
+            )
+        if gv.shape[-1] != gamma.value.shape[-1] or len(gamma.value.shape) != 1:
+            raise CaptureError(
+                f"rms_norm_gated weight must be [width]={xv.shape[-1]}; got shape {gamma.value.shape}"
+            )
+        out = out or self.fresh_buffer(f"{name}{self._suffix()}", xv.shape)
+        self._record(
+            "rms_norm_gated",
+            inputs=(x, gate, gamma),
+            outputs=(out,),
+            attributes={"eps": eps, "activation": activation},
+            reads=(_regional_reads(xv), _regional_reads(gv), _regional_reads(gamma.value)),
+            writes=(_regional_reads(out.value),),
+            source_location=name,
+            numerical_contract={
+                "formula": "x * rsqrt(mean(x^2) + eps) * gamma * activation(gate)",
+                "activation": "sigmoid(g) = 1 / (1 + exp(-g))" if activation == "sigmoid" else activation,
+                "upcast": "strict fp32 statistics and math (floe Glm53RMSNormGated): x/gate upcast before the row reduction, gate sigmoid in fp32, output cast back to the storage dtype",
+            },
+        )
+        return out
+
     def rope(
         self,
         x: SymbolicTensor,
@@ -685,6 +752,226 @@ class RecordingBackend:
         sid = sv.storage_id
         post = self.graph.add_tensor(
             f"conv_state_l{layer}_v{self.graph.storage_versions[sid]}",
+            sv.shape,
+            sv.dtype,
+            storage_id=sid,
+            strides=sv.strides,
+            offset=sv.offset,
+        )
+        return out, SymbolicTensor(post)
+
+    def gdn_delta(
+        self,
+        ssm_state: SymbolicTensor,
+        q: SymbolicTensor,
+        k: SymbolicTensor,
+        v: SymbolicTensor,
+        z: SymbolicTensor,
+        a: SymbolicTensor,
+        b: SymbolicTensor,
+        a_log: SymbolicTensor,
+        dt_bias: SymbolicTensor,
+        norm_w: SymbolicTensor,
+        *,
+        layer: int,
+        scale: float,
+        eps: float,
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """Gated delta rule decode step (Qwen3.5 ``GatedDeltaNet``, seq==1).
+
+        Per value head ``h`` over its ``[HV, HK]`` fp32 SSM state slice,
+        with ``GROUP = NV // NK`` and ``kh = h // GROUP``::
+
+            g      = -exp(A_log[h]) * softplus(a[b,h] + dt_bias[h])
+            beta   = sigmoid(b[b,h])
+            q_n    = q[b,kh] / sqrt(|q[b,kh]|^2 + 1e-6) * scale
+            k_n    = k[b,kh] / sqrt(|k[b,kh]|^2 + 1e-6)
+            s     *= exp(g)                            # per-head scalar decay
+            sk     = s @ k_n                           # state read
+            s     += beta * (v[b,h] - sk) outer k_n     # delta-rule update
+            o      = s @ q_n                           # state readout
+            out    = RMSNorm_HV(o) * norm_w * (z * sigmoid(z))
+
+        ``ssm_state`` is an external caller-owned pool ``[B, NV, HV, HK]``,
+        fp32, read-modify-write per (batch, head) row. ``q``/``k`` are the
+        post-conv rows ``[B, NK, HK]`` (normalized *inside* the op, exactly
+        as floe ``qwen35_gdn.GatedDeltaNet.forward`` conditions them);
+        ``v``/``z`` are ``[B, NV, HV]``; ``a``/``b`` are ``[B, NV]``;
+        ``A_log``/``dt_bias`` are ``[NV]`` and ``norm_w`` ``[HV]`` per-layer
+        parameters broadcast over the batch. All fp32 arithmetic between
+        the gates and the state (floe keeps the recurrence fp32; inputs may
+        arrive bf16 from the projections).
+
+        The op is position-independent: its ordering obligation is the
+        read-modify-write on the state pool (RAW/WAR/WAW hazards vs any
+        other op touching that storage). Records write effects on the pool
+        and returns ``(out, ssm_state_post)`` -- the post-step state view
+        (same storage, bumped version) that later layers must read.
+        """
+        sv, qv, kv, vv, zv, av, bv = (
+            ssm_state.value, q.value, k.value, v.value, z.value, a.value, b.value,
+        )
+        if len(sv.shape) != 4:
+            raise CaptureError(f"gdn_delta state pool must be [B, NV, HV, HK]; got shape {sv.shape}")
+        B, NV, HV, HK = sv.shape
+        if len(qv.shape) != 3 or qv.shape[0] != B or qv.shape[2] != HK:
+            raise CaptureError(f"gdn_delta q rows must be [B, NK, {HK}]; got shape {qv.shape}")
+        NK = qv.shape[1]
+        if NK < 1 or NV % NK:
+            raise CaptureError(f"gdn_delta head group must divide: NV={NV} not divisible by NK={NK}")
+        if kv.shape != (B, NK, HK):
+            raise CaptureError(f"gdn_delta k rows must be [B, {NK}, {HK}]; got shape {kv.shape}")
+        if vv.shape != (B, NV, HV):
+            raise CaptureError(f"gdn_delta v rows must be [B, {NV}, {HV}]; got shape {vv.shape}")
+        if zv.shape != (B, NV, HV):
+            raise CaptureError(f"gdn_delta z gate rows must be [B, {NV}, {HV}]; got shape {zv.shape}")
+        if av.shape != (B, NV) or bv.shape != (B, NV):
+            raise CaptureError(f"gdn_delta a/b rows must be [B, {NV}]; got {av.shape} / {bv.shape}")
+        if a_log.value.shape != (NV,) or dt_bias.value.shape != (NV,):
+            raise CaptureError(f"gdn_delta A_log/dt_bias must be [{NV}]; got {a_log.value.shape} / {dt_bias.value.shape}")
+        if norm_w.value.shape != (HV,):
+            raise CaptureError(f"gdn_delta norm_w must be [{HV}]; got shape {norm_w.value.shape}")
+        out = self.fresh_buffer(f"gdn_delta_l{layer}{self._suffix()}", (B, NV, HV), dtype=vv.dtype)
+        self._record(
+            "gdn_delta",
+            inputs=(ssm_state, q, k, v, z, a, b, a_log, dt_bias, norm_w),
+            outputs=(out,),
+            attributes={"layer": layer, "scale": scale, "eps": eps},
+            reads=(
+                _regional_reads(sv), _regional_reads(qv), _regional_reads(kv),
+                _regional_reads(vv), _regional_reads(zv), _regional_reads(av),
+                _regional_reads(bv), _regional_reads(a_log.value),
+                _regional_reads(dt_bias.value), _regional_reads(norm_w.value),
+            ),
+            writes=(_regional_reads(sv), _regional_reads(out.value)),
+            source_location=f"layer {layer} gdn delta rule",
+            numerical_contract={
+                "decay": "g = -exp(A_log) * softplus(a + dt_bias); s *= exp(g) (softplus guarded: x>20 -> x)",
+                "qk_norm": "q_n = L2(q)*scale, k_n = L2(k) per key head (group-expanded), eps 1e-6 inside the sqrt",
+                "delta_rule": "sk = s @ k_n; s += beta*(v - sk) outer k_n with beta = sigmoid(b)",
+                "readout": "o = s @ q_n",
+                "out_gate": "out = RMSNorm_HV(o) * norm_w * (z * sigmoid(z)), eps inside the rsqrt",
+                "accumulate": "fp32 arithmetic between gates and state",
+                "dtypes": "q/k/v/z/a/b workspace loads (.cg), A_log/dt_bias/norm_w params, SSM state pool fp32 [B, NV, HV, HK] read-modify-write, out follows v's dtype",
+                "pool": "external caller-owned state pool; read-modify-write per decode step",
+            },
+        )
+        # Post-step state view: same pool, bumped version (cache_append's
+        # §4.3 pattern). Later layers must consume this view.
+        sid = sv.storage_id
+        post = self.graph.add_tensor(
+            f"ssm_state_l{layer}_v{self.graph.storage_versions[sid]}",
+            sv.shape,
+            sv.dtype,
+            storage_id=sid,
+            strides=sv.strides,
+            offset=sv.offset,
+        )
+        return out, SymbolicTensor(post)
+
+    def kda_delta(
+        self,
+        ssm_state: SymbolicTensor,
+        q: SymbolicTensor,
+        k: SymbolicTensor,
+        v: SymbolicTensor,
+        f: SymbolicTensor,
+        b: SymbolicTensor,
+        dt_bias: SymbolicTensor,
+        A_log: SymbolicTensor,
+        *,
+        layer: int,
+        scale: float,
+        lower_bound: Optional[float],
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """KDA gated delta rule decode step with element-wise decay
+        (GLM-5.3 ``Glm53LinearAttention``, seq==1 — Kimi delta attention).
+
+        Per head ``h`` over its ``[K, V]`` fp32 state slice (KDA heads are
+        square: K = V = head_dim; one q/k/v head each, no group expansion)::
+
+            g      = lower_bound * sigmoid(exp(A_log[h]) * (f[b,h] + dt_bias[h]))
+                     # log-space [K]; lower_bound None -> -exp(A_log)*softplus
+            beta   = sigmoid(b[b,h])
+            q_n    = q[b,h] / sqrt(|q|^2 + 1e-6) * scale
+            k_n    = k[b,h] / sqrt(|k|^2 + 1e-6)
+            s     *= exp(g)[None over V per k-row]      # element-wise decay
+            kv     = sum_k s * k_n                      # [V]
+            s     += k_n outer (beta * (v - kv))
+            o      = sum_k s * q_n                      # [V]
+
+        ``ssm_state`` is an external caller-owned pool ``[B, H, K, V]`` fp32,
+        read-modify-write per (batch, head) row — same §4.3 pattern as
+        gdn_conv/gdn_delta. ``q``/``k`` are the post-conv rows ``[B, H, K]``
+        (normalized *inside* the op, exactly as floe ``_l2norm`` conditions
+        them before ``_kda_recurrent``); ``v`` is ``[B, H, V]``; ``f`` is
+        the ``f_b(f_a(x))`` projection row ``[B, H, K]`` with ``dt_bias``
+        ``[H, K]`` and ``A_log`` ``[H]`` folded inside (the gate arithmetic
+        is per-(head, k-dim), so it rides with the task — unlike gdn_delta's
+        per-head scalars it cannot stay outside without a materialized
+        ``[B, H, K]`` intermediate). ``lower_bound`` is the config scalar
+        (``Glm53Config.linear_lower_bound``; ``None`` selects the guarded
+        softplus branch). All gate/state arithmetic fp32; output follows
+        ``v``'s dtype.
+
+        The op is position-independent: its ordering obligation is the
+        read-modify-write on the state pool (RAW/WAR/WAW hazards vs any
+        other op touching that storage). Records write effects on the pool
+        and returns ``(out, ssm_state_post)`` — the post-step state view
+        (same storage, bumped version) that later layers must read.
+        """
+        sv, qv, kv, vv, fv, bv = (
+            ssm_state.value, q.value, k.value, v.value, f.value, b.value,
+        )
+        if len(sv.shape) != 4:
+            raise CaptureError(f"kda_delta state pool must be [B, H, K, V]; got shape {sv.shape}")
+        B, H, K, V = sv.shape
+        if K != V:
+            raise CaptureError(f"kda_delta heads must be square (K = V = head_dim); got K={K}, V={V}")
+        if qv.shape != (B, H, K):
+            raise CaptureError(f"kda_delta q rows must be [B, {H}, {K}]; got shape {qv.shape}")
+        if kv.shape != (B, H, K):
+            raise CaptureError(f"kda_delta k rows must be [B, {H}, {K}]; got shape {kv.shape}")
+        if vv.shape != (B, H, V):
+            raise CaptureError(f"kda_delta v rows must be [B, {H}, {V}]; got shape {vv.shape}")
+        if fv.shape != (B, H, K):
+            raise CaptureError(f"kda_delta f rows (f_b projection) must be [B, {H}, {K}]; got shape {fv.shape}")
+        if bv.shape != (B, H):
+            raise CaptureError(f"kda_delta b logits must be [B, {H}]; got shape {bv.shape}")
+        if dt_bias.value.shape != (H, K):
+            raise CaptureError(f"kda_delta dt_bias must be [{H}, {K}]; got {dt_bias.value.shape}")
+        if A_log.value.shape != (H,):
+            raise CaptureError(f"kda_delta A_log must be [{H}]; got {A_log.value.shape}")
+        out = self.fresh_buffer(f"kda_delta_l{layer}{self._suffix()}", (B, H, V), dtype=vv.dtype)
+        self._record(
+            "kda_delta",
+            inputs=(ssm_state, q, k, v, f, b, dt_bias, A_log),
+            outputs=(out,),
+            attributes={"layer": layer, "scale": scale, "lower_bound": lower_bound},
+            reads=(
+                _regional_reads(sv), _regional_reads(qv), _regional_reads(kv),
+                _regional_reads(vv), _regional_reads(fv), _regional_reads(bv),
+                _regional_reads(dt_bias.value), _regional_reads(A_log.value),
+            ),
+            writes=(_regional_reads(sv), _regional_reads(out.value)),
+            source_location=f"layer {layer} kda delta rule",
+            numerical_contract={
+                "gate": "g = lower_bound * sigmoid(exp(A_log[h]) * (f[b,h] + dt_bias[h])) per (head, k-dim); lower_bound None -> g = -exp(A_log[h]) * softplus(f + dt_bias) with the x>20 guard",
+                "decay": "s *= exp(g) broadcast over the value axis (element-wise per k-row; richer than gdn_delta's scalar-per-head decay)",
+                "qk_norm": "q_n = L2(q)*scale, k_n = L2(k) per head, eps 1e-6 inside the sqrt (floe _l2norm)",
+                "beta": "beta = sigmoid(b[b,h])",
+                "delta_rule": "kv = sum_k s * k_n; s += k_n outer (beta * (v - kv))",
+                "readout": "o = sum_k s * q_n",
+                "accumulate": "fp32 arithmetic between gates and state (floe keeps the KDA recurrence fp32 unconditionally)",
+                "dtypes": "q/k/v/f/b workspace loads (.cg), dt_bias/A_log params, state pool fp32 [B, H, K, V] read-modify-write, out follows v's dtype",
+                "pool": "external caller-owned state pool; read-modify-write per decode step",
+            },
+        )
+        # Post-step state view: same pool, bumped version (cache_append's
+        # §4.3 pattern). Later layers must consume this view.
+        sid = sv.storage_id
+        post = self.graph.add_tensor(
+            f"kda_state_l{layer}_v{self.graph.storage_versions[sid]}",
             sv.shape,
             sv.dtype,
             storage_id=sid,

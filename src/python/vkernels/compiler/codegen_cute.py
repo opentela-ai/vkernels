@@ -49,6 +49,7 @@ TEMPLATE_NAMES = {
     "gemv_fp8": "linear_fp8_task",  # fp8-blockwise GEMV (issue #91)
     "layernorm": "layernorm_task",
     "rms_norm": "rms_norm_task",
+    "rms_norm_gated": "rms_norm_gated_task",  # sigmoid-gated RMSNorm (issue #100)
     "rope": "rope_task",
     "elementwise": "elementwise_task",
     "embedding": "embedding_task",
