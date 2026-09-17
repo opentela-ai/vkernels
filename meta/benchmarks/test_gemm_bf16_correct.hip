@@ -11,6 +11,10 @@
 //      64x128) -- exercised only through the explicit-tile
 //      hip::gemm_bf16_with_config dispatcher -- also matches the oracle on
 //      a small, awkward (M=16, N=100, K=128) shape.
+//   3. (issue #77) The cross-tile B-reuse + LDS double-buffer warmup kernel
+//      gemm_bf16_reuse<BM,BN,RM> (every compiled (BM,BN,RM) config, plus an
+//      unaligned-N shape and a multi-K-tile/beta!=0 case), and the public
+//      hip::gemm_bf16 warmup path that routes to it.
 //
 // Tolerance: A and C are bf16, B is bf16, accumulation is fp32. The device
 // MFMA sums K in 16-element hardware blocks while the CPU oracle sums K
@@ -25,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #include "vkernels/kernels/gemm_bf16.hpp"
@@ -36,6 +41,12 @@ void gemm_bf16_with_config(std::size_t M, std::size_t N, std::size_t K,
                            float alpha, const uint16_t* A,
                            const uint16_t* B, float beta, uint16_t* C,
                            int bm, int bn, int bk, int threads);
+// Cross-tile B-reuse dispatcher (issue #77; not in the public header,
+// forward-declared here the same way).
+void gemm_bf16_reuse_with_config(std::size_t M, std::size_t N, std::size_t K,
+                                 float alpha, const uint16_t* A,
+                                 const uint16_t* B, float beta, uint16_t* C,
+                                 int bm, int bn, int rm);
 }  // namespace vkernels::kernels::hip
 
 #define CK(e, m)                                                       \
@@ -66,11 +77,15 @@ uint16_t f2bf(float v) {
 // One shape: CPU oracle vs HIP, alpha/beta configurable.
 struct Stats { double max_abs, max_rel; };
 
-Stats run_case(int M, int N, int K, float alpha, float beta,
-               const std::vector<uint16_t>& A,
-               const std::vector<uint16_t>& B,
-               const std::vector<uint16_t>& Cinit,
-               uint16_t* dA, uint16_t* dB, uint16_t* dC) {
+// Generic runner: `launch` performs the device GEMM on dA/dB -> dC.
+Stats run_case_impl(int M, int N, int K, float alpha, float beta,
+                    const std::vector<uint16_t>& A,
+                    const std::vector<uint16_t>& B,
+                    const std::vector<uint16_t>& Cinit,
+                    uint16_t* dA, uint16_t* dB, uint16_t* dC,
+                    const std::function<void(int, int, int, float,
+                                             const uint16_t*, const uint16_t*,
+                                             float, uint16_t*)>& launch) {
   std::vector<uint16_t> hC(Cinit), rC(Cinit);
   // CPU reference.
   vkernels::kernels::gemm_bf16_cpu(
@@ -83,8 +98,7 @@ Stats run_case(int M, int N, int K, float alpha, float beta,
      "cpyB");
   CK(hipMemcpy(dC, Cinit.data(), (size_t)M * N * 2, hipMemcpyHostToDevice),
      "cpyC");
-  vkernels::kernels::hip::gemm_bf16(
-      (size_t)M, (size_t)N, (size_t)K, alpha, dA, dB, beta, dC);
+  launch(M, N, K, alpha, dA, dB, beta, dC);
   CK(hipDeviceSynchronize(), "sync");
   CK(hipMemcpy(hC.data(), dC, (size_t)M * N * 2, hipMemcpyDeviceToHost),
      "rdC");
@@ -100,6 +114,21 @@ Stats run_case(int M, int N, int K, float alpha, float beta,
     if (e / d > s.max_rel) s.max_rel = e / d;
   }
   return s;
+}
+
+// Public-entry runner (config-selected tile / reuse dispatch).
+Stats run_case(int M, int N, int K, float alpha, float beta,
+               const std::vector<uint16_t>& A,
+               const std::vector<uint16_t>& B,
+               const std::vector<uint16_t>& Cinit,
+               uint16_t* dA, uint16_t* dB, uint16_t* dC) {
+  return run_case_impl(
+      M, N, K, alpha, beta, A, B, Cinit, dA, dB, dC,
+      [](int m, int n, int k, float a, const uint16_t* pA,
+         const uint16_t* pB, float b, uint16_t* pC) {
+        vkernels::kernels::hip::gemm_bf16((size_t)m, (size_t)n, (size_t)k, a,
+                                          pA, pB, b, pC);
+      });
 }
 
 void fill_AB(std::vector<uint16_t>& A, std::vector<uint16_t>& B,
@@ -157,7 +186,11 @@ int main() {
   {
     const int M = 8192;
     std::printf("\n--- warmup M=%d (public hip::gemm_bf16) ---\n", M);
-    const NK warm[] = {{1536, 128}, {3072, 512}};
+    // {64,7168} is the small-N / large-K warmup corner. On gfx942 all three
+    // stay on the flat (64,64) tile (the issue #77 reuse sweep measured the
+    // reuse schedule ~2x slower here -- see gfx942.md); the reuse kernel is
+    // exercised directly in section (3) below.
+    const NK warm[] = {{1536, 128}, {3072, 512}, {64, 7168}};
     for (const auto& s : warm) {
       std::vector<uint16_t> A((size_t)M * s.K), B((size_t)s.K * s.N),
           C((size_t)M * s.N, 0);
@@ -215,6 +248,57 @@ int main() {
                   c.bn, ma, mr, ok ? "PASS" : "FAIL");
       if (!ok) ++fails;
     }
+  }
+
+  // --- (3) cross-tile B-reuse + LDS double-buffer kernel (issue #77) -----
+  // Every compiled (BM, BN, RM) config on a multi-M-tile, multi-K-tile shape
+  // with beta != 0, plus an unaligned-N shape (bounds-check paths) through
+  // the explicit reuse dispatcher.
+  {
+    struct Cfg { int bm, bn, rm; };
+    const Cfg cfgs[] = {{16, 64, 4}, {32, 64, 2}, {32, 64, 4}};
+    // M=128 spans more than one block footprint (BM*RM) for every config;
+    // K=256 is four K-tiles, so the double-buffer ring actually wraps.
+    const int M = 128, N = 128, K = 256;
+    std::printf("\n--- cross-tile B-reuse sweep (M=%d N=%d K=%d, beta=0.5)"
+                " ---\n", M, N, K);
+    std::vector<uint16_t> A((size_t)M * K), B((size_t)K * N), C((size_t)M * N);
+    fill_AB(A, B, M, N, K, 11);
+    for (size_t i = 0; i < C.size(); ++i) C[i] = f2bf(rnd(4, (int)i) * 0.3f);
+    for (const auto& c : cfgs) {
+      auto st = run_case_impl(
+          M, N, K, 1.0f, 0.5f, A, B, C, dA, dB, dC,
+          [&](int m, int n, int k, float a, const uint16_t* pA,
+              const uint16_t* pB, float b, uint16_t* pC) {
+            vkernels::kernels::hip::gemm_bf16_reuse_with_config(
+                (size_t)m, (size_t)n, (size_t)k, a, pA, pB, b, pC, c.bm,
+                c.bn, c.rm);
+          });
+      bool ok = st.max_rel < THRESH;
+      std::printf("  BM=%-2d BN=%-3d RM=%d  max_abs=%.4f max_rel=%.6f  %s\n",
+                  c.bm, c.bn, c.rm, st.max_abs, st.max_rel,
+                  ok ? "PASS" : "FAIL");
+      if (!ok) ++fails;
+    }
+    // Unaligned N (100, not a multiple of 16/64): exercises the bounds-
+    // checked loads / epilogue of the reuse kernel.
+    const int Mu = 128, Nu = 100, Ku = 128;
+    std::printf("\n--- cross-tile B-reuse, unaligned N (M=%d N=%d K=%d) ---\n",
+                Mu, Nu, Ku);
+    std::vector<uint16_t> Au((size_t)Mu * Ku), Bu((size_t)Ku * Nu),
+        Cu((size_t)Mu * Nu, 0);
+    fill_AB(Au, Bu, Mu, Nu, Ku, 12);
+    auto st = run_case_impl(
+        Mu, Nu, Ku, 1.0f, 0.0f, Au, Bu, Cu, dA, dB, dC,
+        [](int m, int n, int k, float a, const uint16_t* pA,
+           const uint16_t* pB, float b, uint16_t* pC) {
+          vkernels::kernels::hip::gemm_bf16_reuse_with_config(
+              (size_t)m, (size_t)n, (size_t)k, a, pA, pB, b, pC, 32, 64, 4);
+        });
+    bool ok = st.max_rel < THRESH;
+    std::printf("  BM=32 BN=64 RM=4  max_abs=%.4f max_rel=%.6f  %s\n",
+                st.max_abs, st.max_rel, ok ? "PASS" : "FAIL");
+    if (!ok) ++fails;
   }
 
   hipFree(dA); hipFree(dB); hipFree(dC);

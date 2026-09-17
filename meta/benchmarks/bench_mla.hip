@@ -164,6 +164,9 @@ static void bench_shapes(const GpuInfo& info, hipEvent_t start,
     // Tile the kernel will use (for the actual-HBM-traffic model).
     int bq = 0, bn = 0, th = 0;
     vkernels::kernels::mla_config_for(S_q, kv, pe, &bq, &bn, &th);
+    // Split-K decode decision (issue #82): >1 means mla_fwd routes through
+    // the split path, so the KV latent is read ONCE across the splits.
+    const int split = vkernels::kernels::mla_fwd_split_for(B, H, S_q, S_kv);
 
     auto L = [&] {
       vkernels::kernels::hip::mla_fwd(
@@ -175,20 +178,43 @@ static void bench_shapes(const GpuInfo& info, hipEvent_t start,
     double flops = 2.0 * S_q * S_kv * (Dq + kv) * H * B;
     double tflops = flops / (r.median_us / 1e6) / 1e12;
 
-    // Actual HBM traffic (streaming baseline): q read once, out written once,
-    // and k_c/k_pe/v_c re-read once per query tile (no cross-tile reuse).
+    // Actual HBM traffic: q read once, out written once, and k_c/k_pe/v_c
+    // re-read once per query tile in the plain baseline — OR read ONCE when
+    // the split path partitions S_kv across the CUs (no re-read).
     const int n_tiles = (S_q + bq - 1) / bq;
+    const int kv_reads = (split > 1) ? 1 : n_tiles;
     double bytes = 4.0 * ((double)B * H * S_q * Dq            // q read once
                         + (double)B * H * S_q * kv            // out written once
-                        + n_tiles * (double)B * H * S_kv * (kv + pe)   // k_c+k_pe re-read
-                        + n_tiles * (double)B * H * S_kv * kv);        // v_c re-read
+                        + kv_reads * (double)B * H * S_kv * (kv + pe)   // k_c+k_pe re-read
+                        + kv_reads * (double)B * H * S_kv * kv);        // v_c re-read
     double gbs = bytes / (r.median_us / 1e6) / 1e9;
     double ai = flops / bytes;
     const char* bound = ai < (info.tflops * 1e3 / info.bw) ? "mem" : "comp";
     std::printf("  %4d %6d %6d %9.1f %9.1f %9.3f %9.1f %5.1f  %s"
-                "  [BQ=%d BN=%d th=%d]\n",
+                "  [BQ=%d BN=%d th=%d split=%d]\n",
                 H, S_q, S_kv, r.min_us, r.median_us, tflops, gbs, ai, bound,
-                bq, bn, th);
+                bq, bn, th, split);
+
+    // Plain single-baseline row for split shapes (issue #82): the pre-split
+    // decode latency, measured through the unchanged explicit-tile path.
+    if (split > 1) {
+      auto Lp = [&] {
+        vkernels::kernels::hip::mla_fwd_with_tile(
+            B, H, S_q, S_kv, 0, 0, kv, pe, scale, dq, dkc, dkpe, dv, dout,
+            bq, bn);
+      };
+      auto rp = bench_us(Lp, start, stop, 3, 60);
+      const double bytes_p = 4.0 *
+          ((double)B * H * S_q * Dq + (double)B * H * S_q * kv +
+           n_tiles * (double)B * H * S_kv * (kv + pe) +
+           n_tiles * (double)B * H * S_kv * kv);
+      const double tflops_p = flops / (rp.median_us / 1e6) / 1e12;
+      const double gbs_p = bytes_p / (rp.median_us / 1e6) / 1e9;
+      std::printf("  %4d %6d %6d %9.1f %9.1f %9.3f %9.1f %5.1f  %s"
+                  "  [plain baseline, no split]\n",
+                  H, S_q, S_kv, rp.min_us, rp.median_us, tflops_p, gbs_p,
+                  flops / bytes_p, "mem");
+    }
 
     check_hip(hipFree(dq),   "fq");
     check_hip(hipFree(dkc),  "fkc");
