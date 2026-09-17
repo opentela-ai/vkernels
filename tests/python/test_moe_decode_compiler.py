@@ -396,11 +396,14 @@ def test_k_equals_E_bit_parity_vs_dense_every_expert():
                                score_fn="sqrtsoftplus", top_k=E)
         # k=E: the route must select every expert exactly once
         np.testing.assert_array_equal(np.sort(sel), np.arange(E))
-        # slot-ordered accumulation, cast to the executor's f32 output grid
+        # slot-ordered accumulation over the executor's grids: the routing
+        # table is f32 by contract (weights round to f32), partials and the
+        # combine accumulator stay f64 (fresh workspace buffers)
+        w32 = w.astype(np.float32)
         ordered = np.zeros(H, dtype=np.float64)
         for s in range(E):
-            ordered += w[s] * _expert_mirror(data["x"][b], int(sel[s]), data["gate_up"], data["down"])
-        np.testing.assert_array_equal(y[b], ordered.astype(np.float32))
+            ordered += float(w32[s]) * _expert_mirror(data["x"][b], int(sel[s]), data["gate_up"], data["down"])
+        np.testing.assert_array_equal(y[b], ordered)
 
 
 # ---------------------------------------------------------------------------
@@ -412,20 +415,21 @@ def test_swiglu_limit_clamp_boundaries():
     """g = L passes through unchanged; g > L clamps to L; u clamps at ±L; a
     negative gate is unclamped (only the ≤ L side clamps). H=I=1 with exactly
     representable weights makes the boundaries exact."""
-    B, H, E, K, I = 3, 1, 3, 1, 1
+    B, H, E, K, I = 3, 2, 3, 1, 1
     L = 2.0
     rec, h = _capture_block(B=B, H=H, E=E, K=K, I=I, limit=L, V=8)
     gate_up = np.zeros((E, 2 * I, H), dtype=np.float32)
     down = np.ones((E, H, I), dtype=np.float32)
-    gate_up[0, 0, 0] = L      # g == L exactly (boundary, no clamp)
-    gate_up[0, 1, 0] = L      # u == L exactly
-    gate_up[1, 0, 0] = 3 * L  # g > L -> clamps to L
-    gate_up[1, 1, 0] = -3 * L  # u < -L -> clamps to -L
-    gate_up[2, 0, 0] = -L     # negative gate: unclamped
-    gate_up[2, 1, 0] = 0.5 * L
-    router_w = np.zeros((E, H), dtype=np.float32)  # scores all equal
+    gate_up[0, 0, 0] = 0.5 * L    # row0 (x=[2,0]): g = u = L exactly (boundary)
+    gate_up[0, 1, 0] = 0.5 * L
+    gate_up[1, 0, 1] = 1.5 * L    # row1 (x=[0,2]): g = 3L -> clamps to L
+    gate_up[1, 1, 1] = -1.5 * L   # u = -3L -> clamps to -L
+    gate_up[2, 0, 0] = 2 * L      # row2 (x=[-.5,-.5]): g = -L (negative, unclamped)
+    gate_up[2, 1, 0] = -L         # u = +0.5 * L
+    # per-row argmax over sqrt(softplus(w·x)): row0 -> e0, row1 -> e1, row2 -> e2
+    router_w = np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]], dtype=np.float32)
     data = {
-        "x": np.ones((B, H), dtype=np.float32),
+        "x": np.array([[2.0, 0.0], [0.0, 2.0], [-0.5, -0.5]], dtype=np.float32),
         "router_w": router_w,
         "gate_up": gate_up,
         "down": down,
@@ -437,20 +441,22 @@ def test_swiglu_limit_clamp_boundaries():
     ex, _ = _run_schedule(rec.graph, _externals(rec, data))
     partials = np.array(ex.tensor(h["partials"].value.name))
     silu = lambda v: v / (1.0 + np.exp(-v))
-    np.testing.assert_allclose(partials[0, 0, 0], silu(L) * L, rtol=1e-6, atol=1e-7)
-    np.testing.assert_allclose(partials[1, 0, 0], silu(L) * (-L), rtol=1e-6, atol=1e-7)
-    np.testing.assert_allclose(partials[2, 0, 0], silu(-L) * (0.5 * L), rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(partials[0, 0, 0], silu(L) * L, rtol=1e-6, atol=1e-7)  # row0 -> e0
+    np.testing.assert_allclose(partials[1, 0, 0], silu(L) * (-L), rtol=1e-6, atol=1e-7)  # row1 -> e1
+    np.testing.assert_allclose(partials[2, 0, 0], silu(-L) * (0.5 * L), rtol=1e-6, atol=1e-7)  # row2 -> e2
 
 
 def test_expert_weight_base_follows_the_routing_table():
-    """Runtime indirection: rewriting the ids external changes which expert
-    rows are read — the #94 pattern applied to a weight pool."""
+    """Runtime indirection: changing the routing table's input changes which
+    expert weight rows are read — the #94 pattern applied to a weight pool.
+    (Hash routing recomputes route_ids from tid2eid/token_ids, so the rewrite
+    goes through the router input, not the table itself.)"""
     rng = np.random.default_rng(985)
     B, H, E, K, I = 1, 8, 4, 1, 6
-    rec, h = _capture_block(B=B, H=H, E=E, K=K, I=I, V=8)
+    rec, h = _capture_block(B=B, H=H, E=E, K=K, I=I, mode="hash", V=8)
     data = _rand_block(rng, B=B, H=H, E=E, K=K, I=I, mode="hash", V=8)
     data["router_w"] = np.zeros((E, H), dtype=np.float32)
-    data["tid2eid"] = np.array([[0], [1], [2], [3], [0], [1], [2], [3]], dtype=np.int32)[:V]
+    data["tid2eid"] = np.array([[0], [1], [2], [3], [0], [1], [2], [3]], dtype=np.int32)
     data["token_ids"] = np.zeros(B, dtype=np.int32)
     ext = _externals(rec, data)
     ex, _ = _run_schedule(rec.graph, ext)
@@ -461,7 +467,7 @@ def test_expert_weight_base_follows_the_routing_table():
         rtol=1e-6, atol=1e-7,
     )
     ext2 = dict(ext)
-    ext2["route_ids"] = np.array([[3]], dtype=np.int32)
+    ext2["token_ids"] = np.array([3], dtype=np.int32)  # tid2eid[3] = 3
     ex2, _ = _run_schedule(rec.graph, ext2)
     partials2 = np.array(ex2.tensor(h["partials"].value.name))
     np.testing.assert_allclose(
