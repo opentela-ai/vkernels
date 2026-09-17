@@ -552,6 +552,71 @@ def lower_gdn_conv(op: Operator, graph: OperatorGraph) -> TaskFamily:
 # ---------------------------------------------------------------------------
 
 
+def lower_gdn_delta(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    """One task per (batch, value head): the task owns the head's [HV, HK]
+    state slice (read-modify-write, in registers on device) and its v/z
+    rows; q/k are read per key head (group-expanded). The state WAW/WAR is
+    phase-ordered like the KV append — two gdn_delta ops on one pool chain
+    through the state-storage hazards."""
+    state = graph.tensor(op.inputs[0])
+    q = graph.tensor(op.inputs[1])
+    k = graph.tensor(op.inputs[2])
+    v = graph.tensor(op.inputs[3])
+    z = graph.tensor(op.inputs[4])
+    a = graph.tensor(op.inputs[5])
+    b = graph.tensor(op.inputs[6])
+    a_log = graph.tensor(op.inputs[7])
+    dt_bias = graph.tensor(op.inputs[8])
+    norm_w = graph.tensor(op.inputs[9])
+    out = graph.tensor(op.outputs[0])
+    B, NV, HV, HK = state.shape
+    NK = q.shape[1]
+    if NV % NK:
+        raise ValueError(f"gdn_delta head group must divide: NV={NV} not divisible by NK={NK}")
+    domain = TileDomain(((B, 1), (NV, 1)))
+
+    def reads(coords):
+        bb, h = coords
+        kh = h // (NV // NK)
+        return (
+            _tile_region(state, ((bb, bb + 1), (h, h + 1), (0, HV), (0, HK))),
+            _tile_region(q, ((bb, bb + 1), (kh, kh + 1), (0, HK))),
+            _tile_region(k, ((bb, bb + 1), (kh, kh + 1), (0, HK))),
+            _tile_region(v, ((bb, bb + 1), (h, h + 1), (0, HV))),
+            _tile_region(z, ((bb, bb + 1), (h, h + 1), (0, HV))),
+            _tile_region(a, ((bb, bb + 1), (h, h + 1))),
+            _tile_region(b, ((bb, bb + 1), (h, h + 1))),
+            _whole(a_log),
+            _whole(dt_bias),
+            _whole(norm_w),
+        )
+
+    def writes(coords):
+        bb, h = coords
+        # Read-modify-write: the task updates its own state slice in place.
+        return (
+            _tile_region(state, ((bb, bb + 1), (h, h + 1), (0, HV), (0, HK))),
+            _tile_region(out, ((bb, bb + 1), (h, h + 1), (0, HV))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_gdn_delta",
+        kind="gdn_delta",
+        op=op,
+        domain=domain,
+        inputs=(state.name, q.name, k.name, v.name, z.name, a.name, b.name, a_log.name, dt_bias.name, norm_w.name),
+        outputs=(out.name,),
+        params={
+            "layer": op.attributes.get("layer", 0),
+            "scale": op.attributes.get("scale", 1.0),
+            "eps": op.attributes.get("eps", 1e-6),
+        },
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=HV * HK * 4,  # the [HV, HK] fp32 state slice (registers/scratch budget)
+        read_regions=reads,
+        write_regions=writes,
+    )
+
 def lower_attention_scores(op: Operator, graph: OperatorGraph) -> TaskFamily:
     q = graph.tensor(op.inputs[0])
     k_cache = graph.tensor(op.inputs[1])
@@ -622,8 +687,10 @@ def lower_softmax(op: Operator, graph: OperatorGraph) -> TaskFamily:
 
 
 def lower_attention_values(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    gated = op.attributes.get("gated", False)
     probs = graph.tensor(op.inputs[0])
     v_cache = graph.tensor(op.inputs[1])
+    gate = graph.tensor(op.inputs[2]) if gated else None
     y = graph.tensor(op.outputs[0])
     B = probs.shape[0]
     Hq = probs.shape[1]  # query heads drive the task domain
@@ -635,10 +702,13 @@ def lower_attention_values(op: Operator, graph: OperatorGraph) -> TaskFamily:
 
     def reads(coords):
         b, h = coords
-        return (
+        regions = (
             _tile_region(probs, ((b, b + 1), (h, h + 1), (0, f"{p}+1"))),
             _tile_region(v_cache, ((b, b + 1), (h // group, h // group + 1), (0, f"{p}+1"), (0, D))),
         )
+        if gated:
+            regions = regions + (_tile_region(gate, ((b, b + 1), (h, h + 1), (0, D))),)
+        return regions
 
     def writes(coords):
         b, h = coords
@@ -649,9 +719,16 @@ def lower_attention_values(op: Operator, graph: OperatorGraph) -> TaskFamily:
         kind="attention_values",
         op=op,
         domain=domain,
-        inputs=(probs.name, v_cache.name),
+        inputs=(probs.name, v_cache.name) + ((gate.name,) if gated else ()),
         outputs=(y.name,),
-        params={"layer": op.attributes.get("layer", 0), "position": p, "position_form": op.attributes.get("position_form", "scalar"), "kv_heads": kvh, "group": group},
+        params={
+            "layer": op.attributes.get("layer", 0),
+            "position": p,
+            "position_form": op.attributes.get("position_form", "scalar"),
+            "kv_heads": kvh,
+            "group": group,
+            "gated": gated,
+        },
         threads=THREADS_PER_WORKER,
         scratch_bytes=D * 4,  # per-task context accumulator
         read_regions=reads,
@@ -695,7 +772,7 @@ def lower_cache_append_paged(op: Operator, graph: OperatorGraph) -> TaskFamily:
         domain=domain,
         inputs=(k_pool.name, v_pool.name, slot_table.name, k_new.name, v_new.name),
         outputs=(),
-        params={"layer": op.attributes.get("layer", 0), "position": p},
+        params={"layer": op.attributes.get("layer", 0), "position": p, "position_form": op.attributes.get("position_form", "scalar")},
         threads=THREADS_PER_WORKER,
         read_regions=reads,
         write_regions=writes,
@@ -733,7 +810,7 @@ def lower_attention_scores_paged(op: Operator, graph: OperatorGraph) -> TaskFami
         domain=domain,
         inputs=(q.name, k_pool.name, slot_table.name),
         outputs=(y.name,),
-        params={"scale": float(op.attributes.get("scale") or 0.0), "layer": op.attributes.get("layer", 0), "position": p, "kv_heads": kvh, "group": group},
+        params={"scale": float(op.attributes.get("scale") or 0.0), "layer": op.attributes.get("layer", 0), "position": p, "position_form": op.attributes.get("position_form", "scalar"), "kv_heads": kvh, "group": group},
         threads=THREADS_PER_WORKER,
         scratch_bytes=S * 4,
         read_regions=reads,
@@ -772,7 +849,7 @@ def lower_attention_values_paged(op: Operator, graph: OperatorGraph) -> TaskFami
         domain=domain,
         inputs=(probs.name, v_pool.name, slot_table.name),
         outputs=(y.name,),
-        params={"layer": op.attributes.get("layer", 0), "position": p, "kv_heads": kvh, "group": group},
+        params={"layer": op.attributes.get("layer", 0), "position": p, "position_form": op.attributes.get("position_form", "scalar"), "kv_heads": kvh, "group": group},
         threads=THREADS_PER_WORKER,
         scratch_bytes=D * 4,
         read_regions=reads,
@@ -796,6 +873,7 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "embedding": lower_embedding,
     "cache_append": lower_cache_append,
     "gdn_conv": lower_gdn_conv,
+    "gdn_delta": lower_gdn_delta,
     "cache_append_paged": lower_cache_append_paged,
     "attention_scores": lower_attention_scores,
     "attention_scores_paged": lower_attention_scores_paged,

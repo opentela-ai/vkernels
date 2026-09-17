@@ -56,6 +56,16 @@ TEMPLATE_NAMES = {
     "attention_scores": "attention_scores_task",
     "softmax": "softmax_task",
     "attention_values": "attention_values_task",
+    # --- qwen35 hybrid stage-1 additions (issue #102) -------------------
+    # gdn_conv: validated device kernel ``_t_gdn_conv_tiled`` (issue #89)
+    "gdn_conv": "gdn_conv_task",
+    # gdn_delta: validated batched-heads kernel ``_t_gdn_heads_batched`` (issue #90)
+    "gdn_delta": "gdn_delta_task",
+    # paged trio: the shared append/scores/values kernels are slot-table
+    # indirected with per-row position bounds (issues #93/#94)
+    "cache_append_paged": "cache_append_paged_task",
+    "attention_scores_paged": "attention_scores_paged_task",
+    "attention_values_paged": "attention_values_paged_task",
 }
 
 _TEMPLATE_MODULE = "vkernels.compiler.device_templates"
