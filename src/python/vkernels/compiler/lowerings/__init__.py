@@ -593,6 +593,127 @@ def lower_attention_values(op: Operator, graph: OperatorGraph) -> TaskFamily:
 
 
 # ---------------------------------------------------------------------------
+# Paged decode (#94): pools addressed via external i32 [B, S] slot tables.
+# Per-task pool regions are the whole pool: the addressed slot is runtime
+# data (slot_table[b, t]), so overlaps are conservative — sound under
+# phase order, mirroring the Region.indirect storage-span rule (§5.2).
+# ---------------------------------------------------------------------------
+
+
+def lower_cache_append_paged(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    k_pool, v_pool = graph.tensor(op.inputs[0]), graph.tensor(op.inputs[1])
+    slot_table = graph.tensor(op.inputs[2])
+    k_new, v_new = graph.tensor(op.inputs[3]), graph.tensor(op.inputs[4])
+    B, KVH, D = k_new.shape
+    domain = TileDomain(((B, 1), (KVH, 1)))
+    p = op.attributes.get("position", "p")
+
+    def reads(coords):
+        b, h = coords
+        row = ((b, b + 1), (h, h + 1), (0, D))
+        return (_tile_region(k_new, row), _tile_region(v_new, row))
+
+    def writes(coords):
+        # Slot is table[b, p] — runtime data. Whole-pool declaration is the
+        # conservative sound choice (#94); slot 0 (sink) is never written.
+        return (
+            _tile_region(k_pool, ((0, k_pool.shape[0]), (0, k_pool.shape[1]), (0, k_pool.shape[2]))),
+            _tile_region(v_pool, ((0, v_pool.shape[0]), (0, v_pool.shape[1]), (0, v_pool.shape[2]))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_cache_append_paged",
+        kind="cache_append_paged",
+        op=op,
+        domain=domain,
+        inputs=(k_pool.name, v_pool.name, slot_table.name, k_new.name, v_new.name),
+        outputs=(),
+        params={"layer": op.attributes.get("layer", 0), "position": p},
+        threads=THREADS_PER_WORKER,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_attention_scores_paged(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    q = graph.tensor(op.inputs[0])
+    k_pool = graph.tensor(op.inputs[1])
+    slot_table = graph.tensor(op.inputs[2])
+    y = graph.tensor(op.outputs[0])
+    B = q.shape[0]
+    Hq = q.shape[1]
+    S = slot_table.shape[1]
+    kvh = op.attributes.get("kv_heads", Hq) or Hq
+    group = Hq // kvh
+    domain = TileDomain(((B, 1), (Hq, 1)))
+    p = op.attributes.get("position", "p")
+
+    def reads(coords):
+        b, h = coords
+        return (
+            _tile_region(q, ((b, b + 1), (h, h + 1), (0, q.shape[2]))),
+            _tile_region(k_pool, ((0, k_pool.shape[0]), (0, k_pool.shape[1]), (0, k_pool.shape[2]))),
+        )
+
+    def writes(coords):
+        b, h = coords
+        return (_tile_region(y, ((b, b + 1), (h, h + 1), (0, f"{p}+1"))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_attn_scores_paged",
+        kind="attention_scores_paged",
+        op=op,
+        domain=domain,
+        inputs=(q.name, k_pool.name, slot_table.name),
+        outputs=(y.name,),
+        params={"scale": float(op.attributes.get("scale") or 0.0), "layer": op.attributes.get("layer", 0), "position": p, "kv_heads": kvh, "group": group},
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=S * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_attention_values_paged(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    probs = graph.tensor(op.inputs[0])
+    v_pool = graph.tensor(op.inputs[1])
+    slot_table = graph.tensor(op.inputs[2])
+    y = graph.tensor(op.outputs[0])
+    B = probs.shape[0]
+    Hq = probs.shape[1]
+    D = v_pool.shape[2]
+    kvh = op.attributes.get("kv_heads", Hq) or Hq
+    group = Hq // kvh
+    domain = TileDomain(((B, 1), (Hq, 1)))
+    p = op.attributes.get("position", "p")
+
+    def reads(coords):
+        b, h = coords
+        return (
+            _tile_region(probs, ((b, b + 1), (h, h + 1), (0, f"{p}+1"))),
+            _tile_region(v_pool, ((0, v_pool.shape[0]), (0, v_pool.shape[1]), (0, v_pool.shape[2]))),
+        )
+
+    def writes(coords):
+        b, h = coords
+        return (_tile_region(y, ((b, b + 1), (h, h + 1), (0, D))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_attn_values_paged",
+        kind="attention_values_paged",
+        op=op,
+        domain=domain,
+        inputs=(probs.name, v_pool.name, slot_table.name),
+        outputs=(y.name,),
+        params={"layer": op.attributes.get("layer", 0), "position": p, "kv_heads": kvh, "group": group},
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=D * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registry (§3.1)
 # ---------------------------------------------------------------------------
 
@@ -607,9 +728,12 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "add": lower_add,
     "embedding": lower_embedding,
     "cache_append": lower_cache_append,
+    "cache_append_paged": lower_cache_append_paged,
     "attention_scores": lower_attention_scores,
+    "attention_scores_paged": lower_attention_scores_paged,
     "softmax": lower_softmax,
     "attention_values": lower_attention_values,
+    "attention_values_paged": lower_attention_values_paged,
 }
 
 LOWERINGS_VERSION = "0.1.0"
