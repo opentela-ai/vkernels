@@ -53,6 +53,7 @@ class DType:
 F32 = DType("f32", 4)
 F16 = DType("f16", 2)
 BF16 = DType("bf16", 2)
+F8_E4M3 = DType("f8e4m3", 1)
 I32 = DType("i32", 4)
 I64 = DType("i64", 8)
 
@@ -415,6 +416,10 @@ OP_LAYER_NORM = "layer_norm"
 OP_RMS_NORM = "rms_norm"
 OP_ROPE = "rope"
 OP_LINEAR = "linear"
+# fp8-blockwise decode projection (issue #91): y = x @ dequant(w_fp8, scales)^T
+# with DeepSeek-style 128x128 block scales; same task shape as ``linear``, the
+# scale tensor is the second weight external.
+OP_LINEAR_FP8 = "linear_fp8"
 OP_GELU = "gelu"
 OP_SWIGLU = "swiglu"
 OP_ADD = "add"
@@ -429,6 +434,7 @@ ARITHMETIC_OP_KINDS = (
     OP_RMS_NORM,
     OP_ROPE,
     OP_LINEAR,
+    OP_LINEAR_FP8,
     OP_GELU,
     OP_SWIGLU,
     OP_ADD,

@@ -358,6 +358,62 @@ class RecordingBackend:
         )
         return out
 
+    def linear_fp8(
+        self,
+        x: SymbolicTensor,
+        w: SymbolicTensor,
+        scale: SymbolicTensor,
+        *,
+        out: Optional[SymbolicTensor] = None,
+        name: str = "linear_fp8",
+        quant_block: int = 128,
+    ) -> SymbolicTensor:
+        """fp8-blockwise decode projection (issue #91):
+
+            y = x @ dequant(w_fp8, scale)^T
+
+        ``w`` is stored [N, K] row-major (the checkpoint's ``nn.Linear``
+        layout) in fp8 e4m3; ``scale`` is the second weight external, fp32
+        [ceil(N/quant_block), K/quant_block] in block-major order
+        (DeepSeek-style 128x128 block-FP8; ragged trailing N block
+        allowed). Numerics: fp32 accumulation over K, dequant
+        in-register per block — the scale for one block multiplies the
+        products of that block only.
+        """
+        m, k = x.value.shape
+        n, k_w = w.value.shape
+        if k_w != k:
+            raise ValueError(f"linear_fp8 weight contraction mismatch: x K={k}, w K={k_w}")
+        if k % quant_block:
+            raise ValueError(
+                f"linear_fp8 requires K divisible by the {quant_block}-wide quant block; got K={k}"
+            )
+        if n % 16:
+            raise ValueError(
+                f"linear_fp8 requires N divisible by the 16-wide output tile (ragged trailing scale block allowed); got N={n}"
+            )
+        expected_scale = (-(-n // quant_block), k // quant_block)  # ceil rows for ragged N
+        if tuple(scale.value.shape) != expected_scale:
+            raise ValueError(
+                f"linear_fp8 scale shape {tuple(scale.value.shape)} != {expected_scale} (block-major [N/{quant_block}, K/{quant_block}])"
+            )
+        out = out or self.fresh_buffer(f"{name}{self._suffix()}", (m, n))
+        self._record(
+            "linear_fp8",
+            inputs=(x, w, scale),
+            outputs=(out,),
+            attributes={"weight_layout": "fp8_block", "quant_block": quant_block, "bias": False},
+            reads=(_regional_reads(x.value), _regional_reads(w.value), _regional_reads(scale.value)),
+            writes=(_regional_reads(out.value),),
+            source_location=name,
+            numerical_contract={
+                "dequant": f"per {quant_block}x{quant_block} block: w_fp8 * scale (fp32 scale, e4m3 weights)",
+                "accumulation": "f32, full-K reduction per output tile, k ascending within each block",
+                "bias": "none (checkpoint fp8 projections are bias-free)",
+            },
+        )
+        return out
+
     def gelu(self, x: SymbolicTensor, *, out: Optional[SymbolicTensor] = None, name: str = "gelu") -> SymbolicTensor:
         out = out or self.fresh_buffer(f"{name}{self._suffix()}", x.value.shape)
         self._record(
