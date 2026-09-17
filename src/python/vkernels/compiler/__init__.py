@@ -37,6 +37,7 @@ from .legality import Diagnostic, LegalityError, check_graph
 from .operator_ir import (
     DType,
     F32,
+    F8_E4M3,
     Operator,
     OperatorGraph,
     Region,
@@ -55,6 +56,7 @@ __all__ = [
     "Diagnostic",
     "DType",
     "F32",
+    "F8_E4M3",
     "GPT2Config",
     "GPT2Weights",
     "KVCache",

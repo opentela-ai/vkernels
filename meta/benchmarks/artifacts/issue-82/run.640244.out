@@ -1,0 +1,1224 @@
+-- The CXX compiler identification is GNU 7.5.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- vkernels: nvcc not found; building host-only (CPU reference) path.
+-- vkernels: NCCL not searched (CUDA not enabled)
+-- Looking for a HIP compiler
+-- Looking for a HIP compiler - /opt/rocm-6.3.0/lib/llvm/bin/clang++
+-- The HIP compiler identification is Clang 18.0.0
+-- Detecting HIP compiler ABI info
+-- Detecting HIP compiler ABI info - done
+-- Check for working HIP compiler: /opt/rocm-6.3.0/lib/llvm/bin/clang++ - skipped
+-- Detecting HIP compile features
+-- Detecting HIP compile features - done
+-- vkernels: HIP enabled (archs=gfx942)
+-- RCCL (rccl.h / librccl) not found; building the comm layer without the HIP/RCCL transport (issue #19). (missing: VKERNELS_RCCL_LIBRARY VKERNELS_RCCL_INCLUDE_DIR) 
+-- vkernels: RCCL not found; HIP/RCCL transport disabled (host reference still builds)
+-- libfabric (rdma/fabric.h / libfabric) not found; the OFI/CXI net plugin will not be built (issue #19). (missing: VKERNELS_OFI_LIBRARY VKERNELS_OFI_INCLUDE_DIR) 
+-- vkernels: libfabric/OFI not found; OFI/CXI net plugin disabled
+-- vkernels/net-ofi: libfabric not found; plugin not built
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE  
+-- 
+-- ==== vkernels 0.1.0 ====
+--   C++ standard  : 17
+--   CUDA kernels  : OFF (requested ON)
+--   HIP kernels   : ON (requested ON)
+--   NCCL transport: OFF (issue #49 on-site)
+--   RCCL transport: OFF (issue #19)
+--   OFI/CXI plugin: OFF (issue #19)
+--   Tests         : ON (minitest)
+--   Benchmarks    : ON
+--   Python bindings: OFF
+--   Rust bindings  : OFF
+--   Coverage      : OFF
+--   ASan/UBSan    : OFF/OFF
+-- =================================
+-- Configuring done (4.9s)
+-- Generating done (1.1s)
+-- Build files have been written to: /capstor/scratch/cscs/xyao/vk-issue-82/build-i82
+[  4%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/elementwise.cpp.o
+[  4%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/core/stream.cpp.o
+[  8%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/reduce.cpp.o
+[  8%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/moe_fused.cpp.o
+[  8%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/gemm_bf16.cpp.o
+[  8%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/gemm.cpp.o
+[ 13%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/mla.cpp.o
+[ 13%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/dsa_topk.cpp.o
+[ 13%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/moe.cpp.o
+[ 26%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/dsa_kpool.cpp.o
+[ 30%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/dsa.cpp.o
+[ 30%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/glm_moe.cpp.o
+[ 30%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/kda.cpp.o
+[ 30%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/moe_aux.cpp.o
+[ 30%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/mhc.cpp.o
+[ 30%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/rccl.cpp.o
+[ 39%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/channel.cpp.o
+[ 39%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/rccl_c.cpp.o
+[ 39%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/allreduce.cpp.o
+[ 47%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/overlap.cpp.o
+[ 47%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/p2p_gather.cpp.o
+[ 47%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/p2p_kv_restore.cpp.o
+[ 47%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/p2p_kv_donate.cpp.o
+[ 52%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/kv_scatter.cpp.o
+[ 52%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/kv_gather.cpp.o
+[ 56%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/pipeline_boundary.cpp.o
+[ 56%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/pipeline_boundary_c.cpp.o
+[ 60%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/fabric_import.cpp.o
+[ 60%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/fabric_import_c.cpp.o
+[ 65%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/dist/dist_moe.cpp.o
+[ 65%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/comm/cross_node_kv.cpp.o
+[ 65%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/capi/capi.cpp.o
+[ 69%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/capi/capi_kernels.cpp.o
+[ 69%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/capi/capi_attn.cpp.o
+[ 73%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/moe.hip.o
+[ 73%] Building CXX object src/c/CMakeFiles/vkernels.dir/vkernels/capi/capi_moe.cpp.o
+[ 78%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/glm_moe.hip.o
+[ 82%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/moe_fused.hip.o
+[ 82%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/moe_aux.hip.o
+[ 82%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/gemm_bf16.hip.o
+[ 86%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/dsa.hip.o
+[ 86%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/mla.hip.o
+[ 91%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/dsa_topk.hip.o
+[ 95%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/dsa_kpool.hip.o
+[ 95%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/mhc.hip.o
+[ 95%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/kda.hip.o
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:929:16: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  929 |   if (ktime) { hipEventCreate(&ks); hipEventCreate(&ke); }
+      |                ^~~~~~~~~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:929:37: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  929 |   i/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/glm_moe.hipf: 189(:k3t:i mwarning: eignoring return value of function declared with 'nodiscard' attribute [-Wunused-result])
+ {   h189i | p E vheinptMCarlelaotce((&&pkasr)t;,  h(ispiEzvee_ntt)CMr e*a tNe (*& ksek) ;*  }s
+i      z| e                                    ^~~~~~~~~~~~~~ ~~~o
+f(float));/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip
+:      945| :  ^~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~7
+: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/glm_moe.hip  :945191 | : 3 :     Vwarning: Kignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]_
+T  B191E | G I Nh(i)p;F
+r      e| e      ^~~~~~~~~~~(
+p/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hipa:r930t:)37;:
+       note: | expanded from macro 'VK_TBEGIN'  ^~~~~~~ ~~~~
+
+  930 | #define VK_TBEGIN() do { if (ktime) hipEventRecord(ks, hipstream); } while (0)
+      |                                     ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:950:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  950 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:933:7: note: expanded from macro 'VK_TEND'
+  933 |       hipEventRecord(ke, hipstream);                                                      \
+      |       ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:950:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  950 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:934:7: note: expanded from macro 'VK_TEND'
+  934 |       hipEventSynchronize(ke);                                                 \
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:950:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  950 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:935:23: note: expanded from macro 'VK_TEND'
+  935 |       float ms = 0.f; hipEventElapsedTime(&ms, ks, ke);                        \
+      |                       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:954:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  954 |       VK_TBEGIN();
+      |       ^~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:930:37: note: expanded from macro 'VK_TBEGIN'
+  930 | #define VK_TBEGIN() do { if (ktime) hipEventRecord(ks, hipstream); } while (0)
+      |                                     ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:958:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  958 |       VK_TEND("down");
+      |       ^~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:933:7: note: expanded from macro 'VK_TEND'
+  933 |       hipEventRecord(ke, hipstream);                                                      \
+      |       ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:958:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  958 |       VK_TEND("down");
+      |       ^~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:934:7: note: expanded from macro 'VK_TEND'
+  934 |       hipEventSynchronize(ke);                                                 \
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:958:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  958 |       VK_TEND("down");
+      |       ^~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:935:23: note: expanded from macro 'VK_TEND'
+  935 |       float ms = 0.f; hipEventElapsedTime(&ms, ks, ke);                        \
+      |                       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:965:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  965 |       VK_TBEGIN();
+      |       ^~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:930:37: note: expanded from macro 'VK_TBEGIN'
+  930 | #define VK_TBEGIN() do { if (ktime) hipEventRecord(ks, hipstream); } while (0)
+      |                                     ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:976:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  976 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:933:7: note: expanded from macro 'VK_TEND'
+  933 |       hipEventRecord(ke, hipstream);                                                      \
+      |       ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:976:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  976 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:934:7: note: expanded from macro 'VK_TEND'
+  934 |       hipEventSynchronize(ke);                                                 \
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:976:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  976 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:935:23: note: expanded from macro 'VK_TEND'
+  935 |       float ms = 0.f; hipEventElapsedTime(&ms, ks, ke);                        \
+      |                       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:980:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  980 |       VK_TBEGIN();
+      |       ^~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:930:37: note: expanded from macro 'VK_TBEGIN'
+  930 | #define VK_TBEGIN() do { if (ktime) hipEventRecord(ks, hipstream); } while (0)
+      |                                     ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:984:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  984 |       VK_TEND("down");
+      |       ^~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:933:7: note: expanded from macro 'VK_TEND'
+  933 |       hipEventRecord(ke, hipstream);                                                      \
+      |       ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:984:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  984 |    /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/mla.hip : 355 :V26K:_ Twarning: Eignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]N
+D("d  o355w | n " ) ; 
+        | i      ^~~~~~~~~~~~~~~f
+ /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip(:w934.:p7a:r tnote: iexpanded from macro 'VK_TEND'a
+l  _934o | u t )   h i phFirpeEev(ewn.tpSayrntciharlo_noiuzte)(;k
+e      )| ;                         ^~~~~~~ ~~~~~~~~~~~~~ 
+                  /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/mla.hip : 363 : 26 :   warning:  ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result] 
+    363  |              i f   ( w . p a r t i a\l
+_      l| s      ^~~~~~~~~~~~~~~~~~~ ~~e
+) h/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hipi:p984F:r7e:e (warning: wignoring return value of function declared with 'nodiscard' attribute [-Wunused-result].
+p  a984r | t i a l _ l sVeK)_;T
+E      N| D                         ^~~~~~~ ~~~~~~~~~~~~~(
+"down");
+      |       ^~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:935:23: note: expanded from macro 'VK_TEND'
+  935 |       float ms = 0.f; hipEventElapsedTime(&ms, ks, ke);                        \
+      |                       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:989:16: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  989 |   if (ktime) { hipEventDestroy(ks); hipEventDestroy(ke); }
+      |                ^~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:989:37: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  989 |   if (ktime) { hipEventDestroy(ks); hipEventDestroy(ke); }
+      |                                     ^~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:263:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  263 |   if (stream == nullptr) hipDeviceSynchronize();
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:293:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  293 |   hipMalloc(&state, (size_t)B * H * D * D * sizeof(float));
+      |   ^~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:294:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  294 |   hipMemsetAsync(state, 0, (size_t)B * H * D * D * sizeof(float), 0);
+      |   ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:302:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  302 |   hipFree(state);
+      |   ^~~~~~~ ~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:757:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  757 |   if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:786:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  786 |   hipMalloc(&state, (size_t)B * H * D * D * sizeof(float));
+      |   ^~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:787:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  787 |   hipMemsetAsync(state, 0, (size_t)B * H * D * D * sizeof(float), 0);
+      |   ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:790:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  790 |   hipMalloc(&scratch, sf * sizeof(float));
+      |   ^~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:794:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  794 |   hipFree(state);
+      |   ^~~~~~~ ~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:795:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  795 |   hipFree(scratch);
+      |   ^~~~~~~ ~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:819:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  819 |   hipMalloc(&dbg, 8 * sizeof(unsigned long long));
+      |   ^~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:821:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  821 |   hipEventCreate(&e0);
+      |   ^~~~~~~~~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:822:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  822 |   hipEventCreate(&e1);
+      |   ^~~~~~~~~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:840:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  840 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:838:26: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:838:27)>' requested here
+  838 |   out_us[0] = time_launch([&] {
+      |                          ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:845:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  845 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:843:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:843:29)>' requested here
+  843 |     out_us[1] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:850:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  850 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:848:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:848:29)>' requested here
+  848 |     out_us[1] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:855:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  855 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:853:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:853:29)>' requested here
+  853 |     out_us[1] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:860:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  860 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:858:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:858:29)>' requested here
+  858 |     out_us[1] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:867:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  867 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:863:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:863:29)>' requested here
+  863 |     out_us[2] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:873:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  873 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:870:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:870:29)>' requested here
+  870 |     out_us[3] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:880:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  880 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:876:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:876:29)>' requested here
+  876 |     out_us[2] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:886:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  886 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:883:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:883:29)>' requested here
+  883 |     out_us[3] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:893:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  893 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:889:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:889:29)>' requested here
+  889 |     out_us[2] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:899:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  899 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:896:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:896:29)>' requested here
+  896 |     out_us[3] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:906:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  906 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:902:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:902:29)>' requested here
+  902 |     out_us[2] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:912:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  912 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:909:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:909:29)>' requested here
+  909 |     out_us[3] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:915:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  915 |   hipEventDestroy(e0);
+      |   ^~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:916:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  916 |   hipEventDestroy(e1);
+      |   ^~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:917:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  917 |   hipFree(dbg);
+      |   ^~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:263:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  263 |   if (stream == nullptr) hipDeviceSynchronize();
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:279:22: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch<16, 16>' requested here
+  279 |   if (D <= 16)       launch<16, 16>(q, k, v, g, beta, state, out, B, H, S, st);
+      |                      ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:263:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  263 |   if (stream == nullptr) hipDeviceSynchronize();
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:280:22: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch<32, 32>' requested here
+  280 |   else if (D <= 32)  launch<32, 32>(q, k, v, g, beta, state, out, B, H, S, st);
+      |                      ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:263:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  263 |   if (stream == nullptr) hipDeviceSynchronize();
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:281:22: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch<64, 16>' requested here
+  281 |   else if (D <= 64)  launch<64, 16>(q, k, v, g, beta, state, out, B, H, S, st);
+      |                      ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:263:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  263 |   if (stream == nullptr) hipDeviceSynchronize();
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:282:22: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch<128, 32>' requested here
+  282 |   else if (D <= 128) launch<128, 32>(q, k, v, g, beta, state, out, B, H, S, st);
+      |                      ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:757:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  757 |   if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:774:21: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch_chunked<16>' requested here
+  774 |   if (D <= 16)      launch_chunked<16>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+      |                     ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:757:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  757 |   if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:775:21: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch_chunked<32>' requested here
+  775 |   else if (D <= 32) launch_chunked<32>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+      |                     ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:757:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  757 |   if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:776:21: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch_chunked<64>' requested here
+  776 |   else if (D <= 64) launch_chunked<64>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+      |                     ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:757:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  757 |   if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:777:21: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch_chunked<128>' requested here
+  777 |   else              launch_chunked<128>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+      |                     ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/dsa.hip:600:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+  600 | __global__ void dsa_topk_logits_kernel_mfma(
+      |                 ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/dsa.hip:600:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/dsa.hip:600:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/dsa.hip:600:17: warning: loop not unrolled: the optimizer was unable to perform the requested transformation; the transformation might be disabled or specified as part of an unsupported transformation ordering [-Wpass-failed=transform-warning]
+2 warnings generated when compiling for gfx942.
+4 warnings generated when compiling for gfx942.
+2 warnings generated when compiling for gfx942.
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/mla.hip:355:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  355 |       if (w.partial_out) hipFree(w.partial_out);
+      |                          ^~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/mla.hip:363:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  363 |       if (w.partial_lse) hipFree(w.partial_lse);
+      |                          ^~~~~~~ ~~~~~~~~~~~~~
+2 warnings generated when compiling for host.
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/glm_moe.hip:189:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  189 |   hipMalloc(&part, (size_t)M * N * sk * sizeof(float));
+      |   ^~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/glm_moe.hip:191:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  191 |   hipFree(part);
+      |   ^~~~~~~ ~~~~
+107 warnings generated when compiling for gfx942.
+2 warnings generated when compiling for host.
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:630:6: warning: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in '_ZN8vkernels7kernels3hip19down_combine_kernelEPKtPKhS5_PKfPfS7_PKiSA_iiiii': desired occupancy was 16, final occupancy is 4 [-Wpass-failed]
+  630 | void down_combine_kernel(
+      |      ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:499:6: warning: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in '_ZN8vkernels7kernels3hip20gateup_swiglu_kernelILb1EEEvPKtPKhS6_PKfPtPKiSB_iiiififfi': desired occupancy was 10, final occupancy is 3 [-Wpass-failed]
+  499 | void gateup_swiglu_kernel(
+      |      ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:499:6: warning: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in '_ZN8vkernels7kernels3hip20gateup_swiglu_kernelILb0EEEvPKtPKhS6_PKfPtPKiSB_iiiififfi': desired occupancy was 10, final occupancy is 3 [-Wpass-failed]
+23 warnings generated when compiling for gfx942.
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:263:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  263 |   if (stream == nullptr) hipDeviceSynchronize();
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:293:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  293 |   hipMalloc(&state, (size_t)B * H * D * D * sizeof(float));
+      |   ^~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:294:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  294 |   hipMemsetAsync(state, 0, (size_t)B * H * D * D * sizeof(float), 0);
+      |   ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:302:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  302 |   hipFree(state);
+      |   ^~~~~~~ ~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:757:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  757 |   if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:786:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  786 |   hipMalloc(&state, (size_t)B * H * D * D * sizeof(float));
+      |   ^~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:787:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  787 |   hipMemsetAsync(state, 0, (size_t)B * H * D * D * sizeof(float), 0);
+      |   ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:790:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  790 |   hipMalloc(&scratch, sf * sizeof(float));
+      |   ^~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:794:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  794 |   hipFree(state);
+      |   ^~~~~~~ ~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:795:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  795 |   hipFree(scratch);
+      |   ^~~~~~~ ~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:819:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  819 |   hipMalloc(&dbg, 8 * sizeof(unsigned long long));
+      |   ^~~~~~~~~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:821:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  821 |   hipEventCreate(&e0);
+      |   ^~~~~~~~~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:822:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  822 |   hipEventCreate(&e1);
+      |   ^~~~~~~~~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:840:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  840 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:838:26: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:838:27)>' requested here
+  838 |   out_us[0] = time_launch([&] {
+      |                          ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:845:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  845 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:843:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:843:29)>' requested here
+  843 |     out_us[1] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:850:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  850 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:848:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:848:29)>' requested here
+  848 |     out_us[1] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:855:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  855 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:853:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:853:29)>' requested here
+  853 |     out_us[1] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:860:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  860 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:858:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:858:29)>' requested here
+  858 |     out_us[1] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:867:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  867 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:863:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:863:29)>' requested here
+  863 |     out_us[2] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:873:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  873 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:870:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:870:29)>' requested here
+  870 |     out_us[3] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:880:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  880 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:876:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:876:29)>' requested here
+  876 |     out_us[2] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:886:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  886 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:883:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:883:29)>' requested here
+  883 |     out_us[3] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:893:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  893 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:889:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:889:29)>' requested here
+  889 |     out_us[2] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:899:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  899 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:896:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:896:29)>' requested here
+  896 |     out_us[3] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:906:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  906 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:902:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:902:29)>' requested here
+  902 |     out_us[2] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:912:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  912 |       hipDeviceSynchronize();
+      |       ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:825:5: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  825 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:909:28: note: in instantiation of function template specialization 'vkernels::kernels::hip::kda_chunked_phase_times(const float *, const float *, const float *, const float *, const float *, float *, float *, float *, int, int, int, int, int, double *)::(anonymous class)::operator()<(lambda at /capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:909:29)>' requested here
+  909 |     out_us[3] = time_launch([&] {
+      |                            ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:828:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  828 |       hipEventRecord(e0);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:830:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  830 |       hipEventRecord(e1);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:831:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  831 |       hipEventSynchronize(e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:833:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  833 |       hipEventElapsedTime(&ms, e0, e1);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:915:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  915 |   hipEventDestroy(e0);
+      |   ^~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:916:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  916 |   hipEventDestroy(e1);
+      |   ^~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:917:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  917 |   hipFree(dbg);
+      |   ^~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:263:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  263 |   if (stream == nullptr) hipDeviceSynchronize();
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:279:22: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch<16, 16>' requested here
+  279 |   if (D <= 16)       launch<16, 16>(q, k, v, g, beta, state, out, B, H, S, st);
+      |                      ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:263:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  263 |   if (stream == nullptr) hipDeviceSynchronize();
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:280:22: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch<32, 32>' requested here
+  280 |   else if (D <= 32)  launch<32, 32>(q, k, v, g, beta, state, out, B, H, S, st);
+      |                      ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:263:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  263 |   if (stream == nullptr) hipDeviceSynchronize();
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:281:22: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch<64, 16>' requested here
+  281 |   else if (D <= 64)  launch<64, 16>(q, k, v, g, beta, state, out, B, H, S, st);
+      |                      ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:263:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  263 |   if (stream == nullptr) hipDeviceSynchronize();
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:282:22: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch<128, 32>' requested here
+  282 |   else if (D <= 128) launch<128, 32>(q, k, v, g, beta, state, out, B, H, S, st);
+      |                      ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:757:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  757 |   if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:774:21: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch_chunked<16>' requested here
+  774 |   if (D <= 16)      launch_chunked<16>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+      |                     ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:757:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  757 |   if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:775:21: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch_chunked<32>' requested here
+  775 |   else if (D <= 32) launch_chunked<32>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+      |                     ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:757:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  757 |   if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:776:21: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch_chunked<64>' requested here
+  776 |   else if (D <= 64) launch_chunked<64>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+      |                     ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:757:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  757 |   if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
+      |                          ^~~~~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/kda.hip:777:21: note: in instantiation of function template specialization 'vkernels::kernels::hip::(anonymous namespace)::launch_chunked<128>' requested here
+  777 |   else              launch_chunked<128>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+      |                     ^
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:929:16: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  929 |   if (ktime) { hipEventCreate(&ks); hipEventCreate(&ke); }
+      |                ^~~~~~~~~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:929:37: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  929 |   if (ktime) { hipEventCreate(&ks); hipEventCreate(&ke); }
+      |                                     ^~~~~~~~~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:945:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  945 |       VK_TBEGIN();
+      |       ^~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:930:37: note: expanded from macro 'VK_TBEGIN'
+  930 | #define VK_TBEGIN() do { if (ktime) hipEventRecord(ks, hipstream); } while (0)
+      |                                     ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:950:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  950 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:933:7: note: expanded from macro 'VK_TEND'
+  933 |       hipEventRecord(ke, hipstream);                                                      \
+      |       ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:950:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  950 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:934:7: note: expanded from macro 'VK_TEND'
+  934 |       hipEventSynchronize(ke);                                                 \
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:950:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  950 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:935:23: note: expanded from macro 'VK_TEND'
+  935 |       float ms = 0.f; hipEventElapsedTime(&ms, ks, ke);                        \
+      |                       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:954:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  954 |       VK_TBEGIN();
+      |       ^~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:930:37: note: expanded from macro 'VK_TBEGIN'
+  930 | #define VK_TBEGIN() do { if (ktime) hipEventRecord(ks, hipstream); } while (0)
+      |                                     ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:958:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  958 |       VK_TEND("down");
+      |       ^~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:933:7: note: expanded from macro 'VK_TEND'
+  933 |       hipEventRecord(ke, hipstream);                                                      \
+      |       ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:958:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  958 |       VK_TEND("down");
+      |       ^~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:934:7: note: expanded from macro 'VK_TEND'
+  934 |       hipEventSynchronize(ke);                                                 \
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:958:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  958 |       VK_TEND("down");
+      |       ^~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:935:23: note: expanded from macro 'VK_TEND'
+  935 |       float ms = 0.f; hipEventElapsedTime(&ms, ks, ke);                        \
+      |                       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:965:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  965 |       VK_TBEGIN();
+      |       ^~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:930:37: note: expanded from macro 'VK_TBEGIN'
+  930 | #define VK_TBEGIN() do { if (ktime) hipEventRecord(ks, hipstream); } while (0)
+      |                                     ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:976:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  976 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:933:7: note: expanded from macro 'VK_TEND'
+  933 |       hipEventRecord(ke, hipstream);                                                      \
+      |       ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:976:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  976 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:934:7: note: expanded from macro 'VK_TEND'
+  934 |       hipEventSynchronize(ke);                                                 \
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:976:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  976 |       VK_TEND("gateup");
+      |       ^~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:935:23: note: expanded from macro 'VK_TEND'
+  935 |       float ms = 0.f; hipEventElapsedTime(&ms, ks, ke);                        \
+      |                       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:980:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  980 |       VK_TBEGIN();
+      |       ^~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:930:37: note: expanded from macro 'VK_TBEGIN'
+  930 | #define VK_TBEGIN() do { if (ktime) hipEventRecord(ks, hipstream); } while (0)
+      |                                     ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:984:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  984 |       VK_TEND("down");
+      |       ^~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:933:7: note: expanded from macro 'VK_TEND'
+  933 |       hipEventRecord(ke, hipstream);                                                      \
+      |       ^~~~~~~~~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:984:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  984 |       VK_TEND("down");
+      |       ^~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:934:7: note: expanded from macro 'VK_TEND'
+  934 |       hipEventSynchronize(ke);                                                 \
+      |       ^~~~~~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:984:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  984 |       VK_TEND("down");
+      |       ^~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:935:23: note: expanded from macro 'VK_TEND'
+  935 |       float ms = 0.f; hipEventElapsedTime(&ms, ks, ke);                        \
+      |                       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:989:16: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  989 |   if (ktime) { hipEventDestroy(ks); hipEventDestroy(ke); }
+      |                ^~~~~~~~~~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/moe_fused.hip:989:37: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  989 |   if (ktime) { hipEventDestroy(ks); hipEventDestroy(ke); }
+      |                                     ^~~~~~~~~~~~~~~ ~~
+20 warnings generated when compiling for host.
+107 warnings generated when compiling for host.
+[100%] Linking HIP static library libvkernels.a
+[100%] Built target vkernels
+[ 95%] Built target vkernels
+[100%] Building HIP object meta/benchmarks/CMakeFiles/test_mla_correct.dir/test_mla_correct.hip.o
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/test_mla_correct.hip:183:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  183 |   hipFree(dq); hipFree(dkc); hipFree(dkp); hipFree(dvc); hipFree(dout);
+      |   ^~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/test_mla_correct.hip:183:16: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  183 |   hipFree(dq); hipFree(dkc); hipFree(dkp); hipFree(dvc); hipFree(dout);
+      |                ^~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/test_mla_correct.hip:183:30: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  183 |   hipFree(dq); hipFree(dkc); hipFree(dkp); hipFree(dvc); hipFree(dout);
+      |                              ^~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/test_mla_correct.hip:183:44: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  183 |   hipFree(dq); hipFree(dkc); hipFree(dkp); hipFree(dvc); hipFree(dout);
+      |                                            ^~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/test_mla_correct.hip:183:58: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  183 |   hipFree(dq); hipFree(dkc); hipFree(dkp); hipFree(dvc); hipFree(dout);
+      |                                                          ^~~~~~~ ~~~~
+5 warnings generated when compiling for gfx942.
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/test_mla_correct.hip:183:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  183 |   hipFree(dq); hipFree(dkc); hipFree(dkp); hipFree(dvc); hipFree(dout);
+      |   ^~~~~~~ ~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/test_mla_correct.hip:183:16: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  183 |   hipFree(dq); hipFree(dkc); hipFree(dkp); hipFree(dvc); hipFree(dout);
+      |                ^~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/test_mla_correct.hip:183:30: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  183 |   hipFree(dq); hipFree(dkc); hipFree(dkp); hipFree(dvc); hipFree(dout);
+      |                              ^~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/test_mla_correct.hip:183:44: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  183 |   hipFree(dq); hipFree(dkc); hipFree(dkp); hipFree(dvc); hipFree(dout);
+      |                                            ^~~~~~~ ~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/test_mla_correct.hip:183:58: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  183 |   hipFree(dq); hipFree(dkc); hipFree(dkp); hipFree(dvc); hipFree(dout);
+      |                                                          ^~~~~~~ ~~~~
+5 warnings generated when compiling for host.
+[100%] Linking HIP executable test_mla_correct
+[100%] Built target test_mla_correct
+[ 95%] Built target vkernels
+[100%] Building HIP object meta/benchmarks/CMakeFiles/mla_bench.dir/bench_mla.hip.o
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:66:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   66 |       hipEventRecord(start);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:68:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   68 |       hipEventRecord(stop);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:69:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   69 |       hipEventSynchronize(stop);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:71:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   71 |       hipEventElapsedTime(&ms, start, stop);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:310:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  310 |   hipEventCreate(&start); hipEventCreate(&stop);
+      |   ^~~~~~~~~~~~~~ ~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:310:27: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  310 |   hipEventCreate(&start); hipEventCreate(&stop);
+      |                           ^~~~~~~~~~~~~~ ~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:313:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  313 |   hipEventDestroy(start); hipEventDestroy(stop);
+      |   ^~~~~~~~~~~~~~~ ~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:313:27: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  313 |   hipEventDestroy(start); hipEventDestroy(stop);
+      |                           ^~~~~~~~~~~~~~~ ~~~~
+8 warnings generated when compiling for gfx942.
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:66:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   66 |       hipEventRecord(start);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:68:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   68 |       hipEventRecord(stop);
+      |       ^~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:69:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   69 |       hipEventSynchronize(stop);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:71:7: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+   71 |       hipEventElapsedTime(&ms, start, stop);
+      |       ^~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:310:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  310 |   hipEventCreate(&start); hipEventCreate(&stop);
+      |   ^~~~~~~~~~~~~~ ~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:310:27: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  310 |   hipEventCreate(&start); hipEventCreate(&stop);
+      |                           ^~~~~~~~~~~~~~ ~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:313:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  313 |   hipEventDestroy(start); hipEventDestroy(stop);
+      |   ^~~~~~~~~~~~~~~ ~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/meta/benchmarks/bench_mla.hip:313:27: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  313 |   hipEventDestroy(start); hipEventDestroy(stop);
+      |                           ^~~~~~~~~~~~~~~ ~~~~
+8 warnings generated when compiling for host.
+[100%] Linking HIP executable mla_bench
+[100%] Built target mla_bench
+=============== correctness gate (test_mla_correct) ===============
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  B=1 H=1   S_q=1     max_abs=0.0000 max_rel=0.000000  PASS
+  B=1 H=1   S_q=64    max_abs=0.0000 max_rel=0.000003  PASS
+  B=1 H=16  S_q=64    max_abs=0.0000 max_rel=0.000003  PASS
+  B=1 H=1   S_q=8192  max_abs=0.0000 max_rel=0.000003  PASS
+  B=1 H=1   S_q=1    S_kv=2048  q0=2047  kv0=0    max_abs=0.6344 max_rel=0.634421  FAIL
+  B=1 H=2   S_q=1    S_kv=2048  q0=2047  kv0=0    max_abs=0.6344 max_rel=0.634421  FAIL
+  B=1 H=1   S_q=8    S_kv=2048  q0=2047  kv0=0    max_abs=1.2075 max_rel=1.207462  FAIL
+  B=1 H=1   S_q=1    S_kv=64    q0=32    kv0=0    max_abs=3.4562 max_rel=3.456159  FAIL
+  B=1 H=1   S_q=1    S_kv=64    q0=50    kv0=100  max_abs=0.0000 max_rel=0.000000  PASS
+
+FAIL (4 failure(s))

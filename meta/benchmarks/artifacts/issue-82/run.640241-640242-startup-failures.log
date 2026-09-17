@@ -1,0 +1,2 @@
+ERROR: SRC scratch checkout missing at /users/xyao/vk-i82 (runner copies the worktree there)
+ERROR: SRC scratch checkout missing at /var/spool (runner copies the worktree there)

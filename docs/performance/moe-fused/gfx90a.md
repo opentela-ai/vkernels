@@ -199,4 +199,16 @@ Benchmarked on MI250X and recorded under `docs/performance/`.
   nudging) could cut VGPRs below 64 and reach 4 blocks/CU; split gate/up to
   reduce live registers is another path.
 - Wavefront-specialised producer/consumer dequant once occupancy saturates.
+  **Answered by issue #76 (see [gfx942.md](gfx942.md#issue-76--prefill-variants-mi300a--gfx942)):
+  implemented, measured on both gfx90a and gfx942, and rejected** — the
+  dequant ALU demand is ~30× the MFMA issue demand (counted off the gfx942
+  ISA: 511 VALU vs 16 MFMA warp-instructions per kb loop body, ~4 lane-ALU
+  ops per fp4 element), so the split parks half
+  the wavefronts without shortening the critical resource.  What works is
+  narrowing the gateup N tile to 16 and the down N tile to 32, which
+  multiplies the grid for free; measured on MI250X, `VK_MOE_PF_VARIANT=5`
+  gives 1.92× at M=2048 (6030 → 3137 µs) and 2.06× at M=128 (1055 → 512 µs)
+  over baseline.  Raw logs: `beverin-issue76-prefill-variants.txt` (jobs
+  640188/640189; these MI250X runs predate the final comment-only edits to
+  the dispatch, and the log records the `src hip md5` they were built from).
 - Revisit the Triton baseline when ROCm 6.3 / a fixed Triton ships.

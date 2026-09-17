@@ -9,9 +9,15 @@
 // timed iteration so each sample is identical.
 //
 // USAGE
-//   bench_kda_chunked H S D    one config: prints
-//     "H=%d S=%d D=%d coop=%.1fus chunked=%.1fus speedup=%.2fx"
-//   bench_kda_chunked          sweep H in {1,8,16,32,64,128} at S=512 D=128
+//   bench_kda_chunked H S D    one config: prints (issue #83 roofline columns,
+//     the same model as bench_kda) two tagged rows + one speedup line:
+//     "ab coop    B=1 H=.. S=.. D=.. us(min)=.. us(med)=.. TFLOP/s=.. GB/s=.. AI=.. bound=mem"
+//     "ab chunked B=1 H=.. S=.. D=.. us(min)=.. us(med)=.. TFLOP/s=.. GB/s=.. AI=.. bound=mem"
+//     "ab H=.. S=.. D=.. coop=..us chunked=..us speedup=..x"
+//   bench_kda_chunked phases H S D   per-launch phase decomposition
+//   bench_kda_chunked          sweep H in {1,8,16,32,64,128} at S=512 D=128 (legacy
+//                              one-line format; run one shape per process on
+//                              beverin via ab_kda_chunked_mi300.sh instead)
 //
 // Built only with VKERNELS_HAS_HIP + VKERNELS_BUILD_BENCHMARKS.
 
@@ -92,6 +98,35 @@ static float rgate(int seed, int i) {
   return 0.05f + 0.95f * (float)(x % 100000u) / 100000.0f;
 }
 
+// Same roofline columns as bench_kda (issue #83), the same model:
+// flops ~ 7 D^2 per token (a=Sk 2D^2 + gated delta update ~3D^2 + o=Sq
+// 2D^2); HBM bytes are the LEGACY gmem-state model (state 4 D^2 +
+// q,k,v,out 4 D + g,beta 8 per token/head). Both columns OVERSTATE the
+// real HBM traffic: the coop kernel keeps its Db state rows in LDS per
+// 256-token chunk and the chunked state pass keeps its rows LDS-resident
+// across the WHOLE sequence (load once, store once). Judge the kernels
+// on us(min/med) + achieved TFLOP/s; GB/s/AI/Bound exist for
+// like-for-like comparison with the bench_kda tables.
+static void print_ab_row(const char* tag, int B, int H, int S, int D,
+                         const BenchResult& r) {
+  double tp = 1307.0, tf = 5300.0;   // gfx942 (bench_kda roof constants)
+  hipDeviceProp_t p;
+  if (hipGetDeviceProperties(&p, 0) == hipSuccess) {
+    if (std::strstr(p.gcnArchName, "gfx90a"))      { tp = 383.0; tf = 3200.0; }
+    else if (!std::strstr(p.gcnArchName, "gfx942")) { tp = 100.0; tf = 1000.0; }
+  }
+  const double flops = 7.0 * S * (double)D * D * H * B;
+  const double bytes =
+      4.0 * ((double)B * H * S * (4.0 * D * D + 4.0 * D) + 8.0 * B * H * S);
+  const double tflops = flops / (r.median_us / 1e6) / 1e12;
+  const double gbs = bytes / (r.median_us / 1e6) / 1e9;
+  const double ai = flops / bytes;
+  const char* bound = ai < (tp * 1e3 / tf) ? "mem" : "comp";
+  std::printf("ab %-7s B=%d H=%d S=%d D=%d us(min)=%.1f us(med)=%.1f "
+              "TFLOP/s=%.3f GB/s=%.1f AI=%.2f bound=%s\n",
+              tag, B, H, S, D, r.min_us, r.median_us, tflops, gbs, ai, bound);
+}
+
 // One A/B config: allocates, normalises k (chunked contract), times BOTH
 // entries on identical inputs (state re-zeroed per sample), prints one line.
 void bench_ab(hipEvent_t start, hipEvent_t stop, int B, int H, int S, int D) {
@@ -148,7 +183,9 @@ void bench_ab(hipEvent_t start, hipEvent_t stop, int B, int H, int S, int D) {
   const auto rw = long_k ? bench_us(Lw, start, stop, 2, 60)
                          : bench_us(Lw, start, stop, 3, 200);
   const double sp = (rw.median_us > 0) ? rc.median_us / rw.median_us : 0.0;
-  std::printf("H=%d S=%d D=%d coop=%.1fus chunked=%.1fus speedup=%.2fx\n",
+  print_ab_row("coop", B, H, S, D, rc);
+  print_ab_row("chunked", B, H, S, D, rw);
+  std::printf("ab H=%d S=%d D=%d coop=%.1fus chunked=%.1fus speedup=%.2fx\n",
               H, S, D, rc.median_us, rw.median_us, sp);
   fflush(stdout);
 

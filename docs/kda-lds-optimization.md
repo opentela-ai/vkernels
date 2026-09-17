@@ -218,3 +218,33 @@ FLA-style) or fp16 grams could push both, but the math risk grows.
 
 These are diminishing returns against a serial recurrence; the LDS cache was
 the single high-value win (it removed the dominant, H-scaling HBM traffic).
+
+## K3-shape recording (issue #83, 2026-09-17, job 640235)
+
+`bench_kda_chunked.hip` + `ab_kda_chunked_mi300.sh` (same `ab` roofline rows
+as `bench_kda`) add the missing chunked-vs-baseline comparisons at the
+bench_kda six-config set, and the code read they prompted confirms **both
+committed kernels are already LDS-resident for the D×D state** — the
+row-parallel kernel keeps `srow[Db·D]` (4 KB @ D=64/Db=16, 16 KB @
+D=128/Db=32) across each 256-token chunk, and the chunked state pass keeps
+`sC[Rb·(D+4)]` across ALL chunks (load once / store once). The per-token
+and per-chunk 3x HBM state re-reads diagnosed above are already eliminated
+in the committed code; the bench model still attributes AI ~0.43 / mem
+because it counts the legacy per-token state bytes that no longer move.
+The issue-#83 "state written to HBM every token" current-state text is
+stale for the same reason.
+
+**Decode-shape negative result: the chunked WY kernel LOSES at S=64.** At
+the decode-relevant shapes (S=64, cs=64, nc=1) it is 2.5–5x slower than the
+row-parallel kernel (0.18–0.39x): the four fixed launches (cumsum, gram,
+inverse+GEMMs, state) plus the 8·S·D scratch traffic and the gmem M/N
+round-trip cannot amortize over one 64-token chunk, and the B·H-block
+precompute (16–32 blocks) has no occupancy. At S≥512 the WY win stands
+(1.95–3.91x; 3.19x/3.51x at S=1024/2048). Net: the decode-time kernel of
+choice remains the row-parallel LDS-resident `kda_delta_rule_fwd` (coop
+re-measured 150.2 us at 16 64 64 = 454 GB/s model — its record-table
+477 GB/s already reflects LDS residency), and `kda_delta_rule_fwd_chunked*`
+remains the prefill kernel. Correctness 12/12 on the same job
+(`test_kda_chunked`, incl. the nonzero-initial-state multi-turn contract).
+Raw log: `meta/benchmarks/artifacts/issue-83/run-640235-ab-k3-shapes.out`;\
+full tables in [kernels/kda.md](kernels/kda.md).

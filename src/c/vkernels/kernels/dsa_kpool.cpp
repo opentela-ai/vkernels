@@ -108,7 +108,7 @@ inline uint8_t f32_to_fp8e4m3fn_rne(float fv) {
   };
   if (e_unbiased < -6) {                          // subnormal (stored exp=0)
     const uint32_t mant = round_mant(amag * 64.0f);  // amag / 2^-6 = amag*2^6
-    if (mant >= 8u) return static_cast<uint8_t>((sign << 7) | 0x08u);  // -> smallest normal
+    if (mant >= 8u) return static_cast<uint8_t>((sign << 7) | 0x08u);  // -> smallest normal  // LCOV_EXCL_LINE: amag*64 < 1 strictly in this branch, mant >= 8 unreachable
     return static_cast<uint8_t>((sign << 7) | mant);
   }
   // normal: stored_exp = e_unbiased + 7 in [1, 15]; mant = round((2*frac-1)*8)

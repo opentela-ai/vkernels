@@ -267,9 +267,9 @@ int32_t vk_make_ring_channels(int32_t world, vk_channel*** out,
       vkernels::comm::make_ring_channels(world);
   vk_channel** arr = static_cast<vk_channel**>(
       std::malloc(channels.size() * sizeof(vk_channel*)));
-  if (arr == nullptr) {
-    vkernels::capi::set_last_error(VK_ERROR_INTERNAL, "malloc failed");
-    return VK_ERROR_INTERNAL;
+  if (arr == nullptr) {  // LCOV_EXCL_LINE: malloc failure is not deterministically triggerable
+    vkernels::capi::set_last_error(VK_ERROR_INTERNAL, "malloc failed");  // LCOV_EXCL_LINE
+    return VK_ERROR_INTERNAL;  // LCOV_EXCL_LINE
   }
   for (std::size_t i = 0; i < channels.size(); ++i) {
     vk_channel_impl* c = new vk_channel_impl{};

@@ -1,0 +1,92 @@
+=== node: nid002768  date: 2026-09-17T15:39:33Z  job=640235 ===
+GPU[0]		: Card Series: 		Aqua Vanjaram [Instinct MI300A]
+GPU[0]		: Card Model: 		0x74a0
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+=== lock perf level high ===
+(setperflevel not permitted; continuing)
+GPU[0]		: mclk clock level: 3: (1300Mhz)
+GPU[0]		: sclk clock level: S: (98Mhz)
+GPU[1]		: mclk clock level: 3: (1300Mhz)
+GPU[1]		: sclk clock level: S: (102Mhz)
+=== configure (HIP, gfx942, Release) ===
+-- =================================
+-- Configuring done (5.4s)
+-- Generating done (1.2s)
+-- Build files have been written to: /capstor/scratch/cscs/xyao/vk-issue-83/build_kda
+=== build (vkernels + test_kda_chunked + kda_chunked_bench) ===
+[100%] Built target vkernels
+[ 95%] Built target vkernels
+[100%] Built target test_kda_chunked
+[ 95%] Built target vkernels
+[100%] Built target kda_chunked_bench
+
+############ 1. CORRECTNESS (test_kda_chunked) — chunked WY vs K3 oracle ############
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+--- kda_delta_rule_fwd_chunked vs naive oracle ---
+  B=1 H=1   S=64  D=16   max_abs=0.0000 max_rel=0.000003  PASS
+  B=1 H=1   S=64  D=32   max_abs=0.0000 max_rel=0.000002  PASS
+  B=1 H=1   S=64  D=64   max_abs=0.0000 max_rel=0.000005  PASS
+  B=1 H=1   S=64  D=128  max_abs=0.0000 max_rel=0.000003  PASS
+  B=1 H=16  S=64  D=64   max_abs=0.0000 max_rel=0.000005  PASS
+  B=2 H=1   S=128 D=128  max_abs=0.0000 max_rel=0.000004  PASS
+  B=1 H=1   S=512 D=64   max_abs=0.0000 max_rel=0.000005  PASS
+  B=1 H=1   S=512 D=128  max_abs=0.0000 max_rel=0.000004  PASS
+  B=1 H=8   S=512 D=128  max_abs=0.0000 max_rel=0.000006  PASS
+  B=1 H=128 S=512 D=128  max_abs=0.0000 max_rel=0.000006  PASS
+--- nonzero initial state: chunked vs cooperative ---
+  rep=0  out: max_abs=0.0000 max_rel=0.000005   final state: max_abs=0.0000 max_rel=0.000001  PASS
+  rep=1  out: max_abs=0.0000 max_rel=0.000005   final state: max_abs=0.0000 max_rel=0.000001  PASS
+
+PASS (12/12 PASS)
+
+############ 2. A/B (cooperative per-token vs chunked WY, #70) ############
+--- phase decomposition (which launch dominates) ---
+phases H=1 S=512 D=128  cumsum=22.6us gram=269.4us local=116.8us state=339.2us  (sum 748.0)
+phases H=128 S=512 D=128  cumsum=36.3us gram=1324.0us local=623.4us state=938.5us  (sum 2922.2)
+phases H=32 S=2048 D=128  cumsum=33.1us gram=1325.1us local=607.2us state=1332.8us  (sum 3298.2)
+--- A/B at the K3 shapes (bench_kda table set, roofline columns) ---
+ab coop    B=1 H=16 S=64 D=64 us(min)=147.4 us(med)=150.2 TFLOP/s=0.196 GB/s=454.1 AI=0.43 bound=mem
+ab chunked B=1 H=16 S=64 D=64 us(min)=382.1 us(med)=384.8 TFLOP/s=0.076 GB/s=177.2 AI=0.43 bound=mem
+ab H=16 S=64 D=64 coop=150.2us chunked=384.8us speedup=0.39x
+ab coop    B=1 H=1 S=64 D=16 us(min)=61.7 us(med)=64.2 TFLOP/s=0.002 GB/s=4.4 AI=0.41 bound=mem
+ab chunked B=1 H=1 S=64 D=16 us(min)=346.5 us(med)=348.5 TFLOP/s=0.000 GB/s=0.8 AI=0.41 bound=mem
+ab H=1 S=64 D=16 coop=64.2us chunked=348.5us speedup=0.18x
+ab coop    B=1 H=1 S=64 D=32 us(min)=111.0 us(med)=113.9 TFLOP/s=0.004 GB/s=9.5 AI=0.42 bound=mem
+ab chunked B=1 H=1 S=64 D=32 us(min)=343.8 us(med)=345.9 TFLOP/s=0.001 GB/s=3.1 AI=0.42 bound=mem
+ab H=1 S=64 D=32 coop=113.9us chunked=345.9us speedup=0.33x
+ab coop    B=1 H=1 S=64 D=64 us(min)=145.8 us(med)=149.1 TFLOP/s=0.012 GB/s=28.6 AI=0.43 bound=mem
+ab chunked B=1 H=1 S=64 D=64 us(min)=376.6 us(med)=379.1 TFLOP/s=0.005 GB/s=11.2 AI=0.43 bound=mem
+ab H=1 S=64 D=64 coop=149.1us chunked=379.1us speedup=0.39x
+ab coop    B=1 H=1 S=512 D=64 us(min)=1021.6 us(med)=1032.6 TFLOP/s=0.014 GB/s=33.0 AI=0.43 bound=mem
+ab chunked B=1 H=1 S=512 D=64 us(min)=528.0 us(med)=529.8 TFLOP/s=0.028 GB/s=64.4 AI=0.43 bound=mem
+ab H=1 S=512 D=64 coop=1032.6us chunked=529.8us speedup=1.95x
+ab coop    B=1 H=1 S=512 D=128 us(min)=1882.6 us(med)=1897.7 TFLOP/s=0.031 GB/s=71.3 AI=0.43 bound=mem
+ab chunked B=1 H=1 S=512 D=128 us(min)=716.4 us(med)=719.0 TFLOP/s=0.082 GB/s=188.2 AI=0.43 bound=mem
+ab H=1 S=512 D=128 coop=1897.7us chunked=719.0us speedup=2.64x
+--- full A/B table (H sweep at S=512 D=128 + long-S) ---
+ab coop    B=1 H=1 S=512 D=128 us(min)=1878.4 us(med)=1894.8 TFLOP/s=0.031 GB/s=71.4 AI=0.43 bound=mem
+ab chunked B=1 H=1 S=512 D=128 us(min)=715.2 us(med)=720.3 TFLOP/s=0.082 GB/s=187.8 AI=0.43 bound=mem
+ab H=1 S=512 D=128 coop=1894.8us chunked=720.3us speedup=2.63x
+ab coop    B=1 H=8 S=512 D=128 us(min)=1909.3 us(med)=1920.0 TFLOP/s=0.245 GB/s=563.7 AI=0.43 bound=mem
+ab chunked B=1 H=8 S=512 D=128 us(min)=730.5 us(med)=738.2 TFLOP/s=0.636 GB/s=1466.0 AI=0.43 bound=mem
+ab H=8 S=512 D=128 coop=1920.0us chunked=738.2us speedup=2.60x
+ab coop    B=1 H=16 S=512 D=128 us(min)=2874.2 us(med)=2892.9 TFLOP/s=0.325 GB/s=748.2 AI=0.43 bound=mem
+ab chunked B=1 H=16 S=512 D=128 us(min)=736.3 us(med)=740.0 TFLOP/s=1.270 GB/s=2925.0 AI=0.43 bound=mem
+ab H=16 S=512 D=128 coop=2892.9us chunked=740.0us speedup=3.91x
+ab coop    B=1 H=32 S=512 D=128 us(min)=3010.0 us(med)=3024.3 TFLOP/s=0.621 GB/s=1431.4 AI=0.43 bound=mem
+ab chunked B=1 H=32 S=512 D=128 us(min)=1103.4 us(med)=1107.4 TFLOP/s=1.697 GB/s=3909.0 AI=0.43 bound=mem
+ab H=32 S=512 D=128 coop=3024.3us chunked=1107.4us speedup=2.73x
+ab coop    B=1 H=64 S=512 D=128 us(min)=2914.7 us(med)=2928.3 TFLOP/s=1.283 GB/s=2956.7 AI=0.43 bound=mem
+ab chunked B=1 H=64 S=512 D=128 us(min)=1743.5 us(med)=1754.6 TFLOP/s=2.142 GB/s=4934.6 AI=0.43 bound=mem
+ab H=64 S=512 D=128 coop=2928.3us chunked=1754.6us speedup=1.67x
+ab coop    B=1 H=128 S=512 D=128 us(min)=3188.5 us(med)=3201.5 TFLOP/s=2.348 GB/s=5408.7 AI=0.43 bound=mem
+ab chunked B=1 H=128 S=512 D=128 us(min)=2881.9 us(med)=2935.5 TFLOP/s=2.560 GB/s=5898.8 AI=0.43 bound=mem
+ab H=128 S=512 D=128 coop=3201.5us chunked=2935.5us speedup=1.09x
+ab coop    B=1 H=32 S=1024 D=128 us(min)=5807.6 us(med)=5826.7 TFLOP/s=0.645 GB/s=1485.9 AI=0.43 bound=mem
+ab chunked B=1 H=32 S=1024 D=128 us(min)=1818.2 us(med)=1825.1 TFLOP/s=2.059 GB/s=4743.8 AI=0.43 bound=mem
+ab H=32 S=1024 D=128 coop=5826.7us chunked=1825.1us speedup=3.19x
+ab coop    B=1 H=32 S=2048 D=128 us(min)=11609.8 us(med)=11628.2 TFLOP/s=0.646 GB/s=1489.2 AI=0.43 bound=mem
+ab chunked B=1 H=32 S=2048 D=128 us(min)=3303.4 us(med)=3311.1 TFLOP/s=2.270 GB/s=5229.7 AI=0.43 bound=mem
+ab H=32 S=2048 D=128 coop=11628.2us chunked=3311.1us speedup=3.51x
+
+===== DONE 2026-09-17T15:40:01Z =====

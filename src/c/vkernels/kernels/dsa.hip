@@ -53,6 +53,7 @@
 //               Cross-checked against the oracle by test_dsa_correct.hip.
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 #include "vkernels/kernels/dsa.hpp"
 #include "vkernels/util/error.hpp"  // VK_EXPECTS (host: throws std::invalid_argument)
@@ -396,6 +397,206 @@ __global__ void dsa_sparse_fwd_partial_kernel(
         (row_sum > 0.0f) ? (row_max + log2f(row_sum)) : -INFINITY;
 }
 
+// gfx942 has no __syncwarp in this HIP toolchain (see the dsa_kpool.hip
+// note on HIP wavefront intrinsics). A warp here is one full 64-lane
+// wavefront and the LDS unit executes wave instructions in issue order,
+// so the staging stores are globally ordered before any later staged read
+// at the hardware level; the empty inline asm is only a compiler fence to
+// stop instruction scheduling from hoisting the staged LDS reads above
+// the staging stores. On a CUDA backend, __syncwarp() is the exact form.
+#if defined(__HIP__)
+#define VK_DSA_WARP_SYNC() asm volatile("" ::: "memory")
+#else
+#define VK_DSA_WARP_SYNC() __syncwarp()
+#endif
+
+template <int BQ>
+__global__ void dsa_sparse_fwd_partial_db_kernel(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ kv,
+    const int32_t* __restrict__ indices, float* __restrict__ part_out,
+    float* __restrict__ part_lse,
+    int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
+    float sm_scale, int split_kv, int kti, int pipeline) {
+  // Issue #80: double-buffered variant of dsa_sparse_fwd_partial_kernel.
+  // Key tiles are staged into LDS so the global loads of tile i+1 issue
+  // while the warp runs the online-softmax update over tile i (gfx942 has
+  // no cp.async, so latency hiding comes from issuing a tile's worth of
+  // independent loads in bulk, uint2-vectorized when W % 8 == 0).
+  // Per-key ARITHMETIC is identical to the serial kernel (same multiply
+  // order, same shfl reduction tree, same fmaxf/exp2 update sequence; the
+  // loads only move from L2 to staged LDS), so every correctness row is
+  // unchanged. `kti` (keys per tile) is sized by the host so sQ + both
+  // staging buffers stay under gfx942's 48 KB pre-attribute LDS cap.
+  const int q_tile = blockIdx.x;
+  const int h = blockIdx.y;            // kv_group == 1: one shared head_kv
+  const int s = blockIdx.z;            // which [k0,k1) chunk of the topk range
+  const int tid = threadIdx.x;
+  const int warp = tid >> 6;           // which query row within the tile
+  const int lane = tid & 63;           // strided head index this lane owns
+  const int gi = q_tile * BQ + warp;   // global query row
+  if (gi >= S_q) return;               // whole warp exits: no cross-warp LDS deps
+
+  const int W = dim + tail_dim;
+  const int d_v = dim - tail_dim;
+  const int main_tiles = (dim + 63) / 64;
+  const int tail_tiles = (tail_dim + 63) / 64;  // 0 when tail_dim == 0
+  const int v_tiles = (d_v + 63) / 64;
+
+  // This split's contiguous chunk of the per-query index range. Uneven
+  // splits stay legal: chunk boundaries need not align to anything and a
+  // tile is simply the next `kti` keys of the chunk.
+  const int k0 = (int)(((long)topk * s) / split_kv);
+  const int k1 = (int)(((long)topk * (s + 1)) / split_kv);
+
+  // Shared layout: sQ[BQ*W floats] | sKey[2*BQ*kti*W u16] | sIdx[2*BQ*kti i32],
+  // one private sKey/sIdx slice per warp (each warp streams its own query
+  // row's keys, so warp-synchronous __syncwarp() suffices, no barriers).
+  extern __shared__ float sQ[];
+  for (int idx = tid; idx < BQ * W; idx += BQ * 64) {
+    const int r = idx / W, c = idx % W;
+    const int gr = q_tile * BQ + r;
+    sQ[idx] = (gr < S_q) ? bf16_to_f32(
+                  q[((size_t)gr * H + h) * W + c])
+                         : 0.0f;
+  }
+  __syncthreads();
+
+  uint16_t* sKey = reinterpret_cast<uint16_t*>(sQ + BQ * W);
+  int32_t* sIdx = reinterpret_cast<int32_t*>(sKey + (size_t)2 * BQ * kti * W);
+
+  const float* qrow = &sQ[warp * W];  // this warp's query row (fp32)
+  const int32_t* idx_i =
+      indices + (size_t)gi * kv_group * topk;  // kv_group == 1 -> gi*topk
+
+  // Lane-local slices of the output accumulator (strided by 64 over d_v).
+  float o[kPerLane];
+  for (int t = 0; t < kPerLane; ++t) o[t] = 0.0f;
+  float row_max = -INFINITY;          // running max (same on every lane)
+  float row_sum = 0.0f;               // running denominator (same on every lane)
+
+  // Issue the global loads for key tile [tb, tb + tlen) into staging
+  // buffer `sbuf`, then a warp barrier. Written as a code block (repeated
+  // for the prologue tile and the in-loop prefetch) to keep device-lambda
+  // support assumptions out of the picture. Staging is lane-strided (NOT
+  // tid-strided): each warp stages its OWN slice, so the chunk index must
+  // restart at 0 per warp or slices of warps w > 0 would leave their first
+  // 64*w chunks unstaged (issue #80 audit fix; invisible at BQ == 1, wrong
+  // for prefill S_q > 8).
+#define VK_DSA_STAGE_TILE(sbuf_, tb_, tlen_)                                  \
+  do {                                                                        \
+    uint16_t* sdst =                                                          \
+        sKey + (size_t)(((sbuf_) * BQ + warp) * kti) * W;                     \
+    int32_t* idst = sIdx + ((sbuf_) * BQ + warp) * kti;                        \
+    if (W % 8 == 0) {                                                         \
+      const int rpp = W / 8; /* chunks (8 elements) per key row */            \
+      for (int ch = lane; ch < (tlen_) * rpp; ch += 64) {                     \
+        const int r = ch / rpp;                                               \
+        const int c = (ch - r * rpp) * 8;                                     \
+        const int32_t kv_idx = idx_i[(tb_) + r];                              \
+        idst[r] = kv_idx;                                                     \
+        /* one chunk = 8 bf16 = 16 B = uint4. The original uint2 copy moved */\
+        /* only the FIRST 4 of every 8-element chunk, leaving the odd half */ \
+        /* of every staged key row as uninitialized LDS garbage -- the     */ \
+        /* nondeterministic split-LSE corruption of issue #80 (present in */  \
+        /* both VK_DSA_DBPIPE modes; the overlap was never the culprit).   */  \
+        uint4 v = {0u, 0u, 0u, 0u};                                           \
+        if (kv_idx >= 0 && kv_idx < S_kv)                                     \
+          v = *reinterpret_cast<const uint4*>(                                \
+              kv + (size_t)kv_idx * W + c);                                   \
+        *reinterpret_cast<uint4*>(sdst + (size_t)r * W + c) = v;              \
+      }                                                                       \
+    } else {                                                                  \
+      for (int e = lane; e < (tlen_) * W; e += 64) {                          \
+        const int r = e / W;                                                  \
+        const int c = e - r * W;                                              \
+        const int32_t kv_idx = idx_i[(tb_) + r];                              \
+        idst[r] = kv_idx;                                                     \
+        sdst[(size_t)r * W + c] =                                             \
+            (kv_idx >= 0 && kv_idx < S_kv)                                    \
+                ? kv[(size_t)kv_idx * W + c]                                   \
+                : (uint16_t)0;                                                \
+      }                                                                       \
+    }                                                                         \
+    VK_DSA_WARP_SYNC(); /* staged tile visible before it is consumed */       \
+  } while (0)
+
+  // Prologue: stage the first tile into buffer 0. In the no-pipeline
+  // diagnostic mode (VK_DSA_DBPIPE=0) every tile is staged at the top of
+  // its own iteration instead — stage-then-consume with zero overlap —
+  // so a correctness difference between the modes isolates the prefetch
+  // overlap from the staging/index arithmetic.
+  if (pipeline) VK_DSA_STAGE_TILE(0, k0, (k1 - k0 < kti) ? (k1 - k0) : kti);
+
+  int buf = 0;
+  for (int tb = k0; tb < k1; tb += kti) {
+    const int te = (k1 - tb < kti) ? k1 : (tb + kti);
+    if (!pipeline) {
+      VK_DSA_STAGE_TILE(0, tb, te - tb);
+    } else if (te < k1) {  // uniform per warp; prefetch next tile into buf^1
+      VK_DSA_STAGE_TILE(buf ^ 1, te, (k1 - te < kti) ? (k1 - te) : kti);
+    }
+    for (int k = tb; k < te; ++k) {
+      const int tk = k - tb;
+      const int32_t idx = sIdx[(buf * BQ + warp) * kti + tk];
+      const uint16_t* rowp =
+          sKey + (size_t)((buf * BQ + warp) * kti + tk) * W;
+      const bool valid = (idx >= 0) && (idx < S_kv);
+
+      // --- lane-local partial score (main + tail), then warp-reduce ---
+      float partial = 0.0f;
+      if (valid) {
+        for (int t = 0; t < main_tiles; ++t) {
+          const int d = lane + t * 64;
+          if (d < dim) partial += qrow[d] * bf16_to_f32(rowp[d]);
+        }
+        for (int t = 0; t < tail_tiles; ++t) {  // 0 iters when tail_dim == 0
+          const int d = lane + t * 64;
+          if (d < tail_dim)
+            partial += qrow[dim + d] * bf16_to_f32(rowp[dim + d]);
+        }
+      }
+      float score = partial;
+      for (int off = 32; off > 0; off >>= 1)  // warp-wide sum -> broadcast
+        score += __shfl_xor(score, off);
+      // Masked keys must contribute ZERO weight, so clamp their score to
+      // -inf exactly as the CPU oracle does (else exp2(0-max)=1).
+      score = valid ? (score * sm_scale) : -INFINITY;
+
+      // --- online softmax update (lock-step; identical on every lane) ---
+      const float new_max = fmaxf(row_max, score);
+      const float exp_old =
+          (row_max == -INFINITY) ? 0.0f : exp2f(row_max - new_max);
+      const float exp_s =
+          (score == -INFINITY) ? 0.0f : exp2f(score - new_max);
+      row_sum = row_sum * exp_old + exp_s;
+      for (int t = 0; t < v_tiles; ++t) o[t] *= exp_old;
+      if (valid) {
+        for (int t = 0; t < v_tiles; ++t) {
+          const int d = lane + t * 64;
+          if (d < d_v) o[t] += exp_s * bf16_to_f32(rowp[d]);
+        }
+      }
+      row_max = new_max;
+    }
+    if (pipeline) buf ^= 1;
+    VK_DSA_WARP_SYNC(); /* buffer fully consumed before its next restaging */
+  }
+#undef VK_DSA_STAGE_TILE
+#undef VK_DSA_WARP_SYNC
+
+  // --- write the NORMALIZED per-split output (fp32, no bf16 rounding here
+  // -- the combine re-weights in fp32 and rounds once) + per-split lse ---
+  const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
+  float* porow = part_out + (((size_t)gi * H + h) * split_kv + s) * d_v;
+  for (int t = 0; t < v_tiles; ++t) {
+    const int d = lane + t * 64;
+    if (d < d_v) porow[d] = o[t] * inv;
+  }
+  if (lane == 0)
+    part_lse[((size_t)gi * H + h) * split_kv + s] =
+        (row_sum > 0.0f) ? (row_max + log2f(row_sum)) : -INFINITY;
+}
+
 __global__ void dsa_sparse_fwd_combine_kernel(
     const float* __restrict__ part_out, const float* __restrict__ part_lse,
     uint16_t* __restrict__ out, float* __restrict__ lse_out,
@@ -465,6 +666,103 @@ void launch_partial(const void* q, const void* kv, const void* indices,
       reinterpret_cast<float*>(part_out), reinterpret_cast<float*>(part_lse),
       S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, split_kv);
 }
+
+// Issue #80: double-buffered partial launch. Never launched directly by
+// callers: use launch_partial_auto below so the serial kernel stays the
+// fallback for shapes that cannot stage even one key.
+template <int BQ>
+bool launch_partial_db(const void* q, const void* kv, const void* indices,
+                       void* part_out, void* part_lse, int S_q, int S_kv,
+                       int H, int dim, int tail_dim, int topk, int kv_group,
+                       float sm_scale, int split_kv, int& kti,
+                       hipStream_t stream) {
+  // Issue #80 A/B diagnostics (bench-only, same pattern as VK_MOE_KTIME):
+  // VK_DSA_DB=0 forces the serial kernel (this returns false, so
+  // launch_partial_auto falls back); VK_DSA_DB=2 forces the db kernel,
+  // bypassing the occupancy gate below (correctness coverage for both
+  // kernels at every shape); VK_DSA_KTI=<n> overrides the auto-sized
+  // keys-per-tile (0 = auto). Read once per process.
+  static const int db_mode = [] {
+    const char* e = std::getenv("VK_DSA_DB");
+    return e ? std::atoi(e) : 1;
+  }();
+  static const int kti_ovr = [] {
+    const char* e = std::getenv("VK_DSA_KTI");
+    return e ? std::atoi(e) : 0;
+  }();
+  static const int dbpipe = [] {
+    const char* e = std::getenv("VK_DSA_DBPIPE");
+    return e ? std::atoi(e) : 1;
+  }();
+  if (db_mode == 0) return false;
+  const int W = dim + tail_dim;
+  const size_t shq = (size_t)BQ * (size_t)W * 4u;                // sQ
+  const size_t per_key = (size_t)2 * BQ * ((size_t)W * 2u + 4u); // 2 key bufs + idx
+  // gfx942 caps no-attribute dynamic shmem at 48 KB/block; budget 44 KB
+  // with margin. Auto picks kti <= 8 (more adds little once the chain is
+  // pipelined) but VK_DSA_KTI can go deeper for A/B (up to the budget).
+  constexpr size_t kCap = 44u * 1024u;
+  if (shq >= kCap) return false;
+  const int budget = (int)((kCap - shq) / per_key);
+  int new_kti = (kti_ovr > 0) ? kti_ovr : 8;
+  if (new_kti > budget) new_kti = budget;
+  if (new_kti < 1) return false;
+  kti = new_kti;
+  const size_t shmem = shq + (size_t)kti * per_key;
+  // Issue #80 occupancy gate. The staged kernel buys ILP with LDS: at the
+  // GLM decode width (BQ=1, W=256, kti=8) a block wants 9.3 KB, capping
+  // residency at 7 blocks/CU (64 KB LDS/CU on gfx942) vs the serial
+  // kernel's 1 KB (wave-limited, ~32 blocks/CU). Measured crossover
+  // (docs/performance/dsa/gfx942.md, 4 decode shapes x split sweep): the
+  // db kernel wins while the WHOLE grid fits one LDS-limited residency
+  // wave (all four shapes at split<=16, -5..-13%) and strictly loses once
+  // it spills (split>=32 rows, up to +43% at topk=2048 split=64) -- with
+  // thousands of tiny blocks, TLP already hides the serial chain and
+  // staging is pure overhead. Engage the db kernel only in its win region;
+  // VK_DSA_DB=2 bypasses this gate for diagnostics.
+  static const int num_cu = [] {
+    int dev = 0, n = 0;
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount,
+                              dev) != hipSuccess || n <= 0)
+      return 228;  // gfx942 CU count, same default as dsa_sparse_fwd_split_for
+    return n;
+  }();
+  if (db_mode == 1) {
+    const int blocks_per_cu = (int)(64u * 1024u / shmem);  // LDS 64 KB/CU
+    const long total_blocks =
+        (long)((S_q + BQ - 1) / BQ) * (long)H * (long)split_kv;
+    if ((long)blocks_per_cu * num_cu < total_blocks) return false;
+  }
+  dim3 block(BQ * 64);
+  dim3 grid((S_q + BQ - 1) / BQ, H, split_kv);
+  dsa_sparse_fwd_partial_db_kernel<BQ><<<grid, block, shmem, stream>>>(
+      reinterpret_cast<const uint16_t*>(q),
+      reinterpret_cast<const uint16_t*>(kv),
+      reinterpret_cast<const int32_t*>(indices),
+      reinterpret_cast<float*>(part_out), reinterpret_cast<float*>(part_lse),
+      S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, split_kv, kti,
+      dbpipe);
+  return true;
+}
+
+// Issue #80: dispatch the split partial through the double-buffered
+// kernel, falling back to the serial dsa_sparse_fwd_partial_kernel only
+// when the staging budget cannot even fit one key tile.
+template <int BQ>
+void launch_partial_auto(const void* q, const void* kv, const void* indices,
+                         void* part_out, void* part_lse, int S_q, int S_kv,
+                         int H, int dim, int tail_dim, int topk, int kv_group,
+                         float sm_scale, int split_kv,
+                         hipStream_t stream = nullptr) {
+  int kti = 0;
+  if (launch_partial_db<BQ>(q, kv, indices, part_out, part_lse, S_q, S_kv, H,
+                            dim, tail_dim, topk, kv_group, sm_scale,
+                            split_kv, kti, stream))
+    return;
+  launch_partial<BQ>(q, kv, indices, part_out, part_lse, S_q, S_kv, H, dim,
+                     tail_dim, topk, kv_group, sm_scale, split_kv, stream);
+}
 }  // namespace
 
 void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
@@ -515,24 +813,28 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
   int bq = 0, th = 0, bi = 0, ii = 0;
   ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
   (void)th;
-  (void)block_I;     // the partial kernel streams one key at a time, like
-  (void)inner_iter;  // the plain forward (tiled-key prefetch is a follow-on)
+  // The partial kernel now double-buffers its key tiles in LDS (issue
+  // #80); block_I/inner_iter remain cached-pipeline params, and the
+  // serial kernel stays as the fallback the launch path picks when a
+  // shape cannot stage even one key tile.
+  (void)block_I;
+  (void)inner_iter;
   if (bq <= 1)
-    launch_partial<1>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
-                      dim, tail_dim, topk, kv_group, sm_scale, split_kv,
-                      static_cast<hipStream_t>(stream));
+    launch_partial_auto<1>(q, kv, indices, partial_out, partial_lse, S_q,
+                           S_kv, H, dim, tail_dim, topk, kv_group, sm_scale,
+                           split_kv, static_cast<hipStream_t>(stream));
   else if (bq <= 2)
-    launch_partial<2>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
-                      dim, tail_dim, topk, kv_group, sm_scale, split_kv,
-                      static_cast<hipStream_t>(stream));
+    launch_partial_auto<2>(q, kv, indices, partial_out, partial_lse, S_q,
+                           S_kv, H, dim, tail_dim, topk, kv_group, sm_scale,
+                           split_kv, static_cast<hipStream_t>(stream));
   else if (bq <= 4)
-    launch_partial<4>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
-                      dim, tail_dim, topk, kv_group, sm_scale, split_kv,
-                      static_cast<hipStream_t>(stream));
+    launch_partial_auto<4>(q, kv, indices, partial_out, partial_lse, S_q,
+                           S_kv, H, dim, tail_dim, topk, kv_group, sm_scale,
+                           split_kv, static_cast<hipStream_t>(stream));
   else
-    launch_partial<8>(q, kv, indices, partial_out, partial_lse, S_q, S_kv, H,
-                      dim, tail_dim, topk, kv_group, sm_scale, split_kv,
-                      static_cast<hipStream_t>(stream));
+    launch_partial_auto<8>(q, kv, indices, partial_out, partial_lse, S_q,
+                           S_kv, H, dim, tail_dim, topk, kv_group, sm_scale,
+                           split_kv, static_cast<hipStream_t>(stream));
   dim3 cgrid(S_q, H);
   dsa_sparse_fwd_combine_kernel<<<cgrid, 64, 0, static_cast<hipStream_t>(stream)>>>(
       reinterpret_cast<const float*>(partial_out),
