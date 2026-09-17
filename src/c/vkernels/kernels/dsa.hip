@@ -416,7 +416,7 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
     const int32_t* __restrict__ indices, float* __restrict__ part_out,
     float* __restrict__ part_lse,
     int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
-    float sm_scale, int split_kv, int kti) {
+    float sm_scale, int split_kv, int kti, int pipeline) {
   // Issue #80: double-buffered variant of dsa_sparse_fwd_partial_kernel.
   // Key tiles are staged into LDS so the global loads of tile i+1 issue
   // while the warp runs the online-softmax update over tile i (gfx942 has
@@ -515,13 +515,19 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
     VK_DSA_WARP_SYNC(); /* staged tile visible before it is consumed */       \
   } while (0)
 
-  // Prologue: stage the first tile into buffer 0.
-  VK_DSA_STAGE_TILE(0, k0, (k1 - k0 < kti) ? (k1 - k0) : kti);
+  // Prologue: stage the first tile into buffer 0. In the no-pipeline
+  // diagnostic mode (VK_DSA_DBPIPE=0) every tile is staged at the top of
+  // its own iteration instead — stage-then-consume with zero overlap —
+  // so a correctness difference between the modes isolates the prefetch
+  // overlap from the staging/index arithmetic.
+  if (pipeline) VK_DSA_STAGE_TILE(0, k0, (k1 - k0 < kti) ? (k1 - k0) : kti);
 
   int buf = 0;
   for (int tb = k0; tb < k1; tb += kti) {
     const int te = (k1 - tb < kti) ? k1 : (tb + kti);
-    if (te < k1) {  // uniform per warp; prefetch the next tile into buf^1
+    if (!pipeline) {
+      VK_DSA_STAGE_TILE(0, tb, te - tb);
+    } else if (te < k1) {  // uniform per warp; prefetch next tile into buf^1
       VK_DSA_STAGE_TILE(buf ^ 1, te, (k1 - te < kti) ? (k1 - te) : kti);
     }
     for (int k = tb; k < te; ++k) {
@@ -567,7 +573,7 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
       }
       row_max = new_max;
     }
-    buf ^= 1;
+    if (pipeline) buf ^= 1;
     VK_DSA_WARP_SYNC(); /* buffer fully consumed before its next restaging */
   }
 #undef VK_DSA_STAGE_TILE
@@ -677,6 +683,10 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
     const char* e = std::getenv("VK_DSA_KTI");
     return e ? std::atoi(e) : 0;
   }();
+  static const int dbpipe = [] {
+    const char* e = std::getenv("VK_DSA_DBPIPE");
+    return e ? std::atoi(e) : 1;
+  }();
   if (db_mode == 0) return false;
   const int W = dim + tail_dim;
   const size_t shq = (size_t)BQ * (size_t)W * 4u;                // sQ
@@ -699,7 +709,8 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
       reinterpret_cast<const uint16_t*>(kv),
       reinterpret_cast<const int32_t*>(indices),
       reinterpret_cast<float*>(part_out), reinterpret_cast<float*>(part_lse),
-      S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, split_kv, kti);
+      S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, split_kv, kti,
+      dbpipe);
   return true;
 }
 
