@@ -63,22 +63,20 @@ jobs:
     # runner). The `cuda` preset compiles for the native arch (GB10: sm_121).
     runs-on: [self-hosted, cuda]
     timeout-minutes: 45
-    env:
-      CUDA_RUN: /home/xiayao/runners/cuda-run.sh vkernels-ci:cuda13
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure (CUDA release)
-        run: $CUDA_RUN cmake --preset cuda
+        run: ~/runners/cuda-run.sh vkernels-ci:cuda13 cmake --preset cuda
 
       - name: Build
-        run: $CUDA_RUN cmake --build --preset cuda -j$(nproc)
+        run: ~/runners/cuda-run.sh vkernels-ci:cuda13 cmake --build --preset cuda -j$(nproc)
 
       - name: Test
-        run: $CUDA_RUN ctest --preset cuda --output-on-failure
+        run: ~/runners/cuda-run.sh vkernels-ci:cuda13 ctest --preset cuda --output-on-failure
 
       - name: Build wheel (CUDA)
-        run: $CUDA_RUN bash -c "bash meta/scripts/build_wheel.sh --cuda --output-dir dist"
+        run: ~/runners/cuda-run.sh vkernels-ci:cuda13 bash -c "bash meta/scripts/build_wheel.sh --cuda --output-dir dist"
 
       - uses: actions/upload-artifact@v4
         with:
