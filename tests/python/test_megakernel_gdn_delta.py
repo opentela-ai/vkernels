@@ -469,9 +469,11 @@ def test_reference_gdn_conv_then_delta_matches_full_floe_forward():
     w_fir = recorder.external_tensor("w_fir", (conv_dim, K), storage_id=S_WFIR)
     qkv = recorder.linear(hid, w_qkv, name="qkv_proj")
     conv_out, conv_post = recorder.gdn_conv(conv_state, qkv, w_fir, layer=0)
-    q = recorder.view_of(recorder.narrow(conv_out, "q_flat", axis=1, start=0, length=key_dim), "gdn_q", (B, NK, HK))
-    k = recorder.view_of(recorder.narrow(conv_out, "k_flat", axis=1, start=key_dim, length=key_dim), "gdn_k", (B, NK, HK))
-    v = recorder.view_of(recorder.narrow(conv_out, "v_flat", axis=1, start=2 * key_dim, length=value_dim), "gdn_v", (B, NV, HV))
+    # per-head layout first (contiguous reshape), then group narrows
+    heads_flat = recorder.view_of(conv_out, "gdn_heads_flat", (B, NK + NK + NV, HK))
+    q = recorder.narrow(heads_flat, "gdn_q", axis=1, start=0, length=NK)
+    k = recorder.narrow(heads_flat, "gdn_k", axis=1, start=NK, length=NK)
+    v = recorder.narrow(heads_flat, "gdn_v", axis=1, start=2 * NK, length=NV)
     z = recorder.view_of(recorder.linear(hid, recorder.external_tensor("w_z", (hidden, value_dim), storage_id=S_WZ), name="z_proj"), "gdn_z", (B, NV, HV))
     a = recorder.linear(hid, recorder.external_tensor("w_a", (hidden, NV), storage_id=S_WA), name="a_proj")
     b = recorder.linear(hid, recorder.external_tensor("w_b", (hidden, NV), storage_id=S_WB), name="b_proj")
@@ -507,9 +509,16 @@ def test_reference_gdn_conv_then_delta_matches_full_floe_forward():
         721: gdn.dt_bias.detach().numpy().copy(),
         722: gdn.norm.weight.detach().numpy().copy(),
     }
-    for buf in workspace_plan.buffers:
-        sa[buf.storage_id] = np.full(buf.numel, np.nan, dtype=np.float32)
-    executor = ReferenceExecutor(schedule, workers=3, storage_arrays=sa, graph=graph, workspace_plan=workspace_plan)
+    # The executor's canaries are single-invocation (live_at_end buffers are
+    # not re-armed across run() calls), and this walk runs several invocations:
+    # rebuild the executor per step over the persistent external arrays.
+    workspace_sids = {buf.storage_id: buf.numel for buf in workspace_plan.buffers}
+
+    def make_exec():
+        arrays = dict(sa)
+        for sid, numel in workspace_sids.items():
+            arrays[sid] = np.full(numel, np.nan, dtype=np.float32)
+        return ReferenceExecutor(schedule, workers=3, storage_arrays=arrays, graph=graph, workspace_plan=workspace_plan)
 
     # oracle: real floe module, per batch row, real module states
     oracle_conv = torch.from_numpy(conv0.copy())  # [B, K-1, C]
@@ -517,6 +526,7 @@ def test_reference_gdn_conv_then_delta_matches_full_floe_forward():
     for step in range(4):
         hid_np = rng.standard_normal((B, hidden)).astype(np.float32) * 0.5
         sa[S_HID][:] = hid_np.reshape(-1)
+        executor = make_exec()
         executor.run({})
         got = np.array(executor.tensor(y.value.name), copy=True)
         assert np.isfinite(got).all(), f"step {step}: NaN canary tripped"
