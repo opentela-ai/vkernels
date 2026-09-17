@@ -1391,8 +1391,9 @@ def _t_mhc_pre(
             ss += tl.sum(v * v, axis=0)
         rstd = 1.0 / tl.sqrt(ss / HCK + RMS_EPS)
         # pass 2: the folded fn projection — logits[m] = <fn[m, :], flat>
-        # with flat = streams * rstd, plus the base bias
-        logits = tl.load(base_ptr + offs_m, mask=m_mask, other=0.0).to(tl.float32)
+        # with flat = streams * rstd. NO projection bias: floe's F.linear
+        # carries none; base enters only inside the gates below.
+        logits = tl.zeros([MIXP], dtype=tl.float32)
         for k0 in range(0, HCK, BLOCK_K):
             offs = k0 + tl.arange(0, BLOCK_K)
             kmask = offs < HCK

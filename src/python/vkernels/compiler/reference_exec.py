@@ -523,7 +523,9 @@ class ReferenceExecutor:
 
         flat = streams[bb].astype(np.float64).reshape(-1)  # [hc·C]
         flat = flat / np.sqrt(np.mean(flat * flat) + rms_eps)  # unweighted RMSNorm
-        logits = fn.astype(np.float64) @ flat + base.astype(np.float64)  # [mix]
+        # floe F.linear(flat, fn) — NO bias on the projection; base enters
+        # only inside the gates below (adding it here double-counts it)
+        logits = fn.astype(np.float64) @ flat  # [mix]
         pre_w, post_w, comb_w = (
             logits[:hc], logits[hc : 2 * hc], logits[2 * hc :].reshape(hc, hc),
         )

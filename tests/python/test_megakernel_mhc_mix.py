@@ -41,6 +41,15 @@ _SRC = _REPO / "src" / "python"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+# In torch-bearing envs an earlier-collected module may import a *pip-
+# installed* vkernels (e.g. test_vllm_experts' `from vkernels import
+# kernels`), poisoning sys.modules for the repo's vkernels.compiler. Evict
+# any vkernels modules that do not come from this repo's src tree; modules
+# that already bound the foreign package keep their references.
+for _name in [m for m in sys.modules if m == "vkernels" or m.startswith("vkernels.")]:
+    if str(_SRC) not in (getattr(sys.modules[_name], "__file__", None) or ""):
+        del sys.modules[_name]
+
 from vkernels.compiler.capture import CaptureError, RecordingBackend  # noqa: E402
 from vkernels.compiler.legality import check_graph  # noqa: E402
 from vkernels.compiler.lowerings import lower_graph  # noqa: E402
@@ -79,7 +88,8 @@ def _mirror_pre(streams, fn, base, scale, *, iters, eps, rms_eps):
     for b in range(B_):
         flat = streams[b].astype(np.float64).reshape(-1)
         flat = flat / np.sqrt(np.sum(flat * flat) / (hc * C_) + rms_eps)
-        logits = fn.astype(np.float64) @ flat + base.astype(np.float64)
+        # floe F.linear(flat, fn) — no projection bias; base only in the gates
+        logits = fn.astype(np.float64) @ flat
         pre_w, post_w = logits[:hc], logits[hc : 2 * hc]
         comb_w = logits[2 * hc :].reshape(hc, hc)
         pre_b, post_b = base[:hc], base[hc : 2 * hc]
@@ -579,13 +589,20 @@ def test_floe_deepseek_hc_parity():
     # floe oracle: eager forward + the _mhc_compose torch reference
     st = torch.from_numpy(streams).unsqueeze(1)  # [B, S=1, hc, D]
     post, comb, collapsed = hc_mod.forward(st)
-    body_out = collapsed + torch.from_numpy(w["bias"])
+    # keep body_out 3-D [B,1,d]: a 2-D body_out would make
+    # post.unsqueeze(-1) * body_out.unsqueeze(-2) broadcast [B,1,hc,1]x[B,1,d]
+    # -> [B,B,hc,d] — the exact S==1/B>1 trap floe's own _mix_logits comment
+    # documents. bias is unsqueezed to [B,1,d] instead.
+    body_out = collapsed + torch.from_numpy(w["bias"]).unsqueeze(1)
     streams_ref = (post.unsqueeze(-1) * body_out.unsqueeze(-2)
                    + comb.transpose(-1, -2) @ st)
     got_comb = _tensor(executor, handles["pre_l0"][2])
     got_post = _tensor(executor, handles["pre_l0"][1])
-    got_h = _tensor(executor, handles["pre_l0"][0])
     got_streams = _tensor(executor, handles["streams_l1"])
+    # h_in is a dead intermediate in the full chain (canary-poisoned after
+    # its last reader, §9.2) — read it from a pre-only build instead
+    executor_pre, handles_pre = _run_model(w, layers=1, iters=cfg.hc_sinkhorn_iters, hc=hc, c=d, with_body=False)
+    got_h = _tensor(executor_pre, handles_pre["pre_l0"][0])
     torch.testing.assert_close(torch.from_numpy(got_post), post.squeeze(1), rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(torch.from_numpy(got_comb), comb.squeeze(1), rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(torch.from_numpy(got_h), collapsed.squeeze(1), rtol=1e-4, atol=1e-5)
@@ -624,14 +641,21 @@ def test_floe_glm_hc_parity():
 
     st = torch.from_numpy(streams).unsqueeze(1)  # [B, S=1, hc, D]
     post, comb, collapsed = hc_mod.forward(st)
-    body_out = collapsed + torch.from_numpy(w["bias"])
+    # keep body_out 3-D [B,1,d]: a 2-D body_out would make
+    # post.unsqueeze(-1) * body_out.unsqueeze(-2) broadcast [B,1,hc,1]x[B,1,d]
+    # -> [B,B,hc,d] — the exact S==1/B>1 trap floe's own _mix_logits comment
+    # documents. bias is unsqueezed to [B,1,d] instead.
+    body_out = collapsed + torch.from_numpy(w["bias"]).unsqueeze(1)
     streams_ref = (post.unsqueeze(-1) * body_out.unsqueeze(-2)
                    + comb.transpose(-1, -2) @ st)
     got_comb = _tensor(executor, handles["pre_l0"][2])
     got_post = _tensor(executor, handles["pre_l0"][1])
     got_streams = _tensor(executor, handles["streams_l1"])
+    executor_pre, handles_pre = _run_model(w, layers=1, iters=cfg.hc_sinkhorn_iters, hc=hc, c=d, with_body=False)
+    got_h = _tensor(executor_pre, handles_pre["pre_l0"][0])
     torch.testing.assert_close(torch.from_numpy(got_post), post.squeeze(1), rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(torch.from_numpy(got_comb), comb.squeeze(1), rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(torch.from_numpy(got_h), collapsed.squeeze(1), rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(
         torch.from_numpy(got_streams), streams_ref.squeeze(1).to(torch.float32), rtol=1e-3, atol=1e-4)
 

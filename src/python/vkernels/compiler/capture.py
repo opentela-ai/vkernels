@@ -774,7 +774,7 @@ class RecordingBackend:
             source_location=f"layer {layer} mhc pre-mix",
             numerical_contract={
                 "input_norm": "flat = flatten(streams[b]) * rsqrt(mean(flat²) + rms_eps), fp32 (unweighted RMSNorm over the full hc·C vector)",
-                "projection": "logits = fn @ flat + base, one [mix=(2+hc)·hc, hc·C] GEMV per token (data-dependent)",
+                "projection": "logits = fn @ flat (F.linear, NO projection bias), one [mix=(2+hc)·hc, hc·C] GEMV per token (data-dependent); base enters only inside the gates",
                 "pre": "pre = sigmoid(pre_w·pre_s + pre_b) + eps, [hc]",
                 "post": "post = 2·sigmoid(post_w·post_s + post_b), [hc], range (0, 2)",
                 "comb": "comb = softmax((comb_w·comb_s + comb_b.view(hc, hc)), dim=-1) + eps",
