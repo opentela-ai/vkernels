@@ -1285,6 +1285,11 @@ def lower_moe_combine(op: Operator, graph: OperatorGraph) -> TaskFamily:
         outputs=(y.name,),
         params=dict(op.attributes),
         threads=THREADS_PER_WORKER,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
 def lower_index_topk(op: Operator, graph: OperatorGraph) -> TaskFamily:
     s, valid = graph.tensor(op.inputs[0]), graph.tensor(op.inputs[1])
     idx, bias = graph.tensor(op.outputs[0]), graph.tensor(op.outputs[1])
