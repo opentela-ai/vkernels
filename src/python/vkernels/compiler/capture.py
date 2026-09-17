@@ -712,7 +712,8 @@ class RecordingBackend:
         ``mix = (2 + hc)·hc``:
 
             flat    = unweighted_rms_norm(flatten(streams[b]))    # [hc·C], fp32
-            logits  = fn @ flat + base                            # [mix] GEMV
+            logits  = fn @ flat                                   # [mix] GEMV — NO bias:
+                                                                  # base enters only in the gates
             pre_w, post_w, comb_w = split(logits, [hc, hc, hc²])
             pre     = sigmoid(pre_w·pre_s + pre_b) + eps          # [hc]
             post    = 2·sigmoid(post_w·post_s + post_b)           # [hc], (0, 2)
