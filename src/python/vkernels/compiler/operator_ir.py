@@ -478,6 +478,10 @@ OP_CACHE_APPEND = "cache_append"
 # read-modify-write per row (time-major state shift), position-independent —
 # ordering comes from the state-storage hazards, not the decode position.
 OP_GDN_CONV = "gdn_conv"
+# DSA compressor entry emission (issue #96): every m-th token appends one
+# rope-rotated compressed entry to the per-layer two-series (Ca/Cb) entry
+# pool; masked per-row on the boundary condition (issue #93 positions).
+OP_COMPRESSOR_APPEND = "compressor_append"
 OP_CACHE_APPEND_PAGED = "cache_append_paged"
 OP_ATTENTION_SCORES = "attention_scores"
 OP_ATTENTION_SCORES_PAGED = "attention_scores_paged"
@@ -499,6 +503,7 @@ ARITHMETIC_OP_KINDS = (
     OP_ADD,
     OP_CACHE_APPEND,
     OP_GDN_CONV,
+    OP_COMPRESSOR_APPEND,
     OP_CACHE_APPEND_PAGED,
     OP_ATTENTION_SCORES,
     OP_ATTENTION_SCORES_PAGED,
