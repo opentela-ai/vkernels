@@ -42,6 +42,11 @@ compiled = []
 # path (torch_ops/glm_fp8_blockwise_gemm.py). Optional: without it the
 # module falls back to its pure-torch reference path (the oracle).
 cute = ["nvidia-cutlass-dsl>=4.7", "cuda-python>=13"]
+# Megakernel model compiler (src/python/vkernels/compiler/ — capture →
+# operator IR → schedule → Triton/CuTe codegen, with the GPT-2/dense-Qwen3
+# model definitions). Needs torch + triton; without them the subpackage is
+# simply not imported (the floe repo consumes it via vkernels-cli[compiler]).
+compiler = ["torch", "triton"]
 
 [project.scripts]
 vkl = "vkernels.cli.main:main"
