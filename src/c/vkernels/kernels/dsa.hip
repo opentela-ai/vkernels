@@ -396,6 +396,20 @@ __global__ void dsa_sparse_fwd_partial_kernel(
         (row_sum > 0.0f) ? (row_max + log2f(row_sum)) : -INFINITY;
 }
 
+// gfx942 has no __syncwarp in this HIP toolchain (see the dsa_kpool.hip
+// note on HIP wavefront intrinsics). A warp here is one full 64-lane
+// wavefront and the LDS unit executes wave instructions in issue order,
+// so the staging stores are globally ordered before any later staged read
+// at the hardware level; the empty inline asm is only a compiler fence to
+// stop instruction scheduling from hoisting the staged LDS reads above
+// the staging stores. On a CUDA backend, __syncwarp() is the exact form.
+#if defined(__HIP__)
+#define VK_DSA_WARP_SYNC() asm volatile("" ::: "memory")
+#else
+#define VK_DSA_WARP_SYNC() __syncwarp()
+#endif
+
+template <int BQ>
 __global__ void dsa_sparse_fwd_partial_db_kernel(
     const uint16_t* __restrict__ q, const uint16_t* __restrict__ kv,
     const int32_t* __restrict__ indices, float* __restrict__ part_out,
@@ -497,7 +511,7 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
                 : (uint16_t)0;                                                \
       }                                                                       \
     }                                                                         \
-    __syncwarp(); /* staged tile fully visible before it is consumed */       \
+    VK_DSA_WARP_SYNC(); /* staged tile visible before it is consumed */       \
   } while (0)
 
   // Prologue: stage the first tile into buffer 0.
@@ -553,9 +567,10 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
       row_max = new_max;
     }
     buf ^= 1;
-    __syncwarp(); /* buffer fully consumed before its next restaging */
+    VK_DSA_WARP_SYNC(); /* buffer fully consumed before its next restaging */
   }
 #undef VK_DSA_STAGE_TILE
+#undef VK_DSA_WARP_SYNC
 
   // --- write the NORMALIZED per-split output (fp32, no bf16 rounding here
   // -- the combine re-weights in fp32 and rounds once) + per-split lse ---
