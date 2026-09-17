@@ -216,6 +216,15 @@ void launch_gather_kernel(unsigned char* d_scratch, const unsigned char* k_src,
 // persistent device slot map. This is the "prepared gather" first stage.
 constexpr unsigned kPlanMaxGridAxis = 65535u;
 
+// Plan-execute grid cap (issue #84): the plan kernels grid-stride over the
+// PAGES (grid.y) so the grid stays independent of page count, and cap that
+// axis at this many blocks. 264 blocks x 256 threads = 67584 threads, which
+// covers the 132 SMs several times over; the stride guarantees that every
+// page is still visited for arbitrarily large page counts (unlike the old
+// one-block-per-page grid, which silently dropped pages beyond the 65535
+// CUDA grid.y limit). Same idiomatic cap as kv_gather / kv_scatter.
+constexpr int kPlanTargetBlocks = 264;
+
 // One-time int64 -> int32 device conversion (issue #36). The int64
 // device-slot plan owns its int32 slot map and fills it with this kernel so
 // no D2H sync is needed.
@@ -236,15 +245,15 @@ void launch_convert_i64(const long long* src, int* dst, int n) {
   VK_ENSURES(err == cudaSuccess, "cuda int64->int32 slot conversion launch failed");
 }
 
-// Plan donate kernel (issue #36). One block per (page, token-group) pair:
-// grid.x tiles each page's unit range, grid.y = num_pages, blockDim = 256.
-// A unit is one chunk of K plus one chunk of V for one token:
+// Plan donate kernel (issue #36; page grid-stride per issue #84). grid.x
+// tiles each page's unit range (all of it in one pass), grid.y STRIDES the
+// pages (capped at kPlanTargetBlocks in the launcher), blockDim = 256. A unit
+// is one chunk of K plus one chunk of V for one token:
 //   * vectorized path (slot_bytes % 16 == 0 and dst_offset is 16-aligned):
 //     unit = 16 bytes of K + 16 bytes of V (one uint4 each).
 //     units_per_token = slot_bytes / 16.
 //   * scalar fallback: unit = 1 byte of K + 1 byte of V.
-//     units_per_token = slot_bytes. Handles any alignment and still fills
-//     the SMs via the page*units grid (vs one block per page).
+//     units_per_token = slot_bytes. Handles any alignment.
 //
 // The unit index u (blockIdx.x*blockDim.x + threadIdx.x) maps to
 // (token, chunk) by t = u / units_per_token, chunk = u % units_per_token;
@@ -254,6 +263,13 @@ void launch_convert_i64(const long long* src, int* dst, int n) {
 // destination plus slot_bytes. Slot lookups (pages[p].slot_base[t]) are
 // broadcast across the threads of a token, so the small device-side slot
 // map is read once per token from L2.
+//
+// The per-thread unit is computed ONCE (loop-invariant in p) and the page
+// loop strides by gridDim.y, so the grid is independent of page count and
+// covers page counts above the 65535 CUDA grid.y limit that the old
+// one-block-per-page grid silently truncated. Keeping the unit check
+// outside the page loop matters: a per-unit inner loop costs ~4% at the
+// KVAAS 48 MiB point even though it executes a single iteration there.
 __global__ void p2p_kv_donate_plan_kernel(
     const unsigned char* __restrict__ k_src,
     const unsigned char* __restrict__ v_src,
@@ -261,38 +277,41 @@ __global__ void p2p_kv_donate_plan_kernel(
     int page_size, int slot_bytes, int token_stride,
     int units_per_token, int unit_bytes,
     unsigned long long dst_offset) {
-  int p = blockIdx.y;
-  if (p >= num_pages) return;
-  PagePlanDev page = pages[p];
-  unsigned char* __restrict__ base = page.dst;
-  const int* __restrict__ slots = page.slot_base;
-
-  unsigned long long u =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  unsigned long long page_units =
-      static_cast<unsigned long long>(page_size) * units_per_token;
+  const long long page_units =
+      static_cast<long long>(page_size) * units_per_token;
+  const long long u =
+      static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (u >= page_units) return;
 
-  int t = static_cast<int>(u / static_cast<unsigned long long>(units_per_token));
-  int chunk = static_cast<int>(u % static_cast<unsigned long long>(units_per_token));
-  int slot = slots[t];
-  unsigned long long off = static_cast<unsigned long long>(chunk) * unit_bytes;
-  unsigned long long slot_off = static_cast<unsigned long long>(slot) * slot_bytes;
-  const unsigned char* src_k = k_src + slot_off + off;
-  const unsigned char* src_v = v_src + slot_off + off;
-  unsigned char* dst_k = base + dst_offset + static_cast<unsigned long long>(t) * token_stride + off;
-  unsigned char* dst_v = dst_k + slot_bytes;
-  if (unit_bytes == 16) {
-    *reinterpret_cast<uint4*>(dst_k) = *reinterpret_cast<const uint4*>(src_k);
-    *reinterpret_cast<uint4*>(dst_v) = *reinterpret_cast<const uint4*>(src_v);
-  } else {
-    *dst_k = *src_k;
-    *dst_v = *src_v;
+  const int t = static_cast<int>(u / units_per_token);
+  const int chunk =
+      static_cast<int>(u - static_cast<long long>(t) * units_per_token);
+  const long long off = static_cast<long long>(chunk) * unit_bytes;
+
+  for (int p = blockIdx.y; p < num_pages; p += gridDim.y) {
+    const PagePlanDev page = pages[p];
+    const int slot = page.slot_base[t];
+    const long long slot_off = static_cast<long long>(slot) * slot_bytes;
+    const unsigned char* src_k = k_src + slot_off + off;
+    const unsigned char* src_v = v_src + slot_off + off;
+    unsigned char* dst_k = page.dst + dst_offset +
+        static_cast<long long>(t) * token_stride + off;
+    unsigned char* dst_v = dst_k + slot_bytes;
+    if (unit_bytes == 16) {
+      *reinterpret_cast<uint4*>(dst_k) =
+          *reinterpret_cast<const uint4*>(src_k);
+      *reinterpret_cast<uint4*>(dst_v) =
+          *reinterpret_cast<const uint4*>(src_v);
+    } else {
+      *dst_k = *src_k;
+      *dst_v = *src_v;
+    }
   }
 }
 
 // One launch for a whole prepared plan. tile = 256 units; grid.x tiles the
-// page's unit range, grid.y = num_pages (capped at kPlanMaxGridAxis).
+// page's unit range in a single pass, grid.y strides the pages (capped at
+// kPlanTargetBlocks) so the grid fills the SMs and covers any page count.
 void launch_plan_kernel(const unsigned char* k_src, const unsigned char* v_src,
                         const PagePlanDev* d_pages, int num_pages,
                         int page_size, int slot_bytes, int token_stride,
@@ -301,17 +320,13 @@ void launch_plan_kernel(const unsigned char* k_src, const unsigned char* v_src,
   const bool aligned = (slot_bytes % 16 == 0) && (dst_offset % 16 == 0);
   const int units_per_token = aligned ? (slot_bytes / 16) : slot_bytes;
   const int unit_bytes = aligned ? 16 : 1;
-  const unsigned long long page_units =
-      static_cast<unsigned long long>(page_size) * units_per_token;
-  const unsigned grid_x =
-      page_units == 0 ? 1u
-                      : static_cast<unsigned>((page_units + 255ull) / 256ull);
-  const unsigned grid_y =
-      static_cast<unsigned>(num_pages) < kPlanMaxGridAxis
-          ? static_cast<unsigned>(num_pages)
-          : kPlanMaxGridAxis;
+  const long long page_units =
+      static_cast<long long>(page_size) * units_per_token;
+  long long blocks_x = (page_units + 255) / 256;
+  if (blocks_x < 1) blocks_x = 1;
+  const int blocks_y = std::min(num_pages, kPlanTargetBlocks);
   dim3 block(256);
-  dim3 grid(grid_x, grid_y);
+  dim3 grid(static_cast<unsigned>(blocks_x), static_cast<unsigned>(blocks_y));
   p2p_kv_donate_plan_kernel<<<grid, block, 0, stream>>>(
       k_src, v_src, d_pages, num_pages, page_size, slot_bytes, token_stride,
       units_per_token, unit_bytes, dst_offset);
