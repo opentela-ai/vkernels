@@ -21,9 +21,15 @@ from __future__ import annotations
 
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
+
+_REPO = Path(__file__).resolve().parents[2]
+_SRC = _REPO / "src" / "python"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
 torch = pytest.importorskip("torch")
 
@@ -82,6 +88,8 @@ def _floe_decode_step(gdn: "torch.nn.Module", conv_state: "torch.Tensor", mixed_
         conv_out = silu((full * w.t()).sum(0))     # depthwise FIR
         new_conv_state = full[1:]                  # time-major shift
     """
+    # floe keeps the seq dim at seq==1: mixed_qkv arrives as [1, C].
+    mixed_qkv = mixed_qkv.reshape(1, -1)
     full = torch.cat([conv_state, mixed_qkv], dim=0)
     w = gdn.conv1d.weight.squeeze(1)
     conv_out = torch.nn.functional.silu((full * w.t()).sum(dim=0))
@@ -224,6 +232,8 @@ def test_reference_gdn_conv_walk_matches_floe_oracle(workers):
     # Oracle side: per-batch fp32 torch states, floe decode branch each step.
     oracle_states = torch.from_numpy(state0.copy())  # [B, K-1, C]
     w_t = gdn.conv1d.weight.squeeze(1)  # [C, K]
+    # The executor must run the same FIR taps as the oracle.
+    handles["storage_arrays"][STORAGE_W][:] = w_t.detach().numpy().reshape(-1)
 
     for step in range(STEPS):
         x_np = rng.standard_normal((B, CONV_DIM)).astype(np.float32)
