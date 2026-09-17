@@ -49,8 +49,8 @@ serving shape, not a theoretical optimum.
 | 4 | `glm_fp8_block_gemv` | MI300A | GLM gate/up [4096,4096], M=1 | 22.4 µs, 751 GB/s | 5300 GB/s | **14% of HBM** | instruction-issue (all paths plateau 500–800 GB/s after 3 structural rounds) | [glm53-decode-kernels](glm53-decode-kernels.md) |
 | 5 | `fused_moe_mxfp4` (decode cfg) | MI250X | E=256 h4096 i512 k6, M=48 | 10.33 ms, 351 GFLOP/s | 191 TFLOP/s/GCD | 0.18% of compute | padding waste (EM 3456 vs 288 real rows) + inline dequant ALU | [moe-fused/gfx90a](performance/moe-fused/gfx90a.md) |
 | 6 | `fused_moe_mxfp4` (decode cfg) | MI300A | same, M=48 | 4.07 ms, 890 GFLOP/s | 1307 TFLOP/s | 0.07% of compute | same | [moe-fused/gfx942](performance/moe-fused/gfx942.md) |
-| 7 | `fused_moe_mxfp4` (prefill cfg) | MI250X | E=8 h4096 i512 k2, M=2048 | 5.78 ms, 8.9 TFLOP/s | 191 TFLOP/s/GCD | **4.7% of compute** | occupancy (dequant ALU; 3 blocks/CU) | same gfx90a |
-| 8 | `fused_moe_mxfp4` (prefill cfg) | MI300A | same, M=2048 | 1.98 ms, 26.0 TFLOP/s | 1307 TFLOP/s | **2.0% of compute** | occupancy (inline E2M1 dequant dominates MFMA) | same gfx942 |
+| 7 | `fused_moe_mxfp4` (prefill cfg) | MI250X | E=8 h4096 i512 k2, M=2048 | 3.14 ms, 16.4 TFLOP/s | 191 TFLOP/s/GCD | **8.6% of compute** | prefill grid too small for the GCD count (latency-bound); narrow N tiles (#76) | same gfx90a |
+| 8 | `fused_moe_mxfp4` (prefill cfg) | MI300A | same, M=2048 | 1.176 ms, 43.8 TFLOP/s | 1307 TFLOP/s | **3.4% of compute** | prefill grid too small (512 blocks / 228 CU); inline E2M1 dequant ALU is the issue-demand ceiling | same gfx942 |
 | 9 | `fused_moe_mxfp4` (K3 routing) | MI300A | E=256 h7168 k16, M=1 | 1.108 ms, 0.020 TFLOP/s | 1307 TFLOP/s | ≪0.01% | decode padding (93.8% padded rows) | same gfx942 |
 | 10 | `mxfp4_moe_sort` | MI300A | K3 M=112, EM=2048 | 24.4 µs, 2253 GB/s | 3219 GB/s L2 | **70% of L2** | data movement, near roof | [kernels/moe_aux.md](kernels/moe_aux.md) |
 | 11 | `mxfp4_moe_scatter_reduce` | MI300A | same | 42.4 µs, 1461 GB/s | 3219 GB/s L2 | 45% of L2 | atomicAdd contention (16 rows/token) | same |
@@ -151,17 +151,35 @@ Decode (E=256, h=4096, i=512, k=6), latency and useful GFLOP/s:
 | 8 | 3.4 ms | 0.89 ms | ~30 / ~15 ms | ~17× |
 | 48 | 10.3 ms | 4.07 ms | 162 / 127 ms | 31.2× |
 
-Prefill (E=8, top_k=2, dense routing), MI300A:
+Prefill (E=8, top_k=2, dense routing), MI300A, `VK_MOE_PF_VARIANT=5` (the
+shipped default; 0 is the 64-wide baseline), acceptance job 640343.  
+TFLOP/s uses the issue's `6·k·M·h·i` accounting (2× the bench's printed units):
 
-| M | decode ms | prefill ms | prefill TFLOP/s | % of 1307 roof |
-|---:|---:|---:|---:|---:|
-| 512 | 1.209 | 0.804 | 16.0 | 1.2% |
-| 2048 | 4.982 | 1.981 | 26.0 | **2.0%** |
+| M | prefill ms (v0) | prefill ms (v5) | speedup | prefill TFLOP/s | % of 1307 roof |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 0.603 | 0.227 | 2.65× | 14.2 | 1.1% |
+| 256 | 0.615 | 0.239 | 2.58× | 27.0 | 2.1% |
+| 512 | 0.687 | 0.383 | 1.80× | 33.7 | 2.6% |
+| 1024 | 1.149 | 0.628 | 1.83× | 41.0 | 3.1% |
+| 2048 | 1.939 | 1.176 | 1.65× | 43.8 | **3.4%** |
 
-Verdict: ~1.5–2% of the compute roof, bound by the **inline E2M1 dequant
-ALU**, not the MFMA. Occupancy was the proven lever (BN 128→64 → ~1.5×);
-wavefront-specialised dequant is the follow-on. The fused kernel's win over
-the torch loop is never touching the 138 GB materialized bf16 buffer.
+Decode is untouched by the prefill variants (same job: M=2048 3.178 → 3.183
+ms, M=128 0.404 → 0.404 ms).
+
+Verdict: 1.1–3.4% of the compute roof, rising with M. The prefill kernel
+is **latency-bound, not throughput-bound**: at M=2048 the 64-wide tile
+launches only `(EM/64)×(ispp/64) = 512` blocks over MI300A's 228 CUs and
+keeps ≤2 resident blocks/CU, so the SIMDs idle on the serial
+load→dequant→MFMA chain. Narrowing the gateup N tile to 16 and the down N
+tile to 32 multiplies the gateup grid 4× and the down grid 2× for zero
+extra weight traffic, which is
+the whole 1.65× (issue #76, `VK_MOE_PF_VARIANT=5`; the literal
+wavefront-specialised split the issue proposed is implemented as variant 3,
+measured, and rejected — see [moe-fused/gfx942](performance/moe-fused/gfx942.md)).
+The **inline E2M1 dequant ALU** remains the dominant issue demand (~30×
+the MFMA issue count per K-block) and the ceiling on further gains. The
+fused kernel's win over the torch loop is never touching the 138 GB
+materialized bf16 buffer.
 (Baseline is torch, not Triton — xkernels' Triton backend SIGSEGVs under
 ROCm 6.2.4 on both gfx90a and gfx942.)
 

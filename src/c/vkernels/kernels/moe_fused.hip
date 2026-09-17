@@ -61,7 +61,20 @@ static constexpr int kWhreads  = 64;
 // kernel at 2 blocks/CU, while BN=64 (16 KB LDS + 32 accumulator VGPRs) lifts
 // it to 3 blocks/CU — measured ~1.5x faster despite halving the B-tile reuse.
 static constexpr int kBM_pf = 64, kBN_pf = 64, kBK_pf = 64;
+// Issue #76 v2: gateup N tile for the narrower-tile variant.  Total dequant
+// work is independent of the N tile, so a 32-wide tile doubles the prefill
+// grid (512 -> 1024 blocks at M=2048) and halves the per-thread accumulator
+// footprint for free; see the PrefB_pfT comment below.
+static constexpr int kBN_pf_g32 = 32;
+// Issue #76 v4/v5: a 16-wide gateup N tile quadruples the grid relative to
+// kBN_pf (512 -> 2048 blocks at M=2048) at the cost of a 4x smaller A-tile
+// reuse.  kNF == 1, so only 4 accumulator VGPRs are live.
+static constexpr int kBN_pf_g16 = 16;
 static constexpr int kThreads_pf = 256;
+// sA rows padded by 2 halfwords (=1 bank): the MFMA A-fragment read makes
+// all 16 lanes of a row group touch the same bank when the row stride is a
+// multiple of 32 banks (issue #76; the decode kernels already used kSA_P).
+static constexpr int kSA_P_pf = kBK_pf + 2;
 
 // ======================================================================
 //  Dequant helpers
@@ -375,7 +388,7 @@ __device__ __forceinline__ void mfma_k64(
 
 // Load the 64x64 A/act tile. 256 threads; each thread loads 16 bf16 (4 uint2).
 __device__ __forceinline__ void load_a_tile_pf(
-    uint16_t sA[kBM_pf][kBK_pf], const uint16_t* __restrict__ src,
+    uint16_t sA[kBM_pf][kSA_P_pf], const uint16_t* __restrict__ src,
     const int32_t* __restrict__ sorted_ids, int tk_base,
     int k_start, int stride, int M, int top_k, int tid) {
   int row = tid >> 2;                 // tid / 4 (0..63)
@@ -403,7 +416,7 @@ __device__ __forceinline__ void load_a_tile_pf(
 // Load the 64x64 act tile (stage 1).  act [EM, ispp] is indexed by SORTED ROW
 // (tk_base + row), unlike A which is indexed by token.
 __device__ __forceinline__ void load_act_tile_pf(
-    uint16_t sA[kBM_pf][kBK_pf], const uint16_t* __restrict__ act,
+    uint16_t sA[kBM_pf][kSA_P_pf], const uint16_t* __restrict__ act,
     const int32_t* __restrict__ sorted_ids, int tk_base,
     int k_start, int ispp, int M, int top_k, int tid) {
   int row = tid >> 2;
@@ -462,12 +475,156 @@ __device__ __forceinline__ void dequant_b_pf(
   }
 }
 
+// ----------------------------------------------------------------------
+// Issue #76: register-staged, N-tile-parameterised prefill tile movers.
+//
+// The baseline prefill loop touches global in three separate phases per kb
+// (load sA, dequant gate, MFMA gate, dequant up, MFMA up) with four
+// barriers, and the two dequant phases each expose the full cold-DRAM
+// latency of the packed weight stream.  With the prefill grid at ~1.7
+// blocks/CU there are not enough resident warps to hide it: profiling
+// shows ~70% of wave-cycles in SQ_WAIT_ANY.
+//
+// These helpers stage iter kb+1's packed fp4 bytes + ue8m0 scales + the A
+// tile in REGISTERS while iter kb's dequant/MFMA execute (same technique as
+// the decode PrefBTile, one iteration deeper for the 64x64 tile).  The
+// loop then has a single latency-free store/dequant phase and one barrier
+// pair per kb instead of two serialised global round trips.
+//
+// They are also the reason the N tile can be narrowed at all: the prefill
+// grid is (EM / kBM_pf) x (ispp / kBN) blocks.  With kBN=64 that is
+// 64 x 8 = 512 blocks at M=2048, i.e. only ~2.2 workgroups per CU on
+// MI300A's 228 CUs -- and of those the baseline's 107 VGPRs keep only
+// ~1.8 resident (rocprof), under 2 wavefronts per SIMD, which is less than
+// the latency of a packed-weight DRAM read exposed by the serial
+// load -> sync -> dequant -> sync -> MFMA chain.  The weight-dequant work is
+//     (EM / kBM) * ispp * hidden          (independent of kBN)
+// so narrowing the N tile multiplies the grid, and at kNF = kBN/16 divides
+// the per-thread accumulator footprint, at no extra weight traffic.  The
+// A tile is the one thing that does not amortise: it is re-read by every
+// n-block of the same m-block, so A traffic scales as 1/kBN (see the
+// dispatch comment below for the measured crossover).
+//
+//   n = tid & (kBN-1),  kp = (tid / kBN) + it * (kThreads_pf / kBN)
+// so kBN=64 gives 8 packed + 8 scale bytes/thread, kBN=32 gives 4+4, and
+// kBN=16 gives 2+2.
+// ----------------------------------------------------------------------
+template <int kBN>
+struct PrefB_pfT {
+  static constexpr int kBytesPerThread = (kBK_pf / 2) * kBN / kThreads_pf;
+  uint8_t pb[kBytesPerThread];
+  uint8_t sc[kBytesPerThread];
+};
+
+template <int kBN>
+__device__ __forceinline__ PrefB_pfT<kBN> prefetch_b_pfT(
+    const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scale,
+    int k_start, int stride_packed, int stride_scale_n, int tid) {
+  constexpr int kPackedK = kBK_pf / 2;                 // 32
+  constexpr int kBytesPerThread = (kPackedK * kBN) / kThreads_pf;
+  constexpr int kKpStep = kThreads_pf / kBN;
+  int n = tid & (kBN - 1);
+  int kp_grp = tid / kBN;
+  int kp_off = k_start / 2;
+  int sc_off = k_start / kGroupSize;
+  PrefB_pfT<kBN> p;
+#pragma unroll
+  for (int it = 0; it < kBytesPerThread; ++it) {
+    int kp = kp_grp + it * kKpStep;
+    p.pb[it] = packed[(size_t)n * stride_packed + kp_off + kp];
+    int gi = (kp * 2) / kGroupSize;
+    p.sc[it] = scale[(size_t)n * stride_scale_n + sc_off + gi];
+  }
+  return p;
+}
+
+// Bit-identical decode of a staged tile into sB (same math as dequant_b_pf).
+template <int kBN>
+__device__ __forceinline__ void dequant_b_pf_from_regsT(
+    uint16_t sB[kBK_pf][kBN], const PrefB_pfT<kBN>& p, int tid) {
+  constexpr int kBytesPerThread = ((kBK_pf / 2) * kBN) / kThreads_pf;
+  constexpr int kKpStep = kThreads_pf / kBN;
+  int n = tid & (kBN - 1);
+  int kp_grp = tid / kBN;
+#pragma unroll
+  for (int it = 0; it < kBytesPerThread; ++it) {
+    int kp = kp_grp + it * kKpStep;
+    uint8_t pb = p.pb[it];
+    float s = ue8m0_decode(p.sc[it]);
+    uint32_t flo = fp4nib_to_f32bits(pb & 0x0F);
+    float vlo; __builtin_memcpy(&vlo, &flo, sizeof(float));
+    vlo *= s; __builtin_memcpy(&flo, &vlo, sizeof(float));
+    sB[kp * 2][n] = f32bits_to_bf16(flo);
+    uint32_t fhi = fp4nib_to_f32bits((pb >> 4) & 0x0F);
+    float vhi; __builtin_memcpy(&vhi, &fhi, sizeof(float));
+    vhi *= s; __builtin_memcpy(&fhi, &vhi, sizeof(float));
+    sB[kp * 2 + 1][n] = f32bits_to_bf16(fhi);
+  }
+}
+
+// 64x64 A/act tile staged in registers (4 uint2 = 16 bf16 per thread).
+struct PrefA_pf { uint2 v[4]; };
+
+__device__ __forceinline__ PrefA_pf prefetch_a_pf(
+    const uint16_t* __restrict__ src, const int32_t* __restrict__ sorted_ids,
+    int tk_base, int k_start, int stride, int M, int top_k, int tid) {
+  int row = tid >> 2;
+  int base_col = (tid & 3) * 16;
+  PrefA_pf p;
+  int flat = sorted_ids[tk_base + row];
+  int N = M * top_k;
+  if (flat < N) {
+    int token = flat / top_k;
+    const uint32_t* s =
+        (const uint32_t*)(&src[(size_t)token * stride + k_start + base_col]);
+#pragma unroll
+    for (int g = 0; g < 4; ++g) p.v[g] = *(const uint2*)(s + g * 2);
+  } else {
+#pragma unroll
+    for (int g = 0; g < 4; ++g) p.v[g] = make_uint2(0, 0);
+  }
+  return p;
+}
+
+// act [EM, ispp] is indexed by sorted row, unlike A which is indexed by token.
+__device__ __forceinline__ PrefA_pf prefetch_act_pf(
+    const uint16_t* __restrict__ act, const int32_t* __restrict__ sorted_ids,
+    int tk_base, int k_start, int ispp, int M, int top_k, int tid) {
+  int row = tid >> 2;
+  int base_col = (tid & 3) * 16;
+  PrefA_pf p;
+  int flat = sorted_ids[tk_base + row];
+  int N = M * top_k;
+  if (flat < N) {
+    const uint32_t* s = (const uint32_t*)(&act[(size_t)(tk_base + row) * ispp
+                                              + k_start + base_col]);
+#pragma unroll
+    for (int g = 0; g < 4; ++g) p.v[g] = *(const uint2*)(s + g * 2);
+  } else {
+#pragma unroll
+    for (int g = 0; g < 4; ++g) p.v[g] = make_uint2(0, 0);
+  }
+  return p;
+}
+
+__device__ __forceinline__ void store_a_pf_from_regs(
+    uint16_t sA[kBM_pf][kSA_P_pf], const PrefA_pf& p, int tid) {
+  int row = tid >> 2;
+  int base_col = (tid & 3) * 16;
+#pragma unroll
+  for (int g = 0; g < 4; ++g) {
+    uint32_t* dst = (uint32_t*)(&sA[row][base_col + g * 4]);
+    dst[0] = p.v[g].x;
+    dst[1] = p.v[g].y;
+  }
+}
+
 // Run the K=64 MFMA loop over kBN/16 column fragments for one 16-row
 // fragment.  Each wavefront (warp) owns row fragment warp (rows warp*16..+16)
 // and accumulates acc[nf] += sA[row_frag] x sB[:, nf*16..+16].
 template <int kBN>
 __device__ __forceinline__ void mfma_k64_pf(
-    v4f acc[kBN / 16], const uint16_t sA[kBM_pf][kBK_pf],
+    v4f acc[kBN / 16], const uint16_t sA[kBM_pf][kSA_P_pf],
     const uint16_t sB[kBK_pf][kBN], int warp, int lane) {
   constexpr int kNF = kBN / 16;
   int m = lane & 15;          // row within 16-row fragment
@@ -734,7 +891,7 @@ void gateup_swiglu_kernel_prefill(
     int activation, float beta, float linear_beta, int has_bias) {
 
   constexpr int kNF = kBN / 16;
-  __shared__ uint16_t sA[kBM_pf][kBK_pf];
+  __shared__ uint16_t sA[kBM_pf][kSA_P_pf];
   __shared__ uint16_t sB[kBK_pf][kBN];  // reused for gate then up
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
@@ -823,7 +980,7 @@ void down_combine_kernel_prefill(
     int ispp, int hidden, int M, int top_k, int has_bias) {
 
   constexpr int kNF = kBN / 16;
-  __shared__ uint16_t sA[kBM_pf][kBK_pf];
+  __shared__ uint16_t sA[kBM_pf][kSA_P_pf];
   __shared__ uint16_t sB[kBK_pf][kBN];
 
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
@@ -857,6 +1014,341 @@ void down_combine_kernel_prefill(
 
     mfma_k64_pf(acc, sA, sB, warp, lane);
     __syncthreads();
+  }
+
+  int col = lane & 15;
+  int row_base = warp * 16 + (lane >> 4) * 4;
+#pragma unroll
+  for (int nf = 0; nf < kNF; ++nf) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      int flat = sorted_ids[tk_base + row_base + i];
+      if (flat < M * top_k) {
+        int token = flat / top_k;
+        float v = acc[nf][i];
+        if (has_bias)
+          v += b2[(size_t)expert * hidden + n_global + nf * 16 + col];
+        v *= topk_ws[flat];
+        int oc = n_global + nf * 16 + col;
+        if (oc < hidden)
+          atomicAdd(&out[(size_t)token * hidden + oc], v);
+      }
+    }
+  }
+}
+
+// ======================================================================
+//  Prefill, software-pipelined + K-major-aware (issue #76)
+//
+//  Same 64x64/256-thread tiling as the kernels above, but:
+//   * sBg and sBu are separate so gate and up dequant issue back-to-back
+//     (2x memory-level parallelism) and share one barrier pair per kb,
+//   * iter kb+1's A tile + packed fp4 weights + scales are staged in
+//     registers while iter kb runs, so the store/dequant phase has no
+//     exposed DRAM latency (same idea as the decode PrefBTile, depth 2),
+//   * sA rows are padded to kSA_P_pf, removing the 16-way A-fragment LDS
+//     bank conflict the unpadded prefill tile had.
+// ======================================================================
+template <int kBN>
+__global__ __launch_bounds__(kThreads_pf, 2)
+void gateup_swiglu_kernel_prefill_pipe(
+    const uint16_t* __restrict__ A,
+    const uint8_t*  __restrict__ w13,
+    const uint8_t*  __restrict__ w13_scale,
+    const float*    __restrict__ b13,
+    uint16_t*       __restrict__ act,
+    const int32_t*  __restrict__ sorted_ids,
+    const int32_t*  __restrict__ expert_ids,
+    int hidden, int ispp, int M, int top_k, float swiglu_limit,
+    int activation, float beta, float linear_beta, int has_bias) {
+
+  constexpr int kNF = kBN / 16;
+  __shared__ uint16_t sA[kBM_pf][kSA_P_pf];
+  __shared__ uint16_t sBg[kBK_pf][kBN];
+  __shared__ uint16_t sBu[kBK_pf][kBN];
+
+  int pid_m = blockIdx.x, pid_n = blockIdx.y;
+  int expert = expert_ids[pid_m];
+  if (expert < 0) return;
+
+  int tk_base = pid_m * kBM_pf;
+  const size_t w13_bytes  = 2 * (size_t)ispp * (hidden / 2);
+  const size_t w13s_bytes = 2 * (size_t)ispp * (hidden / kGroupSize);
+  int tid = threadIdx.x;
+  int lane = tid & 63;
+  int warp = tid >> 6;
+  int n_global = pid_n * kBN;
+
+  const uint8_t* bp_gate = w13 + expert * w13_bytes
+      + (size_t)n_global * (hidden / 2);
+  const uint8_t* sc_gate = w13_scale + expert * w13s_bytes
+      + (size_t)n_global * (hidden / kGroupSize);
+  const uint8_t* bp_up = w13 + expert * w13_bytes
+      + (size_t)(n_global + ispp) * (hidden / 2);
+  const uint8_t* sc_up = w13_scale + expert * w13s_bytes
+      + (size_t)(n_global + ispp) * (hidden / kGroupSize);
+
+  v4f acc_g[kNF], acc_u[kNF];
+#pragma unroll
+  for (int nf = 0; nf < kNF; ++nf) {
+    acc_g[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
+    acc_u[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
+  }
+
+  const int nkb = hidden / kBK_pf;
+  const int sp = hidden / 2, ss = hidden / kGroupSize;
+  // Register ring, depth 2 (kb, kb+1, kb+2 held).
+  PrefA_pf pa0 = prefetch_a_pf(A, sorted_ids, tk_base, 0, hidden, M, top_k, tid);
+  PrefB_pfT<kBN> pg0 = prefetch_b_pfT<kBN>(bp_gate, sc_gate, 0, sp, ss, tid);
+  PrefB_pfT<kBN> pu0 = prefetch_b_pfT<kBN>(bp_up, sc_up, 0, sp, ss, tid);
+  PrefA_pf pa1; PrefB_pfT<kBN> pg1, pu1;
+  if (nkb > 1) {
+    pa1 = prefetch_a_pf(A, sorted_ids, tk_base, kBK_pf, hidden, M, top_k, tid);
+    pg1 = prefetch_b_pfT<kBN>(bp_gate, sc_gate, kBK_pf, sp, ss, tid);
+    pu1 = prefetch_b_pfT<kBN>(bp_up, sc_up, kBK_pf, sp, ss, tid);
+  }
+
+  for (int kb = 0; kb < nkb; ++kb) {
+    PrefA_pf pa2; PrefB_pfT<kBN> pg2, pu2;
+    if (kb + 2 < nkb) {
+      int ks = (kb + 2) * kBK_pf;
+      pa2 = prefetch_a_pf(A, sorted_ids, tk_base, ks, hidden, M, top_k, tid);
+      pg2 = prefetch_b_pfT<kBN>(bp_gate, sc_gate, ks, sp, ss, tid);
+      pu2 = prefetch_b_pfT<kBN>(bp_up, sc_up, ks, sp, ss, tid);
+    }
+    store_a_pf_from_regs(sA, pa0, tid);
+    dequant_b_pf_from_regsT<kBN>(sBg, pg0, tid);
+    dequant_b_pf_from_regsT<kBN>(sBu, pu0, tid);
+    __syncthreads();
+
+    mfma_k64_pf(acc_g, sA, sBg, warp, lane);
+    mfma_k64_pf(acc_u, sA, sBu, warp, lane);
+    __syncthreads();
+    pa0 = pa1; pg0 = pg1; pu0 = pu1;
+    pa1 = pa2; pg1 = pg2; pu1 = pu2;
+  }
+
+  int col = lane & 15;
+  int row_base = warp * 16 + (lane >> 4) * 4;
+#pragma unroll
+  for (int nf = 0; nf < kNF; ++nf) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      int flat = sorted_ids[tk_base + row_base + i];
+      if (flat < M * top_k) {
+        float g = acc_g[nf][i];
+        if (has_bias)
+          g += b13[(size_t)expert * 2 * ispp + n_global + nf * 16 + col];
+        float u = acc_u[nf][i];
+        if (has_bias)
+          u += b13[(size_t)expert * 2 * ispp + n_global + nf * 16 + col + ispp];
+
+        act[(size_t)(tk_base + row_base + i) * ispp + n_global + nf * 16 + col] =
+            f2bf(epilogue_act(activation, g, u, beta, linear_beta, swiglu_limit));
+      }
+    }
+  }
+}
+
+// ----------------------------------------------------------------------
+// Issue #76 v3: producer/consumer wavefront specialisation.
+//
+// Eight wavefronts per block: warps 0-3 are consumers (MFMA only),
+// warps 4-7 are producers (A staging + gate/up fp4->bf16 dequant only).
+// The A/B stage buffers are double-buffered, so one barrier pair per kb
+// covers both the "stage ready" and "stage consumed" hand-offs.
+//
+// Producers own 256 threads, i.e. exactly the thread mapping the v1/v2
+// tile movers already assume, so prefetch_a_pf / prefetch_b_pfT /
+// store_a_pf_from_regs / dequant_b_pf_from_regsT are reused verbatim with
+// tid = threadIdx.x - kThreads_pf.
+//
+// This is the mechanism the issue asks for.  It is worth knowing that the
+// dequant ALU demand is ~31x the MFMA issue demand -- counted off the
+// gfx942 ISA with meta/scripts/isa_inst_mix.py, the kb loop body of this
+// kernel is 495 non-MFMA VALU warp-instructions against 16 MFMA
+// warp-instructions (2 x 64 x 32 fp4 elements, ~4 lane-ALU ops each), and
+// the non-specialised pipe<16> tiles are 241 vs 8, i.e. the same ~30x --
+// so the split cannot reduce the critical resource: it only
+// parks half the resident wavefronts while the producer half still issues
+// all the ALU on the same four SIMDs.  Measured against v2
+// it is a regression; the prefill-variants section of
+// docs/kernels/moe_fused.md and docs/performance/moe-fused/gfx942.md
+// record the numbers and the reasoning.
+// ----------------------------------------------------------------------
+template <int kBN>
+__global__ __launch_bounds__(2 * kThreads_pf)
+void gateup_swiglu_kernel_prefill_ws(
+    const uint16_t* __restrict__ A,
+    const uint8_t*  __restrict__ w13,
+    const uint8_t*  __restrict__ w13_scale,
+    const float*    __restrict__ b13,
+    uint16_t*       __restrict__ act,
+    const int32_t*  __restrict__ sorted_ids,
+    const int32_t*  __restrict__ expert_ids,
+    int hidden, int ispp, int M, int top_k, float swiglu_limit,
+    int activation, float beta, float linear_beta, int has_bias) {
+
+  constexpr int kNF = kBN / 16;
+  __shared__ uint16_t sA[2][kBM_pf][kSA_P_pf];
+  __shared__ uint16_t sBg[2][kBK_pf][kBN];
+  __shared__ uint16_t sBu[2][kBK_pf][kBN];
+
+  int pid_m = blockIdx.x, pid_n = blockIdx.y;
+  int expert = expert_ids[pid_m];
+  if (expert < 0) return;
+
+  int tk_base = pid_m * kBM_pf;
+  const size_t w13_bytes  = 2 * (size_t)ispp * (hidden / 2);
+  const size_t w13s_bytes = 2 * (size_t)ispp * (hidden / kGroupSize);
+  int tid = threadIdx.x;
+  int lane = tid & 63;
+  int warp = tid >> 6;
+  bool producer = warp >= 4;
+  int ptid = tid - kThreads_pf;           // producer-local tid in [0,256)
+  int n_global = pid_n * kBN;
+
+  const uint8_t* bp_gate = w13 + expert * w13_bytes
+      + (size_t)n_global * (hidden / 2);
+  const uint8_t* sc_gate = w13_scale + expert * w13s_bytes
+      + (size_t)n_global * (hidden / kGroupSize);
+  const uint8_t* bp_up = w13 + expert * w13_bytes
+      + (size_t)(n_global + ispp) * (hidden / 2);
+  const uint8_t* sc_up = w13_scale + expert * w13s_bytes
+      + (size_t)(n_global + ispp) * (hidden / kGroupSize);
+
+  v4f acc_g[kNF], acc_u[kNF];
+#pragma unroll
+  for (int nf = 0; nf < kNF; ++nf) {
+    acc_g[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
+    acc_u[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
+  }
+
+  const int nkb = hidden / kBK_pf;
+  const int sp = hidden / 2, ss = hidden / kGroupSize;
+
+  // Prologue: producers fill stage 0 before the first barrier.
+  PrefA_pf pa; PrefB_pfT<kBN> pg, pu;
+  if (producer) {
+    pa = prefetch_a_pf(A, sorted_ids, tk_base, 0, hidden, M, top_k, ptid);
+    pg = prefetch_b_pfT<kBN>(bp_gate, sc_gate, 0, sp, ss, ptid);
+    pu = prefetch_b_pfT<kBN>(bp_up, sc_up, 0, sp, ss, ptid);
+    store_a_pf_from_regs(sA[0], pa, ptid);
+    dequant_b_pf_from_regsT<kBN>(sBg[0], pg, ptid);
+    dequant_b_pf_from_regsT<kBN>(sBu[0], pu, ptid);
+  }
+
+  for (int kb = 0; kb < nkb; ++kb) {
+    __syncthreads();                       // B1: stage kb is ready
+    if (!producer) {
+      mfma_k64_pf(acc_g, sA[kb & 1], sBg[kb & 1], warp, lane);
+      mfma_k64_pf(acc_u, sA[kb & 1], sBu[kb & 1], warp, lane);
+    } else if (kb + 1 < nkb) {
+      // Issue the next stage's cold loads while the consumers run MFMA.
+      int ks = (kb + 1) * kBK_pf;
+      pa = prefetch_a_pf(A, sorted_ids, tk_base, ks, hidden, M, top_k, ptid);
+      pg = prefetch_b_pfT<kBN>(bp_gate, sc_gate, ks, sp, ss, ptid);
+      pu = prefetch_b_pfT<kBN>(bp_up, sc_up, ks, sp, ss, ptid);
+    }
+    __syncthreads();                       // B2: stage kb is consumed
+    if (producer && kb + 1 < nkb) {
+      // buf[(kb+1)&1] == buf[(kb-1)&1], read only in iteration kb-1,
+      // so B2 (which is after B2 of kb-1) makes the overwrite safe.
+      store_a_pf_from_regs(sA[(kb + 1) & 1], pa, ptid);
+      dequant_b_pf_from_regsT<kBN>(sBg[(kb + 1) & 1], pg, ptid);
+      dequant_b_pf_from_regsT<kBN>(sBu[(kb + 1) & 1], pu, ptid);
+    }
+  }
+
+  if (producer) return;
+
+  int col = lane & 15;
+  int row_base = warp * 16 + (lane >> 4) * 4;
+#pragma unroll
+  for (int nf = 0; nf < kNF; ++nf) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      int flat = sorted_ids[tk_base + row_base + i];
+      if (flat < M * top_k) {
+        float g = acc_g[nf][i];
+        if (has_bias)
+          g += b13[(size_t)expert * 2 * ispp + n_global + nf * 16 + col];
+        float u = acc_u[nf][i];
+        if (has_bias)
+          u += b13[(size_t)expert * 2 * ispp + n_global + nf * 16 + col + ispp];
+
+        act[(size_t)(tk_base + row_base + i) * ispp + n_global + nf * 16 + col] =
+            f2bf(epilogue_act(activation, g, u, beta, linear_beta, swiglu_limit));
+      }
+    }
+  }
+}
+
+// Down GEMM equivalent: register-staged act tile + weight tile, one barrier
+// pair per kb, padded sA rows.
+template <int kBN>
+__global__ __launch_bounds__(kThreads_pf, 2)
+void down_combine_kernel_prefill_pipe(
+    const uint16_t* __restrict__ act,
+    const uint8_t*  __restrict__ w2,
+    const uint8_t*  __restrict__ w2_scale,
+    const float*    __restrict__ b2,
+    float*          __restrict__ out,
+    const float*    __restrict__ topk_ws,
+    const int32_t*  __restrict__ sorted_ids,
+    const int32_t*  __restrict__ expert_ids,
+    int ispp, int hidden, int M, int top_k, int has_bias) {
+
+  constexpr int kNF = kBN / 16;
+  __shared__ uint16_t sA[kBM_pf][kSA_P_pf];
+  __shared__ uint16_t sB[kBK_pf][kBN];
+
+  int pid_m = blockIdx.x, pid_n = blockIdx.y;
+  int expert = expert_ids[pid_m];
+  if (expert < 0) return;
+
+  int tk_base = pid_m * kBM_pf;
+  const size_t w2_bytes  = (size_t)hidden * (ispp / 2);
+  const size_t w2s_bytes = (size_t)hidden * (ispp / kGroupSize);
+  int tid = threadIdx.x;
+  int lane = tid & 63;
+  int warp = tid >> 6;
+  int n_global = pid_n * kBN;
+
+  const uint8_t* bp = w2 + expert * w2_bytes
+      + (size_t)n_global * (ispp / 2);
+  const uint8_t* sc = w2_scale + expert * w2s_bytes
+      + (size_t)n_global * (ispp / kGroupSize);
+
+  v4f acc[kNF];
+#pragma unroll
+  for (int nf = 0; nf < kNF; ++nf) acc[nf] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  const int nkb = ispp / kBK_pf;
+  const int sp = ispp / 2, ss = ispp / kGroupSize;
+  PrefA_pf pa0 = prefetch_act_pf(act, sorted_ids, tk_base, 0, ispp, M, top_k, tid);
+  PrefB_pfT<kBN> pb0 = prefetch_b_pfT<kBN>(bp, sc, 0, sp, ss, tid);
+  PrefA_pf pa1; PrefB_pfT<kBN> pb1;
+  if (nkb > 1) {
+    pa1 = prefetch_act_pf(act, sorted_ids, tk_base, kBK_pf, ispp, M, top_k, tid);
+    pb1 = prefetch_b_pfT<kBN>(bp, sc, kBK_pf, sp, ss, tid);
+  }
+
+  for (int kb = 0; kb < nkb; ++kb) {
+    PrefA_pf pa2; PrefB_pfT<kBN> pb2;
+    if (kb + 2 < nkb) {
+      int ks = (kb + 2) * kBK_pf;
+      pa2 = prefetch_act_pf(act, sorted_ids, tk_base, ks, ispp, M, top_k, tid);
+      pb2 = prefetch_b_pfT<kBN>(bp, sc, ks, sp, ss, tid);
+    }
+    store_a_pf_from_regs(sA, pa0, tid);
+    dequant_b_pf_from_regsT<kBN>(sB, pb0, tid);
+    __syncthreads();
+
+    mfma_k64_pf(acc, sA, sB, warp, lane);
+    __syncthreads();
+    pa0 = pa1; pb0 = pb1;
+    pa1 = pa2; pb1 = pb2;
   }
 
   int col = lane & 15;
@@ -940,22 +1432,101 @@ void fused_moe_mxfp4(
   if (block_size >= kBM_pf) {
     // Prefill regime: 64x64 tiles, 256 threads.  The caller must have
     // aligned expert_ids per 64-row block (EM % 64 == 0).
+    // VK_MOE_PF_VARIANT selects the prefill kernel implementation (issue
+    // #76): 0 = baseline, 1 = register-staged pipeline + padded sA,
+    // 2 = variant 1 with a 32-wide gateup N tile, 3 = producer/consumer
+    // wavefront-specialised gateup, 4 = variant 2 with a 16-wide gateup N
+    // tile, 5 = variant 4 plus a 32-wide down N tile.
+    //
+    // The default is 5.  The prefill gateup kernel is latency-bound at the
+    // shapes that matter (at M=2048, ispp=512 the 64-wide tile launches
+    // only 64 x 8 = 512 blocks, i.e. ~2.2 workgroups per CU).
+    // Weight (dequant) traffic and MFMA work are independent of the N
+    // tile, but the *A-tile* traffic is not: it scales as 1/kBN, because
+    // every (EM/64, ispp/kBN) block reloads the same 64x64 A tile per kb.
+    // At M=2048 that is 256 MB of A reads at kBN=64 against 1 GB at
+    // kBN=16, which is exactly the ~1.4% edge kBN=32 keeps at that M;
+    // below it the A traffic is 4x smaller and the parallelism win
+    // dominates.  Measured on MI300A (see
+    // docs/performance/moe-fused/gfx942.md): 2.61x at M=128, 1.77x at
+    // M=512, 1.82x at M=1024, 1.68x at M=2048 over variant 0.
+    static const int pf_variant = [] {
+      const char* s = std::getenv("VK_MOE_PF_VARIANT");
+      return s ? std::atoi(s) : 5;
+    }();
     {
-      dim3 g(EM / kBM_pf, ispp / kBN_pf);
-      VK_TBEGIN();
-      gateup_swiglu_kernel_prefill<kBN_pf><<<g, kThreads_pf, 0, hipstream>>>(
-          A, w13, w13_scale, b13, act_scratch,
-          sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
-          activation, beta, linear_beta, b13 != nullptr);
-      VK_TEND("gateup");
+      if (pf_variant == 2) {
+        dim3 g(EM / kBM_pf, ispp / kBN_pf_g32);
+        VK_TBEGIN();
+        gateup_swiglu_kernel_prefill_pipe<kBN_pf_g32>
+            <<<g, kThreads_pf, 0, hipstream>>>(
+            A, w13, w13_scale, b13, act_scratch,
+            sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
+            activation, beta, linear_beta, b13 != nullptr);
+        VK_TEND("gateup");
+      } else if (pf_variant == 4 || pf_variant == 5) {
+        dim3 g(EM / kBM_pf, ispp / kBN_pf_g16);
+        VK_TBEGIN();
+        gateup_swiglu_kernel_prefill_pipe<kBN_pf_g16>
+            <<<g, kThreads_pf, 0, hipstream>>>(
+            A, w13, w13_scale, b13, act_scratch,
+            sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
+            activation, beta, linear_beta, b13 != nullptr);
+        VK_TEND("gateup");
+      } else if (pf_variant == 3) {
+        dim3 g(EM / kBM_pf, ispp / kBN_pf_g32);
+        VK_TBEGIN();
+        gateup_swiglu_kernel_prefill_ws<kBN_pf_g32>
+            <<<g, 2 * kThreads_pf, 0, hipstream>>>(
+            A, w13, w13_scale, b13, act_scratch,
+            sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
+            activation, beta, linear_beta, b13 != nullptr);
+        VK_TEND("gateup");
+      } else {
+        // v0 (baseline) and v1 (register-staged pipeline, 64-wide tile).
+        dim3 g(EM / kBM_pf, ispp / kBN_pf);
+        VK_TBEGIN();
+        if (pf_variant == 1)
+          gateup_swiglu_kernel_prefill_pipe<kBN_pf>
+              <<<g, kThreads_pf, 0, hipstream>>>(
+              A, w13, w13_scale, b13, act_scratch,
+              sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
+              activation, beta, linear_beta, b13 != nullptr);
+        else
+          gateup_swiglu_kernel_prefill<kBN_pf>
+              <<<g, kThreads_pf, 0, hipstream>>>(
+              A, w13, w13_scale, b13, act_scratch,
+              sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
+              activation, beta, linear_beta, b13 != nullptr);
+        VK_TEND("gateup");
+      }
     }
     {
-      dim3 g(EM / kBM_pf, hidden / kBN_pf);
-      VK_TBEGIN();
-      down_combine_kernel_prefill<kBN_pf><<<g, kThreads_pf, 0, hipstream>>>(
-          act_scratch, w2, w2_scale, b2, out, topk_w,
-          sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
-      VK_TEND("down");
+      // v5 keeps the narrow N tile through the down GEMM as well; every
+      // other variant uses the 64-wide tile (the down grid is
+      // (EM/64) x (hidden/64), already 4096 blocks at the default shape).
+      if (pf_variant == 5) {
+        dim3 g(EM / kBM_pf, hidden / kBN_pf_g32);
+        VK_TBEGIN();
+        down_combine_kernel_prefill_pipe<kBN_pf_g32>
+            <<<g, kThreads_pf, 0, hipstream>>>(
+            act_scratch, w2, w2_scale, b2, out, topk_w,
+            sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
+        VK_TEND("down");
+      } else {
+        dim3 g(EM / kBM_pf, hidden / kBN_pf);
+        VK_TBEGIN();
+        if (pf_variant >= 1 && pf_variant <= 4)
+          down_combine_kernel_prefill_pipe<kBN_pf>
+              <<<g, kThreads_pf, 0, hipstream>>>(
+              act_scratch, w2, w2_scale, b2, out, topk_w,
+              sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
+        else
+          down_combine_kernel_prefill<kBN_pf><<<g, kThreads_pf, 0, hipstream>>>(
+              act_scratch, w2, w2_scale, b2, out, topk_w,
+              sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
+        VK_TEND("down");
+      }
     }
   } else {
     // Decode regime: 16x64 tiles, 64 threads (1 wavefront), blockIdx.z

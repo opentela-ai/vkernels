@@ -1,0 +1,2866 @@
+# Issue #76 — prefill variant sweep and acceptance on MI300A (gfx942) and
+# MI250X (gfx90a).  Every section prints the `src hip md5` of the kernel it
+# was built from; the shipped default is variant 5.
+#
+#   640186  MI300A nid002510  sweep v0/v1/v2/v3 + prefill correctness
+#   640188  MI250X nid002536  sweep v0/v1/v2/v3 + prefill correctness
+#   640189  MI250X nid002536  sweep v2/v4/v5 + prefill correctness
+#   640190  MI300A nid002490  sweep v2/v4/v5
+#   640193  MI300A nid002676  v0 vs unset default + correctness
+#   640195  MI300A nid002776  acceptance (decode+prefill+bigshape, then v0 vs v5)
+#   640196  MI300A nid002518  acceptance on md5 e6b31c77
+#   640198  MI300A nid002514  acceptance on md5 e6b31c77
+#   640199  MI300A nid002514  acceptance on md5 568210e3
+#   640208  MI300A nid002354  acceptance on md5 91d25dcf
+#   640214  MI300A nid002710  variant sweep, md5 bbd7e518
+#   640236  MI300A nid002676  rocprof counters on md5 91d25dcf (superseded by
+#                             640346; kept for the ISA-count cross-check)
+#   640238  MI250X nid002574  variant sweep, md5 bbd7e518
+#   640239  MI300A nid002348  acceptance on md5 bbd7e518
+#   640330  MI300A nid002676  rocprof counters, md5 bbd7e518
+#   640343  MI300A nid003030  FINAL acceptance, md5 85dfaee9 (the run the docs
+#                             quote)
+#   640344  MI300A              FINAL variant sweep, md5 85dfaee9
+#   640345  MI250X              FINAL variant sweep, md5 85dfaee9
+#   640346  MI300A              rocprof counters, md5 85dfaee9 (the counters
+#                             table the docs quote)
+#
+# The committed source is md5 66e82f4d; the acceptance/sweep jobs above were
+# built from 85dfaee9, which differs from it only in comments -- recompiling
+# the committed tree for gfx942 produces an identical AMDGPU instruction
+# stream (verified: 35,207 instruction lines byte-identical after stripping
+# comments and directives).  bbd7e518, 91d25dcf and 85dfaee9 differ
+# only in comments; the `.s` instruction bodies of all six prefill kernels are
+# byte-identical across them (verified per-kernel, see the run-to-run stability
+# note in gfx942.md), which is what makes the spread across these runs
+# run-to-run variance rather than a code difference.
+#
+# Summaries: docs/performance/moe-fused/gfx942.md
+#             (section "Issue #76 — prefill variants")
+#            docs/kernels/moe_fused.md
+#             (section "Prefill variants (issue #76)")
+
+================ job 640190 (sweep v2, v4, v5) ================
+=== node: nid002490 job=640190 ===
+src hip md5: 862d9a27
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+
+############ VK_MOE_PF_VARIANT=2 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      401.7      4.010 |      361.7      4.453 |   1.11x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      565.2      5.699 |      369.3      8.722 |   1.53x
+   512     1024 |      900.5      7.154 |      419.6     15.352 |   2.15x
+  1024     2048 |     1647.7      7.820 |      690.5     18.661 |   2.39x
+  2048     4096 |     3156.2      8.165 |     1140.0     22.605 |   2.77x
+Done.
+
+############ VK_MOE_PF_VARIANT=4 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      400.6      4.020 |      237.1      6.792 |   1.69x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      565.8      5.694 |      247.2     13.031 |   2.29x
+   512     1024 |      899.9      7.159 |      390.8     16.484 |   2.30x
+  1024     2048 |     1648.4      7.817 |      625.9     20.586 |   2.63x
+  2048     4096 |     3161.0      8.153 |     1156.2     22.288 |   2.73x
+Done.
+
+############ VK_MOE_PF_VARIANT=5 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      402.2      4.005 |      225.7      7.137 |   1.78x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      566.5      5.686 |      237.6     13.555 |   2.38x
+   512     1024 |      901.4      7.147 |      379.3     16.984 |   2.38x
+  1024     2048 |     1648.0      7.819 |      623.4     20.669 |   2.64x
+  2048     4096 |     3157.4      8.162 |     1160.7     22.202 |   2.72x
+Done.
+
+############ correctness, VARIANT=4 ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ correctness, VARIANT=5 ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+===== ALL DONE =====
+
+================ job 640193 (v0 baseline vs unset default, + correctness) ================
+=== node: nid002676 job=640193 ===
+src hip md5: e3e60991
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+
+############ baseline: VK_MOE_PF_VARIANT=0 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      402.4      4.002 |      602.8      2.672 |   0.67x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      568.6      5.665 |      612.6      5.258 |   0.93x
+   512     1024 |      899.8      7.160 |      686.0      9.392 |   1.31x
+  1024     2048 |     1654.9      7.786 |     1141.4     11.289 |   1.45x
+  2048     4096 |     3170.4      8.128 |     1964.7     13.116 |   1.61x
+Done.
+
+############ default (unset -> 5) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.4      3.992 |      226.6      7.108 |   1.78x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      566.3      5.688 |      238.2     13.523 |   2.38x
+   512     1024 |      901.8      7.144 |      378.6     17.018 |   2.38x
+  1024     2048 |     1653.0      7.795 |      622.0     20.716 |   2.66x
+  2048     4096 |     3169.4      8.131 |     1158.8     22.239 |   2.74x
+Done.
+
+############ correctness, default (unset) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ correctness, VARIANT=0 (baseline still reachable) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+===== ALL DONE =====
+
+================ job 640186 (MI300A sweep v0, v1, v2, v3 + correctness) ================
+  === node: nid002510 job=640186 ===
+  src hip md5: 9cf983a1
+  [ 95%] Built target vkernels
+  [100%] Built target moe_fused_prefill_bench
+  [ 95%] Built target vkernels
+  [100%] Built target test_moe_fused_prefill_correct
+  
+  ############ VK_MOE_PF_VARIANT=0 ############
+  GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+     128      512 |      403.2      3.995 |      601.9      2.676 |   0.67x
+    cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+     256      512 |      567.3      5.678 |      614.0      5.247 |   0.92x
+     512     1024 |      902.3      7.140 |      698.8      9.219 |   1.29x
+    1024     2048 |     1655.5      7.783 |     1147.6     11.228 |   1.44x
+    2048     4096 |     3172.8      8.122 |     1930.3     13.350 |   1.64x
+  Done.
+  
+  ############ VK_MOE_PF_VARIANT=1 ############
+  GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+     128      512 |      403.1      3.995 |      595.7      2.704 |   0.68x
+    cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+     256      512 |      566.8      5.683 |      595.6      5.409 |   0.95x
+     512     1024 |      903.2      7.133 |      638.1     10.096 |   1.42x
+    1024     2048 |     1654.3      7.789 |      817.0     15.770 |   2.02x
+    2048     4096 |     3170.6      8.128 |     1484.8     17.356 |   2.14x
+  Done.
+  
+  ############ VK_MOE_PF_VARIANT=2 ############
+  GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+     128      512 |      403.0      3.997 |      362.5      4.443 |   1.11x
+    cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+     256      512 |      568.0      5.672 |      370.6      8.692 |   1.53x
+     512     1024 |      903.2      7.133 |      420.2     15.333 |   2.15x
+    1024     2048 |     1653.6      7.792 |      689.9     18.676 |   2.40x
+    2048     4096 |     3175.5      8.115 |     1137.0     22.666 |   2.79x
+  Done.
+  
+  ############ VK_MOE_PF_VARIANT=3 ############
+  GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+     128      512 |      402.8      3.999 |      347.8      4.631 |   1.16x
+    cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+     256      512 |      568.5      5.666 |      355.8      9.052 |   1.60x
+     512     1024 |      902.5      7.138 |      680.8      9.464 |   1.33x
+    1024     2048 |     1652.2      7.798 |     1046.7     12.310 |   1.58x
+    2048     4096 |     3169.9      8.130 |     1815.0     14.199 |   1.75x
+  Done.
+  
+  ############ correctness, VARIANT=1 ############
+  GPU: AMD Instinct MI300A
+  activation=swiglu
+  clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+    OUT max_rel=0.010937 PASS
+  padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+    OUT max_rel=0.010937 PASS
+  PASS
+  
+  ############ correctness, VARIANT=2 ############
+  GPU: AMD Instinct MI300A
+  activation=swiglu
+  clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+    OUT max_rel=0.010937 PASS
+  padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+    OUT max_rel=0.010937 PASS
+  PASS
+  
+  ############ correctness, VARIANT=3 ############
+  GPU: AMD Instinct MI300A
+  activation=swiglu
+  clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+    OUT max_rel=0.010937 PASS
+  padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+    OUT max_rel=0.010937 PASS
+  PASS
+  
+  ===== ALL DONE =====
+
+================ job 640188 (MI250X sweep v0, v1, v2, v3 + correctness) ================
+  === node: nid002536 job=640188 ===
+  src hip md5: 9cf983a1
+  [ 95%] Built target vkernels
+  [100%] Built target moe_fused_prefill_bench
+  [ 95%] Built target vkernels
+  [100%] Built target test_moe_fused_prefill_correct
+  
+  ############ VK_MOE_PF_VARIANT=0 ############
+  GPU: AMD Instinct MI250X (gfx90a:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0544 WARN
+     128      512 |      797.4      2.020 |     1054.9      1.527 |   0.76x
+    cpu-check block_size=16 M=256 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0544 WARN
+     256      512 |     1407.8      2.288 |     1083.5      2.973 |   1.30x
+     512     1024 |     2463.4      2.615 |     1824.2      3.532 |   1.35x
+    1024     2048 |     4575.7      2.816 |     3077.3      4.187 |   1.49x
+    2048     4096 |     8965.9      2.874 |     6030.4      4.273 |   1.49x
+  Done.
+  
+  ############ VK_MOE_PF_VARIANT=1 ############
+  GPU: AMD Instinct MI250X (gfx90a:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0544 WARN
+     128      512 |      799.4      2.015 |      906.2      1.777 |   0.88x
+    cpu-check block_size=16 M=256 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0544 WARN
+     256      512 |     1407.8      2.288 |      917.8      3.510 |   1.53x
+     512     1024 |     2461.9      2.617 |     1226.7      5.252 |   2.01x
+    1024     2048 |     4572.3      2.818 |     2145.3      6.006 |   2.13x
+    2048     4096 |     8965.4      2.874 |     3555.5      7.248 |   2.52x
+  Done.
+  
+  ############ VK_MOE_PF_VARIANT=2 ############
+  GPU: AMD Instinct MI250X (gfx90a:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0544 WARN
+     128      512 |      799.5      2.014 |      604.5      2.664 |   1.32x
+    cpu-check block_size=16 M=256 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0544 WARN
+     256      512 |     1406.6      2.290 |      619.7      5.198 |   2.27x
+     512     1024 |     2458.1      2.621 |     1010.2      6.377 |   2.43x
+    1024     2048 |     4577.1      2.815 |     1651.8      7.800 |   2.77x
+    2048     4096 |     8961.1      2.876 |     3256.6      7.913 |   2.75x
+  Done.
+  
+  ############ VK_MOE_PF_VARIANT=3 ############
+  GPU: AMD Instinct MI250X (gfx90a:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0544 WARN
+     128      512 |      798.7      2.016 |      942.9      1.708 |   0.85x
+    cpu-check block_size=16 M=256 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0544 WARN
+     256      512 |     1405.0      2.293 |      971.8      3.315 |   1.45x
+     512     1024 |     2461.8      2.617 |     1517.4      4.246 |   1.62x
+    1024     2048 |     4576.1      2.816 |     2589.8      4.975 |   1.77x
+    2048     4096 |     8964.6      2.875 |     5172.6      4.982 |   1.73x
+  Done.
+  
+  ############ correctness, VARIANT=1 ############
+  GPU: AMD Instinct MI250X
+  activation=swiglu
+  clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+    OUT max_rel=0.010937 PASS
+  padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+    OUT max_rel=0.010937 PASS
+  PASS
+  
+  ############ correctness, VARIANT=2 ############
+  GPU: AMD Instinct MI250X
+  activation=swiglu
+  clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+    OUT max_rel=0.010937 PASS
+  padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+    OUT max_rel=0.010937 PASS
+  PASS
+  
+  ############ correctness, VARIANT=3 ############
+  GPU: AMD Instinct MI250X
+  activation=swiglu
+  clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+    OUT max_rel=0.010937 PASS
+  padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+    OUT max_rel=0.010937 PASS
+  PASS
+  
+  ===== ALL DONE =====
+
+================ job 640189 (MI250X sweep v2, v4, v5 + correctness) ================
+  === node: nid002536 job=640189 ===
+  src hip md5: 862d9a27
+  [ 95%] Built target vkernels
+  [100%] Built target moe_fused_prefill_bench
+  [ 95%] Built target vkernels
+  [100%] Built target test_moe_fused_prefill_correct
+  
+  ############ VK_MOE_PF_VARIANT=2 ############
+  GPU: AMD Instinct MI250X (gfx90a:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0544 WARN
+     128      512 |      798.6      2.017 |      603.4      2.669 |   1.32x
+    cpu-check block_size=16 M=256 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0544 WARN
+     256      512 |     1409.6      2.285 |      618.7      5.206 |   2.28x
+     512     1024 |     2462.1      2.617 |     1011.2      6.371 |   2.43x
+    1024     2048 |     4571.5      2.819 |     1651.7      7.801 |   2.77x
+    2048     4096 |     8964.0      2.875 |     3252.0      7.924 |   2.76x
+  Done.
+  
+  ############ VK_MOE_PF_VARIANT=4 ############
+  GPU: AMD Instinct MI250X (gfx90a:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0544 WARN
+     128      512 |      798.2      2.018 |      549.8      2.930 |   1.45x
+    cpu-check block_size=16 M=256 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0544 WARN
+     256      512 |     1405.6      2.292 |      577.9      5.574 |   2.43x
+     512     1024 |     2460.6      2.618 |      940.3      6.851 |   2.62x
+    1024     2048 |     4575.5      2.816 |     1755.4      7.340 |   2.61x
+    2048     4096 |     8959.7      2.876 |     3368.3      7.651 |   2.66x
+  Done.
+  
+  ############ VK_MOE_PF_VARIANT=5 ############
+  GPU: AMD Instinct MI250X (gfx90a:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0544 WARN
+     128      512 |      798.4      2.017 |      511.8      3.147 |   1.56x
+    cpu-check block_size=16 M=256 max_rel=0.0544 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0544 WARN
+     256      512 |     1406.7      2.290 |      545.3      5.907 |   2.58x
+     512     1024 |     2461.9      2.617 |      869.3      7.411 |   2.83x
+    1024     2048 |     4572.6      2.818 |     1641.4      7.850 |   2.79x
+    2048     4096 |     8955.5      2.878 |     3137.0      8.215 |   2.85x
+  Done.
+  
+  ############ correctness, VARIANT=4 ############
+  GPU: AMD Instinct MI250X
+  activation=swiglu
+  clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+    OUT max_rel=0.010937 PASS
+  padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+    OUT max_rel=0.010937 PASS
+  PASS
+  
+  ############ correctness, VARIANT=5 ############
+  GPU: AMD Instinct MI250X
+  activation=swiglu
+  clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+    OUT max_rel=0.010937 PASS
+  padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+    OUT max_rel=0.010937 PASS
+  PASS
+  
+  ===== ALL DONE =====
+
+================ job 640195 (MI300A acceptance: decode+prefill+bigshape correctness on the default path, then v0 vs v5 perf) ================
+  === node: nid002776 job=640195 ===
+  src hip md5: e3e60991
+  [ 95%] Built target vkernels
+  [100%] Built target test_moe_fused_correct
+  [ 95%] Built target vkernels
+  [100%] Built target test_moe_fused_prefill_correct
+  [ 95%] Built target vkernels
+  [100%] Built target test_moe_fused_bigshape_correct
+  [ 95%] Built target vkernels
+  [100%] Built target moe_fused_prefill_bench
+  
+  ############ decode correctness (default path) ############
+  GPU: AMD Instinct MI300A
+  activation=swiglu
+  M=8 hidden=256 ispp=128 top_k=2 E=4 EM_padded=64
+  OUT: max_abs=0.0000 max_rel=0.000004
+  ACT: max_abs=0.0000 max_rel=0.000000
+  PASS
+  
+  ############ prefill correctness (default path) ############
+  GPU: AMD Instinct MI300A
+  activation=swiglu
+  clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+    OUT max_rel=0.010937 PASS
+  padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+    OUT max_rel=0.010937 PASS
+  PASS
+  
+  ############ big-shape correctness (default path) ############
+  GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+  
+  --- decode ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+  [phase] align ok EM=240 max_expert=255
+  [phase] weights filled (w13=7.0 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 5152/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+      [tol] out_rms=62.47 abs_tol=1.874
+      EM=240 max_rel=0.0002413 -> PASS
+  --- decode ispp=4096 all-slots expert 255: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+  [phase] align ok EM=16 max_expert=255
+  [phase] weights filled (w13=7.0 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 0/7168 (max |delta| = 0)
+  [act] max_rel=0 bad=0/65536 worst_flat=-1 diff=0/65536 (0%)
+      [tol] out_rms=167.8 abs_tol=5.034
+      EM=16 max_rel=5.52e-05 -> PASS
+  --- prefill ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=64 situ
+  [phase] align ok EM=960 max_expert=255
+  [phase] weights filled (w13=7.0 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 5018/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+      [tol] out_rms=62.47 abs_tol=1.874
+      EM=960 max_rel=0.0002437 -> PASS
+  --- decode ispp=33792 E=32 serving shard: E=32 hidden=7168 ispp=33792 top_k=16 M=1 block=16 situ
+  [phase] align ok EM=256 max_expert=31
+  [phase] weights filled (w13=7.2 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 4968/7168 (max |delta| = 0.0001221)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=0.001953 bad=0/540672 worst_flat=4 diff=84/540672 (0.0155%)
+      [tol] out_rms=187.5 abs_tol=5.625
+      EM=256 max_rel=0.05808 -> PASS
+  --- prefill small E=8 h512 ispp=512: E=8 hidden=512 ispp=512 top_k=4 M=1 block=64 situ
+  [phase] align ok EM=256 max_expert=3
+  [phase] weights filled (w13=0.0 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 31/512 (max |delta| = 1.192e-07)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=0 bad=0/2048 worst_flat=-1 diff=0/2048 (0%)
+      [tol] out_rms=0.5633 abs_tol=0.0169
+      EM=256 max_rel=2.196e-07 -> PASS
+  --- prefill ispp=4096 M=64 no-padding: E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=64 situ
+  [phase] align ok EM=1024 max_expert=255
+  [phase] weights filled (w13=7.0 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 309305/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+      [tol] out_rms=54.19 abs_tol=1.626
+      EM=1024 max_rel=0.09552 -> PASS
+  --- prefill ispp=4096 M=2 padded: E=256 hidden=7168 ispp=4096 top_k=16 M=2 block=64 situ
+  [phase] align ok EM=960 max_expert=255
+  [phase] weights filled (w13=7.0 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 9816/14336 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=0.0004883 bad=0/131072 worst_flat=21 diff=10/131072 (0.00763%)
+      [tol] out_rms=58.51 abs_tol=1.755
+      EM=960 max_rel=0.0002399 -> PASS
+  --- prefill small M=64 no-padding: E=8 hidden=512 ispp=512 top_k=4 M=64 block=64 situ
+  [phase] align ok EM=256 max_expert=3
+  [phase] weights filled (w13=0.0 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 9196/32768 (max |delta| = 4.768e-07)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=3.815e-06 bad=0/131072 worst_flat=217 diff=2/131072 (0.00153%)
+      [tol] out_rms=0.6496 abs_tol=0.01949
+      EM=256 max_rel=1.062e-05 -> PASS
+  --- bisect E=256 h7168 ispp=512 M=64: E=256 hidden=7168 ispp=512 top_k=16 M=64 block=64 situ
+  [phase] align ok EM=1024 max_expert=255
+  [phase] weights filled (w13=0.9 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 315446/458752 (max |delta| = 3.052e-05)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=0.0004883 bad=0/524288 worst_flat=4 diff=84/524288 (0.016%)
+      [tol] out_rms=19.06 abs_tol=0.5717
+      EM=1024 max_rel=0.03031 -> PASS
+  --- bisect E=256 h7168 ispp=1024 M=64: E=256 hidden=7168 ispp=1024 top_k=16 M=64 block=64 situ
+  [phase] align ok EM=1024 max_expert=255
+  [phase] weights filled (w13=1.8 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 317230/458752 (max |delta| = 3.815e-05)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=0.0009766 bad=0/1048576 worst_flat=693 diff=158/1048576 (0.0151%)
+      [tol] out_rms=27.02 abs_tol=0.8106
+      EM=1024 max_rel=0.03555 -> PASS
+  --- bisect E=256 h7168 ispp=2048 M=64: E=256 hidden=7168 ispp=2048 top_k=16 M=64 block=64 situ
+  [phase] align ok EM=1024 max_expert=255
+  [phase] weights filled (w13=3.5 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 318436/458752 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=0.001953 bad=0/2097152 worst_flat=210 diff=317/2097152 (0.0151%)
+      [tol] out_rms=38.53 abs_tol=1.156
+      EM=1024 max_rel=0.04959 -> PASS
+  --- bisect E=8 h1024 ispp=512 M=64: E=8 hidden=1024 ispp=512 top_k=4 M=64 block=64 situ
+  [phase] align ok EM=256 max_expert=3
+  [phase] weights filled (w13=0.0 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 18843/65536 (max |delta| = 9.537e-07)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=6.104e-05 bad=0/131072 worst_flat=24 diff=3/131072 (0.00229%)
+      [tol] out_rms=1.366 abs_tol=0.04099
+      EM=256 max_rel=0.0006905 -> PASS
+  --- bisect E=8 h2048 ispp=512 M=64: E=8 hidden=2048 ispp=512 top_k=4 M=64 block=64 situ
+  [phase] align ok EM=256 max_expert=3
+  [phase] weights filled (w13=0.0 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 43644/131072 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=7.629e-06 bad=0/131072 worst_flat=25 diff=3/131072 (0.00229%)
+      [tol] out_rms=2.655 abs_tol=0.07966
+      EM=256 max_rel=0.0001258 -> PASS
+  --- bisect E=8 h4096 ispp=512 M=64: E=8 hidden=4096 ispp=512 top_k=4 M=64 block=64 situ
+  [phase] align ok EM=256 max_expert=3
+  [phase] weights filled (w13=0.0 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 64489/262144 (max |delta| = 3.815e-06)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=7.629e-06 bad=0/131072 worst_flat=233 diff=11/131072 (0.00839%)
+      [tol] out_rms=5.343 abs_tol=0.1603
+      EM=256 max_rel=4.53e-06 -> PASS
+  --- decode E=256 h7168 ispp=4096 M=64 (oracle sanity): E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=16 situ
+  [phase] align ok EM=1024 max_expert=255
+  [phase] weights filled (w13=7.0 GB)
+  [phase] CPU oracle done
+  [phase] device buffers ok, launching fused_moe_mxfp4
+  [phase] launcher returned, syncing
+  [phase] device sync ok
+  [determinism] differing elements: 323122/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+  [act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+      [tol] out_rms=54.19 abs_tol=1.626
+      EM=1024 max_rel=0.09552 -> PASS
+  
+  All cases PASS
+  
+  ############ perf, default vs baseline ############
+  --- VK_MOE_PF_VARIANT=0
+  GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+     128      512 |      404.7      3.980 |      603.4      2.669 |   0.67x
+    cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+     256      512 |      568.5      5.666 |      615.1      5.237 |   0.92x
+     512     1024 |      909.2      7.086 |      686.6      9.384 |   1.32x
+    1024     2048 |     1659.5      7.764 |     1153.1     11.174 |   1.44x
+    2048     4096 |     3180.0      8.104 |     1981.7     13.004 |   1.60x
+  Done.
+  --- VK_MOE_PF_VARIANT=5
+  GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+  
+  E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+       M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+    cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+     128      512 |      407.4      3.953 |      231.1      6.970 |   1.76x
+    cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+    cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+     256      512 |      572.2      5.629 |      244.1     13.197 |   2.34x
+     512     1024 |      911.8      7.065 |      387.8     16.614 |   2.35x
+    1024     2048 |     1664.9      7.739 |      632.8     20.360 |   2.63x
+    2048     4096 |     3181.7      8.099 |     1177.4     21.887 |   2.70x
+  Done.
+  
+  ===== ALL DONE =====
+
+================ job 640196 (MI300A nid002518, md5 e6b31c77: acceptance — decode+prefill correctness, 11 big-shape cases, v0-vs-default perf) ================
+=== node: nid002518 job=640196 ===
+src hip md5: e6b31c77
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_bigshape_correct
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+
+############ decode correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+M=8 hidden=256 ispp=128 top_k=2 E=4 EM_padded=64
+OUT: max_abs=0.0000 max_rel=0.000004
+ACT: max_abs=0.0000 max_rel=0.000000
+PASS
+
+############ prefill correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ big-shape correctness (default path) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+--- decode ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=240 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5008/7168 (max |delta| = 3.052e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=240 max_rel=0.000243 -> PASS
+--- decode ispp=4096 all-slots expert 255: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=16 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 0/7168 (max |delta| = 0)
+[act] max_rel=0 bad=0/65536 worst_flat=-1 diff=0/65536 (0%)
+    [tol] out_rms=167.8 abs_tol=5.034
+    EM=16 max_rel=5.52e-05 -> PASS
+--- prefill ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5107/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=960 max_rel=0.0002415 -> PASS
+--- decode ispp=33792 E=32 serving shard: E=32 hidden=7168 ispp=33792 top_k=16 M=1 block=16 situ
+[phase] align ok EM=256 max_expert=31
+[phase] weights filled (w13=7.2 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5045/7168 (max |delta| = 0.0001221)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/540672 worst_flat=4 diff=84/540672 (0.0155%)
+    [tol] out_rms=187.5 abs_tol=5.625
+    EM=256 max_rel=0.05809 -> PASS
+--- prefill small E=8 h512 ispp=512: E=8 hidden=512 ispp=512 top_k=4 M=1 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 66/512 (max |delta| = 1.192e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0 bad=0/2048 worst_flat=-1 diff=0/2048 (0%)
+    [tol] out_rms=0.5633 abs_tol=0.0169
+    EM=256 max_rel=2.196e-07 -> PASS
+--- prefill ispp=4096 M=64 no-padding: E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 311562/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09552 -> PASS
+--- prefill ispp=4096 M=2 padded: E=256 hidden=7168 ispp=4096 top_k=16 M=2 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 9827/14336 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/131072 worst_flat=21 diff=10/131072 (0.00763%)
+    [tol] out_rms=58.51 abs_tol=1.755
+    EM=960 max_rel=0.0002422 -> PASS
+--- prefill small M=64 no-padding: E=8 hidden=512 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 8589/32768 (max |delta| = 4.768e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=3.815e-06 bad=0/131072 worst_flat=217 diff=2/131072 (0.00153%)
+    [tol] out_rms=0.6496 abs_tol=0.01949
+    EM=256 max_rel=1.062e-05 -> PASS
+--- bisect E=256 h7168 ispp=512 M=64: E=256 hidden=7168 ispp=512 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=0.9 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 315958/458752 (max |delta| = 3.052e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/524288 worst_flat=4 diff=84/524288 (0.016%)
+    [tol] out_rms=19.06 abs_tol=0.5717
+    EM=1024 max_rel=0.03031 -> PASS
+--- bisect E=256 h7168 ispp=1024 M=64: E=256 hidden=7168 ispp=1024 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=1.8 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 317728/458752 (max |delta| = 3.815e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0009766 bad=0/1048576 worst_flat=693 diff=158/1048576 (0.0151%)
+    [tol] out_rms=27.02 abs_tol=0.8106
+    EM=1024 max_rel=0.03555 -> PASS
+--- bisect E=256 h7168 ispp=2048 M=64: E=256 hidden=7168 ispp=2048 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=3.5 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 317237/458752 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/2097152 worst_flat=210 diff=317/2097152 (0.0151%)
+    [tol] out_rms=38.53 abs_tol=1.156
+    EM=1024 max_rel=0.04959 -> PASS
+--- bisect E=8 h1024 ispp=512 M=64: E=8 hidden=1024 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 12596/65536 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=6.104e-05 bad=0/131072 worst_flat=24 diff=3/131072 (0.00229%)
+    [tol] out_rms=1.366 abs_tol=0.04099
+    EM=256 max_rel=0.0006905 -> PASS
+--- bisect E=8 h2048 ispp=512 M=64: E=8 hidden=2048 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 18039/131072 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=25 diff=3/131072 (0.00229%)
+    [tol] out_rms=2.655 abs_tol=0.07966
+    EM=256 max_rel=0.0001258 -> PASS
+--- bisect E=8 h4096 ispp=512 M=64: E=8 hidden=4096 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 51611/262144 (max |delta| = 3.815e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=233 diff=11/131072 (0.00839%)
+    [tol] out_rms=5.343 abs_tol=0.1603
+    EM=256 max_rel=4.768e-06 -> PASS
+--- decode E=256 h7168 ispp=4096 M=64 (oracle sanity): E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=16 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 324435/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09552 -> PASS
+
+All cases PASS
+
+############ perf, default vs baseline ############
+--- VK_MOE_PF_VARIANT=0
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.4      3.993 |      603.5      2.669 |   0.67x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      568.7      5.664 |      615.1      5.237 |   0.92x
+   512     1024 |      909.2      7.086 |      688.5      9.357 |   1.32x
+  1024     2048 |     1665.4      7.737 |     1153.3     11.172 |   1.44x
+  2048     4096 |     3207.5      8.034 |     1994.1     12.923 |   1.61x
+Done.
+--- VK_MOE_PF_VARIANT=5
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      404.7      3.980 |      227.4      7.083 |   1.78x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      568.1      5.670 |      239.7     13.440 |   2.37x
+   512     1024 |      907.4      7.100 |      382.5     16.842 |   2.37x
+  1024     2048 |     1665.9      7.735 |      637.9     20.199 |   2.61x
+  2048     4096 |     3207.2      8.035 |     1209.0     21.316 |   2.65x
+Done.
+
+===== ALL DONE =====
+
+================ job 640198 (MI300A nid002514, md5 e6b31c77: acceptance, same script as 640199) ================
+=== node: nid002514 job=640198 ===
+src hip md5: e6b31c77
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_bigshape_correct
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_bench
+
+############ decode correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+M=8 hidden=256 ispp=128 top_k=2 E=4 EM_padded=64
+OUT: max_abs=0.0000 max_rel=0.000004
+ACT: max_abs=0.0000 max_rel=0.000000
+PASS
+
+############ prefill correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ big-shape correctness (default path) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+--- decode ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=240 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5059/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=240 max_rel=0.0002478 -> PASS
+--- decode ispp=4096 all-slots expert 255: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=16 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 0/7168 (max |delta| = 0)
+[act] max_rel=0 bad=0/65536 worst_flat=-1 diff=0/65536 (0%)
+    [tol] out_rms=167.8 abs_tol=5.034
+    EM=16 max_rel=5.52e-05 -> PASS
+--- prefill ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5064/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=960 max_rel=0.0002418 -> PASS
+--- decode ispp=33792 E=32 serving shard: E=32 hidden=7168 ispp=33792 top_k=16 M=1 block=16 situ
+[phase] align ok EM=256 max_expert=31
+[phase] weights filled (w13=7.2 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5023/7168 (max |delta| = 0.0001221)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/540672 worst_flat=4 diff=84/540672 (0.0155%)
+    [tol] out_rms=187.5 abs_tol=5.625
+    EM=256 max_rel=0.05809 -> PASS
+--- prefill small E=8 h512 ispp=512: E=8 hidden=512 ispp=512 top_k=4 M=1 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 77/512 (max |delta| = 1.192e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0 bad=0/2048 worst_flat=-1 diff=0/2048 (0%)
+    [tol] out_rms=0.5633 abs_tol=0.0169
+    EM=256 max_rel=2.11e-07 -> PASS
+--- prefill ispp=4096 M=64 no-padding: E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 305036/458752 (max |delta| = 5.341e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09552 -> PASS
+--- prefill ispp=4096 M=2 padded: E=256 hidden=7168 ispp=4096 top_k=16 M=2 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 9832/14336 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/131072 worst_flat=21 diff=10/131072 (0.00763%)
+    [tol] out_rms=58.51 abs_tol=1.755
+    EM=960 max_rel=0.0002422 -> PASS
+--- prefill small M=64 no-padding: E=8 hidden=512 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 9252/32768 (max |delta| = 7.153e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=3.815e-06 bad=0/131072 worst_flat=217 diff=2/131072 (0.00153%)
+    [tol] out_rms=0.6496 abs_tol=0.01949
+    EM=256 max_rel=1.062e-05 -> PASS
+--- bisect E=256 h7168 ispp=512 M=64: E=256 hidden=7168 ispp=512 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=0.9 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 315080/458752 (max |delta| = 3.052e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/524288 worst_flat=4 diff=84/524288 (0.016%)
+    [tol] out_rms=19.06 abs_tol=0.5717
+    EM=1024 max_rel=0.03031 -> PASS
+--- bisect E=256 h7168 ispp=1024 M=64: E=256 hidden=7168 ispp=1024 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=1.8 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 318544/458752 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0009766 bad=0/1048576 worst_flat=693 diff=158/1048576 (0.0151%)
+    [tol] out_rms=27.02 abs_tol=0.8106
+    EM=1024 max_rel=0.03555 -> PASS
+--- bisect E=256 h7168 ispp=2048 M=64: E=256 hidden=7168 ispp=2048 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=3.5 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 314839/458752 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/2097152 worst_flat=210 diff=317/2097152 (0.0151%)
+    [tol] out_rms=38.53 abs_tol=1.156
+    EM=1024 max_rel=0.04959 -> PASS
+--- bisect E=8 h1024 ispp=512 M=64: E=8 hidden=1024 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 12825/65536 (max |delta| = 9.537e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=6.104e-05 bad=0/131072 worst_flat=24 diff=3/131072 (0.00229%)
+    [tol] out_rms=1.366 abs_tol=0.04099
+    EM=256 max_rel=0.0006905 -> PASS
+--- bisect E=8 h2048 ispp=512 M=64: E=8 hidden=2048 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 24618/131072 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=25 diff=3/131072 (0.00229%)
+    [tol] out_rms=2.655 abs_tol=0.07966
+    EM=256 max_rel=0.0001256 -> PASS
+--- bisect E=8 h4096 ispp=512 M=64: E=8 hidden=4096 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 68600/262144 (max |delta| = 3.815e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=233 diff=11/131072 (0.00839%)
+    [tol] out_rms=5.343 abs_tol=0.1603
+    EM=256 max_rel=4.768e-06 -> PASS
+--- decode E=256 h7168 ispp=4096 M=64 (oracle sanity): E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=16 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 323383/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09553 -> PASS
+
+All cases PASS
+
+############ perf, default vs baseline ############
+--- VK_MOE_PF_VARIANT=0
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.0      3.997 |      601.6      2.677 |   0.67x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      566.7      5.684 |      613.1      5.254 |   0.92x
+   512     1024 |      901.6      7.146 |      685.2      9.403 |   1.32x
+  1024     2048 |     1652.3      7.798 |     1140.0     11.303 |   1.45x
+  2048     4096 |     3169.3      8.131 |     1946.8     13.237 |   1.63x
+Done.
+--- VK_MOE_PF_VARIANT=5
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.9      3.988 |      226.9      7.098 |   1.78x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      567.0      5.682 |      238.1     13.528 |   2.38x
+   512     1024 |      902.4      7.139 |      379.0     16.997 |   2.38x
+  1024     2048 |     1652.6      7.797 |      619.2     20.807 |   2.67x
+  2048     4096 |     3172.3      8.123 |     1157.4     22.264 |   2.74x
+Done.
+
+############ decode regression guard (E=256 h4096 i512 topk=6) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=256 hidden=4096 ispp=512 top_k=6 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     8      768      627.8      626.4     0.160  0.000595        ok
+    32     2432     1873.6     1879.7     0.215         -      skip
+    48     3456     2596.9     2605.1     0.233         -      skip
+Done.
+
+===== ALL DONE =====
+
+================ job 640199 (MI300A nid002514, md5 568210e3: acceptance, same script) ================
+=== node: nid002514 job=640199 ===
+src hip md5: 568210e3
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_bigshape_correct
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_bench
+
+############ decode correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+M=8 hidden=256 ispp=128 top_k=2 E=4 EM_padded=64
+OUT: max_abs=0.0000 max_rel=0.000004
+ACT: max_abs=0.0000 max_rel=0.000000
+PASS
+
+############ prefill correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ big-shape correctness (default path) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+--- decode ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=240 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 4998/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=240 max_rel=0.0002403 -> PASS
+--- decode ispp=4096 all-slots expert 255: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=16 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 0/7168 (max |delta| = 0)
+[act] max_rel=0 bad=0/65536 worst_flat=-1 diff=0/65536 (0%)
+    [tol] out_rms=167.8 abs_tol=5.034
+    EM=16 max_rel=5.52e-05 -> PASS
+--- prefill ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5049/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=960 max_rel=0.0002407 -> PASS
+--- decode ispp=33792 E=32 serving shard: E=32 hidden=7168 ispp=33792 top_k=16 M=1 block=16 situ
+[phase] align ok EM=256 max_expert=31
+[phase] weights filled (w13=7.2 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5047/7168 (max |delta| = 0.0001221)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/540672 worst_flat=4 diff=84/540672 (0.0155%)
+    [tol] out_rms=187.5 abs_tol=5.625
+    EM=256 max_rel=0.05809 -> PASS
+--- prefill small E=8 h512 ispp=512: E=8 hidden=512 ispp=512 top_k=4 M=1 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 78/512 (max |delta| = 1.192e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0 bad=0/2048 worst_flat=-1 diff=0/2048 (0%)
+    [tol] out_rms=0.5633 abs_tol=0.0169
+    EM=256 max_rel=2.196e-07 -> PASS
+--- prefill ispp=4096 M=64 no-padding: E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 305064/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09553 -> PASS
+--- prefill ispp=4096 M=2 padded: E=256 hidden=7168 ispp=4096 top_k=16 M=2 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 10007/14336 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/131072 worst_flat=21 diff=10/131072 (0.00763%)
+    [tol] out_rms=58.51 abs_tol=1.755
+    EM=960 max_rel=0.0002403 -> PASS
+--- prefill small M=64 no-padding: E=8 hidden=512 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 9768/32768 (max |delta| = 4.768e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=3.815e-06 bad=0/131072 worst_flat=217 diff=2/131072 (0.00153%)
+    [tol] out_rms=0.6496 abs_tol=0.01949
+    EM=256 max_rel=1.062e-05 -> PASS
+--- bisect E=256 h7168 ispp=512 M=64: E=256 hidden=7168 ispp=512 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=0.9 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 313930/458752 (max |delta| = 3.052e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/524288 worst_flat=4 diff=84/524288 (0.016%)
+    [tol] out_rms=19.06 abs_tol=0.5717
+    EM=1024 max_rel=0.03031 -> PASS
+--- bisect E=256 h7168 ispp=1024 M=64: E=256 hidden=7168 ispp=1024 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=1.8 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 317416/458752 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0009766 bad=0/1048576 worst_flat=693 diff=158/1048576 (0.0151%)
+    [tol] out_rms=27.02 abs_tol=0.8106
+    EM=1024 max_rel=0.03555 -> PASS
+--- bisect E=256 h7168 ispp=2048 M=64: E=256 hidden=7168 ispp=2048 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=3.5 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 320153/458752 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/2097152 worst_flat=210 diff=317/2097152 (0.0151%)
+    [tol] out_rms=38.53 abs_tol=1.156
+    EM=1024 max_rel=0.04959 -> PASS
+--- bisect E=8 h1024 ispp=512 M=64: E=8 hidden=1024 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5792/65536 (max |delta| = 9.537e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=6.104e-05 bad=0/131072 worst_flat=24 diff=3/131072 (0.00229%)
+    [tol] out_rms=1.366 abs_tol=0.04099
+    EM=256 max_rel=0.0006905 -> PASS
+--- bisect E=8 h2048 ispp=512 M=64: E=8 hidden=2048 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 27798/131072 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=25 diff=3/131072 (0.00229%)
+    [tol] out_rms=2.655 abs_tol=0.07966
+    EM=256 max_rel=0.0001256 -> PASS
+--- bisect E=8 h4096 ispp=512 M=64: E=8 hidden=4096 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 61602/262144 (max |delta| = 3.815e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=233 diff=11/131072 (0.00839%)
+    [tol] out_rms=5.343 abs_tol=0.1603
+    EM=256 max_rel=4.768e-06 -> PASS
+--- decode E=256 h7168 ispp=4096 M=64 (oracle sanity): E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=16 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 323523/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09552 -> PASS
+
+All cases PASS
+
+############ perf, default vs baseline ############
+--- VK_MOE_PF_VARIANT=0
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      401.9      4.007 |      601.6      2.677 |   0.67x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      566.4      5.687 |      612.8      5.257 |   0.92x
+   512     1024 |      901.5      7.146 |      683.6      9.424 |   1.32x
+  1024     2048 |     1654.0      7.790 |     1144.6     11.257 |   1.44x
+  2048     4096 |     3171.2      8.126 |     1933.3     13.329 |   1.64x
+Done.
+--- VK_MOE_PF_VARIANT=5
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      406.6      3.962 |      230.7      6.981 |   1.76x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      569.9      5.652 |      241.4     13.346 |   2.36x
+   512     1024 |      907.5      7.099 |      382.0     16.863 |   2.38x
+  1024     2048 |     1656.8      7.777 |      621.3     20.739 |   2.67x
+  2048     4096 |     3173.5      8.120 |     1158.5     22.244 |   2.74x
+Done.
+
+############ decode regression guard (E=256 h4096 i512 topk=6) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=256 hidden=4096 ispp=512 top_k=6 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     8      768      627.2      624.8     0.160  0.000608        ok
+    32     2432     1873.3     1879.3     0.215         -      skip
+    48     3456     2598.7     2603.9     0.232         -      skip
+Done.
+
+===== ALL DONE =====
+
+
+================ job 640208 ================
+=== node: nid002354 job=640208 ===
+src hip md5: 91d25dcf
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_bigshape_correct
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_bench
+
+############ decode correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+M=8 hidden=256 ispp=128 top_k=2 E=4 EM_padded=64
+OUT: max_abs=0.0000 max_rel=0.000004
+ACT: max_abs=0.0000 max_rel=0.000000
+PASS
+
+############ prefill correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ big-shape correctness (default path) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+--- decode ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=240 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5089/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=240 max_rel=0.0002422 -> PASS
+--- decode ispp=4096 all-slots expert 255: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=16 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 0/7168 (max |delta| = 0)
+[act] max_rel=0 bad=0/65536 worst_flat=-1 diff=0/65536 (0%)
+    [tol] out_rms=167.8 abs_tol=5.034
+    EM=16 max_rel=5.52e-05 -> PASS
+--- prefill ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5043/7168 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=960 max_rel=0.0002413 -> PASS
+--- decode ispp=33792 E=32 serving shard: E=32 hidden=7168 ispp=33792 top_k=16 M=1 block=16 situ
+[phase] align ok EM=256 max_expert=31
+[phase] weights filled (w13=7.2 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5100/7168 (max |delta| = 0.0001831)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/540672 worst_flat=4 diff=84/540672 (0.0155%)
+    [tol] out_rms=187.5 abs_tol=5.625
+    EM=256 max_rel=0.05809 -> PASS
+--- prefill small E=8 h512 ispp=512: E=8 hidden=512 ispp=512 top_k=4 M=1 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 61/512 (max |delta| = 1.192e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0 bad=0/2048 worst_flat=-1 diff=0/2048 (0%)
+    [tol] out_rms=0.5633 abs_tol=0.0169
+    EM=256 max_rel=2.384e-07 -> PASS
+--- prefill ispp=4096 M=64 no-padding: E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 315544/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09553 -> PASS
+--- prefill ispp=4096 M=2 padded: E=256 hidden=7168 ispp=4096 top_k=16 M=2 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 9932/14336 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/131072 worst_flat=21 diff=10/131072 (0.00763%)
+    [tol] out_rms=58.51 abs_tol=1.755
+    EM=960 max_rel=0.000246 -> PASS
+--- prefill small M=64 no-padding: E=8 hidden=512 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 10591/32768 (max |delta| = 4.768e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=3.815e-06 bad=0/131072 worst_flat=217 diff=2/131072 (0.00153%)
+    [tol] out_rms=0.6496 abs_tol=0.01949
+    EM=256 max_rel=1.062e-05 -> PASS
+--- bisect E=256 h7168 ispp=512 M=64: E=256 hidden=7168 ispp=512 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=0.9 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 316345/458752 (max |delta| = 3.052e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/524288 worst_flat=4 diff=84/524288 (0.016%)
+    [tol] out_rms=19.06 abs_tol=0.5717
+    EM=1024 max_rel=0.03031 -> PASS
+--- bisect E=256 h7168 ispp=1024 M=64: E=256 hidden=7168 ispp=1024 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=1.8 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 317701/458752 (max |delta| = 3.052e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0009766 bad=0/1048576 worst_flat=693 diff=158/1048576 (0.0151%)
+    [tol] out_rms=27.02 abs_tol=0.8106
+    EM=1024 max_rel=0.03555 -> PASS
+--- bisect E=256 h7168 ispp=2048 M=64: E=256 hidden=7168 ispp=2048 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=3.5 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 318391/458752 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/2097152 worst_flat=210 diff=317/2097152 (0.0151%)
+    [tol] out_rms=38.53 abs_tol=1.156
+    EM=1024 max_rel=0.04959 -> PASS
+--- bisect E=8 h1024 ispp=512 M=64: E=8 hidden=1024 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 16108/65536 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=6.104e-05 bad=0/131072 worst_flat=24 diff=3/131072 (0.00229%)
+    [tol] out_rms=1.366 abs_tol=0.04099
+    EM=256 max_rel=0.0006905 -> PASS
+--- bisect E=8 h2048 ispp=512 M=64: E=8 hidden=2048 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 19797/131072 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=25 diff=3/131072 (0.00229%)
+    [tol] out_rms=2.655 abs_tol=0.07966
+    EM=256 max_rel=0.0001258 -> PASS
+--- bisect E=8 h4096 ispp=512 M=64: E=8 hidden=4096 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 63442/262144 (max |delta| = 3.815e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=233 diff=11/131072 (0.00839%)
+    [tol] out_rms=5.343 abs_tol=0.1603
+    EM=256 max_rel=4.768e-06 -> PASS
+--- decode E=256 h7168 ispp=4096 M=64 (oracle sanity): E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=16 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 323995/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09553 -> PASS
+
+All cases PASS
+
+############ perf, default vs baseline ############
+--- VK_MOE_PF_VARIANT=0
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.7      3.990 |      602.5      2.673 |   0.67x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      566.4      5.687 |      614.6      5.241 |   0.92x
+   512     1024 |      902.3      7.140 |      685.7      9.396 |   1.32x
+  1024     2048 |     1651.0      7.804 |     1159.6     11.111 |   1.42x
+  2048     4096 |     3158.9      8.158 |     2010.0     12.821 |   1.57x
+Done.
+--- VK_MOE_PF_VARIANT=5
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.2      3.994 |      226.8      7.100 |   1.78x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      565.0      5.701 |      238.5     13.507 |   2.37x
+   512     1024 |      898.8      7.168 |      380.7     16.923 |   2.36x
+  1024     2048 |     1651.7      7.801 |      623.0     20.681 |   2.65x
+  2048     4096 |     3155.7      8.166 |     1155.9     22.294 |   2.73x
+Done.
+
+############ decode regression guard (E=256 h4096 i512 topk=6) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=256 hidden=4096 ispp=512 top_k=6 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     8      768      625.1      623.4     0.161  0.000565        ok
+    32     2432     1857.6     1860.7     0.217         -      skip
+    48     3456     2569.2     2574.1     0.235         -      skip
+Done.
+
+===== ALL DONE =====
+
+
+================ job 640214 ================
+=== node: nid002710 job=640214 ===
+src hip md5: bbd7e518
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+
+############ VK_MOE_PF_VARIANT=0 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      404.3      3.984 |      602.0      2.675 |   0.67x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      566.2      5.690 |      613.6      5.249 |   0.92x
+   512     1024 |      909.3      7.085 |      685.4      9.400 |   1.33x
+  1024     2048 |     1656.3      7.779 |     1156.0     11.146 |   1.43x
+  2048     4096 |     3171.5      8.125 |     1962.9     13.129 |   1.62x
+Done.
+
+############ VK_MOE_PF_VARIANT=1 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.1      3.996 |      595.2      2.706 |   0.68x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      568.9      5.662 |      596.7      5.399 |   0.95x
+   512     1024 |      907.3      7.101 |      638.6     10.089 |   1.42x
+  1024     2048 |     1654.6      7.787 |      815.9     15.792 |   2.03x
+  2048     4096 |     3167.2      8.137 |     1497.5     17.208 |   2.11x
+Done.
+
+############ VK_MOE_PF_VARIANT=2 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      406.0      3.967 |      365.6      4.405 |   1.11x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      571.2      5.639 |      372.8      8.642 |   1.53x
+   512     1024 |      905.9      7.112 |      424.1     15.190 |   2.14x
+  1024     2048 |     1659.6      7.764 |      699.1     18.430 |   2.37x
+  2048     4096 |     3174.1      8.119 |     1151.9     22.371 |   2.76x
+Done.
+
+############ VK_MOE_PF_VARIANT=3 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      402.6      4.001 |      346.9      4.643 |   1.16x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      567.6      5.676 |      355.1      9.072 |   1.60x
+   512     1024 |      904.7      7.121 |      682.1      9.445 |   1.33x
+  1024     2048 |     1654.6      7.787 |     1052.0     12.248 |   1.57x
+  2048     4096 |     3168.2      8.134 |     1813.9     14.207 |   1.75x
+Done.
+
+############ VK_MOE_PF_VARIANT=4 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.8      3.989 |      240.8      6.689 |   1.68x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      572.4      5.627 |      253.0     12.732 |   2.26x
+   512     1024 |      907.4      7.100 |      397.5     16.207 |   2.28x
+  1024     2048 |     1659.0      7.766 |      636.1     20.255 |   2.61x
+  2048     4096 |     3175.1      8.116 |     1167.8     22.067 |   2.72x
+Done.
+
+############ VK_MOE_PF_VARIANT=5 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      404.1      3.985 |      227.9      7.068 |   1.77x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      568.0      5.672 |      238.8     13.491 |   2.38x
+   512     1024 |      905.8      7.112 |      381.0     16.909 |   2.38x
+  1024     2048 |     1657.4      7.774 |      631.0     20.418 |   2.63x
+  2048     4096 |     3170.8      8.127 |     1164.6     22.128 |   2.72x
+Done.
+
+############ prefill correctness, VARIANT=0 ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ prefill correctness, VARIANT=5 ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ prefill correctness, VARIANT=1 ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ prefill correctness, VARIANT=3 ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ markdown table (prefill µs per M) ############
+| M | v0 | v1 | v2 | v3 | v4 | v5 | v5 vs v0 |
+|---|---|---|---|---|---|---|---|
+| 128 | 602 | 595 | 366 | 347 | 241 | 228 | **2.64×** |
+| 256 | 614 | 597 | 373 | 355 | 253 | 239 | **2.57×** |
+| 512 | 685 | 639 | 424 | 682 | 398 | 381 | **1.80×** |
+| 1024 | 1156 | 816 | 699 | 1052 | 636 | 631 | **1.83×** |
+| 2048 | 1963 | 1498 | 1152 | 1814 | 1168 | 1165 | **1.69×** |
+
+===== ALL DONE =====
+
+
+================ job 640236 ================
+=== node: nid002408 job=640236 ===
+src hip md5: bbd7e518
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+
+############ VK_MOE_PF_VARIANT=0 (rocprof) ############
+
+Initialize(), input metric 'SQ_INSTS_VALU_sum' is not supported on this hardware: gfx942
+Error: Context Create failed
+/usr/bin/rocprof: line 347: 167644 Aborted                 (core dumped) "/tmp/vk76cnt-166705/build/meta/benchmarks/moe_fused_prefill_bench" "situ"
+File '/tmp/vk76cnt-166705/cnt_v0.csv' is generating
+
+############ VK_MOE_PF_VARIANT=5 (rocprof) ############
+
+Initialize(), input metric 'SQ_INSTS_VALU_sum' is not supported on this hardware: gfx942
+Error: Context Create failed
+/usr/bin/rocprof: line 347: 167910 Aborted                 (core dumped) "/tmp/vk76cnt-166705/build/meta/benchmarks/moe_fused_prefill_bench" "situ"
+File '/tmp/vk76cnt-166705/cnt_v5.csv' is generating
+
+############ per-kernel counters ############
+build
+cnt_v0.csv
+cnt_v0.txt
+cnt_v5.csv
+cnt_v5.txt
+core_nid002408_167555
+core_nid002408_167644
+core_nid002408_167844
+core_nid002408_167910
+--- /tmp/vk76cnt-166705/cnt_v0.csv
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,OccupancyPercent,MeanOccupancyPerCU,ALUStalledByLDS,MemUnitStalled,MemUnitBusy
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,167578,167578,131072,256,16896,0,108,4,64,64,0x0,0x15447fc47480,22.5878088391,7.2281630506,0.4341685596,0.0102292782,12.8162656373
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,167578,167578,1048576,256,16896,0,76,4,48,64,0x0,0x15447fc47540,33.7948078570,10.8163489180,0.1312498157,0.2283427854,11.8923612215
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,167578,167578,131072,256,16896,0,108,4,64,64,0x0,0x15447fc47480,22.3095818204,7.1391313335,0.4385077985,0.0153530073,13.3619246640
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,167578,167578,1048576,256,16896,0,76,4,48,64,0x0,0x15447fc47540,33.6284568240,10.7631205598,0.1318676520,0.2341842367,11.8110707320
+8,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,17,167578,167578,131072,256,16896,0,108,4,64,64,0x0,0x15447fc47480,22.5784799984,7.2251787384,0.4402922007,0.0146221144,13.6419324527
+9,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,18,167578,167578,1048576,256,16896,0,76,4,48,64,0x0,0x15447fc47540,33.2978515293,10.6573014512,0.1300527826,0.2291801366,11.6663557145
+--- /tmp/vk76cnt-166705/cnt_v5.csv
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,OccupancyPercent,MeanOccupancyPerCU,ALUStalledByLDS,MemUnitStalled,MemUnitBusy
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,167863,167863,524288,256,12800,0,84,4,48,64,0x0,0x146f36f273c0,50.9677665908,16.3101933663,0.1888192744,0.0340929859,15.1486791888
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,167863,167863,2097152,256,12800,0,64,0,48,64,0x0,0x146f36f274c0,56.5378047884,18.0967693946,0.0734435341,0.5048203420,13.5951666151
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,167863,167863,524288,256,12800,0,84,4,48,64,0x0,0x146f36f273c0,50.5807243395,16.1863366370,0.1897531349,0.0403432462,15.0342972301
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,167863,167863,2097152,256,12800,0,64,0,48,64,0x0,0x146f36f274c0,56.8625890100,18.2007796857,0.0743584738,0.5159190702,13.6917781694
+8,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,17,167863,167863,524288,256,12800,0,84,4,48,64,0x0,0x146f36f273c0,50.5298489099,16.1700629816,0.1929620253,0.0332270835,15.0147255098
+9,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,18,167863,167863,2097152,256,12800,0,64,0,48,64,0x0,0x146f36f274c0,56.6767758117,18.1415060191,0.0780954173,0.5109034248,13.6155322286
+
+===== ALL DONE =====
+
+
+================ job 640238 ================
+=== node: nid002574 job=640238 ===
+src hip md5: bbd7e518
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+
+############ VK_MOE_PF_VARIANT=0 ############
+GPU: AMD Instinct MI250X (gfx90a:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0544 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0544 WARN
+   128      512 |      796.3      2.023 |     1056.6      1.524 |   0.75x
+  cpu-check block_size=16 M=256 max_rel=0.0544 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0544 WARN
+   256      512 |     1401.4      2.298 |     1084.2      2.971 |   1.29x
+   512     1024 |     2447.7      2.632 |     1814.3      3.551 |   1.35x
+  1024     2048 |     4555.2      2.829 |     3066.7      4.202 |   1.49x
+  2048     4096 |     8922.0      2.888 |     6007.7      4.289 |   1.49x
+Done.
+
+############ VK_MOE_PF_VARIANT=5 ############
+GPU: AMD Instinct MI250X (gfx90a:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0544 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0544 WARN
+   128      512 |      795.2      2.025 |      509.1      3.164 |   1.56x
+  cpu-check block_size=16 M=256 max_rel=0.0544 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0544 WARN
+   256      512 |     1400.5      2.300 |      542.7      5.935 |   2.58x
+   512     1024 |     2451.1      2.628 |      866.1      7.439 |   2.83x
+  1024     2048 |     4554.9      2.829 |     1638.1      7.866 |   2.78x
+  2048     4096 |     8952.4      2.879 |     3144.2      8.196 |   2.85x
+Done.
+
+############ prefill correctness, VARIANT=0 ############
+GPU: AMD Instinct MI250X
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ prefill correctness, VARIANT=5 ############
+GPU: AMD Instinct MI250X
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ prefill correctness, VARIANT=3 ############
+GPU: AMD Instinct MI250X
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ markdown table (prefill µs per M, gfx90a) ############
+| M | v0 | v5 | v5 vs v0 |
+|---|---|---|---|
+| 128 | 1057 | 509 | **2.08×** |
+| 256 | 1084 | 543 | **2.00×** |
+| 512 | 1814 | 866 | **2.09×** |
+| 1024 | 3067 | 1638 | **1.87×** |
+| 2048 | 6008 | 3144 | **1.91×** |
+
+===== ALL DONE =====
+
+
+================ job 640239 ================
+=== node: nid002348 job=640239 ===
+src hip md5: bbd7e518
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_bigshape_correct
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_bench
+
+############ decode correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+M=8 hidden=256 ispp=128 top_k=2 E=4 EM_padded=64
+OUT: max_abs=0.0000 max_rel=0.000004
+ACT: max_abs=0.0000 max_rel=0.000000
+PASS
+
+############ prefill correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ big-shape correctness (default path) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+--- decode ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=240 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5032/7168 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=240 max_rel=0.0002421 -> PASS
+--- decode ispp=4096 all-slots expert 255: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=16 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 0/7168 (max |delta| = 0)
+[act] max_rel=0 bad=0/65536 worst_flat=-1 diff=0/65536 (0%)
+    [tol] out_rms=167.8 abs_tol=5.034
+    EM=16 max_rel=5.52e-05 -> PASS
+--- prefill ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5107/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=960 max_rel=0.0002409 -> PASS
+--- decode ispp=33792 E=32 serving shard: E=32 hidden=7168 ispp=33792 top_k=16 M=1 block=16 situ
+[phase] align ok EM=256 max_expert=31
+[phase] weights filled (w13=7.2 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5022/7168 (max |delta| = 0.0001221)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/540672 worst_flat=4 diff=84/540672 (0.0155%)
+    [tol] out_rms=187.5 abs_tol=5.625
+    EM=256 max_rel=0.05808 -> PASS
+--- prefill small E=8 h512 ispp=512: E=8 hidden=512 ispp=512 top_k=4 M=1 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 89/512 (max |delta| = 1.192e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0 bad=0/2048 worst_flat=-1 diff=0/2048 (0%)
+    [tol] out_rms=0.5633 abs_tol=0.0169
+    EM=256 max_rel=2.384e-07 -> PASS
+--- prefill ispp=4096 M=64 no-padding: E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 315935/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09552 -> PASS
+--- prefill ispp=4096 M=2 padded: E=256 hidden=7168 ispp=4096 top_k=16 M=2 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 9983/14336 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/131072 worst_flat=21 diff=10/131072 (0.00763%)
+    [tol] out_rms=58.51 abs_tol=1.755
+    EM=960 max_rel=0.0002432 -> PASS
+--- prefill small M=64 no-padding: E=8 hidden=512 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 10672/32768 (max |delta| = 4.768e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=3.815e-06 bad=0/131072 worst_flat=217 diff=2/131072 (0.00153%)
+    [tol] out_rms=0.6496 abs_tol=0.01949
+    EM=256 max_rel=1.062e-05 -> PASS
+--- bisect E=256 h7168 ispp=512 M=64: E=256 hidden=7168 ispp=512 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=0.9 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 316781/458752 (max |delta| = 2.289e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/524288 worst_flat=4 diff=84/524288 (0.016%)
+    [tol] out_rms=19.06 abs_tol=0.5717
+    EM=1024 max_rel=0.03031 -> PASS
+--- bisect E=256 h7168 ispp=1024 M=64: E=256 hidden=7168 ispp=1024 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=1.8 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 318987/458752 (max |delta| = 3.052e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0009766 bad=0/1048576 worst_flat=693 diff=158/1048576 (0.0151%)
+    [tol] out_rms=27.02 abs_tol=0.8106
+    EM=1024 max_rel=0.03555 -> PASS
+--- bisect E=256 h7168 ispp=2048 M=64: E=256 hidden=7168 ispp=2048 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=3.5 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 319795/458752 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/2097152 worst_flat=210 diff=317/2097152 (0.0151%)
+    [tol] out_rms=38.53 abs_tol=1.156
+    EM=1024 max_rel=0.04959 -> PASS
+--- bisect E=8 h1024 ispp=512 M=64: E=8 hidden=1024 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 14133/65536 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=6.104e-05 bad=0/131072 worst_flat=24 diff=3/131072 (0.00229%)
+    [tol] out_rms=1.366 abs_tol=0.04099
+    EM=256 max_rel=0.0006905 -> PASS
+--- bisect E=8 h2048 ispp=512 M=64: E=8 hidden=2048 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 40163/131072 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=25 diff=3/131072 (0.00229%)
+    [tol] out_rms=2.655 abs_tol=0.07966
+    EM=256 max_rel=0.0001256 -> PASS
+--- bisect E=8 h4096 ispp=512 M=64: E=8 hidden=4096 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 68948/262144 (max |delta| = 7.629e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=233 diff=11/131072 (0.00839%)
+    [tol] out_rms=5.343 abs_tol=0.1603
+    EM=256 max_rel=4.53e-06 -> PASS
+--- decode E=256 h7168 ispp=4096 M=64 (oracle sanity): E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=16 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 323569/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09553 -> PASS
+
+All cases PASS
+
+############ perf, default vs baseline ############
+--- VK_MOE_PF_VARIANT=0
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.3      3.993 |      602.5      2.673 |   0.67x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      568.0      5.671 |      612.9      5.256 |   0.93x
+   512     1024 |      903.8      7.128 |      688.4      9.359 |   1.31x
+  1024     2048 |     1655.3      7.784 |     1145.2     11.251 |   1.45x
+  2048     4096 |     3175.4      8.115 |     1951.4     13.205 |   1.63x
+Done.
+--- VK_MOE_PF_VARIANT=5
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      402.2      4.004 |      226.9      7.099 |   1.77x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      565.5      5.696 |      237.5     13.564 |   2.38x
+   512     1024 |      902.3      7.140 |      379.7     16.968 |   2.38x
+  1024     2048 |     1651.2      7.803 |      626.9     20.553 |   2.63x
+  2048     4096 |     3174.2      8.118 |     1171.8     21.991 |   2.71x
+Done.
+
+############ decode regression guard (E=256 h4096 i512 topk=6) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=256 hidden=4096 ispp=512 top_k=6 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     8      768      628.5      626.6     0.160  0.000595        ok
+    32     2432     1887.0     1892.1     0.213         -      skip
+    48     3456     2614.2     2623.4     0.231         -      skip
+Done.
+
+===== ALL DONE =====
+
+
+================ job 640330 ================
+=== node: nid002676 job=640330 ===
+src hip md5: bbd7e518
+gpu:   Marketing Name:          AMD Instinct MI300A Accelerator    
+shape:   Wavefront Size:          64(0x40)                           
+shape:   Max Waves Per CU:        32(0x20)                           
+shape:   Wavefront Size:          64(0x40)                           
+shape:   Max Waves Per CU:        32(0x20)                           
+shape:   Wavefront Size:          64(0x40)                           
+shape:   Max Waves Per CU:        32(0x20)                           
+shape:   Wavefront Size:          64(0x40)                           
+shape:   Max Waves Per CU:        32(0x20)                           
+compute units: 8
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+
+############ VK_MOE_PF_VARIANT=0 pmc-group=occ (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_184656_187170/input0_results_260917_184656
+File '/tmp/vk76cnt-186419/cnt_v0_occ.csv' is generating
+
+############ VK_MOE_PF_VARIANT=0 pmc-group=valu (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_184705_187301/input0_results_260917_184705
+File '/tmp/vk76cnt-186419/cnt_v0_valu.csv' is generating
+
+############ VK_MOE_PF_VARIANT=0 pmc-group=cyc (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_184713_187430/input0_results_260917_184713
+File '/tmp/vk76cnt-186419/cnt_v0_cyc.csv' is generating
+
+############ VK_MOE_PF_VARIANT=5 pmc-group=occ (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_184721_187578/input0_results_260917_184721
+File '/tmp/vk76cnt-186419/cnt_v5_occ.csv' is generating
+
+############ VK_MOE_PF_VARIANT=5 pmc-group=valu (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_184729_187706/input0_results_260917_184729
+File '/tmp/vk76cnt-186419/cnt_v5_valu.csv' is generating
+
+############ VK_MOE_PF_VARIANT=5 pmc-group=cyc (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_184737_187833/input0_results_260917_184737
+File '/tmp/vk76cnt-186419/cnt_v5_cyc.csv' is generating
+
+############ per-kernel counters ############
+
+--- variant 0 group occ (/tmp/vk76cnt-186419/cnt_v0_occ.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,OccupancyPercent,MeanOccupancyPerCU,ALUStalledByLDS,MemUnitStalled,MemUnitBusy
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,187235,187235,131072,256,16896,0,108,4,64,64,0x0,0x153889147480,22.7040071010,7.2653483633,0.4479431380,0.0114219006,13.0819658656
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,187235,187235,1048576,256,16896,0,76,4,48,64,0x0,0x153889147540,32.0669458640,10.2633288044,0.1253987235,0.2206850683,11.2435062019
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,187235,187235,131072,256,16896,0,108,4,64,64,0x0,0x153889147480,22.4443696660,7.1822648741,0.4440319116,0.0110840249,12.6188668804
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,187235,187235,1048576,256,16896,0,76,4,48,64,0x0,0x153889147540,29.0217541586,9.2886955338,0.1140020346,0.1901212341,10.1356511874
+
+--- variant 0 group valu (/tmp/vk76cnt-186419/cnt_v0_valu.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,SQ_INSTS_VALU,SQ_INSTS_VALU_CVT,SQ_INSTS_MFMA,SQ_WAVES
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,187368,187368,131072,256,16896,0,108,4,64,64,0x0,0x14ff4e227480,118263808,36864,4194304,2048
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,187368,187368,1048576,256,16896,0,76,4,48,64,0x0,0x14ff4e227540,66650112,524288,2097152,16384
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,187368,187368,131072,256,16896,0,108,4,64,64,0x0,0x14ff4e227480,118263808,36864,4194304,2048
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,187368,187368,1048576,256,16896,0,76,4,48,64,0x0,0x14ff4e227540,66650112,524288,2097152,16384
+
+--- variant 0 group cyc (/tmp/vk76cnt-186419/cnt_v0_cyc.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,SQ_BUSY_CYCLES,GRBM_COUNT,SQ_WAIT_INST_LDS
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,187495,187495,131072,256,16896,0,108,4,64,64,0x0,0x148047747480,69703930,17773435,40323671
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,187495,187495,1048576,256,16896,0,76,4,48,64,0x0,0x148047747540,17989188,4798072,25359661
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,187495,187495,131072,256,16896,0,108,4,64,64,0x0,0x148047747480,69556322,17761502,40336159
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,187495,187495,1048576,256,16896,0,76,4,48,64,0x0,0x148047747540,17761328,4673474,25609286
+
+--- variant 5 group occ (/tmp/vk76cnt-186419/cnt_v5_occ.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,OccupancyPercent,MeanOccupancyPerCU,ALUStalledByLDS,MemUnitStalled,MemUnitBusy
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,187643,187643,524288,256,12800,0,84,4,48,64,0x0,0x14bd6f8c73c0,51.0087740575,16.3233179698,0.1900885415,0.0328843152,15.1522945726
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,187643,187643,2097152,256,12800,0,64,0,48,64,0x0,0x14bd6f8c74c0,57.1530458094,18.2938057247,0.0760222000,0.5084331106,13.7238712365
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,187643,187643,524288,256,12800,0,84,4,48,64,0x0,0x14bd6f8c73c0,50.5758876574,16.1847922766,0.1914764801,0.0340481084,15.0525751896
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,187643,187643,2097152,256,12800,0,64,0,48,64,0x0,0x14bd6f8c74c0,56.5924510846,18.1144813999,0.0771020459,0.5068583850,13.5587881338
+
+--- variant 5 group valu (/tmp/vk76cnt-186419/cnt_v5_valu.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,SQ_INSTS_VALU,SQ_INSTS_VALU_CVT,SQ_INSTS_MFMA,SQ_WAVES
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,187771,187771,524288,256,12800,0,84,4,48,64,0x0,0x1536547c73c0,134373376,81920,4194304,8192
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,187771,187771,2097152,256,12800,0,64,0,48,64,0x0,0x1536547c74c0,71827456,524288,2097152,32768
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,187771,187771,524288,256,12800,0,84,4,48,64,0x0,0x1536547c73c0,134373376,81920,4194304,8192
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,187771,187771,2097152,256,12800,0,64,0,48,64,0x0,0x1536547c74c0,71827456,524288,2097152,32768
+
+--- variant 5 group cyc (/tmp/vk76cnt-186419/cnt_v5_cyc.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,SQ_BUSY_CYCLES,GRBM_COUNT,SQ_WAIT_INST_LDS
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,187898,187898,524288,256,12800,0,84,4,48,64,0x0,0x14d51cc473c0,36869649,9296536,36267059
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,187898,187898,2097152,256,12800,0,64,0,48,64,0x0,0x14d51cc474c0,15732508,4048276,24404068
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,187898,187898,524288,256,12800,0,84,4,48,64,0x0,0x14d51cc473c0,36554072,9277434,36724444
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,187898,187898,2097152,256,12800,0,64,0,48,64,0x0,0x14d51cc474c0,14964153,3864979,24578096
+
+===== ALL DONE =====
+
+
+================ job 640343 ================
+=== node: nid003030 job=640343 ===
+src hip md5: 85dfaee9
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_bigshape_correct
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_bench
+
+############ decode correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+M=8 hidden=256 ispp=128 top_k=2 E=4 EM_padded=64
+OUT: max_abs=0.0000 max_rel=0.000004
+ACT: max_abs=0.0000 max_rel=0.000000
+PASS
+
+############ prefill correctness (default path) ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ big-shape correctness (default path) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+--- decode ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=240 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5062/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=240 max_rel=0.000247 -> PASS
+--- decode ispp=4096 all-slots expert 255: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=16 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 0/7168 (max |delta| = 0)
+[act] max_rel=0 bad=0/65536 worst_flat=-1 diff=0/65536 (0%)
+    [tol] out_rms=167.8 abs_tol=5.034
+    EM=16 max_rel=5.52e-05 -> PASS
+--- prefill ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 4812/7168 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=960 max_rel=0.0002433 -> PASS
+--- decode ispp=33792 E=32 serving shard: E=32 hidden=7168 ispp=33792 top_k=16 M=1 block=16 situ
+[phase] align ok EM=256 max_expert=31
+[phase] weights filled (w13=7.2 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5006/7168 (max |delta| = 0.0001221)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/540672 worst_flat=4 diff=84/540672 (0.0155%)
+    [tol] out_rms=187.5 abs_tol=5.625
+    EM=256 max_rel=0.05809 -> PASS
+--- prefill small E=8 h512 ispp=512: E=8 hidden=512 ispp=512 top_k=4 M=1 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 114/512 (max |delta| = 2.384e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0 bad=0/2048 worst_flat=-1 diff=0/2048 (0%)
+    [tol] out_rms=0.5633 abs_tol=0.0169
+    EM=256 max_rel=2.384e-07 -> PASS
+--- prefill ispp=4096 M=64 no-padding: E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 302681/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09552 -> PASS
+--- prefill ispp=4096 M=2 padded: E=256 hidden=7168 ispp=4096 top_k=16 M=2 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 9741/14336 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/131072 worst_flat=21 diff=10/131072 (0.00763%)
+    [tol] out_rms=58.51 abs_tol=1.755
+    EM=960 max_rel=0.0002418 -> PASS
+--- prefill small M=64 no-padding: E=8 hidden=512 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 7327/32768 (max |delta| = 2.384e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=3.815e-06 bad=0/131072 worst_flat=217 diff=2/131072 (0.00153%)
+    [tol] out_rms=0.6496 abs_tol=0.01949
+    EM=256 max_rel=1.062e-05 -> PASS
+--- bisect E=256 h7168 ispp=512 M=64: E=256 hidden=7168 ispp=512 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=0.9 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 314885/458752 (max |delta| = 3.052e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/524288 worst_flat=4 diff=84/524288 (0.016%)
+    [tol] out_rms=19.06 abs_tol=0.5717
+    EM=1024 max_rel=0.03031 -> PASS
+--- bisect E=256 h7168 ispp=1024 M=64: E=256 hidden=7168 ispp=1024 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=1.8 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 316113/458752 (max |delta| = 3.815e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0009766 bad=0/1048576 worst_flat=693 diff=158/1048576 (0.0151%)
+    [tol] out_rms=27.02 abs_tol=0.8106
+    EM=1024 max_rel=0.03555 -> PASS
+--- bisect E=256 h7168 ispp=2048 M=64: E=256 hidden=7168 ispp=2048 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=3.5 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 309913/458752 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/2097152 worst_flat=210 diff=317/2097152 (0.0151%)
+    [tol] out_rms=38.53 abs_tol=1.156
+    EM=1024 max_rel=0.04959 -> PASS
+--- bisect E=8 h1024 ispp=512 M=64: E=8 hidden=1024 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 22197/65536 (max |delta| = 9.537e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=6.104e-05 bad=0/131072 worst_flat=24 diff=3/131072 (0.00229%)
+    [tol] out_rms=1.366 abs_tol=0.04099
+    EM=256 max_rel=0.0006905 -> PASS
+--- bisect E=8 h2048 ispp=512 M=64: E=8 hidden=2048 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 23951/131072 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=25 diff=3/131072 (0.00229%)
+    [tol] out_rms=2.655 abs_tol=0.07966
+    EM=256 max_rel=0.0001258 -> PASS
+--- bisect E=8 h4096 ispp=512 M=64: E=8 hidden=4096 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 49929/262144 (max |delta| = 3.815e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=233 diff=11/131072 (0.00839%)
+    [tol] out_rms=5.343 abs_tol=0.1603
+    EM=256 max_rel=4.768e-06 -> PASS
+--- decode E=256 h7168 ispp=4096 M=64 (oracle sanity): E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=16 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 323413/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09553 -> PASS
+
+All cases PASS
+
+############ perf, default vs baseline ############
+--- VK_MOE_PF_VARIANT=0
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      404.0      3.987 |      602.6      2.673 |   0.67x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      566.6      5.686 |      615.0      5.238 |   0.92x
+   512     1024 |      903.5      7.130 |      686.8      9.380 |   1.32x
+  1024     2048 |     1656.0      7.781 |     1148.7     11.217 |   1.44x
+  2048     4096 |     3178.2      8.108 |     1939.0     13.290 |   1.64x
+Done.
+--- VK_MOE_PF_VARIANT=5
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      404.0      3.987 |      227.4      7.083 |   1.78x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      568.0      5.672 |      238.8     13.487 |   2.38x
+   512     1024 |      903.3      7.132 |      382.5     16.842 |   2.36x
+  1024     2048 |     1659.6      7.764 |      628.0     20.516 |   2.64x
+  2048     4096 |     3183.1      8.096 |     1175.5     21.923 |   2.71x
+Done.
+
+############ decode regression guard (E=256 h4096 i512 topk=6) ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=256 hidden=4096 ispp=512 top_k=6 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     8      768      629.0      628.1     0.160  0.000574        ok
+    32     2432     1880.1     1885.3     0.214         -      skip
+    48     3456     2602.9     2609.9     0.232         -      skip
+Done.
+
+===== ALL DONE =====
+
+
+================ job 640344 ================
+=== node: nid003034 job=640344 ===
+src hip md5: 85dfaee9
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+
+############ VK_MOE_PF_VARIANT=0 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      402.8      3.999 |      601.6      2.677 |   0.67x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      566.4      5.687 |      613.3      5.252 |   0.92x
+   512     1024 |      902.0      7.142 |      683.8      9.421 |   1.32x
+  1024     2048 |     1652.5      7.797 |     1144.8     11.255 |   1.44x
+  2048     4096 |     3166.9      8.137 |     1940.7     13.278 |   1.63x
+Done.
+
+############ VK_MOE_PF_VARIANT=1 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.0      3.997 |      595.2      2.706 |   0.68x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      568.1      5.670 |      595.6      5.408 |   0.95x
+   512     1024 |      904.7      7.121 |      638.5     10.090 |   1.42x
+  1024     2048 |     1660.6      7.759 |      822.1     15.673 |   2.02x
+  2048     4096 |     3184.6      8.092 |     1496.9     17.216 |   2.13x
+Done.
+
+############ VK_MOE_PF_VARIANT=2 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      402.4      4.002 |      362.0      4.449 |   1.11x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      567.9      5.672 |      370.1      8.703 |   1.53x
+   512     1024 |      902.1      7.141 |      420.6     15.317 |   2.14x
+  1024     2048 |     1655.5      7.783 |      693.7     18.574 |   2.39x
+  2048     4096 |     3171.6      8.125 |     1144.4     22.519 |   2.77x
+Done.
+
+############ VK_MOE_PF_VARIANT=3 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.5      3.991 |      348.2      4.626 |   1.16x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      567.8      5.673 |      355.3      9.067 |   1.60x
+   512     1024 |      901.7      7.145 |      680.6      9.466 |   1.32x
+  1024     2048 |     1652.9      7.795 |     1048.8     12.285 |   1.58x
+  2048     4096 |     3169.5      8.131 |     1819.3     14.165 |   1.74x
+Done.
+
+############ VK_MOE_PF_VARIANT=4 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      402.4      4.002 |      237.6      6.778 |   1.69x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      568.3      5.668 |      248.6     12.959 |   2.29x
+   512     1024 |      902.6      7.138 |      391.0     16.478 |   2.31x
+  1024     2048 |     1654.2      7.789 |      628.0     20.517 |   2.63x
+  2048     4096 |     3169.8      8.130 |     1167.6     22.070 |   2.71x
+Done.
+
+############ VK_MOE_PF_VARIANT=5 ############
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0543 WARN
+   128      512 |      403.4      3.993 |      227.1      7.091 |   1.78x
+  cpu-check block_size=16 M=256 max_rel=0.0543 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0543 WARN
+   256      512 |      567.7      5.674 |      238.4     13.514 |   2.38x
+   512     1024 |      900.9      7.151 |      379.5     16.975 |   2.37x
+  1024     2048 |     1654.1      7.790 |      626.9     20.553 |   2.64x
+  2048     4096 |     3167.6      8.135 |     1172.2     21.984 |   2.70x
+Done.
+
+############ prefill correctness, VARIANT=0 ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ prefill correctness, VARIANT=5 ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ prefill correctness, VARIANT=1 ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ prefill correctness, VARIANT=3 ############
+GPU: AMD Instinct MI300A
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ markdown table (prefill µs per M) ############
+| M | v0 | v1 | v2 | v3 | v4 | v5 | v5 vs v0 |
+|---|---|---|---|---|---|---|---|
+| 128 | 602 | 595 | 362 | 348 | 238 | 227 | **2.65×** |
+| 256 | 613 | 596 | 370 | 355 | 249 | 238 | **2.57×** |
+| 512 | 684 | 638 | 421 | 681 | 391 | 380 | **1.80×** |
+| 1024 | 1145 | 822 | 694 | 1049 | 628 | 627 | **1.83×** |
+| 2048 | 1941 | 1497 | 1144 | 1819 | 1168 | 1172 | **1.66×** |
+
+===== ALL DONE =====
+
+
+================ job 640345 ================
+=== node: nid002536 job=640345 ===
+src hip md5: 85dfaee9
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_prefill_correct
+
+############ VK_MOE_PF_VARIANT=0 ############
+GPU: AMD Instinct MI250X (gfx90a:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0544 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0544 WARN
+   128      512 |      798.4      2.017 |     1062.2      1.516 |   0.75x
+  cpu-check block_size=16 M=256 max_rel=0.0544 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0544 WARN
+   256      512 |     1408.5      2.287 |     1090.6      2.954 |   1.29x
+   512     1024 |     2463.2      2.615 |     1819.4      3.541 |   1.35x
+  1024     2048 |     4576.6      2.815 |     3073.9      4.192 |   1.49x
+  2048     4096 |     8993.9      2.865 |     6032.8      4.272 |   1.49x
+Done.
+
+############ VK_MOE_PF_VARIANT=5 ############
+GPU: AMD Instinct MI250X (gfx90a:sramecc+:xnack-)
+
+E=8 hidden=4096 ispp=512 top_k=2 activation=situ
+     M     EM64 |     dec-us     dec-TF |      pf-us      pf-TF | speedup
+  cpu-check block_size=16 M=128 max_rel=0.0544 WARN
+  cpu-check block_size=64 M=128 max_rel=0.0544 WARN
+   128      512 |      799.4      2.015 |      511.5      3.149 |   1.56x
+  cpu-check block_size=16 M=256 max_rel=0.0544 WARN
+  cpu-check block_size=64 M=256 max_rel=0.0544 WARN
+   256      512 |     1403.4      2.295 |      545.1      5.909 |   2.57x
+   512     1024 |     2463.8      2.615 |      869.8      7.407 |   2.83x
+  1024     2048 |     4577.3      2.815 |     1640.8      7.853 |   2.79x
+  2048     4096 |     8964.8      2.875 |     3137.6      8.213 |   2.86x
+Done.
+
+############ prefill correctness, VARIANT=0 ############
+GPU: AMD Instinct MI250X
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ prefill correctness, VARIANT=5 ############
+GPU: AMD Instinct MI250X
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ prefill correctness, VARIANT=3 ############
+GPU: AMD Instinct MI250X
+activation=swiglu
+clean          M=128 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=256
+  OUT max_rel=0.010937 PASS
+padded         M=80 hidden=512 ispp=256 top_k=2 E=4 EM_gpu=256 EM_cpu=192
+  OUT max_rel=0.010937 PASS
+PASS
+
+############ markdown table (prefill µs per M, gfx90a) ############
+| M | v0 | v5 | v5 vs v0 |
+|---|---|---|---|
+| 128 | 1062 | 512 | **2.08×** |
+| 256 | 1091 | 545 | **2.00×** |
+| 512 | 1819 | 870 | **2.09×** |
+| 1024 | 3074 | 1641 | **1.87×** |
+| 2048 | 6033 | 3138 | **1.92×** |
+
+===== ALL DONE =====
+
+
+================ job 640346 ================
+=== node: nid002698 job=640346 ===
+src hip md5: 85dfaee9
+gpu:   Marketing Name:          AMD Instinct MI300A Accelerator    
+shape:   Wavefront Size:          64(0x40)                           
+shape:   Max Waves Per CU:        32(0x20)                           
+shape:   Wavefront Size:          64(0x40)                           
+shape:   Max Waves Per CU:        32(0x20)                           
+shape:   Wavefront Size:          64(0x40)                           
+shape:   Max Waves Per CU:        32(0x20)                           
+shape:   Wavefront Size:          64(0x40)                           
+shape:   Max Waves Per CU:        32(0x20)                           
+compute units: 8
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_prefill_bench
+
+############ VK_MOE_PF_VARIANT=0 pmc-group=occ (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_193035_108142/input0_results_260917_193035
+File '/tmp/vk76cnt-107391/cnt_v0_occ.csv' is generating
+
+############ VK_MOE_PF_VARIANT=0 pmc-group=valu (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_193044_108277/input0_results_260917_193044
+File '/tmp/vk76cnt-107391/cnt_v0_valu.csv' is generating
+
+############ VK_MOE_PF_VARIANT=0 pmc-group=cyc (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_193052_108417/input0_results_260917_193052
+File '/tmp/vk76cnt-107391/cnt_v0_cyc.csv' is generating
+
+############ VK_MOE_PF_VARIANT=5 pmc-group=occ (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_193100_108549/input0_results_260917_193100
+File '/tmp/vk76cnt-107391/cnt_v5_occ.csv' is generating
+
+############ VK_MOE_PF_VARIANT=5 pmc-group=valu (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_193109_108680/input0_results_260917_193109
+File '/tmp/vk76cnt-107391/cnt_v5_valu.csv' is generating
+
+############ VK_MOE_PF_VARIANT=5 pmc-group=cyc (rocprof) ############
+Done.
+
+ROCPRofiler: 6086 contexts collected, output directory /tmp/rpl_data_260917_193117_108806/input0_results_260917_193117
+File '/tmp/vk76cnt-107391/cnt_v5_cyc.csv' is generating
+
+############ per-kernel counters ############
+
+--- variant 0 group occ (/tmp/vk76cnt-107391/cnt_v0_occ.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,OccupancyPercent,MeanOccupancyPerCU,ALUStalledByLDS,MemUnitStalled,MemUnitBusy
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,108207,108207,131072,256,16896,0,108,4,64,64,0x0,0x14878c8c7480,21.9611873198,7.0276397820,0.3861819031,0.0109042071,12.5623132768
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,108207,108207,1048576,256,16896,0,76,4,48,64,0x0,0x14878c8c7540,32.5210515640,10.4086385997,0.1241032577,0.2218587826,11.3634937066
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,108207,108207,131072,256,16896,0,108,4,64,64,0x0,0x14878c8c7480,21.8281746737,6.9850760251,0.3820958477,0.0099424737,12.4945338955
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,108207,108207,1048576,256,16896,0,76,4,48,64,0x0,0x14878c8c7540,32.2871304031,10.3338287209,0.1268211420,0.2191431826,11.3775732502
+
+--- variant 0 group valu (/tmp/vk76cnt-107391/cnt_v0_valu.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,SQ_INSTS_VALU,SQ_INSTS_VALU_CVT,SQ_INSTS_MFMA,SQ_WAVES
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,108343,108343,131072,256,16896,0,108,4,64,64,0x0,0x146e4e547480,118263808,36864,4194304,2048
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,108343,108343,1048576,256,16896,0,76,4,48,64,0x0,0x146e4e547540,66650112,524288,2097152,16384
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,108343,108343,131072,256,16896,0,108,4,64,64,0x0,0x146e4e547480,118263808,36864,4194304,2048
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,108343,108343,1048576,256,16896,0,76,4,48,64,0x0,0x146e4e547540,66650112,524288,2097152,16384
+
+--- variant 0 group cyc (/tmp/vk76cnt-107391/cnt_v0_cyc.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,SQ_BUSY_CYCLES,GRBM_COUNT,SQ_WAIT_INST_LDS
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,108486,108486,131072,256,16896,0,108,4,64,64,0x0,0x14ed2d2c7480,77986009,20085308,39256885
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,108486,108486,1048576,256,16896,0,76,4,48,64,0x0,0x14ed2d2c7540,18010416,5007516,25445477
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,108486,108486,131072,256,16896,0,108,4,64,64,0x0,0x14ed2d2c7480,76983370,19833598,39115356
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill<64>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,108486,108486,1048576,256,16896,0,76,4,48,64,0x0,0x14ed2d2c7540,17789211,5188716,25506135
+
+--- variant 5 group occ (/tmp/vk76cnt-107391/cnt_v5_occ.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,OccupancyPercent,MeanOccupancyPerCU,ALUStalledByLDS,MemUnitStalled,MemUnitBusy
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,108618,108618,524288,256,12800,0,84,4,48,64,0x0,0x14b9f9f473c0,51.0263250452,16.3289389796,0.1914457792,0.0332150106,15.1628192231
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,108618,108618,2097152,256,12800,0,64,0,48,64,0x0,0x14b9f9f474c0,57.0217103219,18.2517987765,0.0758328343,0.5054529198,13.6310249761
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,108618,108618,524288,256,12800,0,84,4,48,64,0x0,0x14b9f9f473c0,50.4481545773,16.1439214648,0.1918005764,0.0345466634,14.9947590523
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,108618,108618,2097152,256,12800,0,64,0,48,64,0x0,0x14b9f9f474c0,56.6240080614,18.1246396374,0.0775093339,0.5036752259,13.5590724887
+
+--- variant 5 group valu (/tmp/vk76cnt-107391/cnt_v5_valu.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,SQ_INSTS_VALU,SQ_INSTS_VALU_CVT,SQ_INSTS_MFMA,SQ_WAVES
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,108745,108745,524288,256,12800,0,84,4,48,64,0x0,0x14ba0ef273c0,134373376,81920,4194304,8192
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,108745,108745,2097152,256,12800,0,64,0,48,64,0x0,0x14ba0ef274c0,71827456,524288,2097152,32768
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,108745,108745,524288,256,12800,0,84,4,48,64,0x0,0x14ba0ef273c0,134373376,81920,4194304,8192
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,108745,108745,2097152,256,12800,0,64,0,48,64,0x0,0x14ba0ef274c0,71827456,524288,2097152,32768
+
+--- variant 5 group cyc (/tmp/vk76cnt-107391/cnt_v5_cyc.csv)
+Index,KernelName,gpu-id,queue-id,queue-index,pid,tid,grd,wgr,lds,scr,arch_vgpr,accum_vgpr,sgpr,wave_size,sig,obj,SQ_BUSY_CYCLES,GRBM_COUNT,SQ_WAIT_INST_LDS
+4,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,13,108871,108871,524288,256,12800,0,84,4,48,64,0x0,0x151c50f473c0,36937693,9318891,36359715
+5,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,14,108871,108871,2097152,256,12800,0,64,0,48,64,0x0,0x151c50f474c0,15486134,3959996,24524694
+6,"void vkernels::kernels::hip::gateup_swiglu_kernel_prefill_pipe<16>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, unsigned short*, int const*, int const*, int, int, int, int, float, int, float, float, int) [clone .kd]",4,0,15,108871,108871,524288,256,12800,0,84,4,48,64,0x0,0x151c50f473c0,36669080,9316971,36670066
+7,"void vkernels::kernels::hip::down_combine_kernel_prefill_pipe<32>(unsigned short const*, unsigned char const*, unsigned char const*, float const*, float*, float const*, int const*, int const*, int, int, int, int, int) [clone .kd]",4,0,16,108871,108871,2097152,256,12800,0,64,0,48,64,0x0,0x151c50f474c0,14831174,3852031,24621596
+
+===== ALL DONE =====
