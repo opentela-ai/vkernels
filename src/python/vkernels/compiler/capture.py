@@ -665,10 +665,24 @@ class RecordingBackend:
         *,
         layer: int,
         kv_heads: Optional[int] = None,
+        gate: Optional[SymbolicTensor] = None,
     ) -> SymbolicTensor:
-        """ctx[b,h,:] = sum_{t<=p} probs[b,h,t] * V[l,b,kv(h),t,:] (GQA-aware)."""
+        """ctx[b,h,:] = sum_{t<=p} probs[b,h,t] * V[l,b,kv(h),t,:] (GQA-aware).
+
+        With ``gate`` (issue #92, Qwen3.5 attn_output_gate): the per-head
+        sigmoid output gate is fused into the values task itself —
+        ``ctx[b,h,:] *= sigmoid(gate[b,h,:])`` — so the gated multiply costs
+        no extra grid barrier per FA layer. ``gate`` is [B, H, D] in the
+        same tile domain, emitted by the chunked [q|gate|k|v] projection.
+        """
         self._require_position(position, "attention_values")
         b, h, d = probs.value.shape[0], probs.value.shape[1], v_cache.value.shape[3]
+        if gate is not None and tuple(gate.value.shape) != (b, h, d):
+            raise ValueError(
+                f"attention_values gate must be [B, H, D] = {(b, h, d)}, "
+                f"got {tuple(gate.value.shape)}"
+            )
+        inputs = (probs, v_cache) if gate is None else (probs, v_cache, gate)
         out = self.fresh_buffer(f"ctx_l{layer}{self._suffix()}", (b, h, d))
         p = self._position_name(position)
         valid = self._valid_plus_one(position, "attention_values")
@@ -687,19 +701,33 @@ class RecordingBackend:
                 for g in range(kvh)
             )
 
+        attributes = {
+            "layer": layer,
+            "position": p,
+            "position_form": "row" if valid.is_row else "scalar",
+            "kv_heads": kvh,
+        }
+        if gate is not None:
+            attributes["gated"] = True
+        reads: tuple[Region, ...] = (Region.prefix(probs.value, axis=2, valid=valid),) + v_regions()
+        if gate is not None:
+            reads = reads + (Region.whole(gate.value),)
+        contract = {
+            "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
+            "valid": "only each row's positions [0, pos[b]] contribute; V beyond a row's valid length is never loaded (NaN tails must not leak)",
+            "reduction": "f32, t ascending",
+        }
+        if gate is not None:
+            contract["gate"] = "y = acc * sigmoid(gate[b,h,:]); sigmoid and multiply in f32 before the single bf16 store (#92); no extra barrier"
         self._record(
             "attention_values",
-            inputs=(probs, v_cache),
+            inputs=inputs,
             outputs=(out,),
-            attributes={"layer": layer, "position": p, "position_form": "row" if valid.is_row else "scalar", "kv_heads": kvh},
-            reads=(Region.prefix(probs.value, axis=2, valid=valid),) + v_regions(),
+            attributes=attributes,
+            reads=reads,
             writes=(_regional_reads(out.value),),
             source_location=f"layer {layer} attention values",
-            numerical_contract={
-                "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
-                "valid": "only each row's positions [0, pos[b]] contribute; V beyond a row's valid length is never loaded (NaN tails must not leak)",
-                "reduction": "f32, t ascending",
-            },
+            numerical_contract=contract,
         )
         return out
 

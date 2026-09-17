@@ -41,6 +41,21 @@ from .task_ir import TaskFamily
 __all__ = ["ExecutionTrace", "PhaseStat", "ReferenceExecutor", "ExecutorError", "decode_e4m3"]
 
 
+def _stable_sigmoid(g: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid, fp64 mirror of the device epilogue
+    ``1 / (1 + exp(-g))`` (issue #92). Overflow-safe for large |g|: the
+    device computes exp(-g) directly, so huge negative g overflows to inf
+    and the ratio still rounds to 0; huge positive g underflows to 0 and
+    the ratio rounds to 1 — same saturating semantics, no NaN."""
+    g = np.asarray(g, dtype=np.float64)
+    out = np.empty_like(g)
+    pos = g >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-g[pos]))
+    eg = np.exp(g[~pos])
+    out[~pos] = eg / (1.0 + eg)
+    return out
+
+
 class ExecutorError(Exception):
     """The executed schedule violated an obligation (§12)."""
 
@@ -485,4 +500,11 @@ class ReferenceExecutor:
         vlen = self._valid_len(fam, b, scalars)
         # Masked: V rows beyond pos[b] are never loaded (per-row NaN-tail
         # contract, issue #93).
-        y[b, h, :] = (probs[b, h, :vlen] @ v_cache[b, kvh, :vlen, :]).astype(y.dtype)
+        acc = probs[b, h, :vlen] @ v_cache[b, kvh, :vlen, :]
+        if fam.params.get("gated", False):
+            # Issue #92: per-head sigmoid output gate fused into the values
+            # task — fp64 reference of the device's fp32 epilogue
+            # y = acc * sigmoid(gate[b,h,:]) with no extra barrier.
+            gate = self.tensor(fam.inputs[2]).astype(np.float64)
+            acc = acc * _stable_sigmoid(gate[b, h, :])
+        y[b, h, :] = acc.astype(y.dtype)
