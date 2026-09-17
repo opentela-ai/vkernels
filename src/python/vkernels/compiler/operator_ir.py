@@ -539,6 +539,10 @@ class OperatorGraph:
         # storage_id -> version, bumped by each effectful write; expresses
         # ordering without copying the cache (§4.3).
         self.storage_versions: dict[int, int] = {}
+        # Per-row decode-position tensors (issue #93): name -> declared
+        # capacity. Legality scopes consumers exactly like the scalar p.
+        self.row_position_tensors: set[str] = set()
+        self.row_position_capacity: dict[str, int] = {}
         self._next_vid = 0
         self._next_opid = 0
         self._next_storage = 0
