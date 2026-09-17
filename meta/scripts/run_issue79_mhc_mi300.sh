@@ -7,7 +7,9 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=00:45:00
 # Issue #79: mhc_pre_gemm_sqrsum column-split across blocks (grid
-# (num_tokens, hc_mult3), 256 threads, coalesced fn-row walk). Build +
+# (num_tokens, hc_mult3); coalesced fn-row prefetch through a double-buffered
+# shared chunk; out accumulated as the oracle's strict sequential fp32 chain).
+# Build +
 # correctness gate (test_mhc_correct vs CPU oracle) + mhc_bench on an
 # MI300A (gfx942) -- CSCS beverin `mi300` partition.
 #

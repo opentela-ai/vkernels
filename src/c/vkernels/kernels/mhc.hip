@@ -53,29 +53,51 @@ namespace vkernels::kernels::hip {
 // hidden=4096; 28672 = hidden=7168).
 static constexpr int kMaxHcHidden = 28672;
 
+// fn prefetch chunk (fp32 elements) for the mhc_pre column pipeline: the
+// double buffer (2 * kFnChunk * 4 B = 4 KB) must keep the static shared
+// total (sX 57344 + sFN 4096 + sRed 1024 = 62464 B) under MI300A's 64 KB
+// non-optin cap at the widest hc_hidden = 28672 branch.
+static constexpr int kFnChunk = 512;
+
 
 // ---------------------------------------------------------------------------
 //  mhc_pre_gemm_sqrsum
 //
 //  Grid (num_tokens, hc_mult3): one block per (token, output column o),
 //  256 threads (issue #79). The token row x[n,:] is staged once per block
-//  in static shared memory as bf16 (<= 56 KB); the block then streams ITS
-//  OWN fn row fn[o,:] contiguously -- threads read consecutive fp32
-//  elements, so the fn walk is fully coalesced (the old one-warp-per-token
-//  layout had each lane striding a different fn row: un-coalesced, and at
-//  decode n=1 the whole GEMM ran on ONE block = 0.1% of MI300A HBM).
+//  in static shared memory as bf16 (<= 56 KB); threads 1..255 then stream
+//  the block's OWN fn row fn[o,:] through a double-buffered shared chunk
+//  buffer with fully coalesced reads (the old one-warp-per-token layout had
+//  each lane striding a different fn row: un-coalesced, and at decode n=1
+//  the whole GEMM ran on ONE block = 0.1% of MI300A HBM).
+//
+//  Accumulation ORDER is load-bearing for the correctness gate. The CPU
+//  oracle sums each output element as a strict left-to-right fp32
+//  mul-then-add chain over h (mhc_pre_gemm_sqrsum_cpu). Because fp32
+//  addition is not associative, ANY parallel regrouping of that chain
+//  (strided partials, tree/sequential combine, even a fully exact fp64
+//  reduction) drifts from the oracle by the oracle's own rounding-path
+//  deviation (~1.5e-3 abs on the GLM shapes) -- measured 1.03e-4 max_rel on
+//  the n=7 hc_hidden=16384 gate row, i.e. a FAIL at the unchanged 1e-4
+//  PRE_THRESH, and above the documented <= 2e-5 envelope. So out[n,o] is
+//  computed by ONE thread (tid 0) as the same strict sequential chain,
+//  consuming x from the staged row and fn from shared: the product is
+//  materialized with a compiler barrier (no mul+add -> FMA contraction),
+//  making the device sum BITWISE identical to the oracle. The parallel
+//  speedup comes from (a) one block per column (24 blocks at decode
+//  instead of 1) and (b) the shared double buffer, which hides the global
+//  fn load latency that dominated the old serial walk (~278 us was
+//  load-stall, not FMA: the chain floor is hc_hidden * 4 cyc).
+//
+//  sqrsum[n] has no such ordering constraint (all-positive terms, large
+//  partials): the o == 0 block computes it cooperatively (strided fp32
+//  partials + shared tree reduce, measured max_rel 1.2e-5 <= 2e-5) off the
+//  staged row before the GEMM pipeline starts. No atomics, no extra pass.
 //
 //  Static shared budget (no dynamic-shared request, no hipFuncSetAttribute
-//  opt-in): sX 28672*2 = 57344 B + sRed 256*4 = 1024 B = 58368 B < 65536 B,
-//  so the wider hc_hidden=28672 branch still fits MI300A's 64 KB non-optin
-//  cap.
-//
-//  Per-output accumulation is a strided-lane partial + shared tree reduce,
-//  fp32 end to end -- the same associativity class as the CPU oracle's
-//  left-to-right sum (max_rel <= 2e-5, fp32 storage, gate unchanged).
-//  Block o == 0 additionally computes sqrsum[n] off the staged row; no
-//  atomics, no second kernel/pass. No dynamic-shared-memory workaround is
-//  needed: there is no dynamic shared memory at all.
+//  opt-in): sX 28672*2 = 57344 B + sFN 2*512*4 = 4096 B + sRed 256*4 =
+//  1024 B = 62464 B < 65536 B, so the wider hc_hidden=28672 branch still
+//  fits MI300A's 64 KB non-optin cap.
 // ---------------------------------------------------------------------------
 __global__ void mhc_pre_gemm_sqrsum_kernel(
     const uint16_t* __restrict__ x,   // [num_tokens, hc_hidden_size] bf16
@@ -83,41 +105,30 @@ __global__ void mhc_pre_gemm_sqrsum_kernel(
     float* __restrict__ out,          // [num_tokens, hc_mult3] fp32
     float* __restrict__ sqrsum,       // [num_tokens] fp32
     int num_tokens, int hc_mult3, int hc_hidden_size) {
+  // Strict mul+add rounding for the out chain -- no FMA contraction (the
+  // CPU oracle is a two-rounding mul-then-add chain; see block comment).
+  // Must be the first statement of the compound block (clang restriction).
+#pragma clang fp contract(off)
   const int n = blockIdx.x;
   const int o = blockIdx.y;              // output column (issue #79 split)
   if (n >= num_tokens || o >= hc_mult3) return;
   const int tid = threadIdx.x;
 
   __shared__ uint16_t sX[kMaxHcHidden];  // staged token row (bf16)
-  __shared__ float sRed[256];            // tree-reduction scratch
+  __shared__ float sFN[2][kFnChunk];     // fn[o, chunk] double buffer
+  __shared__ float sRed[256];            // sqrsum tree-reduction scratch
   for (int h = tid; h < hc_hidden_size; h += 256)
     sX[h] = x[(size_t)n * hc_hidden_size + h];
   __syncthreads();
 
-  // GEMM: out[n, o] = sum_h x[n, h] * fn[o, h]. Each block owns exactly one
-  // output element; the fn row walk is coalesced (256 consecutive fp32 =
-  // 1 KB per iteration).
-  const float* fn_row = fn + (size_t)o * hc_hidden_size;
-  float acc = 0.0f;
-  for (int h = tid; h < hc_hidden_size; h += 256)
-    acc += bf16_to_f32(sX[h]) * fn_row[h];
-  sRed[tid] = acc;
-  __syncthreads();
-#pragma unroll
-  for (int off = 128; off > 0; off >>= 1) {
-    if (tid < off) sRed[tid] += sRed[tid + off];
-    __syncthreads();
-  }
-  if (tid == 0) out[(size_t)n * hc_mult3 + o] = sRed[0];
-
-  // Per-token squared-sum, computed by the o == 0 block off the staged row.
+  // Per-token squared-sum (o == 0 block, cooperative -- order-free), done
+  // before the GEMM pipeline so sRed is not touched while it runs.
   if (o == 0) {
     float sq = 0.0f;
     for (int h = tid; h < hc_hidden_size; h += 256) {
       float xv = bf16_to_f32(sX[h]);
       sq += xv * xv;
     }
-    __syncthreads();  // all threads past the out reduction before reusing sRed
     sRed[tid] = sq;
     __syncthreads();
 #pragma unroll
@@ -126,6 +137,50 @@ __global__ void mhc_pre_gemm_sqrsum_kernel(
       __syncthreads();
     }
     if (tid == 0) sqrsum[n] = sRed[0];
+  }
+
+  // GEMM: out[n, o] = sum_h x[n, h] * fn[o, h] as a STRICT sequential fp32
+  // mul+add chain over h (order-faithful to the CPU oracle -- see block
+  // comment; parallel regrouping measurably breaks the 1e-4 gate). tid 0
+  // walks the chain from shared while threads 1..255 prefetch the next
+  // fn chunk (coalesced, 255 consecutive fp32 per instruction) into the
+  // alternate buffer: one __syncthreads() per chunk, double-buffered, so
+  // the chain is fed at LDS latency instead of global latency.
+  const float* fn_row = fn + (size_t)o * hc_hidden_size;
+  const int nc = (hc_hidden_size + kFnChunk - 1) / kFnChunk;
+  // Stage chunk 0 (threads 1..255; tid 0 only consumes).
+  for (int j = tid - 1; j < kFnChunk; j += 255) {
+    if (j < 0) continue;  // tid 0 (j == -1) does not produce
+    const int h = j;
+    if (h < hc_hidden_size) sFN[0][j] = fn_row[h];
+  }
+  __syncthreads();
+
+  float acc = 0.0f;
+  for (int c = 0; c < nc; ++c) {
+    if (tid == 0) {  // consumer: strict h-order chain over chunk c
+      const int base = c * kFnChunk;
+#pragma unroll 8
+      for (int j = 0; j < kFnChunk; ++j) {
+        const int h = base + j;
+        if (h < hc_hidden_size) {
+          float p = bf16_to_f32(sX[h]) * sFN[c & 1][j];
+          // contract(off) below keeps hipcc's default -ffp-contract=fast from
+          // fusing this mul+add into an FMA (one rounding instead of the
+          // oracle's two): the chain then matches the CPU oracle bitwise.
+          acc += p;
+        }
+      }
+      if (c == nc - 1) out[(size_t)n * hc_mult3 + o] = acc;
+    } else if (c + 1 < nc) {  // producers: coalesced fn chunk c+1 prefetch
+      const int cc = c + 1;
+      const int base = cc * kFnChunk;
+      for (int j = tid - 1; j < kFnChunk; j += 255) {
+        const int h = base + j;
+        if (h < hc_hidden_size) sFN[cc & 1][j] = fn_row[h];
+      }
+    }
+    __syncthreads();
   }
 }
 

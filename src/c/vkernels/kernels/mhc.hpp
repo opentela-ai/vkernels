@@ -80,11 +80,20 @@ namespace vkernels::kernels::hip {
 // device pointers. Online accumulation in fp32, bf16 storage for `x`.
 // `hc_mult3 <= 32`; `hc_hidden_size <= 28672` (static shared memory budget).
 // Grid is (num_tokens, hc_mult3) -- one block per (token, output column),
-// so the decode n=1 GEMM uses hc_mult3 blocks (issue #79 column split) and
-// each block streams its own fn row coalesced. No dynamic-shared-memory
-// workaround: per-block shared is a single static `hc_hidden_size`-wide
-// bf16 staging buffer (<= 56 KB) + a 1 KB reduction scratch, well within
-// MI300A's 64 KB non-optin cap.
+// so the decode n=1 GEMM uses hc_mult3 blocks (issue #79 column split).
+// Threads 1..255 prefetch the block's fn row through a double-buffered
+// shared chunk buffer (coalesced global reads); thread 0 accumulates
+// out[n, o] as a strict sequential fp32 mul+add chain over h -- the SAME
+// rounding path as the CPU oracle (fp32 addition is not associative and
+// the oracle's sequential chain is the correctness gate: any parallel
+// regrouping of the chain measurably breaks the 1e-4 test threshold on the
+// n=7 GLM row, so the chain is run serially by design and the parallelism
+// comes from the per-column blocks + latency-hiding prefetch instead).
+// sqrsum[n] (order-free) is a cooperative strided-partial + tree reduce in
+// the o == 0 block. No dynamic-shared-memory workaround: per-block shared
+// is a static `hc_hidden_size`-wide bf16 staging buffer (<= 56 KB) + a 4 KB
+// fn double buffer + 1 KB reduction scratch = 62464 B, within MI300A's
+// 64 KB non-optin cap.
 // stream (issue #69): caller hipStream_t (as void*); nullptr = legacy.
 void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
                          const void* x, const void* fn,
