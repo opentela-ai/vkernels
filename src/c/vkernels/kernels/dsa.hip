@@ -585,10 +585,9 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
 //                        ring slot gt&1 while tile gt+1 is byte-copied into
 //                        slot (gt+1)&1, so the coalesced global loads (which
 //                        may belong to the NEXT page -- the page table is
-//                        walked per tile, and the staged copy of every
-//                        per-thread load slot issues before its stores)
-//                        overlap the MFMAs behind ONE barrier per tile;
-//                        the pre-prefetch loop barriered twice per tile. fp8 pairing vs the single-bf16-tile
+//                        walked per tile) overlap MFMAs behind ONE barrier
+//                        per tile; the pre-prefetch loop barriered twice
+//                        per tile. fp8 pairing vs the single-bf16-tile
 //                        layout keeps the footprint IDENTICAL (each 2-byte
 //                        bf16 K became 1-byte fp8 x 2 slots); the per-lane
 //                        fragment converts fp8->f32->bf16 losslessly, so
@@ -623,16 +622,6 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
 // boundaries ("more keys in flight, fewer serial page loops"); the scale
 // slot's page parity keeps every epilogue read >=1 barrier behind its fill
 // even for single-tile pages (D == kBK).
-//
-// The copy is REGISTER-STAGED: all kTh-strided loads issue back-to-back
-// (independent addresses), then their stores complete. Measured on
-// MI300A (run 640253), an un-staged `dst[i] = kbase[src[i]]` loop
-// serialises each load against its own store (~5.5 us per B*kBK tile --
-// B*kBK/kTh sequential L2 round trips) and the prefetch never actually
-// overlaps the MFMAs. Staging collapses the chain to one round trip; the
-// staged bytes live in 4 u32 registers (16 slots = ceildiv(64*64, kTh) --
-// the largest tile), held via OR-accumulate over distinct byte lanes so
-// the guarded predication never clobbers a written byte.
 __device__ __forceinline__ void dsa_topk_fill_ktile(
     uint8_t* sKring, float* sKscale, const int32_t* page_table,
     const uint8_t* kvcache_u8, int b, int i_start, int gt, int tilesPerPg,
@@ -642,21 +631,8 @@ __device__ __forceinline__ void dsa_topk_fill_ktile(
   const uint8_t* kbase = kvcache_u8 + (size_t)page_id * (B * (D + 4));
   const int kt = gt % tilesPerPg;
   uint8_t* dst = sKring + (size_t)(gt & 1) * B * kBK;
-  uint32_t buf[4] = {0u, 0u, 0u, 0u};
-  #pragma unroll
-  for (int k = 0; k < 16; ++k) {
-    const int idx = tid + k * kTh;
-    if (idx < B * kBK) {
-      const int src = (idx / kBK) * D + kt * kBK + (idx % kBK);
-      buf[k >> 2] |= (uint32_t)kbase[src] << ((k & 3) * 8);
-    }
-  }
-  #pragma unroll
-  for (int k = 0; k < 16; ++k) {
-    const int idx = tid + k * kTh;
-    if (idx < B * kBK)
-      dst[idx] = (uint8_t)(buf[k >> 2] >> ((k & 3) * 8));
-  }
+  for (int idx = tid; idx < B * kBK; idx += kTh)
+    dst[idx] = kbase[(idx / kBK) * D + kt * kBK + (idx % kBK)];
   float* sdst = sKscale + (size_t)(page & 1) * B;
   for (int j = tid; j < B; j += kTh)
     sdst[j] = reinterpret_cast<const float*>(kbase + B * D)[j];
