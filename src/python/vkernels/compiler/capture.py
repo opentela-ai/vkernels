@@ -421,6 +421,134 @@ class RecordingBackend:
         )
         return out
 
+    def indexer_scores(
+        self,
+        q: SymbolicTensor,
+        entries: SymbolicTensor,
+        mix_w: SymbolicTensor,
+        *,
+        out: Optional[SymbolicTensor] = None,
+        name: str = "indexer_scores",
+    ) -> SymbolicTensor:
+        """Lightning-indexer scoring over the compressed entries (issue #97).
+
+        Per floe ``IndexerScorer``/``LightningIndexer`` (deepseek_v4) and
+        ``Glm53Indexer`` (glm53flash), for a single decode token per batch
+        row:
+
+            scores[b, h, j] = relu(<q[b, h, :], c[b, j, :]>) * head_dim**-0.5
+            s[b, j]         = sum_h scores[b, h, j] * mix_w[b, h]
+
+        ``q`` is the indexer query [B, H, D], ``entries`` the compressed
+        token pool [B, M, D] (M = capacity, an upper bound — the per-row
+        valid candidate count masks it at selection time), and ``mix_w``
+        the per-head mixing weights [B, H] (``weights_proj(x) * n_heads**-0.5``
+        computed upstream). Activation is ReLU, not softmax. Scoring and
+        mixing accumulate in f32 (the q/entries may be stored bf16, ``.cg``
+        streamed on device).
+        """
+        b, h, d = q.value.shape
+        b_c, m, d_c = entries.value.shape
+        if (b_c, d_c) != (b, d):
+            raise ValueError(
+                f"indexer_scores shape mismatch: q {q.value.shape} vs entries {entries.value.shape} (shared B and head_dim required)"
+            )
+        if tuple(mix_w.value.shape) != (b, h):
+            raise ValueError(
+                f"indexer_scores mix weights must be [B, H] = {(b, h)}, got {tuple(mix_w.value.shape)}"
+            )
+        out = out or self.fresh_buffer(f"{name}{self._suffix()}", (b, m))
+        self._record(
+            "indexer_scores",
+            inputs=(q, entries, mix_w),
+            outputs=(out,),
+            attributes={"heads": h, "head_dim": d, "capacity": m, "scale": d ** -0.5, "activation": "relu"},
+            reads=(_regional_reads(q.value), _regional_reads(entries.value), _regional_reads(mix_w.value)),
+            writes=(_regional_reads(out.value),),
+            source_location=name,
+            numerical_contract={
+                "scale": f"1/sqrt(head_dim) = {d ** -0.5}",
+                "activation": "relu (elementwise, after the per-head dot, before mixing)",
+                "accumulation": "f32 dot over head_dim, then f32 weighted sum over heads ascending",
+                "validity": "the full capacity M is scored; row masking happens in index_topk via the per-row valid candidate count",
+            },
+        )
+        return out
+
+    def index_topk(
+        self,
+        scores: SymbolicTensor,
+        valid_counts: SymbolicTensor,
+        *,
+        k: int,
+        idx: Optional[SymbolicTensor] = None,
+        bias: Optional[SymbolicTensor] = None,
+        name: str = "index_topk",
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """Fixed-count top-k selection over the fused indexer scores (issue
+        #97). Produces the static-count indirection table the attention
+        scores/values tasks consume via #94: the output count is ``k`` at
+        decode even though selection is data-dependent.
+
+        ``scores`` is the fused score [B, M] (f32); ``valid_counts`` is the
+        per-row number of valid candidates [B] (i32) — candidates at or
+        beyond a row's valid count are uninitialized storage and are never
+        read (masked loads, §5.3; multiplying an uninitialized NaN by zero
+        still produces NaN, so the mask is a hard exclude).
+
+        Semantics (deterministic):
+
+        * candidates are ordered by descending score, ties resolved to the
+          *lowest* candidate index j (``tie_break="lowest_index"``);
+        * a candidate whose score is NaN inside the valid prefix is
+          excluded from selection (canary semantics — corrupt scores must
+          not win);
+        * the first ``min(k, valid_counts[b])`` slots of ``idx`` receive
+          the selected candidate indices (i32); slots beyond a row's valid
+          count are filled with ``-1`` (no candidate);
+        * ``bias`` carries the selected rows' scores normalized by the
+          L2 norm of the row's valid scores (the block_bias consumed by
+          #95/#96), with 0.0 in the ``-1`` slots.
+
+        k must satisfy 1 <= k <= M; rows may have any valid count in
+        [0, M] (ragged candidate counts, including k > valid_count).
+        """
+        b, m = scores.value.shape
+        if scores.value.dtype != F32:
+            raise ValueError(f"index_topk scores must be f32, got {scores.value.dtype}")
+        if tuple(valid_counts.value.shape) != (b,) or valid_counts.value.dtype != I32:
+            raise ValueError(
+                f"index_topk valid_counts must be i32 [B] = {(b,)}, got {valid_counts.value.shape}/{valid_counts.value.dtype}"
+            )
+        if not isinstance(k, int) or k < 1 or k > m:
+            raise ValueError(f"index_topk requires 1 <= k <= capacity M={m}; got k={k!r}")
+        idx = idx or self.fresh_buffer(f"{name}_idx{self._suffix()}", (b, k), I32)
+        bias = bias or self.fresh_buffer(f"{name}_bias{self._suffix()}", (b, k), F32)
+        self._record(
+            "index_topk",
+            inputs=(scores, valid_counts),
+            outputs=(idx, bias),
+            attributes={
+                "k": k,
+                "capacity": m,
+                "tie_break": "lowest_index",
+                "score_dtype": "f32",
+                "index_dtype": "i32",
+                "nan_policy": "exclude",
+                "pad": "idx=-1, bias=0.0 beyond a row's valid count",
+            },
+            reads=(_regional_reads(scores.value), _regional_reads(valid_counts.value)),
+            writes=(_regional_reads(idx.value), _regional_reads(bias.value)),
+            source_location=name,
+            numerical_contract={
+                "selection": f"descending score, ties to the lowest candidate index; top-{k}",
+                "normalization": "bias = s_j / ||s_valid||_2 per row (fp32)",
+                "masking": "candidates j >= valid_counts[b] are never observed (uninitialized storage)",
+                "ordering": "one task per batch row; the consumer (#95/#96) is a later phase (RAW on the indirection table)",
+            },
+        )
+        return idx, bias
+
     def gelu(self, x: SymbolicTensor, *, out: Optional[SymbolicTensor] = None, name: str = "gelu") -> SymbolicTensor:
         out = out or self.fresh_buffer(f"{name}{self._suffix()}", x.value.shape)
         self._record(
@@ -688,6 +816,174 @@ class RecordingBackend:
         )
         return SymbolicTensor(k_post), SymbolicTensor(v_post)
 
+    def compressor_append(
+        self,
+        entry_pool: SymbolicTensor,
+        series_state: SymbolicTensor,
+        window: SymbolicTensor,
+        gates: SymbolicTensor,
+        rms_weight: SymbolicTensor,
+        cos: SymbolicTensor,
+        sin: SymbolicTensor,
+        position,
+        *,
+        m: int,
+        r: int,
+        eps: float,
+        name: str = "compressor_append",
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """Emit one compressed entry at the m-token boundary (issue #96).
+
+        DeepSeek Sparse Attention's compressor (floe
+        ``deepseek_v4/forward.py::_BaseCompressor``): every ``m`` tokens
+        compress into one cached entry, kept in a **two-series** per-layer
+        pool — the prior completed series ``Ca`` and the in-flight series
+        ``Cb`` (width ``2r`` stride ``r`` tokens: at each ``r``-boundary the
+        just-completed ``Cb`` becomes the new ``Ca`` and ``Cb`` restarts, so
+        the attention window [Ca ∪ Cb] slides by ``r`` per rotation). Entries
+        are rope-rotated **once at emission** (at the emitting row's own
+        position), so decode only rotates the query.
+
+        Emission math for a boundary row ``b`` (fp32 accumulated, per floe
+        ``Compressor.emit``)::
+
+            w = softmax(gates[b, :])                    # over the m window
+            e = Σ_t w_t · window[b, t, :]               # weighted latent fold
+            e = e / sqrt(mean(e²) + eps) · rms_weight   # rms_norm
+            e = rotate_half(e, cos[b], sin[b])          # rotated ONCE, at emission
+            entry_pool[b, l, slot, cb_len, :] = bf16(e)
+
+        with ``slot``/``cb_len`` from the persistent per-(row, layer) series
+        state, then the rotation bookkeeping (``cb_len += 1``; at ``cb_len ==
+        r // m`` the completed ``Cb`` becomes ``Ca`` — slot roles ping-pong —
+        and ``Cb`` restarts). Rows whose position is not at a boundary
+        (``p[b] % m != m-1``) are exact no-ops — the per-row mask comes from
+        the issue #93 positions tensor, so ragged rows emit at their own
+        cadence.
+
+        Tensor layout:
+
+        * ``window`` [B, m, D] — the row's in-flight window of shared-latent
+          kv vectors (compressed-entry source), from the compressor state
+          pool; bf16 stored, fp32-accumulated;
+        * ``gates`` [B, m] — fp32 compression gates over the window;
+        * ``entry_pool`` [B, L, 2, R, D] bf16 — persistent, two series slots
+          of ``R = r // m`` entries each; slot roles ping-pong;
+        * ``series_state`` [B, L, 2] i32 — persistent ``[active_slot,
+          cb_len]`` per (row, layer);
+        * ``cos``/``sin`` [B, D//2] fp32 — gathered by the caller at each
+          row's emission position (per-row ragged cadence).
+
+        Reads the series state (RAW), writes the entry pool slab and the
+        series state (RMW, ``cache_append`` §4.3 pattern); returns
+        *post-append views* — same storages, bumped versions.
+
+        block_bias contract (issue #97, producer of record): entries are
+        appended in global emission order, so flat entry index ``j`` is a
+        stable per-row identity across the pool; the indexer's
+        ``block_bias[b, j]`` aligns 1:1 with that index, and the Ca/Cb
+        attention window selects contiguous ``j`` ranges via the #94 slot
+        indirection at scores time (#95's integration).
+        """
+        if m <= 0 or r <= 0 or r % m:
+            raise CaptureError(
+                f"{name}: series rotation needs r % m == 0; got m={m}, r={r}"
+            )
+        b, mw, d = window.value.shape
+        if mw != m:
+            raise CaptureError(f"{name}: window token axis {mw} != m={m}")
+        bg, mg = gates.value.shape
+        if (bg, mg) != (b, m):
+            raise CaptureError(f"{name}: gates {gates.value.shape} != [{b}, {m}]")
+        R = r // m
+        be, le, slots, re, de = entry_pool.value.shape
+        if (be, slots, re, de) != (b, 2, R, d):
+            raise CaptureError(
+                f"{name}: entry_pool {entry_pool.value.shape} != [B={b}, L, 2, R={R}, D={d}]"
+            )
+        if series_state.value.shape != (b, le, 2):
+            raise CaptureError(
+                f"{name}: series_state {series_state.value.shape} != [{b}, {le}, 2]"
+            )
+        if rms_weight.value.shape != (d,):
+            raise CaptureError(f"{name}: rms_weight {rms_weight.value.shape} != [{d}]")
+        dh = cos.value.shape[-1]
+        if cos.value.shape != (b, dh) or sin.value.shape != (b, dh) or 2 * dh != d:
+            raise CaptureError(
+                f"{name}: cos/sin must be [B={b}, D/2={d // 2}]; got {cos.value.shape} / {sin.value.shape}"
+            )
+        valid = self._valid_plus_one(position, name)
+        p = self._position_name(position)
+        writes = (
+            Region.tile(
+                entry_pool.value,
+                ((0, b), (0, le), (0, 2), (0, R), (0, d)),
+            ),
+            Region.tile(series_state.value, ((0, b), (0, le), (0, 2))),
+        )
+        position_form = "row" if valid.is_row else "scalar"
+        self._record(
+            "compressor_append",
+            inputs=(entry_pool, series_state, window, gates, rms_weight, cos, sin),
+            outputs=(),  # mutation through storage effects; views returned below
+            attributes={
+                "m": m,
+                "r": r,
+                "eps": eps,
+                "position": p,
+                "position_form": position_form,
+            },
+            reads=(
+                _regional_reads(window.value),
+                _regional_reads(gates.value),
+                _regional_reads(rms_weight.value),
+                _regional_reads(cos.value),
+                _regional_reads(sin.value),
+                _regional_reads(series_state.value),
+            ),
+            writes=writes,
+            source_location=name,
+            numerical_contract={
+                "emission": (
+                    "boundary rows (p[b] % m == m-1): w = softmax(gates[b]) fp32; "
+                    "e = sum_t w_t*window[b,t] fp32; e = e/sqrt(mean(e^2)+eps)*rms_weight; "
+                    "e = rotate_half(e, cos[b], sin[b]) — rotated once at emission; "
+                    "entry_pool[b,l,slot,cb_len,:] = bf16(e)"
+                ),
+                "boundary_mask": "rows with p[b] % m != m-1 are exact no-ops (per-row, issue #93)",
+                "series_rotation": (
+                    "cb_len += 1 after append; at cb_len == r//m the completed Cb "
+                    "becomes Ca (slot roles swap) and Cb restarts empty"
+                ),
+                "block_bias": (
+                    "entry flat index j = global emission order (stable per row); "
+                    "block_bias[b, j] aligns 1:1 with that index (issue #97 producer "
+                    "contract, non-finite-valid normalization as landed); Ca/Cb "
+                    "windows select contiguous j ranges via #94 indirection at "
+                    "scores time (#95 integration)"
+                ),
+            },
+        )
+        pool_post = self.graph.add_tensor(
+            f"entry_pool_v{self.graph.storage_versions[entry_pool.value.storage_id]}",
+            entry_pool.value.shape,
+            entry_pool.value.dtype,
+            storage_id=entry_pool.value.storage_id,
+            strides=entry_pool.value.strides,
+            offset=entry_pool.value.offset,
+            valid_length=valid,
+        )
+        state_post = self.graph.add_tensor(
+            f"series_state_v{self.graph.storage_versions[series_state.value.storage_id]}",
+            series_state.value.shape,
+            series_state.value.dtype,
+            storage_id=series_state.value.storage_id,
+            strides=series_state.value.strides,
+            offset=series_state.value.offset,
+            valid_length=valid,
+        )
+        return SymbolicTensor(pool_post), SymbolicTensor(state_post)
+
     def gdn_conv(
         self,
         conv_state: SymbolicTensor,
@@ -752,6 +1048,115 @@ class RecordingBackend:
         sid = sv.storage_id
         post = self.graph.add_tensor(
             f"conv_state_l{layer}_v{self.graph.storage_versions[sid]}",
+            sv.shape,
+            sv.dtype,
+            storage_id=sid,
+            strides=sv.strides,
+            offset=sv.offset,
+        )
+        return out, SymbolicTensor(post)
+
+    def gdn_delta(
+        self,
+        ssm_state: SymbolicTensor,
+        q: SymbolicTensor,
+        k: SymbolicTensor,
+        v: SymbolicTensor,
+        z: SymbolicTensor,
+        a: SymbolicTensor,
+        b: SymbolicTensor,
+        a_log: SymbolicTensor,
+        dt_bias: SymbolicTensor,
+        norm_w: SymbolicTensor,
+        *,
+        layer: int,
+        scale: float,
+        eps: float,
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """Gated delta rule decode step (Qwen3.5 ``GatedDeltaNet``, seq==1).
+
+        Per value head ``h`` over its ``[HV, HK]`` fp32 SSM state slice,
+        with ``GROUP = NV // NK`` and ``kh = h // GROUP``::
+
+            g      = -exp(A_log[h]) * softplus(a[b,h] + dt_bias[h])
+            beta   = sigmoid(b[b,h])
+            q_n    = q[b,kh] / sqrt(|q[b,kh]|^2 + 1e-6) * scale
+            k_n    = k[b,kh] / sqrt(|k[b,kh]|^2 + 1e-6)
+            s     *= exp(g)                            # per-head scalar decay
+            sk     = s @ k_n                           # state read
+            s     += beta * (v[b,h] - sk) outer k_n     # delta-rule update
+            o      = s @ q_n                           # state readout
+            out    = RMSNorm_HV(o) * norm_w * (z * sigmoid(z))
+
+        ``ssm_state`` is an external caller-owned pool ``[B, NV, HV, HK]``,
+        fp32, read-modify-write per (batch, head) row. ``q``/``k`` are the
+        post-conv rows ``[B, NK, HK]`` (normalized *inside* the op, exactly
+        as floe ``qwen35_gdn.GatedDeltaNet.forward`` conditions them);
+        ``v``/``z`` are ``[B, NV, HV]``; ``a``/``b`` are ``[B, NV]``;
+        ``A_log``/``dt_bias`` are ``[NV]`` and ``norm_w`` ``[HV]`` per-layer
+        parameters broadcast over the batch. All fp32 arithmetic between
+        the gates and the state (floe keeps the recurrence fp32; inputs may
+        arrive bf16 from the projections).
+
+        The op is position-independent: its ordering obligation is the
+        read-modify-write on the state pool (RAW/WAR/WAW hazards vs any
+        other op touching that storage). Records write effects on the pool
+        and returns ``(out, ssm_state_post)`` -- the post-step state view
+        (same storage, bumped version) that later layers must read.
+        """
+        sv, qv, kv, vv, zv, av, bv = (
+            ssm_state.value, q.value, k.value, v.value, z.value, a.value, b.value,
+        )
+        if len(sv.shape) != 4:
+            raise CaptureError(f"gdn_delta state pool must be [B, NV, HV, HK]; got shape {sv.shape}")
+        B, NV, HV, HK = sv.shape
+        if len(qv.shape) != 3 or qv.shape[0] != B or qv.shape[2] != HK:
+            raise CaptureError(f"gdn_delta q rows must be [B, NK, {HK}]; got shape {qv.shape}")
+        NK = qv.shape[1]
+        if NK < 1 or NV % NK:
+            raise CaptureError(f"gdn_delta head group must divide: NV={NV} not divisible by NK={NK}")
+        if kv.shape != (B, NK, HK):
+            raise CaptureError(f"gdn_delta k rows must be [B, {NK}, {HK}]; got shape {kv.shape}")
+        if vv.shape != (B, NV, HV):
+            raise CaptureError(f"gdn_delta v rows must be [B, {NV}, {HV}]; got shape {vv.shape}")
+        if zv.shape != (B, NV, HV):
+            raise CaptureError(f"gdn_delta z gate rows must be [B, {NV}, {HV}]; got shape {zv.shape}")
+        if av.shape != (B, NV) or bv.shape != (B, NV):
+            raise CaptureError(f"gdn_delta a/b rows must be [B, {NV}]; got {av.shape} / {bv.shape}")
+        if a_log.value.shape != (NV,) or dt_bias.value.shape != (NV,):
+            raise CaptureError(f"gdn_delta A_log/dt_bias must be [{NV}]; got {a_log.value.shape} / {dt_bias.value.shape}")
+        if norm_w.value.shape != (HV,):
+            raise CaptureError(f"gdn_delta norm_w must be [{HV}]; got shape {norm_w.value.shape}")
+        out = self.fresh_buffer(f"gdn_delta_l{layer}{self._suffix()}", (B, NV, HV), dtype=vv.dtype)
+        self._record(
+            "gdn_delta",
+            inputs=(ssm_state, q, k, v, z, a, b, a_log, dt_bias, norm_w),
+            outputs=(out,),
+            attributes={"layer": layer, "scale": scale, "eps": eps},
+            reads=(
+                _regional_reads(sv), _regional_reads(qv), _regional_reads(kv),
+                _regional_reads(vv), _regional_reads(zv), _regional_reads(av),
+                _regional_reads(bv), _regional_reads(a_log.value),
+                _regional_reads(dt_bias.value), _regional_reads(norm_w.value),
+            ),
+            writes=(_regional_reads(sv), _regional_reads(out.value)),
+            source_location=f"layer {layer} gdn delta rule",
+            numerical_contract={
+                "decay": "g = -exp(A_log) * softplus(a + dt_bias); s *= exp(g) (softplus guarded: x>20 -> x)",
+                "qk_norm": "q_n = L2(q)*scale, k_n = L2(k) per key head (group-expanded), eps 1e-6 inside the sqrt",
+                "delta_rule": "sk = s @ k_n; s += beta*(v - sk) outer k_n with beta = sigmoid(b)",
+                "readout": "o = s @ q_n",
+                "out_gate": "out = RMSNorm_HV(o) * norm_w * (z * sigmoid(z)), eps inside the rsqrt",
+                "accumulate": "fp32 arithmetic between gates and state",
+                "dtypes": "q/k/v/z/a/b workspace loads (.cg), A_log/dt_bias/norm_w params, SSM state pool fp32 [B, NV, HV, HK] read-modify-write, out follows v's dtype",
+                "pool": "external caller-owned state pool; read-modify-write per decode step",
+            },
+        )
+        # Post-step state view: same pool, bumped version (cache_append's
+        # §4.3 pattern). Later layers must consume this view.
+        sid = sv.storage_id
+        post = self.graph.add_tensor(
+            f"ssm_state_l{layer}_v{self.graph.storage_versions[sid]}",
             sv.shape,
             sv.dtype,
             storage_id=sid,
@@ -841,10 +1246,24 @@ class RecordingBackend:
         *,
         layer: int,
         kv_heads: Optional[int] = None,
+        gate: Optional[SymbolicTensor] = None,
     ) -> SymbolicTensor:
-        """ctx[b,h,:] = sum_{t<=p} probs[b,h,t] * V[l,b,kv(h),t,:] (GQA-aware)."""
+        """ctx[b,h,:] = sum_{t<=p} probs[b,h,t] * V[l,b,kv(h),t,:] (GQA-aware).
+
+        With ``gate`` (issue #92, Qwen3.5 attn_output_gate): the per-head
+        sigmoid output gate is fused into the values task itself —
+        ``ctx[b,h,:] *= sigmoid(gate[b,h,:])`` — so the gated multiply costs
+        no extra grid barrier per FA layer. ``gate`` is [B, H, D] in the
+        same tile domain, emitted by the chunked [q|gate|k|v] projection.
+        """
         self._require_position(position, "attention_values")
         b, h, d = probs.value.shape[0], probs.value.shape[1], v_cache.value.shape[3]
+        if gate is not None and tuple(gate.value.shape) != (b, h, d):
+            raise ValueError(
+                f"attention_values gate must be [B, H, D] = {(b, h, d)}, "
+                f"got {tuple(gate.value.shape)}"
+            )
+        inputs = (probs, v_cache) if gate is None else (probs, v_cache, gate)
         out = self.fresh_buffer(f"ctx_l{layer}{self._suffix()}", (b, h, d))
         p = self._position_name(position)
         valid = self._valid_plus_one(position, "attention_values")
@@ -863,19 +1282,33 @@ class RecordingBackend:
                 for g in range(kvh)
             )
 
+        attributes = {
+            "layer": layer,
+            "position": p,
+            "position_form": "row" if valid.is_row else "scalar",
+            "kv_heads": kvh,
+        }
+        if gate is not None:
+            attributes["gated"] = True
+        reads: tuple[Region, ...] = (Region.prefix(probs.value, axis=2, valid=valid),) + v_regions()
+        if gate is not None:
+            reads = reads + (Region.whole(gate.value),)
+        contract = {
+            "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
+            "valid": "only each row's positions [0, pos[b]] contribute; V beyond a row's valid length is never loaded (NaN tails must not leak)",
+            "reduction": "f32, t ascending",
+        }
+        if gate is not None:
+            contract["gate"] = "y = acc * sigmoid(gate[b,h,:]); sigmoid and multiply in f32 before the single bf16 store (#92); no extra barrier"
         self._record(
             "attention_values",
-            inputs=(probs, v_cache),
+            inputs=inputs,
             outputs=(out,),
-            attributes={"layer": layer, "position": p, "position_form": "row" if valid.is_row else "scalar", "kv_heads": kvh},
-            reads=(Region.prefix(probs.value, axis=2, valid=valid),) + v_regions(),
+            attributes=attributes,
+            reads=reads,
             writes=(_regional_reads(out.value),),
             source_location=f"layer {layer} attention values",
-            numerical_contract={
-                "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
-                "valid": "only each row's positions [0, pos[b]] contribute; V beyond a row's valid length is never loaded (NaN tails must not leak)",
-                "reduction": "f32, t ascending",
-            },
+            numerical_contract=contract,
         )
         return out
 
@@ -919,7 +1352,7 @@ class RecordingBackend:
             "cache_append_paged",
             inputs=(k_pool, v_pool, slot_table, k_new, v_new),
             outputs=(),  # mutation through storage effects; pool views returned below
-            attributes={"layer": layer, "position": p},
+            attributes={"layer": layer, "position": p, "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"},
             reads=(_regional_reads(k_new.value), _regional_reads(v_new.value)),
             writes=(
                 Region.indirect(k_pool.value, slot_table.value, axis=0),
@@ -976,7 +1409,7 @@ class RecordingBackend:
             "attention_scores_paged",
             inputs=(q, k_pool, slot_table),
             outputs=(out,),
-            attributes={"scale": float(scale), "layer": layer, "position": p, "kv_heads": kvh},
+            attributes={"scale": float(scale), "layer": layer, "position": p, "kv_heads": kvh, "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"},
             reads=(
                 _regional_reads(q.value),
                 Region.indirect(k_pool.value, slot_table.value, axis=0),
@@ -1016,7 +1449,7 @@ class RecordingBackend:
             "attention_values_paged",
             inputs=(probs, v_pool, slot_table),
             outputs=(out,),
-            attributes={"layer": layer, "position": p, "kv_heads": kvh},
+            attributes={"layer": layer, "position": p, "kv_heads": kvh, "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"},
             reads=(
                 Region.prefix(probs.value, axis=2, valid=ValidLength(f"{p}+1")),
                 Region.indirect(v_pool.value, slot_table.value, axis=0),

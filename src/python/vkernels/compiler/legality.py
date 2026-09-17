@@ -21,10 +21,16 @@ POSITION_CONSUMERS = frozenset(
     {
         "embedding",
         "cache_append",
+        "compressor_append",
         "attention_scores",
         "softmax",
         "attention_values",
         "rope",
+        # #94 paged trio: same runtime-bound contracts as their dense twins,
+        # extended to the per-row form (issue #93 x #94 composition).
+        "cache_append_paged",
+        "attention_scores_paged",
+        "attention_values_paged",
     }
 )
 

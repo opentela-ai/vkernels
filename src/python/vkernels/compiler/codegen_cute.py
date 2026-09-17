@@ -47,6 +47,14 @@ __all__ = ["emit_megakernel_source", "TEMPLATE_NAMES"]
 TEMPLATE_NAMES = {
     "gemm": "linear_task",
     "gemv_fp8": "linear_fp8_task",  # fp8-blockwise GEMV (issue #91)
+    # Lightning-indexer lane (issue #97): fused scoring + fixed-count top-k
+    # selection producing the i32 indirection table for #95/#96 via #94.
+    "indexer_scores": "indexer_scores_task",
+    "index_topk": "index_topk_task",
+    # DSA compressor lane (issue #96): per-(row, layer) entry emission into
+    # the two-series Ca/Cb pool; consumes #97's block_bias alignment and
+    # #93's per-row boundary cadence; reads fold into #95 via #94.
+    "compressor_append": "compressor_append_task",
     "layernorm": "layernorm_task",
     "rms_norm": "rms_norm_task",
     "rms_norm_gated": "rms_norm_gated_task",  # sigmoid-gated RMSNorm (issue #100)
@@ -57,6 +65,16 @@ TEMPLATE_NAMES = {
     "attention_scores": "attention_scores_task",
     "softmax": "softmax_task",
     "attention_values": "attention_values_task",
+    # --- qwen35 hybrid stage-1 additions (issue #102) -------------------
+    # gdn_conv: validated device kernel ``_t_gdn_conv_tiled`` (issue #89)
+    "gdn_conv": "gdn_conv_task",
+    # gdn_delta: validated batched-heads kernel ``_t_gdn_heads_batched`` (issue #90)
+    "gdn_delta": "gdn_delta_task",
+    # paged trio: the shared append/scores/values kernels are slot-table
+    # indirected with per-row position bounds (issues #93/#94)
+    "cache_append_paged": "cache_append_paged_task",
+    "attention_scores_paged": "attention_scores_paged_task",
+    "attention_values_paged": "attention_values_paged_task",
 }
 
 _TEMPLATE_MODULE = "vkernels.compiler.device_templates"
