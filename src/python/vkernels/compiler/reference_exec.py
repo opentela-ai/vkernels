@@ -146,6 +146,8 @@ class ReferenceExecutor:
         self._tensor_arrays = self._materialize_tensors()
         self._bodies: dict[str, Callable] = {
             "gemm": self._body_gemm,
+            "indexer_scores": self._body_indexer_scores,
+            "index_topk": self._body_index_topk,
             "layernorm": self._body_layernorm,
             "rms_norm": self._body_rms_norm,
             "rms_norm_gated": self._body_rms_norm_gated,
@@ -347,6 +349,68 @@ class ReferenceExecutor:
         s = np.repeat(scale[n0 // qb, :], qb)[:k]
         acc = (x[m0:m1, :] @ (wt * s[None, :]).T)
         y[m0:m1, n0:n1] = acc.astype(y.dtype)
+    def _body_indexer_scores(self, fam: TaskFamily, coords, scalars) -> None:
+        """Lightning-indexer scoring reference (issue #97).
+
+        Mirrors the device contract of ``_t_indexer_scores``: per (batch,
+        entry tile), relu(<q_h, c_j>) * head_dim**-0.5 per indexer head,
+        then the f32/fp64 weighted head mix. fp64 accumulation stands in
+        for the device's f32 (oracle stability).
+        """
+        q = self.tensor(fam.inputs[0]).astype(np.float64)
+        c = self.tensor(fam.inputs[1]).astype(np.float64)
+        w = self.tensor(fam.inputs[2]).astype(np.float64)
+        s = self.tensor(fam.outputs[0])
+        scale = fam.params["scale"]
+        (m_extent, m_tile) = fam.domain.dims[1]
+        b, t = coords
+        m0, m1 = t * m_tile, min(t * m_tile + m_tile, m_extent)
+        # [H, tile]: relu of the per-head dots, scaled.
+        scores = np.maximum(q[b] @ c[b, m0:m1].T, 0.0) * scale
+        s[b, m0:m1] = (scores * w[b][:, None]).sum(axis=0).astype(s.dtype)
+
+    def _body_index_topk(self, fam: TaskFamily, coords, scalars) -> None:
+        """Fixed-count top-k selection reference (issue #97).
+
+        Mirrors the device contract of ``_t_index_topk`` exactly:
+        rank(j) = #{valid i : s_i > s_j} + #{valid i < j : s_i == s_j} —
+        descending score with deterministic lowest-index tie-break; NaN
+        scores inside the valid prefix are excluded; candidates at or
+        beyond the row's valid count are never observed; slots beyond a
+        row's valid count are idx=-1 / bias=0.0; bias = s_j / ||s_valid||_2.
+        """
+        s = self.tensor(fam.inputs[0]).astype(np.float64)
+        valid = self.tensor(fam.inputs[1])
+        idx = self.tensor(fam.outputs[0])
+        bias = self.tensor(fam.outputs[1])
+        k = fam.params["k"]
+        (b,) = coords
+        row = s[b]
+        m = row.shape[0]
+        vc = int(valid[b])
+        vc = max(0, min(vc, m))
+        valid_mask = np.zeros(m, dtype=bool)
+        valid_mask[:vc] = True
+        finite = np.isfinite(row)
+        cand = valid_mask & finite  # NaN canaries inside the prefix lose
+        # rank by comparison counting (the template's exact tie-break).
+        gt = (row[None, :] > row[:, None]) & cand[None, :]
+        eq_lower = (row[None, :] == row[:, None]) & cand[None, :] & (np.arange(m)[None, :] < np.arange(m)[:, None])
+        rank = gt.sum(axis=1) + eq_lower.sum(axis=1)
+        sel = cand & (rank < k)
+        idx_row = np.full(k, -1, dtype=np.int32)
+        bias_row = np.zeros(k, dtype=bias.dtype)
+        sel_idx = np.nonzero(sel)[0]
+        idx_row[rank[sel_idx]] = sel_idx.astype(np.int32)
+        if vc > 0:
+            valid_finite = row[:vc][finite[:vc]]
+            norm = np.sqrt((valid_finite**2).sum()) if valid_finite.size else 0.0
+        else:
+            norm = 0.0
+        if norm > 0.0:
+            bias_row[rank[sel_idx]] = (row[sel_idx] / norm).astype(bias.dtype)
+        idx[b, :] = idx_row
+        bias[b, :] = bias_row
 
     def _body_layernorm(self, fam: TaskFamily, coords, scalars) -> None:
         x = self.tensor(fam.inputs[0]).astype(np.float64)

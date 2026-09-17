@@ -469,6 +469,12 @@ OP_LINEAR = "linear"
 # with DeepSeek-style 128x128 block scales; same task shape as ``linear``, the
 # scale tensor is the second weight external.
 OP_LINEAR_FP8 = "linear_fp8"
+# Lightning-indexer (DSA / GLM indexer, issue #97): per-(batch, head) ReLU
+# scoring of the compressed entries plus the fused head mix, then the fixed-
+# count top-k selection producing the i32 indirection table consumed by the
+# attention scores/values tasks via #94.
+OP_INDEXER_SCORES = "indexer_scores"
+OP_INDEX_TOPK = "index_topk"
 OP_GELU = "gelu"
 OP_SWIGLU = "swiglu"
 OP_ADD = "add"
@@ -530,6 +536,8 @@ ARITHMETIC_OP_KINDS = (
     OP_ROPE,
     OP_LINEAR,
     OP_LINEAR_FP8,
+    OP_INDEXER_SCORES,
+    OP_INDEX_TOPK,
     OP_GELU,
     OP_SWIGLU,
     OP_ADD,

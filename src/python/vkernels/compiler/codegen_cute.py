@@ -50,6 +50,10 @@ TEMPLATE_NAMES = {
     "moe_route": "moe_route_task",  # MoE decode ops (issue #98)
     "moe_expert": "moe_expert_task",
     "moe_combine": "moe_combine_task",
+    # Lightning-indexer lane (issue #97): fused scoring + fixed-count top-k
+    # selection producing the i32 indirection table for #95/#96 via #94.
+    "indexer_scores": "indexer_scores_task",
+    "index_topk": "index_topk_task",
     "layernorm": "layernorm_task",
     "rms_norm": "rms_norm_task",
     "rms_norm_gated": "rms_norm_gated_task",  # sigmoid-gated RMSNorm (issue #100)
