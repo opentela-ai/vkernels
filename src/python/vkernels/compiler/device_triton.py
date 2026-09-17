@@ -1218,6 +1218,51 @@ def _t_gdn_conv(
 
 
 @triton.jit
+def _t_gdn_conv_tiled(
+    worker: tl.int32,
+    P: tl.int32,
+    state_ptr,
+    w_ptr,
+    x_ptr,
+    out_ptr,
+    B: tl.constexpr,
+    C: tl.constexpr,
+    ELEM: tl.constexpr,
+    KTAPS: tl.constexpr,
+):
+    """Generic gdn_conv decode-step task body (issue #89): one task per
+    (batch, ELEM-channel tile) over the batched persistent state pool
+    [B, KTAPS-1, C] (fp32, time-major), the mixed qkv rows [B, C] and the
+    FIR weights [C, KTAPS]. Same arithmetic as the 27B-validated
+    ``_t_gdn_conv`` (which is a single flattened batch row of this
+    template), generalized to per-task (b, tile) addressing. Requires
+    C % ELEM == 0 (the lowering picks an exact tiling).
+    """
+    NTILE: tl.constexpr = C // ELEM
+    task = worker
+    while task < B * NTILE:
+        b = task // NTILE
+        t = task % NTILE
+        offs = t * ELEM + tl.arange(0, ELEM)
+        sbase = state_ptr + b.to(tl.int64) * ((KTAPS - 1) * C)
+        acc = tl.zeros([ELEM], tl.float32)
+        for j in tl.static_range(KTAPS - 1):
+            wj = tl.load(w_ptr + offs * KTAPS + j).to(tl.float32)
+            sj = tl.load(sbase + j * C + offs, cache_modifier=".cg")
+            acc += wj * sj
+        wj = tl.load(w_ptr + offs * KTAPS + (KTAPS - 1)).to(tl.float32)
+        xn = tl.load(x_ptr + b.to(tl.int64) * C + offs, cache_modifier=".cg").to(tl.float32)
+        acc += wj * xn
+        tl.store(out_ptr + b.to(tl.int64) * C + offs, acc / (1.0 + tl.exp(-acc)))
+        # state shift: drop the oldest tap, append the new row
+        for j in tl.static_range(KTAPS - 2):
+            sj1 = tl.load(sbase + (j + 1) * C + offs, cache_modifier=".cg")
+            tl.store(sbase + j * C + offs, sj1)
+        tl.store(sbase + (KTAPS - 2) * C + offs, xn)
+        task += P
+
+
+@triton.jit
 def _t_gdn_heads(
     worker: tl.int32,
     P: tl.int32,

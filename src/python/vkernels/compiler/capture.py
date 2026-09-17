@@ -621,6 +621,78 @@ class RecordingBackend:
         )
         return SymbolicTensor(k_post), SymbolicTensor(v_post)
 
+    def gdn_conv(
+        self,
+        conv_state: SymbolicTensor,
+        x: SymbolicTensor,
+        w: SymbolicTensor,
+        *,
+        layer: int,
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """GDN short-conv decode step (Qwen3.5 ``GatedDeltaNet``, seq==1 path).
+
+        Causal depthwise conv1d over the packed qkv row, folding the
+        persistent conv state::
+
+            full = cat(conv_state[b], x[b])      # [K, C]
+            out[b] = silu(sum_k full[:, k] * w[:, k])   # depthwise FIR
+            conv_state'[b] = full[1:]            # time-major shift
+
+        ``conv_state`` is an external caller-owned pool [B, K-1, C], fp32,
+        time-major (floe's eager init uses the embed dtype — the compiled
+        pool is fp32; oracle tolerance ~1e-3). ``x`` is the mixed qkv row
+        [B, C] and ``w`` the FIR weights [C, K] (grouped conv, one tap
+        vector per channel).
+
+        The op is position-independent: it consumes no decode-position
+        scalar, and its ordering obligation is the read-modify-write on
+        the state pool (RAW/WAR/WAW hazards vs any other op touching that
+        storage). Records write effects on the pool and returns
+        ``(out, conv_state_post)`` — the post-step state view (same
+        storage, bumped version) that later layers must read.
+        """
+        sv, xv, wv = conv_state.value, x.value, w.value
+        if len(sv.shape) != 3:
+            raise CaptureError(f"gdn_conv state pool must be [B, K-1, C]; got shape {sv.shape}")
+        if len(xv.shape) != 2:
+            raise CaptureError(f"gdn_conv input row must be [B, C]; got shape {xv.shape}")
+        B, Km1, C = sv.shape
+        K = Km1 + 1
+        if xv.shape != (B, C):
+            raise CaptureError(f"gdn_conv input row shape {xv.shape} does not match state pool [B, C] = {(B, C)}")
+        if tuple(wv.shape) != (C, K):
+            raise CaptureError(f"gdn_conv FIR weights must be [C, K] = [{C}, {K}]; got shape {wv.shape}")
+        out = self.fresh_buffer(f"gdn_conv_l{layer}{self._suffix()}", (B, C), dtype=xv.dtype)
+        self._record(
+            "gdn_conv",
+            inputs=(conv_state, x, w),
+            outputs=(out,),
+            attributes={"layer": layer, "conv_kernel": K},
+            reads=(_regional_reads(sv), _regional_reads(xv), _regional_reads(wv)),
+            writes=(_regional_reads(sv), _regional_reads(out.value)),
+            source_location=f"layer {layer} gdn conv",
+            numerical_contract={
+                "fir": "out[b] = silu(sum_{j<K-1} w[:, j] * state[b, j, :] + w[:, K-1] * x[b, :])",
+                "state_shift": "state'[b, j, :] = state[b, j+1, :] for j < K-2; state'[b, K-2, :] = x[b, :]",
+                "silu": "x / (1 + exp(-x))",
+                "accumulate": "fp32 accumulation",
+                "dtypes": "x/w bf16 (.cg loads), state pool fp32 [B, K-1, C] time-major (floe eager init uses the embed dtype — compiled pool is fp32; oracle tolerance ~1e-3)",
+                "pool": "external caller-owned state pool; read-modify-write per decode step",
+            },
+        )
+        # Post-step state view: same pool, bumped version (cache_append's
+        # §4.3 pattern). Later layers must consume this view.
+        sid = sv.storage_id
+        post = self.graph.add_tensor(
+            f"conv_state_l{layer}_v{self.graph.storage_versions[sid]}",
+            sv.shape,
+            sv.dtype,
+            storage_id=sid,
+            strides=sv.strides,
+            offset=sv.offset,
+        )
+        return out, SymbolicTensor(post)
+
     def attention_scores(
         self,
         q: SymbolicTensor,

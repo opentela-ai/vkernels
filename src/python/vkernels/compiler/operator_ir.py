@@ -467,6 +467,11 @@ OP_GELU = "gelu"
 OP_SWIGLU = "swiglu"
 OP_ADD = "add"
 OP_CACHE_APPEND = "cache_append"
+# gdn_conv attributes: layer, conv_kernel (K). Decode-step FIR over the
+# packed qkv row with an external [B, K-1, conv_dim] fp32 conv-state pool:
+# read-modify-write per row (time-major state shift), position-independent —
+# ordering comes from the state-storage hazards, not the decode position.
+OP_GDN_CONV = "gdn_conv"
 OP_CACHE_APPEND_PAGED = "cache_append_paged"
 OP_ATTENTION_SCORES = "attention_scores"
 OP_ATTENTION_SCORES_PAGED = "attention_scores_paged"
@@ -485,6 +490,7 @@ ARITHMETIC_OP_KINDS = (
     OP_SWIGLU,
     OP_ADD,
     OP_CACHE_APPEND,
+    OP_GDN_CONV,
     OP_CACHE_APPEND_PAGED,
     OP_ATTENTION_SCORES,
     OP_ATTENTION_SCORES_PAGED,
