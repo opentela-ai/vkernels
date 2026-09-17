@@ -152,10 +152,12 @@ class ReferenceExecutor:
             "attention_values": self._body_attention_values,
             "attention_values_paged": self._body_attention_values_paged,
             "gemv_fp8": self._body_gemv_fp8,
-            "attention_values_paged": self._body_attention_values_paged,
             "moe_route": self._body_moe_route,
             "moe_expert": self._body_moe_expert,
             "moe_combine": self._body_moe_combine,
+            "mla_scores": self._body_mla_scores,
+            "mla_values": self._body_mla_values,
+            "conjugate_rope": self._body_conjugate_rope,
         }
         self._barrier_state = None
 
@@ -300,6 +302,27 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         bias = self.tensor(fam.inputs[2]) if fam.params["bias"] else None
         (m0, m1), (n0, n1) = self._gemm_box(fam, coords)
+        gh = fam.params.get("grouped_heads")
+        if gh:
+            # Block-diagonal per-head projection (issue #95 GroupedLinear):
+            # output n-range may span several heads; each head contributes
+            # only its own diagonal block (off-block entries NEVER read —
+            # the storage may hold NaN canaries there).
+            k_g = x.shape[1] // gh
+            n_g = w.shape[1] // gh
+            acc = np.zeros((m1 - m0, n1 - n0), dtype=np.float64)
+            for h in range(n0 // n_g, min(gh, (n1 + n_g - 1) // n_g)):
+                h_n0, h_n1 = max(n0, h * n_g), min(n1, (h + 1) * n_g)
+                x_blk = x[m0:m1, h * k_g:(h + 1) * k_g].astype(np.float64)
+                # w is stored [Cin, Cout]: block rows are the head's K slice,
+                # block columns the head's N slice.
+                w_blk = w[h * k_g:(h + 1) * k_g,
+                          h * n_g + (h_n0 - h * n_g):h * n_g + (h_n1 - h * n_g)].astype(np.float64)
+                acc[:, h_n0 - n0:h_n1 - n0] = x_blk @ w_blk
+            if bias is not None:
+                acc = acc + bias[n0:n1]
+            y[m0:m1, n0:n1] = acc.astype(y.dtype)
+            return
         acc = x[m0:m1, :].astype(np.float64) @ w[:, n0:n1].astype(np.float64)
         if bias is not None:
             acc = acc + bias[n0:n1]
@@ -311,6 +334,106 @@ class ReferenceExecutor:
         m0 = coords[0] * m_tile
         n0 = coords[1] * n_tile
         return (m0, min(m0 + m_tile, m_extent)), (n0, min(n0 + n_tile, n_extent))
+
+    def _body_conjugate_rope(self, fam: TaskFamily, coords, scalars) -> None:
+        """Conjugate (output-side) rope (issue #95): rotation by the NEGATIVE
+        angle — sin negated. Exact inverse of the q/k rotation."""
+        x = self.tensor(fam.inputs[0]).astype(np.float64)
+        cos_t = self.tensor(fam.inputs[1])
+        sin_t = self.tensor(fam.inputs[2])
+        y = self.tensor(fam.outputs[0])
+        b, h = coords
+        p = self._row_pos_value(fam, b, scalars)
+        rot = fam.params["rotary_dim"]
+        half = rot // 2
+        c = cos_t[p][:half].astype(np.float64)
+        s = sin_t[p][:half].astype(np.float64)  # applied NEGATED below
+        row = x[b, h]
+        if fam.params.get("convention", "interleaved") == "interleaved":
+            x_even, x_odd = row[0:rot:2], row[1:rot:2]
+            out = row.copy()
+            out[0:rot:2] = x_even * c + x_odd * s
+            out[1:rot:2] = x_odd * c - x_even * s
+        else:  # rotate_half conjugate
+            hh = row.shape[-1] // 2
+            rotated = np.concatenate((-row[hh:], row[:hh]), axis=-1)
+            out = row * cos_t[p].astype(np.float64) - rotated * sin_t[p].astype(np.float64)
+        y[b, h] = out.astype(y.dtype)
+
+    def _body_mla_scores(self, fam: TaskFamily, coords, scalars) -> None:
+        """MLA fused scores + softmax + sink (issue #95), fp64 oracle.
+
+        Candidate layout per (b, h): [W window | K compressed | 1 sink].
+        Window slot i holds logical cache position t = p - W + 1 + i
+        (sliding-window bound |q - t| < W, t <= q); slots with t < 0 or
+        t > p are invalid. Compressed slot j holds comp_idx[b, j] (valid
+        iff >= 0). fp64 two-pass softmax over valid candidates ∪ sink;
+        invalid slots exact 0.0 (§4.3).
+        """
+        q = self.tensor(fam.inputs[0]).astype(np.float64)
+        latent = self.tensor(fam.inputs[1]).astype(np.float64)
+        window_table = self.tensor(fam.inputs[2])
+        comp_pool = self.tensor(fam.inputs[3]).astype(np.float64)
+        comp_idx = self.tensor(fam.inputs[4])
+        sink = self.tensor(fam.inputs[5]).astype(np.float64)
+        bias = None
+        if len(fam.inputs) > 6:
+            bias = self.tensor(fam.inputs[6]).astype(np.float64)
+        y = self.tensor(fam.outputs[0])
+        b, h = coords
+        p = self._row_pos_value(fam, b, scalars)
+        W = fam.params["window"]
+        K = fam.params["comp_slots"]
+        scale = fam.params["scale"]
+        qb = q[b, h]
+        logits = np.full(W + K + 1, -np.inf, dtype=np.float64)
+        # window candidates: logical t in [max(0, p-W+1), p]
+        t_lo = max(0, p - W + 1)
+        for i in range(W):
+            t = p - W + 1 + i
+            if t_lo <= t <= p:
+                row = latent[b, int(window_table[b, t])]
+                lg = float(row @ qb) * scale
+                logits[i] = lg
+        # compressed candidates via the #97 indirection table
+        for j in range(K):
+            e = int(comp_idx[b, j])
+            if e >= 0:
+                lg = float(comp_pool[b, e] @ qb) * scale
+                if bias is not None:
+                    lg += float(bias[b, j])
+                logits[W + j] = lg
+        # sink: per-head learnable logit, always valid, LAST slot
+        logits[W + K] = float(sink[b, h]) if sink.ndim == 2 else float(sink[h])
+        m = logits.max()
+        e = np.exp(logits - m)
+        e[~np.isfinite(logits)] = 0.0  # invalid slots (logit -inf) exact zero
+        y[b, h, :] = (e / e.sum()).astype(y.dtype)
+
+    def _body_mla_values(self, fam: TaskFamily, coords, scalars) -> None:
+        """MLA context gather (issue #95): window + compressed pools, sink
+        column contributes no value. fp64 accumulation oracle."""
+        probs = self.tensor(fam.inputs[0]).astype(np.float64)
+        latent = self.tensor(fam.inputs[1]).astype(np.float64)
+        window_table = self.tensor(fam.inputs[2])
+        comp_pool = self.tensor(fam.inputs[3]).astype(np.float64)
+        comp_idx = self.tensor(fam.inputs[4])
+        y = self.tensor(fam.outputs[0])
+        b, h = coords
+        p = self._row_pos_value(fam, b, scalars)
+        W = fam.params["window"]
+        K = fam.params["comp_slots"]
+        acc = np.zeros(y.shape[2], dtype=np.float64)
+        t_lo = max(0, p - W + 1)
+        for i in range(W):
+            t = p - W + 1 + i
+            if t_lo <= t <= p:
+                acc += probs[b, h, i] * latent[b, int(window_table[b, t])]
+        for j in range(K):
+            e = int(comp_idx[b, j])
+            if e >= 0:
+                acc += probs[b, h, W + j] * comp_pool[b, e]
+        y[b, h, :] = acc.astype(y.dtype)
 
     def _body_gemv_fp8(self, fam: TaskFamily, coords, scalars) -> None:
         """fp8-blockwise GEMV reference (issue #91): dequant-then-matmul in fp64.
@@ -333,6 +456,7 @@ class ReferenceExecutor:
         s = np.repeat(scale[n0 // qb, :], qb)[:k]
         acc = (x[m0:m1, :] @ (wt * s[None, :]).T)
         y[m0:m1, n0:n1] = acc.astype(y.dtype)
+
     def _body_indexer_scores(self, fam: TaskFamily, coords, scalars) -> None:
         """Lightning-indexer scoring reference (issue #97).
 
@@ -396,6 +520,7 @@ class ReferenceExecutor:
         idx[b, :] = idx_row
         bias[b, :] = bias_row
 
+
     def _body_layernorm(self, fam: TaskFamily, coords, scalars) -> None:
         x = self.tensor(fam.inputs[0]).astype(np.float64)
         g = self.tensor(fam.inputs[1])
@@ -443,6 +568,22 @@ class ReferenceExecutor:
             out = row.copy()
             out[:half] = x1 * c - x2 * s
             out[half:rot] = x2 * c + x1 * s
+            y[b, h] = out.astype(y.dtype)
+            return
+        if fam.params.get("convention", "rotate_half") == "interleaved":
+            # GPT-J adjacent-pair rotation (issue #95, DeepSeek-V4): pairs
+            # (2i, 2i+1), c/s indexed by PAIR index i at the row's position;
+            # dims [rotary_dim, D) pass through. PINNED convention: pair
+            # stride 2, tables [max_pos, rotary_dim//2], c_i = cos[p, i],
+            # s_i = sin[p, i].
+            rot = fam.params["rotary_dim"]
+            half = rot // 2
+            c = cos_t[p][:half].astype(np.float64)
+            s = sin_t[p][:half].astype(np.float64)
+            x_even, x_odd = row[0:rot:2], row[1:rot:2]
+            out = row.copy()
+            out[0:rot:2] = x_even * c - x_odd * s
+            out[1:rot:2] = x_odd * c + x_even * s
             y[b, h] = out.astype(y.dtype)
             return
         half = row.shape[-1] // 2

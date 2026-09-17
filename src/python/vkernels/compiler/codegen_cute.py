@@ -58,6 +58,11 @@ TEMPLATE_NAMES = {
     # the two-series Ca/Cb pool; consumes #97's block_bias alignment and
     # #93's per-row boundary cadence; reads fold into #95 via #94.
     "compressor_append": "compressor_append_task",
+    # MLA decode lane (issue #95): fused latent-attention scores + softmax +
+    # sink, the context gather, and the conjugate (output-side) rope.
+    "mla_scores": "mla_scores_task",
+    "mla_values": "mla_values_task",
+    "conjugate_rope": "conjugate_rope_task",
     "layernorm": "layernorm_task",
     "rms_norm": "rms_norm_task",
     "rope": "rope_task",

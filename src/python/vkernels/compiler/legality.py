@@ -26,6 +26,15 @@ POSITION_CONSUMERS = frozenset(
         "softmax",
         "attention_values",
         "rope",
+        # MLA decode (issue #95): fused latent-attention scores/values and
+        # the conjugate output-side rope all bind the runtime decode position
+        # (window bound t in (p-W, p], per-row rope position).
+        "cache_append_paged",
+        "attention_scores_paged",
+        "attention_values_paged",
+        "mla_scores",
+        "mla_values",
+        "conjugate_rope",
     }
 )
 

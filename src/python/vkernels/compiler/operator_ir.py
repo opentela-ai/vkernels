@@ -456,9 +456,11 @@ OP_LAYER_NORM = "layer_norm"
 OP_RMS_NORM = "rms_norm"
 OP_ROPE = "rope"
 # rope attributes: layer, which, position, convention ("rotate_half" —
-# full-width Qwen3 form, default — or "neox_partial" — partial rotation over
-# the first rotary_dim dims with a pass-through tail; rotary_dim is present
-# iff convention == "neox_partial").
+# full-width Qwen3 form, default; "neox_partial" — partial rotation over
+# the first rotary_dim dims with a pass-through tail, rotary_dim present
+# iff convention == "neox_partial"; or "interleaved" — GPT-J style pairing
+# (2i, 2i+1) over the first rotary_dim dims, DeepSeek-V4 q/k-latent form,
+# rotary_dim present iff convention == "interleaved").
 OP_LINEAR = "linear"
 # fp8-blockwise decode projection (issue #91): y = x @ dequant(w_fp8, scales)^T
 # with DeepSeek-style 128x128 block scales; same task shape as ``linear``, the
@@ -510,6 +512,17 @@ OP_ATTENTION_VALUES_PAGED = "attention_values_paged"
 OP_MOE_ROUTE = "moe_route"
 OP_MOE_EXPERT = "moe_expert"
 OP_MOE_COMBINE = "moe_combine"
+# MLA decode (DeepSeek-V4 latent attention, issue #95): shared-KV MQA over a
+# latent cache — fused scores+softmax with a per-head learnable sink column
+# and the sliding-window branch bound, over window keys (slot table) union
+# selected compressed entries (indexer top-k table, #97). ``mla_values``
+# gathers context from both pools with the sink column contributing no value.
+OP_MLA_SCORES = "mla_scores"
+OP_MLA_VALUES = "mla_values"
+# Conjugate rope (issue #95): output-side rotation by the NEGATIVE angle —
+# same tables, sin negated; the exact inverse of the q/k rotation, so
+# rope -> conjugate_rope round-trips to identity.
+OP_CONJUGATE_ROPE = "conjugate_rope"
 
 ARITHMETIC_OP_KINDS = (
     OP_EMBEDDING,
@@ -537,6 +550,9 @@ ARITHMETIC_OP_KINDS = (
     OP_MOE_ROUTE,
     OP_MOE_EXPERT,
     OP_MOE_COMBINE,
+    OP_MLA_SCORES,
+    OP_MLA_VALUES,
+    OP_CONJUGATE_ROPE,
 )
 
 
