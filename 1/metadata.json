@@ -1,0 +1,123 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M2QYAAX1FTX0362RNP95BBPN",
+  "session_id": "01a0af1d-6a25-7493-ae3c-7b7632910458",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-17T15:03:48.352458404Z",
+  "branch": "wip/issue76-local",
+  "checkpoints_count": 5,
+  "save_step_count": 5,
+  "files_touched": [
+    "docs/kernels/moe_fused.md",
+    "docs/performance/moe-fused/gfx90a.md",
+    "docs/performance/moe-fused/gfx942.md",
+    "meta/benchmarks/test_moe_fused_prefill_correct.hip",
+    "meta/scripts/issue76_ab_mi300.sh",
+    "meta/scripts/issue76_counters_mi300.sh",
+    "src/c/vkernels/kernels/moe_fused.hip"
+  ],
+  "agent": "Pi",
+  "model": "zai-org/GLM-5.3-Flash",
+  "turn_id": "9b30ec9861b2",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 162041,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 17031,
+    "api_call_count": 12
+  },
+  "session_metrics": {
+    "turn_count": 5
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-17T15:03:48.316385938Z",
+    "agent_lines": 274,
+    "agent_removed": 0,
+    "human_added": 1574,
+    "human_modified": 88,
+    "human_removed": 0,
+    "total_committed": 1921,
+    "total_lines_changed": 1936,
+    "agent_percentage": 14.152892561983471,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 806,
+      "user_lines_removed": 12,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12,
+        "meta/scripts/issue76_ab_mi300.sh": 34,
+        "meta/scripts/issue76_analyze_mi300.sh": 52,
+        "meta/scripts/issue76_counters2_mi300.sh": 35,
+        "meta/scripts/issue76_counters_mi300.sh": 28,
+        "meta/scripts/issue76_isa2_mi300.sh": 35,
+        "meta/scripts/issue76_isa3_mi300.sh": 45,
+        "meta/scripts/issue76_isa_mi300.sh": 28,
+        "meta/scripts/issue76_prefill_mi300.sh": 48,
+        "meta/scripts/issue76_prof2_mi300.sh": 36,
+        "src/c/vkernels/kernels/moe_fused.hip": 405
+      },
+      "user_removed_per_file": {
+        "src/c/vkernels/kernels/moe_fused.hip": 12
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 191,
+      "user_lines_removed": 61,
+      "agent_lines_added": 2391,
+      "agent_lines_removed": 34,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12,
+        "docs/kernels/moe_fused.md": 23,
+        "docs/performance/moe-fused/gfx90a.md": 3,
+        "docs/performance/moe-fused/gfx942.md": 46,
+        "meta/scripts/issue76_counters_mi300.sh": 45,
+        "src/c/vkernels/kernels/moe_fused.hip": 14
+      },
+      "user_removed_per_file": {
+        "docs/kernels/moe_fused.md": 17,
+        "docs/performance/moe-fused/gfx90a.md": 1,
+        "docs/performance/moe-fused/gfx942.md": 17,
+        "meta/scripts/issue76_counters_mi300.sh": 15,
+        "src/c/vkernels/kernels/moe_fused.hip": 11
+      }
+    }
+  ]
+}

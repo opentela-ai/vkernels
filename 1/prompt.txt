@@ -1,0 +1,5 @@
+Can you read open issues https://github.com/opentela-ai/vkernels/issues, and for each gfx942 kernel, mark them as "In progress", and spin up a subagent to work on it, and each subagent should work in a separate worktree, and test on beverin (ssh beverin, use the mi300 partition)
+
+---
+
+continue
