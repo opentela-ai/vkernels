@@ -117,11 +117,15 @@ def real_glm53_dims_config(num_hidden_layers: int = 46) -> Glm53Config:
 
 
 def _rms_norm(x: np.ndarray, gamma: np.ndarray, eps: float) -> np.ndarray:
-    return x * np.rsqrt(np.mean(x * x, axis=-1, keepdims=True) + eps) * gamma
+    return x * _rsqrt(np.mean(x * x, axis=-1, keepdims=True) + eps) * gamma
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
+
+
+def _rsqrt(x: np.ndarray) -> np.ndarray:
+    return 1.0 / np.sqrt(x)
 
 
 def _softmax(x: np.ndarray, axis: int) -> np.ndarray:
@@ -179,7 +183,19 @@ class Glm53Weights:
     final_norm: list  # [C]
 
 
-def random_glm53_weights(cfg: Glm53Config, seed: int = 20260917) -> Glm53Weights:
+class _LazyWeight:
+    """Shape-only stand-in for the huge MoE weight tensors. The real-dims
+    compile smoke never executes on the host — 288 experts × [2·Imoe, C]
+    fp32 is ~18 GB per layer — so only the shape is consulted."""
+
+    def __init__(self, shape: tuple[int, ...]):
+        self.shape = shape
+
+    def astype(self, *a, **k):  # pragma: no cover - guard
+        raise RuntimeError("lazy weight materialized outside compile-only mode")
+
+
+def random_glm53_weights(cfg: Glm53Config, seed: int = 20260917, *, real_experts: bool = True) -> Glm53Weights:
     rng = np.random.default_rng(seed)
 
     def n(*shape: int, s: float = 0.05) -> np.ndarray:
@@ -215,8 +231,8 @@ def random_glm53_weights(cfg: Glm53Config, seed: int = 20260917) -> Glm53Weights
         down_proj=[n(C, I) for _ in range(L)],
         router_w=[n(E, C, s=0.3) for _ in range(L)],
         router_bias=[np.zeros(E) for _ in range(L)],
-        expert_gate_up=[n(E, 2 * Imoe, C) for _ in range(L)],
-        expert_down=[n(E, C, Imoe) for _ in range(L)],
+        expert_gate_up=[n(E, 2 * Imoe, C) if real_experts else _LazyWeight((E, 2 * Imoe, C)) for _ in range(L)],
+        expert_down=[n(E, C, Imoe) if real_experts else _LazyWeight((E, C, Imoe)) for _ in range(L)],
         shared_gate=[n(Imoe, C) for _ in range(L)],
         shared_up=[n(Imoe, C) for _ in range(L)],
         shared_down=[n(C, Imoe) for _ in range(L)],
@@ -234,7 +250,7 @@ def _mhc_block(
     B, hc, C = streams.shape
     eps, rms_eps = cfg.hc_eps, cfg.rms_norm_eps
     flat = streams.reshape(B, hc * C)
-    flat_n = flat * np.rsqrt(np.mean(flat * flat, axis=-1, keepdims=True) + rms_eps)
+    flat_n = flat * _rsqrt(np.mean(flat * flat, axis=-1, keepdims=True) + rms_eps)
     logits = flat_n @ fn.T  # [B, mix] — no projection bias
     pre_w, post_w, comb_w = np.split(logits, [hc, 2 * hc], axis=-1)
     pre_b, post_b, comb_b = np.split(base, [hc, 2 * hc])
@@ -289,10 +305,10 @@ def _kda_layer_decode(
     k_n = k / np.sqrt((k * k).sum(-1, keepdims=True) + 1e-6)
     s = ssm_state.copy()
     s = s * np.exp(g)[:, :, :, None]  # decay rows, broadcast over V
-    kv = np.einsum("bhk,bhk->bhv", s, k_n)
+    kv = np.einsum("bhkv,bhk->bhv", s, k_n)
     delta = beta[:, :, None] * (v - kv)
     s = s + k_n[:, :, :, None] * delta[:, :, None, :]
-    out = np.einsum("bhk,bhk->bhv", s, q_n)
+    out = np.einsum("bhkv,bhk->bhv", s, q_n)
     ssm_state[:] = s
     # gated output norm (per head row) + o_proj
     gate = (h @ w.g_a[layer].T @ w.g_b[layer].T).reshape(B, H, D)
@@ -326,7 +342,8 @@ def _moe_block(
             acc = acc + wk[b, slot] * (w.expert_down[layer][e] @ act)
         routed[b] = acc
     # shared dense expert
-    sh = w.shared_down[layer] @ _swiglu(w.shared_gate[layer] @ h.T, w.shared_up[layer] @ h.T, cfg.swiglu_limit).T
+    act = _swiglu(w.shared_gate[layer] @ h.T, w.shared_up[layer] @ h.T, cfg.swiglu_limit)  # [I, B]
+    sh = w.shared_down[layer] @ act  # [C, B]
     return routed + sh.T
 
 
@@ -349,8 +366,8 @@ def glm53_reference_decode_step(
         post, comb, h_in = _mhc_block(hidden, w.hc_ffn_fn[layer], w.hc_ffn_base[layer], w.hc_ffn_scale[layer], cfg)
         h = _rms_norm(h_in, w.ln2[layer], cfg.rms_norm_eps)
         if cfg.mlp_layer_types[layer] == "dense":
-            body = w.down_proj[layer] @ _swiglu(w.gate_proj[layer] @ h.T, w.up_proj[layer] @ h.T, cfg.swiglu_limit).T
-            body = body.T
+            act = _swiglu(w.gate_proj[layer] @ h.T, w.up_proj[layer] @ h.T, cfg.swiglu_limit)  # [I, B]
+            body = (w.down_proj[layer] @ act).T  # [B, C]
         else:
             body = _moe_block(h, w, cfg, layer)
         hidden = _mhc_compose(residual, post, comb, body)

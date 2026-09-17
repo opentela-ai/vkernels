@@ -24,6 +24,7 @@ from __future__ import annotations
 import numpy as np
 
 from .capture import RecordingBackend, SymbolicTensor
+from .operator_ir import F32, I32
 from .glm53_arch import Glm53Config, Glm53Weights
 from .model_gpt2 import _stable_storage_id
 
@@ -31,7 +32,8 @@ from .model_gpt2 import _stable_storage_id
 class Glm53ModelArgs:
     """Symbolic externals for one GLM-5.3 decode step (batch B)."""
 
-    def __init__(self, ops: RecordingBackend, cfg: Glm53Config, weights: Glm53Weights, batch: int = 3):
+    def __init__(self, ops: RecordingBackend, cfg: Glm53Config, weights: Glm53Weights, batch: int = 3, *,
+                 materialize_hosts: bool = True):
         B, C = batch, cfg.hidden_size
         H, D, qkv = cfg.linear_num_heads, cfg.linear_head_dim, cfg.qkv_dim
         hc, mix = cfg.hc_mult, cfg.hc_mix
@@ -39,16 +41,29 @@ class Glm53ModelArgs:
         I, Imoe, E = cfg.intermediate_size, cfg.moe_intermediate_size, cfg.n_routed_experts
         self.cfg, self.batch = cfg, B
 
-        def ext(name: str, arr: np.ndarray) -> SymbolicTensor:
-            t = ops.external_tensor(name, tuple(arr.shape), dtype=arr.dtype, storage_id=next(self._sid))
-            self.host[name] = arr
+        def ext(name: str, arr: np.ndarray, dtype=F32) -> SymbolicTensor:
+            t = ops.external_tensor(name, tuple(arr.shape), dtype=dtype, storage_id=next(self._sid))
+            if not materialize_hosts:
+                # compile-only mode (real-dims smoke): shapes only — the
+                # 288-expert fp32 weight externals are ~18 GB per layer and
+                # never executed on the host
+                self.host[name] = None
+                self.host_by_sid[t.value.storage_id] = None
+                return t
+            # host mirror of the storage: fp32 (the compiled-pool convention;
+            # the fp64 oracle in glm53_arch consumes these via astype)
+            self.host[name] = (arr.astype(np.float32) if dtype is F32 else arr)
+            self.host_by_sid[t.value.storage_id] = self.host[name]
             return t
+
+        self.host_by_sid: dict[int, np.ndarray] = {}
 
         self.host: dict[str, np.ndarray] = {}
         self._sid = iter(range(1000, 100000))
 
         # token-row streams (host tiles the token embedding across hc)
         self.streams_in = ops.external_tensor("glm53_streams_in", (B, hc, C), storage_id=next(self._sid))
+        self.host_by_sid[self.streams_in.value.storage_id] = None  # filled per test (the decode input)
         # per-layer state pools (external, §4.3 RMW)
         self.conv_state: list[SymbolicTensor] = []
         self.ssm_state: list[SymbolicTensor] = []
@@ -57,6 +72,9 @@ class Glm53ModelArgs:
             ss = ops.external_tensor(f"glm53_ssm_state_l{i}", (B, H, D, D), storage_id=next(self._sid))
             self.conv_state.append(cs)
             self.ssm_state.append(ss)
+            if materialize_hosts:
+                self.host_by_sid[cs.value.storage_id] = np.zeros((B, K - 1, Cc), np.float32)
+                self.host_by_sid[ss.value.storage_id] = np.zeros((B, H, D, D), np.float32)
         # weights (floe layout unless the op contract says otherwise;
         # ``linear`` takes [Cin, Cout] — floe's [out, in] is transposed here)
         L = cfg.num_hidden_layers
@@ -89,22 +107,27 @@ class Glm53ModelArgs:
         self.gate_proj = [ext(f"gate_proj_{i}", weights.gate_proj[i].T.copy()) for i in range(L)]  # [C, I]
         self.up_proj = [ext(f"up_proj_{i}", weights.up_proj[i].T.copy()) for i in range(L)]
         self.down_proj = [ext(f"down_proj_{i}", weights.down_proj[i].T.copy()) for i in range(L)]  # [I, C]
-        # HyperHead mean over hc as a [C, hc·C] 0.5-tile GEMV (no reduce-mean op)
+        # HyperHead mean over hc as a [C, hc·C] 0.5-tile GEMV (no reduce-mean op):
+        # y = flat @ W with W[j, c] = 0.5 iff j % C == c (flat is the row-major
+        # flatten of [B, hc, C], so y[c] = 0.5·Σ_h flat[h·C + c]).
         mean_w = np.zeros((hc * C, C))
         for h_i in range(hc):
-            mean_w[h_i * C : (h_i + 1) * C, :] = 0.5
+            mean_w[h_i * C : (h_i + 1) * C, :] = 0.5 * np.eye(C)
         self.head_mean = ext("glm53_head_mean", mean_w)
         self.final_norm = ext("glm53_final_norm", weights.final_norm[0])
         # top-k scratch for sparse MoE (routing table: i32 ids + f32 weights)
         self.route_ids = [
-            ops.external_tensor(f"route_ids_{i}", (B, cfg.num_experts_per_tok), storage_id=next(self._sid))
+            ops.external_tensor(f"route_ids_{i}", (B, cfg.num_experts_per_tok), I32, storage_id=next(self._sid))
             for i in range(L)
         ]
         self.route_weights = [
             ops.external_tensor(f"route_w_{i}", (B, cfg.num_experts_per_tok), storage_id=next(self._sid))
             for i in range(L)
         ]
-
+        if materialize_hosts:
+            for i in range(L):
+                self.host_by_sid[self.route_ids[i].value.storage_id] = np.zeros((B, cfg.num_experts_per_tok), np.int32)
+                self.host_by_sid[self.route_weights[i].value.storage_id] = np.zeros((B, cfg.num_experts_per_tok), np.float32)
 
 def build_glm53_forward(ops: RecordingBackend, args: Glm53ModelArgs) -> SymbolicTensor:
     """GLM-5.3 decode step body (KDA layers + mHC + MoE) → normed hidden [B, C]."""
