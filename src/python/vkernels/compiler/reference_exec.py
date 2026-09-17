@@ -116,6 +116,7 @@ class ReferenceExecutor:
             "elementwise": self._body_elementwise,
             "embedding": self._body_embedding,
             "cache_append": self._body_cache_append,
+            "gdn_conv": self._body_gdn_conv,
             "attention_scores": self._body_attention_scores,
             "softmax": self._body_softmax,
             "attention_values": self._body_attention_values,
@@ -345,6 +346,29 @@ class ReferenceExecutor:
         p = scalars["p"]
         k_cache[b, h, p, :] = k_new[b, h, :]
         v_cache[b, h, p, :] = v_new[b, h, :]
+
+    def _body_gdn_conv(self, fam: TaskFamily, coords, scalars) -> None:
+        """GDN short-conv decode step over one (batch, channel-tile) task:
+        fp32-accumulated depthwise FIR + silu, then the time-major state
+        shift (drop oldest tap, append the new row) — in place, since the
+        pool is external persistent storage.
+        """
+        state = self.tensor(fam.inputs[0])
+        x = self.tensor(fam.inputs[1]).astype(np.float64)
+        w = self.tensor(fam.inputs[2]).astype(np.float64)
+        out = self.tensor(fam.outputs[0])
+        b, c = coords
+        tile = fam.params["tile"]
+        K = fam.params["conv_kernel"]
+        C = state.shape[-1]
+        c0, c1 = c * tile, min((c + 1) * tile, C)
+        st = state[b, :, c0:c1].astype(np.float64)  # [K-1, T] time-major
+        xs = x[b, c0:c1]  # [T]
+        ws = w[c0:c1, :]  # [T, K]
+        acc = np.einsum("jt,tj->t", st, ws[:, :-1]) + xs * ws[:, K - 1]
+        out[b, c0:c1] = (acc / (1.0 + np.exp(-acc))).astype(out.dtype)
+        # state shift: state[j] <- state[j+1]; state[K-2] <- x
+        state[b, :, c0:c1] = np.concatenate([st[1:], xs[None, :]], axis=0).astype(state.dtype)
 
     def _body_attention_scores(self, fam: TaskFamily, coords, scalars) -> None:
         q = self.tensor(fam.inputs[0]).astype(np.float64)
