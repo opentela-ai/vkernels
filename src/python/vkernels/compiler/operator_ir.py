@@ -379,6 +379,15 @@ OP_GDN_CONV = "gdn_conv"
 # per-head RMSNorm + z-gate. Position-independent — ordering comes from the
 # state-storage hazards (read-modify-write per (b, head) row), like gdn_conv.
 OP_GDN_DELTA = "gdn_delta"
+# kda_delta attributes: layer, scale, lower_bound. Per-head gated delta rule
+# decode step with ELEMENT-WISE decay (GLM-5.3 KDA / Kimi delta attention,
+# seq==1): unlike gdn_delta's scalar-per-head decay, the log gate is
+# per-(head, k-dim) — exp(g) row-broadcast over the value axis of the
+# [B, H, K, V] fp32 state. Gate conditioning (f_b output + dt_bias + A_log +
+# lower_bound·sigmoid) folds inside the task; q/k L2-normalize inside (q
+# carries the 1/sqrt(D) scale). Position-independent — ordering comes from
+# the state-storage hazards (read-modify-write per (b, head) row).
+OP_KDA_DELTA = "kda_delta"
 OP_ATTENTION_SCORES = "attention_scores"
 OP_SOFTMAX = "softmax"
 OP_ATTENTION_VALUES = "attention_values"
@@ -396,6 +405,7 @@ ARITHMETIC_OP_KINDS = (
     OP_CACHE_APPEND,
     OP_GDN_CONV,
     OP_GDN_DELTA,
+    OP_KDA_DELTA,
     OP_ATTENTION_SCORES,
     OP_SOFTMAX,
     OP_ATTENTION_VALUES,
