@@ -19,8 +19,10 @@
 # prefill rows + the unchanged mla_fwd_with_tile path are the evidence).
 set -euo pipefail
 
-SRC=${SRC:-$HOME/vk-i82}
-if [ ! -d "$SRC" ]; then
+# SRC = the scratch checkout containing this script (meta/scripts/... -> the
+# checkout root). Overridable via the SRC env var.
+SRC=${SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
+if [ ! -f "$SRC/CMakeLists.txt" ]; then
   echo "ERROR: SRC scratch checkout missing at $SRC (runner copies the worktree there)" >&2
   exit 1
 fi
