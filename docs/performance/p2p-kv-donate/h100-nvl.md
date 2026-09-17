@@ -17,12 +17,16 @@ separate peer copy.
 - benchmark: `p2p_kv_donate_bench --dst-device 1` — local K/V sources on
   device 0, peer page destinations on device 1 (real NVLink peer writes,
   peer access enabled by the bench), 50-iteration medians
-- machine state at measurement time: GPU0 idle; GPUs 1-3 running an
-  unrelated training job at ~100% util, so the NVLink peer-write numbers
+- machine state at first measurement (2026-08-14): GPU0 idle; GPUs 1-3 running
+  an unrelated training job at ~100% util, so the NVLink peer-write numbers
   land in a contended GPU1 HBM. The SAME-DEVICE D2D table (idle GPU0,
   `--quick`) is the clean measurement; the peer table demonstrates real
-  NVLink writes with the contention caveat. Re-run on an idle machine for
-  publication-grade peer numbers.
+  NVLink writes with the contention caveat.
+- **2026-09-17 re-measurement:** idle NVLink pair GPU2<->GPU3 (NV12, no
+  unrelated load), full 50-iteration medians — see
+  [Idle re-measurement and roof calibration](#idle-re-measurement-and-roof-calibration-sgs-gpu07-2026-09-17)
+  below. That section supersedes the peer numbers above and adds the
+  measured copy roofs.
 
 ## Workload
 
@@ -44,7 +48,7 @@ from the bench output when a truly idle NVLink pair is available.
 
 | Path | Model |
 |---|---|
-| Direct-plan SM kernel | `max(8.6 us, 4.20 us/MiB)` flat in page count below the 65535-page grid cap |
+| Direct-plan SM kernel | `max(8.6 us, 4.20 us/MiB)` flat in page count (page grid-stride since #84, no 65535-page cap) |
 | Copy-engine two stage | gather kernel `max(8.6, 4.20*MiB)` + one copy `max(20.0, 4.20*MiB)` + `7.37 us` per extra page |
 
 The gather kernel pays no NVLink traffic (local -> local scratch), the
@@ -114,15 +118,100 @@ The bench asserts `cudaMemcmp` equality of the fused kernel against the
 suites check byte-exactness against the host reference for page sizes
 16/32/64, head dims 64/128/256, on both the host and CUDA paths.
 
+## Idle re-measurement and roof calibration (sgs-gpu07, 2026-09-17)
+
+Issue #84 asked whether the plan-execute grid under-covers the SMs and
+whether a grid-stride loop would lift the 48 MiB point above 1.34 TB/s.
+Re-measured on an idle GPU (same-device) and an idle NVLink pair
+(`CUDA_VISIBLE_DEVICES=2,3`, GPU2->GPU3, NV12), full 50-iteration medians,
+with a **copy-roof calibration** so the achieved number can be compared to
+the resource that actually binds a copy.
+
+### Is the 48 MiB point at the roof?
+
+A copy of 48 MiB moves 48 MiB of payload but *touches* 96 MiB (read +
+write); the plan additionally reads a small slot map. The right roof is
+therefore the device copy roof, not the HBM read peak:
+
+| Path (48 MiB, distinct layer buffers, no L2 reuse) | med us | payload | touched | vs payload copy-kernel roof |
+|---|---:|---:|---:|---:|
+| D2D streaming copy kernel (grid-stride, `__ldcs`/`__stcs`) | 34.50 | 1.459 TB/s | 2.918 TB/s | 1.00x |
+| D2D `cudaMemcpy` | 33.79 | 1.489 TB/s | 2.979 TB/s | 1.02x |
+| **donate prepared plan** (page sweep, 192 pages) | **36.86** | **1.365 TB/s** | **2.730 TB/s** | **0.94x (93.6%)** |
+| **restore prepared plan** (page sweep, 192 pages) | **35.62** | **1.413 TB/s** | **2.826 TB/s** | **0.97x (96.8%)** |
+
+The plan is within 3-6% of the pure copy kernel and 7-9% of `cudaMemcpy`.
+The residual gap is the gather itself — two independent K/V source
+streams, a per-token slot indirection, and `dst_k`/`dst_v` interleaving —
+not grid coverage. Reported as "% of HBM read peak" it looks like ~40%
+(donate) because 1.365 TB/s is measured against the 3.35 TB/s read-only
+peak; against the copy roof it is 94%.
+
+### NVLink peer writes (idle GPU2 -> GPU3)
+
+| pages | MiB | two_stage us | fused us |
+|---:|---:|---:|---:|
+| 1   | 0.25 | 128.3 | 118.2 |
+| 16  | 4.00 | 624.1 | 119.2 |
+| 64  | 16.0 | 2208.8 | 172.0 |
+| 192 | 48.0 | 8595.1 | 324.2 |
+
+Prepared plan, 40-layer KVAAS sweep (median/layer):
+
+| pages | MiB/lyr | one-shot us | plan us/layer | plan create | plan vs one-shot |
+|---:|---:|---:|---:|---:|---:|
+| 1   | 0.25 | 118.8 |  7.0 | 0.145 ms | 12.8x |
+| 16  | 4.00 | 137.2 | 23.3 | 0.111 ms |  5.3x |
+| 64  | 16.0 | 177.7 | 73.6 | 0.113 ms |  2.3x |
+| 192 | 48.0 | 310.2 | **207.6** | 0.132 ms |  1.47x |
+
+Restore prepared plan at 48 MiB/layer: **207.1 us**.
+
+Peer roof calibration (48 MiB, distinct buffers): a pure peer streaming
+copy kernel is **206.7 us (243.6 GB/s)** and peer `cudaMemcpy` is
+**195.1 us (258.0 GB/s)**. So at 48 MiB the donate/restore plan
+(207.6 / 207.1 us) is **at the SM peer-copy roof (100.2-100.4%)**; only
+the copy-engine/`cudaMemcpy` path is ~6% faster. This matches the
+`p2p_gather` finding of a ~240-265 GB/s NVLink unidirectional roof on this
+box, so the peer plan is not an optimization target either.
+
+### Grid-stride change (issue #84)
+
+Even though it does not move the 48 MiB number, the plan kernels were
+switched to stride over PAGES (`grid.y`, capped at `kPlanTargetBlocks = 264`,
+blockDim 256), matching the existing `kv_gather` / `kv_scatter` idiom:
+
+- **Correctness:** the old launch capped `grid.y = min(num_pages, 65535)`
+  and the kernel did `if (p >= num_pages) return;` with no loop, so any plan
+  with **more than 65535 pages silently dropped every page past 65534**.
+  The page loop makes coverage independent of page count. Regression tests
+  `KvDonatePlan.CoversMorePagesThanGridYLimit` and
+  `KvRestorePlan.CoversMorePagesThanGridYLimit` build a 70000-page plan and
+  check every byte (they fail on the pre-#84 kernel).
+- **Coverage:** the grid is now `(ceil(page_size*units_per_token/256), 264)`
+  instead of growing to `num_pages` blocks, so it is bounded and still
+  fills the SMs. At the KVAAS point the two shapes are identical
+  (`(32, 192)`), which is why the measured 36.5-36.9 us is unchanged.
+- A full grid-stride over BOTH axes (inner unit loop) was measured and is
+  **~4% slower** at 48 MiB (38.4 us vs 36.6 us) because the inner loop
+  executes one iteration but still emits its induction/branch; the
+  page-only stride keeps the loop-invariant unit computation outside the
+  loop and stays within ~1% of the pre-#84 kernel.
+
 ## Dispatch model (for reference)
 
 ## Caveats
 
-- The plan's per-layer kernel uses a grid of (page_size*units,
-  num_pages) blocks and under-covers the 132 SMs at the KVAAS point
-  (192x4x256 threads move 48 MiB), which lands it at ~1.34 TB/s D2D
-  rather than peak; a grid-stride loop is a possible future tuning step.
-  The restore plan shares this shape.
+- The plan's per-layer kernel now uses a grid of
+  `(page_size*units_per_token/256, min(num_pages, 264))` blocks and
+  grid-strides over pages (issue #84). At the KVAAS point this is the same
+  `(32, 192)` grid the original one-block-per-page kernel launched, so the
+  36.5 us D2D number is unchanged; it was never SM-starved there. The change
+  fixes a real latent bug — `num_pages > 65535` was silently truncated by
+  the `grid.y` cap — and bounds the grid for all shapes. The binding
+  resource at 48 MiB is the D2D/peer copy roof (measured 34.5 us D2D,
+  206.7 us peer), which the plan reaches to 94% / 100%; the restore plan
+  shares this shape and the same caveat. See the 2026-09-17 section above.
 - Peer-write absolute numbers above were measured against a GPU1 running
   someone else's job (100% util); NVLink peer writes land in its HBM and
   are slowed. Re-measure on an idle pair before quoting absolute peer
@@ -188,3 +277,20 @@ main — pre-existing, unrelated. A CUDA-only compile fix (missing
 `#pragma once`) and two donate C ABI test bugs were found and fixed on
 GPU; remaining follow-up: re-run the peer table on an idle NVLink pair
 and retune the dispatch constants.
+
+2026-09-17 — Issue #84 (grid-stride loop). Switched both plan kernels
+(`p2p_kv_donate.cu`, `p2p_kv_restore.cu`) to stride over pages with
+`grid.y` capped at `kPlanTargetBlocks = 264`, matching `kv_gather` /
+`kv_scatter`. This fixes a latent correctness bug: the old
+`grid.y = min(num_pages, 65535)` plus a non-looping `if (p >= num_pages)
+return` silently dropped every page past 65534 (regression tests added for
+70000 pages on both sides, which fail on the old kernel). Re-measured on
+idle hardware with a copy-roof calibration: the 48 MiB plan is 36.9 us
+(donate) / 35.6 us (restore) D2D = 1.37-1.41 TB/s payload, i.e. 94-97% of
+the measured D2D copy-kernel roof; and 207.6 / 207.1 us over an idle
+GPU2->GPU3 NVLink pair = 100% of the 206.7 us peer copy-kernel roof. The
+"~40% of HBM" framing counted payload against the HBM READ peak while a
+copy touches 2x and is bound by the copy roof; a full both-axis
+grid-stride was measured ~4% slower at 48 MiB, so only the page axis
+strides. Tests: 39 donate + 27 donate C ABI + 36 restore + 18 restore C
+ABI, all pass.
