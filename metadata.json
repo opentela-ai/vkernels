@@ -3,7 +3,7 @@
   "checkpoint_id": "01M2QYAAX1FTX0362RNP95BBPN",
   "strategy": "manual-commit",
   "branch": "wip/issue76-local",
-  "checkpoints_count": 64,
+  "checkpoints_count": 65,
   "files_touched": [
     "docs/kernels/moe_fused.md",
     "docs/performance/moe-fused/beverin-issue76-prefill-variants.txt",
@@ -30,13 +30,20 @@
       "compact_transcript": "/1/transcript.jsonl",
       "content_hash": "/1/content_hash.txt",
       "prompt": "/1/prompt.txt"
+    },
+    {
+      "metadata": "/2/metadata.json",
+      "transcript": "/2/full.jsonl",
+      "compact_transcript": "/2/transcript.jsonl",
+      "content_hash": "/2/content_hash.txt",
+      "prompt": "/2/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 27282172,
+    "input_tokens": 27291707,
     "cache_creation_tokens": 0,
     "cache_read_tokens": 0,
-    "output_tokens": 254342,
-    "api_call_count": 430
+    "output_tokens": 254412,
+    "api_call_count": 431
   }
 }

@@ -1,0 +1,69 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M2QYAAX1FTX0362RNP95BBPN",
+  "session_id": "01a0af1f-43c4-758a-a115-ab2be30e928a",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-17T15:03:48.379104372Z",
+  "branch": "wip/issue76-local",
+  "checkpoints_count": 1,
+  "save_step_count": 1,
+  "files_touched": [
+    "src/c/vkernels/kernels/moe_fused.hip"
+  ],
+  "agent": "Pi",
+  "model": "zai-org/GLM-5.3-Flash",
+  "turn_id": "3e2c1752c2cb",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 9535,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 70,
+    "api_call_count": 1
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-17T15:03:48.373074383Z",
+    "agent_lines": 171,
+    "agent_removed": 6,
+    "human_added": 1664,
+    "human_modified": 12,
+    "human_removed": 0,
+    "total_committed": 1847,
+    "total_lines_changed": 1856,
+    "agent_percentage": 9.536637931034484,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 809,
+      "user_lines_removed": 12,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".omx/logs/omx-2026-08-28.jsonl": 1,
+        ".omx/logs/omx-2026-08-30.jsonl": 1,
+        ".omx/state/native-stop-state.json": 24,
+        ".omx/state/session.json": 10,
+        ".omx/state/sessions/01a047cf-0bbd-7e12-95f5-73f8516b77e4/prompt-routing-state.json": 12,
+        ".omx/state/sessions/01a0543b-e180-7b50-bbb5-4b1861d2b716/prompt-routing-state.json": 12,
+        "meta/scripts/issue76_ab_mi300.sh": 37,
+        "meta/scripts/issue76_analyze_mi300.sh": 52,
+        "meta/scripts/issue76_counters2_mi300.sh": 35,
+        "meta/scripts/issue76_counters_mi300.sh": 28,
+        "meta/scripts/issue76_isa2_mi300.sh": 35,
+        "meta/scripts/issue76_isa3_mi300.sh": 45,
+        "meta/scripts/issue76_isa_mi300.sh": 28,
+        "meta/scripts/issue76_prefill_mi300.sh": 48,
+        "meta/scripts/issue76_prof2_mi300.sh": 36,
+        "src/c/vkernels/kernels/moe_fused.hip": 405
+      },
+      "user_removed_per_file": {
+        "src/c/vkernels/kernels/moe_fused.hip": 12
+      }
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+{"v":1,"agent":"pi","cli_version":"0.10.3","type":"user","ts":"2026-09-17T11:27:40.688Z","content":[{"text":"test"}]}
+{"v":1,"agent":"pi","cli_version":"0.10.3","type":"assistant","ts":"2026-09-17T11:28:04.551Z","id":"72ca1f4c","input_tokens":9535,"output_tokens":70,"content":[{"type":"text","text":"Hi! I'm here and working. What would you like to test or what can I help you with?"}]}
