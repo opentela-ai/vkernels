@@ -33,6 +33,20 @@
 // Tuning. hip::gemm_bf16 selects a tile via gemm_bf16_config_for; the
 // explicit-tile hip::gemm_bf16_with_config is the offline-autotuner hook
 // used by meta/benchmarks/bench_gemm_bf16.hip to sweep candidate tiles.
+//
+// Issue #77 adds the next two rungs of the hip-gemm-tuning ladder for the
+// warmup (M > 64) regime, mirroring the validated GB10 (CUDA) port of
+// commit 1fa1f2e:
+//   * gemm_bf16_kernel_reuse<BM, BN, RM> -- cross-tile B reuse: each block
+//     owns RM consecutive M-tiles for ONE N-tile, so sB is loaded once per
+//     K-tile and consumed by all RM M-tiles (global B traffic / RM vs RM
+//     separate blocks), and sA/sB live in a two-deep LDS ring so the load
+//     of K-tile kt+1 overlaps the MFMAs of tile kt (double buffering).
+//   * The b fragment (sB -> registers) is read once per (K-group, column
+//     fragment) per warp and amortised over RM MFMA accumulate updates.
+//
+// Semantics are unchanged: same fp32-accumulate / RNE-store contract as
+// gemm_bf16_cpu, verified by test_gemm_bf16_correct.hip.
 #include <cstdint>
 
 #include "vkernels/kernels/gemm_bf16.hpp"
@@ -163,6 +177,160 @@ __global__ void gemm_bf16_kernel(const uint16_t* __restrict__ A,
   }
 }
 
+// ======================================================================
+//  Cross-tile B-reuse + LDS double-buffer kernel (gfx942, issue #77)
+// ======================================================================
+// Each block owns RM consecutive M-tiles for ONE N-tile: for a given
+// K-tile, sB[BK][BN] is loaded once from global memory and consumed by all
+// RM M-tiles, so global B traffic drops RM-fold vs RM separate blocks and
+// the b fragment (sB -> register) load is amortised over RM MFMA updates.
+//
+// LDS double-buffering: sA and sB live in a two-deep ring; the K-tile
+// kt+1 loads are issued (as plain global loads, which the memory system
+// keeps in flight) BEFORE the MFMAs of tile kt execute, so the global->LDS
+// transfer of tile kt+1 overlaps the matrix-core work of tile kt. One
+// __syncthreads() per K-tile (vs two in the two-phase kernel) both orders
+// the ring and publishes the prefetch; the writes target the buffer that
+// iteration kt-1 finished reading (or, at kt = 0, an untouched slot), so
+// there is no WAR hazard on it.
+//
+// Warp mapping (cf. the two-phase kernel above): kWarps = (BM/16)*(BN/16)
+// wavefronts; wavefront (warp_r, warp_c) owns rows [warp_r*16, +16) of
+// EVERY M-panel and columns [warp_c*16, +16), accumulating RM v4f
+// fragments (RM * kNF registers per thread -- the register cost of the
+// reuse). Requires RM * kNF * 4 VGPRs to stay well under the 256-reg
+// budget: the compiled configs are (16,64,R4), (32,64,R2), (32,64,R4).
+template <int BM, int BN, int RM>
+__global__ void gemm_bf16_kernel_reuse(const uint16_t* __restrict__ A,
+                                       const uint16_t* __restrict__ B,
+                                       uint16_t* __restrict__ C,
+                                       int M, int N, int K,
+                                       float alpha, float beta) {
+  static_assert(BM % 16 == 0 && BN % 16 == 0, "tile must be a multiple of 16");
+  static_assert(BK % kMfmaK == 0, "BK must be a multiple of the MFMA K");
+
+  constexpr int kNF    = BN / 16;                 // col fragments per warp
+  constexpr int kWarps = (BM / 16) * kNF;
+  constexpr int kTh    = kWarps * 64;
+
+  __shared__ uint16_t sA[2][RM][BM][BK];  // two-deep ring, RM M-panels
+  __shared__ uint16_t sB[2][BK][BN];      // two-deep ring, shared by panels
+
+  const int m_base = blockIdx.x * (BM * RM);  // first global row of block
+  const int n_tile = blockIdx.y;
+  const int tid    = threadIdx.x;
+  const int warp   = tid >> 6;
+  const int lane   = tid & 63;
+  const int warp_r = warp / kNF;
+  const int warp_c = warp % kNF;
+  const int m      = lane & 15;     // row within the 16-row fragment
+  const int n      = lane & 15;     // col within the 16-col fragment
+  const int kq     = lane >> 4;     // 0..3 -> which 4-K group
+  const int row_off = (lane >> 4) * 4;  // epilogue row within the fragment
+
+  const int n_ktiles = (K + BK - 1) / BK;
+
+  // Cooperative uint2 load of K-tile kt into ring slot buf (bounds-checked
+  // to 0 on M, N and K -- same convention as the two-phase kernel).
+  auto load_tile = [&](int kt, int buf) {
+    const int k_off = kt * BK;
+
+    // sA[RM][BM][BK]: 4 bf16 = 1 uint2 per chunk.
+    constexpr int a_chunks = RM * BM * BK / 4;
+    for (int idx = tid; idx < a_chunks; idx += kTh) {
+      const int mm  = idx / (BM * (BK / 4));
+      const int rem = idx % (BM * (BK / 4));
+      const int row = rem / (BK / 4);
+      const int col = (rem % (BK / 4)) * 4;
+      const int gr  = m_base + mm * BM + row;
+      uint32_t* dst = (uint32_t*)(&sA[buf][mm][row][col]);
+      if (gr < M && k_off + col + 3 < K) {
+        const uint32_t* src =
+            (const uint32_t*)(&A[(size_t)gr * K + k_off + col]);
+        uint2 v = *(const uint2*)(src);
+        dst[0] = v.x; dst[1] = v.y;
+      } else {
+        for (int t = 0; t < 4; ++t) {
+          const int kc = k_off + col + t;
+          sA[buf][mm][row][col + t] =
+              (gr < M && kc < K) ? A[(size_t)gr * K + kc] : (uint16_t)0;
+        }
+      }
+    }
+
+    // sB[BK][BN]: bounds-checked on K and N.
+    constexpr int b_chunks = BK * BN / 4;
+    for (int idx = tid; idx < b_chunks; idx += kTh) {
+      const int row = idx / (BN / 4);
+      const int col = (idx % (BN / 4)) * 4;
+      const int gk  = k_off + row;                 // global K row
+      const int gc  = n_tile * BN + col;           // global N column (chunk)
+      if (gk < K && gc + 3 < N) {
+        const uint32_t* src = (const uint32_t*)(&B[(size_t)gk * N + gc]);
+        uint32_t* dst = (uint32_t*)(&sB[buf][row][col]);
+        uint2 v = *(const uint2*)(src);
+        dst[0] = v.x; dst[1] = v.y;
+      } else {
+        for (int t = 0; t < 4; ++t) {
+          const int gcc = gc + t;
+          sB[buf][row][col + t] =
+              (gk < K && gcc < N) ? B[(size_t)gk * N + gcc] : (uint16_t)0;
+        }
+      }
+    }
+  };
+
+  load_tile(0, 0);
+  __syncthreads();
+
+  v4f acc[RM][kNF];
+#pragma unroll
+  for (int r = 0; r < RM; ++r)
+#pragma unroll
+    for (int nf = 0; nf < kNF; ++nf) acc[r][nf] = (v4f){0.0f, 0.0f, 0.0f, 0.0f};
+
+  for (int kt = 0; kt < n_ktiles; ++kt) {
+    const int buf = kt & 1;
+    if (kt + 1 < n_ktiles) load_tile(kt + 1, buf ^ 1);  // prefetch, in flight
+
+    // K-loop: BK/kMfmaK (= 4) MFMAs per (panel, column fragment); the b
+    // fragment is loaded once per K-group and consumed by all RM panels.
+    const int nb = warp_c * 16 + n;
+    for (int mf = 0; mf < BK / kMfmaK; ++mf) {
+      const int k0 = mf * kMfmaK + kq * 4;
+      v4s b = {(short)sB[buf][k0][nb],     (short)sB[buf][k0 + 1][nb],
+               (short)sB[buf][k0 + 2][nb], (short)sB[buf][k0 + 3][nb]};
+#pragma unroll
+      for (int r = 0; r < RM; ++r) {
+        const int ar = warp_r * 16 + m;
+        v4s a = {(short)sA[buf][r][ar][k0],     (short)sA[buf][r][ar][k0 + 1],
+                 (short)sA[buf][r][ar][k0 + 2], (short)sA[buf][r][ar][k0 + 3]};
+        acc[r][warp_c] =
+            __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc[r][warp_c],
+                                                      0, 0, 0);
+      }
+    }
+    // Orders the ring: all reads of `buf` done, all prefetch writes into
+    // buf^1 (issued this iteration) complete before anyone moves on.
+    __syncthreads();
+  }
+
+  // Epilogue (same fragment layout as the two-phase kernel): col = lane%16,
+  // row = warp_r*16 + (lane/16)*4 + i within each panel, bounds-checked.
+  const int col = lane & 15;
+  const int gcol = n_tile * BN + warp_c * 16 + col;
+  if (gcol >= N) return;  // uniform per lane across the RM panels
+  for (int r = 0; r < RM; ++r) {
+    for (int i = 0; i < 4; ++i) {
+      const int grow = m_base + r * BM + warp_r * 16 + row_off + i;
+      if (grow >= M) break;          // grow increases monotonically with i
+      float v = alpha * acc[r][warp_c][i];
+      if (beta != 0.0f) v += beta * bf16_to_f32(C[(size_t)grow * N + gcol]);
+      C[(size_t)grow * N + gcol] = f2bf(v);
+    }
+  }
+}
+
 namespace {
 template <int BM, int BN>
 void launch(const uint16_t* A, const uint16_t* B, uint16_t* C,
@@ -173,7 +341,40 @@ void launch(const uint16_t* A, const uint16_t* B, uint16_t* C,
   gemm_bf16_kernel<BM, BN><<<grid, block, 0, 0>>>(
       A, B, C, M, N, K, alpha, beta);
 }
+
+template <int BM, int BN, int RM>
+void launch_reuse(const uint16_t* A, const uint16_t* B, uint16_t* C,
+                  int M, int N, int K, float alpha, float beta) {
+  constexpr int kWarps = (BM / 16) * (BN / 16);
+  constexpr int kTh    = kWarps * 64;
+  dim3 block(kTh);
+  // M grid shrinks by RM: each block covers RM consecutive M-tiles.
+  dim3 grid((M + BM * RM - 1) / (BM * RM), (N + BN - 1) / BN);
+  gemm_bf16_kernel_reuse<BM, BN, RM><<<grid, block, 0, 0>>>(
+      A, B, C, M, N, K, alpha, beta);
+}
 }  // namespace
+
+// Cross-tile B-reuse entry point (offline autotuner, issue #77). (bm, bn)
+// is the per-M-tile tile shape and rm the M-tiles per block (the block's
+// effective output footprint is (rm*bm, bn)); the benchmark pairs them.
+// Unknown (bm, bn, rm) fall back to the two-phase kernel (16, 64).
+void gemm_bf16_reuse_with_config(std::size_t M, std::size_t N, std::size_t K,
+                                 float alpha, const uint16_t* A,
+                                 const uint16_t* B, float beta, uint16_t* C,
+                                 int bm, int bn, int rm) {
+  const int Mi = static_cast<int>(M);
+  const int Ni = static_cast<int>(N);
+  const int Ki = static_cast<int>(K);
+  if (rm == 4 && bm == 16 && bn == 64)
+    launch_reuse<16, 64, 4>(A, B, C, Mi, Ni, Ki, alpha, beta);
+  else if (rm == 2 && bm == 32 && bn == 64)
+    launch_reuse<32, 64, 2>(A, B, C, Mi, Ni, Ki, alpha, beta);
+  else if (rm == 4 && bm == 32 && bn == 64)
+    launch_reuse<32, 64, 4>(A, B, C, Mi, Ni, Ki, alpha, beta);
+  else
+    launch<16, 64>(A, B, C, Mi, Ni, Ki, alpha, beta);
+}
 
 // Explicit-tile entry point (offline autotuner). BK is fixed at 64 (every
 // K3 K is a multiple of 64); `threads` is derived per tile as (bm/16)*64.
@@ -206,6 +407,23 @@ void gemm_bf16(std::size_t M, std::size_t N, std::size_t K, float alpha,
                uint16_t* C) {
   int bm = 0, bn = 0, bk = 0, threads = 0;
   ::vkernels::kernels::gemm_bf16_config_for(M, N, K, &bm, &bn, &bk, &threads);
+  // Warmup / prefill (M > 64): the selector reports the effective output
+  // footprint (rm*bm, bn) and the kernel realises it as the cross-tile
+  // B-reuse + LDS double-buffer kernel (issue #77): one sB load per K-tile
+  // shared by rm M-tiles, with the tile kt+1 loads overlapping tile kt's
+  // MFMAs. (128, 64) = (32, 64, RM=4); (64, 64) = (16, 64, RM=4). Serving
+  // (M <= 64) is a single M-tile per output tile, so reuse cannot help and
+  // stays on the two-phase kernel below.
+  if (M > 64) {
+    if (bm == 128 && bn == 64)
+      gemm_bf16_reuse_with_config(M, N, K, alpha, A, B, beta, C, 32, 64, 4);
+    else if (bm == 64 && bn == 64)
+      gemm_bf16_reuse_with_config(M, N, K, alpha, A, B, beta, C, 16, 64, 4);
+    else
+      gemm_bf16_with_config(M, N, K, alpha, A, B, beta, C, bm, bn, bk,
+                            threads);
+    return;
+  }
   gemm_bf16_with_config(M, N, K, alpha, A, B, beta, C, bm, bn, bk, threads);
 }
 

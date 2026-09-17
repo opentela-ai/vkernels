@@ -131,11 +131,17 @@ void gemm_bf16_config_for(std::size_t M, std::size_t N, std::size_t K,
     *bn = 16;
     *threads = 64;  // 1 wavefront (one per 16-row fragment)
   } else {
-    // Warmup / prefill: large M, compute-bound; (64,64) keeps the block
-    // count sane (~13k at M=8192) and reaches ~45% of HBM bandwidth.
-    *bm = 64;
+    // Warmup / prefill: large M, compute-bound once cross-tile B reuse
+    // lands (issue #77). The selector reports the EFFECTIVE output footprint
+    // (rm*bm, bn); hip::gemm_bf16 realises it as the reuse + LDS
+    // double-buffer kernel: (128, 64) = (32, 64) M-tiles x RM=4 per block
+    // (512 threads = RM*(bm/16)*64 wavefront lanes), halving the global B
+    // re-reads vs the old flat (64, 64) tile and pipelining the tile kt+1
+    // loads against tile kt's MFMAs. threads matches the reuse kernel's
+    // block size (bm/16)*64 with bm = the effective 128-row footprint.
+    *bm = 128;
     *bn = 64;
-    *threads = 256;  // 4 wavefronts (one per 16-row fragment)
+    *threads = 512;  // (128/16)*64 = 4 wavefronts
   }
 #endif
 }
