@@ -989,7 +989,7 @@ class RecordingBackend:
             "cache_append_paged",
             inputs=(k_pool, v_pool, slot_table, k_new, v_new),
             outputs=(),  # mutation through storage effects; pool views returned below
-            attributes={"layer": layer, "position": p},
+            attributes={"layer": layer, "position": p, "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"},
             reads=(_regional_reads(k_new.value), _regional_reads(v_new.value)),
             writes=(
                 Region.indirect(k_pool.value, slot_table.value, axis=0),
@@ -1046,7 +1046,7 @@ class RecordingBackend:
             "attention_scores_paged",
             inputs=(q, k_pool, slot_table),
             outputs=(out,),
-            attributes={"scale": float(scale), "layer": layer, "position": p, "kv_heads": kvh},
+            attributes={"scale": float(scale), "layer": layer, "position": p, "kv_heads": kvh, "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"},
             reads=(
                 _regional_reads(q.value),
                 Region.indirect(k_pool.value, slot_table.value, axis=0),
@@ -1086,7 +1086,7 @@ class RecordingBackend:
             "attention_values_paged",
             inputs=(probs, v_pool, slot_table),
             outputs=(out,),
-            attributes={"layer": layer, "position": p, "kv_heads": kvh},
+            attributes={"layer": layer, "position": p, "kv_heads": kvh, "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"},
             reads=(
                 Region.prefix(probs.value, axis=2, valid=ValidLength(f"{p}+1")),
                 Region.indirect(v_pool.value, slot_table.value, axis=0),

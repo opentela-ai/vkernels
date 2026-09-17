@@ -476,7 +476,7 @@ class ReferenceExecutor:
         k_new = self.tensor(fam.inputs[3])
         v_new = self.tensor(fam.inputs[4])
         b, h = coords
-        p = int(scalars["p"])
+        p = self._row_pos_value(fam, b, scalars)  # #93 ragged: per-row bound
         slot = int(table[b, p])  # write lands at slot_table[b, p_row] (#94)
         k_pool[slot, h, :] = k_new[b, h, :]
         v_pool[slot, h, :] = v_new[b, h, :]
@@ -488,7 +488,7 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         b, h = coords
         kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
-        p = int(scalars["p"])
+        p = self._row_pos_value(fam, b, scalars)  # #93 ragged: per-row bound
         scale = fam.params["scale"]
         # Gathered masked load: only positions [0, p] map through the table;
         # slot 0 is the reserved null/sink page (never written by a live row).
@@ -502,7 +502,7 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         b, h = coords
         kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
-        p = int(scalars["p"])
+        p = self._row_pos_value(fam, b, scalars)  # #93 ragged: per-row bound
         # Gathered masked: V rows beyond p are never gathered (NaN slots must not leak).
         slots = table[b, : p + 1].astype(np.int64)
         y[b, h, :] = (probs[b, h, : p + 1] @ v_pool[slots, kvh, :]).astype(y.dtype)
