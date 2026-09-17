@@ -56,7 +56,7 @@ serving shape, not a theoretical optimum.
 | 11 | `mxfp4_moe_scatter_reduce` | MI300A | same | 42.4 µs, 1461 GB/s | 3219 GB/s L2 | 45% of L2 | atomicAdd contention (16 rows/token) | same |
 | 12 | `mxfp4_moe_quant` / `_q` / `_sort_scales` | MI300A | same | 17.8 / 43.7 / 5.6 µs | L2 / launch floor | 3.6–7.8% L2; sort_scales launch-bound | compute (E2M1 round-trip) / launch | same |
 | 13 | `mla_fwd` | MI300A | H=128 S_q=S_kv=512 (prefill, best case) | 15.9 ms, 2318 GB/s | 5300 GB/s | **44% of HBM** | memory (AI 2.0; KV re-read per query tile) | [kernels/mla.md](kernels/mla.md) |
-| 14 | `mla_fwd` | MI300A | H=1 S_q=1 S_kv=8192 (decode, worst) | 5.5 ms, 6.5 GB/s | 5300 GB/s | 0.12% of HBM | occupancy (1 block re-reads 8192 keys) | same |
+| 14 | `mla_fwd` split-K decode | MI300A | H=1 S_q=1 S_kv=8192, split=228 | **66.8 µs, 533 GB/s** (was 5.5 ms, 6.5 GB/s pre-split) | 5300 GB/s | ~10% of HBM | **82× vs the single-block baseline**; 32-keys/split serial chain | [kernels/mla.md](kernels/mla.md) |
 | 15 | `kda_delta_rule_fwd` | MI300A | H=16 S=64 D=64 | 143 µs, 477 GB/s | 5300 GB/s | 9.0% of HBM | memory (D×D state → HBM per token, 3× re-read) | [kernels/kda.md](kernels/kda.md) |
 | 16 | `kda_layer_norm_gated` | MI300A | N=8192 D=128 | 174 µs, 72 GB/s | HBM | 1.4% | occupancy (32 blocks on 228 CUs) | same |
 | 17 | `dsa_sparse_fwd` (plain) | MI300A | GLM decode, topk=2048 (full) | 3.12 ms, 21.5 GB/s | HBM/L2 | 0.4% HBM | occupancy (64 blocks / 228 CU, serial key chain) | [dsa/gfx942](performance/dsa/gfx942.md) |
@@ -184,7 +184,7 @@ dependent-chain floor, not a device roof):
 | 16 | 512 | 512 | 3387 | 1358 | 26% |
 | 1 | 8192 | 8192 | 58727 | 1244 | 23% |
 | 1 | 64 | 8192 | 5315 | 107 | 2% |
-| 1 | 1 | 8192 | 5510 | 6.5 | 0.12% |
+| 1 | 1 | 8192 | 66.8 | 533 | ~10% (split=228, issue #82; was 5510 µs, 0.12%) |
 
 **KDA** delta rule (all memory-bound, AI ≈ 0.43): best 477 GB/s (9% HBM,
 H=16 S=64 D=64); worst 5.6 GB/s (H=1). The D×D state hits HBM every token

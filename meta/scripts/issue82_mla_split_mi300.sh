@@ -33,7 +33,7 @@ cmake -S "$SRC" -B "$SRC/build-i82" \
   -DVKERNELS_BUILD_BENCHMARKS=ON \
   -DCMAKE_HIP_ARCHITECTURES=gfx942 \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build "$SRC/build-i82" -j 64 --target vkernels test_mla_correct mla_bench
+cmake --build "$SRC/build-i82" -j 64 --target vkernels test_mla_correct mla_bench vkernels_test_mla
 
 echo "=============== correctness gate (test_mla_correct) ==============="
 "$SRC/build-i82/meta/benchmarks/test_mla_correct"
