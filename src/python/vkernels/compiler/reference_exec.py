@@ -142,6 +142,7 @@ class ReferenceExecutor:
             "embedding": self._body_embedding,
             "cache_append": self._body_cache_append,
             "gdn_conv": self._body_gdn_conv,
+            "compressor_append": self._body_compressor_append,
             "cache_append_paged": self._body_cache_append_paged,
             "attention_scores": self._body_attention_scores,
             "attention_scores_paged": self._body_attention_scores_paged,
@@ -482,6 +483,56 @@ class ReferenceExecutor:
             # Row b adds its own position row (issue #93 ragged form).
             row = row + pos[self._row_pos_value(fam, b, scalars), c0:c1].astype(np.float64)
         y[b, c0:c1] = row.astype(y.dtype)
+
+    def _body_compressor_append(self, fam: TaskFamily, coords, scalars) -> None:
+        """Issue #96: emit one compressed entry at the m-token boundary.
+
+        One task per (batch, layer). Rows not at a boundary (``p % m !=
+        m-1``) are exact no-ops. Emission (fp32 accumulated, mirrored in
+        fp64 here — tile-exact against the device contract):
+
+            w = softmax(gates[b]) ; e = Σ_t w_t·window[b,t]
+            e = e/sqrt(mean(e²)+eps)·rms_weight ; e = rotate_half(e, cos[b], sin[b])
+            entry_pool[b,l,slot,cb_len,:] = bf16(e)
+
+        then series bookkeeping: cb_len += 1; at cb_len == r//m the
+        completed Cb becomes Ca (slots ping-pong) and Cb restarts.
+        """
+        pool = self.tensor(fam.inputs[0])
+        state = self.tensor(fam.inputs[1])
+        window = self.tensor(fam.inputs[2])
+        gates = self.tensor(fam.inputs[3])
+        rms_w = self.tensor(fam.inputs[4])
+        cos = self.tensor(fam.inputs[5])
+        sin = self.tensor(fam.inputs[6])
+        b, l = coords
+        p = self._row_pos_value(fam, b, scalars)
+        m = fam.params["m"]
+        if p % m != m - 1:
+            return  # not a boundary token for this row: exact no-op
+        R = fam.params["r"] // m
+        eps = fam.params["eps"]
+        slot = int(state[b, l, 0])
+        cb_len = int(state[b, l, 1])
+        # fp32-accumulated emission (fp64 mirror here, tile-exact rounding
+        # applied only at the bf16 store).
+        g = gates[b].astype(np.float64)
+        gmax = g.max()
+        ex = np.exp(g - gmax)
+        w = ex / ex.sum()
+        e = (w[:, None] * window[b].astype(np.float64)).sum(axis=0)
+        e = e * np.reciprocal(np.sqrt((e * e).mean() + eps)) * rms_w.astype(np.float64)
+        half = e.shape[0] // 2
+        ch, sh = cos[b].astype(np.float64), sin[b].astype(np.float64)
+        e1, e2 = e[:half], e[half:]
+        e_rot = np.concatenate([e1 * ch - e2 * sh, e2 * ch + e1 * sh])
+        pool[b, l, slot, cb_len, :] = e_rot.astype(pool.dtype)
+        cb_len += 1
+        if cb_len == R:
+            state[b, l, 0] = 1 - slot
+            state[b, l, 1] = 0
+        else:
+            state[b, l, 1] = cb_len
 
     def _body_cache_append(self, fam: TaskFamily, coords, scalars) -> None:
         k_cache = self.tensor(fam.inputs[0])
