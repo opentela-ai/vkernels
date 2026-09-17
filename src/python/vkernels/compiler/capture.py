@@ -417,6 +417,10 @@ class RecordingBackend:
                 "dequant": f"per {quant_block}x{quant_block} block: w_fp8 * scale (fp32 scale, e4m3 weights)",
                 "accumulation": "f32, full-K reduction per output tile, k ascending within each block",
                 "bias": "none (checkpoint fp8 projections are bias-free)",
+            },
+        )
+        return out
+
     def indexer_scores(
         self,
         q: SymbolicTensor,
