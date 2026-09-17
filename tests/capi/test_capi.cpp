@@ -986,6 +986,89 @@ TEST(CapiDsaTopk, SplitForNullArg) {
   EXPECT_EQ(vk_last_error_code(), VK_ERROR_INVALID_ARGUMENT);
 }
 
+// --- DSA kpool-cache compress/write (dsa_kpool.hpp, #60) ------------------
+
+TEST(CapiDsaKpool, Helpers) {
+  EXPECT_EQ(vk_dsa_kpool_group_topk_supported(128), 1);
+  EXPECT_EQ(vk_dsa_kpool_group_topk_supported(64), 0);
+  EXPECT_EQ(vk_dsa_kpool_max_closed_pools(5, 2), 3);
+  EXPECT_EQ(vk_dsa_kpool_max_closed_pools(0, 2), 0);
+}
+
+// Minimal wiring test for the four dsa_kpool C-API entry points (the
+// numerical semantics are covered exhaustively by the kernels suites):
+// pool_size=1 with equal scores makes the pooled vector the key itself.
+TEST(CapiDsaKpool, AssembleAndDecodeUpdateBf16AndFp8) {
+  constexpr int H = 128;
+  // Constant key: Hadamard of a constant vector is a single nonzero lane
+  // (0.5 * sqrt(128)), everything else exactly 0.
+  std::vector<float> chunk_k(H, 0.5f), chunk_score(H, 0.25f), ape(2 * H, 0.0f);
+  std::vector<float> tail_k(2 * H, 0.0f), tail_score(2 * H, 0.0f);
+  std::vector<float> key(H, 0.5f), slot_score(H, 0.25f);
+  std::vector<float> tail_score_eq(2 * H, 0.25f);  // equal scores -> probs 1
+  std::vector<int32_t> rpi = {0}, nt = {0}, css = {0}, tlb = {0}, loc = {0};
+  std::vector<int32_t> block_tables = {0}, req_ids = {0}, positions = {1};
+  std::vector<int32_t> seq_lens = {4}, out_cache_loc = {1};
+
+  // bf16 assemble: pooled mean = key -> Hadamard -> out[0] = 0.5*sqrt(128).
+  std::vector<float> out(H, -1.0f);
+  EXPECT_EQ(vk_dsa_kpool_assemble(1, 1, H, 1, 1, 1, 1, 1, chunk_k.data(),
+                                  chunk_score.data(), tail_k.data(),
+                                  tail_score.data(), ape.data(), rpi.data(),
+                                  nt.data(), css.data(), tlb.data(), loc.data(),
+                                  nullptr, out.data()),
+            VK_OK);
+  EXPECT_NEAR(out[0], 0.5f * 11.313708498984761f, 1e-3f);
+  for (int d = 1; d < H; ++d) EXPECT_EQ(out[d], 0.0f);
+
+  // fp8 assemble: same pooled vector, stored as fp8 bytes + fp32 scale.
+  std::vector<uint8_t> cache(1 * (H + 4), 0u);
+  float round_scale = 0.0f;
+  EXPECT_EQ(vk_dsa_kpool_assemble_fp8(1, 1, H, 1, 1, 1, 1, 1, chunk_k.data(),
+                                      chunk_score.data(), tail_k.data(),
+                                      tail_score.data(), ape.data(), rpi.data(),
+                                      nt.data(), css.data(), tlb.data(),
+                                      loc.data(), nullptr, cache.data(),
+                                      &round_scale),
+            VK_OK);
+  const float fp8_scale =
+      *reinterpret_cast<const float*>(cache.data() + H);
+  EXPECT_TRUE(fp8_scale > 0.0f && std::isfinite(fp8_scale));
+  EXPECT_NE(cache[0], 0x00);  // the O(1) lane quantized to a finite code
+
+  // bf16 decode_update: pool_size=2, position 1 == pool_size-1 triggers the
+  // compress write into page 0 slot 0; the live-tail write lands at
+  // phys_slot = pos % tail_size = 1.
+  std::vector<float> dout(H, -1.0f);
+  EXPECT_EQ(vk_dsa_kpool_decode_update(
+                1, 2, H, 2, 1, 1, 1, 1, key.data(), slot_score.data(),
+                tail_k.data(), tail_score_eq.data(), ape.data(),
+                block_tables.data(), req_ids.data(), positions.data(),
+                seq_lens.data(), out_cache_loc.data(), dout.data()),
+            VK_OK);
+  // The unconditional live-tail write copies the current key verbatim.
+  for (int d = 0; d < H; ++d) EXPECT_EQ(tail_k[H + d], key[d]);
+  // The compressed pool is the weighted mean of {tail_k[0]=0, key=0.5}
+  // under equal scores = 0.25 -> Hadamard -> single lane 0.25*sqrt(128).
+  EXPECT_NEAR(dout[0], 0.25f * 11.313708498984761f, 1e-3f);
+  for (int d = 1; d < H; ++d) EXPECT_EQ(dout[d], 0.0f);
+
+  // fp8 decode_update: same core, fp8+scale store.
+  std::vector<float> tail_k2(2 * H, 0.0f);
+  std::vector<uint8_t> dcache(1 * (H + 4), 0u);
+  EXPECT_EQ(vk_dsa_kpool_decode_update_fp8(
+                1, 2, H, 2, 1, 1, 1, 1, key.data(), slot_score.data(),
+                tail_k2.data(), tail_score_eq.data(), ape.data(),
+                block_tables.data(), req_ids.data(), positions.data(),
+                seq_lens.data(), out_cache_loc.data(), dcache.data(), nullptr),
+            VK_OK);
+  for (int d = 0; d < H; ++d) EXPECT_EQ(tail_k2[H + d], key[d]);
+  const float fp8_scale2 =
+      *reinterpret_cast<const float*>(dcache.data() + H);
+  EXPECT_TRUE(fp8_scale2 > 0.0f && std::isfinite(fp8_scale2));
+  EXPECT_NE(dcache[0], 0x00);
+}
+
 // --- MHC — multi-head hybrid-attention pre-norm (mhc.hpp, issue #51) ----
 
 TEST(CapiMhc, PreGemmSqrsumHandChecked) {
