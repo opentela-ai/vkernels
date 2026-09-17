@@ -140,8 +140,9 @@ __global__ void mla_fwd_kernel(const float* __restrict__ q,
 //  A decode grid of B*H*S_q blocks (one 64-thread block per row) leaves CUs
 //  idle when B*H*S_q << kMlaCus — the H=1 S_q=1 S_kv=8192 case runs on ONE
 //  block: 6.5 GB/s = 0.12% of HBM. mla_fwd_split_for splits the S_kv window
-//  across `split` blocks per row; each writes the UNSCALED partial-softmax
-//  output (Σ exp(score − row_max) · v_c) and a per-split lse
+//  across `split` blocks per row; each writes the per-split NORMALIZED
+//  partial-softmax output (softmax_causal restricted to its visible keys:
+//  Σ exp(score − row_max) · v_c / row_sum) and a per-split lse
 //  (row_max + log(row_sum), −inf when its slice has no visible keys), and a
 //  combine kernel folds the splits in FIXED ascending order:
 //
@@ -226,13 +227,16 @@ __global__ void mla_fwd_split_kernel(const float* __restrict__ q,
     row_max = new_max;
   }
 
-  // Per-split partial: UNSCALED output slice (softmax numerator over row_max,
-  // no normalisation here) + lse = row_max + log(row_sum).
+  // Per-split partial: normalized partial-softmax output slice (this split's
+  // attention restricted to its visible keys) + lse = row_max + log(row_sum).
+  // Normalizing here makes the combine exact:
+  // out = Σ_sp exp(lse_sp − lse_g) · partial_out_sp.
   const size_t row = (size_t)((size_t)b * H + h) * S_q + gi;
+  const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
   float* porow = partial_out + (row * split + sp) * lr;
   for (int t = 0; t < nope_tiles; ++t) {
     const int idx = lane + t * 64;
-    if (idx < lr) porow[idx] = o[t];
+    if (idx < lr) porow[idx] = o[t] * inv;
   }
   if (lane == 0) {
     const float lse = (row_sum > 0.0f) ? row_max + logf(row_sum) : -INFINITY;
