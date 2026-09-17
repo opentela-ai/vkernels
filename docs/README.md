@@ -1,5 +1,9 @@
 # vkernels — Supported Kernels & Primitives
 
+> Looking for measured performance? See
+> [kernels-reference.md](kernels-reference.md) — every measured kernel,
+> tested hardware, and gap to speed of light in one table.
+
 This document lists every kernel and communication primitive in vkernels,
 along with the mathematical computation each performs. Every operation follows
 the **two-implementation model**: a CPU reference (oracle, always compiled)
@@ -63,7 +67,7 @@ shapes** — the ones that today fall back to AITER's untuned
 | Function | Computation | Data type | GPU backend |
 |---|---|---|---|
 | `gemm_bf16_cpu(M, N, K, α, A, B, β, C)` | `C = α·A@B + β·C` (per-output fp32 dot, single RNE bf16 store) | bf16 (uint16_t) | CPU (oracle) |
-| `gemm_bf16_config_for(M, N, K, &bm, &bn, &bk, &threads)` | serving `M≤64`→`(16,16,64)` (measured; `BN=16` saturates the 228 CUs, 1.4–2.9× over `BN=64`), warmup `M>64`→`(64,64,256)`, `BK=64` | — | CPU |
+| `gemm_bf16_config_for(M, N, K, &bm, &bn, &bk, &threads)` | **per-arch**: MI300A serving `M≤64`→`(16,16,64)` (measured; `BN=16` saturates the 228 CUs, 1.4–2.9× over `BN=64`), GB10 serving `M≤64`→`(16,64,64)` (cp.async kernel; `N≤1024`→`(16,16,64)`, e.g. QKV M=64 2248→547 µs), warmup `M>64`→effective `(64,64,256)` on both MI300A/host and GB10 (GB10 realises it as `(16,64,RM4)` cross-tile reuse; QKV M=8192 95458→53588 µs), `BK=64` | — | CPU |
 | `hip::gemm_bf16(M, N, K, α, A, B, β, C)` | tiled K16-MFMA GEMM, cooperative `uint2` loads, M/N/K bounds-checked | bf16 (uint16_t) | HIP |
 
 - **Layout**: `A` is M×K, `B` is K×N (the **transposed** projection

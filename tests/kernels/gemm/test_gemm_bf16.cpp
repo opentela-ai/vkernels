@@ -117,30 +117,52 @@ TEST(GemmBf16, MatchesIndependentReferenceAcrossK3Shapes) {
   }
 }
 
-TEST(GemmBf16Config, ServingShapePicks16x16) {
+TEST(GemmBf16Config, ServingShapePicksArchTile) {
   int bm = 0, bn = 0, bk = 0, threads = 0;
+  // QKV 6288x7168 at M=8: MI300A's 228 CUs want the small (16,16) tile so the
+  // N-dimension supplies enough blocks; GB10's pipelined path wants (16,64)
+  // (small BM keeps the block count high, BN=64 feeds the async copies).
   gemm_bf16_config_for(8, 6288, 7168, &bm, &bn, &bk, &threads);
+#if VKERNELS_HAS_CUDA
+  EXPECT_EQ(bm, 16);
+  EXPECT_EQ(bn, 64);
+  EXPECT_EQ(bk, 64);
+  EXPECT_EQ(threads, 128);
+#else
   EXPECT_EQ(bm, 16);
   EXPECT_EQ(bn, 16);
   EXPECT_EQ(bk, 64);
   EXPECT_EQ(threads, 64);
-  // The boundary M == 64 is still serving.
+#endif
+  // The boundary M == 64 is still serving, and N <= 1024 takes the (16,16)
+  // branch (the 896x7168 outlier where (16,16) beats (16,64) by ~40%).
   gemm_bf16_config_for(64, 128, 512, &bm, &bn, &bk, &threads);
+#if VKERNELS_HAS_CUDA
+  EXPECT_EQ(bm, 16);
+  EXPECT_EQ(bn, 16);
+  EXPECT_EQ(threads, 32);
+#else
   EXPECT_EQ(bm, 16);
   EXPECT_EQ(bn, 16);
   EXPECT_EQ(threads, 64);
+#endif
 }
 
-TEST(GemmBf16Config, WarmupShapePicks64x64) {
+TEST(GemmBf16Config, WarmupShapePicksArchTile) {
   int bm = 0, bn = 0, bk = 0, threads = 0;
+  // Large-K warmup: every arch picks an effective (64,64). MI300A's 228 CUs
+  // keep B reuse high; GB10 realises it as the 4-way M-grouped (16,64,RM4)
+  // reuse kernel, which won every M=8192 K3 shape (see gb10.md).
   gemm_bf16_config_for(8192, 6288, 7168, &bm, &bn, &bk, &threads);
   EXPECT_EQ(bm, 64);
   EXPECT_EQ(bn, 64);
   EXPECT_EQ(bk, 64);
   EXPECT_EQ(threads, 256);
-  // M == 65 crosses into the warmup / prefill tile.
+  // M == 65 crosses into the warmup / prefill tile; K = 64 is the small-K
+  // branch, (64,64) on every arch.
   gemm_bf16_config_for(65, 128, 64, &bm, &bn, &bk, &threads);
   EXPECT_EQ(bm, 64);
+  EXPECT_EQ(bn, 64);
   EXPECT_EQ(threads, 256);
 }
 

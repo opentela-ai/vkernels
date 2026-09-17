@@ -37,6 +37,10 @@ void gemm_bf16_with_config(std::size_t M, std::size_t N, std::size_t K,
                            float alpha, const uint16_t* A,
                            const uint16_t* B, float beta, uint16_t* C,
                            int bm, int bn, int bk, int threads);
+void gemm_bf16_reuse_with_config(std::size_t M, std::size_t N, std::size_t K,
+                                 float alpha, const uint16_t* A,
+                                 const uint16_t* B, float beta, uint16_t* C,
+                                 int bm, int bn, int rm);
 }  // namespace vkernels::kernels::cuda
 
 #define CK(e, m)                                                       \
@@ -65,11 +69,13 @@ using vkernels::kernels::f2bf;
 // One shape: CPU oracle vs CUDA, alpha/beta configurable.
 struct Stats { double max_abs, max_rel; };
 
-Stats run_case(int M, int N, int K, float alpha, float beta,
-               const std::vector<uint16_t>& A,
-               const std::vector<uint16_t>& B,
-               const std::vector<uint16_t>& Cinit,
-               uint16_t* dA, uint16_t* dB, uint16_t* dC) {
+template <typename Launch>
+Stats run_case_impl(int M, int N, int K, float alpha, float beta,
+                    const std::vector<uint16_t>& A,
+                    const std::vector<uint16_t>& B,
+                    const std::vector<uint16_t>& Cinit,
+                    uint16_t* dA, uint16_t* dB, uint16_t* dC,
+                    Launch launch) {
   std::vector<uint16_t> hC(Cinit), rC(Cinit);
   // CPU reference.
   vkernels::kernels::gemm_bf16_cpu(
@@ -82,8 +88,7 @@ Stats run_case(int M, int N, int K, float alpha, float beta,
      "cpyB");
   CK(cudaMemcpy(dC, Cinit.data(), (size_t)M * N * 2, cudaMemcpyHostToDevice),
      "cpyC");
-  vkernels::kernels::cuda::gemm_bf16(
-      (size_t)M, (size_t)N, (size_t)K, alpha, dA, dB, beta, dC);
+  launch(M, N, K, alpha, dA, dB, beta, dC);
   CK(cudaDeviceSynchronize(), "sync");
   CK(cudaMemcpy(hC.data(), dC, (size_t)M * N * 2, cudaMemcpyDeviceToHost),
      "rdC");
@@ -99,6 +104,20 @@ Stats run_case(int M, int N, int K, float alpha, float beta,
     if (e / d > s.max_rel) s.max_rel = e / d;
   }
   return s;
+}
+
+Stats run_case(int M, int N, int K, float alpha, float beta,
+               const std::vector<uint16_t>& A,
+               const std::vector<uint16_t>& B,
+               const std::vector<uint16_t>& Cinit,
+               uint16_t* dA, uint16_t* dB, uint16_t* dC) {
+  return run_case_impl(
+      M, N, K, alpha, beta, A, B, Cinit, dA, dB, dC,
+      [](int m, int n, int k, float a, const uint16_t* pA,
+         const uint16_t* pB, float b, uint16_t* pC) {
+        vkernels::kernels::cuda::gemm_bf16((size_t)m, (size_t)n, (size_t)k, a,
+                                            pA, pB, b, pC);
+      });
 }
 
 void fill_AB(std::vector<uint16_t>& A, std::vector<uint16_t>& B,
@@ -156,7 +175,10 @@ int main() {
   {
     const int M = 8192;
     std::printf("\n--- warmup M=%d (public cuda::gemm_bf16) ---\n", M);
-    const NK warm[] = {{1536, 128}, {3072, 512}};
+    // {64,7168} is the small-N / large-K warmup corner; all three now run
+    // the M > 64 effective (64,64) tile through the (16,64,RM4) reuse
+    // kernel (via the public cuda::gemm_bf16).
+    const NK warm[] = {{1536, 128}, {3072, 512}, {64, 7168}};
     for (const auto& s : warm) {
       std::vector<uint16_t> A((size_t)M * s.K), B((size_t)s.K * s.N),
           C((size_t)M * s.N, 0);
@@ -167,6 +189,25 @@ int main() {
                   M, s.N, s.K, st.max_abs, st.max_rel, ok ? "PASS" : "FAIL");
       if (!ok) ++fails;
     }
+  }
+
+  // --- (1c) public entry, shape that breaks cp.async chunk alignment ------
+  // N=100 is not a multiple of 8, so the double-buffered kernel must fall
+  // back to the synchronous one; the result must still match the CPU oracle.
+  // Every K3 shape is a multiple of 8/64, so this is the only coverage of
+  // the fallback.
+  {
+    const int M = 16, N = 100, K = 128;
+    std::printf("\n--- unaligned public entry (M=%d N=%d K=%d, "
+                "cp.async fallback) ---\n", M, N, K);
+    std::vector<uint16_t> A((size_t)M * K), B((size_t)K * N),
+        C((size_t)M * N, 0);
+    fill_AB(A, B, M, N, K, 9);
+    auto st = run_case(M, N, K, 1.0f, 0.0f, A, B, C, dA, dB, dC);
+    bool ok = st.max_rel < THRESH;
+    std::printf("  M=%-4d N=%-4d K=%-4d  max_abs=%.4f max_rel=%.6f  %s\n",
+                M, N, K, st.max_abs, st.max_rel, ok ? "PASS" : "FAIL");
+    if (!ok) ++fails;
   }
 
   // --- (2) every compiled tile via cuda::gemm_bf16_with_config ---
@@ -214,6 +255,53 @@ int main() {
                   c.bn, ma, mr, ok ? "PASS" : "FAIL");
       if (!ok) ++fails;
     }
+  }
+
+  // --- (3) cross-tile B-reuse kernel (RM M-tiles per block, cp.async) ----
+  {
+    struct Cfg { int bm, bn, rm; };
+    const Cfg cfgs[] = {{16, 64, 4}, {32, 64, 2}, {32, 64, 4}, {64, 64, 2}};
+    // M=128 spans more than one M-tile for every config (BM*RM >= 64).
+    const int M = 128, N = 128, K = 256;
+    std::printf("\n--- cross-tile B-reuse sweep (M=%d N=%d K=%d) ---\n", M, N,
+                K);
+    std::vector<uint16_t> A((size_t)M * K), B((size_t)K * N),
+        C((size_t)M * N, 0);
+    fill_AB(A, B, M, N, K, 11);
+    for (const auto& c : cfgs) {
+      auto st = run_case_impl(
+          M, N, K, 1.0f, 0.0f, A, B, C, dA, dB, dC,
+          [&](int m, int n, int k, float a, const uint16_t* pA,
+              const uint16_t* pB, float b, uint16_t* pC) {
+            vkernels::kernels::cuda::gemm_bf16_reuse_with_config(
+                (size_t)m, (size_t)n, (size_t)k, a, pA, pB, b, pC, c.bm,
+                c.bn, c.rm);
+          });
+      bool ok = st.max_rel < THRESH;
+      std::printf("  BM=%-2d BN=%-3d RM=%d  max_abs=%.4f max_rel=%.6f  %s\n",
+                  c.bm, c.bn, c.rm, st.max_abs, st.max_rel,
+                  ok ? "PASS" : "FAIL");
+      if (!ok) ++fails;
+    }
+    // Unaligned N: reuse -> db -> synchronous fallback chain.
+    const int Mu = 16, Nu = 100, Ku = 128;
+    std::printf("\n--- cross-tile B-reuse, unaligned fallback (M=%d N=%d "
+                "K=%d) ---\n",
+                Mu, Nu, Ku);
+    std::vector<uint16_t> Au((size_t)Mu * Ku), Bu((size_t)Ku * Nu),
+        Cu((size_t)Mu * Nu, 0);
+    fill_AB(Au, Bu, Mu, Nu, Ku, 12);
+    auto st = run_case_impl(
+        Mu, Nu, Ku, 1.0f, 0.0f, Au, Bu, Cu, dA, dB, dC,
+        [](int m, int n, int k, float a, const uint16_t* pA,
+           const uint16_t* pB, float b, uint16_t* pC) {
+          vkernels::kernels::cuda::gemm_bf16_reuse_with_config(
+              (size_t)m, (size_t)n, (size_t)k, a, pA, pB, b, pC, 32, 64, 2);
+        });
+    bool ok = st.max_rel < THRESH;
+    std::printf("  BM=32 BN=64 RM=2  max_abs=%.4f max_rel=%.6f  %s\n",
+                st.max_abs, st.max_rel, ok ? "PASS" : "FAIL");
+    if (!ok) ++fails;
   }
 
   cudaFree(dA); cudaFree(dB); cudaFree(dC);

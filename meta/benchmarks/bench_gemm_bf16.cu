@@ -25,6 +25,7 @@
 // dual-toolkit box (see meta/benchmarks/CMakeLists.txt).
 
 #include "vkernels/kernels/gemm_bf16.hpp"
+#include "vkernels/kernels/device_numeric.cuh"  // f2bf (shared, oracle-exact)
 
 // Roofline + timing machinery shared with bench_dsa_topk_logits.cu.
 #include "bench_cuda_common.cuh"
@@ -37,7 +38,29 @@ void gemm_bf16_with_config(std::size_t M, std::size_t N, std::size_t K,
                            float alpha, const uint16_t* A,
                            const uint16_t* B, float beta, uint16_t* C,
                            int bm, int bn, int bk, int threads);
+void gemm_bf16_db_with_config(std::size_t M, std::size_t N, std::size_t K,
+                              float alpha, const uint16_t* A,
+                              const uint16_t* B, float beta, uint16_t* C,
+                              int bm, int bn);
+void gemm_bf16_reuse_with_config(std::size_t M, std::size_t N, std::size_t K,
+                                 float alpha, const uint16_t* A,
+                                 const uint16_t* B, float beta, uint16_t* C,
+                                 int bm, int bn, int rm);
 }  // namespace vkernels::kernels::cuda
+
+// Pick the synchronous or cp.async kernel for one explicit-tile launch.
+static void launch_tile(int M, int N, int K, const uint16_t* dA,
+                        const uint16_t* dB, uint16_t* dC, int bm, int bn,
+                        bool use_db) {
+  if (use_db) {
+    vkernels::kernels::cuda::gemm_bf16_db_with_config(
+        (size_t)M, (size_t)N, (size_t)K, 1.0f, dA, dB, 0.0f, dC, bm, bn);
+  } else {
+    vkernels::kernels::cuda::gemm_bf16_with_config(
+        (size_t)M, (size_t)N, (size_t)K, 1.0f, dA, dB, 0.0f, dC, bm, bn, 64,
+        (bm / 16) * (bn / 16) * 32);
+  }
+}
 
 // bf16 round-to-nearest-even store comes from device_numeric.cuh (the one
 // definition the CPU oracle's .cpp copies and every device TU mirrors).
@@ -109,7 +132,8 @@ static void bench_shapes(const GpuInfo& info, cudaEvent_t start,
 // Per-shape autotuner: sweep ALL compiled tiles at EVERY serving M and print
 // the full matrix (us median) plus the best tile, so gemm_bf16_config_for can
 // be regenerated from measured data rather than projection.
-static void autotune(const GpuInfo& info, cudaEvent_t start, cudaEvent_t stop) {
+static void autotune(const GpuInfo& info, cudaEvent_t start, cudaEvent_t stop,
+                     bool use_db, const char* label) {
   (void)info;
   struct NK { int N, K; };
   const NK k3[] = {
@@ -123,7 +147,8 @@ static void autotune(const GpuInfo& info, cudaEvent_t start, cudaEvent_t stop) {
   constexpr int kNCfg = sizeof(cfgs) / sizeof(cfgs[0]);
   const int Ms[] = {5, 8, 16, 32, 64};
   for (int M : Ms) {
-    std::printf("\n=== tile autotuner (M=%d): us(med) per tile ===\n", M);
+    std::printf("\n=== tile autotuner (M=%d, %s): us(med) per tile ===\n", M,
+                label);
     std::printf("  %6s %6s", "N", "K");
     for (const auto& c : cfgs) { char nm[16];
       std::snprintf(nm, sizeof(nm), "%dx%d", c.bm, c.bn);
@@ -147,11 +172,7 @@ static void autotune(const GpuInfo& info, cudaEvent_t start, cudaEvent_t stop) {
       int best_i = 0; double best_us = 1e18;
       for (int i = 0; i < kNCfg; ++i) {
         const auto& c = cfgs[i];
-        auto L = [&] {
-          vkernels::kernels::cuda::gemm_bf16_with_config(
-              (size_t)M, (size_t)N, (size_t)K, 1.0f, dA, dB, 0.0f, dC,
-              c.bm, c.bn, 64, (c.bm / 16) * (c.bn / 16) * 32);
-        };
+        auto L = [&] { launch_tile(M, N, K, dA, dB, dC, c.bm, c.bn, use_db); };
         auto r = bench_us(L, start, stop, 3, 80);
         us[i] = r.median_us;
         if (us[i] < best_us) { best_us = us[i]; best_i = i; }
@@ -166,6 +187,126 @@ static void autotune(const GpuInfo& info, cudaEvent_t start, cudaEvent_t stop) {
 }
 
 // ---------------------------------------------------------------------------
+// Warmup tile sweep (M = 8192). The serving autotuner above only covers
+// M <= 64; this sweeps the same compiled tiles in the prefill regime, where
+// the B-reuse question actually matters.
+static void autotune_warmup(const GpuInfo& info, cudaEvent_t start,
+                            cudaEvent_t stop, bool use_db,
+                            const char* label) {
+  (void)info;
+  struct NK { int N, K; };
+  const NK k3[] = {
+      {6288, 7168}, {3584, 7168}, {896, 7168}, {2112, 7168}, {1536, 7168},
+      {7168, 1536}, {7168, 768}, {7168, 3584}, {2304, 1536}, {3072, 512},
+      {1536, 128},
+  };
+  struct Cfg { int bm, bn; };
+  const Cfg cfgs[] = {{16, 16}, {16, 64}, {16, 128}, {32, 64}, {32, 128},
+                      {64, 64},  {64, 128}};
+  constexpr int kNCfg = sizeof(cfgs) / sizeof(cfgs[0]);
+  constexpr int M = 8192;
+  std::printf("\n=== tile autotuner (M=%d, warmup, %s): us(med) per tile ===\n",
+              M, label);
+  std::printf("  %6s %6s", "N", "K");
+  for (const auto& c : cfgs) { char nm[16];
+    std::snprintf(nm, sizeof(nm), "%dx%d", c.bm, c.bn);
+    std::printf(" %9s", nm); }
+  std::printf("  %s\n", "best");
+  for (const auto& s : k3) {
+    const int N = s.N, K = s.K;
+    std::vector<uint16_t> A((size_t)M * K), B((size_t)K * N),
+        C((size_t)M * N, 0);
+    for (int i = 0; i < M * K; ++i) A[i] = f2bf(rnd(1, i) * 0.5f);
+    for (int i = 0; i < K * N; ++i) B[i] = f2bf(rnd(2, i) * 0.5f);
+    uint16_t *dA, *dB, *dC;
+    check_cuda(cudaMalloc(&dA, (size_t)M * K * 2), "A");
+    check_cuda(cudaMalloc(&dB, (size_t)K * N * 2), "B");
+    check_cuda(cudaMalloc(&dC, (size_t)M * N * 2), "C");
+    check_cuda(cudaMemcpy(dA, A.data(), (size_t)M * K * 2,
+                          cudaMemcpyHostToDevice), "cpyA");
+    check_cuda(cudaMemcpy(dB, B.data(), (size_t)K * N * 2,
+                          cudaMemcpyHostToDevice), "cpyB");
+    double us[kNCfg];
+    int best_i = 0; double best_us = 1e18;
+    for (int i = 0; i < kNCfg; ++i) {
+      const auto& c = cfgs[i];
+      auto L = [&] { launch_tile(M, N, K, dA, dB, dC, c.bm, c.bn, use_db); };
+      auto r = bench_us(L, start, stop, 3, 80);
+      us[i] = r.median_us;
+      if (us[i] < best_us) { best_us = us[i]; best_i = i; }
+    }
+    std::printf("  %6d %6d", N, K);
+    for (int i = 0; i < kNCfg; ++i) std::printf(" %9.1f", us[i]);
+    std::printf("  %dx%d\n", cfgs[best_i].bm, cfgs[best_i].bn);
+    check_cuda(cudaFree(dA), "fA"); check_cuda(cudaFree(dB), "fB");
+    check_cuda(cudaFree(dC), "fC");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-tile B-reuse sweep: (BM, BN, RM) = RM M-tiles per block sharing sB.
+// Reports the serving Ms and the warmup M=8192, for comparison against the
+// plain cp.async matrix above. RM=1 reduces to the db kernel.
+static void autotune_reuse(const GpuInfo& info, cudaEvent_t start,
+                           cudaEvent_t stop) {
+  (void)info;
+  struct NK { int N, K; };
+  const NK k3[] = {
+      {6288, 7168}, {3584, 7168}, {896, 7168}, {2112, 7168}, {1536, 7168},
+      {7168, 1536}, {7168, 768}, {7168, 3584}, {2304, 1536}, {3072, 512},
+      {1536, 128},
+  };
+  struct Cfg { int bm, bn, rm; };
+  const Cfg cfgs[] = {{16, 64, 4}, {32, 64, 2}, {32, 64, 4}, {64, 64, 2}};
+  constexpr int kNCfg = sizeof(cfgs) / sizeof(cfgs[0]);
+  for (int M : {5, 16, 64, 8192}) {
+    std::printf("\n=== reuse sweep (M=%d): us(med) per (BM,BN,RM) ===\n", M);
+    std::printf("  %6s %6s", "N", "K");
+    for (const auto& c : cfgs) {
+      char nm[24];
+      std::snprintf(nm, sizeof(nm), "%dx%d/RM%d", c.bm, c.bn, c.rm);
+      std::printf(" %12s", nm);
+    }
+    std::printf("  %s\n", "best");
+    for (const auto& s : k3) {
+      const int N = s.N, K = s.K;
+      std::vector<uint16_t> A((size_t)M * K), B((size_t)K * N),
+          C((size_t)M * N, 0);
+      for (int i = 0; i < M * K; ++i) A[i] = f2bf(rnd(1, i) * 0.5f);
+      for (int i = 0; i < K * N; ++i) B[i] = f2bf(rnd(2, i) * 0.5f);
+      uint16_t *dA, *dB, *dC;
+      check_cuda(cudaMalloc(&dA, (size_t)M * K * 2), "A");
+      check_cuda(cudaMalloc(&dB, (size_t)K * N * 2), "B");
+      check_cuda(cudaMalloc(&dC, (size_t)M * N * 2), "C");
+      check_cuda(cudaMemcpy(dA, A.data(), (size_t)M * K * 2,
+                            cudaMemcpyHostToDevice), "cpyA");
+      check_cuda(cudaMemcpy(dB, B.data(), (size_t)K * N * 2,
+                            cudaMemcpyHostToDevice), "cpyB");
+      double us[kNCfg];
+      int best_i = 0;
+      double best_us = 1e18;
+      for (int i = 0; i < kNCfg; ++i) {
+        const auto& c = cfgs[i];
+        auto L = [&] {
+          vkernels::kernels::cuda::gemm_bf16_reuse_with_config(
+              (size_t)M, (size_t)N, (size_t)K, 1.0f, dA, dB, 0.0f, dC, c.bm,
+              c.bn, c.rm);
+        };
+        auto r = bench_us(L, start, stop, 3, 80);
+        us[i] = r.median_us;
+        if (us[i] < best_us) { best_us = us[i]; best_i = i; }
+      }
+      std::printf("  %6d %6d", N, K);
+      for (int i = 0; i < kNCfg; ++i) std::printf(" %12.1f", us[i]);
+      std::printf("  %dx%d/RM%d\n", cfgs[best_i].bm, cfgs[best_i].bn,
+                  cfgs[best_i].rm);
+      check_cuda(cudaFree(dA), "fA"); check_cuda(cudaFree(dB), "fB");
+      check_cuda(cudaFree(dC), "fC");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 int main() {
   cudaEvent_t start, stop;
   cudaEventCreate(&start); cudaEventCreate(&stop);
@@ -173,8 +314,26 @@ int main() {
   std::printf("GPU: %s  SMs=%d  bf16=%.0f TFLOP/s (empirical)  "
               "mem=%.0f GB/s (measured)\n",
               info.name.c_str(), info.sms, info.tflops, info.bw);
+  // Fast iteration hooks: VK_BENCH_ONLY=reuse|shapes runs one sweep.
+  const char* only = std::getenv("VK_BENCH_ONLY");
+  if (only && std::string(only) == "reuse") {
+    autotune_reuse(info, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return 0;
+  }
+  if (only && std::string(only) == "shapes") {
+    bench_shapes(info, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return 0;
+  }
   bench_shapes(info, start, stop);
-  autotune(info, start, stop);
+  autotune(info, start, stop, false, "base");
+  autotune(info, start, stop, true, "cp.async");
+  autotune_warmup(info, start, stop, false, "base");
+  autotune_warmup(info, start, stop, true, "cp.async");
+  autotune_reuse(info, start, stop);
   cudaEventDestroy(start); cudaEventDestroy(stop);
   return 0;
 }

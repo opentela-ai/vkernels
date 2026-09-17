@@ -67,10 +67,58 @@ void gemm_bf16_cpu(std::size_t M, std::size_t N, std::size_t K, float alpha,
 
 void gemm_bf16_config_for(std::size_t M, std::size_t N, std::size_t K,
                           int* bm, int* bn, int* bk, int* threads) {
-  (void)N;  // N is bounds-checked per tile inside the kernel; the K3 shapes
-  (void)K;  // are all multiples of 16 (N) and 64 (K), so no config needs to
-            // pad K or pick a BN that divides N.
+  // The selector is per-arch: the tile that saturates MI300A's 228 CUs is
+  // the wrong one for GB10's 48 SMs, so the two branches below are chosen
+  // independently against each chip's on-device autotuner.  BK is fixed at
+  // 64 for every architecture -- every K3 K is a multiple of 64.
   *bk = 64;
+
+#if VKERNELS_HAS_CUDA
+  (void)K;  // GB10's tile choice is independent of K (measured on all K3 shapes)
+  // --- NVIDIA (GB10 / sm_121, 48 SMs, LPDDR) ------------------------------
+  // These tiles were regenerated against the cp.async double-buffered kernel
+  // (gemm_bf16_kernel_db) that the CUDA public path now uses -- the pipeline
+  // shifts the optimum from the synchronous kernel's (32,64) to (16,64) for
+  // serving and back to (64,64) for warmup (see the two autotuner matrices in
+  // docs/performance/gemm-bf16/gb10.md).
+  //
+  // Serving M <= 64: (16,64) is within ~15% of the per-shape optimum on
+  // almost every K3 shape and wins most of them; the small BM keeps the block
+  // count high and BN=64 gives the async copies a full row to work on. The
+  // one outlier is 896x7168 (N <= 1024), where (16,16) is ~40% faster at 64
+  // (90us vs 126us), so it gets its own branch.
+  //
+  //   (16,16): (16/16)*(16/16)*32 = 32 threads
+  //   (16,64): (16/16)*(64/16)*32 = 128 threads
+  //   (64,64): (64/16)*(64/16)*32 = 256 threads
+  if (M <= 64) {
+    if (N <= 1024) {
+      *bm = 16;
+      *bn = 16;
+      *threads = 32;
+    } else {
+      *bm = 16;
+      *bn = 64;
+      *threads = 128;
+    }
+  } else {
+    // Warmup / prefill. The selector reports the effective (64,64) output
+    // footprint; on CUDA the kernel realises it as a 4-way M-grouped
+    // (16,64) cross-tile-B-reuse kernel (see gemm_bf16.cu). The M=8192
+    // autotuner measured that form faster than the flat (64,64) cp.async
+    // tile on every K3 shape -- 2-6% on the large-K shapes and 26-52% on
+    // the small-K ones (K = 128..1536, where B reuse dominates).
+    *bm = 64;
+    *bn = 64;
+    *threads = 256;
+  }
+#else
+  // --- AMD (MI300A / gfx942) and host-only builds -------------------------
+  // N is bounds-checked per tile inside the kernel; the K3 shapes are all
+  // multiples of 16 (N) and 64 (K), so no config needs to pad K or pick a
+  // BN that divides N.
+  (void)N;
+  (void)K;
   if (M <= 64) {
     // Serving / decode: tiny M, memory-bound, and the block count comes
     // almost entirely from the N-tiles.  A small BN (=> more blocks) is what
@@ -89,6 +137,7 @@ void gemm_bf16_config_for(std::size_t M, std::size_t N, std::size_t K,
     *bn = 64;
     *threads = 256;  // 4 wavefronts (one per 16-row fragment)
   }
+#endif
 }
 
 }  // namespace vkernels::kernels

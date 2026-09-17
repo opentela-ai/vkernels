@@ -110,17 +110,27 @@ void gemm_bf16_cpu(std::size_t M, std::size_t N, std::size_t K, float alpha,
 ```
 
 `gemm_bf16_config_for(M, N, K, &bm, &bn, &bk, &threads)` picks the launch
-tile. Both shapes are bf16-memory-bound at serving `M ≤ 64` and
-bf16-compute-bound at warmup `M > 64`; `BK` is fixed at 64. The serving
-`BN = 16` (not `64`) is **measured**: the on-device autotuner found
-`(16,16)` beats `(16,64)` by 1.4–2.9× on every serving shape because it
-launches `⌈N/16⌉ × ⌈M/16⌉` blocks (e.g. 1572 at `M=64, N=6288`) and
-saturates the 228 CUs, whereas `BN = 64` launches only 396.
+tile. It is **per-arch**: the table below covers the MI300A/HIP branch (and
+the host-only build) plus the GB10/CUDA branch, which returns `(16,64)` at
+serving `M ≤ 64` (`(16,16)` for `N ≤ 1024`) and `(64,64)` at warmup on the
+cp.async double-buffered kernel (4.1× on the QKV `M=64` shape — see
+`docs/performance/gemm-bf16/gb10.md`). The CUDA warmup path realises the
+`(64,64)` footprint as a 4-way M-grouped `(16,64,RM4)` cross-tile B-reuse
+kernel (2–52% over the flat cp.async tile, largest on the small-`K`
+shapes); CUDA serving additionally has the cp.async pipeline.
+Both shapes are bf16-memory-bound at serving `M ≤ 64` and bf16-compute-bound
+at warmup `M > 64`; `BK` is fixed at 64. The serving `BN = 16` (not `64`) is
+**measured on MI300A**: the on-device autotuner found `(16,16)` beats
+`(16,64)` by 1.4–2.9× on every serving shape because it launches
+`⌈N/16⌉ × ⌈M/16⌉` blocks (e.g. 1572 at `M=64, N=6288`) and saturates the
+228 CUs, whereas `BN = 64` launches only 396.
 
 | M | BM | BN | BK | threads | regime |
 |---:|---:|---:|---:|---:|---|
-| ≤ 64 | 16 | 16 | 64 | 64 | serving (one wavefront per 16-row fragment) |
-| > 64 | 64 | 64 | 64 | 256 | warmup (4 wavefronts; max B reuse) |
+| ≤ 64 (MI300A / host) | 16 | 16 | 64 | 64 | serving (one wavefront per 16-row fragment) |
+| ≤ 64 (GB10 / CUDA) | 16 | 64 | 64 | 128 | serving; `N ≤ 1024` → `(16,16,64,32)` (cp.async; see gb10.md) |
+| > 64 (MI300A / host) | 64 | 64 | 64 | 256 | warmup (4 wavefronts; max B reuse) |
+| > 64 (GB10 / CUDA) | 64 | 64 | 64 | 256 | warmup (M-grouped `(16,64,RM4)` reuse; effective 64×64 — see gb10.md) |
 
 ---
 
@@ -220,8 +230,10 @@ too):
   an independent fp32+RNE reference.
 - A bit-exact cross-check against the independent reference across the K3
   shapes (including `N = 6288`, not a multiple of 64).
-- `gemm_bf16_config_for` for both branches (`M ≤ 64` → `16×16/64`;
-  `M > 64` → `64×64/256`) and the `M == 64` boundary.
+- `gemm_bf16_config_for` for both branches (`M ≤ 64` → `16×16/64` on
+  MI300A / the host build, `16×64/128` on GB10 for `N > 1024` and
+  `16×16/32` for `N ≤ 1024`; `M > 64` → `64×64/256` on both) and the
+  `M == 64` boundary.
 - Null-argument contracts throw `std::invalid_argument`.
 - `M == 0` / `N == 0` are no-ops.
 
