@@ -542,6 +542,116 @@ def lower_gdn_conv(op: Operator, graph: OperatorGraph) -> TaskFamily:
         params={"layer": op.attributes.get("layer", 0), "conv_kernel": K, "tile": tile},
         threads=THREADS_PER_WORKER,
         scratch_bytes=tile * 4,  # fp32 accumulator for one channel tile
+# mHC hyper-connection mixing (issue #99): the data-dependent pre/post/comb
+# weights and stream collapse (pre), then the composed stream update (post).
+# One task per row (pre) / per (batch, stream) row (post) at every layer
+# boundary. The fn projection is FOLDED into the pre task rather than lowered
+# as a separate `linear` op: its [mix=(2+hc)·hc] output is consumed entirely
+# by the same task's elementwise gate/softmax/Sinkhorn chain, so a separate
+# op would only add a workspace round-trip plus a second task, while the
+# unweighted-RMSNorm rsqrt over the flattened streams must sit between the
+# stream load and the GEMV reduction anyway (floe's mhc_pre_gemm_sqrsum
+# fusion precedent). No tl.dot on device: the GEMV is a K-reduction over
+# hc·C with a tiny mix-row output, and hc² Sinkhorn is a register-resident
+# [hc, hc] chain.
+# ---------------------------------------------------------------------------
+
+
+def lower_mhc_pre(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    """One task per batch row: the task owns the row's whole [hc, C] stream
+    stack (the flat RMSNorm reduction and the fn GEMV both read the full
+    hc·C extent), computes the [mix] projection logits, the sigmoid gates,
+    the hc×hc Sinkhorn chain and the pre-weighted collapse. hc is small
+    (2–8): the entire mixing state lives in registers/scratch."""
+    streams = graph.tensor(op.inputs[0])
+    fn = graph.tensor(op.inputs[1])
+    base = graph.tensor(op.inputs[2])
+    scale = graph.tensor(op.inputs[3])
+    h_in = graph.tensor(op.outputs[0])
+    post_w = graph.tensor(op.outputs[1])
+    comb = graph.tensor(op.outputs[2])
+    B, hc, C = streams.shape
+    mix = (2 + hc) * hc
+    if fn.shape != (mix, hc * C):
+        raise ValueError(f"mhc_pre fn must be [{mix}, {hc * C}]; got {fn.shape}")
+    domain = TileDomain(((B, 1),))
+
+    def reads(coords):
+        (bb,) = coords
+        return (
+            _tile_region(streams, ((bb, bb + 1), (0, hc), (0, C))),
+            _whole(fn),
+            _whole(base),
+            _whole(scale),
+        )
+
+    def writes(coords):
+        (bb,) = coords
+        return (
+            _tile_region(h_in, ((bb, bb + 1), (0, C))),
+            _tile_region(post_w, ((bb, bb + 1), (0, hc))),
+            _tile_region(comb, ((bb, bb + 1), (0, hc), (0, hc))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_mhc_pre",
+        kind="mhc_pre",
+        op=op,
+        domain=domain,
+        inputs=(streams.name, fn.name, base.name, scale.name),
+        outputs=(h_in.name, post_w.name, comb.name),
+        params={
+            "layer": op.attributes.get("layer", 0),
+            "hc": hc,
+            "iters": op.attributes.get("iters", 1),
+            "eps": float(op.attributes.get("eps", 1e-6)),
+            "rms_eps": float(op.attributes.get("rms_eps", 1e-6)),
+        },
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=hc * C * 4,  # fp32 flattened-stream row
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_mhc_post(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    """One task per (batch, stream j): the task reads the whole stream stack
+    row (all hc sources feed stream j through comb[:, j]), the body output
+    row and this token's post/comb weights, and writes exactly stream j of
+    the fresh [B, hc, C] output stack. Narrow per-stream writes keep the
+    family's tasks independent — layer chaining is the ordinary RAW hazard
+    on the returned workspace view."""
+    streams = graph.tensor(op.inputs[0])
+    body_out = graph.tensor(op.inputs[1])
+    post_w = graph.tensor(op.inputs[2])
+    comb = graph.tensor(op.inputs[3])
+    streams_post = graph.tensor(op.outputs[0])
+    B, hc, C = streams.shape
+    domain = TileDomain(((B, 1), (hc, 1)))
+
+    def reads(coords):
+        bb, j = coords
+        return (
+            _tile_region(streams, ((bb, bb + 1), (0, hc), (0, C))),
+            _tile_region(body_out, ((bb, bb + 1), (0, C))),
+            _tile_region(post_w, ((bb, bb + 1), (j, j + 1))),
+            _tile_region(comb, ((bb, bb + 1), (0, hc), (j, j + 1))),
+        )
+
+    def writes(coords):
+        bb, j = coords
+        return (_tile_region(streams_post, ((bb, bb + 1), (j, j + 1), (0, C))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_mhc_post",
+        kind="mhc_post",
+        op=op,
+        domain=domain,
+        inputs=(streams.name, body_out.name, post_w.name, comb.name),
+        outputs=(streams_post.name,),
+        params={"layer": op.attributes.get("layer", 0), "hc": hc},
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=C * 4,  # fp32 composed stream row
         read_regions=reads,
         write_regions=writes,
     )
@@ -797,6 +907,8 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "cache_append": lower_cache_append,
     "gdn_conv": lower_gdn_conv,
     "cache_append_paged": lower_cache_append_paged,
+    "mhc_pre": lower_mhc_pre,
+    "mhc_post": lower_mhc_post,
     "attention_scores": lower_attention_scores,
     "attention_scores_paged": lower_attention_scores_paged,
     "softmax": lower_softmax,
