@@ -697,62 +697,6 @@ def lower_cache_append_paged(op: Operator, graph: OperatorGraph) -> TaskFamily:
         outputs=(),
         params={"layer": op.attributes.get("layer", 0), "position": p},
         threads=THREADS_PER_WORKER,
-# Lightning-indexer (issue #97): fused ReLU scoring over the compressed
-# entries + per-head mix, then the fixed-count top-k selection.
-#
-# indexer_scores: one task per (batch, entry tile). Each task streams the
-# row's full indexer query block [H, D] against its entry tile and reduces
-# the head mix in registers — H is the small indexer head count (e.g. 4),
-# so per-task reads stay bounded and no cross-task reduction is needed.
-#
-# index_topk: one task per batch row (M <= ~1k candidates fit in one
-# block's sweep). The device template computes ranks by comparison
-# counting (rank(j) = #{valid i : s_i > s_j} + #{valid i < j : s_i == s_j}),
-# which yields the slot positions directly and tie-breaks to the lowest
-# candidate index with no shared-memory sort.
-# ---------------------------------------------------------------------------
-
-INDEXER_TILE_M = 64  # compressed-entry candidates per indexer_scores task
-
-
-def lower_indexer_scores(op: Operator, graph: OperatorGraph) -> TaskFamily:
-    q, c, w = (graph.tensor(op.inputs[i]) for i in range(3))
-    s = graph.tensor(op.outputs[0])
-    b, h, d = q.shape
-    m = c.shape[1]
-    if op.attributes.get("activation") != "relu":
-        raise ValueError(f"indexer_scores {op.source_location!r}: unsupported activation {op.attributes.get('activation')!r}")
-    if not c.is_contiguous():
-        raise ValueError(f"indexer_scores {op.source_location!r}: entries must be row-major contiguous")
-    domain = TileDomain(((b, 1), (m, INDEXER_TILE_M)))
-
-    def reads(coords):
-        bi, t = coords
-        m0 = t * INDEXER_TILE_M
-        m1 = min(m0 + INDEXER_TILE_M, m)
-        return (
-            _tile_region(q, ((bi, bi + 1), (0, h), (0, d))),
-            _tile_region(c, ((bi, bi + 1), (m0, m1), (0, d))),
-            _tile_region(w, ((bi, bi + 1), (0, h))),
-        )
-
-    def writes(coords):
-        bi, t = coords
-        m0 = t * INDEXER_TILE_M
-        m1 = min(m0 + INDEXER_TILE_M, m)
-        return (_tile_region(s, ((bi, bi + 1), (m0, m1))),)
-
-    return TaskFamily(
-        family_id=f"ph{op.opid:02d}_indexer_scores",
-        kind="indexer_scores",
-        op=op,
-        domain=domain,
-        inputs=(q.name, c.name, w.name),
-        outputs=(s.name,),
-        params={"heads": h, "head_dim": d, "capacity": m, "scale": op.attributes["scale"], "tile_m": INDEXER_TILE_M},
-        threads=THREADS_PER_WORKER,
-        # In-register staging: one entry tile [TILE_M, D] + one query row [D] (f32).
-        scratch_bytes=(INDEXER_TILE_M + 1) * d * 4,
         read_regions=reads,
         write_regions=writes,
     )
@@ -831,6 +775,77 @@ def lower_attention_values_paged(op: Operator, graph: OperatorGraph) -> TaskFami
         params={"layer": op.attributes.get("layer", 0), "position": p, "kv_heads": kvh, "group": group},
         threads=THREADS_PER_WORKER,
         scratch_bytes=D * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Registry (§3.1)
+# ---------------------------------------------------------------------------
+
+
+# Lightning-indexer (issue #97): fused ReLU scoring over the compressed
+# entries + per-head mix, then the fixed-count top-k selection.
+#
+# indexer_scores: one task per (batch, entry tile). Each task streams the
+# row's full indexer query block [H, D] against its entry tile and reduces
+# the head mix in registers — H is the small indexer head count (e.g. 4),
+# so per-task reads stay bounded and no cross-task reduction is needed.
+#
+# index_topk: one task per batch row (M <= ~1k candidates fit in one
+# block's sweep). The device template computes ranks by comparison
+# counting (rank(j) = #{valid i : s_i > s_j} + #{valid i < j : s_i == s_j}),
+# which yields the slot positions directly and tie-breaks to the lowest
+# candidate index with no shared-memory sort.
+# ---------------------------------------------------------------------------
+
+INDEXER_TILE_M = 64  # compressed-entry candidates per indexer_scores task
+
+
+def lower_indexer_scores(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    q, c, w = (graph.tensor(op.inputs[i]) for i in range(3))
+    s = graph.tensor(op.outputs[0])
+    b, h, d = q.shape
+    m = c.shape[1]
+    if op.attributes.get("activation") != "relu":
+        raise ValueError(f"indexer_scores {op.source_location!r}: unsupported activation {op.attributes.get('activation')!r}")
+    if not c.is_contiguous():
+        raise ValueError(f"indexer_scores {op.source_location!r}: entries must be row-major contiguous")
+    domain = TileDomain(((b, 1), (m, INDEXER_TILE_M)))
+
+    def reads(coords):
+        bi, t = coords
+        m0 = t * INDEXER_TILE_M
+        m1 = min(m0 + INDEXER_TILE_M, m)
+        return (
+            _tile_region(q, ((bi, bi + 1), (0, h), (0, d))),
+            _tile_region(c, ((bi, bi + 1), (m0, m1), (0, d))),
+            _tile_region(w, ((bi, bi + 1), (0, h))),
+        )
+
+    def writes(coords):
+        bi, t = coords
+        m0 = t * INDEXER_TILE_M
+        m1 = min(m0 + INDEXER_TILE_M, m)
+        return (_tile_region(s, ((bi, bi + 1), (m0, m1))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_indexer_scores",
+        kind="indexer_scores",
+        op=op,
+        domain=domain,
+        inputs=(q.name, c.name, w.name),
+        outputs=(s.name,),
+        params={"heads": h, "head_dim": d, "capacity": m, "scale": op.attributes["scale"], "tile_m": INDEXER_TILE_M},
+        threads=THREADS_PER_WORKER,
+        # In-register staging: one entry tile [TILE_M, D] + one query row [D] (f32).
+        scratch_bytes=(INDEXER_TILE_M + 1) * d * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
 def lower_index_topk(op: Operator, graph: OperatorGraph) -> TaskFamily:
     s, valid = graph.tensor(op.inputs[0]), graph.tensor(op.inputs[1])
     idx, bias = graph.tensor(op.outputs[0]), graph.tensor(op.outputs[1])
@@ -875,11 +890,10 @@ def lower_index_topk(op: Operator, graph: OperatorGraph) -> TaskFamily:
 # Registry (§3.1)
 # ---------------------------------------------------------------------------
 
+
 LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "linear": lower_linear,
     "linear_fp8": lower_linear_fp8,
-    "indexer_scores": lower_indexer_scores,
-    "index_topk": lower_index_topk,
     "layer_norm": lower_layer_norm,
     "rms_norm": lower_rms_norm,
     "rope": lower_rope,
@@ -895,6 +909,8 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "softmax": lower_softmax,
     "attention_values": lower_attention_values,
     "attention_values_paged": lower_attention_values_paged,
+    "indexer_scores": lower_indexer_scores,
+    "index_topk": lower_index_topk,
 }
 
 LOWERINGS_VERSION = "0.1.0"
