@@ -146,6 +146,9 @@ class ReferenceExecutor:
             "attention_values": self._body_attention_values,
             "gemv_fp8": self._body_gemv_fp8,
             "attention_values_paged": self._body_attention_values_paged,
+            "moe_route": self._body_moe_route,
+            "moe_expert": self._body_moe_expert,
+            "moe_combine": self._body_moe_combine,
         }
         self._barrier_state = None
 
@@ -443,6 +446,110 @@ class ReferenceExecutor:
         scale = fam.params["scale"]
         # Masked load: only rows [0, p] are read (§5.3); the tail is never touched.
         y[b, h, : p + 1] = (k_cache[b, kvh, : p + 1, :] @ q[b, h, :] * scale).astype(y.dtype)
+
+    # ------------------------------------------------------------------
+    # MoE decode reference bodies (issue #98)
+    # ------------------------------------------------------------------
+
+    def _moe_scores(self, logits: np.ndarray, fam: TaskFamily) -> np.ndarray:
+        """Router scores, fp64 standing in for the fp32 device math."""
+        if fam.params["score_fn"] == "sigmoid_noaux_tc":
+            # Stable sigmoid: no overflow for large |logit|.
+            return 1.0 / (1.0 + np.exp(-np.logaddexp(0.0, -logits)))
+        # sqrtsoftplus (DeepSeek-V4): sqrt(softplus(l)), stable softplus.
+        return np.sqrt(np.logaddexp(0.0, logits))
+
+    @staticmethod
+    def _moe_topk_stable(choice: np.ndarray, k: int) -> np.ndarray:
+        """Top-k with the documented determinism contract: stable descending
+        order, ties to the lower expert index (sorted=False set semantics)."""
+        order = np.argsort(-choice, kind="stable")
+        return order[:k]
+
+    def _body_moe_route(self, fam: TaskFamily, coords, scalars) -> None:
+        """Router decode step (issue #98), fp64 oracle of the fp32 device math.
+
+        Learned noaux_tc (GLM-5.3): biased choice scores restricted to the
+        top-2-sum groups, top-k over masked scores, weights from the UNBIASED
+        scores. Learned sqrtsoftplus (DeepSeek-V4): global top-k. Hash: frozen
+        ``tid2eid[token_id]`` gather. Renorm ``w/(Σw+1e-20)`` (unconditional
+        for sqrtsoftplus/hash; gated on norm_topk_prob for noaux_tc), then ×
+        routed_scaling_factor.
+        """
+        x = self.tensor(fam.inputs[0]).astype(np.float64)
+        router_w = self.tensor(fam.inputs[1]).astype(np.float64)
+        ids = self.tensor(fam.inputs[2])
+        weights = self.tensor(fam.inputs[3])
+        r = coords[0]
+        k = int(fam.params["top_k"])
+        rsf = float(fam.params["routed_scaling_factor"])
+        logits = router_w @ x[r]
+        scores = self._moe_scores(logits, fam)
+        if fam.params["mode"] == "hash":
+            tid2eid = self.tensor(fam.inputs[4])
+            token_ids = self.tensor(fam.inputs[5])
+            sel = tid2eid[int(token_ids[r]), :].astype(np.int64)
+            w = scores[sel]
+            w = w / (w.sum() + 1e-20)
+        else:
+            choice = scores.copy()
+            if fam.params.get("routed_bias"):
+                choice = choice + self.tensor(fam.inputs[4]).astype(np.float64)
+            if fam.params["score_fn"] == "sigmoid_noaux_tc" and int(fam.params["n_group"]) > 1:
+                n_group = int(fam.params["n_group"])
+                topk_group = int(fam.params["topk_group"])
+                e = choice.shape[0]
+                groups = choice.reshape(n_group, e // n_group)
+                # Top-2 sum per group (stable descending; ties to lower index).
+                top2 = np.sort(groups, axis=1, kind="stable")[:, ::-1][:, :2]
+                group_scores = top2.sum(axis=1)
+                g_order = self._moe_topk_stable(group_scores, topk_group)
+                mask = np.full(e, -np.inf)
+                for g in g_order:
+                    mask[g * (e // n_group) : (g + 1) * (e // n_group)] = 0.0
+                choice = choice + mask
+            sel = self._moe_topk_stable(choice, k)
+            w = scores[sel]  # unbiased scores (floe semantics)
+            if fam.params.get("norm_topk_prob", False):
+                w = w / (w.sum() + 1e-20)
+        ids[r, :] = sel.astype(ids.dtype)
+        weights[r, :] = (w * rsf).astype(weights.dtype)
+
+    def _body_moe_expert(self, fam: TaskFamily, coords, scalars) -> None:
+        """One (row, slot) expert FFN task (issue #98): runtime-indirected
+        weight base ``e = ids[b, slot]`` (#94 pattern), swiglu_limit clamp
+        folded into the activation, fp64 oracle of the fp32 device math."""
+        x = self.tensor(fam.inputs[0]).astype(np.float64)
+        gate_up = self.tensor(fam.inputs[1]).astype(np.float64)
+        down = self.tensor(fam.inputs[2]).astype(np.float64)
+        ids = self.tensor(fam.inputs[3])
+        partials = self.tensor(fam.outputs[0])
+        r, s = coords
+        e = int(ids[r, s])
+        gu = gate_up[e] @ x[r]
+        inter = gu.shape[0] // 2
+        g, u = gu[:inter], gu[inter:]
+        limit = fam.params.get("swiglu_limit")
+        if limit is not None:
+            g = np.minimum(g, float(limit))
+            u = np.clip(u, -float(limit), float(limit))
+        act = g / (1.0 + np.exp(-np.logaddexp(0.0, -g))) * u  # silu(g) · u
+        partials[r, s, :] = (down[e] @ act).astype(partials.dtype)
+
+    def _body_moe_combine(self, fam: TaskFamily, coords, scalars) -> None:
+        """Weighted scatter-add per row (issue #98): Σ_k w_k·h_k in slot order
+        (+ the dense shared-expert path when recorded), fp64 accumulate."""
+        partials = self.tensor(fam.inputs[0]).astype(np.float64)
+        weights = self.tensor(fam.inputs[1]).astype(np.float64)
+        y = self.tensor(fam.outputs[0])
+        r = coords[0]
+        k = partials.shape[1]
+        acc = np.zeros(partials.shape[2], dtype=np.float64)
+        for s in range(k):  # documented contract: accumulate in slot order
+            acc += weights[r, s] * partials[r, s]
+        if len(fam.inputs) > 2:
+            acc = acc + self.tensor(fam.inputs[2]).astype(np.float64)[r]
+        y[r, :] = acc.astype(y.dtype)
 
     def _body_softmax(self, fam: TaskFamily, coords, scalars) -> None:
         x = self.tensor(fam.inputs[0]).astype(np.float64)

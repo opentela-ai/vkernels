@@ -47,6 +47,9 @@ __all__ = ["emit_megakernel_source", "TEMPLATE_NAMES"]
 TEMPLATE_NAMES = {
     "gemm": "linear_task",
     "gemv_fp8": "linear_fp8_task",  # fp8-blockwise GEMV (issue #91)
+    "moe_route": "moe_route_task",  # MoE decode ops (issue #98)
+    "moe_expert": "moe_expert_task",
+    "moe_combine": "moe_combine_task",
     "layernorm": "layernorm_task",
     "rms_norm": "rms_norm_task",
     "rope": "rope_task",
