@@ -733,13 +733,177 @@ __global__ void dsa_topk_logits_kernel_mfma(
   }
 }
 
-// Dispatch shim shared by dsa_topk_logits (auto) and
+// ---------------------------------------------------------------------------
+// fp8-MFMA variant (issue #81, "tiled-key / MFMA-fp8 prefetch"). The bf16
+// MFMA variant above still stages every K-tile through LDS (sK[B][kBK]
+// reloaded + __syncthreads per K-tile) and every Q through a transposed
+// bf16 sQt[D][H], because the bf16 16x16x16 fragment carries fp8 values
+// only after an fp8->fp32->bf16 conversion. gfx942's Matrix Core consumes
+// fp8 e4m3fnuz DIRECTLY: __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8
+// reduces K=32 per instruction -- 2x fewer MFMAs per D than the bf16
+// variant -- and its A/B fragments are 8 BYTES per lane, so the fragment
+// IS one 8-byte global load of raw cache bytes. That removes the ENTIRE
+// staging path: no sQt transform, no sK tile, no LDS round-trips, no
+// __syncthreads on the hot loop. Shared memory collapses to the per-head
+// gate alone (H*4 bytes -- 256 B at H=64 vs the bf16 variant's 25,088 B;
+// the per-token scales are read straight from each page tail as ONE 16B
+// load per lane -- j = row_base+kq*4 .. +3 is contiguous), so the 64 KB
+// cap is a non-constraint and shapes the other variants refuse (H=128 at
+// D=192) are admitted.
+//
+// Fragment layouts (empirically decoded on gfx942, issue #81 probe
+// record; confirmed end-to-end by test_dsa_topk_correct.hip variant 4):
+//   A/B fragments: lane l byte j = X[l & 15][(l >> 4) * 8 + j]
+//   C fragment:    c[i] = C[4 * (l >> 4) + i][l & 15]
+// i.e. the SAME C-fragment geometry as the bf16 16x16x16 instruction, so
+// the gated epilogue below is byte-identical to the bf16 variant's.
+// The 4-operand inline-asm form of this instruction assembles with
+// garbage cbsz/blgp modifier defaults on ROCm 6.3 (silently scrambled
+// operand semantics -- the probe record), so the 7-operand builtin with
+// explicit zeros is REQUIRED.
+//
+// Numerics: fp8 e4m3fnuz products have an 8-bit significand, exact in
+// fp32; the instruction accumulates its K=32 reduction in fp32 and the
+// per-page dots are fp32-added over D/32 chunk results -- the same
+// residual class as the bf16 variant (fp32 reassociation only), within
+// the 1e-3 cross-check. The 0x7F/0xFF NaN byte encodings never occur in
+// real cache data and the harness excludes them.
+//
+// Per wavefront w (one per 16 KV tokens), per page, per head fragment nf:
+// D/32 MFMAs, each with two independent 8-byte loads (K from the page,
+// Q from the per-batch tile -- the SAME Q addresses every page, L1/L2
+// resident after the first). The loads are independent of the MFMA chain,
+// so the compiler issues the next page's/chunk's loads while MFMAs are in
+// flight (the "prefetch" of the issue title -- measured, not assumed:
+// see docs/performance/dsa-topk/gfx942.md).
+__global__ void dsa_topk_logits_kernel_mfma_fp8(
+    const uint8_t* __restrict__ q_fp8,
+    const uint8_t* __restrict__ kvcache_u8,
+    const float* __restrict__ weight,
+    const int32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ page_table,
+    float* __restrict__ out,
+    int H, int D, int B, int max_table_len, int max_seq_len, int split_kv) {
+  const int kNF    = H / 16;           // column / head fragments
+  const int kWarps = B / 16;           // one wavefront per 16-row fragment
+  const int kTh    = kWarps * 64;      // threads per block (= B*4)
+
+  const int b = blockIdx.x;
+  const int pid_split = blockIdx.y;
+  const int tid  = threadIdx.x;        // 0..kTh-1
+  const int warp = tid >> 6;           // 0..kWarps-1
+  const int lane = tid & 63;           // in-wavefront lane
+  const int m    = lane & 15;          // row within the 16-row fragment
+  const int kq   = lane >> 4;          // 0..3 -> which 8-K byte chunk
+  const int row_base = warp * 16;      // this warp's 16-row fragment (j)
+
+  const int seq_len = seq_lens[b];
+  const int np_total = (seq_len + B - 1) / B;  // pages with content
+  const int stride = (np_total + split_kv - 1) / split_kv;
+  const int i_start = pid_split * stride;
+  const int rem = np_total - i_start;
+  const int n_iters = (rem <= 0) ? 0 : (stride < rem ? stride : rem);
+  if (n_iters <= 0) return;
+
+  extern __shared__ float smem[];
+  float* sGate = smem;                 // H (written once per block)
+
+  const float* gp = weight + (size_t)b * H;
+  for (int h = tid; h < H; h += kTh) sGate[h] = gp[h];
+  __syncthreads();
+
+  const uint8_t* qp = q_fp8 + (size_t)b * H * D;
+  const int kt_n = D >> 5;             // D/32 fp8 MFMAs per page per fragment
+
+  // Accumulators for [0, kNF) fragments. kMaxNF = 8 covers every admitted
+  // shape (fits_lds_mfma_fp8 requires H <= 128); the predicated full unroll
+  // keeps every acc[nf] index compile-time so the accumulators stay in
+  // register (a runtime-bound loop here would spill them to scratch).
+  constexpr int kMaxNF = 8;
+  v4f acc[kMaxNF];
+
+  // Per-page scale slot: the 4 token scales THIS lane's accumulator rows
+  // need (j = row_base + kq*4 .. +3 -- contiguous, 16B-aligned because
+  // B*D is a multiple of 32 and each j-group starts at a multiple of 4).
+  // Read straight from the page tail -- NO sKscale staging, so the page
+  // loop runs with ZERO barriers (the bf16 variant needs one per K-tile).
+  const int j0 = row_base + kq * 4;
+
+  // One-entry-deep page-table prefetch: the page POINTER of page pg+1 is
+  // loaded while page pg computes, collapsing the serial
+  // table->kbase->K-load dependency chain to one L2 hop per page.
+  int32_t page = page_table[(size_t)b * max_table_len + i_start];
+
+  for (int it = 0; it < n_iters; ++it) {
+    const int pg = i_start + it;
+    // Issue next page's table load NOW -- it is independent of everything
+    // below, so it flies during this page's MFMA chain.
+    int32_t page_next = 0;
+    if (it + 1 < n_iters)
+      page_next = page_table[(size_t)b * max_table_len + pg + 1];
+    const uint8_t* kbase = kvcache_u8 + (size_t)page * (B * (D + 4));
+    // This lane's 4 token scales: j = row_base + kq*4 .. +3, contiguous and
+    // 16B-aligned (B*D is a multiple of 32). Read straight from the page
+    // tail -- no sKscale staging, so the page loop runs with ZERO barriers.
+    const v4f kscale4 = *reinterpret_cast<const v4f*>(kbase + B * D +
+                                                      (size_t)j0 * 4);
+
+    #pragma unroll
+    for (int nf = 0; nf < kMaxNF; ++nf) acc[nf] = (v4f){0.0f, 0.0f, 0.0f, 0.0f};
+
+    // --- the whole page's [16 tokens] x [H heads] dot matrix: kt_n x kNF
+    // MFMAs, no LDS, no barriers. The A fragment (K, the M side) is this
+    // lane's 8 bytes of token row row_base+m at D-offset t*32+kq*8; the B
+    // fragment (Q, the N side) is head nf*16+m at the SAME offset, so the
+    // two loads share their address form. acc[nf][i] accumulates
+    // dot[j = row_base + kq*4 + i, h = nf*16 + m].
+    for (int t = 0; t < kt_n; ++t) {
+      const size_t doff = (size_t)t * 32 + (size_t)kq * 8;
+      long a;
+      __builtin_memcpy(&a, kbase + (size_t)(row_base + m) * D + doff, 8);
+      #pragma unroll
+      for (int nf = 0; nf < kMaxNF; ++nf) {
+        if (nf < kNF) {
+          long bq;
+          __builtin_memcpy(&bq, qp + (size_t)(nf * 16 + m) * D + doff, 8);
+          acc[nf] = __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(
+              a, bq, acc[nf], 0, 0, 0);
+        }
+      }
+    }
+
+    // --- per-token gated reduce (fp32) + k_scale, then write -- identical
+    // geometry to the bf16-MFMA variant (same C fragment).
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      float partial = 0.0f;
+      #pragma unroll
+      for (int nf = 0; nf < kMaxNF; ++nf) {
+        if (nf < kNF) {
+          float d = acc[nf][i];
+          if (d < 0.0f) d = 0.0f;             // ReLU (max(0, raw))
+          partial += sGate[nf * 16 + m] * d;
+        }
+      }
+      for (int off = 1; off < 16; off <<= 1)
+        partial += __shfl_xor(partial, off);
+      if ((tid & 15) == 0) {
+        const int j = j0 + i;               // == row_base + kq*4 + i
+        const int tk = pg * B + j;
+        if (tk < seq_len)
+          out[(size_t)b * max_seq_len + tk] = kscale4[i] * partial;
+      }
+    }
+    page = page_next;
+  }
+}
+
 // dsa_topk_logits_with_variant (explicit). `variant`: 0 = auto
-// (mfma -> fp32q -> fp8q -> refuse); 1 = fp32-Q; 2 = fp8-Q; 3 = mfma.
-// An explicit variant that does NOT fit its LDS cap is refused with a
-// stderr diagnostic + no-op (the caller zeroed `out`, which is what
-// stays) rather than launch a block gfx942's driver would drop -- mirrors
-// the auto path's contract.
+// (mfma-fp8 -> mfma -> fp32q -> fp8q -> refuse); 1 = fp32-Q; 2 = fp8-Q;
+// 3 = mfma; 4 = mfma-fp8. An explicit variant that does NOT fit its LDS
+// cap is refused with a stderr diagnostic + no-op (the caller zeroed
+// `out`, which is what stays) rather than launch a block gfx942's driver
+// would drop -- mirrors the auto path's contract.
 namespace {
 void dsa_topk_logits_dispatch(int batch_size, int num_heads, int head_dim,
                               int block, int max_table_len, int max_seq_len,
@@ -758,6 +922,27 @@ void dsa_topk_logits_dispatch(int batch_size, int num_heads, int head_dim,
   const bool want_mfma  = (variant == 3) || (variant == 0);
   const bool want_fp32q = (variant == 1) || (variant == 0);
   const bool want_fp8q  = (variant == 2) || (variant == 0);
+  const bool want_mfma8 = (variant == 4) || (variant == 0);
+
+  // FASTEST path: the fp8-MFMA kernel (issue #81) -- raw-fp8 fragments
+  // straight from global (no staging, no barriers, K=32 per instruction).
+  // Admits every bf16-MFMA shape (D%64 => D%32) plus more (H=128 at
+  // D=192), and is picked FIRST by auto. See
+  // dsa.hpp::dsa_topk_logits_fits_lds_mfma_fp8.
+  if (want_mfma8 && dsa_topk_logits_fits_lds_mfma_fp8(num_heads, head_dim,
+                                                      block)) {
+    const int shmem = num_heads * (int)sizeof(float);  // sGate only
+    dim3 blockdim((block / 16) * 64);
+    dsa_topk_logits_kernel_mfma_fp8<<<grid, blockdim, shmem, 0>>>(
+        reinterpret_cast<const uint8_t*>(q_fp8),
+        reinterpret_cast<const uint8_t*>(kvcache_u8),
+        reinterpret_cast<const float*>(weight),
+        reinterpret_cast<const int32_t*>(seq_lens),
+        reinterpret_cast<const int32_t*>(page_table),
+        reinterpret_cast<float*>(out),
+        num_heads, head_dim, block, max_table_len, max_seq_len, split_kv);
+    return;
+  }
 
   // Fast path: the bf16-MFMA kernel (smallest footprint, Matrix-Core).
   // Shapes need H%16==0, D%64==0, B%16==0 (the verified 16x16x16bf16_1k
@@ -823,9 +1008,10 @@ void dsa_topk_logits_dispatch(int batch_size, int num_heads, int head_dim,
   // (logged, not a silent wrong all-zero top-k).
   std::fprintf(stderr,
       "vk_hip_dsa_topk_logits: indexer (H=%d D=%d B=%d) exceeds gfx942's 64 KB "
-      "non-optin dynamic-LDS cap under ALL of mfma (%d B), fp32-Q (%d B) and "
-      "fp8-Q (%d B). Refusing (output left as the caller provided). See "
-      "dsa.hpp::dsa_topk_logits_fits_lds{,_fp8q,_mfma}.\n",
+      "non-optin dynamic-LDS cap under ALL of mfma-fp8 (needs H%%16==0, H<=128, "
+      "D%%32==0, B%%16==0, B<=256), mfma (%d B), fp32-Q (%d B) and fp8-Q (%d B). "
+      "Refusing (output left as the caller provided). See "
+      "dsa.hpp::dsa_topk_logits_fits_lds{,_fp8q,_mfma,_mfma_fp8}.\n",
       num_heads, head_dim, block,
       (head_dim * num_heads + block * kBK) * 2 + (num_heads + block) * 4,
       (num_heads * head_dim + num_heads + block * head_dim + block) * 4,
@@ -840,10 +1026,12 @@ void dsa_topk_logits_with_variant(int batch_size, int num_heads, int head_dim,
                                   const void* weight, const void* seq_lens,
                                   const void* page_table, void* out,
                                   int variant) {
-  if (variant != 0 && variant != 1 && variant != 2 && variant != 3) {
+  if (variant != 0 && variant != 1 && variant != 2 && variant != 3 &&
+      variant != 4) {
     std::fprintf(stderr,
         "vk_hip_dsa_topk_logits_with_variant: bad variant=%d "
-        "(want 0=auto, 1=fp32q, 2=fp8q, 3=mfma). Refusing.\n", variant);
+        "(want 0=auto, 1=fp32q, 2=fp8q, 3=mfma, 4=mfma-fp8). Refusing.\n",
+        variant);
     return;
   }
   dsa_topk_logits_dispatch(batch_size, num_heads, head_dim, block,
