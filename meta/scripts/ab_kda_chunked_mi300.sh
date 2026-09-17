@@ -17,9 +17,12 @@
 #      nonzero-initial-state contract vs the cooperative kernel. Expect
 #      PASS (max_rel ~1e-5..1e-3 << 2e-2).
 #   3. A/B  kda_chunked_bench: committed cooperative per-token kernel vs
-#      chunked WY, same inputs/events, H sweep at S=512 D=128 + long-S
-#      (1024, 2048). One short-lived process per shape (MI300A per-context
-#      fault workaround).
+#      chunked WY, same inputs/events. One short-lived process per shape
+#      (MI300A per-context fault workaround). Each shape prints two tagged
+#      roofline rows (issue #83, the same columns as bench_kda: us(min/med),
+#      TFLOP/s, GB/s, AI, bound) for coop + chunked plus a speedup line:
+#      the K3-shape table (bench_kda.sh's six (H,S,D) configs) and the
+#      H sweep at S=512 D=128 + long-S (1024, 2048).
 #
 # The math was CPU-verified first (tests/kernels/attn/test_kda_k3_chunked.cpp,
 # k3_wy_chunked_fwd vs oracle <=1e-6 incl. S=512 D=128 cs=64); this runner
@@ -66,14 +69,20 @@ for cfg in "1 512 128" "128 512 128" "32 2048 128"; do
   "$B/meta/benchmarks/kda_chunked_bench" phases "$1" "$2" "$3" 2>/dev/null \
     | grep '^phases' || echo "phases H=$1 S=$2 D=$3 (failed)"
 done
-echo "--- full A/B table ---"
+echo "--- A/B at the K3 shapes (bench_kda table set, roofline columns) ---"
+for cfg in "16 64 64" "1 64 16" "1 64 32" "1 64 64" "1 512 64" "1 512 128"; do
+  set -- $cfg
+  "$B/meta/benchmarks/kda_chunked_bench" "$1" "$2" "$3" 2>/dev/null \
+    | grep '^ab ' || echo "ab failed H=$1 S=$2 D=$3"
+done
+echo "--- full A/B table (H sweep at S=512 D=128 + long-S) ---"
 for H in 1 8 16 32 64 128; do
   "$B/meta/benchmarks/kda_chunked_bench" "$H" 512 128 2>/dev/null \
-    | grep '^H=' || echo "H=$H S=512 D=128 coop=? chunked=? (run failed)"
+    | grep '^ab ' || echo "ab failed H=$H S=512 D=128"
 done
 for S in 1024 2048; do
   "$B/meta/benchmarks/kda_chunked_bench" 32 "$S" 128 2>/dev/null \
-    | grep '^H=' || echo "H=32 S=$S D=128 coop=? chunked=? (run failed)"
+    | grep '^ab ' || echo "ab failed H=32 S=$S D=128"
 done
 
 echo

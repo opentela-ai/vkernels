@@ -1,0 +1,127 @@
+-- vkernels: nvcc not found; building host-only (CPU reference) path.
+-- vkernels: NCCL not searched (CUDA not enabled)
+-- vkernels: HIP enabled (archs=gfx942)
+-- RCCL (rccl.h / librccl) not found; building the comm layer without the HIP/RCCL transport (issue #19). (missing: VKERNELS_RCCL_LIBRARY VKERNELS_RCCL_INCLUDE_DIR) 
+-- vkernels: RCCL not found; HIP/RCCL transport disabled (host reference still builds)
+-- libfabric (rdma/fabric.h / libfabric) not found; the OFI/CXI net plugin will not be built (issue #19). (missing: VKERNELS_OFI_LIBRARY VKERNELS_OFI_INCLUDE_DIR) 
+-- vkernels: libfabric/OFI not found; OFI/CXI net plugin disabled
+-- vkernels/net-ofi: libfabric not found; plugin not built
+-- 
+-- ==== vkernels 0.1.0 ====
+--   C++ standard  : 17
+--   CUDA kernels  : OFF (requested ON)
+--   HIP kernels   : ON (requested ON)
+--   NCCL transport: OFF (issue #49 on-site)
+--   RCCL transport: OFF (issue #19)
+--   OFI/CXI plugin: OFF (issue #19)
+--   Tests         : ON (minitest)
+--   Benchmarks    : ON
+--   Python bindings: OFF
+--   Rust bindings  : OFF
+--   Coverage      : OFF
+--   ASan/UBSan    : OFF/OFF
+-- =================================
+-- Configuring done (0.7s)
+-- Generating done (5.3s)
+-- Build files have been written to: /capstor/scratch/cscs/xyao/vk-issue-82/build-i82
+[  4%] Building HIP object src/c/CMakeFiles/vkernels.dir/vkernels/kernels/mla.hip.o
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/mla.hip:359:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  359 |       if (w.partial_out) hipFree(w.partial_out);
+      |                          ^~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/mla.hip:367:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  367 |       if (w.partial_lse) hipFree(w.partial_lse);
+      |                          ^~~~~~~ ~~~~~~~~~~~~~
+2 warnings generated when compiling for gfx942.
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/mla.hip:359:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  359 |       if (w.partial_out) hipFree(w.partial_out);
+      |                          ^~~~~~~ ~~~~~~~~~~~~~
+/capstor/scratch/cscs/xyao/vk-issue-82/src/c/vkernels/kernels/mla.hip:367:26: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  367 |       if (w.partial_lse) hipFree(w.partial_lse);
+      |                          ^~~~~~~ ~~~~~~~~~~~~~
+2 warnings generated when compiling for host.
+[  8%] Linking HIP static library libvkernels.a
+[100%] Built target vkernels
+[ 95%] Built target vkernels
+[ 95%] Linking HIP executable test_mla_correct
+[100%] Built target test_mla_correct
+[ 95%] Built target vkernels
+[ 95%] Linking HIP executable mla_bench
+[100%] Built target mla_bench
+=============== correctness gate (test_mla_correct) ===============
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  B=1 H=1   S_q=1     max_abs=0.0000 max_rel=0.000000  PASS
+  B=1 H=1   S_q=64    max_abs=0.0000 max_rel=0.000003  PASS
+  B=1 H=16  S_q=64    max_abs=0.0000 max_rel=0.000003  PASS
+  B=1 H=1   S_q=8192  max_abs=0.0000 max_rel=0.000003  PASS
+  B=1 H=1   S_q=1    S_kv=2048  q0=2047  kv0=0    max_abs=0.0000 max_rel=0.000000  PASS
+  B=1 H=2   S_q=1    S_kv=2048  q0=2047  kv0=0    max_abs=0.0000 max_rel=0.000000  PASS
+  B=1 H=1   S_q=8    S_kv=2048  q0=2047  kv0=0    max_abs=0.0000 max_rel=0.000001  PASS
+  B=1 H=1   S_q=1    S_kv=64    q0=32    kv0=0    max_abs=0.0000 max_rel=0.000001  PASS
+  B=1 H=1   S_q=1    S_kv=64    q0=50    kv0=100  max_abs=0.0000 max_rel=0.000000  PASS
+
+PASS (0 failure(s))
+=============== acceptance numbers (mla_bench) ===============
+GPU: AMD Instinct MI300A  arch=942  bf16=1307 TFLOP/s  HBM=5300 GB/s
+
+=== hip::mla_fwd (K3: kv=512 pe=64 D_q=576) ===
+     H    S_q   S_kv   us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+     1      1   8192      63.3      66.8     0.267     533.4   0.5  mem  [BQ=1 BN=64 th=64 split=228]
+     1      1   8192    5488.1    5506.9     0.003       6.5   0.5  mem  [plain baseline, no split]
+     1     64   8192    5284.4    5289.5     0.216     107.9   2.0  mem  [BQ=4 BN=64 th=256 split=1]
+     8     64     64     213.6     217.4     0.328     174.3   1.9  mem  [BQ=4 BN=64 th=256 split=1]
+    16    512    512    3334.8    3380.8     2.700    1360.3   2.0  mem  [BQ=4 BN=64 th=256 split=1]
+   128    512    512   15827.6   15897.8     4.593    2314.3   2.0  mem  [BQ=4 BN=64 th=256 split=1]
+     1   8192   8192   57874.4   59741.2     2.444    1222.8   2.0  mem  [BQ=4 BN=64 th=256 split=1]
+  Roof: 1307 TFLOP/s bf16, 5300 GB/s HBM, ridge ~247 FLOP/B
+
+=== MLA autotuner (H=1 S_q=64 S_kv=8192): us(med) per tile ===
+  BQ\BN        8       16       32       64      128  best(BQ,BN)
+      1   5758.5   5757.4   5764.3   5755.9   5756.0
+      2   5292.2   5295.8   5290.6   5295.6   5295.1
+      4   5293.8   5291.2   5292.4   5291.7   5293.2
+      8   5822.2   5817.3   5821.8   5822.4   5820.6
+     16   5821.8   5826.8   5824.5   5822.1   5823.8
+     32   5824.6   5823.0   5822.8   5827.9   5822.2
+  best: BQ=2 BN=32  (5290.6 us)
+
+=== MLA autotuner (H=8 S_q=64 S_kv=64): us(med) per tile ===
+  BQ\BN        8       16       32       64      128  best(BQ,BN)
+      1    224.6    224.5    225.0    225.6    224.6
+      2    222.0    221.6    222.1    221.0    221.8
+      4    221.4    221.0    221.4    220.6    221.1
+      8    220.9    220.5    220.2    220.7    221.4
+     16    221.4    222.2    221.9    221.8    221.1
+     32    221.2    221.8    221.2    220.5    222.1
+  best: BQ=8 BN=32  (220.2 us)
+
+=== MLA autotuner (H=16 S_q=512 S_kv=512): us(med) per tile ===
+  BQ\BN        8       16       32       64      128  best(BQ,BN)
+      1   3588.2   3572.4   3565.3   3569.4   3567.8
+      2   3389.0   3403.6   3396.8   3399.0   3390.2
+      4   3381.1   3396.6   3385.7   3398.0   3395.7
+      8   3426.9   3426.4   3426.3   3409.7   3431.7
+     16   3419.1   3422.4   3426.0   3414.4   3427.5
+     32   3429.8   3429.3   3429.4   3431.3   3427.2
+  best: BQ=4 BN=8  (3381.1 us)
+
+=== MLA autotuner (H=128 S_q=512 S_kv=512): us(med) per tile ===
+  BQ\BN        8       16       32       64      128  best(BQ,BN)
+      1  17827.9  17839.3  17797.1  17816.4  17831.0
+      2  16953.4  16954.0  16956.8  16885.3  16908.6
+      4  16028.4  16064.5  16049.3  16009.5  16012.7
+      8  17459.2  17441.4  17439.7  17464.2  17406.2
+     16  17418.0  17453.8  17417.5  17404.0  17434.5
+     32  17429.2  17433.0  17476.9  17441.0  17438.1
+  best: BQ=4 BN=64  (16009.5 us)
+
+=== MLA autotuner (H=1 S_q=8192 S_kv=8192): us(med) per tile ===
+  BQ\BN        8       16       32       64      128  best(BQ,BN)
+      1  64209.1  64354.9  64298.0  64165.8  64170.4
+      2  61182.2  60809.0  61276.6  61048.4  60955.4
+      4  59691.4  59870.1  59592.9  59825.9  59457.0
+      8  62995.4  62426.5  62854.3  62734.9  62789.2
+     16  62692.8  62795.4  62602.5  62728.3  62829.2
+     32  62677.1  62996.1  62353.5  62547.4  63166.0
+  best: BQ=4 BN=128  (59457.0 us)
+=============== host unit tests (split-for formula) ===============
+/var/spool/slurmd/job640246/slurm_script: line 45: /capstor/scratch/cscs/xyao/vk-issue-82/build-i82/tests/vkernels_test_mla: No such file or directory
