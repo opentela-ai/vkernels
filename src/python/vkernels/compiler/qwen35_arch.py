@@ -303,13 +303,17 @@ def initial_state(config: Qwen35Config, seed: int = 1) -> Qwen35DecodeState:
     surface as NaN in the output (canary), never silently as stale data.
     """
     B, cap = config.batch, config.cache_capacity
+    rng = np.random.default_rng(1000 + seed)
     pos = np.array([min(5, cap - 1), min(2, cap - 1)], dtype=np.int32)[:B]
     if B > 2:  # deterministic extension for larger batches
         pos = np.array([min(2 * b + 1, cap - 1) for b in range(B)], dtype=np.int32)
     slot_table = np.zeros((B, cap), dtype=np.int32)
     for b in range(B):
+        # Non-identity per-row permutation (rotate by 3): the compiled graph
+        # must route every gather/append through the table — an identity
+        # table would silently pass a slot==position aliasing bug.
         for t in range(cap):
-            slot_table[b, t] = 1 + b * cap + t
+            slot_table[b, t] = 1 + b * cap + ((t + 3) % cap)
     n_gdn, n_fa = len(config.gdn_layers), len(config.fa_layers)
     conv = np.zeros((n_gdn, B, config.conv_kernel - 1, config.gdn_kv_dim))
     ssm = np.zeros((n_gdn, B, config.gdn_v_heads, config.head_v_dim, config.head_k_dim))
@@ -318,6 +322,18 @@ def initial_state(config: Qwen35Config, seed: int = 1) -> Qwen35DecodeState:
     v_pool = np.full_like(k_pool, nan)
     k_dense = np.full((n_fa, B, config.kv_heads, cap, config.head_dim), nan)
     v_dense = np.full_like(k_dense, nan)
+    # Prior-step K/V: positions [0, pos[b]) are legal history (random, seeded);
+    # position pos[b] is written by THIS step; everything beyond stays NaN —
+    # an over-gather (contract violation) leaks NaN into the output canary.
+    for b in range(B):
+        pb = int(pos[b])
+        if pb > 0:
+            for t in range(pb):
+                slot = slot_table[b, t]
+                k_pool[0, slot] = rng.standard_normal(k_pool.shape[2:]) * 0.1
+                v_pool[0, slot] = rng.standard_normal(v_pool.shape[2:]) * 0.1
+            k_dense[0, b, :, :pb, :] = rng.standard_normal((k_dense.shape[2], pb, k_dense.shape[4])) * 0.1
+            v_dense[0, b, :, :pb, :] = rng.standard_normal((v_dense.shape[2], pb, v_dense.shape[4])) * 0.1
     ids = np.array([7, 3][:B] + [ (11 * (b + 1)) % config.vocab for b in range(2, B)], dtype=np.int32)
     return Qwen35DecodeState(conv, ssm, k_pool, v_pool, k_dense, v_dense, slot_table, pos, ids)
 
@@ -403,7 +419,7 @@ def qwen35_reference_decode_step(
             # --- short conv + state shift (gdn_conv contract) ---
             sv = st.conv_state[gdn_i]  # [B, K-1, C_conv]
             full = np.concatenate([sv, qkvz_row[:, None, :]], axis=1)  # [B, K, C_conv]
-            fir = np.einsum("bk,bkc->bc", lw.conv_w.astype(np.float64), full)  # w[:, k] * full[k, :]
+            fir = np.einsum("ck,bkc->bc", lw.conv_w.astype(np.float64), full)  # out[b,c] = sum_k w[c,k]*full[b,k,c]
             conv_out = _silu(fir)
             st.conv_state[gdn_i] = full[:, 1:]  # time-major shift
             # --- views: q|k|v|z ---
