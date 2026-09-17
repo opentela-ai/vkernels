@@ -473,6 +473,17 @@ OP_CACHE_APPEND = "cache_append"
 # ordering comes from the state-storage hazards, not the decode position.
 OP_GDN_CONV = "gdn_conv"
 OP_CACHE_APPEND_PAGED = "cache_append_paged"
+# mHC hyper-connection mixing family (issue #99; floe DeepseekV4HyperConnection
+# / Glm53HyperConnection — one op family, family attributes hc/iters/eps/
+# rms_eps). `mhc_pre` computes the data-dependent pre/post/comb weights from
+# the flattened stream contents (unweighted RMSNorm + one small GEMV each
+# step) and collapses the streams into the block-body input; `mhc_post`
+# composes the sublayer output back onto the hc parallel streams with the
+# Sinkhorn-projected doubly-stochastic comb. Both are per-token (decode:
+# Sinkhorn runs per token, not at load time). Stream state is intermediate
+# workspace — a fresh [B, hc, C] buffer per layer, NOT a persistent pool.
+OP_MHC_PRE = "mhc_pre"
+OP_MHC_POST = "mhc_post"
 OP_ATTENTION_SCORES = "attention_scores"
 OP_ATTENTION_SCORES_PAGED = "attention_scores_paged"
 OP_SOFTMAX = "softmax"
@@ -492,6 +503,8 @@ ARITHMETIC_OP_KINDS = (
     OP_CACHE_APPEND,
     OP_GDN_CONV,
     OP_CACHE_APPEND_PAGED,
+    OP_MHC_PRE,
+    OP_MHC_POST,
     OP_ATTENTION_SCORES,
     OP_ATTENTION_SCORES_PAGED,
     OP_SOFTMAX,
