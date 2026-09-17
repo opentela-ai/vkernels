@@ -233,6 +233,10 @@ int main() {
       {1, 256, 16, 576, 64, 256, 64, 14},  // DSv3 decode, split=14
       {1, 2048, 64, 256, 0, 2048, 64, 3},  // full-topk decode, split=3
       {1, 128, 64, 256, 0, 128, 64, 128},  // split == topk (1 key/split)
+      // Issue #80: the double-buffered partial kernel with BQ > 1 (S_q > 8
+      // -> dsa_config_for picks bq = 4): exercises the per-warp LDS
+      // staging slices + uneven split on a multi-warp block.
+      {64, 256, 1, 256, 0, 128, 64, 7},    // short, BQ=4, uneven split
   };
 
   for (const auto& c : cfgs) {

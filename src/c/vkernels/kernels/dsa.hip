@@ -470,7 +470,11 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
     int32_t* idst = sIdx + ((sbuf_) * BQ + warp) * kti;                        \
     if (W % 8 == 0) {                                                         \
       const int rpp = W / 8; /* chunks (8 elements) per key row */            \
-      for (int ch = tid; ch < (tlen_) * rpp; ch += 64) {                      \
+      // lane-strided (NOT tid-strided): each warp stages its OWN slice,
+      // so the chunk index must restart at 0 per warp or slices of warps
+      // w > 0 would leave their first 64*w chunks unstaged (issue #80
+      // audit fix; invisible at BQ == 1, wrong for prefill S_q > 8).
+      for (int ch = lane; ch < (tlen_) * rpp; ch += 64) {                     \
         const int r = ch / rpp;                                               \
         const int c = (ch - r * rpp) * 8;                                     \
         const int32_t kv_idx = idx_i[(tb_) + r];                              \
@@ -482,7 +486,7 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
         *reinterpret_cast<uint2*>(sdst + (size_t)r * W + c) = v;              \
       }                                                                       \
     } else {                                                                  \
-      for (int e = tid; e < (tlen_) * W; e += 64) {                           \
+      for (int e = lane; e < (tlen_) * W; e += 64) {                          \
         const int r = e / W;                                                  \
         const int c = e - r * W;                                              \
         const int32_t kv_idx = idx_i[(tb_) + r];                              \
