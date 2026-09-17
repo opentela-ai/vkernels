@@ -462,7 +462,11 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
   // Issue the global loads for key tile [tb, tb + tlen) into staging
   // buffer `sbuf`, then a warp barrier. Written as a code block (repeated
   // for the prologue tile and the in-loop prefetch) to keep device-lambda
-  // support assumptions out of the picture.
+  // support assumptions out of the picture. Staging is lane-strided (NOT
+  // tid-strided): each warp stages its OWN slice, so the chunk index must
+  // restart at 0 per warp or slices of warps w > 0 would leave their first
+  // 64*w chunks unstaged (issue #80 audit fix; invisible at BQ == 1, wrong
+  // for prefill S_q > 8).
 #define VK_DSA_STAGE_TILE(sbuf_, tb_, tlen_)                                  \
   do {                                                                        \
     uint16_t* sdst =                                                          \
@@ -470,10 +474,6 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
     int32_t* idst = sIdx + ((sbuf_) * BQ + warp) * kti;                        \
     if (W % 8 == 0) {                                                         \
       const int rpp = W / 8; /* chunks (8 elements) per key row */            \
-      // lane-strided (NOT tid-strided): each warp stages its OWN slice,
-      // so the chunk index must restart at 0 per warp or slices of warps
-      // w > 0 would leave their first 64*w chunks unstaged (issue #80
-      // audit fix; invisible at BQ == 1, wrong for prefill S_q > 8).
       for (int ch = lane; ch < (tlen_) * rpp; ch += 64) {                     \
         const int r = ch / rpp;                                               \
         const int c = (ch - r * rpp) * 8;                                     \
