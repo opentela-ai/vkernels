@@ -292,6 +292,20 @@ class ReferenceExecutor:
         b, h = coords
         p = scalars["p"]
         row = x[b, h]
+        if fam.params.get("convention", "rotate_half") == "neox_partial":
+            # NeoX split-half over the first rotary_dim dims (floe Qwen3.5
+            # PartialRotaryEmbedding): x1' = x1*c - x2*s / x2' = x2*c + x1*s
+            # with half = rotary_dim//2; dims [rotary_dim, D) pass through.
+            rot = fam.params["rotary_dim"]
+            half = rot // 2
+            c = cos_t[p][:half].astype(np.float64)
+            s = sin_t[p][:half].astype(np.float64)
+            x1, x2 = row[:half], row[half:rot]
+            out = row.copy()
+            out[:half] = x1 * c - x2 * s
+            out[half:rot] = x2 * c + x1 * s
+            y[b, h] = out.astype(y.dtype)
+            return
         half = row.shape[-1] // 2
         rotated = np.concatenate((-row[half:], row[:half]), axis=-1)
         out = row * cos_t[p].astype(np.float64) + rotated * sin_t[p].astype(np.float64)

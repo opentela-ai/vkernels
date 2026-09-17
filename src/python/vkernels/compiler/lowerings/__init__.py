@@ -336,7 +336,17 @@ def lower_rope(op: Operator, graph: OperatorGraph) -> TaskFamily:
         domain=domain,
         inputs=(x.name, cos_t.name, sin_t.name),
         outputs=(y.name,),
-        params={"layer": op.attributes.get("layer", 0), "which": op.attributes.get("which", "q"), "position": op.attributes.get("position", "p")},
+        # Task shape is unchanged by the convention (one task per (b, h)); the
+        # params carry it so reference/device bodies can branch: "rotate_half"
+        # is the full-width Qwen3 form (rotary_dim == D), "neox_partial"
+        # rotates only the first rotary_dim dims with a pass-through tail.
+        params={
+            "layer": op.attributes.get("layer", 0),
+            "which": op.attributes.get("which", "q"),
+            "position": op.attributes.get("position", "p"),
+            "convention": op.attributes.get("convention", "rotate_half"),
+            "rotary_dim": op.attributes.get("rotary_dim", D),
+        },
         threads=THREADS_PER_WORKER,
         scratch_bytes=D * 4,
         read_regions=reads,

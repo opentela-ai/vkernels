@@ -395,27 +395,63 @@ class RecordingBackend:
         *,
         layer: int,
         which: str = "q",
+        rotary_dim: Optional[int] = None,
+        convention: str = "rotate_half",
     ) -> SymbolicTensor:
-        """Rotate-half RoPE at the runtime position p (Qwen3 convention).
+        """RoPE at the runtime position p.
 
-        Tables are precomputed [max_positions, D] externals with
-        cos = cat([f, f]) so x' = x*cos[p] + rotate_half(x)*sin[p].
+        ``convention="rotate_half"`` (default — Qwen3): full-width
+        rotate-half form ``x' = x*cos[p] + rotate_half(x)*sin[p]`` where
+        rotate_half(x) = cat(-x[D/2:], x[:D/2]). Tables are precomputed
+        [max_positions, D] externals with cos = cat([f, f]).
+
+        ``convention="neox_partial"`` (Qwen3.5 ``PartialRotaryEmbedding``):
+        NeoX split-half over the first ``rotary_dim`` dims only — with
+        ``half = rotary_dim // 2``, ``x1 = x[:half]``, ``x2 = x[half:rotary_dim]``::
+
+            x1' = x1*c - x2*s ;  x2' = x2*c + x1*s      (c,s = tables[p])
+
+        and dims ``[rotary_dim, head_dim)`` pass through unchanged. Tables
+        are fp32 externals of shape [max_positions, rotary_dim // 2].
         """
+        if convention not in ("rotate_half", "neox_partial"):
+            raise CaptureError(f"rope convention {convention!r} not supported (expected 'rotate_half' or 'neox_partial')")
+        if convention == "neox_partial":
+            head_dim = x.value.shape[-1]
+            if rotary_dim is None or rotary_dim % 2 != 0 or not 0 < rotary_dim <= head_dim:
+                raise CaptureError(f"neox_partial rope requires an even 0 < rotary_dim <= head_dim ({head_dim}); got {rotary_dim!r}")
+            for t in (cos_table, sin_table):
+                if t.value.shape[-1] != rotary_dim // 2:
+                    raise CaptureError(
+                        f"neox_partial rope tables must be [max_positions, rotary_dim//2] = [.., {rotary_dim // 2}]; got shape {t.value.shape}"
+                    )
         self._require_position(position, "rope")
         out = self.fresh_buffer(f"rope_{which}_l{layer}{self._suffix()}", x.value.shape)
         p = self._position_name(position)
+        attributes = {"layer": layer, "which": which, "position": p, "convention": convention}
+        if rotary_dim is not None:
+            attributes["rotary_dim"] = rotary_dim
+        if convention == "rotate_half":
+            numerical_contract = {
+                "rotate_half": "cat(-x[D/2:], x[:D/2])",
+                "tables": "full-width cos/sin (HF rotate_half convention)",
+            }
+        else:
+            numerical_contract = {
+                "neox_partial": "x1' = x1*c - x2*s ; x2' = x2*c + x1*s over dims [0, rotary_dim), half = rotary_dim//2",
+                "pass_through": f"dims [{rotary_dim}, {x.value.shape[-1]}) unchanged",
+                "tables": "cos/sin [max_positions, rotary_dim//2], fp32, indexed at the runtime position",
+                "upcast": "rotation math in fp32 (bf16 activations in/out)",
+            }
         self._record(
             "rope",
             inputs=(x, cos_table, sin_table),
             outputs=(out,),
-            attributes={"layer": layer, "which": which, "position": p},
+            attributes=attributes,
             reads=(_regional_reads(x.value), _regional_reads(cos_table.value), _regional_reads(sin_table.value)),
             writes=(_regional_reads(out.value),),
             source_location=f"layer {layer} rope {which}",
-            numerical_contract={
-                "rotate_half": "cat(-x[D/2:], x[:D/2])",
-                "tables": "full-width cos/sin (HF rotate_half convention)",
-            },
+            numerical_contract=numerical_contract,
         )
         return out
 

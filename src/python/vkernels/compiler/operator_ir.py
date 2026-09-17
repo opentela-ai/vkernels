@@ -358,6 +358,10 @@ OP_EMBEDDING = "embedding"
 OP_LAYER_NORM = "layer_norm"
 OP_RMS_NORM = "rms_norm"
 OP_ROPE = "rope"
+# rope attributes: layer, which, position, convention ("rotate_half" —
+# full-width Qwen3 form, default — or "neox_partial" — partial rotation over
+# the first rotary_dim dims with a pass-through tail; rotary_dim is present
+# iff convention == "neox_partial").
 OP_LINEAR = "linear"
 OP_GELU = "gelu"
 OP_SWIGLU = "swiglu"
