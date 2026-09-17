@@ -139,13 +139,10 @@ class ReferenceExecutor:
             "elementwise": self._body_elementwise,
             "embedding": self._body_embedding,
             "cache_append": self._body_cache_append,
-<<<<<<< HEAD
             "gdn_conv": self._body_gdn_conv,
             "cache_append_paged": self._body_cache_append_paged,
-=======
             "mhc_pre": self._body_mhc_pre,
             "mhc_post": self._body_mhc_post,
->>>>>>> 525c428 (feat(compiler): mhc_pre/mhc_post lowering + reference-exec bodies (issue #99))
             "attention_scores": self._body_attention_scores,
             "attention_scores_paged": self._body_attention_scores_paged,
             "softmax": self._body_softmax,
@@ -435,7 +432,6 @@ class ReferenceExecutor:
         k_cache[b, h, p, :] = k_new[b, h, :]
         v_cache[b, h, p, :] = v_new[b, h, :]
 
-<<<<<<< HEAD
     def _body_gdn_conv(self, fam: TaskFamily, coords, scalars) -> None:
         """GDN short-conv decode step over one (batch, channel-tile) task:
         fp32-accumulated depthwise FIR + silu, then the time-major state
@@ -496,7 +492,6 @@ class ReferenceExecutor:
         # Gathered masked: V rows beyond p are never gathered (NaN slots must not leak).
         slots = table[b, : p + 1].astype(np.int64)
         y[b, h, :] = (probs[b, h, : p + 1] @ v_pool[slots, kvh, :]).astype(y.dtype)
-=======
     def _body_mhc_pre(self, fam: TaskFamily, coords, scalars) -> None:
         """mHC hyper-connection pre-mix over one batch row.
 
@@ -567,7 +562,6 @@ class ReferenceExecutor:
         acc = (comb[bb, :, j].astype(np.float64)[:, None] * streams[bb].astype(np.float64)).sum(axis=0)
         acc = acc + float(post_w[bb, j]) * body_out[bb].astype(np.float64)
         streams_post[bb, j] = acc.astype(streams_post.dtype)
->>>>>>> 525c428 (feat(compiler): mhc_pre/mhc_post lowering + reference-exec bodies (issue #99))
 
     def _body_attention_scores(self, fam: TaskFamily, coords, scalars) -> None:
         q = self.tensor(fam.inputs[0]).astype(np.float64)

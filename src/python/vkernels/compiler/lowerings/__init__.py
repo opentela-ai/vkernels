@@ -542,6 +542,12 @@ def lower_gdn_conv(op: Operator, graph: OperatorGraph) -> TaskFamily:
         params={"layer": op.attributes.get("layer", 0), "conv_kernel": K, "tile": tile},
         threads=THREADS_PER_WORKER,
         scratch_bytes=tile * 4,  # fp32 accumulator for one channel tile
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
 # mHC hyper-connection mixing (issue #99): the data-dependent pre/post/comb
 # weights and stream collapse (pre), then the composed stream update (post).
 # One task per row (pre) / per (batch, stream) row (post) at every layer
