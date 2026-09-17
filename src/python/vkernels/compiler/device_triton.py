@@ -827,9 +827,13 @@ def _t_linear_grouped(
                 offs_k = h * K_G + tl.arange(0, K_G)
                 xv = tl.load(x_ptr + m * K + offs_k, cache_modifier=".cg").to(tl.float32)
                 nn = tl.where(sel, offs_n, 0) - h * N_G
-                wv = tl.load(w_ptr + (h * N_G + nn)[:, None] * K + offs_k[None, :],
-                             mask=sel[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
-                acc += tl.sum(wv * xv[None, :], axis=1)
+                # w is stored [Cin, Cout] = [K, N] (§3.1, same as the base
+                # linear): the head's diagonal block is
+                # w[h*K_G:(h+1)*K_G, h*N_G:(h+1)*N_G] — rows are the head's
+                # K slice, columns its N slice. y[n] = <w[:, n], x>.
+                wv = tl.load(w_ptr + offs_k[:, None] * N + (h * N_G + nn)[None, :],
+                             mask=sel[None, :], other=0.0, cache_modifier=".cg").to(tl.float32)
+                acc += tl.sum(xv[:, None] * wv, axis=0)
         tl.store(y_ptr + m * N + offs_n, acc)
         task += P
 
