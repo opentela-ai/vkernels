@@ -68,6 +68,26 @@ void mla_fwd_cpu(int B, int H, int S_q, int S_kv, int q_start, int kv_start,
 void mla_config_for(int S_q, int kv_lora_rank, int qk_rope_head_dim,
                     int* bq, int* bn_kv, int* threads);
 
+// MI300A compute-unit count (gfx942) — the occupancy cap the split-K helper
+// fills toward (same convention as the dsa_topk split rule), and the minimum
+// number of keys a split's slice must keep so the latent reads still
+// coalesce. Both feed mla_fwd_split_for and the HIP split-kernel sizing.
+static constexpr int kMlaCus = 228;
+static constexpr int kMlaMinSplitKeys = 32;
+
+// Recommended split-K for the HIP decode path (issue #82). A decode grid with
+// tiny `B*H*S_q` (e.g. H=1, S_q=1, S_kv=8192: a single 64-thread block on
+// MI300A's 228 CUs) cannot fill the machine, so the kernel splits the S_kv key
+// window across blocks -- each writing a partial-softmax output + per-split
+// lse, combined in fixed order (the scheme proven on dsa_sparse_fwd_split).
+// Returns the split count for `mla_fwd`; 1 means the plain single-block path
+// (prefill shapes, or grids that already fill the CUs). Host-pure; unit-tested
+// in tests/kernels/attn/test_mla.cpp (MlaSplitFor).
+// Formula (occupancy rule, as in dsa_topk_logits_split_for): fill the CUs the
+// plain grid leaves idle, capped so every split keeps >= kMlaMinSplitKeys
+// keys (coalescing floor).
+int mla_fwd_split_for(int B, int H, int S_q, int S_kv);
+
 }  // namespace vkernels::kernels
 
 #if VKERNELS_HAS_HIP
