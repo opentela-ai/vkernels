@@ -567,8 +567,10 @@ def convert_weights_for_vkernel(
     w2_weight,
     w13_weight_scale,
     w2_weight_scale,
+    *rest,
     w13_bias=None,
     w2_bias=None,
+    **_ignored,
 ):
     """Pass raw ``create_weights()``-layout MXFP4 MoE weights through to
     :class:`VkernelFusedExperts` (issue #74 serving contract).
@@ -582,10 +584,21 @@ def convert_weights_for_vkernel(
     cast to fp32 here (mirroring what the AITER/TRITON oracle branches do
     for their kernels).
 
+    Accepts both oracle call shapes: the MoE variant
+    ``(w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)`` and the gpt-oss
+    variant which additionally carries ``w13_input_scale`` /
+    ``w2_input_scale`` / ``_cache_permute_indices`` after the biases
+    (ignored — the vkernels kernel takes no activation input scales).
+
     Returns the 6-tuple ``(w13, w2, w13_scale, w2_scale, w13_bias,
     w2_bias)`` in the ``convert_*_to_mxfp4_moe_kernel_format`` shape.
     """
     torch = _require_torch()
+    # Positional gpt-oss-variant biases (first two of ``rest``).
+    if len(rest) >= 1 and rest[0] is not None:
+        w13_bias = rest[0]
+    if len(rest) >= 2 and rest[1] is not None:
+        w2_bias = rest[1]
     w13_weight = w13_weight.data
     w2_weight = w2_weight.data
     w13_weight_scale = w13_weight_scale.data

@@ -28,6 +28,7 @@ contract tests).
 from __future__ import annotations
 
 import ctypes
+import importlib.util
 import os
 import unittest
 
@@ -104,7 +105,10 @@ def _make_weights(E, hidden, ispp, seed, scale_lo=124, scale_hi=130):
     )
 
     def rand_packed(shape):
-        nib = finite_nibbles[rng.integers(0, len(finite_nibbles), shape)]
+        # shape is the PACKED shape (..., K/2); draw nibbles at element
+        # resolution (..., K) then pack pairs (even k -> low nibble).
+        elem_shape = (*shape[:-1], shape[-1] * 2)
+        nib = finite_nibbles[rng.integers(0, len(finite_nibbles), elem_shape)]
         return (nib[..., 0::2] | (nib[..., 1::2] << 4)).astype(np.uint8)
 
     def rand_scale(shape):
@@ -161,7 +165,7 @@ def _bf16_reference(hs_bits, w13_bits, w2_bits, topk_ids, topk_w,
         if b13 is not None:
             g = g + b13[e, :ispp]
             u = u + b13[e, ispp:]
-        gate_out = beta * np.tanh(g / beta) / (1.0 + np.exp(-g))
+        gate_out = beta * np.tanh(g / beta) / (1.0 + np.exp(-np.clip(g, -60, 60)))
         up_out = linear_beta * np.tanh(u / linear_beta)
         act = gate_out * up_out  # [n_e, ispp]
         y = act @ down_w.T
@@ -330,6 +334,61 @@ class ConvertWeightsForVkernelTest(unittest.TestCase):
         self.assertTrue(torch.equal(b13_out, b13.to(torch.float32)))
 
 
+@unittest.skipIf(torch is None, "torch is required")
+@unittest.skipIf(
+    importlib.util.find_spec("vllm") is None,
+    "vLLM is required (oracle import) — runs on the serving image",
+)
+class VkernelBackendShimTest(unittest.TestCase):
+    """Integration gate: register_vkernel_backend_shim must make the
+    ``AITER_MXFP4_BF16`` enum — the enum the K3 serving shim selects —
+    resolve to VkernelFusedExperts AND convert weights with the raw
+    pass-through contract, not the AITER gfx950 CK shuffle (issue #74)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from vkernels.vllm_experts import register_vkernel_backend_shim
+
+        cls.installed = register_vkernel_backend_shim()
+        from vllm.model_executor.layers.fused_moe.oracle import (
+            mxfp4 as oracle_mxfp4,
+        )
+        cls.oracle = oracle_mxfp4
+
+    def test_shim_installed(self):
+        self.assertTrue(self.installed)
+
+    def test_aiter_enum_resolves_to_vkernel_experts(self):
+        from vkernels.vllm_experts import VkernelFusedExperts
+
+        cls_list = self.oracle.backend_to_kernel_cls(
+            self.oracle.Mxfp4MoeBackend.AITER_MXFP4_BF16
+        )
+        self.assertEqual(cls_list, [VkernelFusedExperts])
+
+    def test_conversion_is_raw_pass_through(self):
+        E, hidden, ispp = 2, 256, 128
+        w13, w13_scale, w2, w2_scale = _make_weights(E, hidden, ispp, seed=3)
+        b13 = torch.randn(E, 2 * ispp, dtype=torch.bfloat16)
+        b2 = torch.randn(E, hidden, dtype=torch.bfloat16)
+        out = self.oracle.convert_weight_to_mxfp4_moe_kernel_format(
+            mxfp4_backend=self.oracle.Mxfp4MoeBackend.AITER_MXFP4_BF16,
+            layer=None,
+            w13_weight=torch.from_numpy(w13),
+            w2_weight=torch.from_numpy(w2),
+            w13_weight_scale=torch.from_numpy(w13_scale),
+            w2_weight_scale=torch.from_numpy(w2_scale),
+            w13_bias=b13,
+            w2_bias=b2,
+        )
+        w13o, w2o, s13o, s2o, b13o, b2o = out
+        self.assertTrue(torch.equal(w13o, torch.from_numpy(w13)))
+        self.assertTrue(torch.equal(s13o, torch.from_numpy(w13_scale)))
+        self.assertTrue(torch.equal(w2o, torch.from_numpy(w2)))
+        self.assertEqual(w13o.dtype, torch.uint8)  # NOT a fp4x2/CK view
+        self.assertEqual(b13o.dtype, torch.float32)
+
+
 @unittest.skipUnless(_HIP_OK, _HIP_WHY)
 class Mxfp4ServingParityTest(unittest.TestCase):
     """HIP vk_hip_fused_moe_mxfp4 vs the naive bf16 reference, on the raw
@@ -344,6 +403,9 @@ class Mxfp4ServingParityTest(unittest.TestCase):
 
     def _case(self, M, hidden, ispp, E, top_k, seed, wrong_layout=False):
         w13, w13_scale, w2, w2_scale = _make_weights(E, hidden, ispp, seed)
+        # The bf16 reference is ALWAYS computed from the raw (correct)
+        # layout — snapshot before the wrong-layout mutation.
+        ref_w13, ref_w13_scale = w13.copy(), w13_scale.copy()
         if wrong_layout:
             w13, w13_scale = _interleave_pairs(w13, w13_scale)
         rng = np.random.default_rng(seed + 1)
@@ -378,7 +440,7 @@ class Mxfp4ServingParityTest(unittest.TestCase):
 
         ref = _bf16_reference(
             hs_bits,
-            _dequant_mxfp4(w13, w13_scale),
+            _dequant_mxfp4(ref_w13, ref_w13_scale),
             _dequant_mxfp4(w2, w2_scale),
             topk_ids, topk_w, b13, b2, ispp,
         )
