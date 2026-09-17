@@ -150,12 +150,12 @@ TEST(GemmBf16Config, ServingShapePicksArchTile) {
 
 TEST(GemmBf16Config, WarmupShapePicksArchTile) {
   int bm = 0, bn = 0, bk = 0, threads = 0;
-  // Large-K warmup: the selector reports the EFFECTIVE output footprint of
-  // the warmup kernel. GB10 realises (64,64) as the 4-way M-grouped
-  // (16,64,RM4) reuse kernel, which won every M=8192 K3 shape (see gb10.md);
-  // MI300A (gfx942) realises (128,64) as the (32,64,RM4) cross-tile B-reuse
-  // + LDS double-buffer kernel (issue #77), halving the B re-reads vs the
-  // old flat (64,64) tile.
+  // Large-K warmup: the selector reports the warmup tile. GB10 realises
+  // (64,64) as the 4-way M-grouped (16,64,RM4) reuse kernel, which won every
+  // M=8192 K3 shape (see gb10.md); MI300A (gfx942) keeps the flat (64,64)
+  // tile -- the issue #77 on-device reuse sweep measured the reuse + LDS
+  // double-buffer schedule ~2x SLOWER there (occupancy collapse; see
+  // gfx942.md), so the reuse kernel is not routed on AMD.
   gemm_bf16_config_for(8192, 6288, 7168, &bm, &bn, &bk, &threads);
 #if VKERNELS_HAS_CUDA
   EXPECT_EQ(bm, 64);
@@ -163,10 +163,10 @@ TEST(GemmBf16Config, WarmupShapePicksArchTile) {
   EXPECT_EQ(bk, 64);
   EXPECT_EQ(threads, 256);
 #else
-  EXPECT_EQ(bm, 128);
+  EXPECT_EQ(bm, 64);
   EXPECT_EQ(bn, 64);
   EXPECT_EQ(bk, 64);
-  EXPECT_EQ(threads, 512);
+  EXPECT_EQ(threads, 256);
 #endif
   // M == 65 crosses into the warmup / prefill tile; K = 64 is the small-K
   // branch, the warmup footprint on every arch.
@@ -176,9 +176,9 @@ TEST(GemmBf16Config, WarmupShapePicksArchTile) {
   EXPECT_EQ(bn, 64);
   EXPECT_EQ(threads, 256);
 #else
-  EXPECT_EQ(bm, 128);
+  EXPECT_EQ(bm, 64);
   EXPECT_EQ(bn, 64);
-  EXPECT_EQ(threads, 512);
+  EXPECT_EQ(threads, 256);
 #endif
 }
 

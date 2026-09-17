@@ -44,6 +44,11 @@
 //     of K-tile kt+1 overlaps the MFMAs of tile kt (double buffering).
 //   * The b fragment (sB -> registers) is read once per (K-group, column
 //     fragment) per warp and amortised over RM MFMA accumulate updates.
+// On gfx942 the on-device M=8192 autotuner measured this schedule ~2x
+// SLOWER than the flat (64,64) tile (the 24 KB double-buffered LDS ring at
+// 128 threads caps occupancy at ~25%; see gfx942.md), so hip::gemm_bf16
+// keeps the flat warmup tile and the reuse kernel is exposed only through
+// gemm_bf16_reuse_with_config for the autotuner and the correctness sweep.
 //
 // Semantics are unchanged: same fp32-accumulate / RNE-store contract as
 // gemm_bf16_cpu, verified by test_gemm_bf16_correct.hip.
@@ -407,23 +412,13 @@ void gemm_bf16(std::size_t M, std::size_t N, std::size_t K, float alpha,
                uint16_t* C) {
   int bm = 0, bn = 0, bk = 0, threads = 0;
   ::vkernels::kernels::gemm_bf16_config_for(M, N, K, &bm, &bn, &bk, &threads);
-  // Warmup / prefill (M > 64): the selector reports the effective output
-  // footprint (rm*bm, bn) and the kernel realises it as the cross-tile
-  // B-reuse + LDS double-buffer kernel (issue #77): one sB load per K-tile
-  // shared by rm M-tiles, with the tile kt+1 loads overlapping tile kt's
-  // MFMAs. (128, 64) = (32, 64, RM=4); (64, 64) = (16, 64, RM=4). Serving
-  // (M <= 64) is a single M-tile per output tile, so reuse cannot help and
-  // stays on the two-phase kernel below.
-  if (M > 64) {
-    if (bm == 128 && bn == 64)
-      gemm_bf16_reuse_with_config(M, N, K, alpha, A, B, beta, C, 32, 64, 4);
-    else if (bm == 64 && bn == 64)
-      gemm_bf16_reuse_with_config(M, N, K, alpha, A, B, beta, C, 16, 64, 4);
-    else
-      gemm_bf16_with_config(M, N, K, alpha, A, B, beta, C, bm, bn, bk,
-                            threads);
-    return;
-  }
+  // The per-arch selector owns the warmup schedule. On GB10 it reports the
+  // (64,64) footprint realised as the cross-tile B-reuse + cp.async kernel
+  // (issue #77); on gfx942 the on-device M=8192 reuse sweep measured that
+  // schedule ~2x SLOWER than the flat (64,64) tile (occupancy collapse from
+  // the double-buffered LDS ring -- see gemm_bf16.cpp and gfx942.md), so the
+  // AMD path stays on the flat tile. gemm_bf16_reuse_with_config remains
+  // available here for the autotuner and the correctness sweep.
   gemm_bf16_with_config(M, N, K, alpha, A, B, beta, C, bm, bn, bk, threads);
 }
 

@@ -90,7 +90,12 @@ Two ports of the *same algorithm* (two-phase tiled loop, 16×16×16
 matrix-core instruction) — with an increasingly arch-specific tail on
 CUDA: a `cp.async` double-buffered pipeline for serving, and an M-grouped
 cross-tile B-reuse kernel for warmup. The HIP port keeps the synchronous
-form.
+form; issue #77 ported the reuse + LDS double-buffer kernel to HIP and the
+on-device M=8192 autotuner measured it ~2× slower than the flat `(64,64)`
+tile on MI300A (occupancy collapse from the 24 KB LDS ring — see
+[gemm-bf16/gfx942](performance/gemm-bf16/gfx942.md)), so the AMD warmup
+path stays on the flat tile and the reuse kernel remains an
+offline-autotuner / correctness-sweep entry only.
 
 | Config | HW | M | Time | TFLOP/s | GB/s | AI | % of binding roof |
 |---|---|---:|---:|---:|---:|---:|---|
@@ -115,7 +120,12 @@ it is not a DRAM-roof fraction.
   double-buffer landed first (1.3–1.8×) and cross-tile reuse then landed as
   an **L1TEX/register-blocking** lever for warmup (2–52%); serving is
   already at the DRAM roof, so reuse is gated on `M > 64`. On MI300A the
-  LDS double-buffer would close the 45%→100% effective-HBM gap.
+  #77 reuse + LDS double-buffer port was **measured and rejected** (≈2×
+  regression, occupancy-bound — the flat `(64,64)` tile already runs at
+  45% effective HBM with 3× the reuse kernel's occupancy); closing the
+  45%→100% effective-HBM gap there needs a schedule that keeps
+  ≥1536 resident threads/CU while pipelining (e.g. `(64,64)` with a
+  single-buffered sB pipeline or wider `BN`), not the GB10 ring layout.
 * GB10's *synchronous* kernel preferred `(32,64)` (1.4–2.3× over `(16,16)`);
   the **cp.async double-buffer** (1.3–1.8×) then re-tuned it to `(16,64)` at
   serving and, with the **M-grouped `(16,64,RM4)` reuse** kernel, gave the

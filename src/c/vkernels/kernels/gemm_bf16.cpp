@@ -131,17 +131,20 @@ void gemm_bf16_config_for(std::size_t M, std::size_t N, std::size_t K,
     *bn = 16;
     *threads = 64;  // 1 wavefront (one per 16-row fragment)
   } else {
-    // Warmup / prefill: large M, compute-bound once cross-tile B reuse
-    // lands (issue #77). The selector reports the EFFECTIVE output footprint
-    // (rm*bm, bn); hip::gemm_bf16 realises it as the reuse + LDS
-    // double-buffer kernel: (128, 64) = (32, 64) M-tiles x RM=4 per block
-    // (512 threads = RM*(bm/16)*64 wavefront lanes), halving the global B
-    // re-reads vs the old flat (64, 64) tile and pipelining the tile kt+1
-    // loads against tile kt's MFMAs. threads matches the reuse kernel's
-    // block size (bm/16)*64 with bm = the effective 128-row footprint.
-    *bm = 128;
+    // Warmup / prefill: large M. Issue #77 added a cross-tile B-reuse + LDS
+    // double-buffer kernel and the on-device autotuner swept it at M=8192
+    // (bench_gemm_bf16.hip, VK_BENCH_ONLY=reuse): it LOSES on gfx942 -- even
+    // the best config (32,64,RM2) is ~2x slower than the flat (64,64) tile
+    // (QKV 6288x7168: 19855 vs 9697 us; 1536x128: 144 vs 53 us) because the
+    // 24 KB double-buffered LDS ring at 128 threads caps occupancy at ~25%
+    // while the (32,64,RM2) footprint moves the same global bytes as the
+    // flat (64,64) tile. GB10's latency-bound LPDDR is where the schedule
+    // pays (see gb10.md), so gfx942 keeps the flat (64,64) tile and the
+    // reuse kernel stays available via gemm_bf16_reuse_with_config for the
+    // autotuner / offline experiments.
+    *bm = 64;
     *bn = 64;
-    *threads = 512;  // (128/16)*64 = 4 wavefronts
+    *threads = 256;  // (64/16)*64 = 4 wavefronts
   }
 #endif
 }

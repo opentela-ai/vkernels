@@ -186,9 +186,10 @@ int main() {
   {
     const int M = 8192;
     std::printf("\n--- warmup M=%d (public hip::gemm_bf16) ---\n", M);
-    // {64,7168} is the small-N / large-K warmup corner; all three run the
-    // M > 64 effective (128,64) tile through the (32,64,RM4) reuse kernel
-    // (via the public hip::gemm_bf16).
+    // {64,7168} is the small-N / large-K warmup corner. On gfx942 all three
+    // stay on the flat (64,64) tile (the issue #77 reuse sweep measured the
+    // reuse schedule ~2x slower here -- see gfx942.md); the reuse kernel is
+    // exercised directly in section (3) below.
     const NK warm[] = {{1536, 128}, {3072, 512}, {64, 7168}};
     for (const auto& s : warm) {
       std::vector<uint16_t> A((size_t)M * s.K), B((size_t)s.K * s.N),
