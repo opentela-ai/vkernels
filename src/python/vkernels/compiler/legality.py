@@ -21,10 +21,22 @@ POSITION_CONSUMERS = frozenset(
     {
         "embedding",
         "cache_append",
+        "compressor_append",
         "attention_scores",
         "softmax",
         "attention_values",
         "rope",
+        # MLA decode (issue #95): fused latent-attention scores/values and
+        # the conjugate output-side rope all bind the runtime decode position
+        # (window bound t in (p-W, p], per-row rope position).
+        "cache_append_paged",
+        "attention_scores_paged",
+        "attention_values_paged",
+        "mla_scores",
+        "mla_values",
+        "conjugate_rope",
+        # #94 paged trio: same runtime-bound contracts as their dense twins,
+        # extended to the per-row form (issue #93 x #94 composition).
     }
 )
 
@@ -71,6 +83,9 @@ def check_graph(graph: OperatorGraph) -> list[Diagnostic]:
 
     # 3. Symbolic scalars may be consumed only by position consumers.
     scalar_names = set(graph.scalars)
+    # Per-row position tensors (issue #93) are scoped exactly like the
+    # scalar: only attention/append/rope/embedding consumers may read them.
+    row_position_names = getattr(graph, "row_position_tensors", set())
     for op in graph.ops:
         consumed = [v for v in op.attributes.values() if isinstance(v, str) and v in scalar_names]
         if consumed and op.kind not in POSITION_CONSUMERS:
@@ -79,6 +94,16 @@ def check_graph(graph: OperatorGraph) -> list[Diagnostic]:
                     "error",
                     "symbolic-scalar-consumer",
                     f"{op.kind} consumes runtime scalar(s) {consumed} without a supported bound contract",
+                    op.source_location,
+                )
+            )
+        consumed_row = [v for v in op.attributes.values() if isinstance(v, str) and v in row_position_names]
+        if consumed_row and op.kind not in POSITION_CONSUMERS:
+            diags.append(
+                Diagnostic(
+                    "error",
+                    "row-position-consumer",
+                    f"{op.kind} consumes per-row position tensor(s) {consumed_row} without a supported per-row bound contract",
                     op.source_location,
                 )
             )

@@ -632,6 +632,36 @@ def convert_weights_for_vkernel(
 _vkernel_shim_active = False
 
 
+def _patch_oracle_converters(oracle_mxfp4, aiter_bf16):
+    """Wrap the oracle module's two convert_* entry points so the
+    ``aiter_bf16`` enum (now denoting the vkernels backend) routes to
+    :func:`convert_weights_for_vkernel` and every other backend reaches its
+    OWN original converter. Module-level so tests can drive it against a
+    stub oracle: the wrapper binds ``_orig_convert`` per iteration via a
+    default-arg — a closure over the loop variable would leave BOTH
+    wrappers dispatching to the last original, misrouting non-AITER
+    backends across converters (silently-wrong weights — the exact class
+    issue #74 is about)."""
+    for _name in (
+        "convert_weight_to_mxfp4_moe_kernel_format",
+        "convert_gpt_oss_weight_to_mxfp4_moe_kernel_format",
+    ):
+        _orig_convert = getattr(oracle_mxfp4, _name, None)
+        if _orig_convert is None:
+            continue
+
+        def _vk_convert(mxfp4_backend, layer, *args,
+                        _orig_convert=_orig_convert, _aiter=aiter_bf16, **kwargs):
+            if mxfp4_backend == _aiter:
+                # The shim mapped this enum to VkernelFusedExperts;
+                # feed the kernel its documented raw layout.
+                return convert_weights_for_vkernel(*args, **kwargs)
+            return _orig_convert(mxfp4_backend, layer, *args, **kwargs)
+
+        _vk_convert.__name__ = _name + "__vkernels"
+        setattr(oracle_mxfp4, _name, _vk_convert)
+
+
 def _build_vkernel_cls_or_raise():
     """Build/resolve :class:`VkernelFusedExperts` (PEP 562 ``__getattr__``
     is bypassed by bare-name lookup inside this module, so the shim builds
@@ -700,23 +730,7 @@ def register_vkernel_backend_shim():
 
     # --- (2) weight-conversion contract (issue #74) ----------------------
     if not getattr(_oracle_mxfp4, "_vkernels_convert_patched", False):
-        for _name in (
-            "convert_weight_to_mxfp4_moe_kernel_format",
-            "convert_gpt_oss_weight_to_mxfp4_moe_kernel_format",
-        ):
-            _orig_convert = getattr(_oracle_mxfp4, _name, None)
-            if _orig_convert is None:
-                continue
-
-            def _vk_convert(mxfp4_backend, layer, *args, **kwargs):
-                if mxfp4_backend == aiter_bf16:
-                    # The shim mapped this enum to VkernelFusedExperts;
-                    # feed the kernel its documented raw layout.
-                    return convert_weights_for_vkernel(*args, **kwargs)
-                return _orig_convert(mxfp4_backend, layer, *args, **kwargs)
-
-            _vk_convert.__name__ = _name + "__vkernels"
-            setattr(_oracle_mxfp4, _name, _vk_convert)
+        _patch_oracle_converters(_oracle_mxfp4, aiter_bf16)
         _oracle_mxfp4._vkernels_convert_patched = True
 
     # Keep the quantization module's imported reference (used by

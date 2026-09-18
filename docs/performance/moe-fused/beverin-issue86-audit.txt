@@ -1,0 +1,176 @@
+=== node: nid002670 job=640392 date: Thu Sep 17 07:19:16 PM UTC 2026 ===
+=== src md5: 228b87e4 ===
+
+=== build moe_fused_bench + probe_moe_largeispp (incremental) ===
+/capstor/scratch/cscs/xyao/vk-issue-86/meta/benchmarks/bench_moe_fused.hip:383:18: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vk-issue-86/meta/benchmarks/bench_moe_fused.hip:383:34: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vk-issue-86/meta/benchmarks/bench_moe_fused.hip:383:48: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vk-issue-86/meta/benchmarks/bench_moe_fused.hip:384:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vk-issue-86/meta/benchmarks/bench_moe_fused.hip:384:18: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+[100%] Built target moe_fused_bench
+[ 95%] Built target vkernels
+[100%] Built target probe_moe_largeispp
+
+###### A. fault repro on CURRENT code (exit codes checked) ######
+--- E=32 h7168 ispp=4096 kmajor M=1,2 dummy no-cpu (minimal recorded shape) ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=4096 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     2624.4     2629.0     0.067         -      skip
+     2      432     4681.6     4682.2     0.075         -      skip
+Done.
+--- E=32 h7168 ispp=4096 nmajor M=1,2 dummy no-cpu ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=4096 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     2875.7     2871.5     0.061         -      skip
+     2      432     4687.3     4692.5     0.075         -      skip
+Done.
+--- E=256 h7168 ispp=4096 kmajor M=1,2 dummy no-cpu (recorded fault shape) ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=256 hidden=7168 ispp=4096 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     2623.3     2621.9     0.067         -      skip
+     2      512     5539.7     5549.0     0.064         -      skip
+Done.
+--- E=32 h7168 ispp=33792 kmajor M=1,2 dummy no-cpu (TP-shard) ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=33792 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256    21011.2    21034.8     0.069         -      skip
+     2      432    34303.6    34327.2     0.085         -      skip
+Done.
+--- E=256 h7168 ispp=33792 kmajor M=1,2 dummy no-cpu (whole-model K3) ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=256 hidden=7168 ispp=33792 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256    21005.2    21008.4     0.069         -      skip
+     2      512    40106.9    40212.6     0.072         -      skip
+Done.
+[audit] fault-repro block FAULT_FREE=1 (1 = all shapes ran clean)
+
+###### B. oracle-mismatch quantification across seeds/M/ispp ######
+--- ispp=4096 kmajor M=1 seed=0 ---
+probe: E=32 hidden=7168 ispp=4096 top_k=16 M=1 kmajor seed=0
+[det]    rerun spread: max|delta|=7.812e-03 worst_rel=0.000756
+[gateup] act rows=16 real only: worst_rel=0.004115 bad_rows=0/16 | bf16-ulp max=1 >1ulp=0/4096
+[down]   out cols: worst_rel=0.165771 worst_col=1151 bad_cols=7/7168
+[down]   bad cols by pid_n (col/64): 6:1 7:1 17:1 19:1 30:1 51:1 90:1 
+[down]   bad cols by col%16: 0:1 5:1 7:1 8:1 9:1 15:2 
+[iso] CPU-down(GPU-act): vs GPU rel=0.009033 (col 1151) | vs CPU rel=0.156738
+Done.
+--- ispp=4096 kmajor M=1 seed=1 ---
+probe: E=32 hidden=7168 ispp=4096 top_k=16 M=1 kmajor seed=1
+[det]    rerun spread: max|delta|=7.812e-03 worst_rel=0.000467
+[gateup] act rows=16 real only: worst_rel=0.000000 bad_rows=0/16 | bf16-ulp max=1 >1ulp=0/4096
+[down]   out cols: worst_rel=0.006983 worst_col=1232 bad_cols=0/7168
+[down]   bad cols by pid_n (col/64): 
+[down]   bad cols by col%16: 
+[iso] CPU-down(GPU-act): vs GPU rel=0.003087 (col 140) | vs CPU rel=0.006207
+Done.
+--- ispp=4096 kmajor M=1 seed=2 ---
+probe: E=32 hidden=7168 ispp=4096 top_k=16 M=1 kmajor seed=2
+[det]    rerun spread: max|delta|=7.812e-03 worst_rel=0.000583
+[gateup] act rows=16 real only: worst_rel=0.000000 bad_rows=0/16 | bf16-ulp max=0 >1ulp=0/4096
+[down]   out cols: worst_rel=0.384499 worst_col=2585 bad_cols=14/7168
+[down]   bad cols by pid_n (col/64): 23:1 35:1 38:1 39:1 40:1 45:1 64:2 67:1 68:1 74:1 81:1 91:1 103:1 
+[down]   bad cols by col%16: 1:1 3:2 4:1 5:1 6:1 8:1 9:2 10:1 11:1 12:1 14:2 
+[iso] CPU-down(GPU-act): vs GPU rel=0.005150 (col 2585) | vs CPU rel=0.389648
+Done.
+--- ispp=4096 kmajor M=1 seed=3 ---
+probe: E=32 hidden=7168 ispp=4096 top_k=16 M=1 kmajor seed=3
+[det]    rerun spread: max|delta|=7.812e-03 worst_rel=0.000357
+[gateup] act rows=16 real only: worst_rel=0.000000 bad_rows=0/16 | bf16-ulp max=0 >1ulp=0/4096
+[down]   out cols: worst_rel=0.007746 worst_col=1660 bad_cols=0/7168
+[down]   bad cols by pid_n (col/64): 
+[down]   bad cols by col%16: 
+[iso] CPU-down(GPU-act): vs GPU rel=0.002453 (col 1660) | vs CPU rel=0.010180
+Done.
+--- ispp=4096 kmajor M=1 seed=4 ---
+probe: E=32 hidden=7168 ispp=4096 top_k=16 M=1 kmajor seed=4
+[det]    rerun spread: max|delta|=1.172e-02 worst_rel=0.000198
+[gateup] act rows=16 real only: worst_rel=0.000000 bad_rows=0/16 | bf16-ulp max=0 >1ulp=0/4096
+[down]   out cols: worst_rel=0.017896 worst_col=6747 bad_cols=0/7168
+[down]   bad cols by pid_n (col/64): 
+[down]   bad cols by col%16: 
+[iso] CPU-down(GPU-act): vs GPU rel=0.001343 (col 4348) | vs CPU rel=0.017811
+Done.
+--- ispp=4096 nmajor M=2 seed=0 ---
+probe: E=32 hidden=7168 ispp=4096 top_k=16 M=2 nmajor seed=0
+[det]    rerun spread: max|delta|=7.812e-03 worst_rel=0.000854
+[gateup] act rows=16 real only: worst_rel=0.004115 bad_rows=0/32 | bf16-ulp max=1 >1ulp=0/12288
+[down]   out cols: worst_rel=0.166016 worst_col=1151 bad_cols=8/7168
+[down]   bad cols by pid_n (col/64): 6:1 7:1 17:1 19:1 30:1 51:1 90:1 
+[down]   bad cols by col%16: 0:1 5:1 6:1 7:1 8:1 9:1 15:2 
+[iso] CPU-down(GPU-act): vs GPU rel=0.009277 (col 1151) | vs CPU rel=0.156738
+Done.
+--- ispp=4096 nmajor M=2 seed=1 ---
+probe: E=32 hidden=7168 ispp=4096 top_k=16 M=2 nmajor seed=1
+[det]    rerun spread: max|delta|=1.172e-02 worst_rel=0.000591
+[gateup] act rows=16 real only: worst_rel=0.000000 bad_rows=0/32 | bf16-ulp max=1 >1ulp=0/12288
+[down]   out cols: worst_rel=0.006519 worst_col=1232 bad_cols=0/7168
+[down]   bad cols by pid_n (col/64): 
+[down]   bad cols by col%16: 
+[iso] CPU-down(GPU-act): vs GPU rel=0.002779 (col 140) | vs CPU rel=0.006207
+Done.
+--- ispp=4096 nmajor M=2 seed=2 ---
+probe: E=32 hidden=7168 ispp=4096 top_k=16 M=2 nmajor seed=2
+[det]    rerun spread: max|delta|=1.172e-02 worst_rel=0.000687
+[gateup] act rows=16 real only: worst_rel=0.000000 bad_rows=0/32 | bf16-ulp max=0 >1ulp=0/12288
+[down]   out cols: worst_rel=0.386162 worst_col=2585 bad_cols=14/7168
+[down]   bad cols by pid_n (col/64): 23:1 35:1 38:1 39:1 40:1 45:1 64:2 67:1 68:1 74:1 81:1 91:1 103:1 
+[down]   bad cols by col%16: 1:1 3:2 4:1 5:1 6:1 8:1 9:2 10:1 11:1 12:1 14:2 
+[iso] CPU-down(GPU-act): vs GPU rel=0.003976 (col 4294) | vs CPU rel=0.389648
+Done.
+--- control ispp=3072 kmajor M=1 seed=0 ---
+probe: E=32 hidden=7168 ispp=3072 top_k=16 M=1 kmajor seed=0
+[det]    rerun spread: max|delta|=7.812e-03 worst_rel=0.000112
+[gateup] act rows=16 real only: worst_rel=0.000000 bad_rows=0/16 | bf16-ulp max=0 >1ulp=0/3072
+[down]   out cols: worst_rel=0.002197 worst_col=2648 bad_cols=0/7168
+[down]   bad cols by pid_n (col/64): 
+[down]   bad cols by col%16: 
+[iso] CPU-down(GPU-act): vs GPU rel=0.001029 (col 2079) | vs CPU rel=0.001296
+Done.
+--- control ispp=3072 kmajor M=1 seed=3 ---
+probe: E=32 hidden=7168 ispp=3072 top_k=16 M=1 kmajor seed=3
+[det]    rerun spread: max|delta|=7.812e-03 worst_rel=0.000110
+[gateup] act rows=16 real only: worst_rel=0.000000 bad_rows=0/16 | bf16-ulp max=0 >1ulp=0/3072
+[down]   out cols: worst_rel=0.001109 worst_col=1267 bad_cols=0/7168
+[down]   bad cols by pid_n (col/64): 
+[down]   bad cols by col%16: 
+[iso] CPU-down(GPU-act): vs GPU rel=0.001675 (col 1267) | vs CPU rel=0.000568
+Done.
+--- shard ispp=33792 kmajor M=1 seed=0 ---
+probe: E=32 hidden=7168 ispp=33792 top_k=16 M=1 kmajor seed=0
+[det]    rerun spread: max|delta|=2.344e-02 worst_rel=0.000236
+[gateup] act rows=16 real only: worst_rel=0.000488 bad_rows=0/16 | bf16-ulp max=1 >1ulp=0/33792
+[down]   out cols: worst_rel=0.039272 worst_col=4315 bad_cols=3/7168
+[down]   bad cols by pid_n (col/64): 15:1 17:1 67:1 
+[down]   bad cols by col%16: 2:1 9:1 11:1 
+[iso] CPU-down(GPU-act): vs GPU rel=0.010524 (col 2554) | vs CPU rel=0.040594
+Done.
+--- shard ispp=33792 kmajor M=1 seed=1 ---
+probe: E=32 hidden=7168 ispp=33792 top_k=16 M=1 kmajor seed=1
+[det]    rerun spread: max|delta|=2.344e-02 worst_rel=0.000112
+[gateup] act rows=16 real only: worst_rel=0.000000 bad_rows=0/16 | bf16-ulp max=0 >1ulp=0/33792
+[down]   out cols: worst_rel=0.084417 worst_col=4109 bad_cols=1/7168
+[down]   bad cols by pid_n (col/64): 64:1 
+[down]   bad cols by col%16: 13:1 
+[iso] CPU-down(GPU-act): vs GPU rel=0.002726 (col 6985) | vs CPU rel=0.082035
+Done.
+--- shard ispp=33792 kmajor M=1 seed=2 ---
+probe: E=32 hidden=7168 ispp=33792 top_k=16 M=1 kmajor seed=2
+[det]    rerun spread: max|delta|=2.734e-02 worst_rel=0.000146
+[gateup] act rows=16 real only: worst_rel=0.000000 bad_rows=0/16 | bf16-ulp max=0 >1ulp=0/33792
+[down]   out cols: worst_rel=0.100001 worst_col=6907 bad_cols=1/7168
+[down]   bad cols by pid_n (col/64): 107:1 
+[down]   bad cols by col%16: 11:1 
+[iso] CPU-down(GPU-act): vs GPU rel=0.004399 (col 6907) | vs CPU rel=0.095162
+Done.
+
+===== DONE (FAULT_FREE=1) =====

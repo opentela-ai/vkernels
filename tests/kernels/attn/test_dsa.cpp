@@ -24,6 +24,7 @@ using vkernels::kernels::dsa_topk_logits_cpu;
 using vkernels::kernels::dsa_topk_logits_fits_lds;
 using vkernels::kernels::dsa_topk_logits_fits_lds_fp8q;
 using vkernels::kernels::dsa_topk_logits_fits_lds_mfma;
+using vkernels::kernels::dsa_topk_logits_fits_lds_mfma_fp8;
 using vkernels::kernels::dsa_topk_logits_fits_lds_wmma;
 using vkernels::kernels::dsa_topk_logits_split_for;
 
@@ -640,6 +641,28 @@ TEST(DsaTopk, FitsLdsMfma) {
   EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma(32, 128, 128));   // 25,216 B (fits!)
   // Same SMALLEST-footprint win at the tiny end (D must be >= 64).
   EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma(2, 8, 4));       // D=8 not mult of 64
+}
+
+// dsa_topk_logits_fits_lds_mfma_fp8: the fp8-MFMA kernel's admission (issue
+// #81). NO staged tile at all -- the 16x16x32 fp8 fragment IS the global
+// 8-byte load, shared memory is just gate + scales ((H+B)*4 B) -- so the
+// 64 KB cap is a non-constraint and the gates are the FRAGMENT multiples:
+// H%16==0 and H<=128 (kNF<=8 register accumulators), D%32==0 (K=32 per
+// instruction), B%16==0 and B<=256 ((B/16)*64 threads). D%32 admits
+// D=96/160/192... shapes the bf16-MFMA kernel (D%64) refuses.
+TEST(DsaTopk, FitsLdsMfmaFp8) {
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma_fp8(32, 128, 64));   // GLM-5.3
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma_fp8(64, 128, 64));   // 2x indexer
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma_fp8(128, 128, 64));  // 4x indexer
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma_fp8(64, 192, 64));   // D=192: bf16-mfma refuses
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma_fp8(128, 192, 64));  // D=192 + H=128
+  EXPECT_TRUE(dsa_topk_logits_fits_lds_mfma_fp8(16, 32, 16));    // minimal tile
+  // Fragment gates.
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma_fp8(246, 128, 64)); // H not mult 16
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma_fp8(144, 128, 64)); // H>128 (kMaxNF=8)
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma_fp8(32, 130, 64));  // D not mult 32
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma_fp8(32, 130, 72));  // B not mult 16
+  EXPECT_FALSE(dsa_topk_logits_fits_lds_mfma_fp8(32, 128, 272)); // B>256
 }
 
 // dsa_topk_logits_fits_lds_wmma: the CUDA wmma kernel's admission -- the

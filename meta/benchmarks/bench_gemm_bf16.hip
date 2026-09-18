@@ -10,7 +10,8 @@
 //     (≈1307 TFLOP/s bf16, ≈5300 GB/s HBM3, ridge ≈245 FLOP/byte).
 //
 // It also runs a per-shape tile autotuner over the compiled tiles via the
-// explicit-config dispatcher hip::gemm_bf16_with_config, so the
+// explicit-config dispatcher hip::gemm_bf16_with_config, plus (issue #77) a
+// cross-tile B-reuse sweep via hip::gemm_bf16_reuse_with_config, so the
 // gemm_bf16_config_for table in src/c can be regenerated on device.
 //
 // Built only with VKERNELS_HAS_HIP + VKERNELS_BUILD_BENCHMARKS.
@@ -36,6 +37,12 @@ void gemm_bf16_with_config(std::size_t M, std::size_t N, std::size_t K,
                            float alpha, const uint16_t* A,
                            const uint16_t* B, float beta, uint16_t* C,
                            int bm, int bn, int bk, int threads);
+// Cross-tile B-reuse dispatcher (issue #77; not in the public header,
+// forward-declared here, same as test_gemm_bf16_correct.hip).
+void gemm_bf16_reuse_with_config(std::size_t M, std::size_t N, std::size_t K,
+                                 float alpha, const uint16_t* A,
+                                 const uint16_t* B, float beta, uint16_t* C,
+                                 int bm, int bn, int rm);
 }  // namespace vkernels::kernels::hip
 
 static void check_hip(hipError_t err, const char* ctx) {
@@ -236,14 +243,90 @@ static void autotune(const GpuInfo& info, hipEvent_t start, hipEvent_t stop) {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-tile B-reuse + LDS double-buffer sweep (issue #77): (BM, BN, RM) =
+// RM M-tiles per block sharing sB. Reports the serving Ms and the warmup
+// M = 8192, for comparison against the flat tile matrix above.
+static void autotune_reuse(const GpuInfo& info, hipEvent_t start,
+                           hipEvent_t stop) {
+  (void)info;
+  struct NK { int N, K; };
+  const NK k3[] = {
+      {6288, 7168}, {3584, 7168}, {896, 7168}, {2112, 7168}, {1536, 7168},
+      {7168, 1536}, {7168, 768}, {7168, 3584}, {2304, 1536}, {3072, 512},
+      {1536, 128},
+  };
+  struct Cfg { int bm, bn, rm; };
+  const Cfg cfgs[] = {{16, 64, 4}, {32, 64, 2}, {32, 64, 4}};
+  constexpr int kNCfg = sizeof(cfgs) / sizeof(cfgs[0]);
+  for (int M : {5, 16, 64, 8192}) {
+    std::printf("\n=== reuse sweep (M=%d): us(med) per (BM,BN,RM) ===\n", M);
+    std::printf("  %6s %6s", "N", "K");
+    for (const auto& c : cfgs) {
+      char nm[24];
+      std::snprintf(nm, sizeof(nm), "%dx%d/RM%d", c.bm, c.bn, c.rm);
+      std::printf(" %12s", nm);
+    }
+    std::printf("  %s\n", "best");
+    for (const auto& s : k3) {
+      const int N = s.N, K = s.K;
+      std::vector<uint16_t> A((size_t)M * K), B((size_t)K * N),
+          C((size_t)M * N, 0);
+      for (int i = 0; i < M * K; ++i) A[i] = f2bf(rnd(1, i) * 0.5f);
+      for (int i = 0; i < K * N; ++i) B[i] = f2bf(rnd(2, i) * 0.5f);
+      uint16_t *dA, *dB, *dC;
+      check_hip(hipMalloc(&dA, (size_t)M * K * 2), "A");
+      check_hip(hipMalloc(&dB, (size_t)K * N * 2), "B");
+      check_hip(hipMalloc(&dC, (size_t)M * N * 2), "C");
+      check_hip(hipMemcpy(dA, A.data(), (size_t)M * K * 2,
+                          hipMemcpyHostToDevice), "cpyA");
+      check_hip(hipMemcpy(dB, B.data(), (size_t)K * N * 2,
+                          hipMemcpyHostToDevice), "cpyB");
+      double us[kNCfg];
+      int best_i = 0;
+      double best_us = 1e18;
+      for (int i = 0; i < kNCfg; ++i) {
+        const auto& c = cfgs[i];
+        auto L = [&] {
+          vkernels::kernels::hip::gemm_bf16_reuse_with_config(
+              (size_t)M, (size_t)N, (size_t)K, 1.0f, dA, dB, 0.0f, dC, c.bm,
+              c.bn, c.rm);
+        };
+        auto r = bench_us(L, start, stop, 3, 80);
+        us[i] = r.median_us;
+        if (us[i] < best_us) { best_us = us[i]; best_i = i; }
+      }
+      std::printf("  %6d %6d", N, K);
+      for (int i = 0; i < kNCfg; ++i) std::printf(" %12.1f", us[i]);
+      std::printf("  %dx%d/RM%d\n", cfgs[best_i].bm, cfgs[best_i].bn,
+                  cfgs[best_i].rm);
+      check_hip(hipFree(dA), "fA"); check_hip(hipFree(dB), "fB");
+      check_hip(hipFree(dC), "fC");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 int main() {
   auto info = get_gpu_info();
   std::printf("GPU: %s  arch=%d  bf16=%.0f TFLOP/s  HBM=%.0f GB/s\n",
               info.name.c_str(), info.arch, info.tflops, info.bw);
   hipEvent_t start, stop;
   hipEventCreate(&start); hipEventCreate(&stop);
+  // Fast iteration hooks: VK_BENCH_ONLY=shapes|reuse runs one sweep.
+  const char* only = std::getenv("VK_BENCH_ONLY");
+  if (only && std::string(only) == "shapes") {
+    bench_shapes(info, start, stop);
+    hipEventDestroy(start); hipEventDestroy(stop);
+    return 0;
+  }
+  if (only && std::string(only) == "reuse") {
+    autotune_reuse(info, start, stop);
+    hipEventDestroy(start); hipEventDestroy(stop);
+    return 0;
+  }
   bench_shapes(info, start, stop);
   autotune(info, start, stop);
+  autotune_reuse(info, start, stop);
   hipEventDestroy(start); hipEventDestroy(stop);
   return 0;
 }

@@ -70,6 +70,30 @@ GB10 it serves dense-Qwen3 decode in exactly one kernel launch per step,
 validated against the HF-checked oracle (7.6e-7 logits at the real 0.6B
 dims). Benchmarks: `bench/bench_megakernel_qwen3.py` (floe repo).
 
+## Lightning-indexer lane (issue #97)
+
+DSA/GLM-indexer decode support (`indexer_scores` + `index_topk`), the
+static-task-grid + runtime-indirection pattern of #94: selection is
+data-dependent but the decode output count is static (`k = index_topk`),
+and the i32 indirection table orders the attention scores/values tasks
+(#95/#96) through the existing RAW-hazard phase barrier.
+
+- `ops.indexer_scores(q, entries, mix_w)` — per-(batch, head) ReLU scoring
+  of the compressed entries (`scale = head_dim**-0.5`), f32 fused head mix;
+  q/entries may be stored bf16 (`.cg` streamed on device).
+- `ops.index_topk(scores, valid_counts, k)` — fixed-count selection over
+  the fused scores, masked by per-row valid candidate counts: descending
+  score, deterministic lowest-index tie-break, NaN scores in the valid
+  prefix excluded; outputs the i32 indirection table `[B, k]` plus the
+  normalized block_bias `[B, k]` (`s_j / ||s_valid||_2`); `-1/0.0` slots
+  beyond a row's valid count (ragged candidates, `k > valid_count` ok).
+  HCA variant (no indexer): `k = capacity` — same ops, selection trivial.
+- Device templates `_t_indexer_scores` (one task per batch × 64-entry tile)
+  and `_t_index_topk` (one task per batch row; rank-by-comparison-counting
+  sweep, no sort/scratch, M ≤ ~1k). CPU oracle suite:
+  `tests/python/test_megakernel_indexer_topk.py`. The Triton templates are
+  CUDA-gated and unverified on CPU-only stacks.
+
 ## kvaas integration
 
 The device backend addresses its KV cache through the **kvaas data
@@ -171,3 +195,26 @@ standard `×w` instead of the model's gemma `×(1+w)`** convention (every
 layer was ~18% off). The out-projection GEMV and the residual add are in
 *separate* barrier phases (GDN 6→7, FA 9→10) to avoid the within-phase
 read-after-write race that fused them.
+
+## fp8-blockwise GEMV linear in the compiler IR (issue #91)
+
+The compiler lane gained a first-class fp8 decode projection:
+`ops.linear_fp8(x, w_fp8, scale)` records the `linear_fp8` op variant
+(`weight_layout="fp8_block"`, the scale tensor as the second weight
+external — DeepSeek-style 128×128 block-FP8, e4m3 weights [N, K]
+row-major, fp32 scales [ceil(N/128), K/128] block-major; ragged trailing
+N blocks allowed). The lowering (`gemv_fp8` kind) reuses the dense
+linear's GEMV tile domain — one task per (m, 16-column) output tile with
+a full-K sweep — and each task reads exactly one scale row (a 16-column
+tile always lies inside one 128-wide N block) plus one fp32 scale per
+128-deep k-block. The reference body dequantizes tile-exactly and runs
+the matmul in fp64; the device side is the already-validated
+`_t_gemv_fp8` / `_h_gemv_fp8` Triton template (dequant-in-register, fp32
+accumulate, no intermediate dequantized tensor). The CPU oracle suite
+(`tests/python/test_linear_fp8_compiler.py`) proves reference-executor ↔
+fp64-oracle equivalence (1e-12), the worker-stride device-template
+mirror (1e-5, odd m / ragged N / block boundaries), and the bf16-reference
+vs fp8 GEMV rel-err bound (measured 2.6–3.1e-2 for a single K=512 GEMV;
+the 27B end-to-end logits gate is 1.4–3.4e-3 across 64 layers). MXFP4
+expert weights (glm/deepseek checkpoints) are a dtype follow-up on the
+same task shape.

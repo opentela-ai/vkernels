@@ -233,6 +233,30 @@ bool dsa_topk_logits_fits_lds_fp8q(int num_heads, int head_dim, int block,
 bool dsa_topk_logits_fits_lds_mfma(int num_heads, int head_dim, int block,
                                    int lds_cap = kDsaTopkLdsCapGfx942);
 
+// Whether an indexer shape admits the fp8-MFMA kernel
+// (dsa.hip::dsa_topk_logits_kernel_mfma_fp8, issue #81) -- the launcher's
+// FASTEST path, picked FIRST by dsa_topk_logits at every shape it admits.
+// Unlike the bf16-MFMA variant this kernel stages NO Q or K tile through
+// LDS: the 16x16x32 fp8-MFMA fragment IS the global 8-byte load (raw fp8
+// e4m3fnuz, consumed natively by the matrix unit), so the only shared
+// memory is the per-head gate sGate[H] (fp32; the per-token scales are read
+// straight from each page tail as one 16B load per lane):
+//
+//   shmem = H * 4   bytes
+//
+// -- 256 B at the GLM-5.3 indexer (H=64) vs the bf16-MFMA variant's
+// 25,088 B, so the 64 KB cap is a non-constraint and shapes the other
+// variants refuse (e.g. H=128 at D=192) are admitted here. Shape
+// constraints (the verified 16x16x32 fp8 fragment, empirically decoded on
+// gfx942 -- see probe8 in the issue #81 record): num_heads % 16 == 0 AND
+// num_heads <= 128 (kNF = H/16 <= 8 register accumulators, predicated
+// unroll), head_dim % 32 == 0 (K=32 per instruction, so D/kMfmaK fp8
+// MFMAs per page vs D/64 for the bf16 variant) and block % 16 == 0 with
+// block <= 256 ((B/16)*64 threads). Pure arithmetic; host unit tests
+// (tests/kernels/attn/test_dsa.cpp::DsaTopk::FitsLdsMfmaFp8) assert on it.
+bool dsa_topk_logits_fits_lds_mfma_fp8(int num_heads, int head_dim, int block,
+                                       int lds_cap = kDsaTopkLdsCapGfx942);
+
 // Whether an indexer shape fits a dynamic-LDS cap under the CUDA wmma kernel
 // (dsa.cu::dsa_topk_logits_kernel_wmma) -- the CUDA analogue of the MFMA
 // guard above: the SAME fragment-multiple shape gates (num_heads % 16,
@@ -405,12 +429,16 @@ void dsa_topk_logits(int batch_size, int num_heads, int head_dim, int block,
 // Explicit-variant entry point (offline-autotuner / correctness hook).
 // Runs a SPECIFIC kernel at the given shape, bypassing the auto dispatcher
 // in dsa_topk_logits above:
-//   variant 0 -> auto (mfma-if-fits, else fp32q-if-fits, else fp8q-if-fits,
-//                      else refuse); identical to dsa_topk_logits
+//   variant 0 -> auto (mfma-fp8-if-fits, else mfma-if-fits, else
+//                      fp32q-if-fits, else fp8q-if-fits, else refuse);
+//                      identical to dsa_topk_logits
 //   variant 1 -> dsa_topk_logits_kernel        (fp32-Q)
 //   variant 2 -> dsa_topk_logits_kernel_fp8q    (fp8-Q)
 //   variant 3 -> dsa_topk_logits_kernel_mfma    (bf16 MFMA)
-// An explicit variant (1/2/3) that does NOT fit the shape's LDS cap is
+//   variant 4 -> dsa_topk_logits_kernel_mfma_fp8 (fp8 MFMA, issue #81;
+//                      HIP-only -- the CUDA TU refuses it like any other
+//                      unknown variant)
+// An explicit variant (1/2/3/4) that does NOT fit the shape's LDS cap is
 // refused with a stderr diagnostic + no-op (the caller zeroed `out`, which
 // is what stays) rather than launch a block gfx942's driver would drop --
 // mirrors dsa_topk_logits's contract. Same pointers/contract as

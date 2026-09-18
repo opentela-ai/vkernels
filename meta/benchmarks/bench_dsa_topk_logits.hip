@@ -43,6 +43,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -146,6 +147,26 @@ static BenchResult bench_us(const std::function<void()>& launch,
     for (int i = 0; i < 256; ++i) launch();
     (void)hipDeviceSynchronize();
     r = measure_once();
+  }
+  if (r.median_us <= kImplausibleUs) {
+    // The event path is broken for THIS kernel in THIS process state:
+    // every event pair across every window (widened to max_iters) and
+    // both burst retries read elapsed exactly 0.0 (issue #81 record:
+    // runs 640511/640618 vs 640547 -- the same launches measure fine
+    // in some process states and 0.0 in others; standalone harness
+    // probe9_benchcheck.hip run 640544 measured 0/100 zero samples).
+    // Fall back to HOST WALL CLOCK over 100 launches: includes launch
+    // overhead (~1-3 us/launch), so it is an UPPER bound -- but a real
+    // number with honest provenance beats a 0.0/infx row.
+    (void)hipDeviceSynchronize();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 100; ++i) launch();
+    (void)hipDeviceSynchronize();
+    const double us =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+            .count() *
+        1e6 / 100.0;
+    r = BenchResult{us, us, us, 0.0};
   }
   return r;
 }
@@ -455,7 +476,7 @@ static void bench_variants(const GpuInfo& info, hipEvent_t start,
 
   struct Ent { const char* name; int variant; };
   const Ent ents[] = {
-      {"auto", 0}, {"fp32", 1}, {"fp8q", 2}, {"mfma", 3},
+      {"auto", 0}, {"fp32", 1}, {"fp8q", 2}, {"mfma", 3}, {"mfma8", 4},
   };
   std::printf("\n=== hip::dsa_topk_logits variant comparison "
               "(bs=%d H=%d D=%d B=%d max_seq_len=%d, %d CUs) ===\n",

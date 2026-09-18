@@ -1,0 +1,305 @@
+=== node: nid003032 job=640256 date: Thu Sep 17 04:09:13 PM UTC 2026 ===
+=== src md5: 228b87e4 ===
+
+=== build (moe_fused_bench) ===
+[ 95%] Built target vkernels
+[100%] Built target moe_fused_bench
+
+###### 1. ORACLE sweep — bracket the MISMATCH (E=32, real weights) ######
+--- kmajor ispp=512 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=512 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256      641.4      635.9     0.034  0.000702        ok
+     2      432      706.2      701.3     0.062    0.0266        ok
+Done.
+--- nmajor ispp=512 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=512 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256      664.6      660.0     0.033  0.000793        ok
+     2      432      745.0      739.4     0.059    0.0263        ok
+Done.
+--- kmajor ispp=1024 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=1024 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256      891.6      886.6     0.049    0.0386        ok
+     2      432     1089.3     1086.7     0.081    0.0386        ok
+Done.
+--- nmajor ispp=1024 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=1024 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256      917.9      910.8     0.048    0.0386        ok
+     2      432     1304.4     1298.3     0.068    0.0387        ok
+Done.
+--- kmajor ispp=2048 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=2048 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     1271.8     1270.7     0.069    0.0203        ok
+     2      432     2284.5     2284.3     0.077    0.0203        ok
+Done.
+--- nmajor ispp=2048 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=2048 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     1514.6     1509.4     0.058    0.0202        ok
+     2      432     2553.2     2550.2     0.069    0.0202        ok
+Done.
+--- kmajor ispp=2560 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=2560 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     1700.7     1713.0     0.065    0.0173        ok
+     2      432     2861.8     2864.5     0.077    0.0175        ok
+Done.
+--- nmajor ispp=2560 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=2560 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     1922.6     1921.2     0.057    0.0174        ok
+     2      432     3001.7     3003.9     0.073    0.0175        ok
+Done.
+--- kmajor ispp=3072 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=3072 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     2120.3     2119.4     0.062   0.00243        ok
+     2      432     3599.9     3600.8     0.073   0.00212        ok
+Done.
+--- nmajor ispp=3072 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=3072 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     2317.1     2318.1     0.057   0.00223        ok
+     2      432     3629.7     3633.2     0.073   0.00194        ok
+Done.
+--- kmajor ispp=4096 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=4096 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     2757.5     2752.8     0.064     0.166  MISMATCH
+     2      432     4924.0     4919.3     0.072     0.164  MISMATCH
+Done.
+--- nmajor ispp=4096 ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=4096 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     2900.6     2897.5     0.061     0.165  MISMATCH
+     2      432     4764.0     4772.6     0.074     0.166  MISMATCH
+Done.
+
+###### 2. recorded fault shapes re-run (--no-cpu, dummy) ######
+--- E=256 ispp=4096 kmajor M=1,2 (recorded fault shape) ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=256 hidden=7168 ispp=4096 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256     2565.3     2580.8     0.069         -      skip
+     2      512     5390.5     5393.3     0.065         -      skip
+Done.
+--- E=32 ispp=33792 kmajor M=1,2 (TP-shard) ---
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=32 hidden=7168 ispp=33792 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256    21265.2    21177.2     0.068         -      skip
+     2      432    33894.8    34250.8     0.086         -      skip
+Done.
+
+###### 3. acceptance shape: E=256 ispp=33792 whole model (~97 GB) ######
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+E=256 hidden=7168 ispp=33792 top_k=16 activation=situ
+     M       EM    evt(us)    bch(us)    TFLOP/s   cpu-rel    status
+     1      256    21288.8    20834.9     0.068         -      skip
+Done.
+
+###### 4. bigshape correctness test (independent cross-check) ######
+[ 95%] Built target vkernels
+[100%] Built target test_moe_fused_bigshape_correct
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+
+--- decode ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=240 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 5057/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=240 max_rel=0.0002408 -> PASS
+--- decode ispp=4096 all-slots expert 255: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=16 situ
+[phase] align ok EM=16 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 0/7168 (max |delta| = 0)
+[act] max_rel=0 bad=0/65536 worst_flat=-1 diff=0/65536 (0%)
+    [tol] out_rms=167.8 abs_tol=5.034
+    EM=16 max_rel=5.52e-05 -> PASS
+--- prefill ispp=4096 wrap-threshold experts: E=256 hidden=7168 ispp=4096 top_k=16 M=1 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 4599/7168 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/65536 worst_flat=4 diff=4/65536 (0.0061%)
+    [tol] out_rms=62.47 abs_tol=1.874
+    EM=960 max_rel=0.000246 -> PASS
+--- decode ispp=33792 E=32 serving shard: E=32 hidden=7168 ispp=33792 top_k=16 M=1 block=16 situ
+[phase] align ok EM=256 max_expert=31
+[phase] weights filled (w13=7.2 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 4979/7168 (max |delta| = 0.0001221)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/540672 worst_flat=4 diff=84/540672 (0.0155%)
+    [tol] out_rms=187.5 abs_tol=5.625
+    EM=256 max_rel=0.05809 -> PASS
+--- prefill small E=8 h512 ispp=512: E=8 hidden=512 ispp=512 top_k=4 M=1 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 16/512 (max |delta| = 1.192e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0 bad=0/2048 worst_flat=-1 diff=0/2048 (0%)
+    [tol] out_rms=0.5633 abs_tol=0.0169
+    EM=256 max_rel=2.11e-07 -> PASS
+--- prefill ispp=4096 M=64 no-padding: E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 309308/458752 (max |delta| = 6.104e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09552 -> PASS
+--- prefill ispp=4096 M=2 padded: E=256 hidden=7168 ispp=4096 top_k=16 M=2 block=64 situ
+[phase] align ok EM=960 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 7853/14336 (max |delta| = 3.052e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/131072 worst_flat=21 diff=10/131072 (0.00763%)
+    [tol] out_rms=58.51 abs_tol=1.755
+    EM=960 max_rel=0.0002441 -> PASS
+--- prefill small M=64 no-padding: E=8 hidden=512 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 11125/32768 (max |delta| = 4.768e-07)  -> NON-DETERMINISTIC (race)
+[act] max_rel=3.815e-06 bad=0/131072 worst_flat=217 diff=2/131072 (0.00153%)
+    [tol] out_rms=0.6496 abs_tol=0.01949
+    EM=256 max_rel=1.062e-05 -> PASS
+--- bisect E=256 h7168 ispp=512 M=64: E=256 hidden=7168 ispp=512 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=0.9 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 319505/458752 (max |delta| = 3.052e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0004883 bad=0/524288 worst_flat=4 diff=84/524288 (0.016%)
+    [tol] out_rms=19.06 abs_tol=0.5717
+    EM=1024 max_rel=0.03031 -> PASS
+--- bisect E=256 h7168 ispp=1024 M=64: E=256 hidden=7168 ispp=1024 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=1.8 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 319268/458752 (max |delta| = 3.815e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.0009766 bad=0/1048576 worst_flat=693 diff=158/1048576 (0.0151%)
+    [tol] out_rms=27.02 abs_tol=0.8106
+    EM=1024 max_rel=0.03555 -> PASS
+--- bisect E=256 h7168 ispp=2048 M=64: E=256 hidden=7168 ispp=2048 top_k=16 M=64 block=64 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=3.5 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 313831/458752 (max |delta| = 4.578e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/2097152 worst_flat=210 diff=317/2097152 (0.0151%)
+    [tol] out_rms=38.53 abs_tol=1.156
+    EM=1024 max_rel=0.04959 -> PASS
+--- bisect E=8 h1024 ispp=512 M=64: E=8 hidden=1024 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 18248/65536 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=6.104e-05 bad=0/131072 worst_flat=24 diff=3/131072 (0.00229%)
+    [tol] out_rms=1.366 abs_tol=0.04099
+    EM=256 max_rel=0.0006905 -> PASS
+--- bisect E=8 h2048 ispp=512 M=64: E=8 hidden=2048 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 21201/131072 (max |delta| = 1.907e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=25 diff=3/131072 (0.00229%)
+    [tol] out_rms=2.655 abs_tol=0.07966
+    EM=256 max_rel=0.0001258 -> PASS
+--- bisect E=8 h4096 ispp=512 M=64: E=8 hidden=4096 ispp=512 top_k=4 M=64 block=64 situ
+[phase] align ok EM=256 max_expert=3
+[phase] weights filled (w13=0.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 42705/262144 (max |delta| = 3.815e-06)  -> NON-DETERMINISTIC (race)
+[act] max_rel=7.629e-06 bad=0/131072 worst_flat=233 diff=11/131072 (0.00839%)
+    [tol] out_rms=5.343 abs_tol=0.1603
+    EM=256 max_rel=4.768e-06 -> PASS
+--- decode E=256 h7168 ispp=4096 M=64 (oracle sanity): E=256 hidden=7168 ispp=4096 top_k=16 M=64 block=16 situ
+[phase] align ok EM=1024 max_expert=255
+[phase] weights filled (w13=7.0 GB)
+[phase] CPU oracle done
+[phase] device buffers ok, launching fused_moe_mxfp4
+[phase] launcher returned, syncing
+[phase] device sync ok
+[determinism] differing elements: 323623/458752 (max |delta| = 7.629e-05)  -> NON-DETERMINISTIC (race)
+[act] max_rel=0.001953 bad=0/4194304 worst_flat=80 diff=660/4194304 (0.0157%)
+    [tol] out_rms=54.19 abs_tol=1.626
+    EM=1024 max_rel=0.09553 -> PASS
+
+All cases PASS
+
+===== DONE =====

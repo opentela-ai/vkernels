@@ -53,6 +53,7 @@ class DType:
 F32 = DType("f32", 4)
 F16 = DType("f16", 2)
 BF16 = DType("bf16", 2)
+F8_E4M3 = DType("f8e4m3", 1)
 I32 = DType("i32", 4)
 I64 = DType("i64", 8)
 
@@ -84,16 +85,58 @@ class SymbolicScalar:
 class ValidLength:
     """Number of leading valid entries along a cache axis (§5.3).
 
-    ``expr`` is either a concrete int or the string name of a symbolic
-    scalar (e.g. ``"p+1"``). Positions at or beyond the valid length are
-    *uninitialized storage*: implementations must use masked loads or
-    control flow that never reads them, because multiplying an
-    uninitialized NaN by zero still produces NaN.
+    Two forms:
+
+    * **Scalar form** (``row_tensor is None``): ``expr`` is either a
+      concrete int or the string name of a symbolic scalar (e.g.
+      ``"p+1"``). One valid length for the whole batch.
+    * **Per-row form** (ragged decode, floe ``forward_batch``): the valid
+      length is a runtime **tensor** — an external i32 ``[B]`` array named
+      by ``row_tensor``. With ``mode="positions"`` row ``b``'s valid
+      length is ``pos[b] + 1``; with ``mode="lengths"`` it is the value
+      ``lengths[b]`` itself. Resolution happens per task at execution —
+      :meth:`resolve` deliberately does *not* collapse it to one int.
+
+    Entries at or beyond the valid length are *uninitialized storage*:
+    implementations must use masked loads or control flow that never
+    reads them, because multiplying an uninitialized NaN by zero still
+    produces NaN. In per-row form the mask is per row: row ``b`` never
+    reads beyond its own valid length (§5.3 NaN-tail contract, per row).
     """
 
-    expr: int | str
+    expr: int | str | None = None
+    row_tensor: Optional[str] = None
+    mode: str = "positions"  # "positions" (len = pos[b] + 1) | "lengths"
+
+    def __post_init__(self):
+        if self.row_tensor is None:
+            if self.expr is None:
+                raise ValueError("ValidLength needs an int/str expr or a row_tensor")
+        else:
+            if self.expr is not None:
+                raise ValueError("ValidLength row form takes row_tensor, not expr")
+            if self.mode not in ("positions", "lengths"):
+                raise ValueError(f"ValidLength row mode {self.mode!r} not supported")
+
+    @property
+    def is_row(self) -> bool:
+        return self.row_tensor is not None
+
+    @classmethod
+    def from_positions(cls, tensor_name: str) -> "ValidLength":
+        """Per-row lengths from an external i32 [B] decode-position tensor."""
+        return cls(row_tensor=tensor_name, mode="positions")
+
+    @classmethod
+    def from_lengths(cls, tensor_name: str) -> "ValidLength":
+        """Per-row lengths from an external i32 [B] cache-seqlen tensor."""
+        return cls(row_tensor=tensor_name, mode="lengths")
 
     def resolve(self, scalars: dict[str, int]) -> int:
+        if self.is_row:
+            raise ValueError(
+                f"ValidLength row tensor {self.row_tensor!r} resolves per row at execution, not to a single int"
+            )
         if isinstance(self.expr, int):
             return self.expr
         # Support the single supported symbolic form "<name>+1".
@@ -104,6 +147,9 @@ class ValidLength:
         return scalars[expr] + add
 
     def __str__(self) -> str:  # pragma: no cover - trivial
+        if self.is_row:
+            tail = "pos[b]+1" if self.mode == "positions" else "len[b]"
+            return f"row:{self.row_tensor}[{tail}]"
         return str(self.expr)
 
 
@@ -284,8 +330,14 @@ class Region:
 
     storage_id: int
     view: TensorValue
-    # (lo, hi) per dimension; hi may be a str symbolic expression.
-    boxes: tuple[tuple[int, int | str], ...]
+    # (lo, hi) per dimension; hi may be a str symbolic expression, a
+    # per-row ValidLength (row-tensor form, stored as the object itself),
+    # or a plain int.
+    boxes: tuple[tuple[int, int | str | ValidLength], ...]
+    # Paged indirection (#94): when set, the position axis is addressed
+    # through an external i32 [B, S] slot table rather than a static box.
+    indirect_table: Optional[TensorValue] = None
+    indirect_axis: int = -1
 
     @staticmethod
     def whole(view: TensorValue) -> "Region":
@@ -294,14 +346,46 @@ class Region:
 
     @staticmethod
     def prefix(view: TensorValue, axis: int, valid: ValidLength) -> "Region":
-        """Whole view, but the extent on ``axis`` is the valid prefix."""
+        """Whole view, but the extent on ``axis`` is the valid prefix.
+
+        Per-row (row-tensor) valid lengths are stored as the
+        :class:`ValidLength` object itself; :meth:`resolved_boxes` treats
+        them conservatively as the full extent.
+        """
         boxes = []
         for i, d in enumerate(view.shape):
             if i == axis:
-                boxes.append((0, valid.expr))
+                boxes.append((0, valid if valid.is_row else valid.expr))
             else:
                 boxes.append((0, d))
         return Region(view.storage_id, view, tuple(boxes))
+
+    @staticmethod
+    def indirect(
+        view: TensorValue,
+        table: TensorValue,
+        axis: int,
+        valid: Optional[ValidLength] = None,
+    ) -> "Region":
+        """Paged region (#94): ``axis`` of ``view`` is indexed through
+        ``table`` — an external i32 ``[B, S]`` slot table. Element
+        addresses become ``slot = table[b, t]``,
+        ``addr = pool_base + slot * row_stride``; writes land at
+        ``table[b, p_row]`` and slot 0 is the reserved null/sink page
+        (never written by a live row).
+
+        The static boxes keep the view extent (optionally bounded by
+        ``valid`` on ``axis``), but storage-span analysis overapproximates
+        to the *whole pool*: indirected regions on one pool conflict with
+        everything on that pool. Sound under phase order — same reasoning
+        as today's prefix regions, whose symbolic bounds are likewise
+        treated as full extent (§5.2).
+        """
+        assert 0 <= axis < len(view.shape), f"indirect axis {axis} out of range for {view.shape}"
+        boxes = []
+        for i, d in enumerate(view.shape):
+            boxes.append((0, valid.expr) if (i == axis and valid is not None) else (0, d))
+        return Region(view.storage_id, view, tuple(boxes), indirect_table=table, indirect_axis=axis)
 
     @staticmethod
     def tile(view: TensorValue, tile: Sequence[tuple[int, int]]) -> "Region":
@@ -315,7 +399,12 @@ class Region:
         """Boxes with symbolic bounds resolved (defaults: full extent)."""
         out = []
         for (lo, hi), extent in zip(self.boxes, self.view.shape):
-            if isinstance(hi, str):
+            if isinstance(hi, ValidLength):
+                # Per-row form: exact extent depends on runtime row data.
+                # Conservative full-extent, exactly like the symbolic case
+                # — never unsound for overlap analysis.
+                hi = extent
+            elif isinstance(hi, str):
                 hi = ValidLength(hi).resolve(scalars or {})
                 hi = min(hi, extent)
             out.append((lo, hi))
@@ -328,6 +417,13 @@ class Region:
         Strides must be non-negative (asserted at view creation sites we
         control).
         """
+        if self.indirect_table is not None:
+            # Paged (#94): addressed slots are runtime data — overapproximate
+            # to the whole pool extent (conservative, never unsound).
+            total = 1
+            for d in self.view.shape:
+                total *= d
+            return (self.view.offset, self.view.offset + max(total - 1, 0))
         lo_addr = self.view.offset
         hi_addr = self.view.offset
         for (lo, hi), stride, extent in zip(self.boxes, self.view.strides, self.view.shape):
@@ -345,7 +441,8 @@ class Region:
         return a0 <= b1 and b0 <= a1
 
     def __repr__(self) -> str:  # pragma: no cover - trivial
-        return f"Region(s{self.storage_id}, {self.boxes})"
+        ind = f" via table[{self.indirect_table.name}]" if self.indirect_table is not None else ""
+        return f"Region(s{self.storage_id}, {self.boxes}){ind}"
 
 
 # ---------------------------------------------------------------------------
@@ -357,29 +454,130 @@ class Region:
 OP_EMBEDDING = "embedding"
 OP_LAYER_NORM = "layer_norm"
 OP_RMS_NORM = "rms_norm"
+# rms_norm_gated attributes: eps, activation ("sigmoid" for the GLM o_norm;
+# NOT silu — vkernels' kda_layer_norm_gated hardcodes silu and does not cover
+# this variant). Optional per-element gate stream: row-wise RMSNorm whose
+# output is additionally multiplied by activation(gate), elementwise.
+OP_RMS_NORM_GATED = "rms_norm_gated"
 OP_ROPE = "rope"
+# rope attributes: layer, which, position, convention ("rotate_half" —
+# full-width Qwen3 form, default; "neox_partial" — partial rotation over
+# the first rotary_dim dims with a pass-through tail, rotary_dim present
+# iff convention == "neox_partial"; or "interleaved" — GPT-J style pairing
+# (2i, 2i+1) over the first rotary_dim dims, DeepSeek-V4 q/k-latent form,
+# rotary_dim present iff convention == "interleaved").
 OP_LINEAR = "linear"
+# fp8-blockwise decode projection (issue #91): y = x @ dequant(w_fp8, scales)^T
+# with DeepSeek-style 128x128 block scales; same task shape as ``linear``, the
+# scale tensor is the second weight external.
+OP_LINEAR_FP8 = "linear_fp8"
+# Lightning-indexer (DSA / GLM indexer, issue #97): per-(batch, head) ReLU
+# scoring of the compressed entries plus the fused head mix, then the fixed-
+# count top-k selection producing the i32 indirection table consumed by the
+# attention scores/values tasks via #94.
+OP_INDEXER_SCORES = "indexer_scores"
+OP_INDEX_TOPK = "index_topk"
 OP_GELU = "gelu"
 OP_SWIGLU = "swiglu"
 OP_ADD = "add"
 OP_CACHE_APPEND = "cache_append"
+# gdn_conv attributes: layer, conv_kernel (K). Decode-step FIR over the
+# packed qkv row with an external [B, K-1, conv_dim] fp32 conv-state pool:
+# read-modify-write per row (time-major state shift), position-independent —
+# ordering comes from the state-storage hazards, not the decode position.
+OP_GDN_CONV = "gdn_conv"
+# DSA compressor entry emission (issue #96): every m-th token appends one
+# rope-rotated compressed entry to the per-layer two-series (Ca/Cb) entry
+# pool; masked per-row on the boundary condition (issue #93 positions).
+OP_COMPRESSOR_APPEND = "compressor_append"
+OP_CACHE_APPEND_PAGED = "cache_append_paged"
+# gdn_delta attributes: layer, scale, eps. Per-value-head gated delta rule
+# decode step (Qwen3.5 GatedDeltaNet, seq==1 path): decays the fp32 SSM
+# state, applies the delta-rule outer-product update, reads out through the
+# per-head RMSNorm + z-gate. Position-independent — ordering comes from the
+# state-storage hazards (read-modify-write per (b, head) row), like gdn_conv.
+OP_GDN_DELTA = "gdn_delta"
+# kda_delta attributes: layer, scale, lower_bound. Per-head gated delta rule
+# decode step with ELEMENT-WISE decay (GLM-5.3 KDA / Kimi delta attention,
+# seq==1): unlike gdn_delta's scalar-per-head decay, the log gate is
+# per-(head, k-dim) — exp(g) row-broadcast over the value axis of the
+# [B, H, K, V] fp32 state. Gate conditioning (f_b output + dt_bias + A_log +
+# lower_bound·sigmoid) folds inside the task; q/k L2-normalize inside (q
+# carries the 1/sqrt(D) scale). Position-independent — ordering comes from
+# the state-storage hazards (read-modify-write per (b, head) row).
+OP_KDA_DELTA = "kda_delta"
+OP_CACHE_APPEND_PAGED = "cache_append_paged"
+# mHC hyper-connection mixing family (issue #99; floe DeepseekV4HyperConnection
+# / Glm53HyperConnection — one op family, family attributes hc/iters/eps/
+# rms_eps). `mhc_pre` computes the data-dependent pre/post/comb weights from
+# the flattened stream contents (unweighted RMSNorm + one small GEMV each
+# step) and collapses the streams into the block-body input; `mhc_post`
+# composes the sublayer output back onto the hc parallel streams with the
+# Sinkhorn-projected doubly-stochastic comb. Both are per-token (decode:
+# Sinkhorn runs per token, not at load time). Stream state is intermediate
+# workspace — a fresh [B, hc, C] buffer per layer, NOT a persistent pool.
+OP_MHC_PRE = "mhc_pre"
+OP_MHC_POST = "mhc_post"
 OP_ATTENTION_SCORES = "attention_scores"
+OP_ATTENTION_SCORES_PAGED = "attention_scores_paged"
 OP_SOFTMAX = "softmax"
 OP_ATTENTION_VALUES = "attention_values"
+OP_ATTENTION_VALUES_PAGED = "attention_values_paged"
+# MoE decode ops (issue #98): routed-expert decode with a static task grid and
+# runtime indirection. ``moe_route`` writes the routing table (external scratch
+# [B, k]: i32 expert ids + fp32 weights); ``moe_expert`` runs the k·B per-(row,
+# slot) expert FFN tasks with the weight base indirected through the table (the
+# #94 slot-table pattern); ``moe_combine`` does the weighted scatter-add per row
+# (+ optional shared-expert path). Phase order route ≺ experts ≺ combine falls
+# out of the RAW hazards on the table and the partials buffer.
+OP_MOE_ROUTE = "moe_route"
+OP_MOE_EXPERT = "moe_expert"
+OP_MOE_COMBINE = "moe_combine"
+
+# MLA decode (DeepSeek-V4 latent attention, issue #95): shared-KV MQA over a
+# latent cache — fused scores+softmax with a per-head learnable sink column
+# and the sliding-window branch bound, over window keys (slot table) union
+# selected compressed entries (indexer top-k table, #97). ``mla_values``
+# gathers context from both pools with the sink column contributing no value.
+OP_MLA_SCORES = "mla_scores"
+OP_MLA_VALUES = "mla_values"
+# Conjugate rope (issue #95): output-side rotation by the NEGATIVE angle —
+# same tables, sin negated; the exact inverse of the q/k rotation, so
+# rope -> conjugate_rope round-trips to identity.
+OP_CONJUGATE_ROPE = "conjugate_rope"
 
 ARITHMETIC_OP_KINDS = (
     OP_EMBEDDING,
     OP_LAYER_NORM,
     OP_RMS_NORM,
+    OP_RMS_NORM_GATED,
     OP_ROPE,
     OP_LINEAR,
+    OP_LINEAR_FP8,
+    OP_INDEXER_SCORES,
+    OP_INDEX_TOPK,
     OP_GELU,
     OP_SWIGLU,
     OP_ADD,
     OP_CACHE_APPEND,
+    OP_GDN_CONV,
+    OP_GDN_DELTA,
+    OP_KDA_DELTA,
+    OP_COMPRESSOR_APPEND,
+    OP_CACHE_APPEND_PAGED,
+    OP_MHC_PRE,
+    OP_MHC_POST,
     OP_ATTENTION_SCORES,
+    OP_ATTENTION_SCORES_PAGED,
     OP_SOFTMAX,
     OP_ATTENTION_VALUES,
+    OP_ATTENTION_VALUES_PAGED,
+    OP_MOE_ROUTE,
+    OP_MOE_EXPERT,
+    OP_MOE_COMBINE,
+    OP_MLA_SCORES,
+    OP_MLA_VALUES,
+    OP_CONJUGATE_ROPE,
 )
 
 
@@ -483,6 +681,10 @@ class OperatorGraph:
         # storage_id -> version, bumped by each effectful write; expresses
         # ordering without copying the cache (§4.3).
         self.storage_versions: dict[int, int] = {}
+        # Per-row decode-position tensors (issue #93): name -> declared
+        # capacity. Legality scopes consumers exactly like the scalar p.
+        self.row_position_tensors: set[str] = set()
+        self.row_position_capacity: dict[str, int] = {}
         self._next_vid = 0
         self._next_opid = 0
         self._next_storage = 0

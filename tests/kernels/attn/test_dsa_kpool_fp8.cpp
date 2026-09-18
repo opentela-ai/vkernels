@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -292,4 +293,68 @@ TEST(DsaKpoolFp8, AssembleNullRoundScaleIsRaw) {
   for (size_t i = 0; i < out_a.size(); ++i)
     if (out_a[i] != out_b[i]) ++mism;
   EXPECT_EQ(mism, 0);
+}
+
+TEST(DsaKpoolFp8, AssembleSubnormalTapEncodesThroughSubnormalBranch) {
+  // A pool whose pooled K has a tiny tap next to O(1) taps: after the
+  // normalized Hadamard, the tiny tap lands (exactly, all sums are
+  // powers-of-two adds) in the d%4==0/2 lanes at ~eps*kScale while the
+  // O(1) taps set absmax, so q = x/scale ~ 0.0137 falls in the fp8
+  // SUBNORMAL encode window [2^-7, 3*2^-7) and must be stored through the
+  // e_unbiased < -6 branch with a nonzero mantissa field.
+  constexpr int H = 128;
+  const float eps = 6.103515625e-5f;  // 2^-14 (bf16-exact)
+  std::vector<float> chunk_k(H, 0.0f), chunk_score(H, 0.5f), ape(H, 0.0f);
+  chunk_k[0] = 1.0f;
+  chunk_k[1] = -1.0f;
+  chunk_k[2] = eps;  // Hadamard lane d%4 in {0, 2} carries ~eps*kScale
+  std::vector<float> tail_k(H, 0.0f), tail_score(H, 0.0f);
+  std::vector<int32_t> rpi = {0}, nt = {0}, css = {0}, tlb = {0}, loc = {0};
+  const int ssp = 1, num_pages = 1;
+  const int page_bytes = ssp * (H + 4);
+  std::vector<uint8_t> out((size_t)num_pages * page_bytes, 0u);
+  dsa_kpool_assemble_fp8_cpu(1, 1, H, 1, ssp, num_pages, 1, 1, chunk_k.data(),
+                             chunk_score.data(), tail_k.data(),
+                             tail_score.data(), ape.data(), rpi.data(),
+                             nt.data(), css.data(), tlb.data(), loc.data(),
+                             nullptr, out.data(), nullptr);
+  const float scale = *reinterpret_cast<const float*>(out.data() + ssp * H);
+  EXPECT_TRUE(scale > 0.0f && std::isfinite(scale));
+  // q = bf16(eps*kScale) / (bf16((2+eps)*kScale)/448) ~ 0.0137 in
+  // [2^-7, 3*2^-7): the subnormal branch stores mant=1 with exp=0.
+  int subnorm = 0;
+  for (int d = 0; d < H; d += 2) {
+    if (out[d] == ((d % 4 == 0) ? 0x01 : 0x81)) ++subnorm;
+  }
+  EXPECT_EQ(subnorm, H / 2);  // every tiny lane encoded as a subnormal
+  // The O(1) lanes must quantize to finite normal codes, not zeros.
+  EXPECT_NE(out[1], 0x00);
+  EXPECT_NE(out[3], 0x00);
+}
+
+TEST(DsaKpoolFp8, AssembleNonFiniteKeyWritesZeroRowAndZeroScale) {
+  // All-inf keys make every acc non-finite: the store must take the
+  // x[d]=0 fallback for every lane, report any_finite=false -> 0 scale,
+  // and write the all-zero K row (the documented empty-pool contract).
+  constexpr int H = 128;
+  const float inf = std::numeric_limits<float>::infinity();
+  std::vector<float> chunk_k(H, inf), chunk_score(H, 0.5f), ape(H, 0.0f);
+  std::vector<float> tail_k(H, 0.0f), tail_score(H, 0.0f);
+  std::vector<int32_t> rpi = {0}, nt = {0}, css = {0}, tlb = {0}, loc = {0};
+  const int ssp = 1, num_pages = 1;
+  const int page_bytes = ssp * (H + 4);
+  std::vector<uint8_t> out((size_t)num_pages * page_bytes, 0xABu);
+  float round_scale = 0.0f;
+  dsa_kpool_assemble_fp8_cpu(1, 1, H, 1, ssp, num_pages, 1, 1, chunk_k.data(),
+                             chunk_score.data(), tail_k.data(),
+                             tail_score.data(), ape.data(), rpi.data(),
+                             nt.data(), css.data(), tlb.data(), loc.data(),
+                             nullptr, out.data(), &round_scale);
+  int nonzero = 0;
+  for (int i = 0; i < H; ++i)
+    if (out[i] != 0x00) ++nonzero;
+  EXPECT_EQ(nonzero, 0);  // K row all-zero
+  const float scale = *reinterpret_cast<const float*>(out.data() + ssp * H);
+  EXPECT_EQ(scale, 0.0f);  // scale slot 0
+  EXPECT_EQ(round_scale, 0.0f);
 }
