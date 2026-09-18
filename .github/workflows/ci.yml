@@ -105,15 +105,28 @@ jobs:
         # so no install step: pytest runs straight from the workspace.
         # pip bootstraps what the image lacks (per the kpool step above, the
         # image ships no pytest/torch) — idempotent (no-op once torch/triton
-        # are baked in; first run pulls ~2.5 GB of torch wheels). The image
-        # ships python3-dev, so triton JIT compilation has its headers.
-        # Plain pip first; --break-system-packages covers externally-managed
-        # pythons (PEP 668 rejects before downloading, so the retry is
-        # cheap). gdn_delta's device test is excluded: it is floe-oracle-
-        # gated and would only ever skip here.
+        # are baked in). Plain pip first; --break-system-packages covers
+        # externally-managed pythons (PEP 668 rejects before downloading, so
+        # the retry is cheap — and IS hit on the NGC base image).
+        # Triton's loader, unlike torch's, needs a real file path for
+        # libcuda.so.1: it only greps the ldconfig cache, which predates the
+        # runner's SONAME-mapped driver mounts (dlopen-by-soname works — the
+        # kpool step proves it — and once torch has loaded libcuda, triton's
+        # dlopen returns the same handle, so any valid path satisfies
+        # discovery). Locate the mount and export it.
+        # gdn_delta's device test is excluded: it is floe-oracle-gated and
+        # would only ever skip here.
         run: |
           ~/runners/cuda-run.sh vkernels-ci:cuda13 bash -c '
             set -e
+            libcuda="$(find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o -name libcuda.so.1 -print 2>/dev/null | head -1)"
+            if [ -z "$libcuda" ]; then
+              echo "FATAL: libcuda.so.1 not visible in the container — check ~/runners/nvidia-docker.sh mounts"
+              exit 1
+            fi
+            echo "triton: libcuda.so.1 at $libcuda"
+            export LD_LIBRARY_PATH="$(dirname "$libcuda")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export TRITON_LIBCUDA_PATH="$(dirname "$libcuda")"
             python3 -m pip install --quiet numpy pytest torch triton || \
               python3 -m pip install --quiet --break-system-packages numpy pytest torch triton
             python3 -m pytest -v \
