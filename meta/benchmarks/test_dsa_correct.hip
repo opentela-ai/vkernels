@@ -250,6 +250,11 @@ int main() {
       // -> dsa_config_for picks bq = 4): exercises the per-warp LDS
       // staging slices + uneven split on a multi-warp block.
       {64, 256, 1, 256, 0, 128, 64, 7},    // short, BQ=4, uneven split
+      // Issue #137: the vectorized partial kernel with BQ > 1 (64 keys per
+      // split clears the vec gate's keys>=32 bound at 32 blocks): exercises
+      // the lane-contiguous uint2 loads + fused combine on a multi-warp
+      // block (the row above falls below the vec gate and runs serial).
+      {64, 256, 1, 256, 0, 128, 64, 2},    // short, BQ=4, vec partial
   };
 
   for (int rep = 0; rep < reps; ++rep) {

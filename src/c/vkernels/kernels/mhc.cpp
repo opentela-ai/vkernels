@@ -48,6 +48,35 @@ void mhc_pre_gemm_sqrsum_cpu(int num_tokens, int hc_mult, int hidden_size,
   }
 }
 
+void mhc_pre_gemm_sqrsum_cpu_f64(int num_tokens, int hc_mult, int hidden_size,
+                                 const float* x, const float* fn,
+                                 double* out, double* sqrsum) {
+  const int hc_hidden_size = hc_mult * hidden_size;
+  const int hc_mult3 = hc_mult * (2 + hc_mult);
+  VK_EXPECTS(hc_mult > 0 && hidden_size > 0, "hc_mult and hidden_size must be positive");
+  VK_EXPECTS(hc_mult3 <= 32, "hc_mult*(2+hc_mult) must be <= 32");
+  VK_EXPECTS(num_tokens == 0 || x != nullptr, "x must not be null");
+  VK_EXPECTS(num_tokens == 0 || fn != nullptr, "fn must not be null");
+  VK_EXPECTS(num_tokens == 0 || out != nullptr, "out must not be null");
+  VK_EXPECTS(num_tokens == 0 || sqrsum != nullptr, "sqrsum must not be null");
+
+  for (int n = 0; n < num_tokens; ++n) {
+    const float* xn = x + (size_t)n * hc_hidden_size;
+    double sq = 0.0;
+    for (int h = 0; h < hc_hidden_size; ++h)
+      sq += (double)xn[h] * (double)xn[h];
+    sqrsum[n] = sq;
+    double* on = out + (size_t)n * hc_mult3;
+    for (int o = 0; o < hc_mult3; ++o) {
+      const float* fo = fn + (size_t)o * hc_hidden_size;
+      double acc = 0.0;
+      for (int h = 0; h < hc_hidden_size; ++h)
+        acc += (double)xn[h] * (double)fo[h];
+      on[o] = acc;
+    }
+  }
+}
+
 void mhc_post_cpu(int num_tokens, int hc, int hidden,
                   const float* a, const float* b, const float* c,
                   const float* d, float* out) {

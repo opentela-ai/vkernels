@@ -161,19 +161,47 @@ int vk_hip_moe_align_block_size(
  * RoPE slice; `k_c`/`v_c` are the compressed latent (kv_lora_rank);
  * `k_pe` is the decoupled RoPE part.
  *
- *   q           [B, S_q, H, kv_lora_rank + qk_rope_head_dim]  float32
+ *   q           [B, H, S_q, kv_lora_rank + qk_rope_head_dim]  float32
  *   k_c         [B, S_kv, kv_lora_rank]                       float32
  *   k_pe        [B, S_kv, qk_rope_head_dim]                   float32
  *   v_c         [B, S_kv, kv_lora_rank]                       float32
- *   out         [B, S_q, H, kv_lora_rank]                     float32
+ *   out         [B, H, S_q, kv_lora_rank]                     float32
  *   q_start/kv_start  row offsets into the (B, S) batch
  *   scale             1/sqrt(kv_lora_rank + qk_rope_head_dim)
+ *
+ * Layout matches the CPU oracle `vk_mla_fwd` in capi.hpp and the C++
+ * kernels (mla.cpp / mla.hip index q as ((b*H + h)*S_q + row)*D + d).
+ * Enqueues on the default stream and returns without synchronising —
+ * the caller owns sync + hipGetLastError(). Use `vk_hip_mla_fwd_stream`
+ * below for capture-safe (issue #45) execution on a caller stream.
  */
 void vk_hip_mla_fwd(
     int B, int H, int S_q, int S_kv, int q_start, int kv_start,
     int kv_lora_rank, int qk_rope_head_dim, float scale,
     const float* q, const float* k_c, const float* k_pe,
     const float* v_c, float* out);
+
+/* Stream-safe MLA forward (issue #69 convention, for the #45 vLLM decode
+ * path): same contract as vk_hip_mla_fwd, but every kernel is enqueued on
+ * the caller's hipStream_t (`stream`, passed as void* — e.g. torch's
+ * current stream via
+ * `torch.cuda.current_stream().cuda_stream`) and NO allocation, free, or
+ * synchronisation happens inside, so the call is safe under graph capture
+ * (hipStreamBeginCapture). If the split-K decode workspace would need a
+ * resize during capture, the entry falls back to the capture-safe
+ * non-split kernel; warm the decode shape up once eagerly (one call before
+ * capture) to keep the split path inside the graph.
+ *
+ * Returns (int)hipGetLastError() after the enqueues: 0 / VK_OK on success,
+ * non-zero HIP error code otherwise — never silent, unlike the void
+ * legacy entry above. `stream == nullptr` is allowed and means legacy
+ * stream 0 (eager behaviour identical to vk_hip_mla_fwd).
+ */
+int vk_hip_mla_fwd_stream(
+    int B, int H, int S_q, int S_kv, int q_start, int kv_start,
+    int kv_lora_rank, int qk_rope_head_dim, float scale,
+    const float* q, const float* k_c, const float* k_pe,
+    const float* v_c, float* out, void* stream);
 
 /* ------------------------------------------------------------------ */
 /* DSA sparse-MLA forward (src/c/vkernels/kernels/dsa.hip, #51)      */

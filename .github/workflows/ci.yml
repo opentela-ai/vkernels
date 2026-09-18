@@ -75,6 +75,25 @@ jobs:
       - name: Test
         run: ~/runners/cuda-run.sh vkernels-ci:cuda13 ctest --preset cuda --output-on-failure
 
+      # Issue #60: the kpool .hip device sources are compiled into libvkernels
+      # by the CUDA build above, but the default target does not build the
+      # device-vs-oracle harness (it lives under meta/benchmarks, OFF by
+      # default). Reconfigure the SAME build dir with the benchmarks on (all
+      # earlier objects are cache hits), build + run the kpool device
+      # correctness test via its registered ctest entry, then exercise the
+      # ctypes device-ABI python wrapper tests against the CUDA-built
+      # libvkernels_c.so (stdlib unittest — no pytest/torch in the image; the
+      # torch-dependent tests skip themselves).
+      - name: kpool device correctness + device-ABI python tests
+        run: |
+          ~/runners/cuda-run.sh vkernels-ci:cuda13 bash -c '
+            set -e
+            cmake -S . -B build/cuda -DVKERNELS_BUILD_BENCHMARKS=ON
+            cmake --build build/cuda --target test_dsa_kpool_correct -j"$(nproc)"
+            ctest --test-dir build/cuda -R dsa_kpool_device_cuda --output-on-failure
+            VKERNELS_LIB="$PWD/build/cuda/src/c/libvkernels_c.so" \
+              python3 tests/python/test_dsa_kpool_device.py -v'
+
       - name: Build wheel (CUDA)
         run: ~/runners/cuda-run.sh vkernels-ci:cuda13 bash -c "bash meta/scripts/build_wheel.sh --cuda --output-dir dist"
 

@@ -309,12 +309,13 @@ namespace {
 template <int BQ>
 void launch(const float* q, const float* k_c, const float* k_pe,
             const float* v_c, float* out, int B, int H, int S_q, int S_kv,
-            int q_start, int kv_start, int lr, int rhd, float scale) {
+            int q_start, int kv_start, int lr, int rhd, float scale,
+            hipStream_t st) {
   const int Dq = lr + rhd;
   const int shmem = BQ * Dq * sizeof(float);
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, B);
-  mla_fwd_kernel<BQ><<<grid, block, shmem, 0>>>(
+  mla_fwd_kernel<BQ><<<grid, block, shmem, st>>>(
       q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start, lr, rhd,
       scale);
 }
@@ -338,13 +339,21 @@ SplitWorkspace& split_ws() {
 }
 
 // Split-K decode launch: allocates (grow-only) the per-split partial buffers
-// and enqueues the split kernel + fixed-order combine kernel on the default
-// stream. Returns false when the buffers cannot be sized; the caller then
-// falls back to the plain single-block path.
+// and enqueues the split kernel + fixed-order combine kernel on the caller
+// stream (`st`; nullptr = legacy default stream 0). Returns false when the
+// buffers cannot be sized; the caller then falls back to the plain
+// single-block path.
+//
+// Capture safety (issue #45): the resize path hipFree()s, which
+// device-synchronises — illegal mid-capture. While `st` is capturing we
+// therefore never touch the workspace: if it is already sized (caller warmed
+// the shape up before capture, the steady-state serving pattern) the split
+// path enqueues on `st` exactly as eagerly; otherwise we return false and the
+// caller falls back to the capture-safe non-split kernel.
 bool launch_split(const float* q, const float* k_c, const float* k_pe,
                   const float* v_c, float* out, int B, int H, int S_q,
                   int S_kv, int q_start, int kv_start, int lr, int rhd,
-                  float scale, int split) {
+                  float scale, int split, hipStream_t st) {
   const int Dq = lr + rhd;
   const int kvs = (S_kv + split - 1) / split;  // every split keeps >= 1 key
   const size_t rows = (size_t)B * H * S_q;
@@ -353,31 +362,37 @@ bool launch_split(const float* q, const float* k_c, const float* k_pe,
 
   auto& w = split_ws();
   std::lock_guard<std::mutex> lock(w.mu);
-  if (w.cap_out < n_out) {
-    float* p = nullptr;
-    if (hipMalloc(&p, n_out * sizeof(float)) == hipSuccess) {
-      if (w.partial_out) hipFree(w.partial_out);
-      w.partial_out = p;
-      w.cap_out = n_out;
+  hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
+  const bool capturing =
+      st != nullptr && hipStreamIsCapturing(st, &cap_status) == hipSuccess &&
+      cap_status == hipStreamCaptureStatusActive;
+  if (!capturing) {
+    if (w.cap_out < n_out) {
+      float* p = nullptr;
+      if (hipMalloc(&p, n_out * sizeof(float)) == hipSuccess) {
+        if (w.partial_out) hipFree(w.partial_out);
+        w.partial_out = p;
+        w.cap_out = n_out;
+      }
     }
-  }
-  if (w.cap_lse < n_lse) {
-    float* p = nullptr;
-    if (hipMalloc(&p, n_lse * sizeof(float)) == hipSuccess) {
-      if (w.partial_lse) hipFree(w.partial_lse);
-      w.partial_lse = p;
-      w.cap_lse = n_lse;
+    if (w.cap_lse < n_lse) {
+      float* p = nullptr;
+      if (hipMalloc(&p, n_lse * sizeof(float)) == hipSuccess) {
+        if (w.partial_lse) hipFree(w.partial_lse);
+        w.partial_lse = p;
+        w.cap_lse = n_lse;
+      }
     }
   }
   if (w.cap_out < n_out || w.cap_lse < n_lse) return false;
 
   const dim3 block(64);
   const dim3 gridS(S_q, H, B * split);
-  mla_fwd_split_kernel<<<gridS, block, Dq * sizeof(float), 0>>>(
+  mla_fwd_split_kernel<<<gridS, block, Dq * sizeof(float), st>>>(
       q, k_c, k_pe, v_c, w.partial_out, w.partial_lse, H, S_q, S_kv, q_start,
       kv_start, lr, rhd, scale, split, kvs);
   const dim3 gridC(S_q, H, B);
-  mla_fwd_split_combine_kernel<<<gridC, block, split * sizeof(float), 0>>>(
+  mla_fwd_split_combine_kernel<<<gridC, block, split * sizeof(float), st>>>(
       w.partial_out, w.partial_lse, out, S_q, split, lr);
   return true;
 }
@@ -387,41 +402,44 @@ void mla_fwd_with_tile(int B, int H, int S_q, int S_kv, int q_start,
                        int kv_start, int kv_lora_rank, int qk_rope_head_dim,
                        float scale, const float* q, const float* k_c,
                        const float* k_pe, const float* v_c, float* out,
-                       int bq, int bn_kv) {
+                       int bq, int bn_kv, void* stream) {
   (void)bn_kv;  // baseline streams one key at a time; reserved for a tiled
                 // key prefetch in a follow-on optimisation.
+  hipStream_t st = static_cast<hipStream_t>(stream);
   if (bq <= 1)
     launch<1>(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
-              kv_lora_rank, qk_rope_head_dim, scale);
+              kv_lora_rank, qk_rope_head_dim, scale, st);
   else if (bq <= 2)
     launch<2>(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
-              kv_lora_rank, qk_rope_head_dim, scale);
+              kv_lora_rank, qk_rope_head_dim, scale, st);
   else if (bq <= 4)
     launch<4>(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
-              kv_lora_rank, qk_rope_head_dim, scale);
+              kv_lora_rank, qk_rope_head_dim, scale, st);
   else
     launch<8>(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
-              kv_lora_rank, qk_rope_head_dim, scale);
+              kv_lora_rank, qk_rope_head_dim, scale, st);
 }
 
 void mla_fwd(int B, int H, int S_q, int S_kv, int q_start, int kv_start,
              int kv_lora_rank, int qk_rope_head_dim, float scale,
              const float* q, const float* k_c, const float* k_pe,
-             const float* v_c, float* out) {
+             const float* v_c, float* out, void* stream) {
+  hipStream_t st = static_cast<hipStream_t>(stream);
   // Decode shaped grids that cannot fill the CUs take the split-K path
   // (issue #82); mla_fwd_split_for returns 1 for prefill shapes and for
   // grids that already fill them, which then run exactly as before.
   const int split = ::vkernels::kernels::mla_fwd_split_for(B, H, S_q, S_kv);
   if (split > 1 &&
       launch_split(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
-                   kv_lora_rank, qk_rope_head_dim, scale, split)) {
+                   kv_lora_rank, qk_rope_head_dim, scale, split, st)) {
     return;
   }
   int bq = 0, bn = 0, th = 0;
   ::vkernels::kernels::mla_config_for(S_q, kv_lora_rank, qk_rope_head_dim,
                                       &bq, &bn, &th);
   mla_fwd_with_tile(B, H, S_q, S_kv, q_start, kv_start, kv_lora_rank,
-                    qk_rope_head_dim, scale, q, k_c, k_pe, v_c, out, bq, bn);
+                    qk_rope_head_dim, scale, q, k_c, k_pe, v_c, out, bq, bn,
+                    stream);
 }
 
 }  // namespace vkernels::kernels::hip

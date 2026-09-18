@@ -355,19 +355,17 @@ int dsa_sparse_fwd_split_for(int S_q, int H, int topk, int block_I,
   // Decode shapes: the optimum is set by the per-block SERIAL key chain (a
   // key's global read is a load->use dependency, ~1.2 us unpipelined), not
   // by CU filling -- over-subscription up to ~18 waves measured strictly
-  // beneficial. The split sweep (docs/performance/dsa/gfx942.md, MI300A)
-  // puts the best at 8-32 keys per split on every decode shape, and
-  // ceil(sqrt(2*topk)) lands on the measured best or its nearest measured
-  // neighbor on all four: topk=2048 -> 64 (19.7x), 256 -> 23 (best 16),
-  // 128 -> 16 (4.1x), DSv3 256 -> 23 (best 16). The indexer's floor-division
-  // formula (num_cu/blocks) is WRONG here: it recommends 3-4 at H=64, 5-6x
-  // off the measured optimum, because it models CU filling, not the serial
-  // chain. block_I stays reserved for the future tiled-key variant (whose
-  // split cap WILL be ceildiv(topk, block_I)); the streaming partial kernel
-  // reads one key at a time, so any split in [1, topk] is legal.
+  // beneficial for the pre-#137 serial/db dispatch, whose best sat at 8-32
+  // keys per split. Issue #137 (unfused vectorized partial, jobs 641060 +
+  // 641089) shifted the optima: topk=2048 -> 32 (99.0 us / 679 GB/s, 64
+  // keys/split), topk=256 -> 8 (40.0 us, 32 keys/split; 16 within 2%),
+  // topk=128 -> 8 (31.2 us, 16 keys/split), DSv3 -> 16 (db regime, 85.4
+  // us). The recommendation tracks the measured best with two bands:
+  // topk >= 1024 -> 32, else min(topk, 16). block_I stays reserved for the
+  // future tiled-key variant (whose split cap WILL be ceildiv(topk,
+  // block_I)); any split in [1, topk] is legal.
   (void)block_I;
-  int s = (int)std::ceil(std::sqrt(2.0 * (double)topk));
-  if (s > topk) s = topk;   // every split keeps >= 1 key
+  int s = topk >= 1024 ? 32 : (topk < 16 ? topk : 16);
   return s < 1 ? 1 : s;
 }
 

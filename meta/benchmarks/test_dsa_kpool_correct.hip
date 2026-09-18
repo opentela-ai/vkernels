@@ -525,6 +525,14 @@ void run_decode_fp8(const DCfg& c, bool round_scale, hipStream_t,
 }  // namespace
 
 int main() {
+  // Graceful skip (ctest SKIP_RETURN_CODE 77) when no GPU is visible: the
+  // CUDA CI registers this binary as a test, and a CUDA build may also be
+  // configured on a GPU-less box (compile-only check).
+  int ndev = 0;
+  if (hipGetDeviceCount(&ndev) != hipSuccess || ndev < 1) {
+    std::printf("SKIP: no GPU device visible (count=%d)\n", ndev);
+    return 77;
+  }
   hipDeviceProp_t p;
   CK(hipGetDeviceProperties(&p, 0), "props");
   std::printf("GPU: %s (arch=%s)\n", p.name, p.gcnArchName);

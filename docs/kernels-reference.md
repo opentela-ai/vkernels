@@ -68,7 +68,7 @@ serving shape, not a theoretical optimum.
 | 23 | `dsa_kpool_assemble` / `_decode_update` | MI300A | ps=8 t128, 256 pools / bs=512 | 12.2–21.5 µs, ≤214 GB/s | 5300 GB/s / 2.8 µs dispatch floor | 4% HBM; ~4–7× dispatch floor | **launch/occupancy** (sub-µs kernels; ~15 ns/request marginal) | [dsa-kpool/gfx942](performance/dsa-kpool/gfx942.md) |
 | 24 | `dsa_kpool_*` (A100 port) | A100 (via HIP→CUDA shim) | same | 6.0–15.7 µs, ≤294 GB/s | 2039 GB/s | 14.5% HBM | launch | [dsa-kpool/A100](performance/dsa-kpool/A100.md) |
 | 25 | `dsa_kpool_*_fp8` | MI300A + A100 | same | +10–20% vs bf16 | — | deliberate: half cache footprint + graph capture | launch (2 extra smem reductions) | [dsa-kpool/fp8](performance/dsa-kpool/fp8.md) |
-| 26 | `mhc_pre_gemm_sqrsum` | MI300A | GLM decode n=1, hc_hidden=16384 | 278 µs, 5.8 GB/s | HBM | 0.1% HBM | occupancy (**1 block on 228 CUs**; serial hc_hidden walk) | [mhc/gfx942](performance/mhc/gfx942.md) |
+| 26 | `mhc_pre_gemm_sqrsum` | MI300A | GLM decode n=1, hc_hidden=16384 | 278 µs → **43.5 µs (ns=16) / 30.8 µs (ns=32)** blocked, #138 gate | HBM | 0.1% HBM | occupancy (**1 block on 228 CUs**; serial hc_hidden walk — fixed by the #79 blocked-order split + #128 fp64-reference gate) | [mhc/gfx942](performance/mhc/gfx942.md) |
 | 27 | `mhc_post` | MI300A | n=1..7, hc=4, hidden=4096 | < 0.5 µs | event-timer floor | free | negligible — no work warranted | same |
 | 28 | torch_ops `qkv_projection` (Triton) | MI300A | [3×8192,4096], M=1 | 70.1 µs vs 517.5 BLAS | — | **7.4× vs default BLAS** (TunableOp 76 µs) | BLAS algorithm choice | [qkv-projection](qkv-projection.md) |
 | 29 | torch_ops `mhc_projection` (Triton) | MI300A | [24,16384], M=1 | 3.94 µs vs 146.2 BLAS | — | **37× vs default BLAS** | single-GEMV dispatch overhead | [mhc-projection](mhc-projection.md) |
@@ -221,8 +221,12 @@ msl=512 (10.3× vs the fp32-Q scalar baseline's 2717 µs), 893 µs at
 msl=4096; `split_kv=64` cuts that to 190 µs (4.7×). Occupancy-bound (one
 wavefront); batch scaling free to ~228.
 
-**MHC**: `mhc_pre` 278 µs at decode (single-block floor — split-column
-redesign documented); `mhc_post` sub-µs (free). n=7 costs the same as n=1.
+**MHC**: `mhc_pre` 278 µs at decode pre-#79 (single-block floor); the
+#79 blocked-order split + the #138 conditioning-normalized fp64-reference
+correctness gate (`|got−fp64| ≤ K·eps·Σ|x·fn|`, K=256; strict 1e-4
+oracle-chain gate kept via `VK_MHC_STRICT_GATE=1`) make NSLICE≥16
+admissible: **43.5 µs at ns=16, 30.8 µs at ns=32** (≤50 µs/layer target
+met). `mhc_post` sub-µs (free). n=7 costs the same as n=1.
 
 **kpool bookkeeping** (`dsa_kpool_*`): 6–22 µs per step at serving shapes,
 ~15 ns/request marginal on MI300A (~7 ns on A100). Launch/occupancy-bound

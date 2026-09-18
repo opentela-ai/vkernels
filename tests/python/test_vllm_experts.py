@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover
 
 from vkernels.vllm_experts import (
     CaptureSafeScratch,
+    _align_em_bound,
     find_libvkernels_hip,
     max_em_count,
     max_num_tokens_hint,
@@ -168,6 +169,110 @@ class MoeAlignWithMapTest(unittest.TestCase):
         # All padding.
         np.testing.assert_array_equal(sids, np.full(EM, 4, dtype=np.int32))
         np.testing.assert_array_equal(eids, np.full(EM // 16, -1, dtype=np.int32))
+
+
+class GpuAlignDefaultTest(unittest.TestCase):
+    """Issue #78: the on-device moe_align path is the DEFAULT.
+
+    The PP0 ``topk_ids.cpu()`` host round-trip (97-100% of PP0's per-call
+    ``moe:vkernel_apply``) must be gone unless explicitly disabled with
+    VKERNELS_GPU_ALIGN=0.
+    """
+
+    def test_default_is_on(self):
+        import vkernels.vllm_experts as ve
+
+        if os.environ.get("VKERNELS_GPU_ALIGN") is not None:
+            self.skipTest("VKERNELS_GPU_ALIGN is set in this environment")
+        self.assertTrue(ve._GPU_ALIGN)
+
+    def test_env_zero_disables(self):
+        # The opt-OUT must still work: a fresh interpreter with
+        # VKERNELS_GPU_ALIGN=0 must see _GPU_ALIGN False.
+        import subprocess
+        import sys
+
+        code = (
+            "import sys; sys.path.insert(0, {!r}); "
+            "import vkernels.vllm_experts as ve; "
+            "print(int(ve._GPU_ALIGN))"
+        ).format(str(_SRC))
+        env = dict(os.environ, VKERNELS_GPU_ALIGN="0")
+        out = subprocess.run(
+            [sys.executable, "-c", code], env=env,
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(out.stdout.strip(), "0")
+
+
+class AlignEmBoundTest(unittest.TestCase):
+    """_align_em_bound must upper-bound the real EM for every routing.
+
+    The on-device fast path sizes the GEMM grid at bound/block_size (a
+    host constant — capture-safe); the kernels early-out the padding
+    blocks/rows. If the bound were ever BELOW the real EM the fast path
+    would silently truncate real tokens, so check it against the CPU
+    reference over uniform, hot-expert, and skewed routings (the
+    test_glm_fp8_grouped_multitile lesson: skewed routing is where
+    layout assumptions break).
+    """
+
+    def _check(self, ids, local_n, bs, expert_map=None):
+        M, top_k = ids.shape
+        E = expert_map.shape[0] if expert_map is not None else local_n
+        _sids, _eids, EM = moe_align_block_size_with_map(
+            ids.ravel(), E, bs, expert_map=expert_map
+        )
+        bound = _align_em_bound(M, top_k, local_n, bs)
+        self.assertGreaterEqual(bound, EM, f"bound {bound} < EM {EM}")
+        self.assertEqual(bound % bs, 0)
+
+    def test_uniform_random(self):
+        rng = np.random.default_rng(42)
+        for M, top_k, local_n, bs in [
+            (1, 8, 32, 16), (8, 8, 32, 16), (50, 8, 32, 64),
+            (32, 16, 896, 64),
+        ]:
+            ids = rng.integers(0, local_n, size=(M, top_k), dtype=np.int32)
+            with self.subTest(M=M, top_k=top_k, local_n=local_n, bs=bs):
+                self._check(ids, local_n, bs)
+
+    def test_hot_expert(self):
+        # All tokens to one expert: max intra-expert padding.
+        for M, top_k, local_n, bs in [(8, 1, 4, 16), (50, 8, 32, 64)]:
+            ids = np.full((M, top_k), 1, dtype=np.int32)
+            with self.subTest(M=M, top_k=top_k, local_n=local_n, bs=bs):
+                self._check(ids, local_n, bs)
+
+    def test_skewed_distinct(self):
+        # One token per expert: max inter-expert padding.
+        ids = np.tile(np.arange(4, dtype=np.int32), (8, 1))
+        self._check(ids, 4, 16)
+
+    def test_skewed_power_law(self):
+        # Zipf-ish: expert 0 gets most tokens, the tail gets one each.
+        rng = np.random.default_rng(7)
+        M, top_k, local_n, bs = 64, 8, 32, 16
+        probs = 1.0 / np.arange(1, local_n + 1)
+        probs /= probs.sum()
+        ids = rng.choice(local_n, size=(M, top_k), p=probs).astype(np.int32)
+        self._check(ids, local_n, bs)
+
+    def test_tp_shard_with_skips(self):
+        # EP/TP sharding: half the global experts unmapped (-1).
+        rng = np.random.default_rng(11)
+        M, top_k, E, bs = 32, 8, 16, 16
+        ids = rng.integers(0, E, size=(M, top_k), dtype=np.int32)
+        expert_map = np.full(E, -1, dtype=np.int32)
+        expert_map[::2] = np.arange(E // 2, dtype=np.int32)
+        self._check(ids, E // 2, bs, expert_map=expert_map)
+
+    def test_never_below_one_block(self):
+        # Empty / all-skipped routing: bound must still cover the
+        # reference's min-one-block EM.
+        ids = np.zeros((2, 2), dtype=np.int32)
+        expert_map = np.array([-1, -1], dtype=np.int32)
+        self._check(ids, 2, 16, expert_map=expert_map)
 
 
 class FindLibTest(unittest.TestCase):

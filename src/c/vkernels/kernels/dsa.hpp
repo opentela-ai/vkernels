@@ -307,20 +307,19 @@ bool dsa_topk_logits_fits_lds_wmma(int num_heads, int head_dim, int block,
 // different CU count.
 int dsa_topk_logits_split_for(int batch_size, int max_seq_len, int block);
 
-// The optimal split for the HIP dsa_sparse_fwd_split forward. Unlike the
-// indexer's split_kv (pure CU-filling, floor formula), the forward's decode
-// optimum is set by the per-block SERIAL key chain: each split block's
-// key loop is a load->use dependency chain (~1.2 us per key unpipelined),
-// so over-subscribing the CUs up to ~18 waves measured strictly beneficial
-// and the CU-filling formula is 5-6x off (recommends 3-4 at H=64 where the
-// measured best is 16-64). The split sweep (docs/performance/dsa/gfx942.md,
-// MI300A) puts the best at 8-32 keys per split on every decode shape, and
-// ceil(sqrt(2*topk)) lands on the measured best or its nearest neighbor on
-// all four shapes (topk=2048 -> 64 = measured best, 19.7x; 256 -> 23, best
-// 16; 128 -> 16 = measured best; DSv3 256 -> 23, best 16):
+// The optimal split for the HIP dsa_sparse_fwd_split forward. The decode
+// dispatch is three-way since issue #137 (vectorized register-batched
+// partial for tail_dim==0 dim<=256 shapes -> double-buffered LDS kernel
+// behind its occupancy gate -> serial fallback), and the unfused vectorized
+// kernel measured >= the other two at EVERY admitted point (jobs 641060 +
+// 641089, MI300A). The measured optima: topk=2048 -> split=32 (99.0 us /
+// 679 GB/s, 31.6x vs unsplit serial; the old split=64 serial floor was
+// 156-169 us), topk=256 -> 8 (40.0 us), topk=128 -> 8 (31.2 us), DSv3 ->
+// 16 (db regime, 85.4 us), encoded as two bands:
 //
 //   split = 1                                   if ceildiv(S_q,BQ)*H >= NUM_CU
-//         = min(ceil(sqrt(2*topk)), topk)       otherwise
+//         = 32                                  if topk >= 1024
+//         = min(topk, 16)                       otherwise
 //
 // with NUM_CU = 228 (MI300A / gfx942; hipDeviceProp_t::multiProcessorCount,
 // verified on a CSCS beverin node). The plain-grid term returns 1 for

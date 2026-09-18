@@ -104,6 +104,21 @@ extern "C" void vk_hip_mla_fwd(
       q, k_c, k_pe, v_c, out);
 }
 
+// Stream-safe MLA forward (issue #69 convention): enqueue on the caller
+// stream, never allocate/sync internally (capture-safe, issue #45), and
+// surface hipGetLastError() instead of returning void.
+extern "C" int vk_hip_mla_fwd_stream(
+    int B, int H, int S_q, int S_kv, int q_start, int kv_start,
+    int kv_lora_rank, int qk_rope_head_dim, float scale,
+    const float* q, const float* k_c, const float* k_pe,
+    const float* v_c, float* out, void* stream) {
+  vkernels::kernels::hip::mla_fwd(
+      B, H, S_q, S_kv, q_start, kv_start,
+      kv_lora_rank, qk_rope_head_dim, scale,
+      q, k_c, k_pe, v_c, out, stream);
+  return (int)hipGetLastError();
+}
+
 // --- DSA sparse-MLA forward (GLM-5.3-Flash / DeepSeek-V3) ---
 extern "C" int vk_hip_dsa_sparse_fwd(
     int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,

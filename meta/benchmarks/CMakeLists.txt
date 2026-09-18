@@ -268,6 +268,16 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_mla_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_mla_correct)
 
+  # MLA stream/graph-capture safety (issues #45/#69): exercises the C ABI
+  # entry `vk_hip_mla_fwd_stream` under hipStreamBeginCapture — cold
+  # workspace (fallback path), warm workspace (split path in the graph),
+  # re-feed replay, and legacy/stream parity. vkernels for the CPU oracle,
+  # vkernels_hip for the C ABI (vk_hip_mla_fwd / vk_hip_mla_fwd_stream).
+  add_executable(test_mla_capture test_mla_capture.hip)
+  target_link_libraries(test_mla_capture PRIVATE vkernels::vkernels vkernels::vkernels_hip)
+  target_compile_features(test_mla_capture PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_mla_capture)
+
   add_executable(test_kda_correct test_kda_correct.hip)
   target_link_libraries(test_kda_correct PRIVATE vkernels::vkernels)
   target_compile_features(test_kda_correct PRIVATE cxx_std_17)
@@ -312,6 +322,13 @@ if(VKERNELS_HAS_HIP)
   target_link_libraries(test_dsa_correct PRIVATE vkernels::vkernels)
   target_compile_features(test_dsa_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_dsa_correct)
+
+  # Issue #137 focused split-sweep (decode shapes, env-selected dispatch
+  # variant per run -- see the file header).
+  add_executable(dsa_bench_split137 bench_dsa_split137.hip)
+  target_link_libraries(dsa_bench_split137 PRIVATE vkernels::vkernels)
+  target_compile_features(dsa_bench_split137 PRIVATE cxx_std_17)
+  vkernels_set_warnings(dsa_bench_split137)
 
   # DSA paged-MQA gated top-k logits (issue #51): the kpool>1 indexer path.
   add_executable(test_dsa_topk_correct test_dsa_topk_correct.hip)
@@ -405,6 +422,13 @@ if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
   target_include_directories(dsa_kpool_bench PRIVATE
     ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
   vkernels_set_warnings(dsa_kpool_bench)
+
+  # The device-vs-oracle harness is registered with CTest on the CUDA build
+  # (issue #60: until now the kpool .hip sources were COMPILED by the CUDA CI
+  # but never RUN there). The binary exits 77 when no GPU is visible, so the
+  # test skips (SKIP_RETURN_CODE) on GPU-less CUDA boxes instead of failing.
+  add_test(NAME dsa_kpool_device_cuda COMMAND test_dsa_kpool_correct)
+  set_tests_properties(dsa_kpool_device_cuda PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # bf16 GEMM correctness + benchmark on NVIDIA (issue #29 CUDA port): the

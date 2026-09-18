@@ -71,8 +71,9 @@
 #define hipEventDestroy cudaEventDestroy
 #define hipEventElapsedTime cudaEventElapsedTime
 
-// ---- device properties ----------------------------------------------------
+// ---- device properties / enumeration --------------------------------------
 #define hipGetDeviceProperties cudaGetDeviceProperties
+#define hipGetDeviceCount cudaGetDeviceCount
 // cudaDeviceProp has no gcnArchName; map it to name so AMD device-detection
 // code (e.g. strstr(p.gcnArchName, "gfx942")) keeps compiling and simply
 // falls through to NVIDIA/other device branches.
