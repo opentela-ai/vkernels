@@ -29,6 +29,9 @@ jobs:
         with:
           install: true
 
+      - name: Lint (ruff, pyflakes)
+        run: uvx ruff check src/python tests/python
+
       - name: Configure (coverage)
         run: cmake --preset coverage
 
