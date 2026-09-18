@@ -1580,6 +1580,117 @@ class RecordingBackend:
         )
         return out, SymbolicTensor(post)
 
+    def kda_delta(
+        self,
+        ssm_state: SymbolicTensor,
+        q: SymbolicTensor,
+        k: SymbolicTensor,
+        v: SymbolicTensor,
+        f: SymbolicTensor,
+        b: SymbolicTensor,
+        dt_bias: SymbolicTensor,
+        A_log: SymbolicTensor,
+        *,
+        layer: int,
+        scale: float,
+        lower_bound: Optional[float],
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """KDA gated delta rule decode step with element-wise decay
+        (GLM-5.3 ``Glm53LinearAttention``, seq==1 — Kimi delta attention).
+
+        Per head ``h`` over its ``[K, V]`` fp32 state slice (KDA heads are
+        square: K = V = head_dim; one q/k/v head each, no group expansion)::
+
+            g      = lower_bound * sigmoid(exp(A_log[h]) * (f[b,h] + dt_bias[h]))
+                     # log-space [K]; lower_bound None -> -exp(A_log)*softplus
+            beta   = sigmoid(b[b,h])
+            q_n    = q[b,h] / sqrt(|q|^2 + 1e-6) * scale
+            k_n    = k[b,h] / sqrt(|k|^2 + 1e-6)
+            s     *= exp(g)[None over V per k-row]      # element-wise decay
+            kv     = sum_k s * k_n                      # [V]
+            s     += k_n outer (beta * (v - kv))
+            o      = sum_k s * q_n                      # [V]
+
+        ``ssm_state`` is an external caller-owned pool ``[B, H, K, V]`` fp32,
+        read-modify-write per (batch, head) row — same §4.3 pattern as
+        gdn_conv/gdn_delta. ``q``/``k`` are the post-conv rows ``[B, H, K]``
+        (normalized *inside* the op, exactly as floe ``_l2norm`` conditions
+        them before ``_kda_recurrent``); ``v`` is ``[B, H, V]``; ``f`` is
+        the ``f_b(f_a(x))`` projection row ``[B, H, K]`` with ``dt_bias``
+        ``[H, K]`` and ``A_log`` ``[H]`` folded inside (the gate arithmetic
+        is per-(head, k-dim), so it rides with the task — unlike gdn_delta's
+        per-head scalars it cannot stay outside without a materialized
+        ``[B, H, K]`` intermediate). ``lower_bound`` is the config scalar
+        (``Glm53Config.linear_lower_bound``; ``None`` selects the guarded
+        softplus branch). All gate/state arithmetic fp32; output follows
+        ``v``'s dtype.
+
+        The op is position-independent: its ordering obligation is the
+        read-modify-write on the state pool (RAW/WAR/WAW hazards vs any
+        other op touching that storage). Records write effects on the pool
+        and returns ``(out, ssm_state_post)`` — the post-step state view
+        (same storage, bumped version) that later layers must read.
+        """
+        sv, qv, kv, vv, fv, bv = (
+            ssm_state.value, q.value, k.value, v.value, f.value, b.value,
+        )
+        if len(sv.shape) != 4:
+            raise CaptureError(f"kda_delta state pool must be [B, H, K, V]; got shape {sv.shape}")
+        B, H, K, V = sv.shape
+        if K != V:
+            raise CaptureError(f"kda_delta heads must be square (K = V = head_dim); got K={K}, V={V}")
+        if qv.shape != (B, H, K):
+            raise CaptureError(f"kda_delta q rows must be [B, {H}, {K}]; got shape {qv.shape}")
+        if kv.shape != (B, H, K):
+            raise CaptureError(f"kda_delta k rows must be [B, {H}, {K}]; got shape {kv.shape}")
+        if vv.shape != (B, H, V):
+            raise CaptureError(f"kda_delta v rows must be [B, {H}, {V}]; got shape {vv.shape}")
+        if fv.shape != (B, H, K):
+            raise CaptureError(f"kda_delta f rows (f_b projection) must be [B, {H}, {K}]; got shape {fv.shape}")
+        if bv.shape != (B, H):
+            raise CaptureError(f"kda_delta b logits must be [B, {H}]; got shape {bv.shape}")
+        if dt_bias.value.shape != (H, K):
+            raise CaptureError(f"kda_delta dt_bias must be [{H}, {K}]; got {dt_bias.value.shape}")
+        if A_log.value.shape != (H,):
+            raise CaptureError(f"kda_delta A_log must be [{H}]; got {A_log.value.shape}")
+        out = self.fresh_buffer(f"kda_delta_l{layer}{self._suffix()}", (B, H, V), dtype=vv.dtype)
+        self._record(
+            "kda_delta",
+            inputs=(ssm_state, q, k, v, f, b, dt_bias, A_log),
+            outputs=(out,),
+            attributes={"layer": layer, "scale": scale, "lower_bound": lower_bound},
+            reads=(
+                _regional_reads(sv), _regional_reads(qv), _regional_reads(kv),
+                _regional_reads(vv), _regional_reads(fv), _regional_reads(bv),
+                _regional_reads(dt_bias.value), _regional_reads(A_log.value),
+            ),
+            writes=(_regional_reads(sv), _regional_reads(out.value)),
+            source_location=f"layer {layer} kda delta rule",
+            numerical_contract={
+                "gate": "g = lower_bound * sigmoid(exp(A_log[h]) * (f[b,h] + dt_bias[h])) per (head, k-dim); lower_bound None -> g = -exp(A_log[h]) * softplus(f + dt_bias) with the x>20 guard",
+                "decay": "s *= exp(g) broadcast over the value axis (element-wise per k-row; richer than gdn_delta's scalar-per-head decay)",
+                "qk_norm": "q_n = L2(q)*scale, k_n = L2(k) per head, eps 1e-6 inside the sqrt (floe _l2norm)",
+                "beta": "beta = sigmoid(b[b,h])",
+                "delta_rule": "kv = sum_k s * k_n; s += k_n outer (beta * (v - kv))",
+                "readout": "o = sum_k s * q_n",
+                "accumulate": "fp32 arithmetic between gates and state (floe keeps the KDA recurrence fp32 unconditionally)",
+                "dtypes": "q/k/v/f/b workspace loads (.cg), dt_bias/A_log params, state pool fp32 [B, H, K, V] read-modify-write, out follows v's dtype",
+                "pool": "external caller-owned state pool; read-modify-write per decode step",
+            },
+        )
+        # Post-step state view: same pool, bumped version (cache_append's
+        # §4.3 pattern). Later layers must consume this view.
+        sid = sv.storage_id
+        post = self.graph.add_tensor(
+            f"kda_state_l{layer}_v{self.graph.storage_versions[sid]}",
+            sv.shape,
+            sv.dtype,
+            storage_id=sid,
+            strides=sv.strides,
+            offset=sv.offset,
+        )
+        return out, SymbolicTensor(post)
+
     def attention_scores(
         self,
         q: SymbolicTensor,

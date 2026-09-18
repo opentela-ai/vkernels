@@ -821,6 +821,12 @@ def lower_gdn_delta(op: Operator, graph: OperatorGraph) -> TaskFamily:
         write_regions=writes,
     )
 
+
+# ---------------------------------------------------------------------------
+# Attention: one task per (batch, head); valid prefix [0, p] (§5.3, §10.3)
+# ---------------------------------------------------------------------------
+
+
 def lower_kda_delta(op: Operator, graph: OperatorGraph) -> TaskFamily:
     """One task per (batch, head): the task owns the head's [K, V] state
     slice (read-modify-write, in registers on device) plus its q/k/v/f/gate
@@ -878,6 +884,7 @@ def lower_kda_delta(op: Operator, graph: OperatorGraph) -> TaskFamily:
         read_regions=reads,
         write_regions=writes,
     )
+
 
 def lower_attention_scores(op: Operator, graph: OperatorGraph) -> TaskFamily:
     q = graph.tensor(op.inputs[0])

@@ -2504,6 +2504,9 @@ def _t_gdn_heads_batched(
         og = on * (z * (1.0 / (1.0 + tl.exp(-z))))
         tl.store(out_ptr + bb.to(tl.int64) * (NH * HV) + h * HV + offs_v, og)
         task += P
+
+
+@triton.jit
 def _t_kda_heads_batched(
     worker: tl.int32,
     P: tl.int32,
@@ -2575,4 +2578,4 @@ def _t_kda_heads_batched(
         # plain readout (gated norm is the separate rms_norm_gated op)
         o = tl.sum(s * qn[:, None], axis=0)
         tl.store(out_ptr + bb.to(tl.int64) * (H * V) + h * V + offs_v, o)
-
+        task += P

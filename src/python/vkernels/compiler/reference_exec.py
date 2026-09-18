@@ -41,6 +41,10 @@ from .task_ir import TaskFamily
 __all__ = ["ExecutionTrace", "PhaseStat", "ReferenceExecutor", "ExecutorError", "decode_e4m3"]
 
 
+def _sigmoid(g):
+    """Overflow-stable elementwise sigmoid in fp64: 1/(1+e^-g) for g>=0,
+    e^g/(1+e^g) otherwise (avoids exp overflow warnings for gate <= -103,
+    where the device fp32 sigmoid saturates to exactly 0)."""
 def _stable_sigmoid(g: np.ndarray) -> np.ndarray:
     """Numerically stable sigmoid, fp64 mirror of the device epilogue
     ``1 / (1 + exp(-g))`` (issue #92). Overflow-safe for large |g|: the
@@ -158,12 +162,12 @@ class ReferenceExecutor:
             "embedding": self._body_embedding,
             "cache_append": self._body_cache_append,
             "gdn_conv": self._body_gdn_conv,
+            "gdn_delta": self._body_gdn_delta,
+            "kda_delta": self._body_kda_delta,
             "compressor_append": self._body_compressor_append,
             "cache_append_paged": self._body_cache_append_paged,
             "mhc_pre": self._body_mhc_pre,
             "mhc_post": self._body_mhc_post,
-            "gdn_delta": self._body_gdn_delta,
-            "kda_delta": self._body_kda_delta,
             "attention_scores": self._body_attention_scores,
             "attention_scores_paged": self._body_attention_scores_paged,
             "softmax": self._body_softmax,
