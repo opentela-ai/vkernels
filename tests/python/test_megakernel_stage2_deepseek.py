@@ -88,7 +88,6 @@ def _storage(cfg, W, st, graph, ws_plan, *, copy_state=False):
     put("comp_cos", st.comp_cos)
     put("comp_sin", st.comp_sin)
     put("valid_counts", st.valid_counts)
-    mix = (2 + cfg.hc) * cfg.hc
     for li, lw in enumerate(W.layers):
         for k, v in {
             "mhc_attn_fn": lw.mhc_attn.fn, "mhc_attn_base": lw.mhc_attn.base,
@@ -351,7 +350,6 @@ def test_compressor_boundary_and_series_state():
     _, _, out = _run(cfg, W, st, graph, sched, ws_plan, S, canary=False)
     assert np.abs(out - logits_ref).max() < 1e-5
     pools = _pools(cfg, S)
-    R = cfg.entries_per_series
     for li in range(cfg.layers):
         ss = pools["series_states"][li]
         # row 0 (p=5): no emission — state unchanged from seed [0, 1]

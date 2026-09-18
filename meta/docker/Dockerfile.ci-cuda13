@@ -1,0 +1,23 @@
+# meta/docker/Dockerfile.ci-cuda13
+#
+# Bake the megakernel device-test python deps into the ds6 CUDA CI image
+# (`vkernels-ci:cuda13`, NGC CUDA 13.0.3 devel base + python3-dev). The CI
+# workflow (ci.yml, cuda job "Device tests" step) pip-installs the same set
+# at runtime as a bootstrap; with them baked in that step's pip line becomes
+# an instant no-op and remains purely as a drift-catcher.
+#
+# Rebuild on ds6 after a base-image or toolkit bump:
+#   mkdir -p /tmp/vci-bake && cp meta/docker/Dockerfile.ci-cuda13 /tmp/vci-bake/Dockerfile
+#   docker build -t vkernels-ci:cuda13 /tmp/vci-bake
+# The previously tagged image stays addressable by ID (`docker images -a`);
+# rollback: docker tag <old-id> vkernels-ci:cuda13
+#
+# Note on the container runtime: ~/runners/cuda-run.sh mounts the workspace
+# at /ws and runs as the runner user with HOME=/tmp, so system site-packages
+# (root-owned, installed below) are read-only at test time — exactly what we
+# want. --break-system-packages is required: the base python is
+# externally-managed (PEP 668).
+
+FROM vkernels-ci:cuda13
+
+RUN python3 -m pip install --no-cache-dir --break-system-packages numpy pytest torch triton

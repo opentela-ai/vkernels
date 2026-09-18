@@ -246,7 +246,6 @@ def _prep(t, dtype, name, in_place_ok=False):
     must already match the ABI dtype — a cast would fork the buffer and
     silently drop the kernel's tail update.
     """
-    import torch
 
     if t.dtype != dtype:
         if in_place_ok:

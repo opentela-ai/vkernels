@@ -28,7 +28,6 @@ Chain of evidence:
 
 from __future__ import annotations
 
-import os
 import sys
 import pathlib
 
@@ -137,7 +136,7 @@ def test_capture_records_glm53_phase_structure():
     cfg = Glm53Config()
     rec = RecordingBackend()
     args = Glm53ModelArgs(rec, cfg, random_glm53_weights(cfg, seed=1), batch=2)
-    out = build_glm53_forward(rec, args)
+    build_glm53_forward(rec, args)
     kinds = [op.kind for op in rec.graph.ops]
     pos = 0
     for i, layer_kind in enumerate(cfg.mlp_layer_types):
@@ -320,7 +319,6 @@ def test_real_glm53_flash_dims_compile():
     args, out, graph, families, schedule, wp = _compile(cfg, seed=23, batch=1, workers=4,
                                                         materialize_hosts=False)
     n_tasks = sum(fam.domain.task_count if hasattr(fam, "domain") else 0 for fam in families)
-    n_phases = len(schedule.phases) if hasattr(schedule, "phases") else -1
     assert n_tasks > 0
     # every weight/pool external got a distinct flat storage
     assert len(args.host_by_sid) == len(set(args.host_by_sid))

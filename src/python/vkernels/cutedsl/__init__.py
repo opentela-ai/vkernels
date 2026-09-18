@@ -439,7 +439,6 @@ def _attention_cutedsl(q, k_kv, v_kv, *, is_causal, scale):
     envelope so :func:`attention` can fall back per call.
     """
     import torch
-    import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_drv

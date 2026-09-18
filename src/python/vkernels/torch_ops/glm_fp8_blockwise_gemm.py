@@ -682,7 +682,7 @@ def glm_moe_grouped_gemm_native(
 
     t, k = topk_index.shape
     h = x.shape[1]
-    two_i, h2 = gate_up_nz.shape[1], gate_up_nz.shape[2]
+    two_i = gate_up_nz.shape[1]
     i = two_i // 2
     dev = x.device
 

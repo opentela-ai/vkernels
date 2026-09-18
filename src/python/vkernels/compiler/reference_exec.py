@@ -882,7 +882,7 @@ class ReferenceExecutor:
         post_o = self.tensor(fam.outputs[1])  # [B, hc]
         comb_out = self.tensor(fam.outputs[2])  # [B, hc, hc]
         (bb,) = coords
-        hc, C = streams.shape[1], streams.shape[2]
+        hc = streams.shape[1]
         iters, eps = int(fam.params["iters"]), float(fam.params["eps"])
         rms_eps = float(fam.params["rms_eps"])
 
@@ -954,7 +954,7 @@ class ReferenceExecutor:
         norm_w = self.tensor(fam.inputs[9])  # [HV]
         out = self.tensor(fam.outputs[0])
         bb, h = coords
-        NV, HV, HK = state.shape[1], state.shape[2], state.shape[3]
+        NV = state.shape[1]
         NK = q.shape[1]
         kh = h // (NV // NK)
         scale, eps = fam.params["scale"], fam.params["eps"]
@@ -1005,7 +1005,6 @@ class ReferenceExecutor:
         a_log = self.tensor(fam.inputs[7])  # [H]
         out = self.tensor(fam.outputs[0])
         bb, h = coords
-        K, V = state.shape[2], state.shape[3]
         scale = fam.params["scale"]
         lower_bound = fam.params.get("lower_bound")
         s = state[bb, h].astype(np.float64)  # [K, V]

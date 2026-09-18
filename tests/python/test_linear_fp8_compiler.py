@@ -31,7 +31,6 @@ from vkernels.compiler.memory import plan_memory
 from vkernels.compiler.operator_ir import F32, F8_E4M3, I32
 from vkernels.compiler.reference_exec import ReferenceExecutor, decode_e4m3
 from vkernels.compiler.schedule_phase import PhaseSchedule
-from vkernels.compiler.task_ir import TileDomain
 
 QB = 128  # the DeepSeek quant block
 
@@ -210,7 +209,7 @@ def test_lowering_rejects_non_fp8_block_layout_and_bad_dtypes():
     x = recorder.external_tensor("x", (1, 256), F32, storage_id=3001)
     w = recorder.external_tensor("w", (256, 256), F32, storage_id=3002)
     scale = recorder.external_tensor("s", (2, 2), F32, storage_id=3003)
-    y = recorder.linear_fp8(x, w, scale, name="bad_dtypes")
+    recorder.linear_fp8(x, w, scale, name="bad_dtypes")
     with pytest.raises(ValueError, match="dtypes"):
         lower_graph(recorder.graph)
 

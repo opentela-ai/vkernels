@@ -236,6 +236,7 @@ gpu = pytest.mark.skipif(
 @gpu
 def test_device_t_rope_partial_matches_floe_oracle():
     pytest.importorskip("triton")
+    from tests.python._megakernel_launch import launch_task_body
     from vkernels.compiler.device_triton import _t_rope
 
     PartialRotaryEmbedding = _floe_partial_rope()
@@ -249,9 +250,7 @@ def test_device_t_rope_partial_matches_floe_oracle():
     sin = torch.from_numpy(sin_np).to(dev)
 
     y = torch.empty_like(x)
-    # worker=0, P=1: a single program covers every (b, head) task via the
-    # kernel's task-striding loop (the compiled path passes worker=pid, P=grid).
-    _t_rope[(1,)](0, 1, x, cos, sin, positions, y, B, H, D, ROT=ROTARY_DIM, TSTRIDE=ROTARY_DIM // 2)
+    launch_task_body(_t_rope, x, cos, sin, positions, y, B, H, D, ROT=ROTARY_DIM, TSTRIDE=ROTARY_DIM // 2)
 
     rope = PartialRotaryEmbedding(D, ROTARY_DIM, MAX_POS, THETA, dev, torch.float32)
     rope._build(dev)
@@ -264,6 +263,7 @@ def test_device_t_rope_partial_matches_floe_oracle():
 def test_device_t_rope_full_width_matches_oracle():
     """The Qwen3 call shape (ROT=D, TSTRIDE=D) is unchanged by the port."""
     pytest.importorskip("triton")
+    from tests.python._megakernel_launch import launch_task_body
     from vkernels.compiler.device_triton import _t_rope
 
     dev = torch.device("cuda")
@@ -277,9 +277,7 @@ def test_device_t_rope_full_width_matches_oracle():
     sin = torch.from_numpy(np.sin(np.concatenate([freqs, freqs], -1)).astype(np.float32)).to(dev)
 
     y = torch.empty_like(x)
-    # worker=0, P=1: single program sweeps all tasks (stateless kernel; the
-    # compiled path passes worker=pid, P=grid).
-    _t_rope[(1,)](0, 1, x, cos, sin, positions, y, B, H, D, ROT=D, TSTRIDE=D)
+    launch_task_body(_t_rope, x, cos, sin, positions, y, B, H, D, ROT=D, TSTRIDE=D)
 
     for b in range(B):
         p = int(positions[b])

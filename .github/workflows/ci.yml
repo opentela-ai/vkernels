@@ -29,6 +29,9 @@ jobs:
         with:
           install: true
 
+      - name: Lint (ruff, pyflakes)
+        run: uvx ruff check src/python tests/python
+
       - name: Configure (coverage)
         run: cmake --preset coverage
 
@@ -93,6 +96,50 @@ jobs:
             ctest --test-dir build/cuda -R dsa_kpool_device_cuda --output-on-failure
             VKERNELS_LIB="$PWD/build/cuda/src/c/libvkernels_c.so" \
               python3 tests/python/test_dsa_kpool_device.py -v'
+
+      - name: Device tests (self-contained megakernel templates, sm_121)
+        # The six megakernel device-test files whose device tests are
+        # self-contained (in-file oracles, no floe) run against the GB10
+        # GPU. Tests need only python3 + numpy + pytest + torch + triton and
+        # the pure-python package (conftest.py pins sys.path to src/python),
+        # so no install step: pytest runs straight from the workspace.
+        # pip line = drift-catcher: numpy/pytest/torch/triton are baked into
+        # the image (meta/docker/Dockerfile.ci-cuda13), so the plain attempt
+        # still trips PEP 668 on the externally-managed base python and the
+        # --break-system-packages retry then finds everything satisfied —
+        # two quick no-ops (~1s). On an unbaked image the retry bootstraps
+        # for real (~1 min of downloads). Tests need only python3 + those
+        # wheels and the pure-python package (conftest.py pins sys.path to
+        # src/python), so no install step: pytest runs straight from the
+        # workspace. Triton's loader, unlike torch's, needs a real file path
+        # for libcuda.so.1: it only greps the ldconfig cache, which predates
+        # the runner's SONAME-mapped driver mounts (dlopen-by-soname works —
+        # the kpool step proves it — and once torch has loaded libcuda,
+        # triton's dlopen returns the same handle, so any valid path
+        # satisfies discovery). Locate the mount and export it.
+        # gdn_delta's device test is excluded: it is floe-oracle-gated and
+        # would only ever skip here.
+        run: |
+          ~/runners/cuda-run.sh vkernels-ci:cuda13 bash -c '
+            set -e
+            libcuda="$(find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o -name libcuda.so.1 -print 2>/dev/null | head -1)"
+            if [ -z "$libcuda" ]; then
+              echo "FATAL: libcuda.so.1 not visible in the container — check ~/runners/nvidia-docker.sh mounts"
+              exit 1
+            fi
+            echo "triton: libcuda.so.1 at $libcuda"
+            export LD_LIBRARY_PATH="$(dirname "$libcuda")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export TRITON_LIBCUDA_PATH="$(dirname "$libcuda")"
+            python3 -m pip install --quiet numpy pytest torch triton || \
+              python3 -m pip install --quiet --break-system-packages numpy pytest torch triton
+            python3 -m pytest -v \
+              tests/python/test_megakernel_rope_neox.py \
+              tests/python/test_megakernel_gdn_conv.py \
+              tests/python/test_megakernel_values_gate.py \
+              tests/python/test_megakernel_kda_delta.py \
+              tests/python/test_megakernel_indexer_topk.py \
+              tests/python/test_megakernel_mla_decode.py
+          '
 
       - name: Build wheel (CUDA)
         run: ~/runners/cuda-run.sh vkernels-ci:cuda13 bash -c "bash meta/scripts/build_wheel.sh --cuda --output-dir dist"

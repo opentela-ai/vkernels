@@ -79,3 +79,13 @@ include-package-data = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+# Pyflakes: duplicate definitions/registry keys, unused imports/variables,
+# empty f-strings — the mechanical scar class that union splices leave behind.
+# Structure and style stay human-reviewed; this is the automatable floor.
+select = ["F"]

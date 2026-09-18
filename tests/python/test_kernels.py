@@ -532,7 +532,6 @@ class FusedMoeExpertFilterTest(unittest.TestCase):
 class MoeAlignTest(unittest.TestCase):
     def test_basic_8x4(self):
         M, top_k, E, BS = 8, 4, 4, 16
-        N = M * top_k  # 32
 
         # Expert 0: 5 (token0 ×4, token1 sel0); expert 1: 11; expert 2: 16
         topk_ids = np.zeros((M, top_k), dtype=np.int32)
@@ -1317,7 +1316,6 @@ class DsaFwdTest(unittest.TestCase):
             (1, 16, 2, 8, 2, 16),
         ]:
             W = dim + td
-            d_v = dim - td
             q = rng.standard_normal((1, S_q, H, W)).astype(_F32)
             kv = rng.standard_normal((1, S_kv, 1, W)).astype(_F32)
             idx = rng.integers(0, S_kv, size=(1, S_q, 1, tk),
@@ -1757,7 +1755,7 @@ class DsaKpoolDecodeUpdateTest(unittest.TestCase):
         # A single valid row at pool_size-1 (full pool) writes BOTH the out
         # cache and the live tail at [req, pos % tail_size].
         rng = np.random.default_rng(67)
-        H = 128; pool_size = 4; tail_size = 64; ssp = 8; btc = 2
+        H = 128; pool_size = 4; tail_size = 64; ssp = 8
         num_pages = 16; n_reqs = 1; batch = 1
         ky = rng.standard_normal((batch, H)).astype(_F32)
         ss = rng.standard_normal((batch, H)).astype(_F32)
