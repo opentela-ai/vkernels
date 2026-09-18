@@ -2,7 +2,10 @@
 
 > Looking for measured performance? See
 > [kernels-reference.md](kernels-reference.md) — every measured kernel,
-> tested hardware, and gap to speed of light in one table.
+> tested hardware, and gap to speed of light in one table. For the *methods*
+> behind those numbers — roofline classification, the optimization ladder,
+> occupancy/latency findings, numerics contracts — see the
+> [project wiki](https://github.com/opentela-ai/vkernels/wiki).
 
 This document lists every kernel and communication primitive in vkernels,
 along with the mathematical computation each performs. Every operation follows

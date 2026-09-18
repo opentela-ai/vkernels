@@ -221,8 +221,13 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
   CK(hipDeviceSynchronize(), "sync");
   std::fprintf(stderr, "[phase] device sync ok\n");
 
-  // Determinism probe: identical inputs + fresh memset, run twice; the
-  // two outputs must be bitwise equal for a data-race-free kernel.
+  // Determinism probe: identical inputs + fresh memset, run twice.
+  // combine_kernel accumulates into `out` via float atomicAdd, so the two
+  // runs differ only by accumulation ORDER (expected, by design) — the gate
+  // is therefore a BOUND on the rerun spread, not bitwise equality.  A real
+  // data race (torn/corrupted accumulation) produces deltas orders of
+  // magnitude above the ordering-noise floor observed on MI300A (<1e-3 of
+  // out_rms, see issue #86 audit log).
   {
     std::vector<float> out_run1((size_t)M * hidden);
     CK(hipMemcpy(out_run1.data(), dOut, (size_t)M * hidden * 4,
@@ -244,9 +249,20 @@ void run_case(const char* name, int E, int hidden, int ispp, int top_k, int M,
         ++nd;
         md = std::fmax(md, std::fabs((double)out_run1[i] - out_run2[i]));
       }
+    double sq1 = 0;
+    for (int i = 0; i < M * hidden; ++i)
+      sq1 += (double)out_run1[i] * out_run1[i];
+    const double run_rms = std::sqrt(sq1 / std::max(1, M * hidden));
+    // Ordering-noise gate: 1e-3 * out_rms is ~30x the MI300A observed
+    // maximum (7.6e-5 abs on out_rms 54-190); a genuine race blows past it.
+    const bool spread_ok = md <= 1e-3 * run_rms;
+    if (!spread_ok) ++g_failures;
     std::fprintf(stderr, "[determinism] differing elements: %d/%d "
-                 "(max |delta| = %.4g)%s\n", nd, M * hidden, md,
-                 nd ? "  -> NON-DETERMINISTIC (race)" : "");
+                 "(max |delta| = %.4g, run_rms = %.4g) -> %s%s\n",
+                 nd, M * hidden, md, run_rms,
+                 spread_ok ? "WITHIN atomic-order bound (PASS)"
+                           : "EXCEEDS atomic-order bound (FAIL: race)",
+                 (nd && spread_ok) ? " [float atomicAdd combine: order-only]" : "");
   }
 
   // Intermediate act comparison (matched by flat index across the two

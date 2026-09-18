@@ -50,6 +50,7 @@ EXPECTED_KERNELS = [
     ("dsa_topk_logits_fits_lds", "dsa"),
     ("dsa_topk_logits_fits_lds_fp8q", "dsa"),
     ("dsa_topk_logits_fits_lds_mfma", "dsa"),
+    ("dsa_topk_logits_fits_lds_mfma_fp8", "dsa"),
     # dsa_topk_logits_fits_lds_wmma (PR #30 review): the CUDA wmma kernel's
     # admission guard -- the MFMA gates + sAcc staging + the CUDA 1024
     # threads/block cap -- declared in dsa.hpp right after the mfma guard.

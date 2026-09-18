@@ -52,6 +52,10 @@ from .model_qwen3 import (
     build_qwen3_forward,
     random_qwen3_weights,
 )
+from .model_qwen35 import Qwen35ModelArgs, build_qwen35_forward
+from .model_deepseek_v4 import DeepseekV4ModelArgs, build_deepseek_v4_forward
+from .qwen35_arch import Qwen35Config, random_qwen35_weights
+from .deepseek_v4_arch import DeepseekV4Config, random_deepseek_weights
 from .operator_ir import I32, OperatorGraph
 from .reference_exec import ExecutionTrace, ReferenceExecutor
 from .runtime.launch import LaunchManifest, choose_worker_count, query_device_sms
@@ -296,17 +300,44 @@ def compile_model(
         model_config = GPT2Config()
     config = model_config
     is_qwen3 = isinstance(config, Qwen3Config)
+    is_qwen35 = isinstance(config, Qwen35Config)
+    is_deepseek = isinstance(config, DeepseekV4Config)
     config.validate()
     if model_body is None:
-        model_body = build_qwen3_forward if is_qwen3 else build_forward
+        if is_deepseek:
+            model_body = build_deepseek_v4_forward
+        elif is_qwen35:
+            model_body = build_qwen35_forward
+        else:
+            model_body = build_qwen3_forward if is_qwen3 else build_forward
     if weights is None:
-        weights = random_qwen3_weights(config, seed=seed) if is_qwen3 else random_weights(config, seed=seed)
+        if is_deepseek:
+            weights = random_deepseek_weights(config, seed=seed)
+        elif is_qwen35:
+            weights = random_qwen35_weights(config, seed=seed)
+        elif is_qwen3:
+            weights = random_qwen3_weights(config, seed=seed)
+        else:
+            weights = random_weights(config, seed=seed)
 
     # ---- capture (§4, M1) ----------------------------------------------
     recorder = RecordingBackend()
-    position = recorder.define_position(config.cache_capacity)
+    if is_qwen35 or is_deepseek:
+        # #93: the decode step is ragged-row native — per-row positions.
+        position = recorder.define_row_positions(
+            "row_positions", config.batch, config.cache_capacity, storage_id=10**6 + 5
+        )
+    else:
+        position = recorder.define_position(config.cache_capacity)
     ids = recorder.external_tensor("ids", (config.batch,), I32, storage_id=10**6)
-    args = Qwen3ModelArgs(recorder, config) if is_qwen3 else SymbolicModelArgs(recorder, config, weights)
+    if is_deepseek:
+        args = DeepseekV4ModelArgs(recorder, config)
+    elif is_qwen35:
+        args = Qwen35ModelArgs(recorder, config)
+    elif is_qwen3:
+        args = Qwen3ModelArgs(recorder, config)
+    else:
+        args = SymbolicModelArgs(recorder, config, weights)
     graph, recorder = capture_model(model_body, args, ids, position, config, backend=recorder)
 
     # ---- legality (§3.3) --------------------------------------------------

@@ -1,0 +1,15 @@
+split= 1 warmup lasterr=no error
+           nz=4096/4096 checksum=-nan
+split= 1  mean_us=216.48 over n=20 (zero-elapsed samples: 0)
+split= 8 warmup lasterr=no error
+           nz=4096/4096 checksum=-nan
+split= 8  mean_us=34.38 over n=20 (zero-elapsed samples: 0)
+split=16 warmup lasterr=no error
+           nz=4096/4096 checksum=-nan
+split=16  mean_us=21.31 over n=20 (zero-elapsed samples: 0)
+split=32 warmup lasterr=no error
+           nz=4096/4096 checksum=-nan
+split=32  mean_us=14.57 over n=20 (zero-elapsed samples: 0)
+split=64 warmup lasterr=no error
+           nz=4096/4096 checksum=-nan
+split=64  mean_us=12.02 over n=20 (zero-elapsed samples: 0)

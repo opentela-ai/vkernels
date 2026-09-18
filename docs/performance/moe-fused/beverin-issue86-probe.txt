@@ -1,0 +1,35 @@
+=== node: nid003032 job=640243 date: Thu Sep 17 03:56:33 PM UTC 2026 ===
+=== src md5: 228b87e4 ===
+
+=== build probe_moe_largeispp (incremental) ===
+[ 95%] Built target vkernels
+[100%] Built target probe_moe_largeispp
+
+###### A. repro ispp=4096 ######
+probe: E=32 hidden=7168 ispp=4096 top_k=16 M=1 kmajor
+[gateup] act rows=16 real only: worst_rel=0.004115 bad_rows=0/16
+[down]   out cols: worst_rel=0.165039 worst_col=1151 bad_cols=7/7168
+[down]   bad cols by pid_n (col/64): 6:1 7:1 17:1 19:1 30:1 51:1 90:1 
+[down]   bad cols by col%16: 0:1 5:1 7:1 8:1 9:1 15:2 
+[iso] CPU-down(GPU-act): vs GPU rel=0.008301 (col 1151) | vs CPU rel=0.156738
+Done.
+
+###### B. control ispp=3072 ######
+probe: E=32 hidden=7168 ispp=3072 top_k=16 M=1 kmajor
+[gateup] act rows=16 real only: worst_rel=0.000000 bad_rows=0/16
+[down]   out cols: worst_rel=0.003564 worst_col=2648 bad_cols=0/7168
+[down]   bad cols by pid_n (col/64): 
+[down]   bad cols by col%16: 
+[iso] CPU-down(GPU-act): vs GPU rel=0.002276 (col 2648) | vs CPU rel=0.001296
+Done.
+
+###### C. shard ispp=33792 (CPU oracle ON) ######
+probe: E=32 hidden=7168 ispp=33792 top_k=16 M=1 kmajor
+[gateup] act rows=16 real only: worst_rel=0.000488 bad_rows=0/16
+[down]   out cols: worst_rel=0.039498 worst_col=4315 bad_cols=3/7168
+[down]   bad cols by pid_n (col/64): 15:1 17:1 67:1 
+[down]   bad cols by col%16: 2:1 9:1 11:1 
+[iso] CPU-down(GPU-act): vs GPU rel=0.010834 (col 2554) | vs CPU rel=0.040594
+Done.
+
+===== DONE =====

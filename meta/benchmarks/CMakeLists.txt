@@ -176,6 +176,12 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(moe_fused_bench PRIVATE cxx_std_17)
   vkernels_set_warnings(moe_fused_bench)
 
+  # Issue #86 stage-split oracle probe at ispp >= 4096 (fault vs mismatch).
+  add_executable(probe_moe_largeispp probe_moe_largeispp.hip)
+  target_link_libraries(probe_moe_largeispp PRIVATE vkernels::vkernels)
+  target_compile_features(probe_moe_largeispp PRIVATE cxx_std_17)
+  vkernels_set_warnings(probe_moe_largeispp)
+
   add_executable(moe_fused_prefill_bench bench_moe_fused_prefill.hip)
   target_link_libraries(moe_fused_prefill_bench PRIVATE vkernels::vkernels)
   target_compile_features(moe_fused_prefill_bench PRIVATE cxx_std_17)

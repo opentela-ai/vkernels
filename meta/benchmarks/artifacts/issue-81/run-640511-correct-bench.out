@@ -1,0 +1,85 @@
+BUILD_OK
+############ CORRECTNESS ############
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  bs=1  H=32 D=128 B=64 mt=8  nb=8  split=1 v=auto out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=32 D=128 B=64 mt=16 nb=16 split=1 v=auto out[a=0.0000 r=0.000000]  PASS
+  bs=2  H=32 D=128 B=64 mt=8  nb=8  split=1 v=auto out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=32 D=128 B=64 mt=8  nb=8  split=2 v=auto out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=64 D=128 B=64 mt=8  nb=8  split=1 v=auto out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=64 D=128 B=64 mt=16 nb=16 split=1 v=auto out[a=0.0000 r=0.000000]  PASS
+  bs=2  H=64 D=128 B=64 mt=8  nb=8  split=1 v=auto out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=64 D=128 B=64 mt=8  nb=8  split=2 v=auto out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=128 D=128 B=64 mt=8  nb=8  split=1 v=auto out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=4  D=16  B=8  mt=32 nb=32 split=1 v=auto out[a=0.0020 r=0.000001]  PASS
+  bs=1  H=2  D=8   B=4  mt=16 nb=16 split=1 v=auto out[a=0.0020 r=0.000000]  PASS
+  bs=1  H=1  D=2   B=2  mt=4  nb=4  split=1 v=auto out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=32 D=128 B=64 mt=8  nb=8  split=1 v=fp32 out[a=0.0625 r=0.000011]  PASS
+  bs=1  H=32 D=128 B=64 mt=8  nb=8  split=1 v=fp8q out[a=0.0625 r=0.000037]  PASS
+  bs=1  H=32 D=128 B=64 mt=8  nb=8  split=1 v=mfma out[a=0.1250 r=0.000031]  PASS
+  bs=1  H=32 D=128 B=64 mt=8  nb=8  split=1 v=mfma8 out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=32 D=128 B=64 mt=16 nb=16 split=1 v=mfma8 out[a=0.0000 r=0.000000]  PASS
+  bs=2  H=32 D=128 B=64 mt=8  nb=8  split=1 v=mfma8 out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=32 D=128 B=64 mt=8  nb=8  split=2 v=mfma8 out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=64 D=128 B=64 mt=8  nb=8  split=1 v=mfma8 out[a=0.0000 r=0.000000]  PASS
+  bs=1  H=128 D=128 B=64 mt=8  nb=8  split=1 v=mfma8 out[a=0.0000 r=0.000000]  PASS
+
+PASS (0 failure(s))
+############ BENCH ############
+GPU: AMD Instinct MI300A (arch=gfx942)  228 CUs,  roof 1307 TFLOP/s bf16, 5300 GB/s HBM3, ridge ~247 FLOP/B
+
+=== hip::dsa_topk_logits (GLM-5.3 indexer) ===
+    bs    H ms_len    B   mt   nb  split   us(min)   us(med)      GB/s    AI  %bw  bound
+     1   32     512   64    8    8      1      35.4      38.1       1.9  57.2  0.0  mem
+     1   32    1024   64   16   16      1      63.3      65.7       2.2  58.9  0.0  mem
+     1   32    2048   64   32   32      1     112.2     117.6       2.4  59.8  0.0  mem
+     1   32    4096   64   64   64      1     216.5     220.6       2.5  60.2  0.0  mem
+     2   32     512   64    8    8      1      36.2      37.4       4.0  57.2  0.1  mem
+     4   32     512   64    8    8      1      37.1      38.8       7.6  57.2  0.1  mem
+     8   32     512   64    8    8      1      36.5      38.5      15.4  57.2  0.3  mem
+    16   32     512   64    8    8      1      36.2      38.9      30.4  57.2  0.6  mem
+    32   32     512   64    8    8      1      37.0      39.2      60.3  57.2  1.1  mem
+    64   32     512   64    8    8      1      35.1      39.7     119.1  57.2  2.2  mem
+     1   64     512   64    8    8      1      43.9      46.6       1.7 108.2  0.0  mem
+     1   64    1024   64   16   16      1      80.9      82.6       1.8 114.4  0.0  mem
+     1   64    4096   64   64   64      1     290.0     294.5       1.9 119.6  0.0  mem
+     1   32     128   64    2    2      1       0.0       0.0       inf  48.8  inf  mem
+  Roof: 1307 TFLOP/s bf16 (Matrix-Core), 5300 GB/s HBM3.
+  NB: the working set (68-560 KB for these shapes) is L2-resident
+      after warmup, so the kernel is NOT HBM-bandwidth-bound -- the
+      binding constraint at decode (bs=1, split=1) is OCCUPANCY: the
+      grid is ONE wavefront (one of MI300A's 228 CUs). split_kv
+      (below) distributes the page range across more CUs and gives
+      near-linear speedup; batch scaling is free parallelism up to
+      ~228 batches. The follow-on tiled-key/MFMA the kernel's
+      docstring references raises occupancy AND moves toward the
+      compute roof.
+
+=== split_kv sweep (bs=1 H=32 D=128 B=64 mt=64 nb=64, max_seq_len=4096, 228 CUs) ===
+  dsa_topk_logits_split_for(1, 4096, 64) = 64  (recommended)
+   split   us(min)   us(med)      GB/s   speedup
+       1     215.3     218.9       2.6      1.0x
+       2     111.8     117.0       4.8      1.9x
+       4      62.0      64.4       8.7      3.4x
+       8      36.0      39.0      14.4      5.6x
+      16       0.0       0.0       inf      infx
+      32       0.0       0.0       inf      infx
+      64       0.0       0.0       inf      infx
+  (split_kv is perf-only and grouping-independent -- the
+        reference logit is identical across splits; see
+        test_dsa_topk_correct.hip case split=2. Max split
+        here is ceildiv(max_seq_len,B)=64. The integrator
+        should set split_kv = min(ceildiv(max_seq_len,B),
+        CUs/batch_size) -- see dsa.hpp::dsa_topk_logits_split_for.)
+
+=== hip::dsa_topk_logits variant comparison (bs=1 H=32 D=128 B=64 max_seq_len=512, 228 CUs) ===
+     var   us(min)   us(med)   vs fp32
+    auto       0.0       0.0     1.00x
+    fp32    2706.7    2710.8     1.00x
+    fp8q    4225.5    4229.6     0.64x
+    mfma     283.6     297.9     9.10x
+   mfma8       0.0       0.0      infx
+  (auto dispatches mfma here -- the SMALLEST-variant + Matrix-Core path.
+   fp32-Q stages Q as fp32 once (49,536 B),
+   fp8-Q stages Q raw + dequants on the fly (41,472 B),
+   mfma   stages Q transposed bf16 once + bf16 K-tile (16,768 B).
+   See dsa.hpp::dsa_topk_logits_fits_lds{,_fp8q,_mfma}.)

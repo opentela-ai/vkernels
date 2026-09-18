@@ -46,9 +46,11 @@ if TYPE_CHECKING:
 __all__ = [
     "CaptureSafeScratch",
     "VkernelFusedExperts",  # noqa: F822 - provided via __getattr__
+    "convert_weights_for_vkernel",
     "max_em_count",
     "max_num_tokens_hint",
     "moe_align_block_size_with_map",
+    "register_vkernel_backend_shim",
 ]
 
 import ctypes
@@ -536,6 +538,204 @@ def _align_em_bound(M: int, top_k: int, local_n: int, block_size: int) -> int:
 # layers on a rank (matches the validated cookbook wrapper). Uses the vLLM
 # capture probe so the breakable eager-break window is covered.
 _scratch = CaptureSafeScratch(capture_probe=_vllm_capture_probe)
+
+
+# ---------------------------------------------------------------------------
+# Serving weight-format contract (issue #74)
+# ---------------------------------------------------------------------------
+#
+# :c:func:`vk_hip_fused_moe_mxfp4` consumes the RAW ``create_weights()``
+# layout: ``w13`` ``[E, 2*ispp, hidden/2]`` uint8 with the gate rows in
+# ``[0, ispp)`` and the up rows in ``[ispp, 2*ispp)`` (separated halves —
+# NOT gate/up pair-interleaved), ``w2`` ``[E, hidden, ispp/2]`` uint8, the
+# matching N-major ue8m0 scale tensors, and fp32 biases.
+#
+# The K3 serving integration registers :class:`VkernelFusedExperts` by
+# hijacking ``backend_to_kernel_cls`` for ``Mxfp4MoeBackend.AITER_MXFP4_BF16``
+# (see :func:`register_vkernel_backend_shim`). Without the conversion patch
+# installed there, vLLM's oracle
+# (``convert_weight_to_mxfp4_moe_kernel_format``) runs its **AITER** branch
+# for that enum and feeds the vkernels kernel aiter-gfx950 CK-shuffled
+# weights and scales — a layout the kernel reads as garbage. Every real-
+# weight ``VKERNELS_MXFP4_BF16`` serve then produced degenerate output
+# (wrong-but-finite ``.dartampionship…`` or all-NaN ``!!!!…`` logits),
+# while the same checkpoint on ``TRITON_UNFUSED`` was coherent. Issue #74.
+
+
+def convert_weights_for_vkernel(
+    w13_weight,
+    w2_weight,
+    w13_weight_scale,
+    w2_weight_scale,
+    *rest,
+    w13_bias=None,
+    w2_bias=None,
+    **_ignored,
+):
+    """Pass raw ``create_weights()``-layout MXFP4 MoE weights through to
+    :class:`VkernelFusedExperts` (issue #74 serving contract).
+
+    The vkernels HIP kernel reads exactly the layout vLLM's
+    ``Mxfp4MoEMethod.create_weights()`` produces — separated gate/up
+    halves, N-major ue8m0 scales — so no weight or scale transform is
+    needed. The only conversion is the bias dtype: the C ABI declares
+    ``const float* b13/b2`` (see ``hip_capi.cpp``), while
+    ``create_weights()`` registers bf16 bias parameters, so the biases are
+    cast to fp32 here (mirroring what the AITER/TRITON oracle branches do
+    for their kernels).
+
+    Accepts both oracle call shapes: the MoE variant
+    ``(w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)`` and the gpt-oss
+    variant which additionally carries ``w13_input_scale`` /
+    ``w2_input_scale`` / ``_cache_permute_indices`` after the biases
+    (ignored — the vkernels kernel takes no activation input scales).
+
+    Returns the 6-tuple ``(w13, w2, w13_scale, w2_scale, w13_bias,
+    w2_bias)`` in the ``convert_*_to_mxfp4_moe_kernel_format`` shape.
+    """
+    torch = _require_torch()
+    # Positional gpt-oss-variant biases (first two of ``rest``).
+    if len(rest) >= 1 and rest[0] is not None:
+        w13_bias = rest[0]
+    if len(rest) >= 2 and rest[1] is not None:
+        w2_bias = rest[1]
+    w13_weight = w13_weight.data
+    w2_weight = w2_weight.data
+    w13_weight_scale = w13_weight_scale.data
+    w2_weight_scale = w2_weight_scale.data
+    if w13_bias is not None:
+        w13_bias = w13_bias.data.to(torch.float32)
+    if w2_bias is not None:
+        w2_bias = w2_bias.data.to(torch.float32)
+    return (
+        w13_weight,
+        w2_weight,
+        w13_weight_scale,
+        w2_weight_scale,
+        w13_bias,
+        w2_bias,
+    )
+
+
+# Set by :func:`register_vkernel_backend_shim` once the backend_to_kernel_cls
+# hijack is live — from that point the ``AITER_MXFP4_BF16`` enum means the
+# vkernels backend, so the oracle conversion must be intercepted.
+_vkernel_shim_active = False
+
+
+def _patch_oracle_converters(oracle_mxfp4, aiter_bf16):
+    """Wrap the oracle module's two convert_* entry points so the
+    ``aiter_bf16`` enum (now denoting the vkernels backend) routes to
+    :func:`convert_weights_for_vkernel` and every other backend reaches its
+    OWN original converter. Module-level so tests can drive it against a
+    stub oracle: the wrapper binds ``_orig_convert`` per iteration via a
+    default-arg — a closure over the loop variable would leave BOTH
+    wrappers dispatching to the last original, misrouting non-AITER
+    backends across converters (silently-wrong weights — the exact class
+    issue #74 is about)."""
+    for _name in (
+        "convert_weight_to_mxfp4_moe_kernel_format",
+        "convert_gpt_oss_weight_to_mxfp4_moe_kernel_format",
+    ):
+        _orig_convert = getattr(oracle_mxfp4, _name, None)
+        if _orig_convert is None:
+            continue
+
+        def _vk_convert(mxfp4_backend, layer, *args,
+                        _orig_convert=_orig_convert, _aiter=aiter_bf16, **kwargs):
+            if mxfp4_backend == _aiter:
+                # The shim mapped this enum to VkernelFusedExperts;
+                # feed the kernel its documented raw layout.
+                return convert_weights_for_vkernel(*args, **kwargs)
+            return _orig_convert(mxfp4_backend, layer, *args, **kwargs)
+
+        _vk_convert.__name__ = _name + "__vkernels"
+        setattr(oracle_mxfp4, _name, _vk_convert)
+
+
+def _build_vkernel_cls_or_raise():
+    """Build/resolve :class:`VkernelFusedExperts` (PEP 562 ``__getattr__``
+    is bypassed by bare-name lookup inside this module, so the shim builds
+    it explicitly)."""
+    _build_vllm_experts()
+    cls = _VkernelFusedExperts_cls
+    if cls is None:  # pragma: no cover - defensive
+        raise RuntimeError("VkernelFusedExperts failed to build")
+    return cls
+
+
+def register_vkernel_backend_shim():
+    """Register :class:`VkernelFusedExperts` as the ``VKERNELS_MXFP4_BF16``
+    serving backend AND fix its weight-format contract (issue #74).
+
+    Two coupled patches on the vLLM oracle
+    (``vllm.model_executor.layers.fused_moe.oracle.mxfp4``):
+
+    1. ``backend_to_kernel_cls(AITER_MXFP4_BF16)`` returns
+       ``[VkernelFusedExperts]`` — the K3 selector
+       (``select_deepseek_v4_mxfp4_moe_backend``) then picks the vkernels
+       backend on gfx942 (AITER itself fails ``_supports_activation(SITU)``
+       on MI300A, so without the shim it falls through to TRITON_UNFUSED).
+    2. ``convert_weight_to_mxfp4_moe_kernel_format`` and
+       ``convert_gpt_oss_weight_to_mxfp4_moe_kernel_format`` are wrapped so
+       that the ``AITER_MXFP4_BF16`` enum — which now denotes the vkernels
+       backend — routes to :func:`convert_weights_for_vkernel` (raw
+       pass-through + fp32 biases) instead of the AITER gfx950 CK shuffle
+       that previously produced the degenerate serving output.
+
+    Idempotent; returns ``True`` when the shim is (already) installed.
+    """
+    global _vkernel_shim_active
+    if _vkernel_shim_active:
+        return True
+    try:
+        from vllm.model_executor.layers.fused_moe.oracle import (
+            mxfp4 as _oracle_mxfp4,
+        )
+        from vllm.model_executor.layers.quantization import (
+            mxfp4 as _quant_mxfp4,
+        )
+    except ImportError:
+        return False
+
+    backend_enum = getattr(_oracle_mxfp4, "Mxfp4MoeBackend", None)
+    if backend_enum is None:
+        return False
+    aiter_bf16 = getattr(backend_enum, "AITER_MXFP4_BF16", None)
+    if aiter_bf16 is None:
+        return False
+
+    # --- (1) experts-class hijack (as the K3 sitecustomize did) ---------
+    if not getattr(_oracle_mxfp4, "_vkernels_b2kc_patched", False):
+        _orig_b2kc = _oracle_mxfp4.backend_to_kernel_cls
+
+        def _b2kc_with_vke(backend, *args, **kwargs):
+            if backend == aiter_bf16:
+                # Lazy: builds VkernelFusedExperts on first use (imports
+                # vLLM submodules; see module __getattr__ below).
+                return [_build_vkernel_cls_or_raise()]
+            return _orig_b2kc(backend, *args, **kwargs)
+
+        _oracle_mxfp4.backend_to_kernel_cls = _b2kc_with_vke
+        _oracle_mxfp4._vkernels_b2kc_patched = True
+
+    # --- (2) weight-conversion contract (issue #74) ----------------------
+    if not getattr(_oracle_mxfp4, "_vkernels_convert_patched", False):
+        _patch_oracle_converters(_oracle_mxfp4, aiter_bf16)
+        _oracle_mxfp4._vkernels_convert_patched = True
+
+    # Keep the quantization module's imported reference (used by
+    # ``Mxfp4MoEMethod._setup_kernel``) pointing at the patched function.
+    if getattr(_oracle_mxfp4, "_vkernels_convert_patched", False):
+        try:
+            _quant_mxfp4.convert_weight_to_mxfp4_moe_kernel_format = (
+                _oracle_mxfp4.convert_weight_to_mxfp4_moe_kernel_format
+            )
+        except AttributeError:
+            pass
+
+    _vkernel_shim_active = True
+    return True
 
 
 # ---------------------------------------------------------------------------
