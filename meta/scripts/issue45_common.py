@@ -22,8 +22,6 @@ Contents:
     degeneracy detector so a smoke-only / degenerate PASS is self-identifying.
 """
 
-from __future__ import annotations
-
 import json
 import re
 import sys

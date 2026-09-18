@@ -49,7 +49,10 @@ case "${1:-selftest}" in
     elif ! command -v rocprof >/dev/null 2>&1; then
       echo "rocprof not on PATH -> skipping the real-capture round-trip"
     else
-      T="$(mktemp -d /tmp/i45ac3.XXXXXX)"
+      # keep artifacts next to the checkout for post-mortem; rocprof v2/v3
+      # naming differs, so print everything it produces
+      T="i45-smoke-artifacts-$$"
+      rm -rf "$T"; mkdir -p "$T"
       cat > "$T/tiny.hip" <<'EOF'
 #include <hip/hip_runtime.h>
 __global__ void vk_smoke_probe_kernel(float* x) { x[threadIdx.x] = threadIdx.x * 2.0f; }
@@ -65,9 +68,13 @@ int main() {
 }
 EOF
       hipcc -O2 -o "$T/tiny" "$T/tiny.hip" 2>&1 | tail -2
+      "$T/tiny"; echo "tiny-kernel rc=$?"
+      rocprof --version 2>&1 | head -2
       # rocprof exits non-zero even on successful collection
-      rocprof --stats -o "$T/rp_clean" "$T/tiny" >/dev/null 2>&1 || true
-      CSV=$(ls "$T"/rp_clean*.csv 2>/dev/null | head -1)
+      rocprof --stats -o "$T/rp_clean" "$T/tiny" >"$T/rocprof.log" 2>&1 || true
+      tail -5 "$T/rocprof.log"
+      echo "--- artifacts produced:"; ls -la "$T" | grep -v tiny.hip
+      CSV=$(ls "$T"/rp_clean*.csv "$T"/*.csv 2>/dev/null | head -1)
       if [ -n "${CSV:-}" ]; then
         echo "--- clean capture: $CSV"
         "$PY" "$HERE/issue45_rocprof_attention_assert.py" "$CSV" --json "$T/ac3_clean.json" \
