@@ -19,6 +19,7 @@
 
 using vkernels::kernels::mhc_post_cpu;
 using vkernels::kernels::mhc_pre_gemm_sqrsum_cpu;
+using vkernels::kernels::mhc_pre_gemm_sqrsum_cpu_f64;
 
 namespace {
 
@@ -116,6 +117,131 @@ TEST(MhcPreGemmSqrsum, HandCheckedConstantRows) {
   // sqrsum: token0 = 1+4+9+16+25+36 = 91; token1 = 0+1+4+9+16+0 = 30.
   EXPECT_NEAR(sqrsum[0], 91.0f, 1e-4f);
   EXPECT_NEAR(sqrsum[1], 30.0f, 1e-4f);
+}
+
+// ---- mhc_pre_gemm_sqrsum_cpu_f64 (fp64 gate reference, issue #138) --------
+
+// Same setup as HandCheckedIdentityExtended: identity in the first 4 fn rows,
+// zero in the last 4 (hc_mult3 = 8 > hc_hidden_size = 4 is exercised).
+// out = [1,2,3,4,0,0,0,0], sqrsum = 30, all exactly representable in fp64.
+TEST(MhcPreGemmSqrsumF64, HandCheckedIdentityExtended) {
+  const int hc_mult = 2, hidden = 2;
+  const int hc_hidden = hc_mult * hidden;        // 4
+  const int hc_mult3 = hc_mult * (2 + hc_mult);  // 8
+  const int num_tokens = 1;
+  std::vector<float> x = {1, 2, 3, 4};
+  std::vector<float> fn((size_t)hc_mult3 * hc_hidden, 0.0f);
+  for (int o = 0; o < hc_hidden; ++o) fn[(size_t)o * hc_hidden + o] = 1.0f;
+  std::vector<double> out((size_t)num_tokens * hc_mult3, -1.0);
+  std::vector<double> sqrsum(num_tokens, -1.0);
+  mhc_pre_gemm_sqrsum_cpu_f64(num_tokens, hc_mult, hidden, x.data(), fn.data(),
+                              out.data(), sqrsum.data());
+  EXPECT_EQ(out[0], 1.0); EXPECT_EQ(out[1], 2.0);
+  EXPECT_EQ(out[2], 3.0); EXPECT_EQ(out[3], 4.0);
+  EXPECT_EQ(out[4], 0.0); EXPECT_EQ(out[5], 0.0);
+  EXPECT_EQ(out[6], 0.0); EXPECT_EQ(out[7], 0.0);
+  EXPECT_EQ(sqrsum[0], 30.0);
+}
+
+// Multi-token + mixed-sign rows (hand-checked): token0 x = [1,-2,3] ->
+// sqrsum = 14; token1 x = [0,-1,0] -> sqrsum = 1. fn rows: [1,1,1] ->
+// out[0,0] = 2, out[1,0] = -1; [2,0,-1] -> out[0,1] = -1, out[1,1] = 0;
+// [0,0,0] -> out[0,2] = out[1,2] = 0.
+TEST(MhcPreGemmSqrsumF64, HandCheckedMultiToken) {
+  const int hc_mult = 1, hidden = 3;
+  const int hc_mult3 = hc_mult * (2 + hc_mult);  // 3
+  const int num_tokens = 2;
+  std::vector<float> x = {1, -2, 3,
+                          0, -1, 0};
+  std::vector<float> fn = {1, 1, 1,
+                           2, 0, -1,
+                           0, 0, 0};
+  std::vector<double> out((size_t)num_tokens * hc_mult3, -1.0);
+  std::vector<double> sqrsum(num_tokens, -1.0);
+  mhc_pre_gemm_sqrsum_cpu_f64(num_tokens, hc_mult, hidden, x.data(), fn.data(),
+                              out.data(), sqrsum.data());
+  EXPECT_EQ(out[0], 2.0);   // token 0, fn row 0
+  EXPECT_EQ(out[1], -1.0);  // token 0, fn row 1
+  EXPECT_EQ(out[2], 0.0);   // token 0, fn row 2 (zero row)
+  EXPECT_EQ(out[3], -1.0);  // token 1, fn row 0
+  EXPECT_EQ(out[4], 0.0);   // token 1, fn row 1
+  EXPECT_EQ(out[5], 0.0);   // token 1, fn row 2 (zero row)
+  EXPECT_EQ(sqrsum[0], 14.0);
+  EXPECT_EQ(sqrsum[1], 1.0);
+}
+
+// fp64 reference must stay within ~1 ulp of the exact double-precision result
+// on randomized data, and must agree with the fp32 oracle to fp32 rounding
+// tolerance (the whole point of the #138 gate: the f64 chain and the fp32
+// chain differ only by float rounding, not by accumulation-order ambiguity).
+TEST(MhcPreGemmSqrsumF64, MatchesFp64Reference) {
+  struct Cfg { int num_tokens, hc_mult, hidden; };
+  std::vector<Cfg> cfgs = {{1, 2, 2}, {3, 2, 4}, {7, 3, 3}, {2, 4, 4}, {5, 4, 8}};
+  std::mt19937 rng(54321);
+  for (const auto& c : cfgs) {
+    const int hc_hidden = c.hc_mult * c.hidden;
+    const int hc_mult3 = c.hc_mult * (2 + c.hc_mult);
+    std::vector<float> x((size_t)c.num_tokens * hc_hidden);
+    std::vector<float> fn((size_t)hc_mult3 * hc_hidden);
+    std::uniform_real_distribution<float> u(-1, 1);
+    for (auto& v : x) v = u(rng);
+    for (auto& v : fn) v = u(rng);
+    std::vector<double> out((size_t)c.num_tokens * hc_mult3);
+    std::vector<double> sqrsum(c.num_tokens);
+    mhc_pre_gemm_sqrsum_cpu_f64(c.num_tokens, c.hc_mult, c.hidden, x.data(),
+                                fn.data(), out.data(), sqrsum.data());
+    for (int n = 0; n < c.num_tokens; ++n) {
+      double sq = 0.0;
+      for (int h = 0; h < hc_hidden; ++h)
+        sq += double(x[(size_t)n * hc_hidden + h]) * double(x[(size_t)n * hc_hidden + h]);
+      EXPECT_NEAR(sqrsum[n], sq, 1e-9 * std::fmax(1.0, std::fabs(sq)));
+      for (int o = 0; o < hc_mult3; ++o) {
+        double acc = 0.0;
+        for (int h = 0; h < hc_hidden; ++h)
+          acc += double(x[(size_t)n * hc_hidden + h]) *
+                 double(fn[(size_t)o * hc_hidden + h]);
+        EXPECT_NEAR(out[(size_t)n * hc_mult3 + o], acc,
+                    1e-9 * std::fmax(1.0, std::fabs(acc)));
+      }
+    }
+  }
+}
+
+// Contract violations throw on the host (same as the fp32 oracle).
+TEST(MhcPreGemmSqrsumF64, ContractThrows) {
+  std::vector<float> x(4, 1.0f), fn(8, 1.0f);
+  std::vector<double> out(8), sqrsum(1);
+  // hc_mult / hidden must be positive.
+  EXPECT_THROW(mhc_pre_gemm_sqrsum_cpu_f64(1, 0, 2, x.data(), fn.data(),
+                                           out.data(), sqrsum.data()),
+               std::invalid_argument);
+  EXPECT_THROW(mhc_pre_gemm_sqrsum_cpu_f64(1, 2, 0, x.data(), fn.data(),
+                                           out.data(), sqrsum.data()),
+               std::invalid_argument);
+  // hc_mult3 = 5*(2+5) = 35 > 32.
+  EXPECT_THROW(mhc_pre_gemm_sqrsum_cpu_f64(1, 5, 1, x.data(), fn.data(),
+                                           out.data(), sqrsum.data()),
+               std::invalid_argument);
+  // Null pointers with num_tokens > 0.
+  EXPECT_THROW(mhc_pre_gemm_sqrsum_cpu_f64(1, 2, 2, nullptr, fn.data(),
+                                           out.data(), sqrsum.data()),
+               std::invalid_argument);
+  EXPECT_THROW(mhc_pre_gemm_sqrsum_cpu_f64(1, 2, 2, x.data(), nullptr,
+                                           out.data(), sqrsum.data()),
+               std::invalid_argument);
+  EXPECT_THROW(mhc_pre_gemm_sqrsum_cpu_f64(1, 2, 2, x.data(), fn.data(),
+                                           nullptr, sqrsum.data()),
+               std::invalid_argument);
+  EXPECT_THROW(mhc_pre_gemm_sqrsum_cpu_f64(1, 2, 2, x.data(), fn.data(),
+                                           out.data(), nullptr),
+               std::invalid_argument);
+  // num_tokens == 0: null pointers are fine (no-op short-circuits each check).
+  EXPECT_NO_THROW(mhc_pre_gemm_sqrsum_cpu_f64(0, 2, 2, nullptr, nullptr,
+                                              nullptr, nullptr));
+  std::vector<float> e_x(0), e_fn(8, 0.0f);
+  std::vector<double> e_out(0), e_sq(0);
+  EXPECT_NO_THROW(mhc_pre_gemm_sqrsum_cpu_f64(0, 2, 2, e_x.data(), e_fn.data(),
+                                              e_out.data(), e_sq.data()));
 }
 
 // ---- mhc_post: hand-checked ----------------------------------------------
