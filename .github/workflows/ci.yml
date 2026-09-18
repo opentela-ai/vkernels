@@ -103,17 +103,20 @@ jobs:
         # GPU. Tests need only python3 + numpy + pytest + torch + triton and
         # the pure-python package (conftest.py pins sys.path to src/python),
         # so no install step: pytest runs straight from the workspace.
-        # pip bootstraps what the image lacks (per the kpool step above, the
-        # image ships no pytest/torch) — idempotent (no-op once torch/triton
-        # are baked in). Plain pip first; --break-system-packages covers
-        # externally-managed pythons (PEP 668 rejects before downloading, so
-        # the retry is cheap — and IS hit on the NGC base image).
-        # Triton's loader, unlike torch's, needs a real file path for
-        # libcuda.so.1: it only greps the ldconfig cache, which predates the
-        # runner's SONAME-mapped driver mounts (dlopen-by-soname works — the
-        # kpool step proves it — and once torch has loaded libcuda, triton's
-        # dlopen returns the same handle, so any valid path satisfies
-        # discovery). Locate the mount and export it.
+        # pip line = drift-catcher: numpy/pytest/torch/triton are baked into
+        # the image (meta/docker/Dockerfile.ci-cuda13), so the plain attempt
+        # still trips PEP 668 on the externally-managed base python and the
+        # --break-system-packages retry then finds everything satisfied —
+        # two quick no-ops (~1s). On an unbaked image the retry bootstraps
+        # for real (~1 min of downloads). Tests need only python3 + those
+        # wheels and the pure-python package (conftest.py pins sys.path to
+        # src/python), so no install step: pytest runs straight from the
+        # workspace. Triton's loader, unlike torch's, needs a real file path
+        # for libcuda.so.1: it only greps the ldconfig cache, which predates
+        # the runner's SONAME-mapped driver mounts (dlopen-by-soname works —
+        # the kpool step proves it — and once torch has loaded libcuda,
+        # triton's dlopen returns the same handle, so any valid path
+        # satisfies discovery). Locate the mount and export it.
         # gdn_delta's device test is excluded: it is floe-oracle-gated and
         # would only ever skip here.
         run: |
