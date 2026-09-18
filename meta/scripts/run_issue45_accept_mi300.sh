@@ -71,11 +71,12 @@ EOF
       "$T/tiny"; echo "tiny-kernel rc=$?"
       rocprof --version 2>&1 | head -2
       # rocprof exits non-zero even on successful collection; rocprof 6.3
-      # requires the output name to end in uppercase .CSV
-      rocprof --stats -o "$T/rp_clean.CSV" "$T/tiny" >"$T/rocprof.log" 2>&1 || true
+      # rejects -o names ("file name must have .CSV extension") even for
+      # *.CSV, so run from the artifact dir and take its default output
+      ( cd "$T" && rocprof --stats "$T/tiny" >"$T/rocprof.log" 2>&1 ) || true
       tail -5 "$T/rocprof.log"
       echo "--- artifacts produced:"; ls -la "$T" | grep -v tiny.hip
-      CSV=$(ls "$T"/rp_clean*.CSV "$T"/rp_clean*.csv "$T"/*.csv 2>/dev/null | head -1)
+      CSV=$(ls "$T"/results*.CSV "$T"/results*.csv "$T"/*.csv "$T"/*.CSV 2>/dev/null | head -1)
       if [ -n "${CSV:-}" ]; then
         echo "--- clean capture: $CSV"
         "$PY" "$HERE/issue45_rocprof_attention_assert.py" "$CSV" --json "$T/ac3_clean.json" \
