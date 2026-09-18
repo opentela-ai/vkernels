@@ -276,6 +276,28 @@ bool dsa_topk_logits_fits_lds_mfma(int num_heads, int head_dim, int block,
   return bytes <= lds_cap;
 }
 
+// Whether the indexer shape admits the fp8-MFMA kernel
+// (dsa.hip::dsa_topk_logits_kernel_mfma_fp8, issue #81) -- the launcher's
+// FASTEST path, picked FIRST by auto. NO staged tile at all: the 16x16x32
+// fp8 fragment IS the global 8-byte load (raw fp8 e4m3fnuz consumed
+// natively by the matrix unit), shared memory is just the gate + per-token
+// gate alone (H*4 B -- 256 B at GLM-5.3), so `lds_cap` is nominal and the
+// gates are the FRAGMENT multiples: H%16==0 and H<=128 (kNF = H/16 <= 8
+// register accumulators, predicated unroll in the kernel), head_dim%32==0
+// (one K=32 MFMA per 32 D -- 2x fewer than the bf16 variant's D%64),
+// block%16==0 and block<=256 ((B/16)*64 threads, one wavefront per 16-row
+// fragment). All-int. See dsa.hpp and the host unit test
+// tests/kernels/attn/test_dsa.cpp::DsaTopk::FitsLdsMfmaFp8.
+bool dsa_topk_logits_fits_lds_mfma_fp8(int num_heads, int head_dim, int block,
+                                       int lds_cap) {
+  (void)lds_cap;  // the fp8-MFMA footprint is H*4 -- never near any cap
+  if (num_heads <= 0 || head_dim <= 0 || block <= 0) return false;
+  if (num_heads % 16 != 0 || num_heads > 128 || head_dim % 32 != 0 ||
+      block % 16 != 0 || block > 256)
+    return false;   // 16x16x32 fp8 fragment needs exact multiples + reg budget
+  return true;
+}
+
 // CUDA wmma admission: the MFMA shape gates + kTh = (B/16)*(H/16)*32 <= 1024
 // (CUDA max threads/block -- each warp owns ONE [16,16] c_frag, not the kNF
 // fragments-per-lane the AMD 64-lane MFMA layout demands) and the MFMA
