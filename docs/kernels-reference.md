@@ -43,7 +43,7 @@ serving shape, not a theoretical optimum.
 
 | # | Kernel | HW tested | Headline shape | Achieved | Binding roof | Gap to SOL | Binding constraint | Record |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `gemm_bf16` (HIP MFMA) | MI300A | K3 QKV 6288×7168, M=64 (serving) | 376 µs, 1919 GB/s | 5300 GB/s HBM | **36% of HBM** | memory (AI≈8 ≪ ridge 247; two-phase tile, no load/MFMA overlap) | [gemm-bf16/gfx942](performance/gemm-bf16/gfx942.md) |
+| 1 | `gemm_bf16` (HIP MFMA) | MI300A | K3 QKV 6288×7168, M=64 (serving, split-K #146) | 244.8 µs, 2949 GB/s | 5300 GB/s HBM | **56% of HBM** | memory (AI≈8 ≪ ridge 247; S=8 split-K, combine round-trip included) | [gemm-bf16/gfx942](performance/gemm-bf16/gfx942.md) |
 | 2 | `gemm_bf16` (HIP MFMA) | MI300A | same, M=8192 (warmup) | 76.2 TFLOP/s, 2400 GB/s | 1307 TFLOP/s / 5300 GB/s | **5.8% compute, 45% HBM** | memory (B re-read ⌈M/BM⌉×, AI≈31) | same |
 | 3 | `gemm_bf16` (CUDA wmma) | GB10 | same shape, M=64 | 547 µs, 826 GB/s* | 227 GB/s LPDDR | ~100% of LPDDR roof | memory (pinned to LPDDR ceiling; compute units 30× idle) | [gemm-bf16/gb10](performance/gemm-bf16/gb10.md) |
 | 4 | `glm_fp8_block_gemv` | MI300A | GLM gate/up [4096,4096], M=1 | 22.4 µs, 751 GB/s | 5300 GB/s | **14% of HBM** | instruction-issue (all paths plateau 500–800 GB/s after 3 structural rounds) | [glm53-decode-kernels](glm53-decode-kernels.md) |
@@ -101,6 +101,8 @@ offline-autotuner / correctness-sweep entry only.
 |---|---|---:|---:|---:|---:|---:|---|
 | QKV (6288×7168), (16,16) tile | MI300A | 5 | 346 µs | 1.30 | 342 | 3.8 | 6.5% HBM |
 | | MI300A | 64 | 376 µs | 15.3 | 1919 | 8.0 | 36% HBM |
+| QKV (6288×7168), split-K S=8 (#146) | MI300A | 5 | **99.6 µs** | 4.5 | 1189 | 3.8 | 22% HBM |
+| | MI300A | 64 | **244.8 µs** | 23.6 | 2949 | 8.0 | **56% HBM** |
 | | GB10 (16,16) tile (pre-fix) | 5 | 636 µs | 0.71 | 186 | 3.8 | 82% LPDDR |
 | | GB10 (16,16) tile (pre-fix) | 64 | 2248 µs | 2.57 | 321 | 8.0 | ~100% LPDDR |
 | | GB10 **(16,64)** cp.async (per-arch default) | 5 | 442 µs | 1.02 | 220* | 4.6 | see gb10.md |
@@ -115,8 +117,13 @@ it is not a DRAM-roof fraction.
   effective-memory ceilings — the ~4–5.6× TFLOP/s gap at warmup is now
   mostly the ~10× effective-bandwidth gap, plus a residual latency term on
   GB10's 48 SMs.
-* Highest-leverage next rung for MI300A: cross-tile B reuse (persistent
-  kernel) → lifts AI from ~31 toward ~2378. On GB10 the `cp.async`
+* Highest-leverage next rung for MI300A serving: the #146 split-K landed
+  (M ≤ 64 routed to `gemm_bf16_splitk` at `S = min(8, K/64)`; QKV serving
+  346 → 99.6 µs at M=5, 376 → 244.8 µs at M=64 = 56% of HBM) — the
+  remaining serving gap is the workspace round-trip plus the two-phase
+  tile's exposed load latency inside each split. Warmup (`M = 8192`, 45%
+  effective HBM) is unchanged by split-K: cross-tile B reuse (persistent
+  kernel) would lift AI from ~31 toward ~2378. On GB10 the `cp.async`
   double-buffer landed first (1.3–1.8×) and cross-tile reuse then landed as
   an **L1TEX/register-blocking** lever for warmup (2–52%); serving is
   already at the DRAM roof, so reuse is gated on `M > 64`. On MI300A the
