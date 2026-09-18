@@ -97,6 +97,7 @@ void mla_fwd_cpu(int B, int H, int S_q, int S_kv, int q_start, int kv_start,
 
 void mla_config_for(int S_q, int kv_lora_rank, int qk_rope_head_dim,
                     int* bq, int* bn_kv, int* threads) {
+  const int kv = kv_lora_rank, pe = qk_rope_head_dim;
   (void)kv_lora_rank;
   (void)qk_rope_head_dim;
   // Decode: tiny S_q, memory-bound on the per-head K/V latent reads. One
@@ -108,28 +109,55 @@ void mla_config_for(int S_q, int kv_lora_rank, int qk_rope_head_dim,
     *bn_kv = 64;
     *threads = 64;  // one wavefront
   } else {
-    // Prefill: tiled (bq x bn_kv) causal attention. 4 query rows per block
-    // keeps the score tile small enough for online softmax in registers
-    // while BN_kv=64 reuses each loaded key window across the rows.
+    // Prefill (issue #151): fused-head attention. BQ=4 query rows per block
+    // plus min(H, 16/BQ) heads riding along as parallel wavefronts, so the
+    // head-shared KV latent is read from DRAM once per (query tile, head
+    // group) instead of once per (query tile, head). bn_kv is unused by the
+    // fused-head path (plain per-key streaming keeps SGPR allocation clean).
+    // Wide ranks (kv=512, K3) run the pipelined variant, whose register
+    // tile caps the block at 12 wavefronts → 4·2 = 8 wavefronts, 512 th.
     *bq = 4;
-    *bn_kv = 64;
-    *threads = 256;  // four wavefronts
+    *bn_kv = 8;
+    const int bh = mla_prefill_heads_per_block(4, 128);
+    *threads = 4 * (kv == 512 && pe <= 64 && bh > 2 ? 2 : bh) * 64;
   }
 }
 
 int mla_fwd_split_for(int B, int H, int S_q, int S_kv) {
-  // Decode only: the split re-launches the shared latent reads from a grid
-  // that would otherwise leave CUs idle. Prefill keeps its single-block path
-  // exactly as before (documented tuning target untouched).
-  const int row_blocks = B * H * S_q;  // plain-grid blocks (decode tile BQ=1)
-  if (S_q > 8 || row_blocks <= 0) return 1;
-  // Occupancy rule (same shape as dsa_topk_logits_split_for): one wavefront
-  // per block, so fill the CUs the plain grid leaves idle, and never shrink a
-  // split's key slice below kMlaMinSplitKeys (coalescing floor).
-  if (row_blocks >= kMlaCus) return 1;
-  const int cu_cap = kMlaCus / row_blocks;
+  if (B <= 0 || H <= 0 || S_q <= 0) return 1;
   const int kv_cap = (S_kv + kMlaMinSplitKeys - 1) / kMlaMinSplitKeys;
-  return std::max(1, std::min(cu_cap, kv_cap));
+  // Decode (issue #82): the split re-launches the shared latent reads from a
+  // grid that would otherwise leave CUs idle. One wavefront per block, so
+  // fill the CUs the plain grid leaves idle, and never shrink a split's key
+  // slice below kMlaMinSplitKeys (coalescing floor).
+  if (S_q <= 8) {
+    const int row_blocks = B * H * S_q;
+    if (row_blocks >= kMlaCus) return 1;
+    return std::max(1, std::min(kMlaCus / row_blocks, kv_cap));
+  }
+  // Chunked / short prefill (issue #151): the fused-head prefill grid leaves
+  // CUs idle when tiles·head_groups·B << kMlaCus — split the S_kv window
+  // across blocks too (BQ=4 split variant + the #82 combine kernel).
+  const int tiles = (S_q + 3) / 4;
+  const int bh = mla_prefill_heads_per_block(4, H);
+  const int groups = (H + bh - 1) / bh;
+  const long blocks = (long)tiles * groups * B;
+  if (blocks >= kMlaCus) return 1;
+  return std::max(1, std::min((int)(kMlaCus / blocks), kv_cap));
+}
+
+int mla_prefill_heads_per_block(int bq, int H) {
+  if (H <= 0 || bq <= 0) return 1;
+  // k_c/k_pe/v_c are head-shared, so batching `bh` heads per block divides
+  // the per-query-tile KV re-reads by bh. bh is capped by H (never batch
+  // across heads that do not exist) and by 16/bq so the block stays within
+  // the 1024-thread workgroup limit, rounded down to a power of two so the
+  // (row, head) -> wavefront mapping divides evenly.
+  int bh = H;
+  if (bh > 16 / std::max(1, bq)) bh = 16 / std::max(1, bq);
+  if (bh < 1) bh = 1;
+  while ((bh & (bh - 1)) != 0) bh &= bh - 1;  // drop to power of two
+  return bh;
 }
 
 }  // namespace vkernels::kernels

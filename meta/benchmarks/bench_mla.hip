@@ -55,10 +55,10 @@ struct BenchResult { double min_us, median_us, mean_us; };
 
 static BenchResult bench_us(const std::function<void()>& launch,
                             hipEvent_t start, hipEvent_t stop,
-                            int warmup = 5, int max_iters = 500) {
+                            int warmup = 5, int max_iters = 2000) {
   (void)hipDeviceSynchronize();
   for (int i = 0; i < warmup; ++i) launch();
-  std::vector<float> times;
+  std::vector<float> times, all;
   int iters = 20;
   while (iters <= max_iters) {
     times.clear();
@@ -78,6 +78,7 @@ static BenchResult bench_us(const std::function<void()>& launch,
       // login-node no-gfx-agent signature), rather than a hang.
       if (ms <= 0.0f) continue;
       times.push_back(ms * 1000.0f);
+      all.push_back(ms * 1000.0f);
     }
     const int n = (int)times.size();
     if (n == 0) {
@@ -96,6 +97,14 @@ static BenchResult bench_us(const std::function<void()>& launch,
       return {times[0], times[n / 2], mean};
     }
     iters *= 2;
+  }
+  // Never converged to a stable window (e.g. persistent DVFS jitter):
+  // report the collected samples instead of a broken all-zero row.
+  if (!all.empty()) {
+    std::sort(all.begin(), all.end());
+    double sum = 0;
+    for (double t : all) sum += t;
+    return {all[0], all[all.size() / 2], sum / (double)all.size()};
   }
   return {};
 }
@@ -164,9 +173,18 @@ static void bench_shapes(const GpuInfo& info, hipEvent_t start,
     // Tile the kernel will use (for the actual-HBM-traffic model).
     int bq = 0, bn = 0, th = 0;
     vkernels::kernels::mla_config_for(S_q, kv, pe, &bq, &bn, &th);
-    // Split-K decode decision (issue #82): >1 means mla_fwd routes through
-    // the split path, so the KV latent is read ONCE across the splits.
+    // Split decision (issues #82/#151): >1 means mla_fwd routes through
+    // the split path (decode: one row per block; prefill: BQ=4 rows).
     const int split = vkernels::kernels::mla_fwd_split_for(B, H, S_q, S_kv);
+    int bh = vkernels::kernels::mla_prefill_heads_per_block(bq, H);
+    // Wide ranks (kv=512) run the pipelined fused kernel, which caps the
+    // block at 12 wavefronts (power of two) — mirror that clamp here so the
+    // HBM-traffic model matches the launched grid.
+    if (kv == 512 && pe <= 64) {
+      int cap = 12 / bq;
+      while ((cap & (cap - 1)) != 0) cap &= cap - 1;
+      if (bh > cap) bh = cap;
+    }
 
     auto L = [&] {
       vkernels::kernels::hip::mla_fwd(
@@ -178,11 +196,23 @@ static void bench_shapes(const GpuInfo& info, hipEvent_t start,
     double flops = 2.0 * S_q * S_kv * (Dq + kv) * H * B;
     double tflops = flops / (r.median_us / 1e6) / 1e12;
 
-    // Actual HBM traffic: q read once, out written once, and k_c/k_pe/v_c
-    // re-read once per query tile in the plain baseline — OR read ONCE when
-    // the split path partitions S_kv across the CUs (no re-read).
+    // Actual HBM traffic: q read once, out written once, and the shared KV
+    // latent re-read once per KV pass over the machine:
+    //   decode split (S_q <= 8, #82): every row streams the full window
+    //     across its splits (S_q passes);
+    //   prefill fused (#151): each (query tile, head-group) block streams
+    //     the full KV set once → n_tiles · ceil(H/bh) passes per batch;
+    //   prefill split (#151): each (query tile, head) reads the full window
+    //     across its splits (latency relief; traffic unchanged);
+    //   plain paths: once per (query tile, head).
     const int n_tiles = (S_q + bq - 1) / bq;
-    const int kv_reads = (split > 1) ? 1 : n_tiles;
+    double kv_reads;
+    if (split > 1)
+      kv_reads = (S_q <= 8) ? (double)S_q : (double)n_tiles;
+    else if (S_q > 8)
+      kv_reads = (double)n_tiles * ((H + bh - 1) / bh) / H;
+    else
+      kv_reads = n_tiles;
     double bytes = 4.0 * ((double)B * H * S_q * Dq            // q read once
                         + (double)B * H * S_q * kv            // out written once
                         + kv_reads * (double)B * H * S_kv * (kv + pe)   // k_c+k_pe re-read
@@ -191,13 +221,15 @@ static void bench_shapes(const GpuInfo& info, hipEvent_t start,
     double ai = flops / bytes;
     const char* bound = ai < (info.tflops * 1e3 / info.bw) ? "mem" : "comp";
     std::printf("  %4d %6d %6d %9.1f %9.1f %9.3f %9.1f %5.1f  %s"
-                "  [BQ=%d BN=%d th=%d split=%d]\n",
+                "  [BQ=%d BN=%d th=%d split=%d bh=%d]\n",
                 H, S_q, S_kv, r.min_us, r.median_us, tflops, gbs, ai, bound,
-                bq, bn, th, split);
+                bq, bn, th, split, bh);
 
-    // Plain single-baseline row for split shapes (issue #82): the pre-split
-    // decode latency, measured through the unchanged explicit-tile path.
-    if (split > 1) {
+    // Plain pre-split baseline row for decode split shapes (issue #82): the
+    // pre-split decode latency, measured through the unchanged
+    // explicit-tile path (for prefill shapes that path is now the fused
+    // kernel, so there is no longer a distinct 'plain' variant to compare).
+    if (split > 1 && S_q <= 8) {
       auto Lp = [&] {
         vkernels::kernels::hip::mla_fwd_with_tile(
             B, H, S_q, S_kv, 0, 0, kv, pe, scale, dq, dkc, dkpe, dv, dout,
@@ -238,8 +270,8 @@ static void autotune(const GpuInfo& info, hipEvent_t start, hipEvent_t stop) {
   struct Cfg { int H, S_q, S_kv; };
   const Cfg cfgs[] = {{1, 64, 8192}, {8, 64, 64}, {16, 512, 512},
                       {128, 512, 512}, {1, 8192, 8192}};
-  const int bqs[]  = {1, 2, 4, 8, 16, 32};
-  const int bns[]  = {8, 16, 32, 64, 128};
+  const int bqs[]  = {1, 2, 4, 8};
+  const int bns[]  = {4, 8};
   constexpr int nBQ = sizeof(bqs) / sizeof(bqs[0]);
   constexpr int nBN = sizeof(bns) / sizeof(bns[0]);
 

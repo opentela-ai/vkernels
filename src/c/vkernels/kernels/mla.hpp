@@ -64,7 +64,9 @@ void mla_fwd_cpu(int B, int H, int S_q, int S_kv, int q_start, int kv_start,
 //   decode  (S_q <= 8) : one query row per block, BN_kv keys per pass,
 //                        one wavefront (64 threads)
 //   prefill (S_q >  8) : BQ query rows × BN_kv key columns per block, 256
-//                        threads (4 wavefronts)
+//                        threads (4 wavefronts); bn_kv selects the
+//                        double-buffered LDS key tile of the fused-head
+//                        prefill kernel (4 or 8; issue #151)
 void mla_config_for(int S_q, int kv_lora_rank, int qk_rope_head_dim,
                     int* bq, int* bn_kv, int* threads);
 
@@ -86,7 +88,22 @@ static constexpr int kMlaMinSplitKeys = 32;
 // Formula (occupancy rule, as in dsa_topk_logits_split_for): fill the CUs the
 // plain grid leaves idle, capped so every split keeps >= kMlaMinSplitKeys
 // keys (coalescing floor).
+//
+// Issue #151 extends the rule to CHUNKED / SHORT PREFILL (S_q > 8): the
+// fused-head prefill grid (BQ=4 rows per block, mla_prefill_heads_per_block
+// heads per block) leaves CUs idle when tiles·head_groups·B << kMlaCus
+// (e.g. H=1, S_q=64, S_kv=8192: 16 blocks on 228 CUs, 2% of HBM). Such
+// grids split their S_kv window too, via the BQ=4 split variant + the #82
+// combine kernel. Prefill grids that already fill the CUs return 1 (the
+// fused kernel handles their KV reuse).
 int mla_fwd_split_for(int B, int H, int S_q, int S_kv);
+
+// Heads per block for the fused-head prefill kernel (issue #151). k_c/k_pe/
+// v_c are shared across heads, so batching `bh` heads per block divides the
+// per-query-tile KV re-reads by bh. The heuristic caps bh at H and at
+// 16/bq (1024-thread workgroup limit), rounded down to a power of two so
+// the (row, head) -> wavefront mapping divides evenly. Host-pure.
+int mla_prefill_heads_per_block(int bq, int H);
 
 }  // namespace vkernels::kernels
 

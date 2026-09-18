@@ -24,14 +24,15 @@
 // Memory. Each key's k_c/k_pe/v_c is read exactly once from global memory;
 // the BQ query rows share a key read via L1/L2. The query rows themselves
 // are staged in LDS once per block. This is the simple, correct baseline
-// (one key at a time, no double-buffered key tile); a tiled key prefetch is
-// a follow-on optimisation, not required for correctness against the oracle.
+// (one key at a time, no double-buffered key tile); serving prefill uses
+// the fused-head kernels below (issue #151).
 //
 // Two-implementation model:
 //   mla.cpp  -- CPU reference (oracle), always compiled, two-pass softmax.
 //   mla.hip  -- this file, compiled with VKERNELS_HAS_HIP, online softmax.
 //               Cross-checked against the oracle by test_mla_correct.hip.
 #include <cstdint>
+#include <climits>
 #include <mutex>
 
 #include "vkernels/kernels/mla.hpp"
@@ -152,7 +153,15 @@ __global__ void mla_fwd_kernel(const float* __restrict__ q,
 //  That sum is exactly the softmax numerator over lse_g, so no second
 //  normalisation is needed and the result matches mla_fwd_cpu within the
 //  same fp tolerance (the fixed ascending order keeps it deterministic).
+//
+//  Issue #151 adds the BQ>1 PREFILL variant: a block owns BQ query rows (one
+//  warp per row, as in the plain kernel) over one head, each warp covering
+//  the block's key slice for its row. This keeps the causal mask per row and
+//  divides the KV traffic by BQ versus one-row blocks; the combine kernel is
+//  unchanged (it is per-row and split-count agnostic). BQ=1 is the decode
+//  path from #82 (grid.x = S_q, one row per block).
 // ---------------------------------------------------------------------------
+template <int BQ>
 __global__ void mla_fwd_split_kernel(const float* __restrict__ q,
                                      const float* __restrict__ k_c,
                                      const float* __restrict__ k_pe,
@@ -163,21 +172,31 @@ __global__ void mla_fwd_split_kernel(const float* __restrict__ q,
                                      int q_start, int kv_start,
                                      int lr, int rhd, float scale,
                                      int split, int kvs) {
-  const int gi = blockIdx.x;          // one query row per block (decode)
+  const int q_tile = blockIdx.x;
   const int h = blockIdx.y;
   const int z = blockIdx.z;           // b * split + sp
   const int b = z / split;
   const int sp = z - b * split;
-  const int lane = threadIdx.x;       // 64 threads: one wavefront
-
+  const int warp = threadIdx.x >> 6;  // which query row within the tile
+  const int lane = threadIdx.x & 63;  // strided head index this lane owns
+  const int gi = q_tile * BQ + warp;
+  // Rows past the end of S_q (last tile) keep computing — uniform control
+  // flow around __syncthreads — but never store their partials.
+  const bool active = gi < S_q;
+  const int gqi = active ? q_start + gi : INT_MAX;
   const int Dq = lr + rhd;
-  const int gqi = q_start + gi;
 
-  // Stage this block's single query row in shared memory.
-  extern __shared__ float sQ[];       // sQ[Dq]
-  for (int c = lane; c < Dq; c += 64)
-    sQ[c] = q[(((size_t)b * H + h) * S_q + gi) * Dq + c];
+  // Stage this block's BQ query rows in shared memory.
+  extern __shared__ float sQ[];       // sQ[BQ][Dq]
+  for (int idx = threadIdx.x; idx < BQ * Dq; idx += BQ * 64) {
+    const int r = idx / Dq, c = idx - r * Dq;
+    const int gr = q_tile * BQ + r;
+    sQ[idx] = (gr < S_q)
+                  ? q[(((size_t)b * H + h) * S_q + gr) * Dq + c]
+                  : 0.0f;
+  }
   __syncthreads();
+  const float* qrow = &sQ[warp * Dq];  // this warp's query row
 
   // Key slice [lo, hi) of the S_kv window owned by this split.
   const int lo = sp * kvs;
@@ -197,11 +216,11 @@ __global__ void mla_fwd_split_kernel(const float* __restrict__ q,
       const float* kc = k_c + ((size_t)b * S_kv + j) * lr;
       for (int t = 0; t < nope_tiles; ++t) {
         const int idx = lane + t * 64;
-        if (idx < lr) partial += sQ[idx] * kc[idx];
+        if (idx < lr) partial += qrow[idx] * kc[idx];
       }
       if (lane < rhd) {               // one rope element per lane (rhd <= 64)
         const float* kp = k_pe + ((size_t)b * S_kv + j) * rhd;
-        partial += sQ[lr + lane] * kp[lane];
+        partial += qrow[lr + lane] * kp[lane];
       }
     }
     float score = partial;
@@ -231,6 +250,7 @@ __global__ void mla_fwd_split_kernel(const float* __restrict__ q,
   // attention restricted to its visible keys) + lse = row_max + log(row_sum).
   // Normalizing here makes the combine exact:
   // out = Σ_sp exp(lse_sp − lse_g) · partial_out_sp.
+  if (!active) return;  // padding row of the last query tile: no partial
   const size_t row = (size_t)((size_t)b * H + h) * S_q + gi;
   const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
   float* porow = partial_out + (row * split + sp) * lr;
@@ -303,6 +323,265 @@ __global__ void mla_fwd_split_combine_kernel(
 }
 
 // ---------------------------------------------------------------------------
+//  Fused-head prefill (issue #151)
+//
+//  The plain prefill grid launches (S_q/BQ)·H·B blocks and every block
+//  streams the full shared KV latent one key at a time, so k_c/k_pe/v_c are
+//  re-read once per (query tile, head) — ~36 GB vs ~290 MB ideal at the
+//  H=128 S_q=512 K3 shape — even though the latent is head-SHARED.
+//
+//  This kernel batches BH heads into one block alongside its BQ query rows:
+//  a block owns BQ·BH (row, head) pairs, one wavefront each, all streaming
+//  the SAME key sequence. Because k_c/k_pe/v_c are identical for every head,
+//  the block-wide key reads are absorbed by L1 and the KV latent is read
+//  from DRAM once per (query tile, head group) instead of once per
+//  (query tile, head) — a BH-fold traffic cut — while each wavefront keeps
+//  the exact plain-kernel inner loop (which allocates cleanly: no LDS key
+//  staging, no serial head loop; a BN-tiled LDS variant of this kernel
+//  measured 57 spilled SGPRs on gfx942 and ran ~50x slower per key).
+//
+//  Grid: (ceil(S_q/BQ), ceil(H/BH), B) blocks of BQ·BH wavefronts; warp w
+//  owns row q_tile·BQ + w/BH and head hgroup·BH + w%BH. Heads per group are
+//  capped at 16/BQ so the block stays <= 1024 threads (16 wavefronts).
+// ---------------------------------------------------------------------------
+template <int BQ, int BH>
+__global__ void mla_fwd_headfused_kernel(const float* __restrict__ q,
+                                         const float* __restrict__ k_c,
+                                         const float* __restrict__ k_pe,
+                                         const float* __restrict__ v_c,
+                                         float* __restrict__ out,
+                                         int B, int H, int S_q, int S_kv,
+                                         int q_start, int kv_start,
+                                         int lr, int rhd, float scale) {
+  const int q_tile = blockIdx.x;
+  const int hgroup = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 63;          // strided head index this lane owns
+  const int warp = tid >> 6;          // (row, head) pair within the block
+  const int r = warp / BH;            // query row within the tile
+  const int hh = warp - r * BH;       // head within the group
+  const int h = hgroup * BH + hh;
+  const int gi = q_tile * BQ + r;
+  // Warp-uniform guards: whole wavefronts may exit before any barrier (this
+  // kernel has none — every wavefront is independent).
+  if (gi >= S_q || h >= H) return;
+
+  const int Dq = lr + rhd;
+  const int gqi = q_start + gi;
+
+  // This warp's query row slice (lane-strided), loaded once. The runtime
+  // nope_tiles bound keeps o[]/qr[] allocatable exactly as in the plain
+  // kernel (full unrolling spilled SGPRs).
+  float qr[kPerLane];
+  float qrope = 0.0f;
+  {
+    const float* qrow = q + (((size_t)b * H + h) * S_q + gi) * Dq;
+    const int nope_tiles = (lr + 63) / 64;
+    for (int t = 0; t < nope_tiles; ++t) {
+      const int idx = lane + t * 64;
+      qr[t] = (idx < lr) ? qrow[idx] : 0.0f;
+    }
+    if (lane < rhd) qrope = qrow[lr + lane];  // one rope element per lane
+  }
+
+  // Lane-local slices of the no-ropes output accumulator (strided by 64).
+  float o[kPerLane];
+  for (int t = 0; t < kPerLane; ++t) o[t] = 0.0f;
+  float row_max = -INFINITY;          // running max (same on every lane)
+  float row_sum = 0.0f;               // running denominator (same on every lane)
+
+  const int nope_tiles = (lr + 63) / 64;
+  for (int j = 0; j < S_kv; ++j) {
+    const int gkj = kv_start + j;
+
+    // --- lane-local partial score (no-ropes + rope), then warp-reduce ---
+    // k_c/k_pe rows are head-shared: all BH·BQ wavefronts of the block read
+    // the same rows, so L1 serves the duplicates.
+    float partial = 0.0f;
+    if (gkj <= gqi) {
+      const float* kc = k_c + ((size_t)b * S_kv + j) * lr;
+      for (int t = 0; t < nope_tiles; ++t) {
+        const int idx = lane + t * 64;
+        if (idx < lr) partial += qr[t] * kc[idx];
+      }
+      if (lane < rhd) {               // one rope element per lane (rhd <= 64)
+        const float* kp = k_pe + ((size_t)b * S_kv + j) * rhd;
+        partial += qrope * kp[lane];
+      }
+    }
+    float score = partial;
+    for (int off = 32; off > 0; off >>= 1)   // warp-wide sum → broadcast
+      score += __shfl_xor(score, off);
+    // Masked keys (gkj > gqi) must contribute ZERO weight, so clamp their
+    // score to -inf exactly as the CPU oracle does (else exp(0-max)=1).
+    score = (gkj <= gqi) ? (score * scale) : -INFINITY;
+
+    // --- online softmax update (lock-step; identical on every lane) ---
+    const float new_max = fmaxf(row_max, score);
+    const float exp_old = (row_max == -INFINITY) ? 0.0f
+                                                 : expf(row_max - new_max);
+    const float exp_s = (score == -INFINITY) ? 0.0f : expf(score - new_max);
+    row_sum = row_sum * exp_old + exp_s;
+    for (int t = 0; t < nope_tiles; ++t) o[t] *= exp_old;
+    if (gkj <= gqi) {
+      const float* vc = v_c + ((size_t)b * S_kv + j) * lr;
+      for (int t = 0; t < nope_tiles; ++t) {
+        const int idx = lane + t * 64;
+        if (idx < lr) o[t] += exp_s * vc[idx];
+      }
+    }
+    row_max = new_max;
+  }
+
+  // --- normalise and write the lane-local output slice ---
+  const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
+  float* orow = out + (((size_t)b * H + h) * S_q + gi) * lr;
+  for (int t = 0; t < nope_tiles; ++t) {
+    const int idx = lane + t * 64;
+    if (idx < lr) orow[idx] = o[t] * inv;
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Fused-head prefill, wide-rank pipeline (issue #151): same block mapping
+//  as mla_fwd_headfused_kernel, specialised for ranks where lr = LP·64
+//  (Kimi-K3: lr=512, LP=8) and rhd <= 64. Two latency tricks:
+//
+//  * BN-key software pipeline: a tile's k_c/k_pe/v_c loads are issued up
+//    front into registers, so the per-key chain (warp reduce → expf →
+//    accumulate) runs ALU-only while the next tile's loads are in flight.
+//    The unpipelined loop sits at ~1300 cycles/key on MI300A (latency, not
+//    bandwidth); the pipeline amortises load latency over BN keys.
+//  * Consecutive-lane ownership: lane l owns floats [l·LP, (l+1)·LP) of
+//    every lr-row, so each row load is LP/4 float4s (2 instead of 8 scalar
+//    loads at LP=8) and every address is 32 B aligned (Dq = lr + rhd keeps
+//    rows 16 B aligned; q/out rows are lr-sized and likewise aligned).
+//
+//  The online softmax also takes a branch-free fast path: keys that do not
+//  advance the running max skip the accumulator rescale and one expf.
+//  BN=2 keeps the register tile under the occupancy cliff: a workgroup's
+//  wavefronts must fit the CU's 256 KB register file.
+// ---------------------------------------------------------------------------
+template <int BQ, int BH, int LP>
+__global__ void mla_fwd_headfused_wide_kernel(
+    const float* __restrict__ q, const float* __restrict__ k_c,
+    const float* __restrict__ k_pe, const float* __restrict__ v_c,
+    float* __restrict__ out, int B, int H, int S_q, int S_kv,
+    int q_start, int kv_start, int rhd, float scale) {
+  constexpr int LR = LP * 64;          // launcher guarantees lr == LR
+  constexpr int BN = 2;                // keys in flight per wavefront
+  const int q_tile = blockIdx.x;
+  const int hgroup = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 63;
+  const int warp = tid >> 6;
+  const int r = warp / BH;
+  const int hh = warp - r * BH;
+  const int h = hgroup * BH + hh;
+  const int gi = q_tile * BQ + r;
+  if (gi >= S_q || h >= H) return;
+  const int gqi = q_start + gi;
+
+  // This wavefront's query row slice (lane-consecutive float4s).
+  float qr[LP];
+  float qrope = 0.0f;
+  {
+    const float* qrow = q + (((size_t)b * H + h) * S_q + gi) * (LR + rhd);
+    const float4* q4 = reinterpret_cast<const float4*>(qrow + lane * LP);
+    #pragma unroll
+    for (int f = 0; f < LP / 4; ++f) {
+      const float4 v4 = q4[f];
+      qr[f * 4 + 0] = v4.x; qr[f * 4 + 1] = v4.y;
+      qr[f * 4 + 2] = v4.z; qr[f * 4 + 3] = v4.w;
+    }
+    if (lane < rhd) qrope = qrow[LR + lane];
+  }
+
+  float o[LP];
+  #pragma unroll
+  for (int t = 0; t < LP; ++t) o[t] = 0.0f;
+  float row_max = -INFINITY;
+  float row_sum = 0.0f;
+
+  for (int j0 = 0; j0 < S_kv; j0 += BN) {
+    const int n = (S_kv - j0 < BN) ? S_kv - j0 : BN;
+    // Stage 1: issue the tile's loads (independent → all in flight).
+    float kcr[BN][LP], vcr[BN][LP], kpr[BN];
+    #pragma unroll
+    for (int n2 = 0; n2 < BN; ++n2) {
+      if (n2 < n) {
+        const int j = j0 + n2;
+        const float* kc = k_c + ((size_t)b * S_kv + j) * LR;
+        const float* vc = v_c + ((size_t)b * S_kv + j) * LR;
+        const float4* kc4 = reinterpret_cast<const float4*>(kc + lane * LP);
+        const float4* vc4 = reinterpret_cast<const float4*>(vc + lane * LP);
+        #pragma unroll
+        for (int f = 0; f < LP / 4; ++f) {
+          const float4 k4 = kc4[f];
+          kcr[n2][f * 4 + 0] = k4.x; kcr[n2][f * 4 + 1] = k4.y;
+          kcr[n2][f * 4 + 2] = k4.z; kcr[n2][f * 4 + 3] = k4.w;
+          const float4 v4 = vc4[f];
+          vcr[n2][f * 4 + 0] = v4.x; vcr[n2][f * 4 + 1] = v4.y;
+          vcr[n2][f * 4 + 2] = v4.z; vcr[n2][f * 4 + 3] = v4.w;
+        }
+        kpr[n2] = (lane < rhd)
+                      ? k_pe[((size_t)b * S_kv + j) * rhd + lane]
+                      : 0.0f;
+      }
+    }
+    // Stage 2: ALU-only online-softmax merge over the staged keys. Keys
+    // that do not advance row_max skip the accumulator rescale entirely.
+    #pragma unroll
+    for (int n2 = 0; n2 < BN; ++n2) {
+      const int gkj = kv_start + j0 + n2;
+      if (n2 >= n) break;
+      float score;
+      if (gkj <= gqi) {
+        float partial = qrope * kpr[n2];
+        #pragma unroll
+        for (int t = 0; t < LP; ++t) partial += qr[t] * kcr[n2][t];
+        #pragma unroll
+        for (int off = 32; off > 0; off >>= 1)
+          partial += __shfl_xor(partial, off);
+        score = partial * scale;
+      } else {
+        score = -INFINITY;             // masked key: zero weight, as oracle
+      }
+      if (score > row_max) {
+        // New max: one expf (the new key's weight is exactly 1).
+        const float e = expf(row_max - score);   // -inf → 0 (first key)
+        row_sum = row_sum * e + 1.0f;
+        #pragma unroll
+        for (int t = 0; t < LP; ++t) o[t] = o[t] * e + vcr[n2][t];
+        row_max = score;
+      } else {
+        const float w =
+            (score == -INFINITY) ? 0.0f : expf(score - row_max);
+        row_sum += w;
+        #pragma unroll
+        for (int t = 0; t < LP; ++t) o[t] += w * vcr[n2][t];
+      }
+    }
+  }
+
+  const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
+  float* orow = out + (((size_t)b * H + h) * S_q + gi) * LR;
+  if (LP % 4 == 0) {
+    float4* o4 = reinterpret_cast<float4*>(orow + lane * LP);
+    #pragma unroll
+    for (int f = 0; f < LP / 4; ++f) {
+      o4[f] = make_float4(o[f * 4 + 0] * inv, o[f * 4 + 1] * inv,
+                          o[f * 4 + 2] * inv, o[f * 4 + 3] * inv);
+    }
+  } else {
+    #pragma unroll
+    for (int t = 0; t < LP; ++t) orow[lane * LP + t] = o[t] * inv;
+  }
+}
+
+// ---------------------------------------------------------------------------
 //  Launchers
 // ---------------------------------------------------------------------------
 namespace {
@@ -371,15 +650,97 @@ bool launch_split(const float* q, const float* k_c, const float* k_pe,
   }
   if (w.cap_out < n_out || w.cap_lse < n_lse) return false;
 
-  const dim3 block(64);
-  const dim3 gridS(S_q, H, B * split);
-  mla_fwd_split_kernel<<<gridS, block, Dq * sizeof(float), 0>>>(
-      q, k_c, k_pe, v_c, w.partial_out, w.partial_lse, H, S_q, S_kv, q_start,
-      kv_start, lr, rhd, scale, split, kvs);
+  // Decode (S_q <= 8): one row per block, BQ=1 (issue #82, unchanged).
+  // Chunked / short prefill (S_q > 8): BQ=4 rows per block (issue #151) —
+  // BQ× fewer full-KV passes than one-row blocks, same combine.
+  const int bq = (S_q > 8) ? 4 : 1;
+  const dim3 block(bq * 64);
+  const dim3 gridS((S_q + bq - 1) / bq, H, B * split);
+  if (bq == 4) {
+    mla_fwd_split_kernel<4><<<gridS, block, 4 * Dq * sizeof(float), 0>>>(
+        q, k_c, k_pe, v_c, w.partial_out, w.partial_lse, H, S_q, S_kv,
+        q_start, kv_start, lr, rhd, scale, split, kvs);
+  } else {
+    mla_fwd_split_kernel<1><<<gridS, block, Dq * sizeof(float), 0>>>(
+        q, k_c, k_pe, v_c, w.partial_out, w.partial_lse, H, S_q, S_kv,
+        q_start, kv_start, lr, rhd, scale, split, kvs);
+  }
   const dim3 gridC(S_q, H, B);
-  mla_fwd_split_combine_kernel<<<gridC, block, split * sizeof(float), 0>>>(
+  // The combine kernel assumes 64 threads (its strided slices and the sLse
+  // staging loop are hard-wired to 64); keep it at 64 regardless of BQ.
+  mla_fwd_split_combine_kernel<<<gridC, 64, split * sizeof(float), 0>>>(
       w.partial_out, w.partial_lse, out, S_q, split, lr);
   return true;
+}
+
+// Fused-head prefill launch (issue #151). bq selects the query tile (rows
+// per block); the heads-per-block group follows as min(H, 16/BQ) rounded
+// down to a power of two (<= 1024 threads per block).
+void launch_fused(const float* q, const float* k_c, const float* k_pe,
+                  const float* v_c, float* out, int B, int H, int S_q,
+                  int S_kv, int q_start, int kv_start, int lr, int rhd,
+                  float scale, int bq, int bh) {
+  const int BQ = (bq < 2) ? 1 : (bq < 4) ? 2 : (bq < 8) ? 4 : 8;
+
+  // Wide-rank pipeline (K3: lr=512 = 8 lane slices, rhd <= 64): the BN-key
+  // register tile costs ~65 VGPRs per wavefront, so cap the block at 12
+  // wavefronts (12 · 65 · 64 · 4 B ≈ 200 KB of the CU's 256 KB file).
+  if (lr == 512 && rhd <= 64) {
+    int BHw = 12 / BQ;
+    while ((BHw & (BHw - 1)) != 0) BHw &= BHw - 1;  // power of two (case list)
+    if (BHw > bh) BHw = bh;
+    if (BHw < 1) BHw = 1;
+    const dim3 block(BQ * BHw * 64);
+    const dim3 grid((S_q + BQ - 1) / BQ, (H + BHw - 1) / BHw, B);
+#define VK_MLA_WIDE_CASE(BQ_, BH_)                                         \
+  case ((BQ_) * 32 + (BH_)):                                              \
+    mla_fwd_headfused_wide_kernel<BQ_, BH_, 8><<<grid, block, 0, 0>>>(      \
+        q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start, rhd,   \
+        scale);                                                            \
+    return
+    switch (BQ * 32 + BHw) {
+      VK_MLA_WIDE_CASE(1, 1);
+      VK_MLA_WIDE_CASE(1, 2);
+      VK_MLA_WIDE_CASE(1, 4);
+      VK_MLA_WIDE_CASE(1, 8);
+      VK_MLA_WIDE_CASE(2, 1);
+      VK_MLA_WIDE_CASE(2, 2);
+      VK_MLA_WIDE_CASE(2, 4);
+      VK_MLA_WIDE_CASE(4, 1);
+      VK_MLA_WIDE_CASE(4, 2);
+      VK_MLA_WIDE_CASE(8, 1);
+      default: break;
+    }
+#undef VK_MLA_WIDE_CASE
+  }
+
+  const dim3 block(BQ * bh * 64);
+  const dim3 grid((S_q + BQ - 1) / BQ, (H + bh - 1) / bh, B);
+
+#define VK_MLA_FUSED_CASE(BQ_, BH_)                                        \
+  case ((BQ_) * 32 + (BH_)):                                              \
+    mla_fwd_headfused_kernel<BQ_, BH_><<<grid, block, 0, 0>>>(              \
+        q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start, lr,    \
+        rhd, scale);                                                       \
+    return
+  switch (BQ * 32 + bh) {
+    VK_MLA_FUSED_CASE(1, 1);
+    VK_MLA_FUSED_CASE(1, 2);
+    VK_MLA_FUSED_CASE(1, 4);
+    VK_MLA_FUSED_CASE(1, 8);
+    VK_MLA_FUSED_CASE(1, 16);
+    VK_MLA_FUSED_CASE(2, 1);
+    VK_MLA_FUSED_CASE(2, 2);
+    VK_MLA_FUSED_CASE(2, 4);
+    VK_MLA_FUSED_CASE(2, 8);
+    VK_MLA_FUSED_CASE(4, 1);
+    VK_MLA_FUSED_CASE(4, 2);
+    VK_MLA_FUSED_CASE(4, 4);
+    VK_MLA_FUSED_CASE(8, 1);
+    VK_MLA_FUSED_CASE(8, 2);
+    default: break;
+  }
+#undef VK_MLA_FUSED_CASE
 }
 }  // namespace
 
@@ -388,8 +749,17 @@ void mla_fwd_with_tile(int B, int H, int S_q, int S_kv, int q_start,
                        float scale, const float* q, const float* k_c,
                        const float* k_pe, const float* v_c, float* out,
                        int bq, int bn_kv) {
-  (void)bn_kv;  // baseline streams one key at a time; reserved for a tiled
-                // key prefetch in a follow-on optimisation.
+  if (S_q > 8) {
+    // Prefill (issue #151): fused-head kernel — bq selects the query tile;
+    // min(H, 16/BQ) heads ride along per block (power-of-two) so the shared
+    // KV latent is re-read once per head group instead of once per head.
+    const int bh = ::vkernels::kernels::mla_prefill_heads_per_block(bq, H);
+    launch_fused(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
+                 kv_lora_rank, qk_rope_head_dim, scale, bq, bh);
+    return;
+  }
+  (void)bn_kv;  // decode streams one key at a time; the split-K path (#82)
+                // handles occupancy for the grids that need it
   if (bq <= 1)
     launch<1>(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
               kv_lora_rank, qk_rope_head_dim, scale);
@@ -408,9 +778,9 @@ void mla_fwd(int B, int H, int S_q, int S_kv, int q_start, int kv_start,
              int kv_lora_rank, int qk_rope_head_dim, float scale,
              const float* q, const float* k_c, const float* k_pe,
              const float* v_c, float* out) {
-  // Decode shaped grids that cannot fill the CUs take the split-K path
-  // (issue #82); mla_fwd_split_for returns 1 for prefill shapes and for
-  // grids that already fill them, which then run exactly as before.
+  // Grids that cannot fill the CUs take the split path (issues #82/#151:
+  // decode and chunked prefill); everything else runs the plain decode
+  // kernel (S_q <= 8) or the fused-head tiled prefill kernel (S_q > 8).
   const int split = ::vkernels::kernels::mla_fwd_split_for(B, H, S_q, S_kv);
   if (split > 1 &&
       launch_split(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
