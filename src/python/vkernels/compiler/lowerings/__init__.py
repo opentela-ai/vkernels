@@ -821,6 +821,71 @@ def lower_gdn_delta(op: Operator, graph: OperatorGraph) -> TaskFamily:
         write_regions=writes,
     )
 
+
+# ---------------------------------------------------------------------------
+# Attention: one task per (batch, head); valid prefix [0, p] (§5.3, §10.3)
+# ---------------------------------------------------------------------------
+
+
+def lower_kda_delta(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    """One task per (batch, head): the task owns the head's [K, V] state
+    slice (read-modify-write, in registers on device) plus its q/k/v/f/gate
+    rows. KDA heads are square (K = V = head_dim) with one q/k/v head each
+    — no group expansion, unlike gdn_delta. Two kda_delta ops on one pool
+    chain through the state-storage hazards (RAW/WAR/WAW), phase-ordered
+    like the KV append."""
+    state = graph.tensor(op.inputs[0])
+    q = graph.tensor(op.inputs[1])
+    k = graph.tensor(op.inputs[2])
+    v = graph.tensor(op.inputs[3])
+    f = graph.tensor(op.inputs[4])
+    b = graph.tensor(op.inputs[5])
+    dt_bias = graph.tensor(op.inputs[6])
+    A_log = graph.tensor(op.inputs[7])
+    out = graph.tensor(op.outputs[0])
+    B, H, K, V = state.shape
+    domain = TileDomain(((B, 1), (H, 1)))
+
+    def reads(coords):
+        bb, h = coords
+        return (
+            _tile_region(state, ((bb, bb + 1), (h, h + 1), (0, K), (0, V))),
+            _tile_region(q, ((bb, bb + 1), (h, h + 1), (0, K))),
+            _tile_region(k, ((bb, bb + 1), (h, h + 1), (0, K))),
+            _tile_region(v, ((bb, bb + 1), (h, h + 1), (0, V))),
+            _tile_region(f, ((bb, bb + 1), (h, h + 1), (0, K))),
+            _tile_region(b, ((bb, bb + 1), (h, h + 1))),
+            _whole(dt_bias),
+            _whole(A_log),
+        )
+
+    def writes(coords):
+        bb, h = coords
+        # Read-modify-write: the task updates its own state slice in place.
+        return (
+            _tile_region(state, ((bb, bb + 1), (h, h + 1), (0, K), (0, V))),
+            _tile_region(out, ((bb, bb + 1), (h, h + 1), (0, V))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_kda_delta",
+        kind="kda_delta",
+        op=op,
+        domain=domain,
+        inputs=(state.name, q.name, k.name, v.name, f.name, b.name, dt_bias.name, A_log.name),
+        outputs=(out.name,),
+        params={
+            "layer": op.attributes.get("layer", 0),
+            "scale": op.attributes.get("scale", 1.0),
+            "lower_bound": op.attributes.get("lower_bound"),
+        },
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=K * V * 4,  # the [K, V] fp32 state slice (registers/scratch budget)
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
 def lower_attention_scores(op: Operator, graph: OperatorGraph) -> TaskFamily:
     q = graph.tensor(op.inputs[0])
     k_cache = graph.tensor(op.inputs[1])
@@ -1612,6 +1677,7 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "cache_append": lower_cache_append,
     "gdn_conv": lower_gdn_conv,
     "gdn_delta": lower_gdn_delta,
+    "kda_delta": lower_kda_delta,
     "cache_append_paged": lower_cache_append_paged,
     "mhc_pre": lower_mhc_pre,
     "mhc_post": lower_mhc_post,
