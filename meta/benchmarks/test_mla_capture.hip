@@ -328,12 +328,16 @@ int main() {
     if (!ok) ++fails;
   }
 
-  hipFree(legacy.dq); hipFree(legacy.dkc); hipFree(legacy.dkp);
-  hipFree(legacy.dvc); hipFree(legacy.dout);
-  hipFree(stream_dev.dq); hipFree(stream_dev.dkc); hipFree(stream_dev.dkp);
-  hipFree(stream_dev.dvc); hipFree(stream_dev.dout);
-  hipFree(cap_dev.dq); hipFree(cap_dev.dkc); hipFree(cap_dev.dkp);
-  hipFree(cap_dev.dvc); hipFree(cap_dev.dout);
+  // Best-effort teardown at exit (CK would abort after the summary).
+  (void)hipFree(legacy.dq); (void)hipFree(legacy.dkc);
+  (void)hipFree(legacy.dkp); (void)hipFree(legacy.dvc);
+  (void)hipFree(legacy.dout);
+  (void)hipFree(stream_dev.dq); (void)hipFree(stream_dev.dkc);
+  (void)hipFree(stream_dev.dkp); (void)hipFree(stream_dev.dvc);
+  (void)hipFree(stream_dev.dout);
+  (void)hipFree(cap_dev.dq); (void)hipFree(cap_dev.dkc);
+  (void)hipFree(cap_dev.dkp); (void)hipFree(cap_dev.dvc);
+  (void)hipFree(cap_dev.dout);
   std::printf("\n%s (%d failure(s))\n", fails ? "FAIL" : "PASS", fails);
   return fails ? 1 : 0;
 }
