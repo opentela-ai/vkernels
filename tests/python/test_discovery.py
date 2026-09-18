@@ -50,6 +50,7 @@ EXPECTED_KERNELS = [
     ("dsa_topk_logits_fits_lds", "dsa"),
     ("dsa_topk_logits_fits_lds_fp8q", "dsa"),
     ("dsa_topk_logits_fits_lds_mfma", "dsa"),
+    ("dsa_topk_logits_fits_lds_mfma_fp8", "dsa"),
     # dsa_topk_logits_fits_lds_wmma (PR #30 review): the CUDA wmma kernel's
     # admission guard -- the MFMA gates + sAcc staging + the CUDA 1024
     # threads/block cap -- declared in dsa.hpp right after the mfma guard.
@@ -101,6 +102,11 @@ EXPECTED_KERNELS = [
     # Same two-namespace model as dsa.hpp: the CUDA wmma GEMM (PR #30)
     # declares gemm_bf16 a second time in vkernels::kernels::cuda.
     ("gemm_bf16", "gemm_bf16"),
+    ("glm_fp8_block_gemv_cpu", "glm_moe"),
+    ("glm_e4m3_to_f32_cpu", "glm_moe"),
+    ("glm_fp8_gemv_pick_sk", "glm_moe"),
+    ("glm_fp8_block_gemv", "glm_moe"),
+    ("glm_fp8_block_gemv_with_scratch", "glm_moe"),
     ("kda_layer_norm_gated_cpu", "kda"),
     ("kda_gate_chunk_cumsum_cpu", "kda"),
     ("kda_naive_delta_rule_fwd_cpu", "kda"),
@@ -113,13 +119,19 @@ EXPECTED_KERNELS = [
     ("kda_gate_chunk_cumsum", "kda"),
     ("kda_delta_rule_fwd", "kda"),
     ("kda_delta_rule_fwd_with_scratch", "kda"),
+    ("kda_delta_rule_fwd_chunked_with_scratch", "kda"),
+    ("kda_chunked_scratch_floats", "kda"),
+    ("kda_delta_rule_fwd_chunked", "kda"),
+    ("kda_chunked_phase_times", "kda"),
     ("kda_pack_bitmatrix", "kda"),
     ("mhc_pre_gemm_sqrsum_cpu", "mhc"),
     ("mhc_post_cpu", "mhc"),
     ("mhc_pre_gemm_sqrsum", "mhc"),
+    ("mhc_pre_gemm_sqrsum_blocked", "mhc"),
     ("mhc_post", "mhc"),
     ("mla_fwd_cpu", "mla"),
     ("mla_config_for", "mla"),
+    ("mla_fwd_split_for", "mla"),
     ("mla_fwd", "mla"),
     ("mla_fwd_with_tile", "mla"),
     ("direct_lds_fill_bf16", "moe"),

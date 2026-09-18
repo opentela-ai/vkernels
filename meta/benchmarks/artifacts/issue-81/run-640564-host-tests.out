@@ -1,0 +1,11 @@
+BUILD_FAIL
+/capstor/scratch/cscs/xyao/vk-issue-81-v3/src/tests/kernels/attn/test_dsa.cpp:653:15: error: ‘dsa_topk_logits_fits_lds_mfma_fp8’ was not declared in this scope
+/capstor/scratch/cscs/xyao/vk-issue-81-v3/src/tests/kernels/attn/test_dsa.cpp:654:15: error: ‘dsa_topk_logits_fits_lds_mfma_fp8’ was not declared in this scope
+/capstor/scratch/cscs/xyao/vk-issue-81-v3/src/tests/kernels/attn/test_dsa.cpp:655:15: error: ‘dsa_topk_logits_fits_lds_mfma_fp8’ was not declared in this scope
+/capstor/scratch/cscs/xyao/vk-issue-81-v3/src/tests/kernels/attn/test_dsa.cpp:656:15: error: ‘dsa_topk_logits_fits_lds_mfma_fp8’ was not declared in this scope
+/capstor/scratch/cscs/xyao/vk-issue-81-v3/src/tests/kernels/attn/test_dsa.cpp:657:15: error: ‘dsa_topk_logits_fits_lds_mfma_fp8’ was not declared in this scope
+/capstor/scratch/cscs/xyao/vk-issue-81-v3/src/tests/kernels/attn/test_dsa.cpp:658:15: error: ‘dsa_topk_logits_fits_lds_mfma_fp8’ was not declared in this scope
+/capstor/scratch/cscs/xyao/vk-issue-81-v3/src/tests/kernels/attn/test_dsa.cpp:660:16: error: ‘dsa_topk_logits_fits_lds_mfma_fp8’ was not declared in this scope
+/capstor/scratch/cscs/xyao/vk-issue-81-v3/src/tests/kernels/attn/test_dsa.cpp:661:16: error: ‘dsa_topk_logits_fits_lds_mfma_fp8’ was not declared in this scope
+/capstor/scratch/cscs/xyao/vk-issue-81-v3/src/tests/kernels/attn/test_dsa.cpp:662:16: error: ‘dsa_topk_logits_fits_lds_mfma_fp8’ was not declared in this scope
+/capstor/scratch/cscs/xyao/vk-issue-81-v3/src/tests/kernels/attn/test_dsa.cpp:663:16: error: ‘dsa_topk_logits_fits_lds_mfma_fp8’ was not declared in this scope

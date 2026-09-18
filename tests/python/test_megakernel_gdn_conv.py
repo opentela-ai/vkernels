@@ -55,7 +55,7 @@ def _floe_gdn():
         # FLOE_ROOT then the standard serving-stack checkout location.
         import os
         from pathlib import Path
-        for cand in (os.environ.get("FLOE_ROOT"), "/home/xiayao/Documents/projects/opentela-ai/serving-stack/floe"):
+        for cand in (os.environ.get("FLOE_ROOT"), "/home/xiayao/Documents/projects/opentela-ai/serving-stack/floe", "/local/home/xiayao/Documents/code/floe"):
             if cand and (Path(cand) / "floe" / "engine").is_dir():
                 if cand not in sys.path:
                     sys.path.insert(0, cand)
@@ -70,8 +70,15 @@ def _floe_gdn():
         sys.modules["kvaas_runtime"] = kv
         sys.modules["kvaas_runtime.kv_pool_import"] = sub
     try:
-        from floe.engine.runner.models.qwen35.qwen35_config import Qwen35Config
-        from floe.engine.runner.models.qwen35.qwen35_gdn import GatedDeltaNet
+        # floe refactored the qwen35 modules: qwen35_config -> qwen35.config,
+        # qwen35_gdn -> qwen35.gdn. Try the historical paths first, then the
+        # current layout.
+        try:
+            from floe.engine.runner.models.qwen35.qwen35_config import Qwen35Config
+            from floe.engine.runner.models.qwen35.qwen35_gdn import GatedDeltaNet
+        except ModuleNotFoundError:
+            from floe.engine.runner.models.qwen35.config import Qwen35Config
+            from floe.engine.runner.models.qwen35.gdn import GatedDeltaNet
     except ModuleNotFoundError as exc:  # floe not on this stack (vkernels-only venv)
         pytest.skip(f"floe qwen35 oracle unavailable: {exc}")
 
@@ -301,11 +308,19 @@ gpu = pytest.mark.skipif(
 
 
 @gpu
-def test_device_t_gdn_conv_tiled_matches_floe_oracle():
+def test_device_t_gdn_conv_tiled_matches_oracle():
+    """Same oracle as the CPU executor tests above: the kernel is given a
+    random FIR weight ``w`` and must reproduce silu(FIR) + the time-major
+    state shift for exactly that ``w`` (fp64 recomputation).
+
+    Launch contract: ``worker``/``P`` are the runtime worker id / worker
+    count; the kernel mutates the state pool in place, so the test runs a
+    single worker (grid (1,), worker=0, P=1) that walks all (batch, tile)
+    tasks sequentially — deterministic, no double-shift races.
+    """
     pytest.importorskip("triton")
     from vkernels.compiler.device_triton import _t_gdn_conv_tiled
 
-    gdn, _cfg = _floe_gdn()
     dev = torch.device("cuda")
     rng = np.random.default_rng(97)
     state = (rng.standard_normal((B, K - 1, CONV_DIM)) * 0.05).astype(np.float32)
@@ -318,15 +333,20 @@ def test_device_t_gdn_conv_tiled_matches_floe_oracle():
     out = torch.empty(B, CONV_DIM, device=dev, dtype=torch.float32)
 
     ELEM = 32  # exact tiling of the tiny conv_dim
-    _t_gdn_conv_tiled[(4,)](state_t, w_t, x_t, out, B, CONV_DIM, ELEM, K, num_warps=4)
+    _t_gdn_conv_tiled[(1,)](0, 1, state_t, w_t, x_t, out, B, CONV_DIM, ELEM, K, num_warps=4)
     torch.cuda.synchronize()
 
-    expected = torch.empty(B, CONV_DIM)
-    expected_state = torch.empty_like(torch.from_numpy(state))
+    # fp64 oracle on the SAME random w the kernel received (matches the CPU
+    # executor tests): full = cat(state0[b], x[b]); silu((full * w.T).sum(0));
+    # new_state = full[1:] (time-major shift).
+    expected = torch.empty(B, CONV_DIM, dtype=torch.float64)
+    expected_state = torch.empty(B, K - 1, CONV_DIM, dtype=torch.float64)
+    w64 = torch.from_numpy(w).double()
     for b in range(B):
-        conv_out, new_state = _floe_decode_step(gdn, torch.from_numpy(state)[b], torch.from_numpy(x)[b])
-        expected[b] = conv_out
-        expected_state[b] = new_state
-    torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-5)
+        full = torch.cat([torch.from_numpy(state)[b].double(), torch.from_numpy(x)[b][None, :].double()], dim=0)
+        acc = (full * w64.t()).sum(dim=0)
+        expected[b] = acc / (1.0 + torch.exp(-acc))
+        expected_state[b] = full[1:]
+    torch.testing.assert_close(out.double().cpu(), expected, rtol=1e-4, atol=1e-5)
     # in-place state shift on the device pool
-    torch.testing.assert_close(state_t.cpu(), expected_state, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(state_t.double().cpu(), expected_state, rtol=1e-5, atol=1e-6)

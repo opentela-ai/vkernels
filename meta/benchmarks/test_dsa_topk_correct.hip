@@ -159,6 +159,12 @@ int main() {
       {1, 32, 128, 64, 8, 8, 1, 1},    // force fp32-Q
       {1, 32, 128, 64, 8, 8, 1, 2},    // force fp8-Q
       {1, 32, 128, 64, 8, 8, 1, 3},    // force mfma
+      {1, 32, 128, 64, 8, 8, 1, 4},    // force mfma-fp8 (issue #81)
+      {1, 32, 128, 64, 16, 16, 1, 4},  // mfma-fp8, more pages (1024)
+      {2, 32, 128, 64, 8, 8, 1, 4},    // mfma-fp8, batch > 1
+      {1, 32, 128, 64, 8, 8, 2, 4},    // mfma-fp8, split_kv=2 (must match)
+      {1, 64, 128, 64, 8, 8, 1, 4},    // mfma-fp8, 2x indexer
+      {1, 128, 128, 64, 8, 8, 1, 4},   // mfma-fp8, 4x indexer (H=128 edge)
   };
 
   int ci = 0;
@@ -242,7 +248,8 @@ int main() {
     cmp_out(got, ref, &st);
     bool ok = st.max_rel < OUT_THRESH;
     const char* vn = c.variant == 0 ? "auto" : c.variant == 1 ? "fp32"
-                       : c.variant == 2 ? "fp8q" : "mfma";
+                       : c.variant == 2 ? "fp8q" : c.variant == 3 ? "mfma"
+                       : "mfma8";
     std::printf("  bs=%-2d H=%-2d D=%-3d B=%-2d mt=%-2d nb=%-2d split=%d v=%-4s "
                 "out[a=%.4f r=%.6f]  %s\n",
                 c.bs, c.H, c.D, c.B, c.mt, c.nb, c.split_kv, vn, st.max_abs,

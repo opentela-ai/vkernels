@@ -1,0 +1,59 @@
+=== variant table FIRST, fresh GPU ===
+GPU: AMD Instinct MI300A (arch=gfx942)  228 CUs,  roof 1307 TFLOP/s bf16, 5300 GB/s HBM3, ridge ~247 FLOP/B
+
+=== hip::dsa_topk_logits (GLM-5.3 indexer) ===
+    bs    H ms_len    B   mt   nb  split   us(min)   us(med)      GB/s    AI  %bw  bound
+     1   32     512   64    8    8      1      30.2      33.1       2.2  57.2  0.0  mem
+     1   32    1024   64   16   16      1      57.4      59.4       2.4  58.9  0.0  mem
+     1   32    2048   64   32   32      1     109.0     111.7       2.5  59.8  0.0  mem
+     1   32    4096   64   64   64      1     214.2     216.7       2.6  60.2  0.0  mem
+     2   32     512   64    8    8      1      30.6      32.8       4.5  57.2  0.1  mem
+     4   32     512   64    8    8      1      31.3      33.2       8.9  57.2  0.2  mem
+     8   32     512   64    8    8      1      31.0      33.3      17.8  57.2  0.3  mem
+    16   32     512   64    8    8      1      30.9      33.4      35.4  57.2  0.7  mem
+    32   32     512   64    8    8      1      33.3      34.0      69.5  57.2  1.3  mem
+    64   32     512   64    8    8      1      31.7      33.7     140.2  57.2  2.6  mem
+     1   64     512   64    8    8      1      39.4      41.7       1.9 108.2  0.0  mem
+     1   64    1024   64   16   16      1      75.3      77.8       1.9 114.4  0.0  mem
+     1   64    4096   64   64   64      1     284.7     288.2       2.0 119.6  0.0  mem
+     1   32     128   64    2    2      1       0.0       0.0       inf  48.8  inf  mem
+  Roof: 1307 TFLOP/s bf16 (Matrix-Core), 5300 GB/s HBM3.
+  NB: the working set (68-560 KB for these shapes) is L2-resident
+      after warmup, so the kernel is NOT HBM-bandwidth-bound -- the
+      binding constraint at decode (bs=1, split=1) is OCCUPANCY: the
+      grid is ONE wavefront (one of MI300A's 228 CUs). split_kv
+      (below) distributes the page range across more CUs and gives
+      near-linear speedup; batch scaling is free parallelism up to
+      ~228 batches. The follow-on tiled-key/MFMA the kernel's
+      docstring references raises occupancy AND moves toward the
+      compute roof.
+
+=== split_kv sweep (bs=1 H=32 D=128 B=64 mt=64 nb=64, max_seq_len=4096, 228 CUs) ===
+  dsa_topk_logits_split_for(1, 4096, 64) = 64  (recommended)
+   split   us(min)   us(med)      GB/s   speedup
+       1     213.2     216.6       2.6      1.0x
+       2     109.2     112.7       5.0      1.9x
+       4      59.0      60.2       9.3      3.6x
+       8      30.8      33.3      16.9      6.5x
+      16      20.0      20.5      27.4     10.6x
+      32       0.0       0.0       inf      infx
+      64       0.0       0.0       inf      infx
+  (split_kv is perf-only and grouping-independent -- the
+        reference logit is identical across splits; see
+        test_dsa_topk_correct.hip case split=2. Max split
+        here is ceildiv(max_seq_len,B)=64. The integrator
+        should set split_kv = min(ceildiv(max_seq_len,B),
+        CUs/batch_size) -- see dsa.hpp::dsa_topk_logits_split_for.)
+
+=== hip::dsa_topk_logits variant comparison (bs=1 H=32 D=128 B=64 max_seq_len=512, 228 CUs) ===
+     var   us(min)   us(med)   vs fp32
+    auto      31.8      33.4     1.00x
+    fp32    2697.5    2701.9     1.00x
+    fp8q    4213.9    4219.0     0.64x
+    mfma     262.5     264.3    10.22x
+   mfma8      31.4      33.6    80.41x
+  (auto dispatches mfma here -- the SMALLEST-variant + Matrix-Core path.
+   fp32-Q stages Q as fp32 once (49,536 B),
+   fp8-Q stages Q raw + dequants on the fly (41,472 B),
+   mfma   stages Q transposed bf16 once + bf16 K-tile (16,768 B).
+   See dsa.hpp::dsa_topk_logits_fits_lds{,_fp8q,_mfma}.)
