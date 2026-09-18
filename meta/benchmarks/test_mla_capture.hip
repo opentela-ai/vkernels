@@ -118,17 +118,22 @@ Stats oracle(const Shape& s, const Buffers& b, std::vector<float>* host_out) {
   CK(hipMemcpy(kc.data(), b.dkc, b.nkc * 4, hipMemcpyDeviceToHost), "rdkc");
   CK(hipMemcpy(kp.data(), b.dkp, b.nkp * 4, hipMemcpyDeviceToHost), "rdkp");
   CK(hipMemcpy(vc.data(), b.dvc, b.nvc * 4, hipMemcpyDeviceToHost), "rdvc");
-  if (host_out) host_out->resize(b.nout);
+  // `host_out` may be null (caller only wants the stats); the oracle still
+  // needs a writable reference buffer, so fall back to a local vector.
+  std::vector<float> local_ref;
+  std::vector<float>& ref = host_out ? *host_out : local_ref;
+  ref.resize(b.nout);
   vkernels::kernels::mla_fwd_cpu(s.B, s.H, s.S_q, s.S_kv, s.S_q - 1, 0, kLr,
                                  kRhd, kScale, q.data(), kc.data(), kp.data(),
-                                 vc.data(), host_out->data());  std::vector<float> dev(b.nout);
+                                 vc.data(), ref.data());
+  std::vector<float> dev(b.nout);
   CK(hipMemcpy(dev.data(), b.dout, b.nout * 4, hipMemcpyDeviceToHost),
      "rdout");
   Stats st{0.0, 0.0};
   for (size_t i = 0; i < b.nout; ++i) {
-    double e = std::fabs((double)dev[i] - (*host_out)[i]);
+    double e = std::fabs((double)dev[i] - ref[i]);
     if (e > st.max_abs) st.max_abs = e;
-    double d = std::fmax(std::fabs((*host_out)[i]), 1.0);
+    double d = std::fmax(std::fabs(ref[i]), 1.0);
     if (e / d > st.max_rel) st.max_rel = e / d;
   }
   return st;
