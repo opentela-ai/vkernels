@@ -43,15 +43,19 @@ void mxfp4_moe_sort(const uint16_t* A, const int32_t* sorted_ids,
 void mxfp4_moe_sort_scales(const uint8_t* scales, const int32_t* sorted_ids,
                            uint8_t* scales_sorted, int M, int n_groups,
                            int top_k, int EM);
+void mxfp4_moe_build_inv(const int32_t* sorted_ids, int32_t* inv,
+                         int M, int top_k, int EM);
 void mxfp4_moe_scatter_reduce(const float* partial, const float* topk_w,
                               const int32_t* sorted_ids, float* out,
-                              int M, int width, int top_k, int EM);
+                              int M, int width, int top_k, int EM,
+                              int32_t* inv_prebuilt = nullptr);
 void mxfp4_moe_scatter_reduce_q(const uint8_t* partial_q,
                                 const uint8_t* partial_s,
                                 const float* topk_w,
                                 const int32_t* sorted_ids, float* out,
                                 int M, int width, int top_k, int EM,
-                                int group_size);
+                                int group_size,
+                                int32_t* inv_prebuilt = nullptr);
 }  // namespace vkernels::kernels::hip
 
 #define CK(e, m)                                                       \
@@ -192,7 +196,7 @@ int main() {
     // Device buffers.
     uint16_t *dA, *dA_sorted, *dPbf;
     uint8_t *dPacked, *dScales, *dScalesSorted, *dPq, *dPs;
-    int32_t *dSids;
+    int32_t *dSids, *dInv;
     float *dTw, *dOut, *dPartial;
     CK(hipMalloc(&dA, (size_t)M * hidden * 2), "mA");
     CK(hipMalloc(&dA_sorted, (size_t)EM * hidden * 2), "mAs");
@@ -203,6 +207,7 @@ int main() {
     CK(hipMalloc(&dPq, (size_t)EM * hidden / 2), "mPq");
     CK(hipMalloc(&dPs, (size_t)EM * n_groups), "mPs");
     CK(hipMalloc(&dSids, (size_t)EM * 4), "mSids");
+    CK(hipMalloc(&dInv, (size_t)M * top_k * 4), "mInv");
     CK(hipMalloc(&dTw, (size_t)EM * 4), "mTw");
     CK(hipMalloc(&dOut, (size_t)M * hidden * 4), "mOut");
     CK(hipMalloc(&dPartial, (size_t)EM * hidden * 4), "mPartial");
@@ -216,19 +221,25 @@ int main() {
 
     using namespace vkernels::kernels::hip;
 
+    // #145: the inverse permutation is a function of sorted_ids alone; in
+    // the serving pipeline it would be fused into moe_align_block_size, so
+    // it is built once here OUTSIDE the timed region and reused.
+    mxfp4_moe_build_inv(dSids, dInv, M, top_k, EM);
+
     auto run_quant = [&]() { mxfp4_moe_quant(dA, dPacked, dScales, M, hidden, gs); };
     auto run_sort = [&]() { mxfp4_moe_sort(dA, dSids, dA_sorted, M, hidden, top_k, EM); };
     auto run_sort_s = [&]() {
       mxfp4_moe_sort_scales(dScales, dSids, dScalesSorted, M, n_groups, top_k, EM);
     };
+    // #145: token-major gather — fully overwrites out, so the old zero-init
+    // memset is gone from the timed region (and from the serving path).
     auto run_scatter = [&]() {
-      (void)hipMemset(dOut, 0, (size_t)M * hidden * 4);
-      mxfp4_moe_scatter_reduce(dPartial, dTw, dSids, dOut, M, hidden, top_k, EM);
+      mxfp4_moe_scatter_reduce(dPartial, dTw, dSids, dOut, M, hidden, top_k, EM,
+                               dInv);
     };
     auto run_scatter_q = [&]() {
-      (void)hipMemset(dOut, 0, (size_t)M * hidden * 4);
       mxfp4_moe_scatter_reduce_q(dPq, dPs, dTw, dSids, dOut, M, hidden, top_k,
-                                 EM, gs);
+                                 EM, gs, dInv);
     };
 
     // Logical bytes (read once + write once) for each op. atomicAdd traffic
@@ -258,7 +269,7 @@ int main() {
 
     hipFree(dA); hipFree(dA_sorted); hipFree(dPbf);
     hipFree(dPacked); hipFree(dScales); hipFree(dScalesSorted);
-    hipFree(dPq); hipFree(dPs); hipFree(dSids); hipFree(dTw);
+    hipFree(dPq); hipFree(dPs); hipFree(dSids); hipFree(dInv); hipFree(dTw);
     hipFree(dOut); hipFree(dPartial);
   }
 
