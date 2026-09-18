@@ -1,43 +1,57 @@
 """Gate-policy tests for the mhc_pre correctness gate (issue #138).
 
 Background (issue #79 -> #138): the gfx942 HIP ``mhc_pre_gemm_sqrsum``
-kernels are gated against a CPU oracle whose ``out`` is a STRICT sequential
-fp32 mul-add chain over ``hc_hidden``. Because fp32 addition is not
-associative, the oracle chain itself deviates from the exact (fp64) sum by
-up to ~1e-4 rel on the GLM shapes — the same order as ANY parallel
-regrouping's deviation from the oracle. Under that legacy 1e-4 oracle-chain
-gate, the PASS/FAIL verdict for the blocked-order (NSLICE-split) variant is
-seed-dependent (ns=2/16/32 FAILED on the #79 measurement seed while ns=4/8
-passed), which blocks the NSLICE >= 16 operating points needed for the
-<= 50 us/layer decode target.
+kernels were gated against a CPU oracle whose ``out`` is a STRICT sequential
+fp32 mul-add chain over ``hc_hidden`` at ``max_rel < 1e-4``. That gate is
+order-fragile: fp32 accumulation of this dot product — in ANY order,
+including the oracle's own — deviates from the exact (fp64) sum by up to
+~4e-4 rel on the GLM shapes (MI300A-measured over 5 seeds; the deviation
+lives in heavily-cancelled outputs), so the verdict for the blocked-order
+(NSLICE-split) variant is seed-dependent (issue #79: ns=2/16/32 FAILED on
+the measurement seed; the follow-up survey: even the STRICT split kernel
+FAILS 1e-4 on seed 2) and NSLICE >= 16 — needed for the <= 50 us/layer
+decode target — is inadmissible.
 
-Issue #138 revises the gate to an fp64-REFERENCE comparison: the device fp32
-result must sit within a tight fixed envelope of the fp64 (nearly exact)
-sum. This suite validates the POLICY on CPU in pure numpy (no torch, no
-HIP — bare-env friendly), by simulating every accumulation order the device
-can produce:
+Issue #138 revises the DEFAULT gate to a conditioning-normalized
+fp64-REFERENCE comparison, per element:
+
+    |got - ref64| <= K * eps32 * sum(|x_h * fn_h|)     (out)
+    |got - ref64| <= K * eps32 * sum( x_h^2 )          (sqrsum)
+
+(ref64 = fp64 CPU reference; eps32 = FLT_EPSILON; K pinned from the measured
+MI300A multi-seed envelope, K*eps*sum|terms| being the standard a-priori
+fp32 accumulation-error scale.) The normalization makes the gate
+order-INVARIANT — every correct accumulation order sits at the same
+envelope — while a shifted/dropped term perturbs an output by O(|x*fn|),
+i.e. ~1/(K*eps) normalized units, orders of magnitude above the envelope.
+The legacy strict-1e-4 oracle-chain gate remains available via
+VK_MHC_STRICT_GATE=1 on the device harness.
+
+This suite validates the POLICY on CPU in pure numpy (no torch, no HIP —
+bare-env friendly) by simulating every accumulation order the device can
+produce:
 
 * the fp32 sequential oracle chain (legacy gate reference),
 * fp32 blocked-order chains (NSLICE contiguous slices, in-order combine) —
   the device's ``mhc_pre_gemm_sqrsum_blocked`` accumulation pattern,
 * the fp32 tree-reduced sqrsum (strided partials + pairwise combine),
-* the fp64 reference,
+* the fp64 reference and the per-element conditioning scales,
 * a deliberately corrupted result (fn row off by one — the negative-control
   kernel compiled into meta/benchmarks/test_mhc_correct.hip).
 
 Assertions:
-1. EVERY NSLICE (1..256) on EVERY seed passes the fp64 gate (2e-5) — the
-   gate is order-invariant, so NSLICE >= 16 is admissible.
-2. The corrupted result exceeds the gate by >= 100x — real bugs stay caught
-   (the gate is TIGHTER than the legacy 1e-4 for detection purposes).
-3. The fp32 oracle chain itself deviates from the fp64 reference at the
-   ~1e-4 scale on at least one seed — documenting WHY the legacy gate cannot
-   distinguish order noise from bugs (soft, loose-bounded).
+1. EVERY NSLICE (1..256) on EVERY seed passes the normalized fp64 gate —
+   the gate is order-invariant, so NSLICE >= 16 is admissible.
+2. The corrupted result exceeds the gate by >= 100x — real bugs stay caught.
+3. The fp32 sequential oracle chain itself deviates from the fp64 reference
+   at a visible scale — documenting WHY the legacy gate cannot distinguish
+   order noise from bugs (soft, loose-bounded).
 
-The GPU-side counterparts of these simulations (fmaf single-rounding device
-chains vs this file's two-rounding numpy emulation) are measured on MI300A
-by meta/benchmarks/test_mhc_correct.hip; the numpy envelope is a policy
-proxy, the pinned gate threshold comes from the measured GPU envelope.
+The GPU-side counterparts (fmaf single-rounding device chains) are measured
+on MI300A by meta/benchmarks/test_mhc_correct.hip; the pinned K comes from
+that hardware envelope (docs/performance/mhc/gfx942.md). This file's
+numpy two-rounding emulation is a policy proxy with a much smaller envelope,
+so the K asserted here is conservative.
 """
 
 from __future__ import annotations
@@ -49,10 +63,12 @@ import numpy as np
 F32 = np.float32
 F64 = np.float64
 
-# The pinned fp64-reference gate threshold (docs/performance/mhc/gfx942.md).
-# Provisional until the MI300A multi-seed envelope lands; the policy
-# assertions below hold for any threshold in [1e-5, 5e-5].
-F64_GATE = 2e-5
+EPS32 = float(np.finfo(np.float32).eps)  # 1.19e-07
+
+# The pinned normalized-gate constant (docs/performance/mhc/gfx942.md).
+# The MI300A-measured envelope pins the device-side K; this policy test
+# asserts the (much tighter) simulated envelope with wide margin.
+GATE_K = 256.0
 
 # GLM-5.3-Flash decode/multi-token shapes (hc_mult=4, hidden=4096).
 GLM_HIDDEN = 4096
@@ -82,7 +98,6 @@ def _f32_seq_chain(prod: np.ndarray) -> np.ndarray:
 
     np.cumsum with dtype=float32 accumulates sequentially in fp32 (no
     pairwise regrouping), matching the CPU oracle's ``acc += x*h`` chain.
-    Returns the running final values along the last axis.
     """
     return np.cumsum(prod.astype(F32), axis=-1, dtype=F32)[..., -1]
 
@@ -126,8 +141,18 @@ def _rel(got: np.ndarray, ref: np.ndarray) -> float:
     return float(np.max(np.abs(got - ref) / denom))
 
 
+def _norm(got: np.ndarray, ref64: np.ndarray, scale: np.ndarray) -> float:
+    """The issue #138 gate statistic: max |got-ref64| / (eps32 * scale)."""
+    got = got.astype(F64)
+    err = np.abs(got - ref64)
+    denom = EPS32 * scale
+    safe = np.where(denom > 0, denom, 1.0)
+    q = np.where(denom > 0, err / safe, np.where(err > 0, np.inf, 0.0))
+    return float(np.max(q))
+
+
 class MhcPreF64GatePolicyTest(unittest.TestCase):
-    """The issue #138 fp64-reference gate, validated on simulated orders."""
+    """The issue #138 normalized fp64 gate, validated on simulated orders."""
 
     def _case(self, num_tokens: int, seed: int):
         hc_mult, hidden = GLM_HC_MULT, GLM_HIDDEN
@@ -140,30 +165,35 @@ class MhcPreF64GatePolicyTest(unittest.TestCase):
         # The fp32 values ARE the common input here (the policy test does
         # not need the bf16 round-trip; the device test applies it).
         prod = x[None, :, :] * fn[:, None, :]  # [hc_mult3, tokens, hc_hidden]
-        ref64 = prod.astype(F64).sum(axis=-1)  # fp64 reference
-        ref64 = ref64.T  # [tokens, hc_mult3]
+        ref64 = prod.astype(F64).sum(axis=-1).T  # [tokens, hc_mult3]
         oracle = _f32_seq_chain(prod).T  # [tokens, hc_mult3]
-        return x, prod, ref64, oracle, hc_hidden
+        # Conditioning scales: sum|x*fn| per out element, sum x^2 per token.
+        s_out = np.abs(prod.astype(F64)).sum(axis=-1).T  # [tokens, hc_mult3]
+        s_sq = (x.astype(F64) ** 2).sum(axis=-1)  # [tokens]
+        return x, prod, ref64, oracle, s_out, s_sq, hc_hidden
 
-    def test_all_nslice_pass_f64_gate_on_every_seed(self):
+    def test_all_nslice_pass_normalized_f64_gate_on_every_seed(self):
         for num_tokens in (1, 7):
             for seed in range(1, 6):
-                x, prod, ref64, _oracle, hc_hidden = self._case(num_tokens, seed)
+                x, prod, ref64, _oracle, s_out, s_sq, hc_hidden = self._case(
+                    num_tokens, seed
+                )
                 sqrsum64 = (x.astype(F64) ** 2).sum(axis=-1)
                 for ns in (1, 2, 4, 8, 16, 32, 64, 128, 256):
                     got = _f32_blocked(prod, ns).T
-                    r = _rel(got, ref64)
+                    n_out = _norm(got, ref64, s_out)
                     self.assertLess(
-                        r,
-                        F64_GATE,
-                        f"n={num_tokens} seed={seed} ns={ns}: f64 rel {r:.3e}",
+                        n_out,
+                        GATE_K,
+                        f"n={num_tokens} seed={seed} ns={ns}: norm {n_out:.1f}",
                     )
                     sq = _f32_sqrsum_tree(x)
-                    rsq = _rel(sq, sqrsum64)
+                    n_sq = _norm(sq, sqrsum64, s_sq)
                     self.assertLess(
-                        rsq,
-                        F64_GATE,
-                        f"sqrsum n={num_tokens} seed={seed} ns={ns}: {rsq:.3e}",
+                        n_sq,
+                        GATE_K,
+                        f"sqrsum n={num_tokens} seed={seed} ns={ns}: "
+                        f"{n_sq:.1f}",
                     )
 
     def test_corrupted_kernel_fails_gate_by_wide_margin(self):
@@ -171,8 +201,9 @@ class MhcPreF64GatePolicyTest(unittest.TestCase):
         # into test_mhc_correct.hip). Must exceed the gate by >= 100x.
         for num_tokens in (1, 7):
             for seed in (1, 3):
-                x, prod, ref64, _o, hc_hidden = self._case(num_tokens, seed)
-                # shift every fn row by one element (clamped at the end)
+                _x, prod, ref64, _o, s_out, _s, hc_hidden = self._case(
+                    num_tokens, seed
+                )
                 hc_mult3 = prod.shape[0]
                 fn = _rnd(2 * seed, hc_mult3 * hc_hidden).reshape(
                     hc_mult3, hc_hidden
@@ -180,25 +211,32 @@ class MhcPreF64GatePolicyTest(unittest.TestCase):
                 fn_bad = np.empty_like(fn)
                 fn_bad[:, :-1] = fn[:, 1:]
                 fn_bad[:, -1] = 0.0
-                prod_bad = x[None, :, :] * fn_bad[:, None, :]
+                prod_bad = prod * 0 + (
+                    _rnd(2 * seed - 1, num_tokens * hc_hidden).reshape(
+                        num_tokens, hc_hidden
+                    )[None, :, :]
+                    * fn_bad[:, None, :]
+                )
                 got_bad = _f32_blocked(prod_bad, 16).T
-                r = _rel(got_bad, ref64)
-                self.assertGreater(r, 100 * F64_GATE,
-                                   f"corrupted rel {r:.3e} must fail the gate")
+                n_bad = _norm(got_bad, ref64, s_out)
+                self.assertGreater(
+                    n_bad, 100 * GATE_K,
+                    f"corrupted norm {n_bad:.1f} must fail the gate")
 
     def test_legacy_oracle_chain_deviation_is_order_scale(self):
         # WHY the gate had to change: the fp32 sequential oracle chain
-        # itself deviates from the fp64 reference at the ~1e-4 scale — the
-        # same order as any parallel regrouping — so a 1e-4 oracle-chain
-        # gate is seed-fragile (issue #79: ns=2/16/32 FAIL, ns=4/8 PASS).
-        # Loose bounds here (1e-6 < rel < 1e-3); the exact measured scale is
-        # recorded in docs/performance/mhc/gfx942.md from MI300A runs.
+        # itself deviates from the fp64 reference (the MI300A measurement
+        # puts that deviation at up to ~4e-4 rel on cancelled outputs,
+        # seed-dependent — the same order as ANY parallel regrouping), so a
+        # 1e-4 oracle-chain gate is seed-fragile. Loose bounds here
+        # (1e-6 < rel < 1e-2); the exact measured scale is recorded in
+        # docs/performance/mhc/gfx942.md from the MI300A runs.
         seen = 0.0
         for seed in range(1, 6):
-            _x, _prod, ref64, oracle, _h = self._case(7, seed)
+            _x, _prod, ref64, oracle, _so, _sq, _h = self._case(7, seed)
             seen = max(seen, _rel(oracle, ref64))
         self.assertGreater(seen, 1e-6, "oracle chain should deviate measurably")
-        self.assertLess(seen, 1e-3, "oracle chain should stay sane vs fp64")
+        self.assertLess(seen, 1e-2, "oracle chain should stay sane vs fp64")
 
 
 class MhcPreF64GatePolicySmallShapeTest(unittest.TestCase):
@@ -215,9 +253,10 @@ class MhcPreF64GatePolicySmallShapeTest(unittest.TestCase):
             fn = rng.standard_normal(hc_mult3 * hc_hidden).astype(F32)
             prod = x[None, :] * fn[:, None, :]
             ref64 = prod.astype(F64).sum(axis=-1).T
+            s_out = np.abs(prod.astype(F64)).sum(axis=-1).T
             for ns in (1, 4, 16, 64, 256):
                 got = _f32_blocked(prod, ns).T
-                self.assertLess(_rel(got, ref64), F64_GATE)
+                self.assertLess(_norm(got, ref64, s_out), GATE_K)
 
 
 if __name__ == "__main__":
