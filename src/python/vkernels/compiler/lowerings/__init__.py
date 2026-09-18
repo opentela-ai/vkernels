@@ -1509,89 +1509,6 @@ def lower_moe_combine(op: Operator, graph: OperatorGraph) -> TaskFamily:
 INDEXER_TILE_M = 64  # compressed-entry candidates per indexer_scores task
 
 
-def lower_indexer_scores(op: Operator, graph: OperatorGraph) -> TaskFamily:
-    q, c, w = (graph.tensor(op.inputs[i]) for i in range(3))
-    s = graph.tensor(op.outputs[0])
-    b, h, d = q.shape
-    m = c.shape[1]
-    if op.attributes.get("activation") != "relu":
-        raise ValueError(f"indexer_scores {op.source_location!r}: unsupported activation {op.attributes.get('activation')!r}")
-    if not c.is_contiguous():
-        raise ValueError(f"indexer_scores {op.source_location!r}: entries must be row-major contiguous")
-    domain = TileDomain(((b, 1), (m, INDEXER_TILE_M)))
-
-    def reads(coords):
-        bi, t = coords
-        m0 = t * INDEXER_TILE_M
-        m1 = min(m0 + INDEXER_TILE_M, m)
-        return (
-            _tile_region(q, ((bi, bi + 1), (0, h), (0, d))),
-            _tile_region(c, ((bi, bi + 1), (m0, m1), (0, d))),
-            _tile_region(w, ((bi, bi + 1), (0, h))),
-        )
-
-    def writes(coords):
-        bi, t = coords
-        m0 = t * INDEXER_TILE_M
-        m1 = min(m0 + INDEXER_TILE_M, m)
-        return (_tile_region(s, ((bi, bi + 1), (m0, m1))),)
-
-    return TaskFamily(
-        family_id=f"ph{op.opid:02d}_indexer_scores",
-        kind="indexer_scores",
-        op=op,
-        domain=domain,
-        inputs=(q.name, c.name, w.name),
-        outputs=(s.name,),
-        params={"heads": h, "head_dim": d, "capacity": m, "scale": op.attributes["scale"], "tile_m": INDEXER_TILE_M},
-        threads=THREADS_PER_WORKER,
-        # In-register staging: one entry tile [TILE_M, D] + one query row [D] (f32).
-        scratch_bytes=(INDEXER_TILE_M + 1) * d * 4,
-        read_regions=reads,
-        write_regions=writes,
-    )
-
-
-def lower_index_topk(op: Operator, graph: OperatorGraph) -> TaskFamily:
-    s, valid = graph.tensor(op.inputs[0]), graph.tensor(op.inputs[1])
-    idx, bias = graph.tensor(op.outputs[0]), graph.tensor(op.outputs[1])
-    b, m = s.shape
-    k = op.attributes.get("k")
-    if not isinstance(k, int) or not 1 <= k <= m:
-        raise ValueError(f"index_topk {op.source_location!r}: k must be an int in [1, M={m}], got {k!r}")
-    if op.attributes.get("tie_break") != "lowest_index":
-        raise ValueError(f"index_topk {op.source_location!r}: unsupported tie_break {op.attributes.get('tie_break')!r}")
-    domain = TileDomain(((b, 1),))  # one task per batch row, full-candidate sweep
-
-    def reads(coords):
-        (bi,) = coords
-        return (
-            _tile_region(s, ((bi, bi + 1), (0, m))),
-            _tile_region(valid, ((bi, bi + 1),)),
-        )
-
-    def writes(coords):
-        (bi,) = coords
-        return (
-            _tile_region(idx, ((bi, bi + 1), (0, k))),
-            _tile_region(bias, ((bi, bi + 1), (0, k))),
-        )
-
-    return TaskFamily(
-        family_id=f"ph{op.opid:02d}_index_topk",
-        kind="index_topk",
-        op=op,
-        domain=domain,
-        inputs=(s.name, valid.name),
-        outputs=(idx.name, bias.name),
-        params={"k": k, "capacity": m, "tie_break": "lowest_index"},
-        threads=THREADS_PER_WORKER,
-        scratch_bytes=0,  # rank counting works in registers
-        read_regions=reads,
-        write_regions=writes,
-    )
-
-
 # ---------------------------------------------------------------------------
 # DSA compressor append (issue #96): one RMW task per (batch, layer); masked
 # per-row on the m-token boundary (issue #93 positions). Emission = gated
@@ -1692,12 +1609,6 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "moe_route": lower_moe_route,
     "moe_expert": lower_moe_expert,
     "moe_combine": lower_moe_combine,
-    "compressor_append": lower_compressor_append,
-    "moe_route": lower_moe_route,
-    "moe_expert": lower_moe_expert,
-    "moe_combine": lower_moe_combine,
-    "indexer_scores": lower_indexer_scores,
-    "index_topk": lower_index_topk,
     "compressor_append": lower_compressor_append,
 }
 
