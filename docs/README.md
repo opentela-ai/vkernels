@@ -5,7 +5,9 @@
 > tested hardware, and gap to speed of light in one table. For the *methods*
 > behind those numbers — roofline classification, the optimization ladder,
 > occupancy/latency findings, numerics contracts — see the
-> [project wiki](https://github.com/opentela-ai/vkernels/wiki).
+> [project wiki](https://github.com/opentela-ai/vkernels/wiki). For the
+> serving-side C ABI (libvkernels_hip / libvkernels, stream & graph-capture
+> safety), see [serving-c-abi.md](serving-c-abi.md).
 
 This document lists every kernel and communication primitive in vkernels,
 along with the mathematical computation each performs. Every operation follows

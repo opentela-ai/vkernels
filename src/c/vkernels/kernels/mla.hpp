@@ -97,18 +97,28 @@ namespace vkernels::kernels::hip {
 // CPU oracle. Same contract as mla_fwd_cpu. q/k_pe/k_c/v_c are float* on the
 // host side (the kernel converts to its working precision internally); device
 // pointers must reside in device or host-pinned memory.
+//
+// stream (issue #69/#45 convention, matching kda_delta_rule_fwd_with_scratch):
+// pass a hipStream_t (as void*) to enqueue on a caller stream WITHOUT any
+// internal synchronisation or blocking allocation — required for graph
+// capture; the caller owns ordering/sync. nullptr (default/legacy) keeps the
+// default-stream-0 behaviour. The split-K decode path (issue #82) enqueues on
+// the caller stream too; if its grow-only workspace would need a resize
+// (hipMalloc/hipFree — device-synchronising, capture-illegal) while `stream`
+// is capturing, it falls back to the capture-safe non-split kernel instead.
 void mla_fwd(int B, int H, int S_q, int S_kv, int q_start, int kv_start,
              int kv_lora_rank, int qk_rope_head_dim, float scale,
              const float* q, const float* k_c, const float* k_pe,
-             const float* v_c, float* out);
+             const float* v_c, float* out, void* stream = nullptr);
 
 // Explicit-tile entry point (offline autotuner hook). Dispatches the
 // concrete (bq, bn_kv) tile; threads is derived as max(bq,1)*64 capped at 256.
+// Same stream contract as mla_fwd.
 void mla_fwd_with_tile(int B, int H, int S_q, int S_kv, int q_start,
                        int kv_start, int kv_lora_rank, int qk_rope_head_dim,
                        float scale, const float* q, const float* k_c,
                        const float* k_pe, const float* v_c, float* out,
-                       int bq, int bn_kv);
+                       int bq, int bn_kv, void* stream = nullptr);
 
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP
