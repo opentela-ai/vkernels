@@ -850,16 +850,23 @@ def _t_mla_scores(
         if HAS_BIAS:
             lc += tl.load(bias_ptr + b * K + offs_k, mask=m_k, other=0.0).to(tl.float32)
         # sink (per-head, always valid, LAST slot)
-        lsink = tl.load(sink_ptr + (b * H + h) * D // D + h).to(tl.float32) if False else tl.load(sink_ptr + h).to(tl.float32)
-        # fused two-pass softmax over valid candidates ∪ sink
-        m_all = tl.join(tl.join(m_w, m_k).reshape(W + K), tl.full((1,), 1, tl.int1) >= 0).reshape(WIDTH)
-        logits = tl.join(tl.join(lw, lc).reshape(W + K), lsink[None]).reshape(WIDTH)
-        mx = tl.max(tl.where(m_all, logits, -float("inf")))
-        ex = tl.exp(logits - mx)
-        ex = tl.where(m_all, ex, 0.0)
-        denom = tl.sum(ex)
+        lsink = tl.load(sink_ptr + h).to(tl.float32)
+        # fused two-pass softmax over valid candidates ∪ sink. The union
+        # axis (W+K+1) is not a power of two, so it is never materialized:
+        # the window [W], compressed [K] and sink pieces are reduced
+        # separately and share the global max / denominator (identical
+        # result to a single fused pass — max and Σexp are order-free).
+        mx = tl.maximum(tl.max(tl.where(m_w, lw, -float("inf"))),
+                        tl.max(tl.where(m_k, lc, -float("inf"))))
+        mx = tl.maximum(mx, lsink)
+        ex_w = tl.where(m_w, tl.exp(lw - mx), 0.0)
+        ex_k = tl.where(m_k, tl.exp(lc - mx), 0.0)
+        ex_sink = tl.exp(lsink - mx)
+        denom = tl.sum(ex_w) + tl.sum(ex_k) + ex_sink
         prow = probs_ptr + (b * H + h) * WIDTH
-        tl.store(prow + tl.arange(0, WIDTH), ex / denom)
+        tl.store(prow + offs_w, ex_w / denom)
+        tl.store(prow + W + offs_k, ex_k / denom)
+        tl.store(prow + (W + K), ex_sink / denom)
         task += P
 
 
@@ -1597,6 +1604,7 @@ def _t_gdn_conv_tiled(
             sj1 = tl.load(sbase + (j + 1) * C + offs, cache_modifier=".cg")
             tl.store(sbase + j * C + offs, sj1)
         tl.store(sbase + (KTAPS - 2) * C + offs, xn)
+        task += P
 def _t_indexer_scores(
     worker: tl.int32,
     P: tl.int32,
