@@ -51,7 +51,7 @@ case "${1:-selftest}" in
     else
       # keep artifacts next to the checkout for post-mortem; rocprof v2/v3
       # naming differs, so print everything it produces
-      T="i45-smoke-artifacts-$$"
+      T="$PWD/i45-smoke-artifacts-$$"
       rm -rf "$T"; mkdir -p "$T"
       cat > "$T/tiny.hip" <<'EOF'
 #include <hip/hip_runtime.h>
