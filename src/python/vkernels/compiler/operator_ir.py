@@ -491,17 +491,6 @@ OP_GDN_CONV = "gdn_conv"
 # pool; masked per-row on the boundary condition (issue #93 positions).
 OP_COMPRESSOR_APPEND = "compressor_append"
 OP_CACHE_APPEND_PAGED = "cache_append_paged"
-# mHC hyper-connection mixing family (issue #99; floe DeepseekV4HyperConnection
-# / Glm53HyperConnection — one op family, family attributes hc/iters/eps/
-# rms_eps). `mhc_pre` computes the data-dependent pre/post/comb weights from
-# the flattened stream contents (unweighted RMSNorm + one small GEMV each
-# step) and collapses the streams into the block-body input; `mhc_post`
-# composes the sublayer output back onto the hc parallel streams with the
-# Sinkhorn-projected doubly-stochastic comb. Both are per-token (decode:
-# Sinkhorn runs per token, not at load time). Stream state is intermediate
-# workspace — a fresh [B, hc, C] buffer per layer, NOT a persistent pool.
-OP_MHC_PRE = "mhc_pre"
-OP_MHC_POST = "mhc_post"
 # gdn_delta attributes: layer, scale, eps. Per-value-head gated delta rule
 # decode step (Qwen3.5 GatedDeltaNet, seq==1 path): decays the fp32 SSM
 # state, applies the delta-rule outer-product update, reads out through the
@@ -517,6 +506,18 @@ OP_GDN_DELTA = "gdn_delta"
 # carries the 1/sqrt(D) scale). Position-independent — ordering comes from
 # the state-storage hazards (read-modify-write per (b, head) row).
 OP_KDA_DELTA = "kda_delta"
+OP_CACHE_APPEND_PAGED = "cache_append_paged"
+# mHC hyper-connection mixing family (issue #99; floe DeepseekV4HyperConnection
+# / Glm53HyperConnection — one op family, family attributes hc/iters/eps/
+# rms_eps). `mhc_pre` computes the data-dependent pre/post/comb weights from
+# the flattened stream contents (unweighted RMSNorm + one small GEMV each
+# step) and collapses the streams into the block-body input; `mhc_post`
+# composes the sublayer output back onto the hc parallel streams with the
+# Sinkhorn-projected doubly-stochastic comb. Both are per-token (decode:
+# Sinkhorn runs per token, not at load time). Stream state is intermediate
+# workspace — a fresh [B, hc, C] buffer per layer, NOT a persistent pool.
+OP_MHC_PRE = "mhc_pre"
+OP_MHC_POST = "mhc_post"
 OP_ATTENTION_SCORES = "attention_scores"
 OP_ATTENTION_SCORES_PAGED = "attention_scores_paged"
 OP_SOFTMAX = "softmax"
@@ -532,6 +533,7 @@ OP_ATTENTION_VALUES_PAGED = "attention_values_paged"
 OP_MOE_ROUTE = "moe_route"
 OP_MOE_EXPERT = "moe_expert"
 OP_MOE_COMBINE = "moe_combine"
+
 # MLA decode (DeepSeek-V4 latent attention, issue #95): shared-KV MQA over a
 # latent cache — fused scores+softmax with a per-head learnable sink column
 # and the sliding-window branch bound, over window keys (slot table) union
