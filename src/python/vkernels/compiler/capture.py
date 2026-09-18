@@ -340,21 +340,49 @@ class RecordingBackend:
         *,
         out: Optional[SymbolicTensor] = None,
         name: str = "linear",
+        grouped_heads: Optional[int] = None,
     ) -> SymbolicTensor:
-        """y = x @ w (+ b); ``w`` is stored [Cin, Cout] (§3.1)."""
+        """y = x @ w (+ b); ``w`` is stored [Cin, Cout] (§3.1).
+
+        ``grouped_heads=H`` (issue #95, DeepSeek-V4 ``GroupedLinear``):
+        block-diagonal per-head projection — ``x`` is [B, H*K_g], ``w``
+        stays [H*K_g, H*N_g] = [Cin, Cout] with only the per-head
+        diagonal blocks ``w[h*K_g:(h+1)*K_g, h*N_g:(h+1)*N_g]`` ever
+        read (off-block storage is never touched), and ``y[b, h*N_g +
+        n] = <w[h*K_g:(h+1)*K_g, h*N_g + n], x[b, h*K_g:(h+1)*K_g]>``.
+        Requires H | K and H | N.
+        """
         m = x.value.shape[0]
         n = w.value.shape[1]
+        if len(x.value.shape) > 2:
+            # 3D activations [B, H, K_g] (e.g. a conjugate-rope context) are
+            # flattened row-major for the block-diagonal projection; the
+            # flattened layout is exactly [B, H*K_g].
+            k = 1
+            for dim in x.value.shape[1:]:
+                k *= dim
+            x = self.view_of(x, f"{name}_flat{self._suffix()}", (m, k))
+        else:
+            k = x.value.shape[1]
+        if grouped_heads is not None:
+            if grouped_heads < 1 or k % grouped_heads or n % grouped_heads:
+                raise ValueError(
+                    f"grouped linear requires grouped_heads to divide K={k} and N={n}; got H={grouped_heads}"
+                )
         out = out or self.fresh_buffer(f"{name}{self._suffix()}", (m, n))
         reads = [_regional_reads(x.value), _regional_reads(w.value)]
         inputs = [x, w]
         if b is not None:
             reads.append(_regional_reads(b.value))
             inputs.append(b)
+        attributes = {"bias": b is not None}
+        if grouped_heads is not None:
+            attributes["grouped_heads"] = grouped_heads
         self._record(
             "linear",
             inputs=tuple(inputs),
             outputs=(out,),
-            attributes={"bias": b is not None},
+            attributes=attributes,
             reads=tuple(reads),
             writes=(_regional_reads(out.value),),
             source_location=name,
@@ -686,6 +714,16 @@ class RecordingBackend:
         rotate_half(x) = cat(-x[D/2:], x[:D/2]). Tables are precomputed
         [max_positions, D] externals with cos = cat([f, f]).
 
+        ``convention="interleaved"`` (DeepSeek-V4 / GPT-J style, issue #95):
+        adjacent-pair rotation over the first ``rotary_dim`` dims — pairs
+        ``(2i, 2i+1)``::
+
+            x[2i]'   = x[2i]*c_i - x[2i+1]*s_i
+            x[2i+1]' = x[2i+1]*c_i + x[2i]*s_i      (c_i, s_i = tables[p, i])
+
+        and dims ``[rotary_dim, head_dim)`` pass through unchanged. Tables
+        are fp32 externals of shape [max_positions, rotary_dim // 2].
+
         ``convention="neox_partial"`` (Qwen3.5 ``PartialRotaryEmbedding``):
         NeoX split-half over the first ``rotary_dim`` dims only — with
         ``half = rotary_dim // 2``, ``x1 = x[:half]``, ``x2 = x[half:rotary_dim]``::
@@ -695,9 +733,9 @@ class RecordingBackend:
         and dims ``[rotary_dim, head_dim)`` pass through unchanged. Tables
         are fp32 externals of shape [max_positions, rotary_dim // 2].
         """
-        if convention not in ("rotate_half", "neox_partial"):
-            raise CaptureError(f"rope convention {convention!r} not supported (expected 'rotate_half' or 'neox_partial')")
-        if convention == "neox_partial":
+        if convention not in ("rotate_half", "neox_partial", "interleaved"):
+            raise CaptureError(f"rope convention {convention!r} not supported (expected 'rotate_half', 'neox_partial' or 'interleaved')")
+        if convention in ("neox_partial", "interleaved"):
             head_dim = x.value.shape[-1]
             if rotary_dim is None or rotary_dim % 2 != 0 or not 0 < rotary_dim <= head_dim:
                 raise CaptureError(f"neox_partial rope requires an even 0 < rotary_dim <= head_dim ({head_dim}); got {rotary_dim!r}")
@@ -717,6 +755,13 @@ class RecordingBackend:
             numerical_contract = {
                 "rotate_half": "cat(-x[D/2:], x[:D/2])",
                 "tables": "full-width cos/sin (HF rotate_half convention)",
+            }
+        elif convention == "interleaved":
+            numerical_contract = {
+                "interleaved": "x[2i]' = x[2i]*c_i - x[2i+1]*s_i ; x[2i+1]' = x[2i+1]*c_i + x[2i]*s_i over pairs i < rotary_dim//2",
+                "pass_through": f"dims [{rotary_dim}, {x.value.shape[-1]}) unchanged",
+                "tables": "cos/sin [max_positions, rotary_dim//2], fp32, indexed at the runtime position (pair stride 2)",
+                "upcast": "rotation math in fp32 (bf16 activations in/out)",
             }
         else:
             numerical_contract = {
@@ -965,7 +1010,7 @@ class RecordingBackend:
             },
         )
         pool_post = self.graph.add_tensor(
-            f"entry_pool_v{self.graph.storage_versions[entry_pool.value.storage_id]}",
+            f"entry_pool_s{entry_pool.value.storage_id}_v{self.graph.storage_versions[entry_pool.value.storage_id]}",
             entry_pool.value.shape,
             entry_pool.value.dtype,
             storage_id=entry_pool.value.storage_id,
@@ -974,7 +1019,7 @@ class RecordingBackend:
             valid_length=valid,
         )
         state_post = self.graph.add_tensor(
-            f"series_state_v{self.graph.storage_versions[series_state.value.storage_id]}",
+            f"series_state_s{series_state.value.storage_id}_v{self.graph.storage_versions[series_state.value.storage_id]}",
             series_state.value.shape,
             series_state.value.dtype,
             storage_id=series_state.value.storage_id,
@@ -1048,6 +1093,265 @@ class RecordingBackend:
         sid = sv.storage_id
         post = self.graph.add_tensor(
             f"conv_state_l{layer}_v{self.graph.storage_versions[sid]}",
+            sv.shape,
+            sv.dtype,
+            storage_id=sid,
+            strides=sv.strides,
+            offset=sv.offset,
+        )
+        return out, SymbolicTensor(post)
+    def mhc_pre(
+        self,
+        streams: SymbolicTensor,
+        fn: SymbolicTensor,
+        base: SymbolicTensor,
+        scale: SymbolicTensor,
+        *,
+        layer: int,
+        iters: int,
+        eps: float,
+        rms_eps: float,
+    ) -> tuple[SymbolicTensor, SymbolicTensor, SymbolicTensor]:
+        """mHC hyper-connection pre-mix (issue #99; floe
+        ``DeepseekV4HyperConnection.forward`` / ``Glm53HyperConnection.forward``
+        — one op family, family attributes).
+
+        Per decode token (row ``b`` of the ``[B, hc, C]`` stream stack), with
+        ``mix = (2 + hc)·hc``:
+
+            flat    = unweighted_rms_norm(flatten(streams[b]))    # [hc·C], fp32
+            logits  = fn @ flat                                   # [mix] GEMV — NO bias:
+                                                                  # base enters only in the gates
+            pre_w, post_w, comb_w = split(logits, [hc, hc, hc²])
+            pre     = sigmoid(pre_w·pre_s + pre_b) + eps          # [hc]
+            post    = 2·sigmoid(post_w·post_s + post_b)           # [hc], (0, 2)
+            comb    = softmax((comb_w·comb_s + comb_b).view(hc, hc), -1) + eps
+            comb    = comb / (colsum(comb) + eps)                 # Sinkhorn-Knopp:
+            for _ in range(iters − 1):                            # alternate row/col
+                comb = comb / (rowsum(comb) + eps)                # normalization to
+                comb = comb / (colsum(comb) + eps)                # doubly-stochastic
+            h_in   = Σ_h pre_h · streams[b, h, :]                 # stream collapse
+
+        ``pre``/``post``/``comb`` are DATA-DEPENDENT — computed from the stream
+        contents every step, so the Sinkhorn projection runs per token, not at
+        load time. ``base`` splits into (pre_b, post_b, comb_b) with comb_b
+        viewed ``[hc, hc]``; ``scale`` = (pre_s, post_s, comb_s) scalars. All
+        mixing math is fp32 (Sinkhorn numerics demand it); ``h_in`` follows the
+        streams dtype.
+
+        Stream state is intermediate workspace: ``streams`` is read-only here
+        (the composing ``mhc_post`` writes the updated stack to a fresh buffer),
+        and ``h_in``/``post``/``comb`` are fresh compiler-planned buffers — no
+        persistent state pool, no read-modify-write effects.
+
+        Returns ``(h_in, post, comb)``; the block body consumes ``h_in`` and
+        ``mhc_post`` consumes ``(streams, body_out, post, comb)``.
+        """
+        sv, fnv, bv, scv = (
+            streams.value, fn.value, base.value, scale.value,
+        )
+        if len(sv.shape) != 3:
+            raise CaptureError(f"mhc_pre streams must be [B, hc, C]; got shape {sv.shape}")
+        B, hc, C = sv.shape
+        mix = (2 + hc) * hc
+        if fnv.shape != (mix, hc * C):
+            raise CaptureError(
+                f"mhc_pre fn must be [{mix}, {hc * C}] = [(2+hc)·hc, hc·C]; got shape {fnv.shape}"
+            )
+        if bv.shape != (mix,):
+            raise CaptureError(f"mhc_pre base must be [{mix}]; got shape {bv.shape}")
+        if scv.shape != (3,):
+            raise CaptureError(f"mhc_pre scale must be [3] = (pre_s, post_s, comb_s); got shape {scv.shape}")
+        if iters < 1:
+            raise CaptureError(f"mhc_pre Sinkhorn iters must be >= 1; got {iters}")
+        h_in = self.fresh_buffer(f"mhc_h_in_l{layer}{self._suffix()}", (B, C), dtype=sv.dtype)
+        post = self.fresh_buffer(f"mhc_post_w_l{layer}{self._suffix()}", (B, hc), dtype=F32)
+        comb = self.fresh_buffer(f"mhc_comb_l{layer}{self._suffix()}", (B, hc, hc), dtype=F32)
+        self._record(
+            "mhc_pre",
+            inputs=(streams, fn, base, scale),
+            outputs=(h_in, post, comb),
+            attributes={"layer": layer, "hc": hc, "iters": iters, "eps": eps, "rms_eps": rms_eps},
+            reads=(
+                _regional_reads(sv), _regional_reads(fnv),
+                _regional_reads(bv), _regional_reads(scv),
+            ),
+            writes=(
+                _regional_reads(h_in.value), _regional_reads(post.value),
+                _regional_reads(comb.value),
+            ),
+            source_location=f"layer {layer} mhc pre-mix",
+            numerical_contract={
+                "input_norm": "flat = flatten(streams[b]) * rsqrt(mean(flat²) + rms_eps), fp32 (unweighted RMSNorm over the full hc·C vector)",
+                "projection": "logits = fn @ flat (F.linear, NO projection bias), one [mix=(2+hc)·hc, hc·C] GEMV per token (data-dependent); base enters only inside the gates",
+                "pre": "pre = sigmoid(pre_w·pre_s + pre_b) + eps, [hc]",
+                "post": "post = 2·sigmoid(post_w·post_s + post_b), [hc], range (0, 2)",
+                "comb": "comb = softmax((comb_w·comb_s + comb_b.view(hc, hc)), dim=-1) + eps",
+                "sinkhorn": "comb /= (colsum(comb) + eps); then (iters−1)× [comb /= (rowsum+eps); comb /= (colsum+eps)] — alternate normalization to doubly-stochastic, eps inside every denominator",
+                "collapse": "h_in = Σ_h pre_h · streams[b, h, :] (raw streams, not the normalized flat)",
+                "dtypes": "streams bf16 workspace loads, all mixing math fp32 (Sinkhorn numerics demand it), h_in follows the streams dtype",
+                "state": "streams read-only workspace; h_in/post/comb fresh buffers — intermediate, NOT a persistent state pool",
+            },
+        )
+        return h_in, post, comb
+
+    def mhc_post(
+        self,
+        streams: SymbolicTensor,
+        body_out: SymbolicTensor,
+        post: SymbolicTensor,
+        comb: SymbolicTensor,
+        *,
+        layer: int,
+    ) -> SymbolicTensor:
+        """mHC hyper-connection post-compose (issue #99; floe
+        ``_mhc_compose``): place the sublayer output back onto the hc parallel
+        residual streams with the Sinkhorn-projected mixer —
+
+            streams'[j, :] = post[j]·body_out[:] + Σ_k comb[k, j]·streams[k, :]
+
+        (floe torch reference: ``post.unsqueeze(-1)·sublayer_out.unsqueeze(-2)
+        + combᵀ @ residual``). ``post``/``comb`` are the data-dependent weights
+        this token's ``mhc_pre`` produced. The updated stream stack is written
+        to a FRESH ``[B, hc, C]`` workspace buffer (intermediate, NOT a
+        persistent state pool — the next layer's ``mhc_pre`` consumes the
+        returned view through an ordinary RAW dependency).
+        """
+        sv, ov, pv, cv = (
+            streams.value, body_out.value, post.value, comb.value,
+        )
+        if len(sv.shape) != 3:
+            raise CaptureError(f"mhc_post streams must be [B, hc, C]; got shape {sv.shape}")
+        B, hc, C = sv.shape
+        if ov.shape != (B, C):
+            raise CaptureError(f"mhc_post body_out must be [B, {C}]; got shape {ov.shape}")
+        if pv.shape != (B, hc):
+            raise CaptureError(f"mhc_post post weights must be [B, {hc}]; got shape {pv.shape}")
+        if cv.shape != (B, hc, hc):
+            raise CaptureError(f"mhc_post comb must be [B, {hc}, {hc}]; got shape {cv.shape}")
+        streams_post = self.fresh_buffer(
+            f"mhc_streams_l{layer}{self._suffix()}", (B, hc, C), dtype=sv.dtype
+        )
+        self._record(
+            "mhc_post",
+            inputs=(streams, body_out, post, comb),
+            outputs=(streams_post,),
+            attributes={"layer": layer, "hc": hc},
+            reads=(
+                _regional_reads(sv), _regional_reads(ov),
+                _regional_reads(pv), _regional_reads(cv),
+            ),
+            writes=(_regional_reads(streams_post.value),),
+            source_location=f"layer {layer} mhc post-compose",
+            numerical_contract={
+                "compose": "streams'[j] = post[j]·body_out + Σ_k comb[k, j]·streams[k] (combᵀ @ streams + post ⊙ body_out)",
+                "dtypes": "fp32 compose arithmetic, streams' follows the streams dtype",
+                "state": "fresh [B, hc, C] workspace buffer per layer — intermediate, NOT a persistent state pool",
+            },
+        )
+        return streams_post
+
+    def gdn_delta(
+        self,
+        ssm_state: SymbolicTensor,
+        q: SymbolicTensor,
+        k: SymbolicTensor,
+        v: SymbolicTensor,
+        z: SymbolicTensor,
+        a: SymbolicTensor,
+        b: SymbolicTensor,
+        a_log: SymbolicTensor,
+        dt_bias: SymbolicTensor,
+        norm_w: SymbolicTensor,
+        *,
+        layer: int,
+        scale: float,
+        eps: float,
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """Gated delta rule decode step (Qwen3.5 ``GatedDeltaNet``, seq==1).
+
+        Per value head ``h`` over its ``[HV, HK]`` fp32 SSM state slice,
+        with ``GROUP = NV // NK`` and ``kh = h // GROUP``::
+
+            g      = -exp(A_log[h]) * softplus(a[b,h] + dt_bias[h])
+            beta   = sigmoid(b[b,h])
+            q_n    = q[b,kh] / sqrt(|q[b,kh]|^2 + 1e-6) * scale
+            k_n    = k[b,kh] / sqrt(|k[b,kh]|^2 + 1e-6)
+            s     *= exp(g)                            # per-head scalar decay
+            sk     = s @ k_n                           # state read
+            s     += beta * (v[b,h] - sk) outer k_n     # delta-rule update
+            o      = s @ q_n                           # state readout
+            out    = RMSNorm_HV(o) * norm_w * (z * sigmoid(z))
+
+        ``ssm_state`` is an external caller-owned pool ``[B, NV, HV, HK]``,
+        fp32, read-modify-write per (batch, head) row. ``q``/``k`` are the
+        post-conv rows ``[B, NK, HK]`` (normalized *inside* the op, exactly
+        as floe ``qwen35_gdn.GatedDeltaNet.forward`` conditions them);
+        ``v``/``z`` are ``[B, NV, HV]``; ``a``/``b`` are ``[B, NV]``;
+        ``A_log``/``dt_bias`` are ``[NV]`` and ``norm_w`` ``[HV]`` per-layer
+        parameters broadcast over the batch. All fp32 arithmetic between
+        the gates and the state (floe keeps the recurrence fp32; inputs may
+        arrive bf16 from the projections).
+
+        The op is position-independent: its ordering obligation is the
+        read-modify-write on the state pool (RAW/WAR/WAW hazards vs any
+        other op touching that storage). Records write effects on the pool
+        and returns ``(out, ssm_state_post)`` -- the post-step state view
+        (same storage, bumped version) that later layers must read.
+        """
+        sv, qv, kv, vv, zv, av, bv = (
+            ssm_state.value, q.value, k.value, v.value, z.value, a.value, b.value,
+        )
+        if len(sv.shape) != 4:
+            raise CaptureError(f"gdn_delta state pool must be [B, NV, HV, HK]; got shape {sv.shape}")
+        B, NV, HV, HK = sv.shape
+        if len(qv.shape) != 3 or qv.shape[0] != B or qv.shape[2] != HK:
+            raise CaptureError(f"gdn_delta q rows must be [B, NK, {HK}]; got shape {qv.shape}")
+        NK = qv.shape[1]
+        if NK < 1 or NV % NK:
+            raise CaptureError(f"gdn_delta head group must divide: NV={NV} not divisible by NK={NK}")
+        if kv.shape != (B, NK, HK):
+            raise CaptureError(f"gdn_delta k rows must be [B, {NK}, {HK}]; got shape {kv.shape}")
+        if vv.shape != (B, NV, HV):
+            raise CaptureError(f"gdn_delta v rows must be [B, {NV}, {HV}]; got shape {vv.shape}")
+        if zv.shape != (B, NV, HV):
+            raise CaptureError(f"gdn_delta z gate rows must be [B, {NV}, {HV}]; got shape {zv.shape}")
+        if av.shape != (B, NV) or bv.shape != (B, NV):
+            raise CaptureError(f"gdn_delta a/b rows must be [B, {NV}]; got {av.shape} / {bv.shape}")
+        if a_log.value.shape != (NV,) or dt_bias.value.shape != (NV,):
+            raise CaptureError(f"gdn_delta A_log/dt_bias must be [{NV}]; got {a_log.value.shape} / {dt_bias.value.shape}")
+        if norm_w.value.shape != (HV,):
+            raise CaptureError(f"gdn_delta norm_w must be [{HV}]; got shape {norm_w.value.shape}")
+        out = self.fresh_buffer(f"gdn_delta_l{layer}{self._suffix()}", (B, NV, HV), dtype=vv.dtype)
+        self._record(
+            "gdn_delta",
+            inputs=(ssm_state, q, k, v, z, a, b, a_log, dt_bias, norm_w),
+            outputs=(out,),
+            attributes={"layer": layer, "scale": scale, "eps": eps},
+            reads=(
+                _regional_reads(sv), _regional_reads(qv), _regional_reads(kv),
+                _regional_reads(vv), _regional_reads(zv), _regional_reads(av),
+                _regional_reads(bv), _regional_reads(a_log.value),
+                _regional_reads(dt_bias.value), _regional_reads(norm_w.value),
+            ),
+            writes=(_regional_reads(sv), _regional_reads(out.value)),
+            source_location=f"layer {layer} gdn delta rule",
+            numerical_contract={
+                "decay": "g = -exp(A_log) * softplus(a + dt_bias); s *= exp(g) (softplus guarded: x>20 -> x)",
+                "qk_norm": "q_n = L2(q)*scale, k_n = L2(k) per key head (group-expanded), eps 1e-6 inside the sqrt",
+                "delta_rule": "sk = s @ k_n; s += beta*(v - sk) outer k_n with beta = sigmoid(b)",
+                "readout": "o = s @ q_n",
+                "out_gate": "out = RMSNorm_HV(o) * norm_w * (z * sigmoid(z)), eps inside the rsqrt",
+                "accumulate": "fp32 arithmetic between gates and state",
+                "dtypes": "q/k/v/z/a/b workspace loads (.cg), A_log/dt_bias/norm_w params, SSM state pool fp32 [B, NV, HV, HK] read-modify-write, out follows v's dtype",
+                "pool": "external caller-owned state pool; read-modify-write per decode step",
+            },
+        )
+        # Post-step state view: same pool, bumped version (cache_append's
+        # §4.3 pattern). Later layers must consume this view.
+        sid = sv.storage_id
+        post = self.graph.add_tensor(
+            f"ssm_state_l{layer}_v{self.graph.storage_versions[sid]}",
             sv.shape,
             sv.dtype,
             storage_id=sid,
@@ -1460,6 +1764,447 @@ class RecordingBackend:
                 "gqa": f"q head h reads kv head h // {h // kvh}" if kvh != h else "none (MHA)",
                 "gather": f"V rows gathered from slots table[b, t], t in [0, {p}]",
                 "reduction": "f32, t ascending",
+            },
+        )
+        return out
+
+    def conjugate_rope(
+        self,
+        x: SymbolicTensor,
+        cos_table: SymbolicTensor,
+        sin_table: SymbolicTensor,
+        position,
+        *,
+        layer: int,
+        which: str = "o",
+        convention: str = "interleaved",
+        rotary_dim: Optional[int] = None,
+        out: Optional[SymbolicTensor] = None,
+    ) -> SymbolicTensor:
+        """Conjugate (output-side) rope — issue #95, DeepSeek-V4 attention.
+
+        Rotates by the NEGATIVE angle: same tables, sin negated. For the
+        interleaved convention (full width by default)::
+
+            y[2i]   = x[2i]*c_i + x[2i+1]*s_i
+            y[2i+1] = x[2i+1]*c_i - x[2i]*s_i       (c_i, s_i = tables[p, i])
+
+        This is the exact inverse of the q/k rotation at the same position,
+        so ``rope(...) -> conjugate_rope(...)`` round-trips to identity
+        (validated to 1e-12 in fp64). Decode rotates ONLY the query — the
+        cached latent rows stay unrotated (the entry-side rotation happened
+        once at emission).
+        """
+        if convention not in ("interleaved", "rotate_half"):
+            raise CaptureError(f"conjugate_rope convention {convention!r} not supported (expected 'interleaved' or 'rotate_half')")
+        head_dim = x.value.shape[-1]
+        # rotary_dim defaults to the table-defined rotated width (tables are
+        # [max_positions, rotary_dim//2]) — full width when the tables span
+        # the whole head.
+        table_half = cos_table.value.shape[-1]
+        if sin_table.value.shape != cos_table.value.shape:
+            raise CaptureError(f"conjugate_rope cos/sin tables must match; got {cos_table.value.shape} vs {sin_table.value.shape}")
+        rot = rotary_dim if rotary_dim is not None else table_half * 2
+        if rot % 2 != 0 or not 0 < rot <= head_dim:
+            raise CaptureError(f"conjugate_rope requires an even 0 < rotary_dim <= head_dim ({head_dim}); got {rot!r}")
+        if table_half != rot // 2:
+            raise CaptureError(
+                f"conjugate_rope tables must be [max_positions, rotary_dim//2] = [.., {rot // 2}]; got shape {cos_table.value.shape}"
+            )
+        self._require_position(position, "conjugate_rope")
+        out = out or self.fresh_buffer(f"crope_{which}_l{layer}{self._suffix()}", x.value.shape)
+        if out.value.shape != x.value.shape:
+            raise ValueError(f"conjugate_rope out must match x {x.value.shape}; got {out.value.shape}")
+        p = self._position_name(position)
+        self._record(
+            "conjugate_rope",
+            inputs=(x, cos_table, sin_table),
+            outputs=(out,),
+            attributes={"layer": layer, "which": which, "position": p, "convention": convention,
+                        "rotary_dim": rot,
+                        "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"},
+            reads=(_regional_reads(x.value), _regional_reads(cos_table.value), _regional_reads(sin_table.value)),
+            writes=(_regional_reads(out.value),),
+            source_location=f"layer {layer} conjugate rope {which}",
+            numerical_contract={
+                "interleaved": "y[2i] = x[2i]*c_i + x[2i+1]*s_i ; y[2i+1] = x[2i+1]*c_i - x[2i]*s_i (sin NEGATED)",
+                "inverse": "exact inverse of the rope rotation at the same position (round-trip = identity)",
+                "tables": "cos/sin [max_positions, rotary_dim//2], fp32, indexed at the runtime position",
+                "upcast": "rotation math in fp32 (bf16 activations in/out)",
+            },
+        )
+        return out
+
+    def mla_scores(
+        self,
+        q: SymbolicTensor,
+        latent_pool: SymbolicTensor,
+        window_table: SymbolicTensor,
+        comp_pool: SymbolicTensor,
+        comp_idx: SymbolicTensor,
+        sink: SymbolicTensor,
+        position,
+        *,
+        scale: float,
+        layer: int,
+        window: int,
+        bias: Optional[SymbolicTensor] = None,
+    ) -> SymbolicTensor:
+        """MLA decode scores — fused scores + softmax + sink (issue #95).
+
+        Shared-KV MQA (``num_key_value_heads == 1``) over a latent cache.
+        For row ``b``, head ``h`` at decode position ``p`` the candidate set
+        is {window keys} ∪ {selected compressed entries} ∪ {sink}::
+
+            window slot i < W:  t = p - W + 1 + i   (valid iff 0 <= t <= p,
+                                i.e. the sliding-window bound |q - t| < W,
+                                t <= q; slots with t < 0 are masked)
+            compressed slot j < K: e = comp_idx[b, j]  (valid iff e >= 0;
+                                the #97 table is -1-padded beyond a row's
+                                valid candidate count)
+            sink slot (last):   always valid
+
+            logit(window i)    = scale * <q[b, h, :], latent_pool[b, window_table[b, t], :]>
+            logit(compressed j) = scale * <q[b, h, :], comp_pool[b, e, :]>
+                                  + bias[b, j]        (when ``bias`` is given;
+                                  the #97 block_bias, normalized over valid
+                                  scores with non-finite entries excluded —
+                                  that landed contract is the producer of record)
+            logit(sink)        = sink[b, h]   (per-head learnable scalar)
+
+        The output is POST-softmax ``probs[b, h, W + K + 1]`` (the raw
+        logits have no second consumer; the sink column is LAST, index
+        ``W + K``). Invalid candidates receive exact 0.0 (§4.3); the sink
+        absorbs softmax mass but contributes NO value (see
+        :meth:`mla_values`). Accumulation fp32 over D, candidates in
+        window order then #97 rank order then sink.
+        """
+        self._require_position(position, "mla_scores")
+        b, h, d = q.value.shape
+        if latent_pool.value.shape[0] != b or latent_pool.value.shape[2] != d:
+            raise ValueError(f"mla_scores latent_pool {latent_pool.value.shape} must be [B, S, D] with B={b}, D={d}")
+        if window_table.value.shape[0] != b or window_table.value.dtype != I32:
+            raise ValueError(f"mla_scores window_table must be i32 [B, S_w], got {window_table.value.shape} {window_table.value.dtype.name}")
+        if latent_pool.value.shape[1] != window_table.value.shape[1]:
+            raise ValueError(
+                f"mla_scores latent_pool S={latent_pool.value.shape[1]} must match window_table S_w={window_table.value.shape[1]}"
+            )
+        if comp_pool.value.shape[0] != b or comp_pool.value.shape[2] != d:
+            raise ValueError(f"mla_scores comp_pool {comp_pool.value.shape} must be [B, M, D] with B={b}, D={d}")
+        k = comp_idx.value.shape[1]
+        if comp_idx.value.shape[0] != b or comp_idx.value.dtype != I32:
+            raise ValueError(f"mla_scores comp_idx must be i32 [B, K], got {comp_idx.value.shape} {comp_idx.value.dtype.name}")
+        if tuple(sink.value.shape) not in ((h,), (b, h)):
+            raise ValueError(f"mla_scores sink must be [H] = ({h},) or [B, H] = ({b}, {h}); got {sink.value.shape}")
+        if bias is not None and (bias.value.shape != (b, k) or bias.value.dtype != F32):
+            raise ValueError(f"mla_scores bias must be f32 [B, K] = ({b}, {k}); got {bias.value.shape}")
+        if window < 1:
+            raise ValueError(f"mla_scores requires window >= 1; got {window}")
+        width = window + k + 1
+        out = self.fresh_buffer(f"mla_probs_l{layer}{self._suffix()}", (b, h, width), F32)
+        p = self._position_name(position)
+        inputs = [q, latent_pool, window_table, comp_pool, comp_idx, sink]
+        reads = [
+            _regional_reads(q.value),
+            Region.indirect(latent_pool.value, window_table.value, axis=1),
+            _regional_reads(window_table.value),
+            _regional_reads(comp_pool.value),
+            _regional_reads(comp_idx.value),
+            _regional_reads(sink.value),
+        ]
+        if bias is not None:
+            inputs.append(bias)
+            reads.append(_regional_reads(bias.value))
+        self._record(
+            "mla_scores",
+            inputs=tuple(inputs),
+            outputs=(out,),
+            attributes={"scale": float(scale), "layer": layer, "position": p, "window": window,
+                        "comp_slots": k, "width": width, "sink": "last",
+                        "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"},
+            reads=tuple(reads),
+            writes=(_regional_reads(out.value),),
+            source_location=f"layer {layer} mla scores",
+            numerical_contract={
+                "scale": f"1/sqrt(D) = {scale}",
+                "window": f"logical positions (p-{window}, p]; slots with t < 0 masked (row start)",
+                "compressed": "logit = scale*<q, comp_pool[b, comp_idx[b,j]]> (+ bias[b,j] when given); comp_idx < 0 masked",
+                "sink": "per-head learnable logit, no scale; absorbs softmax mass, contributes no value",
+                "softmax": "f32, over valid candidates ∪ sink; invalid candidates exact 0.0",
+                "output": f"post-softmax probs [B, H, {width}]; sink column last",
+                "accumulation": "f32 dot over D per candidate; online-free two-pass max-subtract softmax in f32",
+            },
+        )
+        return out
+
+    def mla_values(
+        self,
+        probs: SymbolicTensor,
+        latent_pool: SymbolicTensor,
+        window_table: SymbolicTensor,
+        comp_pool: SymbolicTensor,
+        comp_idx: SymbolicTensor,
+        position,
+        *,
+        layer: int,
+        window: int,
+        out: Optional[SymbolicTensor] = None,
+    ) -> SymbolicTensor:
+        """MLA decode context gather (issue #95).
+
+        ``ctx[b, h, :] = sum_{i < W, t_i valid} probs[b, h, i] *
+        latent_pool[b, window_table[b, t_i], :] + sum_{j < K, e_j >= 0}
+        probs[b, h, W + j] * comp_pool[b, comp_idx[b, j], :]`` — the sink
+        column (``W + K``) contributes NOTHING (its probability mass is
+        absorbed). Latent rows double as keys and values (K == V, one
+        shared head); invalid/zero-prob candidates contribute exactly zero.
+        fp32 accumulation, single bf16/fp32 store.
+        """
+        self._require_position(position, "mla_values")
+        b, h, width = probs.value.shape
+        d = latent_pool.value.shape[2]
+        if comp_pool.value.shape[2] != d:
+            raise ValueError(f"mla_values comp_pool {comp_pool.value.shape} must share D={d} with the latent pool")
+        if comp_idx.value.shape[1] != comp_pool.value.shape[1] and comp_idx.value.dtype != I32:
+            raise ValueError(f"mla_values comp_idx must be i32 [B, K]; got {comp_idx.value.shape} {comp_idx.value.dtype.name}")
+        k = comp_idx.value.shape[1]
+        if width != window + k + 1:
+            raise ValueError(f"mla_values probs width {width} != window {window} + K {k} + 1 (sink last)")
+        # Epilogue: fp32 accumulation, ONE store — bf16 activations round to
+        # bf16 here (default fp32 for fp32 chains).
+        out = out or self.fresh_buffer(f"mla_ctx_l{layer}{self._suffix()}", (b, h, d))
+        if out.value.shape != (b, h, d):
+            raise ValueError(f"mla_values out must be [B, H, D] = ({b}, {h}, {d}); got {out.value.shape}")
+        p = self._position_name(position)
+        self._record(
+            "mla_values",
+            inputs=(probs, latent_pool, window_table, comp_pool, comp_idx),
+            outputs=(out,),
+            attributes={"layer": layer, "position": p, "window": window, "comp_slots": k, "width": width,
+                        "position_form": "row" if isinstance(position, SymbolicTensor) else "scalar"},
+            reads=(
+                _regional_reads(probs.value),
+                Region.indirect(latent_pool.value, window_table.value, axis=1),
+                _regional_reads(window_table.value),
+                _regional_reads(comp_pool.value),
+                _regional_reads(comp_idx.value),
+            ),
+            writes=(_regional_reads(out.value),),
+            source_location=f"layer {layer} mla values",
+            numerical_contract={
+                "gather": "window rows via window_table (logical t = p-W+1+i), compressed rows via comp_idx",
+                "sink": "column W+K contributes no value (mass absorbed)",
+                "reduction": "f32, window candidates then compressed candidates ascending",
+                "dtypes": "pools bf16 (`.cg` streamed), accumulate fp32, single store",
+            },
+        )
+        return out
+
+    # ------------------------------------------------------------------
+    # MoE decode (issue #98)
+    # ------------------------------------------------------------------
+
+    def moe_route(
+        self,
+        x: SymbolicTensor,
+        router_w: SymbolicTensor,
+        ids: SymbolicTensor,
+        weights: SymbolicTensor,
+        *,
+        mode: str = "learned",
+        score_fn: str = "sqrtsoftplus",
+        top_k: Optional[int] = None,
+        routed_scaling_factor: float = 1.0,
+        bias: Optional[SymbolicTensor] = None,
+        n_group: int = 1,
+        topk_group: int = 1,
+        norm_topk_prob: bool = True,
+        tid2eid: Optional[SymbolicTensor] = None,
+        token_ids: Optional[SymbolicTensor] = None,
+        name: str = "moe_route",
+    ) -> tuple[SymbolicTensor, SymbolicTensor]:
+        """Routed-MoE router decode step (issue #98).
+
+        Computes per-row expert scores and writes the **routing table** —
+        external scratch ``ids`` i32 [B, k] and ``weights`` f32 [B, k] — that
+        the expert and combine phases consume (RAW-ordered). Two families,
+        both floe-exact:
+
+        * ``mode="learned", score_fn="sqrtsoftplus"`` (DeepSeek-V4
+          ``DeepseekV4TopKRouter``): global top-k over sqrt(softplus(logits)),
+          unconditional renorm ``w / (Σw + 1e-20)``, × ``routed_scaling_factor``.
+        * ``mode="learned", score_fn="sigmoid_noaux_tc"`` (GLM-5.3
+          ``Glm53TopkRouter``): fp32 sigmoid scores; biased choice scores
+          ``s + bias`` restricted to the top-2-sum ``topk_group`` expert groups;
+          top-k over the masked choice scores (``sorted=False``); weights gather
+          the *unbiased* scores, renorm iff ``norm_topk_prob``, × scaling factor.
+        * ``mode="hash"`` (``DeepseekV4HashRouter``): expert selection is the
+          frozen ``tid2eid[token_id]`` gather; weights are the gathered scores
+          renormed (unconditionally), × scaling factor.
+
+        Selection ties resolve to the **lower expert index** (stable descending
+        order) — the documented determinism contract of this lowering.
+        """
+        b, h = x.value.shape
+        e, h_w = router_w.value.shape
+        if h_w != h:
+            raise ValueError(f"{name}: router weight contraction mismatch ({h_w} != {h})")
+        k = top_k if top_k is not None else int(weights.value.shape[1])
+        if ids.value.dtype != I32 or weights.value.dtype != F32:
+            raise ValueError(f"{name}: routing table must be i32 ids + f32 weights, got {ids.value.dtype}/{weights.value.dtype}")
+        if tuple(ids.value.shape) != (b, k) or tuple(weights.value.shape) != (b, k):
+            raise ValueError(f"{name}: routing table must be [B={b}, k={k}], got {tuple(ids.value.shape)}/{tuple(weights.value.shape)}")
+        if k < 1 or k > e:
+            raise ValueError(f"{name}: top_k={k} outside [1, E={e}]")
+        attrs = {
+            "mode": mode,
+            "score_fn": score_fn,
+            "top_k": k,
+            "num_experts": e,
+            "routed_scaling_factor": float(routed_scaling_factor),
+        }
+        inputs: list[SymbolicTensor] = [x, router_w, ids, weights]
+        if mode == "hash":
+            if tid2eid is None or token_ids is None:
+                raise ValueError(f"{name}: hash routing requires tid2eid [V, k] and token_ids [B]")
+            if tid2eid.value.dtype != I32 or tuple(tid2eid.value.shape)[1] != k:
+                raise ValueError(f"{name}: tid2eid must be i32 [V, k={k}], got {tid2eid.value.shape}")
+            if token_ids.value.dtype != I32 or tuple(token_ids.value.shape) != (b,):
+                raise ValueError(f"{name}: token_ids must be i32 [B={b}], got {token_ids.value.shape}")
+            inputs += [tid2eid, token_ids]
+            if score_fn != "sqrtsoftplus":
+                raise ValueError(f"{name}: hash routing (DeepSeek-V4) uses the sqrtsoftplus score; got {score_fn!r}")
+        elif mode == "learned" and score_fn == "sigmoid_noaux_tc":
+            if bias is None:
+                raise ValueError(f"{name}: sigmoid_noaux_tc requires the e_score_correction_bias [E]")
+            if tuple(bias.value.shape) != (e,):
+                raise ValueError(f"{name}: bias must be [E={e}], got {tuple(bias.value.shape)}")
+            if n_group < 1 or e % n_group:
+                raise ValueError(f"{name}: n_group={n_group} must divide E={e}")
+            if not (1 <= topk_group <= n_group):
+                raise ValueError(f"{name}: topk_group={topk_group} outside [1, n_group={n_group}]")
+            if k > 2 * topk_group * (e // n_group):
+                raise ValueError(f"{name}: top_k={k} exceeds the group-restricted selection pool ({2 * topk_group * (e // n_group)})")
+            if bias.value.dtype != F32:
+                raise ValueError(f"{name}: bias must be f32, got {bias.value.dtype}")
+            inputs.append(bias)
+            attrs.update({"n_group": n_group, "topk_group": topk_group, "norm_topk_prob": bool(norm_topk_prob), "routed_bias": True})
+        elif mode == "learned" and score_fn == "sqrtsoftplus":
+            attrs.update({"norm_topk_prob": True, "routed_bias": False})
+        else:
+            raise ValueError(f"{name}: unsupported router family mode={mode!r} score_fn={score_fn!r}")
+        route_reads = [_regional_reads(x.value), _regional_reads(router_w.value)]
+        if mode == "hash":
+            route_reads += [_regional_reads(tid2eid.value), _regional_reads(token_ids.value)]
+        elif mode == "learned" and score_fn == "sigmoid_noaux_tc":
+            route_reads.append(_regional_reads(bias.value))
+        self._record(
+            "moe_route",
+            inputs=inputs,
+            outputs=(ids, weights),
+            attributes=attrs,
+            reads=tuple(route_reads),
+            writes=(_regional_reads(ids.value), _regional_reads(weights.value)),
+            source_location=name,
+            numerical_contract={
+                "scores": "fp32 (f64 in the reference body): sigmoid(logits) + bias for noaux_tc, sqrt(softplus(logits)) for sqrtsoftplus",
+                "selection": f"top-{k} by choice scores, stable descending, ties to the lower expert index; sorted=False semantics",
+                "weights": "unbiased score gather" + (", renorm w/(Σw+1e-20)" if attrs.get("norm_topk_prob") else "") + f", × {routed_scaling_factor}",
+            },
+        )
+        return ids, weights
+
+    def moe_expert(
+        self,
+        x: SymbolicTensor,
+        gate_up: SymbolicTensor,
+        down: SymbolicTensor,
+        ids: SymbolicTensor,
+        *,
+        out: Optional[SymbolicTensor] = None,
+        swiglu_limit: Optional[float] = None,
+        name: str = "moe_expert",
+    ) -> SymbolicTensor:
+        """Routed-expert FFN decode tasks (issue #98): the static k·B grid.
+
+        One task per (row, slot) computes the full expert FFN for that row's
+        routed expert — the weight base ``e = ids[b, slot]`` is **runtime
+        indirection** through the routing table (the #94 slot-table pattern
+        applied to a read-only weight pool):
+
+            g, u = gate_up[e] @ x ;  act = silu(clamp(g, ≤L)) · clamp(u, ±L)
+            partials[b, slot] = down[e] @ act
+
+        ``swiglu_limit=L`` (GLM-5.3 ``Glm53Experts`` / DeepSeek-V4 experts:
+        gate clamped to ≤L, up clamped to ±L) folds into the activation.
+        Weights are fp32 in this slice (bf16/fp8-block variants are dtype
+        follow-ups on the same task shape).
+        """
+        b, h = x.value.shape
+        e, two_i, h_w = gate_up.value.shape
+        e_d, h_d, i_d = down.value.shape
+        k = int(ids.value.shape[1])
+        if h_w != h or e_d != e or h_d != h or two_i != 2 * i_d:
+            raise ValueError(f"{name}: expert stack shape mismatch gate_up={gate_up.value.shape} down={down.value.shape} x H={h}")
+        if ids.value.dtype != I32:
+            raise ValueError(f"{name}: routing ids must be i32, got {ids.value.dtype}")
+        if gate_up.value.dtype != F32 or down.value.dtype != F32 or x.value.dtype != F32:
+            raise ValueError(f"{name}: this slice runs fp32 expert weights; got {x.value.dtype}/{gate_up.value.dtype}/{down.value.dtype}")
+        out = out or self.fresh_buffer(f"{name}{self._suffix()}_partials", (b, k, h))
+        if tuple(out.value.shape) != (b, k, h):
+            raise ValueError(f"{name}: partials must be [B={b}, k={k}, H={h}], got {tuple(out.value.shape)}")
+        attrs = {"num_experts": e, "intermediate": i_d, "top_k": k}
+        if swiglu_limit is not None:
+            attrs["swiglu_limit"] = float(swiglu_limit)
+        self._record(
+            "moe_expert",
+            inputs=(x, gate_up, down, ids),
+            outputs=(out,),
+            attributes=attrs,
+            reads=(_regional_reads(x.value), _regional_reads(gate_up.value), _regional_reads(down.value), _regional_reads(ids.value)),
+            writes=(_regional_reads(out.value),),
+            source_location=name,
+            numerical_contract={
+                "indirection": f"weight base = gate_up[ids[b, slot]] / down[ids[b, slot]] — runtime slot gather (#94 pattern)",
+                "activation": "g ≤ L, u ∈ [−L, L], silu(g)·u, fp32" + (f" (L={swiglu_limit})" if swiglu_limit is not None else " (unclamped)"),
+                "reduction": "f32, h ascending over the full K/H sweep per task",
+            },
+        )
+        return out
+
+    def moe_combine(
+        self,
+        partials: SymbolicTensor,
+        weights: SymbolicTensor,
+        *,
+        shared: Optional[SymbolicTensor] = None,
+        out: Optional[SymbolicTensor] = None,
+        name: str = "moe_combine",
+    ) -> SymbolicTensor:
+        """Weighted scatter-add per row (issue #98): ``y = Σ_k w_k·h_k`` (+ the
+        dense shared-expert path when given). One task per row; fp32
+        accumulation in slot order. RAW on the routing ``weights`` (after the
+        router) and on the expert ``partials`` (after the expert phase).
+        """
+        b, k, h = partials.value.shape
+        if weights.value.dtype != F32 or tuple(weights.value.shape) != (b, k):
+            raise ValueError(f"{name}: weights must be f32 [B={b}, k={k}], got {weights.value.dtype}/{tuple(weights.value.shape)}")
+        if shared is not None and tuple(shared.value.shape) != (b, h):
+            raise ValueError(f"{name}: shared path must be [B={b}, H={h}], got {tuple(shared.value.shape)}")
+        out = out or self.fresh_buffer(f"{name}{self._suffix()}", (b, h))
+        if tuple(out.value.shape) != (b, h):
+            raise ValueError(f"{name}: output must be [B={b}, H={h}], got {tuple(out.value.shape)}")
+        inputs = (partials, weights, shared) if shared is not None else (partials, weights)
+        self._record(
+            "moe_combine",
+            inputs=inputs,
+            outputs=(out,),
+            attributes={"top_k": k, "shared": shared is not None},
+            reads=(_regional_reads(partials.value), _regional_reads(weights.value)) + ((_regional_reads(shared.value),) if shared is not None else ()),
+            writes=(_regional_reads(out.value),),
+            source_location=name,
+            numerical_contract={
+                "combine": f"Σ over k={k} slots in slot order, fp32 accumulate" + ("; + shared expert row" if shared is not None else ""),
             },
         )
         return out

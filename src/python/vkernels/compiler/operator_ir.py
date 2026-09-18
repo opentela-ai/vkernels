@@ -330,8 +330,9 @@ class Region:
 
     storage_id: int
     view: TensorValue
-    # (lo, hi) per dimension; hi may be a str symbolic expression or a
-    # per-row ValidLength (row-tensor form, stored as the object itself).
+    # (lo, hi) per dimension; hi may be a str symbolic expression, a
+    # per-row ValidLength (row-tensor form, stored as the object itself),
+    # or a plain int.
     boxes: tuple[tuple[int, int | str | ValidLength], ...]
     # Paged indirection (#94): when set, the position axis is addressed
     # through an external i32 [B, S] slot table rather than a static box.
@@ -460,9 +461,11 @@ OP_RMS_NORM = "rms_norm"
 OP_RMS_NORM_GATED = "rms_norm_gated"
 OP_ROPE = "rope"
 # rope attributes: layer, which, position, convention ("rotate_half" —
-# full-width Qwen3 form, default — or "neox_partial" — partial rotation over
-# the first rotary_dim dims with a pass-through tail; rotary_dim is present
-# iff convention == "neox_partial").
+# full-width Qwen3 form, default; "neox_partial" — partial rotation over
+# the first rotary_dim dims with a pass-through tail, rotary_dim present
+# iff convention == "neox_partial"; or "interleaved" — GPT-J style pairing
+# (2i, 2i+1) over the first rotary_dim dims, DeepSeek-V4 q/k-latent form,
+# rotary_dim present iff convention == "interleaved").
 OP_LINEAR = "linear"
 # fp8-blockwise decode projection (issue #91): y = x @ dequant(w_fp8, scales)^T
 # with DeepSeek-style 128x128 block scales; same task shape as ``linear``, the
@@ -488,6 +491,17 @@ OP_GDN_CONV = "gdn_conv"
 # pool; masked per-row on the boundary condition (issue #93 positions).
 OP_COMPRESSOR_APPEND = "compressor_append"
 OP_CACHE_APPEND_PAGED = "cache_append_paged"
+# mHC hyper-connection mixing family (issue #99; floe DeepseekV4HyperConnection
+# / Glm53HyperConnection — one op family, family attributes hc/iters/eps/
+# rms_eps). `mhc_pre` computes the data-dependent pre/post/comb weights from
+# the flattened stream contents (unweighted RMSNorm + one small GEMV each
+# step) and collapses the streams into the block-body input; `mhc_post`
+# composes the sublayer output back onto the hc parallel streams with the
+# Sinkhorn-projected doubly-stochastic comb. Both are per-token (decode:
+# Sinkhorn runs per token, not at load time). Stream state is intermediate
+# workspace — a fresh [B, hc, C] buffer per layer, NOT a persistent pool.
+OP_MHC_PRE = "mhc_pre"
+OP_MHC_POST = "mhc_post"
 # gdn_delta attributes: layer, scale, eps. Per-value-head gated delta rule
 # decode step (Qwen3.5 GatedDeltaNet, seq==1 path): decays the fp32 SSM
 # state, applies the delta-rule outer-product update, reads out through the
@@ -499,6 +513,27 @@ OP_ATTENTION_SCORES_PAGED = "attention_scores_paged"
 OP_SOFTMAX = "softmax"
 OP_ATTENTION_VALUES = "attention_values"
 OP_ATTENTION_VALUES_PAGED = "attention_values_paged"
+# MoE decode ops (issue #98): routed-expert decode with a static task grid and
+# runtime indirection. ``moe_route`` writes the routing table (external scratch
+# [B, k]: i32 expert ids + fp32 weights); ``moe_expert`` runs the k·B per-(row,
+# slot) expert FFN tasks with the weight base indirected through the table (the
+# #94 slot-table pattern); ``moe_combine`` does the weighted scatter-add per row
+# (+ optional shared-expert path). Phase order route ≺ experts ≺ combine falls
+# out of the RAW hazards on the table and the partials buffer.
+OP_MOE_ROUTE = "moe_route"
+OP_MOE_EXPERT = "moe_expert"
+OP_MOE_COMBINE = "moe_combine"
+# MLA decode (DeepSeek-V4 latent attention, issue #95): shared-KV MQA over a
+# latent cache — fused scores+softmax with a per-head learnable sink column
+# and the sliding-window branch bound, over window keys (slot table) union
+# selected compressed entries (indexer top-k table, #97). ``mla_values``
+# gathers context from both pools with the sink column contributing no value.
+OP_MLA_SCORES = "mla_scores"
+OP_MLA_VALUES = "mla_values"
+# Conjugate rope (issue #95): output-side rotation by the NEGATIVE angle —
+# same tables, sin negated; the exact inverse of the q/k rotation, so
+# rope -> conjugate_rope round-trips to identity.
+OP_CONJUGATE_ROPE = "conjugate_rope"
 
 ARITHMETIC_OP_KINDS = (
     OP_EMBEDDING,
@@ -517,12 +552,20 @@ ARITHMETIC_OP_KINDS = (
     OP_GDN_CONV,
     OP_COMPRESSOR_APPEND,
     OP_CACHE_APPEND_PAGED,
+    OP_MHC_PRE,
+    OP_MHC_POST,
     OP_GDN_DELTA,
     OP_ATTENTION_SCORES,
     OP_ATTENTION_SCORES_PAGED,
     OP_SOFTMAX,
     OP_ATTENTION_VALUES,
     OP_ATTENTION_VALUES_PAGED,
+    OP_MOE_ROUTE,
+    OP_MOE_EXPERT,
+    OP_MOE_COMBINE,
+    OP_MLA_SCORES,
+    OP_MLA_VALUES,
+    OP_CONJUGATE_ROPE,
 )
 
 

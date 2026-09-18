@@ -66,10 +66,25 @@ def lower_linear(op: Operator, graph: OperatorGraph) -> TaskFamily:
     bias = graph.tensor(op.inputs[2]) if len(op.inputs) > 2 else None
     y = graph.tensor(op.outputs[0])
     k = x.shape[1]
+    gh = op.attributes.get("grouped_heads")
     domain = _gemm_domain(x, w)
 
     def reads(coords):
         (m0, m1), (n0, n1) = _pair_box(domain, coords)
+        if gh:
+            # Block-diagonal (issue #95 GroupedLinear): each head's output
+            # rows read only that head's x/w diagonal blocks — off-block
+            # storage is never observed (NaN-canary sound).
+            k_g, n_g = k // gh, w.shape[1] // gh
+            regs = []
+            for h in range(n0 // n_g, min(gh, (n1 + n_g - 1) // n_g)):
+                h_n0, h_n1 = max(n0, h * n_g), min(n1, (h + 1) * n_g)
+                regs.append(_tile_region(x, ((m0, m1), (h * k_g, (h + 1) * k_g))))
+                regs.append(_tile_region(w, ((h * k_g, (h + 1) * k_g),
+                                             (h * n_g + (h_n0 - h * n_g), h * n_g + (h_n1 - h * n_g)))))
+            if bias is not None:
+                regs.append(_tile_region(bias, ((n0, n1),)))
+            return tuple(regs)
         regs = [_tile_region(x, ((m0, m1), (0, k))), _tile_region(w, ((0, k), (n0, n1)))]
         if bias is not None:
             regs.append(_tile_region(bias, ((n0, n1),)))
@@ -86,7 +101,9 @@ def lower_linear(op: Operator, graph: OperatorGraph) -> TaskFamily:
         domain=domain,
         inputs=(x.name, w.name) + ((bias.name,) if bias else ()),
         outputs=(y.name,),
-        params={"bias": bias is not None, "tile_m": GEMM_TILE_M, "tile_n": GEMM_TILE_N},
+        params={"bias": bias is not None, "tile_m": GEMM_TILE_M, "tile_n": GEMM_TILE_N,
+                "grouped_heads": gh,
+                **({"k_g": k // gh, "n_g": w.shape[1] // gh} if gh else {})},
         threads=THREADS_PER_WORKER,
         # Shared-memory staging of one 16x16 A tile and one 16x16 W tile (f32).
         scratch_bytes=2 * GEMM_TILE_M * 16 * 4,
@@ -619,6 +636,122 @@ def lower_gdn_conv(op: Operator, graph: OperatorGraph) -> TaskFamily:
 
 
 # ---------------------------------------------------------------------------
+# mHC hyper-connection mixing (issue #99): the data-dependent pre/post/comb
+# weights and stream collapse (pre), then the composed stream update (post).
+# One task per row (pre) / per (batch, stream) row (post) at every layer
+# boundary. The fn projection is FOLDED into the pre task rather than lowered
+# as a separate `linear` op: its [mix=(2+hc)·hc] output is consumed entirely
+# by the same task's elementwise gate/softmax/Sinkhorn chain, so a separate
+# op would only add a workspace round-trip plus a second task, while the
+# unweighted-RMSNorm rsqrt over the flattened streams must sit between the
+# stream load and the GEMV reduction anyway (floe's mhc_pre_gemm_sqrsum
+# fusion precedent). No tl.dot on device: the GEMV is a K-reduction over
+# hc·C with a tiny mix-row output, and hc² Sinkhorn is a register-resident
+# [hc, hc] chain.
+# ---------------------------------------------------------------------------
+
+
+def lower_mhc_pre(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    """One task per batch row: the task owns the row's whole [hc, C] stream
+    stack (the flat RMSNorm reduction and the fn GEMV both read the full
+    hc·C extent), computes the [mix] projection logits, the sigmoid gates,
+    the hc×hc Sinkhorn chain and the pre-weighted collapse. hc is small
+    (2–8): the entire mixing state lives in registers/scratch."""
+    streams = graph.tensor(op.inputs[0])
+    fn = graph.tensor(op.inputs[1])
+    base = graph.tensor(op.inputs[2])
+    scale = graph.tensor(op.inputs[3])
+    h_in = graph.tensor(op.outputs[0])
+    post_w = graph.tensor(op.outputs[1])
+    comb = graph.tensor(op.outputs[2])
+    B, hc, C = streams.shape
+    mix = (2 + hc) * hc
+    if fn.shape != (mix, hc * C):
+        raise ValueError(f"mhc_pre fn must be [{mix}, {hc * C}]; got {fn.shape}")
+    domain = TileDomain(((B, 1),))
+
+    def reads(coords):
+        (bb,) = coords
+        return (
+            _tile_region(streams, ((bb, bb + 1), (0, hc), (0, C))),
+            _whole(fn),
+            _whole(base),
+            _whole(scale),
+        )
+
+    def writes(coords):
+        (bb,) = coords
+        return (
+            _tile_region(h_in, ((bb, bb + 1), (0, C))),
+            _tile_region(post_w, ((bb, bb + 1), (0, hc))),
+            _tile_region(comb, ((bb, bb + 1), (0, hc), (0, hc))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_mhc_pre",
+        kind="mhc_pre",
+        op=op,
+        domain=domain,
+        inputs=(streams.name, fn.name, base.name, scale.name),
+        outputs=(h_in.name, post_w.name, comb.name),
+        params={
+            "layer": op.attributes.get("layer", 0),
+            "hc": hc,
+            "iters": op.attributes.get("iters", 1),
+            "eps": float(op.attributes.get("eps", 1e-6)),
+            "rms_eps": float(op.attributes.get("rms_eps", 1e-6)),
+        },
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=hc * C * 4,  # fp32 flattened-stream row
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_mhc_post(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    """One task per (batch, stream j): the task reads the whole stream stack
+    row (all hc sources feed stream j through comb[:, j]), the body output
+    row and this token's post/comb weights, and writes exactly stream j of
+    the fresh [B, hc, C] output stack. Narrow per-stream writes keep the
+    family's tasks independent — layer chaining is the ordinary RAW hazard
+    on the returned workspace view."""
+    streams = graph.tensor(op.inputs[0])
+    body_out = graph.tensor(op.inputs[1])
+    post_w = graph.tensor(op.inputs[2])
+    comb = graph.tensor(op.inputs[3])
+    streams_post = graph.tensor(op.outputs[0])
+    B, hc, C = streams.shape
+    domain = TileDomain(((B, 1), (hc, 1)))
+
+    def reads(coords):
+        bb, j = coords
+        return (
+            _tile_region(streams, ((bb, bb + 1), (0, hc), (0, C))),
+            _tile_region(body_out, ((bb, bb + 1), (0, C))),
+            _tile_region(post_w, ((bb, bb + 1), (j, j + 1))),
+            _tile_region(comb, ((bb, bb + 1), (0, hc), (j, j + 1))),
+        )
+
+    def writes(coords):
+        bb, j = coords
+        return (_tile_region(streams_post, ((bb, bb + 1), (j, j + 1), (0, C))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_mhc_post",
+        kind="mhc_post",
+        op=op,
+        domain=domain,
+        inputs=(streams.name, body_out.name, post_w.name, comb.name),
+        outputs=(streams_post.name,),
+        params={"layer": op.attributes.get("layer", 0), "hc": hc},
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=C * 4,  # fp32 composed stream row
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Attention: one task per (batch, head); valid prefix [0, p] (§5.3, §10.3)
 # ---------------------------------------------------------------------------
 
@@ -850,6 +983,67 @@ def lower_cache_append_paged(op: Operator, graph: OperatorGraph) -> TaskFamily:
     )
 
 
+# Lightning-indexer (issue #97): fused ReLU scoring over the compressed
+# entries + per-head mix, then the fixed-count top-k selection.
+#
+# indexer_scores: one task per (batch, entry tile). Each task streams the
+# row's full indexer query block [H, D] against its entry tile and reduces
+# the head mix in registers — H is the small indexer head count (e.g. 4),
+# so per-task reads stay bounded and no cross-task reduction is needed.
+#
+# index_topk: one task per batch row (M <= ~1k candidates fit in one
+# block's sweep). The device template computes ranks by comparison
+# counting (rank(j) = #{valid i : s_i > s_j} + #{valid i < j : s_i == s_j}),
+# which yields the slot positions directly and tie-breaks to the lowest
+# candidate index with no shared-memory sort.
+# ---------------------------------------------------------------------------
+
+INDEXER_TILE_M = 64  # compressed-entry candidates per indexer_scores task
+
+
+def lower_indexer_scores(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    q, c, w = (graph.tensor(op.inputs[i]) for i in range(3))
+    s = graph.tensor(op.outputs[0])
+    b, h, d = q.shape
+    m = c.shape[1]
+    if op.attributes.get("activation") != "relu":
+        raise ValueError(f"indexer_scores {op.source_location!r}: unsupported activation {op.attributes.get('activation')!r}")
+    if not c.is_contiguous():
+        raise ValueError(f"indexer_scores {op.source_location!r}: entries must be row-major contiguous")
+    domain = TileDomain(((b, 1), (m, INDEXER_TILE_M)))
+
+    def reads(coords):
+        bi, t = coords
+        m0 = t * INDEXER_TILE_M
+        m1 = min(m0 + INDEXER_TILE_M, m)
+        return (
+            _tile_region(q, ((bi, bi + 1), (0, h), (0, d))),
+            _tile_region(c, ((bi, bi + 1), (m0, m1), (0, d))),
+            _tile_region(w, ((bi, bi + 1), (0, h))),
+        )
+
+    def writes(coords):
+        bi, t = coords
+        m0 = t * INDEXER_TILE_M
+        m1 = min(m0 + INDEXER_TILE_M, m)
+        return (_tile_region(s, ((bi, bi + 1), (m0, m1))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_indexer_scores",
+        kind="indexer_scores",
+        op=op,
+        domain=domain,
+        inputs=(q.name, c.name, w.name),
+        outputs=(s.name,),
+        params={"heads": h, "head_dim": d, "capacity": m, "scale": op.attributes["scale"], "tile_m": INDEXER_TILE_M},
+        threads=THREADS_PER_WORKER,
+        # In-register staging: one entry tile [TILE_M, D] + one query row [D] (f32).
+        scratch_bytes=(INDEXER_TILE_M + 1) * d * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
 def lower_attention_scores_paged(op: Operator, graph: OperatorGraph) -> TaskFamily:
     q = graph.tensor(op.inputs[0])
     k_pool = graph.tensor(op.inputs[1])
@@ -889,6 +1083,182 @@ def lower_attention_scores_paged(op: Operator, graph: OperatorGraph) -> TaskFami
     )
 
 
+def lower_index_topk(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    s, valid = graph.tensor(op.inputs[0]), graph.tensor(op.inputs[1])
+    idx, bias = graph.tensor(op.outputs[0]), graph.tensor(op.outputs[1])
+    b, m = s.shape
+    k = op.attributes.get("k")
+    if not isinstance(k, int) or not 1 <= k <= m:
+        raise ValueError(f"index_topk {op.source_location!r}: k must be an int in [1, M={m}], got {k!r}")
+    if op.attributes.get("tie_break") != "lowest_index":
+        raise ValueError(f"index_topk {op.source_location!r}: unsupported tie_break {op.attributes.get('tie_break')!r}")
+    domain = TileDomain(((b, 1),))  # one task per batch row, full-candidate sweep
+
+    def reads(coords):
+        (bi,) = coords
+        return (
+            _tile_region(s, ((bi, bi + 1), (0, m))),
+            _tile_region(valid, ((bi, bi + 1),)),
+        )
+
+    def writes(coords):
+        (bi,) = coords
+        return (
+            _tile_region(idx, ((bi, bi + 1), (0, k))),
+            _tile_region(bias, ((bi, bi + 1), (0, k))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_index_topk",
+        kind="index_topk",
+        op=op,
+        domain=domain,
+        inputs=(s.name, valid.name),
+        outputs=(idx.name, bias.name),
+        params={"k": k, "capacity": m, "tie_break": "lowest_index"},
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=0,  # rank counting works in registers
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# MLA decode (issue #95): shared-KV MQA over a latent cache — fused
+# scores+softmax+sink over window ∪ compressed candidates, then the context
+# gather; plus the conjugate (output-side, negative-angle) rope.
+# ---------------------------------------------------------------------------
+
+
+def lower_mla_scores(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    q, latent, window_table, comp_pool, comp_idx, sink = (graph.tensor(op.inputs[i]) for i in range(6))
+    bias = graph.tensor(op.inputs[6]) if len(op.inputs) > 6 else None
+    probs = graph.tensor(op.outputs[0])
+    b, h, _ = q.shape
+    W = op.attributes["window"]
+    K = op.attributes["comp_slots"]
+    domain = TileDomain(((b, 1), (h, 1)))
+    names = [t.name for t in (q, latent, window_table, comp_pool, comp_idx, sink)] + ([bias.name] if bias else [])
+
+    def reads(coords):
+        bb, hh = coords
+        regs = [
+            _tile_region(q, ((bb, bb + 1), (hh, hh + 1), (0, q.shape[2]))),
+            _tile_region(latent, ((bb, bb + 1), (0, latent.shape[1]), (0, latent.shape[2]))),
+            _tile_region(window_table, ((bb, bb + 1), (0, window_table.shape[1]))),
+            _tile_region(comp_pool, ((bb, bb + 1), (0, comp_pool.shape[1]), (0, comp_pool.shape[2]))),
+            _tile_region(comp_idx, ((bb, bb + 1), (0, K))),
+            _tile_region(sink, ((bb, bb + 1), (hh, hh + 1))) if sink.shape.__len__() == 2 else _tile_region(sink, ((hh, hh + 1),)),
+        ]
+        if bias is not None:
+            regs.append(_tile_region(bias, ((bb, bb + 1), (0, K))))
+        return tuple(regs)
+
+    def writes(coords):
+        bb, hh = coords
+        return (_tile_region(probs, ((bb, bb + 1), (hh, hh + 1), (0, W + K + 1))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_mla_scores",
+        kind="mla_scores",
+        op=op,
+        domain=domain,
+        inputs=tuple(names),
+        outputs=(probs.name,),
+        params={"scale": float(op.attributes["scale"]), "layer": op.attributes["layer"],
+                "position": op.attributes["position"], "window": W, "comp_slots": K,
+                "position_form": op.attributes.get("position_form", "scalar")},
+        threads=THREADS_PER_WORKER,
+        # Per-(b,h) candidate logits [W + K + 1] staged in registers; no scratch.
+        scratch_bytes=0,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_mla_values(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    probs, latent, window_table, comp_pool, comp_idx = (graph.tensor(op.inputs[i]) for i in range(5))
+    ctx = graph.tensor(op.outputs[0])
+    b, h, _ = probs.shape
+    W = op.attributes["window"]
+    K = op.attributes["comp_slots"]
+    domain = TileDomain(((b, 1), (h, 1)))
+    d = latent.shape[2]
+
+    def reads(coords):
+        bb, hh = coords
+        return (
+            _tile_region(probs, ((bb, bb + 1), (hh, hh + 1), (0, W + K + 1))),
+            _tile_region(latent, ((bb, bb + 1), (0, latent.shape[1]), (0, d))),
+            _tile_region(window_table, ((bb, bb + 1), (0, window_table.shape[1]))),
+            _tile_region(comp_pool, ((bb, bb + 1), (0, comp_pool.shape[1]), (0, d))),
+            _tile_region(comp_idx, ((bb, bb + 1), (0, K))),
+        )
+
+    def writes(coords):
+        bb, hh = coords
+        return (_tile_region(ctx, ((bb, bb + 1), (hh, hh + 1), (0, d))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_mla_values",
+        kind="mla_values",
+        op=op,
+        domain=domain,
+        inputs=(probs.name, latent.name, window_table.name, comp_pool.name, comp_idx.name),
+        outputs=(ctx.name,),
+        params={"layer": op.attributes["layer"], "position": op.attributes["position"],
+                "window": W, "comp_slots": K,
+                "position_form": op.attributes.get("position_form", "scalar")},
+        threads=THREADS_PER_WORKER,
+        # One [D] accumulator per (b, h) in registers; no scratch.
+        scratch_bytes=0,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_conjugate_rope(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    x, cos_t, sin_t = (graph.tensor(op.inputs[i]) for i in range(3))
+    y = graph.tensor(op.outputs[0])
+    b, h = x.shape[0], x.shape[1]
+
+    def reads(coords):
+        bb, hh = coords
+        return (
+            _tile_region(x, ((bb, bb + 1), (hh, hh + 1), (0, x.shape[2]))),
+            _tile_region(cos_t, ((0, cos_t.shape[0]), (0, cos_t.shape[1]))),
+            _tile_region(sin_t, ((0, sin_t.shape[0]), (0, sin_t.shape[1]))),
+        )
+
+    def writes(coords):
+        bb, hh = coords
+        return (_tile_region(y, ((bb, bb + 1), (hh, hh + 1), (0, x.shape[2]))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_conjugate_rope",
+        kind="conjugate_rope",
+        op=op,
+        domain=TileDomain(((b, 1), (h, 1))),
+        inputs=(x.name, cos_t.name, sin_t.name),
+        outputs=(y.name,),
+        params={"layer": op.attributes["layer"], "which": op.attributes["which"],
+                "position": op.attributes["position"], "convention": op.attributes["convention"],
+                "rotary_dim": op.attributes["rotary_dim"],
+                "position_form": op.attributes.get("position_form", "scalar")},
+        threads=THREADS_PER_WORKER,
+        # Rotation is in-register per (b, h) row; tables stream from L2 (.cg).
+        scratch_bytes=0,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# Registry (§3.1)
+# ---------------------------------------------------------------------------
+
+
 def lower_attention_values_paged(op: Operator, graph: OperatorGraph) -> TaskFamily:
     probs = graph.tensor(op.inputs[0])
     v_pool = graph.tensor(op.inputs[1])
@@ -923,6 +1293,129 @@ def lower_attention_values_paged(op: Operator, graph: OperatorGraph) -> TaskFami
         params={"layer": op.attributes.get("layer", 0), "position": p, "position_form": op.attributes.get("position_form", "scalar"), "kv_heads": kvh, "group": group},
         threads=THREADS_PER_WORKER,
         scratch_bytes=D * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_moe_route(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    x, router_w, ids, weights = (graph.tensor(op.inputs[i]) for i in range(4))
+    b, h = x.shape
+    e, h_w = router_w.shape
+    k = ids.shape[1]
+    if h_w != h:
+        raise ValueError(f"moe_route {op.source_location!r}: contraction mismatch")
+    mode = op.attributes["mode"]
+    score_fn = op.attributes["score_fn"]
+    extra: list[str] = []
+    if mode == "hash":
+        extra = [op.inputs[4], op.inputs[5]]  # tid2eid, token_ids
+    elif score_fn == "sigmoid_noaux_tc":
+        extra = [op.inputs[4]]  # e_score_correction_bias
+    domain = TileDomain(((b, 1),))
+
+    def reads(coords):
+        regions = [
+            _tile_region(x, ((coords[0], coords[0] + 1), (0, h))),
+            _whole(router_w),
+        ]
+        for name in extra:
+            regions.append(_whole(graph.tensor(name)))
+        return tuple(regions)
+
+    def writes(coords):
+        r = coords[0]
+        return (
+            _tile_region(ids, ((r, r + 1), (0, k))),
+            _tile_region(weights, ((r, r + 1), (0, k))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_moe_route",
+        kind="moe_route",
+        op=op,
+        domain=domain,
+        inputs=(x.name, router_w.name, ids.name, weights.name, *extra),
+        outputs=(ids.name, weights.name),
+        params=dict(op.attributes),
+        threads=THREADS_PER_WORKER,
+        # Per-worker score scratch: one E-wide fp32 choice-score vector.
+        scratch_bytes=e * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_moe_expert(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    x, gate_up, down, ids = (graph.tensor(op.inputs[i]) for i in range(4))
+    partials = graph.tensor(op.outputs[0])
+    b, h = x.shape
+    e, two_i, h_w = gate_up.shape
+    inter = two_i // 2
+    k = ids.shape[1]
+    if h_w != h or down.shape != (e, h, inter):
+        raise ValueError(f"moe_expert {op.source_location!r}: expert stack shape mismatch")
+    # The static k·B grid: one task per (row, slot); the weight base is read
+    # from ids[b, slot] at run time (runtime indirection, #94 pattern).
+    domain = TileDomain(((b, 1), (k, 1)))
+
+    def reads(coords):
+        r, s = coords
+        return (
+            _tile_region(x, ((r, r + 1), (0, h))),
+            # Indirected weight pool: slots are runtime data — whole-pool
+            # declaration is the conservative sound choice (#94).
+            _whole(gate_up),
+            _whole(down),
+            _whole(ids),
+        )
+
+    def writes(coords):
+        r, s = coords
+        return (_tile_region(partials, ((r, r + 1), (s, s + 1), (0, h))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_moe_expert",
+        kind="moe_expert",
+        op=op,
+        domain=domain,
+        inputs=(x.name, gate_up.name, down.name, ids.name),
+        outputs=(partials.name,),
+        params=dict(op.attributes),
+        threads=THREADS_PER_WORKER,
+        # In-register gate/up rows: 2·inter fp32 values + the h-wide activation.
+        scratch_bytes=(two_i + h) * 4,
+        read_regions=reads,
+        write_regions=writes,
+    )
+
+
+def lower_moe_combine(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    partials, weights = graph.tensor(op.inputs[0]), graph.tensor(op.inputs[1])
+    shared = graph.tensor(op.inputs[2]) if len(op.inputs) > 2 else None
+    y = graph.tensor(op.outputs[0])
+    b, k, h = partials.shape
+    domain = TileDomain(((b, 1),))
+
+    def reads(coords):
+        regions = [_whole(partials), _whole(weights)]
+        if shared is not None:
+            regions.append(_whole(shared))
+        return tuple(regions)
+
+    def writes(coords):
+        r = coords[0]
+        return (_tile_region(y, ((r, r + 1), (0, h))),)
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_moe_combine",
+        kind="moe_combine",
+        op=op,
+        domain=domain,
+        inputs=(partials.name, weights.name) + ((shared.name,) if shared is not None else ()),
+        outputs=(y.name,),
+        params=dict(op.attributes),
+        threads=THREADS_PER_WORKER,
         read_regions=reads,
         write_regions=writes,
     )
@@ -1106,6 +1599,8 @@ def lower_compressor_append(op: Operator, graph: OperatorGraph) -> TaskFamily:
 LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "linear": lower_linear,
     "linear_fp8": lower_linear_fp8,
+    "indexer_scores": lower_indexer_scores,
+    "index_topk": lower_index_topk,
     "layer_norm": lower_layer_norm,
     "rms_norm": lower_rms_norm,
     "rms_norm_gated": lower_rms_norm_gated,
@@ -1118,11 +1613,23 @@ LOWERINGS: dict[str, Callable[[Operator, OperatorGraph], TaskFamily]] = {
     "gdn_conv": lower_gdn_conv,
     "gdn_delta": lower_gdn_delta,
     "cache_append_paged": lower_cache_append_paged,
+    "mhc_pre": lower_mhc_pre,
+    "mhc_post": lower_mhc_post,
     "attention_scores": lower_attention_scores,
     "attention_scores_paged": lower_attention_scores_paged,
+    "mla_scores": lower_mla_scores,
+    "mla_values": lower_mla_values,
+    "conjugate_rope": lower_conjugate_rope,
     "softmax": lower_softmax,
     "attention_values": lower_attention_values,
     "attention_values_paged": lower_attention_values_paged,
+    "moe_route": lower_moe_route,
+    "moe_expert": lower_moe_expert,
+    "moe_combine": lower_moe_combine,
+    "compressor_append": lower_compressor_append,
+    "moe_route": lower_moe_route,
+    "moe_expert": lower_moe_expert,
+    "moe_combine": lower_moe_combine,
     "indexer_scores": lower_indexer_scores,
     "index_topk": lower_index_topk,
     "compressor_append": lower_compressor_append,

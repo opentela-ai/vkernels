@@ -51,10 +51,18 @@ TEMPLATE_NAMES = {
     # selection producing the i32 indirection table for #95/#96 via #94.
     "indexer_scores": "indexer_scores_task",
     "index_topk": "index_topk_task",
+    "moe_route": "moe_route_task",  # MoE decode ops (issue #98)
+    "moe_expert": "moe_expert_task",
+    "moe_combine": "moe_combine_task",
     # DSA compressor lane (issue #96): per-(row, layer) entry emission into
     # the two-series Ca/Cb pool; consumes #97's block_bias alignment and
     # #93's per-row boundary cadence; reads fold into #95 via #94.
     "compressor_append": "compressor_append_task",
+    # MLA decode lane (issue #95): fused latent-attention scores + softmax +
+    # sink, the context gather, and the conjugate (output-side) rope.
+    "mla_scores": "mla_scores_task",
+    "mla_values": "mla_values_task",
+    "conjugate_rope": "conjugate_rope_task",
     "layernorm": "layernorm_task",
     "rms_norm": "rms_norm_task",
     "rms_norm_gated": "rms_norm_gated_task",  # sigmoid-gated RMSNorm (issue #100)
@@ -75,6 +83,11 @@ TEMPLATE_NAMES = {
     "cache_append_paged": "cache_append_paged_task",
     "attention_scores_paged": "attention_scores_paged_task",
     "attention_values_paged": "attention_values_paged_task",
+    # --- deepseek stage-2 additions (issue #102): mHC hyper-connection
+    # mixing lanes (issue #99) — pre-mix collapse and post-compose over the
+    # [B, hc, C] stream stack
+    "mhc_pre": "mhc_pre_task",
+    "mhc_post": "mhc_post_task",
 }
 
 _TEMPLATE_MODULE = "vkernels.compiler.device_templates"
