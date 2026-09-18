@@ -226,7 +226,12 @@ wavefront); batch scaling free to ~228.
 correctness gate (`|got−fp64| ≤ K·eps·Σ|x·fn|`, K=256; strict 1e-4
 oracle-chain gate kept via `VK_MHC_STRICT_GATE=1`) make NSLICE≥16
 admissible: **43.5 µs at ns=16, 30.8 µs at ns=32** (≤50 µs/layer target
-met). `mhc_post` sub-µs (free). n=7 costs the same as n=1.
+met). Since #147 the C ABI / Python serving path DISPATCHES to the
+blocked kernel by default (`nslice=32`; `nslice=1` or env
+`VK_MHC_PRE_STRICT=1` restores the bitwise-oracle strict chain), so the
+30.8 µs point is actually reachable by consumers (the strict chain was
+still being served at 816 µs when #138 closed). `mhc_post` sub-µs (free).
+n=7 costs the same as n=1.
 
 **kpool bookkeeping** (`dsa_kpool_*`): 6–22 µs per step at serving shapes,
 ~15 ns/request marginal on MI300A (~7 ns on A100). Launch/occupancy-bound

@@ -127,7 +127,9 @@ static void bench_pre(const GpuInfo& info, hipEvent_t start, hipEvent_t stop,
       {1, 4, 7168},              // larger branch
   };
   std::printf("\n=== hip::mhc_pre_gemm_sqrsum%s ===\n",
-              variant ? " (blocked, issue #79 experiment)" : "");
+              variant ? " (blocked ladder, issue #79 experiment)"
+                      : " (served default: ns=auto -> blocked NSLICE=32;"
+                        " VK_MHC_PRE_STRICT=1 pins the strict chain) [#147]");
   std::printf("  %4s %8s %6s %8s %9s %9s %9s %5s  %s\n",
               "n", "hc_hidden", "hc_mult3", "us(min)", "us(med)",
               "TFLOP/s", "GB/s", "AI", "bound");

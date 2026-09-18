@@ -38,6 +38,7 @@
 //               + bf16 storage. Cross-checked against the oracle by
 //               test_mhc_correct.hip.
 #include <cstdint>
+#include <cstdlib>
 
 #include "vkernels/kernels/mhc.hpp"
 
@@ -71,7 +72,14 @@ static constexpr int kFnChunk = 512;
 //  each lane striding a different fn row: un-coalesced, and at decode n=1
 //  the whole GEMM ran on ONE block = 0.1% of MI300A HBM).
 //
-//  Accumulation ORDER is load-bearing for the correctness gate. The CPU
+//  ISSUE #147 NOTE: this kernel is no longer the default serving path --
+//  the launcher dispatches to mhc_pre_gemm_sqrsum_blocked (NSLICE=32) by
+//  default, because #141's order-invariant fp64-reference gate removed the
+//  correctness constraint below. It stays reachable via nslice == 1 or env
+//  VK_MHC_PRE_STRICT=1 for bitwise-oracle parity consumers, and remains the
+//  only path that is BITWISE identical to mhc_pre_gemm_sqrsum_cpu.
+//
+//  Accumulation ORDER is load-bearing for the (legacy 1e-4) gate. The CPU
 //  oracle sums each output element as a strict left-to-right fp32
 //  mul-then-add chain over h (mhc_pre_gemm_sqrsum_cpu). Because fp32
 //  addition is not associative, ANY parallel regrouping of that chain
@@ -234,18 +242,47 @@ __global__ void mhc_post_kernel(
 //  with no try/catch, so validation is the host C ABI's job via VK_CAPI_TRY
 //  and the Python layer's. These launchers only guard the one case that
 //  would corrupt the static shared staging buffer.)
+//
+//  mhc_pre_gemm_sqrsum serving policy (issue #147): the strict-chain kernel
+//  was the default ONLY under #79's order-fragile 1e-4 oracle-chain gate;
+//  #141 replaced that gate with the order-invariant conditioning-normalized
+//  fp64-reference comparison (measured envelope: worst clean normalized
+//  error 0.9 vs K=256 across 5 seeds x NSLICE 1..256 x 3 shapes, corrupted
+//  control >= 3.2e5), which makes the blocked kernel admissible -- but #141
+//  never rewired the serving path, so every C-ABI/Python consumer kept
+//  paying the 816 us single-thread chain at decode n=1 (26x over the
+//  measured 30.8 us blocked ns=32). Default is therefore NSLICE=32 blocked;
+//  nslice == 1 (or env VK_MHC_PRE_STRICT=1, which pins it for ALL calls --
+//  the bitwise-oracle parity escape hatch) keeps the strict chain.
 // ---------------------------------------------------------------------------
 void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
                          const void* x, const void* fn,
-                         void* out, void* sqrsum, void* stream) {
+                         void* out, void* sqrsum, void* stream, int nslice) {
   if (num_tokens <= 0 || hc_mult3 <= 0 || hc_hidden_size <= 0) return;
   if (hc_mult3 > 32 || hc_hidden_size > kMaxHcHidden) return;
-  dim3 grid(num_tokens, hc_mult3);  // one block per (token, column) (#79)
-  dim3 block(256);                  // coalesced fn-row walk + tree reduce
-  mhc_pre_gemm_sqrsum_kernel<<<grid, block, 0, static_cast<hipStream_t>(stream)>>>(
-      reinterpret_cast<const uint16_t*>(x), reinterpret_cast<const float*>(fn),
-      reinterpret_cast<float*>(out), reinterpret_cast<float*>(sqrsum),
-      num_tokens, hc_mult3, hc_hidden_size);
+  // VK_MHC_PRE_STRICT=1 pins the bitwise-oracle strict chain for all calls
+  // (issue #147 parity escape hatch). Resolved once, first call wins.
+  static const bool kStrictEnv = [] {
+    const char* e = std::getenv("VK_MHC_PRE_STRICT");
+    return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+  }();
+  if (kStrictEnv) {
+    nslice = 1;
+  } else if (nslice <= 0) {
+    nslice = 32;  // served default: fastest fully-measured admissible point
+  }
+  if (nslice == 1) {
+    dim3 grid(num_tokens, hc_mult3);  // one block per (token, column) (#79)
+    dim3 block(256);                  // coalesced fn-row walk + tree reduce
+    mhc_pre_gemm_sqrsum_kernel<<<grid, block, 0,
+                                 static_cast<hipStream_t>(stream)>>>(
+        reinterpret_cast<const uint16_t*>(x), reinterpret_cast<const float*>(fn),
+        reinterpret_cast<float*>(out), reinterpret_cast<float*>(sqrsum),
+        num_tokens, hc_mult3, hc_hidden_size);
+    return;
+  }
+  mhc_pre_gemm_sqrsum_blocked(num_tokens, hc_mult3, hc_hidden_size, x, fn,
+                              out, sqrsum, stream, nslice);
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +378,16 @@ void mhc_pre_gemm_sqrsum_blocked(int num_tokens, int hc_mult3,
                                  void* out, void* sqrsum, void* stream,
                                  int nslice) {
   if (num_tokens <= 0 || hc_mult3 <= 0 || hc_hidden_size <= 0) return;
+  // Round UP to the next supported slice count (ladder = powers of two
+  // 1..256): issue #147 forwards arbitrary user nslice here from
+  // mhc_pre_gemm_sqrsum, and a non-ladder value used to select NO kernel
+  // (silent no-op). Exact ladder values are unaffected.
   if (nslice <= 0) nslice = 256;
+  else if (nslice < 256) {
+    int n2 = 1;
+    while (n2 < nslice) n2 <<= 1;
+    nslice = n2;
+  }
   dim3 grid(num_tokens, hc_mult3);  // one block per (token, column)
   dim3 block(256);                  // sqrsum coop + idle-thread +0.0 padding
   hipStream_t s = static_cast<hipStream_t>(stream);

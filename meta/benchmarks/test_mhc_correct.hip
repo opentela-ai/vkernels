@@ -175,6 +175,10 @@ PreStats run_pre(int num_tokens, int hc_mult, int hidden,
                  const std::vector<float>& fn,      // fp32 source (no rounding)
                  uint16_t* dx, float* dfn, float* dout, float* dsqrsum,
                  int variant = 0, int nslice = 256) {
+  // issue #147: for variant 0 the nslice argument is forwarded to the
+  // mhc_pre_gemm_sqrsum launcher (0 = served default policy, 1 = strict
+  // chain, else the blocked ladder); for variant 1 it is the blocked
+  // launcher's explicit nslice as before.
   const int hc_hidden = hc_mult * hidden;
   const int hc_mult3 = hc_mult * (2 + hc_mult);
   const size_t nx = (size_t)num_tokens * hc_hidden;
@@ -225,7 +229,7 @@ PreStats run_pre(int num_tokens, int hc_mult, int hidden,
   if (variant == 0)
     vkernels::kernels::hip::mhc_pre_gemm_sqrsum(num_tokens, hc_mult3,
                                                 hc_hidden, dx, dfn, dout,
-                                                dsqrsum);
+                                                dsqrsum, nullptr, nslice);
   else
     vkernels::kernels::hip::mhc_pre_gemm_sqrsum_blocked(num_tokens, hc_mult3,
                                                         hc_hidden, dx, dfn,
@@ -492,12 +496,14 @@ int main() {
       for (size_t i = 0; i < x.size(); ++i) x[i] = rnd(2 * seed - 1, (int)i);
       for (size_t i = 0; i < fn.size(); ++i) fn[i] = rnd(2 * seed, (int)i);
 
-      // Strict split (the shipped correctness path). Under the default
-      // policy it is gated by the SAME normalized fp64 gate (it passes with
-      // huge margin — and, unlike the legacy gate, on EVERY seed); the
-      // legacy oracle-chain verdict is printed for the #79 record.
+      // Strict split (nslice=1 -- the bitwise-oracle chain, now an explicit
+      // request after issue #147 made the blocked kernel the served
+      // default). Under the default policy it is gated by the SAME
+      // normalized fp64 gate (it passes with huge margin — and, unlike the
+      // legacy gate, on EVERY seed); the legacy oracle-chain verdict is
+      // printed for the #79 record.
       auto s0 = run_pre(c.num_tokens, c.hc_mult, c.hidden, x, fn,
-                        dx, dfn, dout, dsqrsum);
+                        dx, dfn, dout, dsqrsum, 0, 1);
       bool ok0_legacy =
           std::fmax(s0.oracle_out.max_rel, s0.oracle_sq.max_rel) < PRE_THRESH;
       bool ok0 = strict_gate
@@ -514,6 +520,42 @@ int main() {
                   s0.norm_out, s0.norm_sq,
                   ok0 ? "PASS" : "FAIL", ok0_legacy ? "PASS" : "FAIL");
       if (!ok0) ++fails;
+
+      // SERVED default (issue #147): the exact path every C-ABI / Python
+      // consumer now gets (nslice=0 = launcher auto-policy; env
+      // VK_MHC_PRE_STRICT=1 pins strict). Must pass the active gate.
+      // Under VK_MHC_STRICT_GATE=1 the blocked default is definitionally
+      // inadmissible, so the row is skipped unless VK_MHC_PRE_STRICT is
+      // also set (the launcher then serves the strict chain, which the
+      // legacy gate admits).
+      const char* pre_strict_env = std::getenv("VK_MHC_PRE_STRICT");
+      const bool pre_strict =
+          pre_strict_env && pre_strict_env[0] != '\0' &&
+          !(pre_strict_env[0] == '0' && pre_strict_env[1] == '\0');
+      if (strict_gate && !pre_strict) {
+        std::printf(
+            "  [seed %d] SERVED default (ns=auto)  SKIPPED under"
+            " VK_MHC_STRICT_GATE=1 (blocked default inadmissible; set"
+            " VK_MHC_PRE_STRICT=1 to serve+gate the strict chain)\n",
+            seed);
+      } else {
+        auto sd = run_pre(c.num_tokens, c.hc_mult, c.hidden, x, fn,
+                          dx, dfn, dout, dsqrsum, 0, 0);
+        bool okd_legacy = std::fmax(sd.oracle_out.max_rel,
+                                    sd.oracle_sq.max_rel) < PRE_THRESH;
+        bool okd = strict_gate
+                       ? okd_legacy
+                       : (sd.norm_out <= gate_k && sd.norm_sq <= gate_k);
+        std::printf(
+            "  [seed %d] SERVED default (ns=auto) n=%-2d hc_mult=%d"
+            " hidden=%-4d  oracle rel=%.2e  f64 out=%.2e sq=%.2e"
+            "  norm out=%.1f sq=%.1f  GATE %s\n",
+            seed, c.num_tokens, c.hc_mult, c.hidden,
+            std::fmax(sd.oracle_out.max_rel, sd.oracle_sq.max_rel),
+            sd.f64_out.max_rel, sd.f64_sq.max_rel,
+            sd.norm_out, sd.norm_sq, okd ? "PASS" : "FAIL");
+        if (!okd) ++fails;
+      }
 
       // Blocked ladder (issue #138 gate): every NSLICE must pass the
       // order-invariant fp64 gate on EVERY seed; under the legacy gate the
