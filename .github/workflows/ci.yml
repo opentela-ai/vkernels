@@ -97,6 +97,34 @@ jobs:
             VKERNELS_LIB="$PWD/build/cuda/src/c/libvkernels_c.so" \
               python3 tests/python/test_dsa_kpool_device.py -v'
 
+      - name: Device tests (self-contained megakernel templates, sm_121)
+        # The six megakernel device-test files whose device tests are
+        # self-contained (in-file oracles, no floe) run against the GB10
+        # GPU. Tests need only python3 + numpy + pytest + torch + triton and
+        # the pure-python package (conftest.py pins sys.path to src/python),
+        # so no install step: pytest runs straight from the workspace.
+        # pip bootstraps what the image lacks (per the kpool step above, the
+        # image ships no pytest/torch) — idempotent (no-op once torch/triton
+        # are baked in; first run pulls ~2.5 GB of torch wheels). The image
+        # ships python3-dev, so triton JIT compilation has its headers.
+        # Plain pip first; --break-system-packages covers externally-managed
+        # pythons (PEP 668 rejects before downloading, so the retry is
+        # cheap). gdn_delta's device test is excluded: it is floe-oracle-
+        # gated and would only ever skip here.
+        run: |
+          ~/runners/cuda-run.sh vkernels-ci:cuda13 bash -c '
+            set -e
+            python3 -m pip install --quiet numpy pytest torch triton || \
+              python3 -m pip install --quiet --break-system-packages numpy pytest torch triton
+            python3 -m pytest -v \
+              tests/python/test_megakernel_rope_neox.py \
+              tests/python/test_megakernel_gdn_conv.py \
+              tests/python/test_megakernel_values_gate.py \
+              tests/python/test_megakernel_kda_delta.py \
+              tests/python/test_megakernel_indexer_topk.py \
+              tests/python/test_megakernel_mla_decode.py
+          '
+
       - name: Build wheel (CUDA)
         run: ~/runners/cuda-run.sh vkernels-ci:cuda13 bash -c "bash meta/scripts/build_wheel.sh --cuda --output-dir dist"
 
