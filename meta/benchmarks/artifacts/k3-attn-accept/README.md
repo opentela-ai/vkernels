@@ -130,6 +130,24 @@ pass, including the checked-in artifact anchors — 638514 gen report →
 `degenerate`, 638514 recall baseline → `kda_recall` FAIL, 638514 bench vs
 itself → ratio 1.000 PASS.
 
+On-cluster smoke (beverin, 1 GPU, mi300): the `selftest` mode was run as a
+15-min single-GPU Slurm job (`bash meta/scripts/run_issue45_accept_mi300.sh
+selftest`). Final green run: **job 641176** (2026-09-18) — all four offline
+selftests pass under the container/login python (3.6-compatible), and the
+real rocprof round-trip succeeds against **rocprof 6.3.0** on a gfx942 MI300A:
+a tiny HIP kernel is profiled (`results.csv` / `results.stats.csv`,
+`KernelName` column), the capture asserts **PASS** (zero AITER/Triton
+attention kernels), and the capture poisoned with
+`aiter::mla_decode_mla_gluon` correctly asserts **FAIL**. Debug iterations on
+the way (also cited as evidence of the fixes): 641127 (py3.6
+`__future__.annotations` incompat → fixed), 641163 (offline part green,
+rocprof 6.3 rejects `-o` → fixed), 641169/641174 (artifact-dir redirect →
+fixed). Artifacts kept in
+`/capstor/scratch/cscs/xyao/vkernels-i45-accept/i45-smoke-artifacts-*/`.
+NOTE for AC3 on the real serve: capture with `rocprof --stats` run from the
+desired output dir (no `-o`), then pass the `results*.csv` files to
+`issue45_rocprof_attention_assert.py`.
+
 ### Owner acceptance campaign runbook (OWNER-ONLY — not launched by this tooling)
 
 The full campaign needs 6 nodes (TP8×PP3, 24 ranks), the real 96-shard
