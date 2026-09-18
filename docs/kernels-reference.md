@@ -58,7 +58,7 @@ serving shape, not a theoretical optimum.
 | 13 | `mla_fwd` | MI300A | H=128 S_q=S_kv=512 (prefill, best case) | 15.9 ms, 2318 GB/s | 5300 GB/s | **44% of HBM** | memory (AI 2.0; KV re-read per query tile) | [kernels/mla.md](kernels/mla.md) |
 | 14 | `mla_fwd` split-K decode | MI300A | H=1 S_q=1 S_kv=8192, split=228 | **66.8 µs, 533 GB/s** (was 5.5 ms, 6.5 GB/s pre-split) | 5300 GB/s | ~10% of HBM | **82× vs the single-block baseline**; 32-keys/split serial chain | [kernels/mla.md](kernels/mla.md) |
 | 15 | `kda_delta_rule_fwd` | MI300A | H=16 S=64 D=64 | 143 µs, 477 GB/s | 5300 GB/s | 9.0% of HBM | memory (D×D state → HBM per token, 3× re-read) | [kernels/kda.md](kernels/kda.md) |
-| 16 | `kda_layer_norm_gated` | MI300A | N=8192 D=128 | 174 µs, 72 GB/s | HBM | 1.4% | occupancy (32 blocks on 228 CUs) | same |
+| 16 | `kda_layer_norm_gated` | MI300A | N=8192 D=128 | 4.8 µs, ~2600 GB/s (was 174 µs, 72 GB/s) | HBM | ~49% of HBM | warp-per-row float4 (issue #144); was occupancy (32 blocks) | [kernels/kda.md](kernels/kda.md) |
 | 17 | `dsa_sparse_fwd` (plain) | MI300A | GLM decode, topk=2048 (full) | 3.12 ms, 21.5 GB/s | HBM/L2 | 0.4% HBM | occupancy (64 blocks / 228 CU, serial key chain) | [dsa/gfx942](performance/dsa/gfx942.md) |
 | 18 | `dsa_sparse_fwd_split` | MI300A | same, split=64 | **0.156 ms**, 430 GB/s | 5300 GB/s | **8.1% HBM** (20.0× vs unsplit) | key-stream latency (8–32 keys/split serial chain) | same |
 | 19 | `dsa_sparse_fwd` (plain, prefill) | MI300A | H=1 S_q=8192 topk=128, GLM | 0.49 ms, 1116 GB/s | 5300 GB/s | **21% of HBM** | memory | same |
