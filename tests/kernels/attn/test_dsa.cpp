@@ -709,30 +709,34 @@ TEST(DsaTopk, SplitFor) {
   EXPECT_EQ(dsa_topk_logits_split_for(2, 4096, 64), 64);  // min(64, 228/2)
 }
 
-// dsa_sparse_fwd_split_for: the forward's split recommendation, fitted to
-// the measured sweep (docs/performance/dsa/gfx942.md): prefill returns 1
-// (the plain grid already fills the CUs); decode returns ceil(sqrt(2*topk))
-// capped at topk -- the measured optimum is 8-32 keys per split, NOT the
-// indexer's CU-filling floor (which is 5-6x off at H=64).
+// dsa_sparse_fwd_split_for: the forward's split recommendation, re-fitted
+// to the issue-#137 measured sweeps (docs/performance/dsa/gfx942.md):
+// prefill returns 1 (the plain grid already fills the CUs); decode returns
+// 32 for topk >= 1024 and min(topk, 16) otherwise -- the measured optima
+// under the shipped three-way vec/db/serial dispatch (topk=2048: 99.0 us /
+// 679 GB/s with the unfused vectorized kernel at split=32, vs 156-169 us
+// at the old split=64 serial floor).
 TEST(DsaSparse, SplitFor) {
   using vkernels::kernels::dsa_sparse_fwd_split_for;
-  // GLM-5.3-Flash full-topk decode: measured best split = 64 (19.7x).
-  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 228), 64);
-  // topk=256 decode: ceil(sqrt(512)) = 23 (measured best 16, neighbor 32).
-  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 256, 64, 228), 23);
-  // topk=128 decode: ceil(sqrt(256)) = 16 (measured best).
+  // GLM-5.3-Flash full-topk decode: measured best split = 32 (issue #137,
+  // job 641089: 99.0 us / 679 GB/s, -37% vs the old split=64 serial 156).
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 228), 32);
+  // topk=256 decode: measured best 8 (40.0 us; 16 within 2%) -> band 16.
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 256, 64, 228), 16);
+  // topk=128 decode: measured best 8 (31.2 us; 4-sample 0 artifact) -> 16.
   EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 128, 64, 228), 16);
-  // DeepSeek-V3 decode (H=16): 16 blocks, still under-filled -> 23.
-  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 16, 256, 64, 228), 23);
+  // DeepSeek-V3 decode (H=16): 16 blocks, still under-filled -> 16.
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 16, 256, 64, 228), 16);
   // Huge H saturates the CUs with the plain grid: no split.
   EXPECT_EQ(dsa_sparse_fwd_split_for(1, 256, 2048, 64, 228), 1);
   // Prefill S_q=8192 (BQ=4): 2048*H blocks >> CUs -> split 1.
   EXPECT_EQ(dsa_sparse_fwd_split_for(8192, 1, 128, 64, 228), 1);
-  // topk=2: sqrt(4) = 2, capped at topk = 2.
+  // topk < 16: capped at topk (every split keeps >= 1 key).
   EXPECT_EQ(dsa_sparse_fwd_split_for(1, 1, 2, 2, 228), 2);
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 15, 64, 228), 15);
   // Degenerate inputs -> safe 1.
   EXPECT_EQ(dsa_sparse_fwd_split_for(0, 64, 2048, 64, 228), 1);
   EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 0, 64, 228), 1);
-  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 0, 228), 64);  // block_I unused
-  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 0), 64);   // default CUs
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 0, 228), 32);  // block_I unused
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 0), 32);   // default CUs
 }

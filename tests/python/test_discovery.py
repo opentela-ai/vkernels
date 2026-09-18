@@ -60,9 +60,10 @@ EXPECTED_KERNELS = [
     # docstring used to restate (with the wrong NUM_CU=256 -> 228).
     ("dsa_topk_logits_split_for", "dsa"),
     # dsa_sparse_fwd_split_for: the split-key decode recommendation
-    # (ceil(sqrt(2*topk)) for decode, 1 for prefill) fitted to the measured
-    # sweep (docs/performance/dsa/gfx942.md), used by the serving decode
-    # path; sits in dsa.hpp right before the device declarations.
+    # (32 for topk >= 1024, else min(topk, 16) for decode; 1 for prefill)
+    # re-fitted to the issue-#137 measured sweep
+    # (docs/performance/dsa/gfx942.md), used by the serving decode path;
+    # sits in dsa.hpp right before the device declarations.
     ("dsa_sparse_fwd_split_for", "dsa"),
     ("dsa_sparse_fwd", "dsa"),
     ("dsa_sparse_fwd_with_tile", "dsa"),

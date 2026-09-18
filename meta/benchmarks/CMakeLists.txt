@@ -313,6 +313,13 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_dsa_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_dsa_correct)
 
+  # Issue #137 focused split-sweep (decode shapes, env-selected dispatch
+  # variant per run -- see the file header).
+  add_executable(dsa_bench_split137 bench_dsa_split137.hip)
+  target_link_libraries(dsa_bench_split137 PRIVATE vkernels::vkernels)
+  target_compile_features(dsa_bench_split137 PRIVATE cxx_std_17)
+  vkernels_set_warnings(dsa_bench_split137)
+
   # DSA paged-MQA gated top-k logits (issue #51): the kpool>1 indexer path.
   add_executable(test_dsa_topk_correct test_dsa_topk_correct.hip)
   target_link_libraries(test_dsa_topk_correct PRIVATE vkernels::vkernels)

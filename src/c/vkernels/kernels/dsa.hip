@@ -597,6 +597,219 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
         (row_sum > 0.0f) ? (row_max + log2f(row_sum)) : -INFINITY;
 }
 
+// Issue #137: vectorized + batched serial partial (the two levers the
+// perf record called for at full topk, where the db kernel's LDS staging
+// strictly loses to TLP):
+//
+//   (a) Wider per-key loads. The serial kernel reads each 256-wide bf16 key
+//       row as four 2-byte lane-strided loads (score) and re-reads them for
+//       the V update. With tail_dim == 0 the K and V regions COINCIDE
+//       ([0, dim) of the same kv row), so one 8-byte uint2 per lane (4 bf16,
+//       lane-contiguous instead of lane-strided: 64 lanes x 4 elements
+//       cover the row) serves score AND V -- one load instruction instead
+//       of eight, perfectly coalesced (512 B/wavefront).
+//   (b) Key batching in REGISTERS (no LDS -- that is the db kernel's job
+//       and its occupancy tax). The serial kernel's per-key chain is two
+//       dependent global round trips (index load -> address -> data load
+//       -> use). This kernel hoists G keys' index + data loads into
+//       registers BEFORE consuming them sequentially, so the round-trip
+//       latency amortizes over G keys while the online-softmax update
+//       sequence stays per-key sequential (identical masked-key semantics:
+//       out-of-range/invalid group entries run the same -inf update).
+//
+// Per-key arithmetic is otherwise identical to the serial kernel (same
+// exp2/fmax update sequence, same shfl reduction tree); the only numeric
+// difference is the dot-product association across lanes (4 CONTIGUOUS
+// elements per lane instead of 4 strided) -- bf16-tolerant vs the oracle
+// exactly like every other lane mapping here.
+//
+// FUSE mode (lever (b) of the issue, the combine merge): instead of
+// returning after the partial write, the warp fences its partial_out /
+// partial_lse stores device-wide, atomically bumps a per-(gi,h) arrival
+// counter (host memsets it to 0 on the stream before the launch), and the
+// LAST arriving warp for that (gi,h) runs the exact log2-domain merge
+// inline (same weights/order as dsa_sparse_fwd_combine_kernel: w_s =
+// 2^(lse_s - m), fixed s = 0..split_kv-1 order) and writes out/lse
+// directly. One launch + one part_out round trip saved at the split counts
+// where the partial is now fast enough that launch overhead shows.
+// threadFenceReduction pattern (CUDA samples): writer side
+// __threadfence() before the device-scope atomicAdd; the last arriver's
+// reads are safe because every other writer has already fenced.
+template <int BQ, int G>
+__global__ void dsa_sparse_fwd_partial_vec_kernel(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ kv,
+    const int32_t* __restrict__ indices, float* __restrict__ part_out,
+    float* __restrict__ part_lse, uint16_t* __restrict__ fused_out,
+    float* __restrict__ fused_lse, int* __restrict__ counters,
+    int S_q, int S_kv, int H, int dim, int topk, float sm_scale,
+    int split_kv, int return_lse, int fuse) {
+  static_assert(G >= 1 && (G & (G - 1)) == 0, "G must be a power of two");
+  const int q_tile = blockIdx.x;
+  const int h = blockIdx.y;
+  const int s = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 6;
+  const int lane = tid & 63;
+  const int gi = q_tile * BQ + warp;
+  if (gi >= S_q) return;  // whole warp exits (no cross-warp state)
+
+  const int W = dim;                    // tail_dim == 0 in this kernel
+  const int d_v = dim;                  // tail_dim == 0: V = K region
+
+  // Admitted shapes: tail_dim == 0 and dim a multiple of 4 with
+  // dim <= 4*64, so lane `l` owns the CONTIGUOUS element group
+  // [4l, 4l+4) of every 256-wide row and either the whole group is in
+  // range or none of it is (no per-element masks on the hot path).
+  const bool active = 4 * lane < dim;
+
+  const int k0 = (int)(((long)topk * s) / split_kv);
+  const int k1 = (int)(((long)topk * (s + 1)) / split_kv);
+
+  extern __shared__ float sQ[];
+  for (int idx = tid; idx < BQ * W; idx += BQ * 64) {
+    const int r = idx / W, c = idx % W;
+    const int gr = q_tile * BQ + r;
+    sQ[idx] = (gr < S_q) ? bf16_to_f32(
+                  q[((size_t)gr * H + h) * W + c])
+                         : 0.0f;
+  }
+  __syncthreads();
+
+  const float* qrow = &sQ[warp * W];
+  const int32_t* idx_i = indices + (size_t)gi * topk;  // kv_group == 1
+
+  // The query group this lane dots against is fixed across keys: hoist it.
+  float qv[4];
+  for (int j = 0; j < 4; ++j)
+    qv[j] = active ? qrow[4 * lane + j] : 0.0f;
+
+  float o[4];
+  for (int j = 0; j < 4; ++j) o[j] = 0.0f;
+  float row_max = -INFINITY;
+  float row_sum = 0.0f;
+
+  for (int g0 = k0; g0 < k1; g0 += G) {
+    int32_t idxv[G];
+    uint2 kd[G];
+#pragma unroll
+    for (int j = 0; j < G; ++j) {
+      const int k = g0 + j;
+      // Uniform per warp; the tail group treats missing entries as masked
+      // keys (score -inf, zero weight) -- the serial kernel's semantics.
+      idxv[j] = (k < k1) ? idx_i[k] : -1;
+    }
+#pragma unroll
+    for (int j = 0; j < G; ++j) {
+      kd[j] = make_uint2(0u, 0u);
+      if (active && idxv[j] >= 0 && idxv[j] < S_kv)
+        kd[j] = *reinterpret_cast<const uint2*>(
+            kv + (size_t)idxv[j] * W + (size_t)4 * lane);  // 4 bf16 = 8 B
+    }
+#pragma unroll
+    for (int j = 0; j < G; ++j) {
+      if (g0 + j >= k1) break;  // tail group: nothing staged to consume
+      const int32_t idx = idxv[j];
+      const bool valid = (idx >= 0) && (idx < S_kv);
+
+      // --- lane-local partial score (4 contiguous products), warp-reduce
+      // --- (same xor tree as the serial kernel) ---
+      const float k_a = bf16_to_f32((uint16_t)kd[j].x);
+      const float k_b = bf16_to_f32((uint16_t)(kd[j].x >> 16));
+      const float k_c = bf16_to_f32((uint16_t)kd[j].y);
+      const float k_d = bf16_to_f32((uint16_t)(kd[j].y >> 16));
+      float partial = 0.0f;
+      if (valid && active) {
+        partial = qv[0] * k_a;
+        partial += qv[1] * k_b;
+        partial += qv[2] * k_c;
+        partial += qv[3] * k_d;
+      }
+      float score = partial;
+      for (int off = 32; off > 0; off >>= 1)
+        score += __shfl_xor(score, off);
+      score = valid ? (score * sm_scale) : -INFINITY;
+
+      // --- online softmax update (lock-step; identical to serial) ---
+      const float new_max = fmaxf(row_max, score);
+      const float exp_old =
+          (row_max == -INFINITY) ? 0.0f : exp2f(row_max - new_max);
+      const float exp_s =
+          (score == -INFINITY) ? 0.0f : exp2f(score - new_max);
+      row_sum = row_sum * exp_old + exp_s;
+      for (int t = 0; t < 4; ++t) o[t] *= exp_old;
+      if (valid && active) {  // V region == K region (tail_dim == 0)
+        o[0] += exp_s * k_a;
+        o[1] += exp_s * k_b;
+        o[2] += exp_s * k_c;
+        o[3] += exp_s * k_d;
+      }
+      row_max = new_max;
+    }
+  }
+
+  // --- write the NORMALIZED per-split output + per-split lse (same
+  // --- contract as the serial/db kernels) ---
+  const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
+  float* porow = part_out + (((size_t)gi * H + h) * split_kv + s) * d_v;
+  for (int j = 0; j < 4; ++j) {
+    const int d = 4 * lane + j;
+    if (d < d_v) porow[d] = o[j] * inv;
+  }
+  if (lane == 0)
+    part_lse[((size_t)gi * H + h) * split_kv + s] =
+        (row_sum > 0.0f) ? (row_max + log2f(row_sum)) : -INFINITY;
+
+  if (!fuse) return;
+
+  // --- FUSE: last warp for this (gi, h) merges the splits inline ---
+  __threadfence();  // partial stores visible device-wide before the count
+  int arrivals = 0;
+  if (lane == 0) arrivals = atomicAdd(&counters[(size_t)gi * H + h], 1);
+  // Broadcast lane 0's value with the xor tree (gfx942 HIP: no __shfl/
+  // __syncwarp; summing 63 zero contributions reproduces the broadcast).
+  for (int off = 32; off > 0; off >>= 1)
+    arrivals += __shfl_xor(arrivals, off);
+  if (arrivals != split_kv - 1) return;  // uniform per warp
+
+  __threadfence();  // every other writer fenced before us: reads are safe
+  const size_t base = ((size_t)gi * H + h) * split_kv;
+  float m = -INFINITY;
+  for (int sp = 0; sp < split_kv; ++sp) m = fmaxf(m, part_lse[base + sp]);
+  uint16_t* orow = fused_out + ((size_t)gi * H + h) * d_v;
+  if (m == -INFINITY) {
+    // Every selected key of every split is masked -> zero row, lse = -inf
+    // (same contract as dsa_sparse_fwd_combine_kernel).
+    for (int j = 0; j < 4; ++j) {
+      const int d = 4 * lane + j;
+      if (d < d_v) orow[d] = 0;
+    }
+    if (lane == 0 && return_lse) fused_lse[(size_t)gi * H + h] = -INFINITY;
+    return;
+  }
+  // Exact log2-domain merge, same weights and fixed s-order as the combine
+  // kernel; per element d the accumulation sequence over s is identical.
+  float fo[4];
+  for (int j = 0; j < 4; ++j) fo[j] = 0.0f;
+  float denom = 0.0f;
+  for (int sp = 0; sp < split_kv; ++sp) {
+    const float l = part_lse[base + sp];
+    const float w = (l == -INFINITY) ? 0.0f : exp2f(l - m);
+    denom += w;
+    const float* po = part_out + (base + sp) * d_v;
+    for (int j = 0; j < 4; ++j) {
+      const int d = 4 * lane + j;
+      if (d < d_v) fo[j] += w * po[d];
+    }
+  }
+  const float finv = 1.0f / denom;  // denom >= 1 (max-weight split)
+  for (int j = 0; j < 4; ++j) {
+    const int d = 4 * lane + j;
+    if (d < d_v) orow[d] = f2bf(fo[j] * finv);
+  }
+  if (lane == 0 && return_lse)
+    fused_lse[(size_t)gi * H + h] = m + log2f(denom);
+}
+
 __global__ void dsa_sparse_fwd_combine_kernel(
     const float* __restrict__ part_out, const float* __restrict__ part_lse,
     uint16_t* __restrict__ out, float* __restrict__ lse_out,
@@ -746,22 +959,147 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
   return true;
 }
 
-// Issue #80: dispatch the split partial through the double-buffered
-// kernel, falling back to the serial dsa_sparse_fwd_partial_kernel only
-// when the staging budget cannot even fit one key tile.
+// Issue #137: arrival counters for the vec kernel's FUSED combine (lever
+// (b)): one int per (gi, h), memset to 0 on the launch stream before every
+// fused launch (so no cross-launch state and no correctness dependence on
+// the allocator's contents). Grown on demand and never shrunk; retired
+// generations are intentionally NOT hipFree'd (a pending kernel could still
+// reference an old buffer; the leak is bounded by the number of grow steps
+// and is tiny: S_q*H*4 B each).
+namespace {
+int* vec_combine_counters(size_t n, hipStream_t stream) {
+  static int* buf = nullptr;
+  static size_t cap = 0;
+  if (n == 0) return nullptr;
+  if (buf == nullptr || n > cap) {
+    int* nb = nullptr;
+    if (hipMalloc(&nb, n * sizeof(int)) != hipSuccess) return nullptr;
+    if (hipMemsetAsync(nb, 0, n * sizeof(int), stream) != hipSuccess) {
+      hipFree(nb);
+      return nullptr;
+    }
+    buf = nb;
+    cap = n;
+  } else {
+    hipMemsetAsync(buf, 0, n * sizeof(int), stream);
+  }
+  return buf;
+}
+}  // namespace
+
+// Issue #137: vectorized + register-batched serial partial (lever (a)),
+// with the optional FUSED combine (lever (b)). Returns:
+//   0 -- not launched (shape not admitted / disabled): caller falls back,
+//   1 -- launched, combine still required (separate kernel or caller math),
+//   2 -- launched with the combine FUSED in: no combine launch needed.
+// Admission: tail_dim == 0 (K and V regions coincide, the uint2 load serves
+// both), dim % 4 == 0 and dim <= 256 (one contiguous 4-element group per
+// lane). Everything else (DSv3 widths, plain forward, db kernel) unchanged.
 template <int BQ>
-void launch_partial_auto(const void* q, const void* kv, const void* indices,
+int launch_partial_vec(const void* q, const void* kv, const void* indices,
+                       void* part_out, void* part_lse, void* out, void* lse,
+                       int S_q, int S_kv, int H, int dim, int tail_dim,
+                       int topk, float sm_scale, bool return_lse,
+                       int split_kv, hipStream_t stream) {
+  // Issue #137 A/B diagnostics (same pattern as VK_DSA_DB):
+  //   VK_DSA_VEC=0  never (legacy serial/db dispatch)
+  //   VK_DSA_VEC=1  auto: engage wherever the shape is admitted
+  //   VK_DSA_VEC=2  force (identical to auto since the gate was removed;
+  //                 kept for backward compat with the 641060/641089 runs)
+  // VK_DSA_FUSE=1 selects the fused combine (default OFF: the unfused
+  // separate-combine launch measured 20-25% FASTER at the optimum and 2x
+  // faster at high split -- the fence + atomic + last-warp merge tail
+  // costs more than a launch); VK_DSA_VECG overrides the register batch
+  // size G (1/2/4/8; default 1 = vectorization only, no batching -- the
+  // A/B that isolates the two effects; G>1 measured slower).
+  static const int vec_mode = [] {
+    const char* e = std::getenv("VK_DSA_VEC");
+    return e ? std::atoi(e) : 1;
+  }();
+  static const int fuse_mode = [] {
+    const char* e = std::getenv("VK_DSA_FUSE");
+    return e ? std::atoi(e) : 0;
+  }();
+  static const int g_ovr = [] {
+    const char* e = std::getenv("VK_DSA_VECG");
+    return e ? std::atoi(e) : 1;
+  }();
+  if (vec_mode == 0) return 0;
+  if (tail_dim != 0 || dim <= 0 || dim % 4 != 0 || dim > 4 * 64) return 0;
+  // No occupancy/TLP gate in auto mode: the UNFUSED vectorized kernel
+  // (G=1, separate combine launch) measured >= the serial AND db kernels
+  // at EVERY admitted (shape, split) point across the issue-#137 sweeps
+  // (jobs 641060 + 641089, MI300A): topk=2048 split=32 -> 99.0 us /
+  // 679 GB/s vs serial's best 168.4 (split=64) and db's 208+; topk=256
+  // split=8 -> 40.0 vs db 55.1; topk=128 split=8 -> 31.2 vs db 43.5;
+  // even at 1 key/split it ties serial (182.6 vs 183.1 at topk=128
+  // split=128). The FUSED variant (VK_DSA_FUSE=1) is the exception: its
+  // fence + atomic + last-warp merge tail costs 20-25% at the optimum
+  // (132.2 vs 107.4 us at topk=2048 split=16) and 2x at high split
+  // (243.3 vs 127.5 at split=64), so it ships OFF.
+  const int g = (g_ovr == 1 || g_ovr == 2 || g_ovr == 4 || g_ovr == 8)
+                    ? g_ovr
+                    : 1;
+
+  int fuse = fuse_mode ? 1 : 0;
+  int* counters = nullptr;
+  if (fuse) {
+    counters = vec_combine_counters((size_t)S_q * H, stream);
+    if (counters == nullptr) fuse = 0;  // alloc failure: plain partial path
+  }
+
+  dim3 block(BQ * 64);
+  dim3 grid((S_q + BQ - 1) / BQ, H, split_kv);
+  const size_t shmem = (size_t)BQ * dim * sizeof(float);
+#define VK_LAUNCH_VEC(GG)                                                      \
+  do {                                                                         \
+    dsa_sparse_fwd_partial_vec_kernel<BQ, GG><<<grid, block, shmem, stream>>>(  \
+        reinterpret_cast<const uint16_t*>(q),                                  \
+        reinterpret_cast<const uint16_t*>(kv),                                 \
+        reinterpret_cast<const int32_t*>(indices),                             \
+        reinterpret_cast<float*>(part_out),                                    \
+        reinterpret_cast<float*>(part_lse),                                    \
+        reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),       \
+        counters, S_q, S_kv, H, dim, topk, sm_scale, split_kv,                 \
+        return_lse ? 1 : 0, fuse);                                             \
+  } while (0)
+  switch (g) {
+    case 1: VK_LAUNCH_VEC(1); break;
+    case 2: VK_LAUNCH_VEC(2); break;
+    case 8: VK_LAUNCH_VEC(8); break;
+    default: VK_LAUNCH_VEC(4); break;
+  }
+#undef VK_LAUNCH_VEC
+  return fuse ? 2 : 1;
+}
+
+// Issue #80/#137: dispatch the split partial: the vectorized kernel first
+// wherever the shape is admitted (it measured >= db + serial at every
+// admitted point, jobs 641060 + 641089), then the double-buffered kernel
+// (its measured win region: DSv3 / tail_dim != 0 widths at low split),
+// then the serial dsa_sparse_fwd_partial_kernel as the fallback. Returns
+// true when a separate combine launch is still required.
+template <int BQ>
+bool launch_partial_auto(const void* q, const void* kv, const void* indices,
                          void* part_out, void* part_lse, int S_q, int S_kv,
                          int H, int dim, int tail_dim, int topk, int kv_group,
-                         float sm_scale, int split_kv,
+                         float sm_scale, int split_kv, bool return_lse,
+                         void* out, void* lse,
                          hipStream_t stream = nullptr) {
+  const int vec = launch_partial_vec<BQ>(q, kv, indices, part_out, part_lse,
+                                         out, lse, S_q, S_kv, H, dim,
+                                         tail_dim, topk, sm_scale,
+                                         return_lse, split_kv, stream);
+  if (vec == 2) return false;  // fused: no combine launch
+  if (vec == 1) return true;   // partial only: combine still needed
   int kti = 0;
   if (launch_partial_db<BQ>(q, kv, indices, part_out, part_lse, S_q, S_kv, H,
                             dim, tail_dim, topk, kv_group, sm_scale,
                             split_kv, kti, stream))
-    return;
+    return true;
   launch_partial<BQ>(q, kv, indices, part_out, part_lse, S_q, S_kv, H, dim,
                      tail_dim, topk, kv_group, sm_scale, split_kv, stream);
+  return true;
 }
 }  // namespace
 
@@ -814,27 +1152,35 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
   ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
   (void)th;
   // The partial kernel now double-buffers its key tiles in LDS (issue
-  // #80); block_I/inner_iter remain cached-pipeline params, and the
-  // serial kernel stays as the fallback the launch path picks when a
-  // shape cannot stage even one key tile.
+  // #80) or runs the vectorized register-batched serial variant with the
+  // optional fused combine (issue #137); block_I/inner_iter remain
+  // cached-pipeline params. launch_partial_auto reports whether the
+  // separate combine launch is still required (the fused vec path already
+  // wrote out/lse).
   (void)block_I;
   (void)inner_iter;
+  bool need_combine = true;
   if (bq <= 1)
-    launch_partial_auto<1>(q, kv, indices, partial_out, partial_lse, S_q,
-                           S_kv, H, dim, tail_dim, topk, kv_group, sm_scale,
-                           split_kv, static_cast<hipStream_t>(stream));
+    need_combine = launch_partial_auto<1>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
   else if (bq <= 2)
-    launch_partial_auto<2>(q, kv, indices, partial_out, partial_lse, S_q,
-                           S_kv, H, dim, tail_dim, topk, kv_group, sm_scale,
-                           split_kv, static_cast<hipStream_t>(stream));
+    need_combine = launch_partial_auto<2>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
   else if (bq <= 4)
-    launch_partial_auto<4>(q, kv, indices, partial_out, partial_lse, S_q,
-                           S_kv, H, dim, tail_dim, topk, kv_group, sm_scale,
-                           split_kv, static_cast<hipStream_t>(stream));
+    need_combine = launch_partial_auto<4>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
   else
-    launch_partial_auto<8>(q, kv, indices, partial_out, partial_lse, S_q,
-                           S_kv, H, dim, tail_dim, topk, kv_group, sm_scale,
-                           split_kv, static_cast<hipStream_t>(stream));
+    need_combine = launch_partial_auto<8>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
+  if (!need_combine) return;
   dim3 cgrid(S_q, H);
   dsa_sparse_fwd_combine_kernel<<<cgrid, 64, 0, static_cast<hipStream_t>(stream)>>>(
       reinterpret_cast<const float*>(partial_out),
