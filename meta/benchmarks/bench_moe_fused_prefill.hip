@@ -182,8 +182,19 @@ int main(int argc, char** argv) {
 
   std::printf("E=%d hidden=%d ispp=%d top_k=%d activation=%s\n", E, hidden, ispp,
               top_k, situ ? "situ" : "swiglu");
-  std::printf("%6s %8s | %10s %10s | %10s %10s | %6s\n",
-              "M", "EM64", "dec-us", "dec-TF", "pf-us", "pf-TF", "speedup");
+  // Issue #150: VK_MOE_PF_VARIANT=6 adds the 128-row M-tile prefill config
+  // (block_size=128 alignment) as a third column next to the decode and
+  // 64-row prefill measurements.
+  const int pf_variant =
+      (std::getenv("VK_MOE_PF_VARIANT") != nullptr)
+          ? std::atoi(std::getenv("VK_MOE_PF_VARIANT")) : 5;
+  const bool bench_bm128 = (pf_variant == 6);
+  if (bench_bm128)
+    std::printf("VK_MOE_PF_VARIANT=6: measuring the 128-row M-tile config\n");
+  std::printf("%6s %8s | %10s %10s | %10s %10s", "M", "EM64",
+              "dec-us", "dec-TF", "pf-us", "pf-TF");
+  if (bench_bm128) std::printf(" | %10s %10s", "pf128-us", "pf128-TF");
+  std::printf(" | %6s\n", "speedup");
 
   for (int M : Ms) {
     int N = M * top_k;
@@ -266,13 +277,16 @@ int main(int argc, char** argv) {
       hipFree(dTw); hipFree(dTids); hipFree(dSids); hipFree(dEids);
     };
 
-    int EM_dec, EM_pf;
-    double us_dec, tf_dec, us_pf, tf_pf;
+    int EM_dec, EM_pf, EM128 = 0;
+    double us_dec, tf_dec, us_pf, tf_pf, us128 = 0, tf128 = 0;
     measure(16, EM_dec, us_dec, tf_dec);
     measure(64, EM_pf, us_pf, tf_pf);
+    if (bench_bm128) measure(128, EM128, us128, tf128);
 
-    std::printf("%6d %8d | %10.1f %10.3f | %10.1f %10.3f | %6.2fx\n",
-                M, EM_pf, us_dec, tf_dec, us_pf, tf_pf, us_dec / us_pf);
+    std::printf("%6d %8d | %10.1f %10.3f | %10.1f %10.3f",
+                M, EM_pf, us_dec, tf_dec, us_pf, tf_pf);
+    if (bench_bm128) std::printf(" | %10.1f %10.3f", us128, tf128);
+    std::printf(" | %6.2fx\n", us_dec / us_pf);
   }
 
   hipEventDestroy(start); hipEventDestroy(stop);
