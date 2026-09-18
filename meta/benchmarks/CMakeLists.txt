@@ -405,6 +405,13 @@ if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
   target_include_directories(dsa_kpool_bench PRIVATE
     ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
   vkernels_set_warnings(dsa_kpool_bench)
+
+  # The device-vs-oracle harness is registered with CTest on the CUDA build
+  # (issue #60: until now the kpool .hip sources were COMPILED by the CUDA CI
+  # but never RUN there). The binary exits 77 when no GPU is visible, so the
+  # test skips (SKIP_RETURN_CODE) on GPU-less CUDA boxes instead of failing.
+  add_test(NAME dsa_kpool_device_cuda COMMAND test_dsa_kpool_correct)
+  set_tests_properties(dsa_kpool_device_cuda PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # bf16 GEMM correctness + benchmark on NVIDIA (issue #29 CUDA port): the
