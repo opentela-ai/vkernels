@@ -733,7 +733,11 @@ def test_device_t_kda_heads_batched_matches_numpy_mirror():
     dt = torch.from_numpy(P["dt_bias"].astype(np.float32)).to(dev)
     alog = torch.from_numpy(P["A_log"].astype(np.float32)).to(dev)
     out = torch.empty(B, H, D, device=dev, dtype=torch.float32)
-    _t_kda_heads_batched[(4,)](
+    # worker=0, P=1: a single program covers every (batch, head) task via
+    # the task-striding loop; the compiled path passes worker=pid, P=grid
+    # (same direct-launch contract as the #88 rope fix).
+    _t_kda_heads_batched[(1,)](
+        0, 1,
         tensors["q"], tensors["k"], tensors["v"], tensors["f"], tensors["b"],
         dt, alog, state_t, out, B, H, D, D, scale=D ** -0.5, lower_bound=LB, num_warps=4,
     )
