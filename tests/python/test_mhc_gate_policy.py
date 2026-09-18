@@ -66,8 +66,12 @@ F64 = np.float64
 EPS32 = float(np.finfo(np.float32).eps)  # 1.19e-07
 
 # The pinned normalized-gate constant (docs/performance/mhc/gfx942.md).
-# The MI300A-measured envelope pins the device-side K; this policy test
-# asserts the (much tighter) simulated envelope with wide margin.
+# MI300A-measured (job 641091): worst clean normalized error 0.9 over 5
+# seeds x NSLICE 1..256 x 3 GLM shapes; corrupted control 3.2e5-4.1e5.
+# K=256 = ~280x above the clean envelope, still below the ~515-unit
+# single-dropped-term signature. This file's numpy two-rounding emulation
+# has a much smaller envelope, so the assertions below hold with wide
+# margin.
 GATE_K = 256.0
 
 # GLM-5.3-Flash decode/multi-token shapes (hc_mult=4, hidden=4096).

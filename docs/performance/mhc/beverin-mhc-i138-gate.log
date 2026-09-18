@@ -1,0 +1,511 @@
+=== node: nid003026  date: 2026-09-18T09:57:05Z ===
+GPU[0]		: Card Series: 		Aqua Vanjaram [Instinct MI300A]
+GPU[0]		: Card Model: 		0x74a0
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+=== lock perf level high ===
+(setperflevel not permitted; continuing)
+GPU[0]		: mclk clock level: 3: (1300Mhz)
+GPU[0]		: sclk clock level: S: (96Mhz)
+GPU[1]		: mclk clock level: 3: (1300Mhz)
+GPU[1]		: sclk clock level: S: (96Mhz)
+=== configure (HIP, gfx942, Release, tests + benchmarks ON) ===
+-- =================================
+-- Configuring done (0.7s)
+-- Generating done (4.7s)
+-- Build files have been written to: /capstor/scratch/cscs/xyao/vkernels-i138-agent/build-i138
+=== build (vkernels + hip C ABI + mhc correctness test + mhc bench) ===
+/capstor/scratch/cscs/xyao/vkernels-i138-agent/meta/benchmarks/test_mhc_correct.hip:592:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i138-agent/meta/benchmarks/test_mhc_correct.hip:592:16: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i138-agent/meta/benchmarks/test_mhc_correct.hip:592:30: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i138-agent/meta/benchmarks/test_mhc_correct.hip:592:45: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i138-agent/meta/benchmarks/test_mhc_correct.hip:593:3: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i138-agent/meta/benchmarks/test_mhc_correct.hip:593:16: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i138-agent/meta/benchmarks/test_mhc_correct.hip:593:29: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i138-agent/meta/benchmarks/test_mhc_correct.hip:593:42: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+/capstor/scratch/cscs/xyao/vkernels-i138-agent/meta/benchmarks/test_mhc_correct.hip:593:55: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+[100%] Built target test_mhc_correct
+[ 95%] Built target vkernels
+[100%] Built target mhc_bench
+
+############ 1a. MHC CORRECTNESS — issue #138 fp64 gate (default) ######
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+
+gate policy: fp64-reference normalized K*eps*sum|terms| (issue #138) (K=256 default)
+
+mhc_pre_gemm_sqrsum (vs CPU reference; oracle = fp32 chain, f64 = issue #138 reference):
+  [seed 1] strict split n=1  hc_mult=2 hidden=2     oracle rel=7.20e-08 (out 7.20e-08 / sq 0.00e+00)  f64 out=5.73e-08 sq=0.00e+00  norm out=0.5 sq=0.0  GATE PASS  [legacy 1e-4: PASS]
+  [seed 1] blocked ladder n=1  hc_mult=2 hidden=2   :  (gate = fp64)
+    ns=256 oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=128 oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=64  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=32  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=16  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=8   oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=4   oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=2   oracle rel=1.439e-07 (out 1.44e-07 / sq 0.00e+00, P1e-4)  f64 out=5.774e-08 sq=0.000e+00  norm out=0.5 sq=0.0  GATE PASS
+    ns=1   oracle rel=7.197e-08 (out 7.20e-08 / sq 0.00e+00, P1e-4)  f64 out=5.728e-08 sq=0.000e+00  norm out=0.5 sq=0.0  GATE PASS
+  [seed 1] strict split n=7  hc_mult=3 hidden=3     oracle rel=3.59e-07 (out 3.59e-07 / sq 0.00e+00)  f64 out=1.96e-07 sq=3.59e-08  norm out=0.8 sq=0.3  GATE PASS  [legacy 1e-4: PASS]
+  [seed 1] blocked ladder n=7  hc_mult=3 hidden=3   :  (gate = fp64)
+    ns=256 oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=3.097e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=128 oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=3.097e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=64  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=3.097e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=32  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=3.097e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=16  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=3.097e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=8   oracle rel=4.768e-07 (out 4.77e-07 / sq 0.00e+00, P1e-4)  f64 out=5.018e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=4   oracle rel=3.005e-07 (out 3.00e-07 / sq 0.00e+00, P1e-4)  f64 out=1.825e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=2   oracle rel=2.902e-07 (out 2.90e-07 / sq 0.00e+00, P1e-4)  f64 out=2.194e-07 sq=3.588e-08  norm out=0.5 sq=0.3  GATE PASS
+    ns=1   oracle rel=3.593e-07 (out 3.59e-07 / sq 0.00e+00, P1e-4)  f64 out=1.957e-07 sq=3.588e-08  norm out=0.8 sq=0.3  GATE PASS
+  [seed 1] strict split n=1  hc_mult=4 hidden=4096  oracle rel=9.74e-06 (out 9.74e-06 / sq 8.41e-06)  f64 out=2.58e-05 sq=4.87e-08  norm out=0.6 sq=0.4  GATE PASS  [legacy 1e-4: PASS]
+  [seed 1] blocked ladder n=1  hc_mult=4 hidden=4096:  (gate = fp64)
+    ns=256 oracle rel=2.833e-05 (out 2.83e-05 / sq 8.41e-06, P1e-4)  f64 out=1.223e-05 sq=4.875e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=128 oracle rel=4.427e-05 (out 4.43e-05 / sq 8.41e-06, P1e-4)  f64 out=2.817e-05 sq=4.875e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=64  oracle rel=2.349e-05 (out 2.35e-05 / sq 8.41e-06, P1e-4)  f64 out=7.387e-06 sq=4.875e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=32  oracle rel=1.059e-05 (out 1.06e-05 / sq 8.41e-06, P1e-4)  f64 out=1.404e-05 sq=4.875e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=16  oracle rel=4.492e-05 (out 4.49e-05 / sq 8.41e-06, P1e-4)  f64 out=2.881e-05 sq=4.875e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=8   oracle rel=1.394e-05 (out 1.39e-05 / sq 8.41e-06, P1e-4)  f64 out=7.301e-06 sq=4.875e-08  norm out=0.2 sq=0.4  GATE PASS
+    ns=4   oracle rel=2.840e-05 (out 2.84e-05 / sq 8.41e-06, P1e-4)  f64 out=4.450e-05 sq=4.875e-08  norm out=0.3 sq=0.4  GATE PASS
+    ns=2   oracle rel=1.110e-05 (out 1.11e-05 / sq 8.41e-06, P1e-4)  f64 out=2.720e-05 sq=4.875e-08  norm out=0.3 sq=0.4  GATE PASS
+    ns=1   oracle rel=9.745e-06 (out 9.74e-06 / sq 8.41e-06, P1e-4)  f64 out=2.585e-05 sq=4.875e-08  norm out=0.6 sq=0.4  GATE PASS
+  [seed 1] NEGATIVE CONTROL (fn row +1) n=1 hc_mult=4 hidden=4096:  oracle rel=1.854e+01  f64 out=1.854e+01  norm out=319765.9  GATE FAIL (expected: gate catches the corruption)
+  [seed 2] strict split n=1  hc_mult=4 hidden=4096  oracle rel=1.28e-05 (out 1.28e-05 / sq 5.97e-06)  f64 out=1.63e-04 sq=6.95e-08  norm out=0.7 sq=0.6  GATE PASS  [legacy 1e-4: PASS]
+  [seed 2] blocked ladder n=1  hc_mult=4 hidden=4096:  (gate = fp64)
+    ns=256 oracle rel=1.743e-04 (out 1.74e-04 / sq 5.97e-06, F1e-4)  f64 out=1.415e-06 sq=6.951e-08  norm out=0.1 sq=0.6  GATE PASS
+    ns=128 oracle rel=1.440e-04 (out 1.44e-04 / sq 5.97e-06, F1e-4)  f64 out=3.171e-05 sq=6.951e-08  norm out=0.1 sq=0.6  GATE PASS
+    ns=64  oracle rel=1.695e-04 (out 1.70e-04 / sq 5.97e-06, F1e-4)  f64 out=6.199e-06 sq=6.951e-08  norm out=0.1 sq=0.6  GATE PASS
+    ns=32  oracle rel=1.714e-04 (out 1.71e-04 / sq 5.97e-06, F1e-4)  f64 out=4.376e-06 sq=6.951e-08  norm out=0.1 sq=0.6  GATE PASS
+    ns=16  oracle rel=1.586e-04 (out 1.59e-04 / sq 5.97e-06, F1e-4)  f64 out=1.713e-05 sq=6.951e-08  norm out=0.2 sq=0.6  GATE PASS
+    ns=8   oracle rel=3.268e-05 (out 3.27e-05 / sq 5.97e-06, P1e-4)  f64 out=2.085e-04 sq=6.951e-08  norm out=0.3 sq=0.6  GATE PASS
+    ns=4   oracle rel=2.198e-05 (out 2.20e-05 / sq 5.97e-06, P1e-4)  f64 out=1.538e-04 sq=6.951e-08  norm out=0.2 sq=0.6  GATE PASS
+    ns=2   oracle rel=7.481e-05 (out 7.48e-05 / sq 5.97e-06, P1e-4)  f64 out=1.010e-04 sq=6.951e-08  norm out=0.2 sq=0.6  GATE PASS
+    ns=1   oracle rel=1.275e-05 (out 1.28e-05 / sq 5.97e-06, P1e-4)  f64 out=1.630e-04 sq=6.951e-08  norm out=0.7 sq=0.6  GATE PASS
+  [seed 2] NEGATIVE CONTROL (fn row +1) n=1 hc_mult=4 hidden=4096:  oracle rel=7.891e+01  f64 out=7.892e+01  norm out=323483.4  GATE FAIL (expected: gate catches the corruption)
+  [seed 3] strict split n=1  hc_mult=4 hidden=4096  oracle rel=8.62e-06 (out 7.99e-06 / sq 8.62e-06)  f64 out=2.89e-05 sq=2.09e-09  norm out=0.8 sq=0.0  GATE PASS  [legacy 1e-4: PASS]
+  [seed 3] blocked ladder n=1  hc_mult=4 hidden=4096:  (gate = fp64)
+    ns=256 oracle rel=3.489e-05 (out 3.49e-05 / sq 8.62e-06, P1e-4)  f64 out=3.360e-06 sq=2.092e-09  norm out=0.1 sq=0.0  GATE PASS
+    ns=128 oracle rel=3.795e-05 (out 3.80e-05 / sq 8.62e-06, P1e-4)  f64 out=6.422e-06 sq=2.092e-09  norm out=0.0 sq=0.0  GATE PASS
+    ns=64  oracle rel=3.352e-05 (out 3.35e-05 / sq 8.62e-06, P1e-4)  f64 out=4.342e-06 sq=2.092e-09  norm out=0.1 sq=0.0  GATE PASS
+    ns=32  oracle rel=3.102e-05 (out 3.10e-05 / sq 8.62e-06, P1e-4)  f64 out=8.054e-06 sq=2.092e-09  norm out=0.1 sq=0.0  GATE PASS
+    ns=16  oracle rel=3.077e-05 (out 3.08e-05 / sq 8.62e-06, P1e-4)  f64 out=1.770e-05 sq=2.092e-09  norm out=0.1 sq=0.0  GATE PASS
+    ns=8   oracle rel=4.737e-05 (out 4.74e-05 / sq 8.62e-06, P1e-4)  f64 out=1.614e-05 sq=2.092e-09  norm out=0.1 sq=0.0  GATE PASS
+    ns=4   oracle rel=4.631e-05 (out 4.63e-05 / sq 8.62e-06, P1e-4)  f64 out=1.502e-05 sq=2.092e-09  norm out=0.3 sq=0.0  GATE PASS
+    ns=2   oracle rel=3.901e-05 (out 3.90e-05 / sq 8.62e-06, P1e-4)  f64 out=2.353e-05 sq=2.092e-09  norm out=0.5 sq=0.0  GATE PASS
+    ns=1   oracle rel=8.619e-06 (out 7.99e-06 / sq 8.62e-06, P1e-4)  f64 out=2.893e-05 sq=2.092e-09  norm out=0.8 sq=0.0  GATE PASS
+  [seed 3] NEGATIVE CONTROL (fn row +1) n=1 hc_mult=4 hidden=4096:  oracle rel=1.530e+01  f64 out=1.530e+01  norm out=325287.1  GATE FAIL (expected: gate catches the corruption)
+  [seed 4] strict split n=1  hc_mult=4 hidden=4096  oracle rel=7.25e-06 (out 2.95e-06 / sq 7.25e-06)  f64 out=3.61e-05 sq=2.51e-08  norm out=0.6 sq=0.2  GATE PASS  [legacy 1e-4: PASS]
+  [seed 4] blocked ladder n=1  hc_mult=4 hidden=4096:  (gate = fp64)
+    ns=256 oracle rel=3.655e-05 (out 3.65e-05 / sq 7.25e-06, P1e-4)  f64 out=2.508e-06 sq=2.512e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=128 oracle rel=3.594e-05 (out 3.59e-05 / sq 7.25e-06, P1e-4)  f64 out=1.903e-06 sq=2.512e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=64  oracle rel=3.862e-05 (out 3.86e-05 / sq 7.25e-06, P1e-4)  f64 out=4.581e-06 sq=2.512e-08  norm out=0.0 sq=0.2  GATE PASS
+    ns=32  oracle rel=2.549e-05 (out 2.55e-05 / sq 7.25e-06, P1e-4)  f64 out=8.551e-06 sq=2.512e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=16  oracle rel=5.072e-05 (out 5.07e-05 / sq 7.25e-06, P1e-4)  f64 out=1.668e-05 sq=2.512e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=8   oracle rel=4.363e-05 (out 4.36e-05 / sq 7.25e-06, P1e-4)  f64 out=9.592e-06 sq=2.512e-08  norm out=0.2 sq=0.2  GATE PASS
+    ns=4   oracle rel=5.374e-05 (out 5.37e-05 / sq 7.25e-06, P1e-4)  f64 out=1.970e-05 sq=2.512e-08  norm out=0.2 sq=0.2  GATE PASS
+    ns=2   oracle rel=6.523e-05 (out 6.52e-05 / sq 7.25e-06, P1e-4)  f64 out=3.119e-05 sq=2.512e-08  norm out=0.5 sq=0.2  GATE PASS
+    ns=1   oracle rel=7.249e-06 (out 2.95e-06 / sq 7.25e-06, P1e-4)  f64 out=3.611e-05 sq=2.512e-08  norm out=0.6 sq=0.2  GATE PASS
+  [seed 4] NEGATIVE CONTROL (fn row +1) n=1 hc_mult=4 hidden=4096:  oracle rel=5.662e+00  f64 out=5.662e+00  norm out=322991.7  GATE FAIL (expected: gate catches the corruption)
+  [seed 5] strict split n=1  hc_mult=4 hidden=4096  oracle rel=1.44e-05 (out 1.97e-06 / sq 1.44e-05)  f64 out=1.55e-05 sq=6.78e-08  norm out=0.5 sq=0.6  GATE PASS  [legacy 1e-4: PASS]
+  [seed 5] blocked ladder n=1  hc_mult=4 hidden=4096:  (gate = fp64)
+    ns=256 oracle rel=1.566e-05 (out 1.57e-05 / sq 1.44e-05, P1e-4)  f64 out=2.095e-06 sq=6.781e-08  norm out=0.1 sq=0.6  GATE PASS
+    ns=128 oracle rel=1.473e-05 (out 1.47e-05 / sq 1.44e-05, P1e-4)  f64 out=1.253e-06 sq=6.781e-08  norm out=0.0 sq=0.6  GATE PASS
+    ns=64  oracle rel=1.442e-05 (out 1.29e-05 / sq 1.44e-05, P1e-4)  f64 out=1.264e-06 sq=6.781e-08  norm out=0.1 sq=0.6  GATE PASS
+    ns=32  oracle rel=1.628e-05 (out 1.63e-05 / sq 1.44e-05, P1e-4)  f64 out=2.717e-06 sq=6.781e-08  norm out=0.1 sq=0.6  GATE PASS
+    ns=16  oracle rel=1.442e-05 (out 1.16e-05 / sq 1.44e-05, P1e-4)  f64 out=4.434e-06 sq=6.781e-08  norm out=0.2 sq=0.6  GATE PASS
+    ns=8   oracle rel=1.442e-05 (out 9.96e-06 / sq 1.44e-05, P1e-4)  f64 out=3.609e-06 sq=6.781e-08  norm out=0.2 sq=0.6  GATE PASS
+    ns=4   oracle rel=2.012e-05 (out 2.01e-05 / sq 1.44e-05, P1e-4)  f64 out=6.555e-06 sq=6.781e-08  norm out=0.2 sq=0.6  GATE PASS
+    ns=2   oracle rel=1.794e-05 (out 1.79e-05 / sq 1.44e-05, P1e-4)  f64 out=4.486e-06 sq=6.781e-08  norm out=0.4 sq=0.6  GATE PASS
+    ns=1   oracle rel=1.442e-05 (out 1.97e-06 / sq 1.44e-05, P1e-4)  f64 out=1.554e-05 sq=6.781e-08  norm out=0.5 sq=0.6  GATE PASS
+  [seed 5] NEGATIVE CONTROL (fn row +1) n=1 hc_mult=4 hidden=4096:  oracle rel=5.138e+00  f64 out=5.138e+00  norm out=410545.3  GATE FAIL (expected: gate catches the corruption)
+  [seed 1] strict split n=7  hc_mult=4 hidden=4096  oracle rel=1.93e-05 (out 1.93e-05 / sq 1.19e-05)  f64 out=1.01e-04 sq=5.22e-08  norm out=0.6 sq=0.4  GATE PASS  [legacy 1e-4: PASS]
+  [seed 1] blocked ladder n=7  hc_mult=4 hidden=4096:  (gate = fp64)
+    ns=256 oracle rel=1.078e-04 (out 1.08e-04 / sq 1.19e-05, F1e-4)  f64 out=1.460e-05 sq=5.217e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=128 oracle rel=1.111e-04 (out 1.11e-04 / sq 1.19e-05, F1e-4)  f64 out=2.817e-05 sq=5.217e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=64  oracle rel=1.132e-04 (out 1.13e-04 / sq 1.19e-05, F1e-4)  f64 out=9.499e-06 sq=5.217e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=32  oracle rel=1.181e-04 (out 1.18e-04 / sq 1.19e-05, F1e-4)  f64 out=1.882e-05 sq=5.217e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=16  oracle rel=1.063e-04 (out 1.06e-04 / sq 1.19e-05, F1e-4)  f64 out=4.161e-05 sq=5.217e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=8   oracle rel=7.126e-05 (out 7.13e-05 / sq 1.19e-05, P1e-4)  f64 out=5.866e-05 sq=5.217e-08  norm out=0.3 sq=0.4  GATE PASS
+    ns=4   oracle rel=7.508e-05 (out 7.51e-05 / sq 1.19e-05, P1e-4)  f64 out=5.673e-05 sq=5.217e-08  norm out=0.3 sq=0.4  GATE PASS
+    ns=2   oracle rel=1.239e-04 (out 1.24e-04 / sq 1.19e-05, F1e-4)  f64 out=2.368e-04 sq=5.217e-08  norm out=0.7 sq=0.4  GATE PASS
+    ns=1   oracle rel=1.926e-05 (out 1.93e-05 / sq 1.19e-05, P1e-4)  f64 out=1.011e-04 sq=5.217e-08  norm out=0.6 sq=0.4  GATE PASS
+  [seed 2] strict split n=7  hc_mult=4 hidden=4096  oracle rel=1.02e-04 (out 1.02e-04 / sq 1.01e-05)  f64 out=4.00e-04 sq=8.24e-08  norm out=0.7 sq=0.7  GATE PASS  [legacy 1e-4: FAIL]
+  [seed 2] blocked ladder n=7  hc_mult=4 hidden=4096:  (gate = fp64)
+    ns=256 oracle rel=4.958e-04 (out 4.96e-04 / sq 1.01e-05, F1e-4)  f64 out=3.307e-05 sq=8.238e-08  norm out=0.1 sq=0.7  GATE PASS
+    ns=128 oracle rel=5.306e-04 (out 5.31e-04 / sq 1.01e-05, F1e-4)  f64 out=3.643e-05 sq=8.238e-08  norm out=0.1 sq=0.7  GATE PASS
+    ns=64  oracle rel=5.368e-04 (out 5.37e-04 / sq 1.01e-05, F1e-4)  f64 out=3.982e-05 sq=8.238e-08  norm out=0.1 sq=0.7  GATE PASS
+    ns=32  oracle rel=5.151e-04 (out 5.15e-04 / sq 1.01e-05, F1e-4)  f64 out=1.337e-04 sq=8.238e-08  norm out=0.1 sq=0.7  GATE PASS
+    ns=16  oracle rel=5.955e-04 (out 5.95e-04 / sq 1.01e-05, F1e-4)  f64 out=1.184e-04 sq=8.238e-08  norm out=0.2 sq=0.7  GATE PASS
+    ns=8   oracle rel=5.399e-04 (out 5.40e-04 / sq 1.01e-05, F1e-4)  f64 out=2.085e-04 sq=8.238e-08  norm out=0.3 sq=0.7  GATE PASS
+    ns=4   oracle rel=3.946e-04 (out 3.95e-04 / sq 1.01e-05, F1e-4)  f64 out=1.538e-04 sq=8.238e-08  norm out=0.3 sq=0.7  GATE PASS
+    ns=2   oracle rel=3.761e-04 (out 3.76e-04 / sq 1.01e-05, F1e-4)  f64 out=1.253e-04 sq=8.238e-08  norm out=0.4 sq=0.7  GATE PASS
+    ns=1   oracle rel=1.020e-04 (out 1.02e-04 / sq 1.01e-05, F1e-4)  f64 out=3.995e-04 sq=8.238e-08  norm out=0.7 sq=0.7  GATE PASS
+  [seed 3] strict split n=7  hc_mult=4 hidden=4096  oracle rel=1.98e-05 (out 1.98e-05 / sq 1.08e-05)  f64 out=2.89e-05 sq=5.47e-08  norm out=0.8 sq=0.5  GATE PASS  [legacy 1e-4: PASS]
+  [seed 3] blocked ladder n=7  hc_mult=4 hidden=4096:  (gate = fp64)
+    ns=256 oracle rel=4.952e-05 (out 4.95e-05 / sq 1.08e-05, P1e-4)  f64 out=5.679e-05 sq=5.470e-08  norm out=0.1 sq=0.5  GATE PASS
+    ns=128 oracle rel=5.507e-05 (out 5.51e-05 / sq 1.08e-05, P1e-4)  f64 out=2.618e-05 sq=5.470e-08  norm out=0.1 sq=0.5  GATE PASS
+    ns=64  oracle rel=3.767e-05 (out 3.77e-05 / sq 1.08e-05, P1e-4)  f64 out=6.689e-05 sq=5.470e-08  norm out=0.1 sq=0.5  GATE PASS
+    ns=32  oracle rel=7.432e-05 (out 7.43e-05 / sq 1.08e-05, P1e-4)  f64 out=1.108e-04 sq=5.470e-08  norm out=0.1 sq=0.5  GATE PASS
+    ns=16  oracle rel=3.267e-05 (out 3.27e-05 / sq 1.08e-05, P1e-4)  f64 out=1.950e-05 sq=5.470e-08  norm out=0.1 sq=0.5  GATE PASS
+    ns=8   oracle rel=9.600e-05 (out 9.60e-05 / sq 1.08e-05, P1e-4)  f64 out=5.951e-05 sq=5.470e-08  norm out=0.2 sq=0.5  GATE PASS
+    ns=4   oracle rel=2.645e-04 (out 2.64e-04 / sq 1.08e-05, F1e-4)  f64 out=3.010e-04 sq=5.470e-08  norm out=0.5 sq=0.5  GATE PASS
+    ns=2   oracle rel=2.826e-04 (out 2.83e-04 / sq 1.08e-05, F1e-4)  f64 out=3.191e-04 sq=5.470e-08  norm out=0.5 sq=0.5  GATE PASS
+    ns=1   oracle rel=1.984e-05 (out 1.98e-05 / sq 1.08e-05, P1e-4)  f64 out=2.893e-05 sq=5.470e-08  norm out=0.8 sq=0.5  GATE PASS
+  [seed 4] strict split n=7  hc_mult=4 hidden=4096  oracle rel=5.47e-05 (out 5.47e-05 / sq 9.24e-06)  f64 out=8.18e-05 sq=1.25e-07  norm out=0.8 sq=1.0  GATE PASS  [legacy 1e-4: PASS]
+  [seed 4] blocked ladder n=7  hc_mult=4 hidden=4096:  (gate = fp64)
+    ns=256 oracle rel=1.467e-04 (out 1.47e-04 / sq 9.24e-06, F1e-4)  f64 out=1.030e-05 sq=1.246e-07  norm out=0.2 sq=1.0  GATE PASS
+    ns=128 oracle rel=1.594e-04 (out 1.59e-04 / sq 9.24e-06, F1e-4)  f64 out=2.304e-05 sq=1.246e-07  norm out=0.1 sq=1.0  GATE PASS
+    ns=64  oracle rel=9.459e-05 (out 9.46e-05 / sq 9.24e-06, P1e-4)  f64 out=4.182e-05 sq=1.246e-07  norm out=0.1 sq=1.0  GATE PASS
+    ns=32  oracle rel=1.784e-04 (out 1.78e-04 / sq 9.24e-06, F1e-4)  f64 out=4.202e-05 sq=1.246e-07  norm out=0.1 sq=1.0  GATE PASS
+    ns=16  oracle rel=6.643e-05 (out 6.64e-05 / sq 9.24e-06, P1e-4)  f64 out=8.487e-05 sq=1.246e-07  norm out=0.1 sq=1.0  GATE PASS
+    ns=8   oracle rel=1.600e-04 (out 1.60e-04 / sq 9.24e-06, F1e-4)  f64 out=5.248e-05 sq=1.246e-07  norm out=0.2 sq=1.0  GATE PASS
+    ns=4   oracle rel=1.240e-04 (out 1.24e-04 / sq 9.24e-06, F1e-4)  f64 out=1.325e-04 sq=1.246e-07  norm out=0.3 sq=1.0  GATE PASS
+    ns=2   oracle rel=1.513e-04 (out 1.51e-04 / sq 9.24e-06, F1e-4)  f64 out=1.435e-04 sq=1.246e-07  norm out=0.5 sq=1.0  GATE PASS
+    ns=1   oracle rel=5.466e-05 (out 5.47e-05 / sq 9.24e-06, P1e-4)  f64 out=8.176e-05 sq=1.246e-07  norm out=0.8 sq=1.0  GATE PASS
+  [seed 5] strict split n=7  hc_mult=4 hidden=4096  oracle rel=1.47e-05 (out 1.47e-05 / sq 1.44e-05)  f64 out=6.96e-05 sq=9.23e-08  norm out=0.6 sq=0.8  GATE PASS  [legacy 1e-4: PASS]
+  [seed 5] blocked ladder n=7  hc_mult=4 hidden=4096:  (gate = fp64)
+    ns=256 oracle rel=4.504e-05 (out 4.50e-05 / sq 1.44e-05, P1e-4)  f64 out=2.331e-05 sq=9.228e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=128 oracle rel=5.559e-05 (out 5.56e-05 / sq 1.44e-05, P1e-4)  f64 out=1.456e-05 sq=9.228e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=64  oracle rel=5.773e-05 (out 5.77e-05 / sq 1.44e-05, P1e-4)  f64 out=1.097e-05 sq=9.228e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=32  oracle rel=5.844e-05 (out 5.84e-05 / sq 1.44e-05, P1e-4)  f64 out=5.167e-05 sq=9.228e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=16  oracle rel=1.068e-04 (out 1.07e-04 / sq 1.44e-05, F1e-4)  f64 out=8.953e-05 sq=9.228e-08  norm out=0.2 sq=0.8  GATE PASS
+    ns=8   oracle rel=5.488e-05 (out 5.49e-05 / sq 1.44e-05, P1e-4)  f64 out=3.034e-05 sq=9.228e-08  norm out=0.3 sq=0.8  GATE PASS
+    ns=4   oracle rel=5.685e-05 (out 5.69e-05 / sq 1.44e-05, P1e-4)  f64 out=7.416e-05 sq=9.228e-08  norm out=0.4 sq=0.8  GATE PASS
+    ns=2   oracle rel=6.226e-05 (out 6.23e-05 / sq 1.44e-05, P1e-4)  f64 out=6.065e-05 sq=9.228e-08  norm out=0.6 sq=0.8  GATE PASS
+    ns=1   oracle rel=1.470e-05 (out 1.47e-05 / sq 1.44e-05, P1e-4)  f64 out=6.961e-05 sq=9.228e-08  norm out=0.6 sq=0.8  GATE PASS
+  [seed 1] strict split n=1  hc_mult=4 hidden=7168  oracle rel=1.81e-05 (out 5.35e-06 / sq 1.81e-05)  f64 out=5.92e-05 sq=2.73e-08  norm out=0.7 sq=0.2  GATE PASS  [legacy 1e-4: PASS]
+  [seed 1] blocked ladder n=1  hc_mult=4 hidden=7168:  (gate = fp64)
+    ns=256 oracle rel=5.265e-05 (out 5.26e-05 / sq 1.81e-05, P1e-4)  f64 out=3.967e-06 sq=2.731e-08  norm out=0.0 sq=0.2  GATE PASS
+    ns=128 oracle rel=5.038e-05 (out 5.04e-05 / sq 1.81e-05, P1e-4)  f64 out=7.648e-06 sq=2.731e-08  norm out=0.0 sq=0.2  GATE PASS
+    ns=64  oracle rel=4.989e-05 (out 4.99e-05 / sq 1.81e-05, P1e-4)  f64 out=3.923e-06 sq=2.731e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=32  oracle rel=4.341e-05 (out 4.34e-05 / sq 1.81e-05, P1e-4)  f64 out=1.131e-05 sq=2.731e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=16  oracle rel=5.686e-05 (out 5.69e-05 / sq 1.81e-05, P1e-4)  f64 out=8.167e-06 sq=2.731e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=8   oracle rel=4.196e-05 (out 4.20e-05 / sq 1.81e-05, P1e-4)  f64 out=2.477e-05 sq=2.731e-08  norm out=0.2 sq=0.2  GATE PASS
+    ns=4   oracle rel=3.872e-05 (out 3.87e-05 / sq 1.81e-05, P1e-4)  f64 out=3.442e-05 sq=2.731e-08  norm out=0.3 sq=0.2  GATE PASS
+    ns=2   oracle rel=5.427e-05 (out 5.43e-05 / sq 1.81e-05, P1e-4)  f64 out=2.281e-05 sq=2.731e-08  norm out=0.3 sq=0.2  GATE PASS
+    ns=1   oracle rel=1.814e-05 (out 5.35e-06 / sq 1.81e-05, P1e-4)  f64 out=5.917e-05 sq=2.731e-08  norm out=0.7 sq=0.2  GATE PASS
+  [seed 2] strict split n=1  hc_mult=4 hidden=7168  oracle rel=2.09e-05 (out 4.64e-06 / sq 2.09e-05)  f64 out=1.04e-05 sq=1.13e-07  norm out=0.7 sq=0.9  GATE PASS  [legacy 1e-4: PASS]
+  [seed 2] blocked ladder n=1  hc_mult=4 hidden=7168:  (gate = fp64)
+    ns=256 oracle rel=2.086e-05 (out 1.05e-05 / sq 2.09e-05, P1e-4)  f64 out=3.361e-06 sq=1.127e-07  norm out=0.0 sq=0.9  GATE PASS
+    ns=128 oracle rel=2.086e-05 (out 9.39e-06 / sq 2.09e-05, P1e-4)  f64 out=4.283e-06 sq=1.127e-07  norm out=0.0 sq=0.9  GATE PASS
+    ns=64  oracle rel=2.086e-05 (out 1.01e-05 / sq 2.09e-05, P1e-4)  f64 out=8.892e-06 sq=1.127e-07  norm out=0.1 sq=0.9  GATE PASS
+    ns=32  oracle rel=2.086e-05 (out 1.07e-05 / sq 2.09e-05, P1e-4)  f64 out=5.397e-06 sq=1.127e-07  norm out=0.1 sq=0.9  GATE PASS
+    ns=16  oracle rel=2.086e-05 (out 1.21e-05 / sq 2.09e-05, P1e-4)  f64 out=6.779e-06 sq=1.127e-07  norm out=0.2 sq=0.9  GATE PASS
+    ns=8   oracle rel=2.086e-05 (out 1.05e-05 / sq 2.09e-05, P1e-4)  f64 out=5.181e-06 sq=1.127e-07  norm out=0.2 sq=0.9  GATE PASS
+    ns=4   oracle rel=2.086e-05 (out 1.11e-05 / sq 2.09e-05, P1e-4)  f64 out=1.038e-05 sq=1.127e-07  norm out=0.3 sq=0.9  GATE PASS
+    ns=2   oracle rel=2.086e-05 (out 1.95e-05 / sq 2.09e-05, P1e-4)  f64 out=1.415e-05 sq=1.127e-07  norm out=0.4 sq=0.9  GATE PASS
+    ns=1   oracle rel=2.086e-05 (out 4.64e-06 / sq 2.09e-05, P1e-4)  f64 out=1.035e-05 sq=1.127e-07  norm out=0.7 sq=0.9  GATE PASS
+  [seed 3] strict split n=1  hc_mult=4 hidden=7168  oracle rel=1.95e-05 (out 2.90e-06 / sq 1.95e-05)  f64 out=1.68e-05 sq=1.08e-07  norm out=0.4 sq=0.9  GATE PASS  [legacy 1e-4: PASS]
+  [seed 3] blocked ladder n=1  hc_mult=4 hidden=7168:  (gate = fp64)
+    ns=256 oracle rel=1.954e-05 (out 1.22e-05 / sq 1.95e-05, P1e-4)  f64 out=4.544e-06 sq=1.076e-07  norm out=0.0 sq=0.9  GATE PASS
+    ns=128 oracle rel=1.954e-05 (out 1.60e-05 / sq 1.95e-05, P1e-4)  f64 out=4.660e-06 sq=1.076e-07  norm out=0.0 sq=0.9  GATE PASS
+    ns=64  oracle rel=1.954e-05 (out 1.15e-05 / sq 1.95e-05, P1e-4)  f64 out=5.937e-06 sq=1.076e-07  norm out=0.1 sq=0.9  GATE PASS
+    ns=32  oracle rel=1.954e-05 (out 1.23e-05 / sq 1.95e-05, P1e-4)  f64 out=2.753e-06 sq=1.076e-07  norm out=0.1 sq=0.9  GATE PASS
+    ns=16  oracle rel=1.954e-05 (out 6.11e-06 / sq 1.95e-05, P1e-4)  f64 out=1.109e-05 sq=1.076e-07  norm out=0.2 sq=0.9  GATE PASS
+    ns=8   oracle rel=1.954e-05 (out 5.99e-06 / sq 1.95e-05, P1e-4)  f64 out=1.263e-05 sq=1.076e-07  norm out=0.1 sq=0.9  GATE PASS
+    ns=4   oracle rel=1.954e-05 (out 9.64e-06 / sq 1.95e-05, P1e-4)  f64 out=2.335e-05 sq=1.076e-07  norm out=0.2 sq=0.9  GATE PASS
+    ns=2   oracle rel=2.568e-05 (out 2.57e-05 / sq 1.95e-05, P1e-4)  f64 out=2.893e-05 sq=1.076e-07  norm out=0.3 sq=0.9  GATE PASS
+    ns=1   oracle rel=1.954e-05 (out 2.90e-06 / sq 1.95e-05, P1e-4)  f64 out=1.681e-05 sq=1.076e-07  norm out=0.4 sq=0.9  GATE PASS
+  [seed 4] strict split n=1  hc_mult=4 hidden=7168  oracle rel=1.96e-05 (out 1.78e-06 / sq 1.96e-05)  f64 out=4.59e-05 sq=9.74e-08  norm out=0.7 sq=0.8  GATE PASS  [legacy 1e-4: PASS]
+  [seed 4] blocked ladder n=1  hc_mult=4 hidden=7168:  (gate = fp64)
+    ns=256 oracle rel=4.630e-05 (out 4.63e-05 / sq 1.96e-05, P1e-4)  f64 out=2.663e-06 sq=9.739e-08  norm out=0.0 sq=0.8  GATE PASS
+    ns=128 oracle rel=4.604e-05 (out 4.60e-05 / sq 1.96e-05, P1e-4)  f64 out=6.272e-06 sq=9.739e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=64  oracle rel=4.989e-05 (out 4.99e-05 / sq 1.96e-05, P1e-4)  f64 out=4.342e-06 sq=9.739e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=32  oracle rel=6.726e-05 (out 6.73e-05 / sq 1.96e-05, P1e-4)  f64 out=2.170e-05 sq=9.739e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=16  oracle rel=2.473e-05 (out 2.47e-05 / sq 1.96e-05, P1e-4)  f64 out=3.302e-05 sq=9.739e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=8   oracle rel=2.934e-05 (out 2.93e-05 / sq 1.96e-05, P1e-4)  f64 out=3.266e-05 sq=9.739e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=4   oracle rel=2.813e-05 (out 2.81e-05 / sq 1.96e-05, P1e-4)  f64 out=7.090e-05 sq=9.739e-08  norm out=0.2 sq=0.8  GATE PASS
+    ns=2   oracle rel=1.958e-05 (out 7.36e-06 / sq 1.96e-05, P1e-4)  f64 out=5.196e-05 sq=9.739e-08  norm out=0.4 sq=0.8  GATE PASS
+    ns=1   oracle rel=1.958e-05 (out 1.78e-06 / sq 1.96e-05, P1e-4)  f64 out=4.591e-05 sq=9.739e-08  norm out=0.7 sq=0.8  GATE PASS
+  [seed 5] strict split n=1  hc_mult=4 hidden=7168  oracle rel=2.60e-05 (out 9.64e-06 / sq 2.60e-05)  f64 out=1.41e-04 sq=9.55e-08  norm out=0.6 sq=0.8  GATE PASS  [legacy 1e-4: PASS]
+  [seed 5] blocked ladder n=1  hc_mult=4 hidden=7168:  (gate = fp64)
+    ns=256 oracle rel=1.395e-04 (out 1.39e-04 / sq 2.60e-05, F1e-4)  f64 out=2.118e-05 sq=9.546e-08  norm out=0.0 sq=0.8  GATE PASS
+    ns=128 oracle rel=1.454e-04 (out 1.45e-04 / sq 2.60e-05, F1e-4)  f64 out=3.319e-05 sq=9.546e-08  norm out=0.0 sq=0.8  GATE PASS
+    ns=64  oracle rel=2.434e-04 (out 2.43e-04 / sq 2.60e-05, F1e-4)  f64 out=2.087e-04 sq=9.546e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=32  oracle rel=2.620e-04 (out 2.62e-04 / sq 2.60e-05, F1e-4)  f64 out=2.273e-04 sq=9.546e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=16  oracle rel=2.546e-04 (out 2.55e-04 / sq 2.60e-05, F1e-4)  f64 out=2.198e-04 sq=9.546e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=8   oracle rel=2.415e-04 (out 2.41e-04 / sq 2.60e-05, F1e-4)  f64 out=2.068e-04 sq=9.546e-08  norm out=0.3 sq=0.8  GATE PASS
+    ns=4   oracle rel=1.642e-04 (out 1.64e-04 / sq 2.60e-05, F1e-4)  f64 out=3.027e-05 sq=9.546e-08  norm out=0.2 sq=0.8  GATE PASS
+    ns=2   oracle rel=1.388e-04 (out 1.39e-04 / sq 2.60e-05, F1e-4)  f64 out=1.041e-04 sq=9.546e-08  norm out=0.5 sq=0.8  GATE PASS
+    ns=1   oracle rel=2.604e-05 (out 9.64e-06 / sq 2.60e-05, P1e-4)  f64 out=1.410e-04 sq=9.546e-08  norm out=0.6 sq=0.8  GATE PASS
+
+mhc_post (vs CPU reference, bf16 store):
+  n=1  hc=2 hidden=2     abs=7.1509e-03 rel=2.4019e-03  PASS
+  n=7  hc=4 hidden=5     abs=1.4932e-02 rel=3.7855e-03  PASS
+  n=1  hc=4 hidden=4096  abs=3.0088e-02 rel=3.8722e-03  PASS
+  n=7  hc=4 hidden=4096  abs=3.1231e-02 rel=3.8845e-03  PASS
+  n=1  hc=4 hidden=7168  abs=2.9481e-02 rel=3.8721e-03  PASS
+  n=4  hc=8 hidden=1024  abs=3.1247e-02 rel=3.8870e-03  PASS
+
+PASS (0 failure(s))
+
+############ 1b. Same rows under the LEGACY 1e-4 oracle-chain gate #####
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+
+gate policy: LEGACY oracle-chain 1e-4 (VK_MHC_STRICT_GATE=1) (K=256 default)
+
+mhc_pre_gemm_sqrsum (vs CPU reference; oracle = fp32 chain, f64 = issue #138 reference):
+  [seed 1] strict split n=1  hc_mult=2 hidden=2     oracle rel=7.20e-08 (out 7.20e-08 / sq 0.00e+00)  f64 out=5.73e-08 sq=0.00e+00  norm out=0.5 sq=0.0  GATE PASS  [legacy 1e-4: PASS]
+  [seed 1] blocked ladder n=1  hc_mult=2 hidden=2   :  (gate = legacy 1e-4)
+    ns=256 oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=128 oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=64  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=32  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=16  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=8   oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=4   oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=1.050e-07 sq=0.000e+00  norm out=0.9 sq=0.0  GATE PASS
+    ns=2   oracle rel=1.439e-07 (out 1.44e-07 / sq 0.00e+00, P1e-4)  f64 out=5.774e-08 sq=0.000e+00  norm out=0.5 sq=0.0  GATE PASS
+    ns=1   oracle rel=7.197e-08 (out 7.20e-08 / sq 0.00e+00, P1e-4)  f64 out=5.728e-08 sq=0.000e+00  norm out=0.5 sq=0.0  GATE PASS
+  [seed 1] strict split n=7  hc_mult=3 hidden=3     oracle rel=3.59e-07 (out 3.59e-07 / sq 0.00e+00)  f64 out=1.96e-07 sq=3.59e-08  norm out=0.8 sq=0.3  GATE PASS  [legacy 1e-4: PASS]
+  [seed 1] blocked ladder n=7  hc_mult=3 hidden=3   :  (gate = legacy 1e-4)
+    ns=256 oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=3.097e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=128 oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=3.097e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=64  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=3.097e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=32  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=3.097e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=16  oracle rel=0.000e+00 (out 0.00e+00 / sq 0.00e+00, P1e-4)  f64 out=3.097e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=8   oracle rel=4.768e-07 (out 4.77e-07 / sq 0.00e+00, P1e-4)  f64 out=5.018e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=4   oracle rel=3.005e-07 (out 3.00e-07 / sq 0.00e+00, P1e-4)  f64 out=1.825e-07 sq=3.588e-08  norm out=0.7 sq=0.3  GATE PASS
+    ns=2   oracle rel=2.902e-07 (out 2.90e-07 / sq 0.00e+00, P1e-4)  f64 out=2.194e-07 sq=3.588e-08  norm out=0.5 sq=0.3  GATE PASS
+    ns=1   oracle rel=3.593e-07 (out 3.59e-07 / sq 0.00e+00, P1e-4)  f64 out=1.957e-07 sq=3.588e-08  norm out=0.8 sq=0.3  GATE PASS
+  [seed 1] strict split n=1  hc_mult=4 hidden=4096  oracle rel=9.74e-06 (out 9.74e-06 / sq 8.41e-06)  f64 out=2.58e-05 sq=4.87e-08  norm out=0.6 sq=0.4  GATE PASS  [legacy 1e-4: PASS]
+  [seed 1] blocked ladder n=1  hc_mult=4 hidden=4096:  (gate = legacy 1e-4)
+    ns=256 oracle rel=2.833e-05 (out 2.83e-05 / sq 8.41e-06, P1e-4)  f64 out=1.223e-05 sq=4.875e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=128 oracle rel=4.427e-05 (out 4.43e-05 / sq 8.41e-06, P1e-4)  f64 out=2.817e-05 sq=4.875e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=64  oracle rel=2.349e-05 (out 2.35e-05 / sq 8.41e-06, P1e-4)  f64 out=7.387e-06 sq=4.875e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=32  oracle rel=1.059e-05 (out 1.06e-05 / sq 8.41e-06, P1e-4)  f64 out=1.404e-05 sq=4.875e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=16  oracle rel=4.492e-05 (out 4.49e-05 / sq 8.41e-06, P1e-4)  f64 out=2.881e-05 sq=4.875e-08  norm out=0.1 sq=0.4  GATE PASS
+    ns=8   oracle rel=1.394e-05 (out 1.39e-05 / sq 8.41e-06, P1e-4)  f64 out=7.301e-06 sq=4.875e-08  norm out=0.2 sq=0.4  GATE PASS
+    ns=4   oracle rel=2.840e-05 (out 2.84e-05 / sq 8.41e-06, P1e-4)  f64 out=4.450e-05 sq=4.875e-08  norm out=0.3 sq=0.4  GATE PASS
+    ns=2   oracle rel=1.110e-05 (out 1.11e-05 / sq 8.41e-06, P1e-4)  f64 out=2.720e-05 sq=4.875e-08  norm out=0.3 sq=0.4  GATE PASS
+    ns=1   oracle rel=9.745e-06 (out 9.74e-06 / sq 8.41e-06, P1e-4)  f64 out=2.585e-05 sq=4.875e-08  norm out=0.6 sq=0.4  GATE PASS
+  [seed 1] NEGATIVE CONTROL (fn row +1) n=1 hc_mult=4 hidden=4096:  oracle rel=1.854e+01  f64 out=1.854e+01  norm out=319765.9  GATE FAIL (expected: gate catches the corruption)
+  [seed 2] strict split n=1  hc_mult=4 hidden=4096  oracle rel=1.28e-05 (out 1.28e-05 / sq 5.97e-06)  f64 out=1.63e-04 sq=6.95e-08  norm out=0.7 sq=0.6  GATE PASS  [legacy 1e-4: PASS]
+  [seed 2] blocked ladder n=1  hc_mult=4 hidden=4096:  (gate = legacy 1e-4)
+    ns=256 oracle rel=1.743e-04 (out 1.74e-04 / sq 5.97e-06, F1e-4)  f64 out=1.415e-06 sq=6.951e-08  norm out=0.1 sq=0.6  GATE FAIL
+    ns=128 oracle rel=1.440e-04 (out 1.44e-04 / sq 5.97e-06, F1e-4)  f64 out=3.171e-05 sq=6.951e-08  norm out=0.1 sq=0.6  GATE FAIL
+    ns=64  oracle rel=1.695e-04 (out 1.70e-04 / sq 5.97e-06, F1e-4)  f64 out=6.199e-06 sq=6.951e-08  norm out=0.1 sq=0.6  GATE FAIL
+    ns=32  oracle rel=1.714e-04 (out 1.71e-04 / sq 5.97e-06, F1e-4)  f64 out=4.376e-06 sq=6.951e-08  norm out=0.1 sq=0.6  GATE FAIL
+    ns=16  oracle rel=1.586e-04 (out 1.59e-04 / sq 5.97e-06, F1e-4)  f64 out=1.713e-05 sq=6.951e-08  norm out=0.2 sq=0.6  GATE FAIL
+    ns=8   oracle rel=3.268e-05 (out 3.27e-05 / sq 5.97e-06, P1e-4)  f64 out=2.085e-04 sq=6.951e-08  norm out=0.3 sq=0.6  GATE PASS
+    ns=4   oracle rel=2.198e-05 (out 2.20e-05 / sq 5.97e-06, P1e-4)  f64 out=1.538e-04 sq=6.951e-08  norm out=0.2 sq=0.6  GATE PASS
+    ns=2   oracle rel=7.481e-05 (out 7.48e-05 / sq 5.97e-06, P1e-4)  f64 out=1.010e-04 sq=6.951e-08  norm out=0.2 sq=0.6  GATE PASS
+    ns=1   oracle rel=1.275e-05 (out 1.28e-05 / sq 5.97e-06, P1e-4)  f64 out=1.630e-04 sq=6.951e-08  norm out=0.7 sq=0.6  GATE PASS
+  [seed 2] NEGATIVE CONTROL (fn row +1) n=1 hc_mult=4 hidden=4096:  oracle rel=7.891e+01  f64 out=7.892e+01  norm out=323483.4  GATE FAIL (expected: gate catches the corruption)
+  [seed 3] strict split n=1  hc_mult=4 hidden=4096  oracle rel=8.62e-06 (out 7.99e-06 / sq 8.62e-06)  f64 out=2.89e-05 sq=2.09e-09  norm out=0.8 sq=0.0  GATE PASS  [legacy 1e-4: PASS]
+  [seed 3] blocked ladder n=1  hc_mult=4 hidden=4096:  (gate = legacy 1e-4)
+    ns=256 oracle rel=3.489e-05 (out 3.49e-05 / sq 8.62e-06, P1e-4)  f64 out=3.360e-06 sq=2.092e-09  norm out=0.1 sq=0.0  GATE PASS
+    ns=128 oracle rel=3.795e-05 (out 3.80e-05 / sq 8.62e-06, P1e-4)  f64 out=6.422e-06 sq=2.092e-09  norm out=0.0 sq=0.0  GATE PASS
+    ns=64  oracle rel=3.352e-05 (out 3.35e-05 / sq 8.62e-06, P1e-4)  f64 out=4.342e-06 sq=2.092e-09  norm out=0.1 sq=0.0  GATE PASS
+    ns=32  oracle rel=3.102e-05 (out 3.10e-05 / sq 8.62e-06, P1e-4)  f64 out=8.054e-06 sq=2.092e-09  norm out=0.1 sq=0.0  GATE PASS
+    ns=16  oracle rel=3.077e-05 (out 3.08e-05 / sq 8.62e-06, P1e-4)  f64 out=1.770e-05 sq=2.092e-09  norm out=0.1 sq=0.0  GATE PASS
+    ns=8   oracle rel=4.737e-05 (out 4.74e-05 / sq 8.62e-06, P1e-4)  f64 out=1.614e-05 sq=2.092e-09  norm out=0.1 sq=0.0  GATE PASS
+    ns=4   oracle rel=4.631e-05 (out 4.63e-05 / sq 8.62e-06, P1e-4)  f64 out=1.502e-05 sq=2.092e-09  norm out=0.3 sq=0.0  GATE PASS
+    ns=2   oracle rel=3.901e-05 (out 3.90e-05 / sq 8.62e-06, P1e-4)  f64 out=2.353e-05 sq=2.092e-09  norm out=0.5 sq=0.0  GATE PASS
+    ns=1   oracle rel=8.619e-06 (out 7.99e-06 / sq 8.62e-06, P1e-4)  f64 out=2.893e-05 sq=2.092e-09  norm out=0.8 sq=0.0  GATE PASS
+  [seed 3] NEGATIVE CONTROL (fn row +1) n=1 hc_mult=4 hidden=4096:  oracle rel=1.530e+01  f64 out=1.530e+01  norm out=325287.1  GATE FAIL (expected: gate catches the corruption)
+  [seed 4] strict split n=1  hc_mult=4 hidden=4096  oracle rel=7.25e-06 (out 2.95e-06 / sq 7.25e-06)  f64 out=3.61e-05 sq=2.51e-08  norm out=0.6 sq=0.2  GATE PASS  [legacy 1e-4: PASS]
+  [seed 4] blocked ladder n=1  hc_mult=4 hidden=4096:  (gate = legacy 1e-4)
+    ns=256 oracle rel=3.655e-05 (out 3.65e-05 / sq 7.25e-06, P1e-4)  f64 out=2.508e-06 sq=2.512e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=128 oracle rel=3.594e-05 (out 3.59e-05 / sq 7.25e-06, P1e-4)  f64 out=1.903e-06 sq=2.512e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=64  oracle rel=3.862e-05 (out 3.86e-05 / sq 7.25e-06, P1e-4)  f64 out=4.581e-06 sq=2.512e-08  norm out=0.0 sq=0.2  GATE PASS
+    ns=32  oracle rel=2.549e-05 (out 2.55e-05 / sq 7.25e-06, P1e-4)  f64 out=8.551e-06 sq=2.512e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=16  oracle rel=5.072e-05 (out 5.07e-05 / sq 7.25e-06, P1e-4)  f64 out=1.668e-05 sq=2.512e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=8   oracle rel=4.363e-05 (out 4.36e-05 / sq 7.25e-06, P1e-4)  f64 out=9.592e-06 sq=2.512e-08  norm out=0.2 sq=0.2  GATE PASS
+    ns=4   oracle rel=5.374e-05 (out 5.37e-05 / sq 7.25e-06, P1e-4)  f64 out=1.970e-05 sq=2.512e-08  norm out=0.2 sq=0.2  GATE PASS
+    ns=2   oracle rel=6.523e-05 (out 6.52e-05 / sq 7.25e-06, P1e-4)  f64 out=3.119e-05 sq=2.512e-08  norm out=0.5 sq=0.2  GATE PASS
+    ns=1   oracle rel=7.249e-06 (out 2.95e-06 / sq 7.25e-06, P1e-4)  f64 out=3.611e-05 sq=2.512e-08  norm out=0.6 sq=0.2  GATE PASS
+  [seed 4] NEGATIVE CONTROL (fn row +1) n=1 hc_mult=4 hidden=4096:  oracle rel=5.662e+00  f64 out=5.662e+00  norm out=322991.7  GATE FAIL (expected: gate catches the corruption)
+  [seed 5] strict split n=1  hc_mult=4 hidden=4096  oracle rel=1.44e-05 (out 1.97e-06 / sq 1.44e-05)  f64 out=1.55e-05 sq=6.78e-08  norm out=0.5 sq=0.6  GATE PASS  [legacy 1e-4: PASS]
+  [seed 5] blocked ladder n=1  hc_mult=4 hidden=4096:  (gate = legacy 1e-4)
+    ns=256 oracle rel=1.566e-05 (out 1.57e-05 / sq 1.44e-05, P1e-4)  f64 out=2.095e-06 sq=6.781e-08  norm out=0.1 sq=0.6  GATE PASS
+    ns=128 oracle rel=1.473e-05 (out 1.47e-05 / sq 1.44e-05, P1e-4)  f64 out=1.253e-06 sq=6.781e-08  norm out=0.0 sq=0.6  GATE PASS
+    ns=64  oracle rel=1.442e-05 (out 1.29e-05 / sq 1.44e-05, P1e-4)  f64 out=1.264e-06 sq=6.781e-08  norm out=0.1 sq=0.6  GATE PASS
+    ns=32  oracle rel=1.628e-05 (out 1.63e-05 / sq 1.44e-05, P1e-4)  f64 out=2.717e-06 sq=6.781e-08  norm out=0.1 sq=0.6  GATE PASS
+    ns=16  oracle rel=1.442e-05 (out 1.16e-05 / sq 1.44e-05, P1e-4)  f64 out=4.434e-06 sq=6.781e-08  norm out=0.2 sq=0.6  GATE PASS
+    ns=8   oracle rel=1.442e-05 (out 9.96e-06 / sq 1.44e-05, P1e-4)  f64 out=3.609e-06 sq=6.781e-08  norm out=0.2 sq=0.6  GATE PASS
+    ns=4   oracle rel=2.012e-05 (out 2.01e-05 / sq 1.44e-05, P1e-4)  f64 out=6.555e-06 sq=6.781e-08  norm out=0.2 sq=0.6  GATE PASS
+    ns=2   oracle rel=1.794e-05 (out 1.79e-05 / sq 1.44e-05, P1e-4)  f64 out=4.486e-06 sq=6.781e-08  norm out=0.4 sq=0.6  GATE PASS
+    ns=1   oracle rel=1.442e-05 (out 1.97e-06 / sq 1.44e-05, P1e-4)  f64 out=1.554e-05 sq=6.781e-08  norm out=0.5 sq=0.6  GATE PASS
+  [seed 5] NEGATIVE CONTROL (fn row +1) n=1 hc_mult=4 hidden=4096:  oracle rel=5.138e+00  f64 out=5.138e+00  norm out=410545.3  GATE FAIL (expected: gate catches the corruption)
+  [seed 1] strict split n=7  hc_mult=4 hidden=4096  oracle rel=1.93e-05 (out 1.93e-05 / sq 1.19e-05)  f64 out=1.01e-04 sq=5.22e-08  norm out=0.6 sq=0.4  GATE PASS  [legacy 1e-4: PASS]
+  [seed 1] blocked ladder n=7  hc_mult=4 hidden=4096:  (gate = legacy 1e-4)
+    ns=256 oracle rel=1.078e-04 (out 1.08e-04 / sq 1.19e-05, F1e-4)  f64 out=1.460e-05 sq=5.217e-08  norm out=0.1 sq=0.4  GATE FAIL
+    ns=128 oracle rel=1.111e-04 (out 1.11e-04 / sq 1.19e-05, F1e-4)  f64 out=2.817e-05 sq=5.217e-08  norm out=0.1 sq=0.4  GATE FAIL
+    ns=64  oracle rel=1.132e-04 (out 1.13e-04 / sq 1.19e-05, F1e-4)  f64 out=9.499e-06 sq=5.217e-08  norm out=0.1 sq=0.4  GATE FAIL
+    ns=32  oracle rel=1.181e-04 (out 1.18e-04 / sq 1.19e-05, F1e-4)  f64 out=1.882e-05 sq=5.217e-08  norm out=0.1 sq=0.4  GATE FAIL
+    ns=16  oracle rel=1.063e-04 (out 1.06e-04 / sq 1.19e-05, F1e-4)  f64 out=4.161e-05 sq=5.217e-08  norm out=0.1 sq=0.4  GATE FAIL
+    ns=8   oracle rel=7.126e-05 (out 7.13e-05 / sq 1.19e-05, P1e-4)  f64 out=5.866e-05 sq=5.217e-08  norm out=0.3 sq=0.4  GATE PASS
+    ns=4   oracle rel=7.508e-05 (out 7.51e-05 / sq 1.19e-05, P1e-4)  f64 out=5.673e-05 sq=5.217e-08  norm out=0.3 sq=0.4  GATE PASS
+    ns=2   oracle rel=1.239e-04 (out 1.24e-04 / sq 1.19e-05, F1e-4)  f64 out=2.368e-04 sq=5.217e-08  norm out=0.7 sq=0.4  GATE FAIL
+    ns=1   oracle rel=1.926e-05 (out 1.93e-05 / sq 1.19e-05, P1e-4)  f64 out=1.011e-04 sq=5.217e-08  norm out=0.6 sq=0.4  GATE PASS
+  [seed 2] strict split n=7  hc_mult=4 hidden=4096  oracle rel=1.02e-04 (out 1.02e-04 / sq 1.01e-05)  f64 out=4.00e-04 sq=8.24e-08  norm out=0.7 sq=0.7  GATE FAIL  [legacy 1e-4: FAIL]
+  [seed 2] blocked ladder n=7  hc_mult=4 hidden=4096:  (gate = legacy 1e-4)
+    ns=256 oracle rel=4.958e-04 (out 4.96e-04 / sq 1.01e-05, F1e-4)  f64 out=3.307e-05 sq=8.238e-08  norm out=0.1 sq=0.7  GATE FAIL
+    ns=128 oracle rel=5.306e-04 (out 5.31e-04 / sq 1.01e-05, F1e-4)  f64 out=3.643e-05 sq=8.238e-08  norm out=0.1 sq=0.7  GATE FAIL
+    ns=64  oracle rel=5.368e-04 (out 5.37e-04 / sq 1.01e-05, F1e-4)  f64 out=3.982e-05 sq=8.238e-08  norm out=0.1 sq=0.7  GATE FAIL
+    ns=32  oracle rel=5.151e-04 (out 5.15e-04 / sq 1.01e-05, F1e-4)  f64 out=1.337e-04 sq=8.238e-08  norm out=0.1 sq=0.7  GATE FAIL
+    ns=16  oracle rel=5.955e-04 (out 5.95e-04 / sq 1.01e-05, F1e-4)  f64 out=1.184e-04 sq=8.238e-08  norm out=0.2 sq=0.7  GATE FAIL
+    ns=8   oracle rel=5.399e-04 (out 5.40e-04 / sq 1.01e-05, F1e-4)  f64 out=2.085e-04 sq=8.238e-08  norm out=0.3 sq=0.7  GATE FAIL
+    ns=4   oracle rel=3.946e-04 (out 3.95e-04 / sq 1.01e-05, F1e-4)  f64 out=1.538e-04 sq=8.238e-08  norm out=0.3 sq=0.7  GATE FAIL
+    ns=2   oracle rel=3.761e-04 (out 3.76e-04 / sq 1.01e-05, F1e-4)  f64 out=1.253e-04 sq=8.238e-08  norm out=0.4 sq=0.7  GATE FAIL
+    ns=1   oracle rel=1.020e-04 (out 1.02e-04 / sq 1.01e-05, F1e-4)  f64 out=3.995e-04 sq=8.238e-08  norm out=0.7 sq=0.7  GATE FAIL
+  [seed 3] strict split n=7  hc_mult=4 hidden=4096  oracle rel=1.98e-05 (out 1.98e-05 / sq 1.08e-05)  f64 out=2.89e-05 sq=5.47e-08  norm out=0.8 sq=0.5  GATE PASS  [legacy 1e-4: PASS]
+  [seed 3] blocked ladder n=7  hc_mult=4 hidden=4096:  (gate = legacy 1e-4)
+    ns=256 oracle rel=4.952e-05 (out 4.95e-05 / sq 1.08e-05, P1e-4)  f64 out=5.679e-05 sq=5.470e-08  norm out=0.1 sq=0.5  GATE PASS
+    ns=128 oracle rel=5.507e-05 (out 5.51e-05 / sq 1.08e-05, P1e-4)  f64 out=2.618e-05 sq=5.470e-08  norm out=0.1 sq=0.5  GATE PASS
+    ns=64  oracle rel=3.767e-05 (out 3.77e-05 / sq 1.08e-05, P1e-4)  f64 out=6.689e-05 sq=5.470e-08  norm out=0.1 sq=0.5  GATE PASS
+    ns=32  oracle rel=7.432e-05 (out 7.43e-05 / sq 1.08e-05, P1e-4)  f64 out=1.108e-04 sq=5.470e-08  norm out=0.1 sq=0.5  GATE PASS
+    ns=16  oracle rel=3.267e-05 (out 3.27e-05 / sq 1.08e-05, P1e-4)  f64 out=1.950e-05 sq=5.470e-08  norm out=0.1 sq=0.5  GATE PASS
+    ns=8   oracle rel=9.600e-05 (out 9.60e-05 / sq 1.08e-05, P1e-4)  f64 out=5.951e-05 sq=5.470e-08  norm out=0.2 sq=0.5  GATE PASS
+    ns=4   oracle rel=2.645e-04 (out 2.64e-04 / sq 1.08e-05, F1e-4)  f64 out=3.010e-04 sq=5.470e-08  norm out=0.5 sq=0.5  GATE FAIL
+    ns=2   oracle rel=2.826e-04 (out 2.83e-04 / sq 1.08e-05, F1e-4)  f64 out=3.191e-04 sq=5.470e-08  norm out=0.5 sq=0.5  GATE FAIL
+    ns=1   oracle rel=1.984e-05 (out 1.98e-05 / sq 1.08e-05, P1e-4)  f64 out=2.893e-05 sq=5.470e-08  norm out=0.8 sq=0.5  GATE PASS
+  [seed 4] strict split n=7  hc_mult=4 hidden=4096  oracle rel=5.47e-05 (out 5.47e-05 / sq 9.24e-06)  f64 out=8.18e-05 sq=1.25e-07  norm out=0.8 sq=1.0  GATE PASS  [legacy 1e-4: PASS]
+  [seed 4] blocked ladder n=7  hc_mult=4 hidden=4096:  (gate = legacy 1e-4)
+    ns=256 oracle rel=1.467e-04 (out 1.47e-04 / sq 9.24e-06, F1e-4)  f64 out=1.030e-05 sq=1.246e-07  norm out=0.2 sq=1.0  GATE FAIL
+    ns=128 oracle rel=1.594e-04 (out 1.59e-04 / sq 9.24e-06, F1e-4)  f64 out=2.304e-05 sq=1.246e-07  norm out=0.1 sq=1.0  GATE FAIL
+    ns=64  oracle rel=9.459e-05 (out 9.46e-05 / sq 9.24e-06, P1e-4)  f64 out=4.182e-05 sq=1.246e-07  norm out=0.1 sq=1.0  GATE PASS
+    ns=32  oracle rel=1.784e-04 (out 1.78e-04 / sq 9.24e-06, F1e-4)  f64 out=4.202e-05 sq=1.246e-07  norm out=0.1 sq=1.0  GATE FAIL
+    ns=16  oracle rel=6.643e-05 (out 6.64e-05 / sq 9.24e-06, P1e-4)  f64 out=8.487e-05 sq=1.246e-07  norm out=0.1 sq=1.0  GATE PASS
+    ns=8   oracle rel=1.600e-04 (out 1.60e-04 / sq 9.24e-06, F1e-4)  f64 out=5.248e-05 sq=1.246e-07  norm out=0.2 sq=1.0  GATE FAIL
+    ns=4   oracle rel=1.240e-04 (out 1.24e-04 / sq 9.24e-06, F1e-4)  f64 out=1.325e-04 sq=1.246e-07  norm out=0.3 sq=1.0  GATE FAIL
+    ns=2   oracle rel=1.513e-04 (out 1.51e-04 / sq 9.24e-06, F1e-4)  f64 out=1.435e-04 sq=1.246e-07  norm out=0.5 sq=1.0  GATE FAIL
+    ns=1   oracle rel=5.466e-05 (out 5.47e-05 / sq 9.24e-06, P1e-4)  f64 out=8.176e-05 sq=1.246e-07  norm out=0.8 sq=1.0  GATE PASS
+  [seed 5] strict split n=7  hc_mult=4 hidden=4096  oracle rel=1.47e-05 (out 1.47e-05 / sq 1.44e-05)  f64 out=6.96e-05 sq=9.23e-08  norm out=0.6 sq=0.8  GATE PASS  [legacy 1e-4: PASS]
+  [seed 5] blocked ladder n=7  hc_mult=4 hidden=4096:  (gate = legacy 1e-4)
+    ns=256 oracle rel=4.504e-05 (out 4.50e-05 / sq 1.44e-05, P1e-4)  f64 out=2.331e-05 sq=9.228e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=128 oracle rel=5.559e-05 (out 5.56e-05 / sq 1.44e-05, P1e-4)  f64 out=1.456e-05 sq=9.228e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=64  oracle rel=5.773e-05 (out 5.77e-05 / sq 1.44e-05, P1e-4)  f64 out=1.097e-05 sq=9.228e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=32  oracle rel=5.844e-05 (out 5.84e-05 / sq 1.44e-05, P1e-4)  f64 out=5.167e-05 sq=9.228e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=16  oracle rel=1.068e-04 (out 1.07e-04 / sq 1.44e-05, F1e-4)  f64 out=8.953e-05 sq=9.228e-08  norm out=0.2 sq=0.8  GATE FAIL
+    ns=8   oracle rel=5.488e-05 (out 5.49e-05 / sq 1.44e-05, P1e-4)  f64 out=3.034e-05 sq=9.228e-08  norm out=0.3 sq=0.8  GATE PASS
+    ns=4   oracle rel=5.685e-05 (out 5.69e-05 / sq 1.44e-05, P1e-4)  f64 out=7.416e-05 sq=9.228e-08  norm out=0.4 sq=0.8  GATE PASS
+    ns=2   oracle rel=6.226e-05 (out 6.23e-05 / sq 1.44e-05, P1e-4)  f64 out=6.065e-05 sq=9.228e-08  norm out=0.6 sq=0.8  GATE PASS
+    ns=1   oracle rel=1.470e-05 (out 1.47e-05 / sq 1.44e-05, P1e-4)  f64 out=6.961e-05 sq=9.228e-08  norm out=0.6 sq=0.8  GATE PASS
+  [seed 1] strict split n=1  hc_mult=4 hidden=7168  oracle rel=1.81e-05 (out 5.35e-06 / sq 1.81e-05)  f64 out=5.92e-05 sq=2.73e-08  norm out=0.7 sq=0.2  GATE PASS  [legacy 1e-4: PASS]
+  [seed 1] blocked ladder n=1  hc_mult=4 hidden=7168:  (gate = legacy 1e-4)
+    ns=256 oracle rel=5.265e-05 (out 5.26e-05 / sq 1.81e-05, P1e-4)  f64 out=3.967e-06 sq=2.731e-08  norm out=0.0 sq=0.2  GATE PASS
+    ns=128 oracle rel=5.038e-05 (out 5.04e-05 / sq 1.81e-05, P1e-4)  f64 out=7.648e-06 sq=2.731e-08  norm out=0.0 sq=0.2  GATE PASS
+    ns=64  oracle rel=4.989e-05 (out 4.99e-05 / sq 1.81e-05, P1e-4)  f64 out=3.923e-06 sq=2.731e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=32  oracle rel=4.341e-05 (out 4.34e-05 / sq 1.81e-05, P1e-4)  f64 out=1.131e-05 sq=2.731e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=16  oracle rel=5.686e-05 (out 5.69e-05 / sq 1.81e-05, P1e-4)  f64 out=8.167e-06 sq=2.731e-08  norm out=0.1 sq=0.2  GATE PASS
+    ns=8   oracle rel=4.196e-05 (out 4.20e-05 / sq 1.81e-05, P1e-4)  f64 out=2.477e-05 sq=2.731e-08  norm out=0.2 sq=0.2  GATE PASS
+    ns=4   oracle rel=3.872e-05 (out 3.87e-05 / sq 1.81e-05, P1e-4)  f64 out=3.442e-05 sq=2.731e-08  norm out=0.3 sq=0.2  GATE PASS
+    ns=2   oracle rel=5.427e-05 (out 5.43e-05 / sq 1.81e-05, P1e-4)  f64 out=2.281e-05 sq=2.731e-08  norm out=0.3 sq=0.2  GATE PASS
+    ns=1   oracle rel=1.814e-05 (out 5.35e-06 / sq 1.81e-05, P1e-4)  f64 out=5.917e-05 sq=2.731e-08  norm out=0.7 sq=0.2  GATE PASS
+  [seed 2] strict split n=1  hc_mult=4 hidden=7168  oracle rel=2.09e-05 (out 4.64e-06 / sq 2.09e-05)  f64 out=1.04e-05 sq=1.13e-07  norm out=0.7 sq=0.9  GATE PASS  [legacy 1e-4: PASS]
+  [seed 2] blocked ladder n=1  hc_mult=4 hidden=7168:  (gate = legacy 1e-4)
+    ns=256 oracle rel=2.086e-05 (out 1.05e-05 / sq 2.09e-05, P1e-4)  f64 out=3.361e-06 sq=1.127e-07  norm out=0.0 sq=0.9  GATE PASS
+    ns=128 oracle rel=2.086e-05 (out 9.39e-06 / sq 2.09e-05, P1e-4)  f64 out=4.283e-06 sq=1.127e-07  norm out=0.0 sq=0.9  GATE PASS
+    ns=64  oracle rel=2.086e-05 (out 1.01e-05 / sq 2.09e-05, P1e-4)  f64 out=8.892e-06 sq=1.127e-07  norm out=0.1 sq=0.9  GATE PASS
+    ns=32  oracle rel=2.086e-05 (out 1.07e-05 / sq 2.09e-05, P1e-4)  f64 out=5.397e-06 sq=1.127e-07  norm out=0.1 sq=0.9  GATE PASS
+    ns=16  oracle rel=2.086e-05 (out 1.21e-05 / sq 2.09e-05, P1e-4)  f64 out=6.779e-06 sq=1.127e-07  norm out=0.2 sq=0.9  GATE PASS
+    ns=8   oracle rel=2.086e-05 (out 1.05e-05 / sq 2.09e-05, P1e-4)  f64 out=5.181e-06 sq=1.127e-07  norm out=0.2 sq=0.9  GATE PASS
+    ns=4   oracle rel=2.086e-05 (out 1.11e-05 / sq 2.09e-05, P1e-4)  f64 out=1.038e-05 sq=1.127e-07  norm out=0.3 sq=0.9  GATE PASS
+    ns=2   oracle rel=2.086e-05 (out 1.95e-05 / sq 2.09e-05, P1e-4)  f64 out=1.415e-05 sq=1.127e-07  norm out=0.4 sq=0.9  GATE PASS
+    ns=1   oracle rel=2.086e-05 (out 4.64e-06 / sq 2.09e-05, P1e-4)  f64 out=1.035e-05 sq=1.127e-07  norm out=0.7 sq=0.9  GATE PASS
+  [seed 3] strict split n=1  hc_mult=4 hidden=7168  oracle rel=1.95e-05 (out 2.90e-06 / sq 1.95e-05)  f64 out=1.68e-05 sq=1.08e-07  norm out=0.4 sq=0.9  GATE PASS  [legacy 1e-4: PASS]
+  [seed 3] blocked ladder n=1  hc_mult=4 hidden=7168:  (gate = legacy 1e-4)
+    ns=256 oracle rel=1.954e-05 (out 1.22e-05 / sq 1.95e-05, P1e-4)  f64 out=4.544e-06 sq=1.076e-07  norm out=0.0 sq=0.9  GATE PASS
+    ns=128 oracle rel=1.954e-05 (out 1.60e-05 / sq 1.95e-05, P1e-4)  f64 out=4.660e-06 sq=1.076e-07  norm out=0.0 sq=0.9  GATE PASS
+    ns=64  oracle rel=1.954e-05 (out 1.15e-05 / sq 1.95e-05, P1e-4)  f64 out=5.937e-06 sq=1.076e-07  norm out=0.1 sq=0.9  GATE PASS
+    ns=32  oracle rel=1.954e-05 (out 1.23e-05 / sq 1.95e-05, P1e-4)  f64 out=2.753e-06 sq=1.076e-07  norm out=0.1 sq=0.9  GATE PASS
+    ns=16  oracle rel=1.954e-05 (out 6.11e-06 / sq 1.95e-05, P1e-4)  f64 out=1.109e-05 sq=1.076e-07  norm out=0.2 sq=0.9  GATE PASS
+    ns=8   oracle rel=1.954e-05 (out 5.99e-06 / sq 1.95e-05, P1e-4)  f64 out=1.263e-05 sq=1.076e-07  norm out=0.1 sq=0.9  GATE PASS
+    ns=4   oracle rel=1.954e-05 (out 9.64e-06 / sq 1.95e-05, P1e-4)  f64 out=2.335e-05 sq=1.076e-07  norm out=0.2 sq=0.9  GATE PASS
+    ns=2   oracle rel=2.568e-05 (out 2.57e-05 / sq 1.95e-05, P1e-4)  f64 out=2.893e-05 sq=1.076e-07  norm out=0.3 sq=0.9  GATE PASS
+    ns=1   oracle rel=1.954e-05 (out 2.90e-06 / sq 1.95e-05, P1e-4)  f64 out=1.681e-05 sq=1.076e-07  norm out=0.4 sq=0.9  GATE PASS
+  [seed 4] strict split n=1  hc_mult=4 hidden=7168  oracle rel=1.96e-05 (out 1.78e-06 / sq 1.96e-05)  f64 out=4.59e-05 sq=9.74e-08  norm out=0.7 sq=0.8  GATE PASS  [legacy 1e-4: PASS]
+  [seed 4] blocked ladder n=1  hc_mult=4 hidden=7168:  (gate = legacy 1e-4)
+    ns=256 oracle rel=4.630e-05 (out 4.63e-05 / sq 1.96e-05, P1e-4)  f64 out=2.663e-06 sq=9.739e-08  norm out=0.0 sq=0.8  GATE PASS
+    ns=128 oracle rel=4.604e-05 (out 4.60e-05 / sq 1.96e-05, P1e-4)  f64 out=6.272e-06 sq=9.739e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=64  oracle rel=4.989e-05 (out 4.99e-05 / sq 1.96e-05, P1e-4)  f64 out=4.342e-06 sq=9.739e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=32  oracle rel=6.726e-05 (out 6.73e-05 / sq 1.96e-05, P1e-4)  f64 out=2.170e-05 sq=9.739e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=16  oracle rel=2.473e-05 (out 2.47e-05 / sq 1.96e-05, P1e-4)  f64 out=3.302e-05 sq=9.739e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=8   oracle rel=2.934e-05 (out 2.93e-05 / sq 1.96e-05, P1e-4)  f64 out=3.266e-05 sq=9.739e-08  norm out=0.1 sq=0.8  GATE PASS
+    ns=4   oracle rel=2.813e-05 (out 2.81e-05 / sq 1.96e-05, P1e-4)  f64 out=7.090e-05 sq=9.739e-08  norm out=0.2 sq=0.8  GATE PASS
+    ns=2   oracle rel=1.958e-05 (out 7.36e-06 / sq 1.96e-05, P1e-4)  f64 out=5.196e-05 sq=9.739e-08  norm out=0.4 sq=0.8  GATE PASS
+    ns=1   oracle rel=1.958e-05 (out 1.78e-06 / sq 1.96e-05, P1e-4)  f64 out=4.591e-05 sq=9.739e-08  norm out=0.7 sq=0.8  GATE PASS
+  [seed 5] strict split n=1  hc_mult=4 hidden=7168  oracle rel=2.60e-05 (out 9.64e-06 / sq 2.60e-05)  f64 out=1.41e-04 sq=9.55e-08  norm out=0.6 sq=0.8  GATE PASS  [legacy 1e-4: PASS]
+  [seed 5] blocked ladder n=1  hc_mult=4 hidden=7168:  (gate = legacy 1e-4)
+    ns=256 oracle rel=1.395e-04 (out 1.39e-04 / sq 2.60e-05, F1e-4)  f64 out=2.118e-05 sq=9.546e-08  norm out=0.0 sq=0.8  GATE FAIL
+    ns=128 oracle rel=1.454e-04 (out 1.45e-04 / sq 2.60e-05, F1e-4)  f64 out=3.319e-05 sq=9.546e-08  norm out=0.0 sq=0.8  GATE FAIL
+    ns=64  oracle rel=2.434e-04 (out 2.43e-04 / sq 2.60e-05, F1e-4)  f64 out=2.087e-04 sq=9.546e-08  norm out=0.1 sq=0.8  GATE FAIL
+    ns=32  oracle rel=2.620e-04 (out 2.62e-04 / sq 2.60e-05, F1e-4)  f64 out=2.273e-04 sq=9.546e-08  norm out=0.1 sq=0.8  GATE FAIL
+    ns=16  oracle rel=2.546e-04 (out 2.55e-04 / sq 2.60e-05, F1e-4)  f64 out=2.198e-04 sq=9.546e-08  norm out=0.1 sq=0.8  GATE FAIL
+    ns=8   oracle rel=2.415e-04 (out 2.41e-04 / sq 2.60e-05, F1e-4)  f64 out=2.068e-04 sq=9.546e-08  norm out=0.3 sq=0.8  GATE FAIL
+    ns=4   oracle rel=1.642e-04 (out 1.64e-04 / sq 2.60e-05, F1e-4)  f64 out=3.027e-05 sq=9.546e-08  norm out=0.2 sq=0.8  GATE FAIL
+    ns=2   oracle rel=1.388e-04 (out 1.39e-04 / sq 2.60e-05, F1e-4)  f64 out=1.041e-04 sq=9.546e-08  norm out=0.5 sq=0.8  GATE FAIL
+    ns=1   oracle rel=2.604e-05 (out 9.64e-06 / sq 2.60e-05, P1e-4)  f64 out=1.410e-04 sq=9.546e-08  norm out=0.6 sq=0.8  GATE PASS
+
+mhc_post (vs CPU reference, bf16 store):
+  n=1  hc=2 hidden=2     abs=7.1509e-03 rel=2.4019e-03  PASS
+  n=7  hc=4 hidden=5     abs=1.4932e-02 rel=3.7855e-03  PASS
+  n=1  hc=4 hidden=4096  abs=3.0088e-02 rel=3.8722e-03  PASS
+  n=7  hc=4 hidden=4096  abs=3.1231e-02 rel=3.8845e-03  PASS
+  n=1  hc=4 hidden=7168  abs=2.9481e-02 rel=3.8721e-03  PASS
+  n=4  hc=8 hidden=1024  abs=3.1247e-02 rel=3.8870e-03  PASS
+
+FAIL (38 failure(s))
+(legacy-gate run exits non-zero when blocked NSLICE rows exceed 1e-4 — EXPECTED, see issue #138; continuing)
+
+############ 2. BENCHMARK: MHC pre/post (mhc_bench) #####################
+GPU: AMD Instinct MI300A  arch=942  bf16=1307 TFLOP/s  HBM=5300 GB/s
+
+=== hip::mhc_pre_gemm_sqrsum ===
+     n hc_hidden hc_mult3  us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+     1        4      8      0.0       0.0      <res      <res   0.4  mem
+     1    16384     24    810.5     816.1     0.001       2.0   0.5  mem
+     7    16384     24    815.0     817.2     0.007       2.2   3.2  mem
+     1    28672     24   1414.6    1422.3     0.001       2.0   0.5  mem
+
+=== hip::mhc_pre_gemm_sqrsum (blocked, issue #79 experiment) ===
+     n hc_hidden hc_mult3  us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+     n hc_hidden hc_mult3     ns  us(min)   us(med)
+     1        4      8    256     0.00      0.00
+     1        4      8    128     0.00      0.00
+     1        4      8     64     0.00      0.00
+     1        4      8     32     0.00      0.00
+     1        4      8     16     0.00      0.00
+     1        4      8      8     0.00      0.00
+     1        4      8      4     0.00      0.00
+     1        4      8      2     0.00      0.00
+     1        4      8      1     0.00      0.00
+     n hc_hidden hc_mult3     ns  us(min)   us(med)
+     1    16384     24    256     0.00      0.00
+     1    16384     24    128     0.00      0.00
+     1    16384     24     64     0.00      0.00
+     1    16384     24     32    29.76     30.84
+     1    16384     24     16    41.28     43.48
+     1    16384     24      8    66.40     67.96
+     1    16384     24      4   117.24    119.72
+     1    16384     24      2   216.88    221.52
+     1    16384     24      1   412.32    417.16
+     n hc_hidden hc_mult3     ns  us(min)   us(med)
+     7    16384     24    256     0.00      0.00
+     7    16384     24    128     0.00      0.00
+     7    16384     24     64    25.36     27.00
+     7    16384     24     32    30.04     32.08
+     7    16384     24     16    42.60     44.44
+     7    16384     24      8    67.32     70.12
+     7    16384     24      4   119.76    122.04
+     7    16384     24      2   219.96    222.60
+     7    16384     24      1   419.80    422.20
+     n hc_hidden hc_mult3     ns  us(min)   us(med)
+     1    28672     24    256     0.00      0.00
+     1    28672     24    128    26.60     28.76
+     1    28672     24     64    34.96     37.60
+     1    28672     24     32    46.40     48.40
+     1    28672     24     16    67.64     70.32
+     1    28672     24      8   111.48    114.60
+     1    28672     24      4   200.24    203.72
+     1    28672     24      2   373.36    381.00
+     1    28672     24      1   718.00    725.88
+
+=== hip::mhc_post ===
+     n   hc hidden  us(min)   us(med)   TFLOP/s      GB/s    AI  bound
+     1    2      2      0.0       0.0      <res      <res   0.5  mem
+     1    4   4096      0.0       0.0      <res      <res   2.2  mem
+     7    4   4096      0.0       0.0      <res      <res   2.2  mem
+     1    4   7168      0.0       0.0      <res      <res   2.2  mem
+     4    8   1024      0.0       0.0      <res      <res   4.2  mem
+
+Roof: 1307 TFLOP/s bf16, 5300 GB/s HBM, ridge ~247 FLOP/B
+===== DONE 2026-09-18T09:57:18Z =====

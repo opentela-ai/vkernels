@@ -115,11 +115,14 @@ void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
                          const void* x, const void* fn,
                          void* out, void* sqrsum, void* stream = nullptr);
 
-// Blocked-order variant (issue #79 gate experiment): same GEMM, but out[n,o]
+// Blocked-order variant (issue #79 gate experiment, admissible under the
+// issue #138 fp64-reference gate): same GEMM, but out[n,o]
 // is accumulated as 256 contiguous-slice left-to-right chains combined in
 // thread order -- the closest parallel regrouping to the CPU oracle's strict
-// sequential chain. Whether it stays inside the associativity envelope is
-// decided empirically by test_mhc_correct (report-only rows).
+// sequential chain. Correctness is gated by test_mhc_correct's
+// conditioning-normalized fp64-reference comparison (order-invariant; the
+// legacy strict-1e-4 oracle-chain gate is available via VK_MHC_STRICT_GATE=1
+// and is NOT order-invariant).
 void mhc_pre_gemm_sqrsum_blocked(int num_tokens, int hc_mult3,
                                  int hc_hidden_size,
                                  const void* x, const void* fn,

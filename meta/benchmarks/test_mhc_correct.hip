@@ -166,6 +166,8 @@ struct PreStats {
   Stats f64_sq{};      // device sqrsum vs fp64 reference
   double norm_out{};   // GATE statistic: eps-normalized f64 error (out)
   double norm_sq{};    // GATE statistic: eps-normalized f64 error (sqrsum)
+                       // measured envelope (MI300A, 5 seeds, job 641091):
+                       // clean <= 0.9, corrupted >= 3.2e5, K = 256
 };
 
 PreStats run_pre(int num_tokens, int hc_mult, int hidden,
@@ -436,8 +438,10 @@ int main() {
   // gate (K * eps32 * sum|terms|); VK_MHC_STRICT_GATE=1 = legacy 1e-4
   // oracle-chain gate (the #79 policy). K overridable via VK_MHC_F64_K.
   const float PRE_THRESH = 1e-4f;   // legacy oracle-chain gate (kept)
-  double gate_k = 256.0;            // provisional; pinned from the measured
-                                    // multi-seed MI300A envelope
+  double gate_k = 256.0;            // pinned from the measured MI300A
+                                    // envelope (job 641091: worst clean
+                                    // norm 0.9 over 5 seeds x NSLICE 1..256
+                                    // x 3 shapes; corrupted control 3.2e5+)
   if (const char* e = std::getenv("VK_MHC_F64_K"))
     gate_k = std::strtod(e, nullptr);
   const char* strict_env = std::getenv("VK_MHC_STRICT_GATE");
