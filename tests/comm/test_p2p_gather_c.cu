@@ -524,14 +524,23 @@ TEST(P2pGatherPlan2dC, OffsetExecuteConcurrentStreams) {
   cudaStream_t s1, s2;
   ASSERT_TRUE(cudaStreamCreate(&s1) == cudaSuccess);
   ASSERT_TRUE(cudaStreamCreate(&s2) == cudaSuccess);
+  // Both executes target the SAME dst rows with different source offsets,
+  // so the final content depends on completion order. Order s2 after s1
+  // with an event so the offset-256 copy deterministically wins; the point
+  // of the test is that one immutable plan is safe to launch from two
+  // different streams (its device metadata is read-only after create).
+  cudaEvent_t s1_done;
+  ASSERT_TRUE(cudaEventCreate(&s1_done) == cudaSuccess);
   for (int i = 0; i < 4; ++i) {
     ASSERT_EQ(vkernels_p2p_plan_2d_execute_offset(plan, 0, s1), VKERNELS_OK);
+    ASSERT_TRUE(cudaEventRecord(s1_done, s1) == cudaSuccess);
+    ASSERT_TRUE(cudaStreamWaitEvent(s2, s1_done) == cudaSuccess);
     ASSERT_EQ(vkernels_p2p_plan_2d_execute_offset(plan, 256, s2), VKERNELS_OK);
   }
   ASSERT_TRUE(cudaStreamSynchronize(s1) == cudaSuccess);
   ASSERT_TRUE(cudaStreamSynchronize(s2) == cudaSuccess);
 
-  // Both streams wrote the same dst; last to finish (s2, offset 256) wins.
+  // s2 (offset 256) is event-ordered after s1, so it wrote dst last.
   std::vector<uint8_t> hdst(kCap, 0);
   ASSERT_TRUE(cudaMemcpy(hdst.data(), ddst, kCap, cudaMemcpyDeviceToHost) == cudaSuccess);
   for (size_t r = 0; r < 2; ++r)
@@ -539,6 +548,7 @@ TEST(P2pGatherPlan2dC, OffsetExecuteConcurrentStreams) {
       ASSERT_EQ(hdst[r * 32 + c], hsrc[256 + r * 256 + c]);
 
   vkernels_p2p_plan_2d_destroy(plan);
+  cudaEventDestroy(s1_done);
   cudaStreamDestroy(s1); cudaStreamDestroy(s2);
   cudaFree(dsrc); cudaFree(ddst);
 }

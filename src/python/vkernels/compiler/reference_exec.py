@@ -41,10 +41,12 @@ from .task_ir import TaskFamily
 __all__ = ["ExecutionTrace", "PhaseStat", "ReferenceExecutor", "ExecutorError", "decode_e4m3"]
 
 
-def _sigmoid(g):
-    """Overflow-stable elementwise sigmoid in fp64: 1/(1+e^-g) for g>=0,
-    e^g/(1+e^g) otherwise (avoids exp overflow warnings for gate <= -103,
-    where the device fp32 sigmoid saturates to exactly 0)."""
+def _stable_sigmoid(g: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid, fp64 mirror of the device epilogue
+    ``1 / (1 + exp(-g))`` (issue #92). Overflow-safe for large |g|: the
+    device computes exp(-g) directly, so huge negative g overflows to inf
+    and the ratio still rounds to 0; huge positive g underflows to 0 and
+    the ratio rounds to 1 — same saturating semantics, no NaN."""
     g = np.asarray(g, dtype=np.float64)
     out = np.empty_like(g)
     pos = g >= 0
@@ -156,22 +158,24 @@ class ReferenceExecutor:
             "embedding": self._body_embedding,
             "cache_append": self._body_cache_append,
             "gdn_conv": self._body_gdn_conv,
-            "cache_append_paged": self._body_cache_append_paged,
-            "gdn_delta": self._body_gdn_delta,
-            "kda_delta": self._body_kda_delta,
+            "compressor_append": self._body_compressor_append,
             "cache_append_paged": self._body_cache_append_paged,
             "mhc_pre": self._body_mhc_pre,
             "mhc_post": self._body_mhc_post,
+            "gdn_delta": self._body_gdn_delta,
+            "kda_delta": self._body_kda_delta,
             "attention_scores": self._body_attention_scores,
             "attention_scores_paged": self._body_attention_scores_paged,
             "softmax": self._body_softmax,
             "attention_values": self._body_attention_values,
             "attention_values_paged": self._body_attention_values_paged,
             "gemv_fp8": self._body_gemv_fp8,
-            "attention_values_paged": self._body_attention_values_paged,
             "moe_route": self._body_moe_route,
             "moe_expert": self._body_moe_expert,
             "moe_combine": self._body_moe_combine,
+            "mla_scores": self._body_mla_scores,
+            "mla_values": self._body_mla_values,
+            "conjugate_rope": self._body_conjugate_rope,
         }
         self._barrier_state = None
 
@@ -316,6 +320,27 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         bias = self.tensor(fam.inputs[2]) if fam.params["bias"] else None
         (m0, m1), (n0, n1) = self._gemm_box(fam, coords)
+        gh = fam.params.get("grouped_heads")
+        if gh:
+            # Block-diagonal per-head projection (issue #95 GroupedLinear):
+            # output n-range may span several heads; each head contributes
+            # only its own diagonal block (off-block entries NEVER read —
+            # the storage may hold NaN canaries there).
+            k_g = x.shape[1] // gh
+            n_g = w.shape[1] // gh
+            acc = np.zeros((m1 - m0, n1 - n0), dtype=np.float64)
+            for h in range(n0 // n_g, min(gh, (n1 + n_g - 1) // n_g)):
+                h_n0, h_n1 = max(n0, h * n_g), min(n1, (h + 1) * n_g)
+                x_blk = x[m0:m1, h * k_g:(h + 1) * k_g].astype(np.float64)
+                # w is stored [Cin, Cout]: block rows are the head's K slice,
+                # block columns the head's N slice.
+                w_blk = w[h * k_g:(h + 1) * k_g,
+                          h * n_g + (h_n0 - h * n_g):h * n_g + (h_n1 - h * n_g)].astype(np.float64)
+                acc[:, h_n0 - n0:h_n1 - n0] = x_blk @ w_blk
+            if bias is not None:
+                acc = acc + bias[n0:n1]
+            y[m0:m1, n0:n1] = acc.astype(y.dtype)
+            return
         acc = x[m0:m1, :].astype(np.float64) @ w[:, n0:n1].astype(np.float64)
         if bias is not None:
             acc = acc + bias[n0:n1]
@@ -327,6 +352,106 @@ class ReferenceExecutor:
         m0 = coords[0] * m_tile
         n0 = coords[1] * n_tile
         return (m0, min(m0 + m_tile, m_extent)), (n0, min(n0 + n_tile, n_extent))
+
+    def _body_conjugate_rope(self, fam: TaskFamily, coords, scalars) -> None:
+        """Conjugate (output-side) rope (issue #95): rotation by the NEGATIVE
+        angle — sin negated. Exact inverse of the q/k rotation."""
+        x = self.tensor(fam.inputs[0]).astype(np.float64)
+        cos_t = self.tensor(fam.inputs[1])
+        sin_t = self.tensor(fam.inputs[2])
+        y = self.tensor(fam.outputs[0])
+        b, h = coords
+        p = self._row_pos_value(fam, b, scalars)
+        rot = fam.params["rotary_dim"]
+        half = rot // 2
+        c = cos_t[p][:half].astype(np.float64)
+        s = sin_t[p][:half].astype(np.float64)  # applied NEGATED below
+        row = x[b, h]
+        if fam.params.get("convention", "interleaved") == "interleaved":
+            x_even, x_odd = row[0:rot:2], row[1:rot:2]
+            out = row.copy()
+            out[0:rot:2] = x_even * c + x_odd * s
+            out[1:rot:2] = x_odd * c - x_even * s
+        else:  # rotate_half conjugate
+            hh = row.shape[-1] // 2
+            rotated = np.concatenate((-row[hh:], row[:hh]), axis=-1)
+            out = row * cos_t[p].astype(np.float64) - rotated * sin_t[p].astype(np.float64)
+        y[b, h] = out.astype(y.dtype)
+
+    def _body_mla_scores(self, fam: TaskFamily, coords, scalars) -> None:
+        """MLA fused scores + softmax + sink (issue #95), fp64 oracle.
+
+        Candidate layout per (b, h): [W window | K compressed | 1 sink].
+        Window slot i holds logical cache position t = p - W + 1 + i
+        (sliding-window bound |q - t| < W, t <= q); slots with t < 0 or
+        t > p are invalid. Compressed slot j holds comp_idx[b, j] (valid
+        iff >= 0). fp64 two-pass softmax over valid candidates ∪ sink;
+        invalid slots exact 0.0 (§4.3).
+        """
+        q = self.tensor(fam.inputs[0]).astype(np.float64)
+        latent = self.tensor(fam.inputs[1]).astype(np.float64)
+        window_table = self.tensor(fam.inputs[2])
+        comp_pool = self.tensor(fam.inputs[3]).astype(np.float64)
+        comp_idx = self.tensor(fam.inputs[4])
+        sink = self.tensor(fam.inputs[5]).astype(np.float64)
+        bias = None
+        if len(fam.inputs) > 6:
+            bias = self.tensor(fam.inputs[6]).astype(np.float64)
+        y = self.tensor(fam.outputs[0])
+        b, h = coords
+        p = self._row_pos_value(fam, b, scalars)
+        W = fam.params["window"]
+        K = fam.params["comp_slots"]
+        scale = fam.params["scale"]
+        qb = q[b, h]
+        logits = np.full(W + K + 1, -np.inf, dtype=np.float64)
+        # window candidates: logical t in [max(0, p-W+1), p]
+        t_lo = max(0, p - W + 1)
+        for i in range(W):
+            t = p - W + 1 + i
+            if t_lo <= t <= p:
+                row = latent[b, int(window_table[b, t])]
+                lg = float(row @ qb) * scale
+                logits[i] = lg
+        # compressed candidates via the #97 indirection table
+        for j in range(K):
+            e = int(comp_idx[b, j])
+            if e >= 0:
+                lg = float(comp_pool[b, e] @ qb) * scale
+                if bias is not None:
+                    lg += float(bias[b, j])
+                logits[W + j] = lg
+        # sink: per-head learnable logit, always valid, LAST slot
+        logits[W + K] = float(sink[b, h]) if sink.ndim == 2 else float(sink[h])
+        m = logits.max()
+        e = np.exp(logits - m)
+        e[~np.isfinite(logits)] = 0.0  # invalid slots (logit -inf) exact zero
+        y[b, h, :] = (e / e.sum()).astype(y.dtype)
+
+    def _body_mla_values(self, fam: TaskFamily, coords, scalars) -> None:
+        """MLA context gather (issue #95): window + compressed pools, sink
+        column contributes no value. fp64 accumulation oracle."""
+        probs = self.tensor(fam.inputs[0]).astype(np.float64)
+        latent = self.tensor(fam.inputs[1]).astype(np.float64)
+        window_table = self.tensor(fam.inputs[2])
+        comp_pool = self.tensor(fam.inputs[3]).astype(np.float64)
+        comp_idx = self.tensor(fam.inputs[4])
+        y = self.tensor(fam.outputs[0])
+        b, h = coords
+        p = self._row_pos_value(fam, b, scalars)
+        W = fam.params["window"]
+        K = fam.params["comp_slots"]
+        acc = np.zeros(y.shape[2], dtype=np.float64)
+        t_lo = max(0, p - W + 1)
+        for i in range(W):
+            t = p - W + 1 + i
+            if t_lo <= t <= p:
+                acc += probs[b, h, i] * latent[b, int(window_table[b, t])]
+        for j in range(K):
+            e = int(comp_idx[b, j])
+            if e >= 0:
+                acc += probs[b, h, W + j] * comp_pool[b, e]
+        y[b, h, :] = acc.astype(y.dtype)
 
     def _body_gemv_fp8(self, fam: TaskFamily, coords, scalars) -> None:
         """fp8-blockwise GEMV reference (issue #91): dequant-then-matmul in fp64.
@@ -412,6 +537,70 @@ class ReferenceExecutor:
         idx[b, :] = idx_row
         bias[b, :] = bias_row
 
+    def _body_indexer_scores(self, fam: TaskFamily, coords, scalars) -> None:
+        """Lightning-indexer scoring reference (issue #97).
+
+        Mirrors the device contract of ``_t_indexer_scores``: per (batch,
+        entry tile), relu(<q_h, c_j>) * head_dim**-0.5 per indexer head,
+        then the f32/fp64 weighted head mix. fp64 accumulation stands in
+        for the device's f32 (oracle stability).
+        """
+        q = self.tensor(fam.inputs[0]).astype(np.float64)
+        c = self.tensor(fam.inputs[1]).astype(np.float64)
+        w = self.tensor(fam.inputs[2]).astype(np.float64)
+        s = self.tensor(fam.outputs[0])
+        scale = fam.params["scale"]
+        (m_extent, m_tile) = fam.domain.dims[1]
+        b, t = coords
+        m0, m1 = t * m_tile, min(t * m_tile + m_tile, m_extent)
+        # [H, tile]: relu of the per-head dots, scaled.
+        scores = np.maximum(q[b] @ c[b, m0:m1].T, 0.0) * scale
+        s[b, m0:m1] = (scores * w[b][:, None]).sum(axis=0).astype(s.dtype)
+
+    def _body_index_topk(self, fam: TaskFamily, coords, scalars) -> None:
+        """Fixed-count top-k selection reference (issue #97).
+
+        Mirrors the device contract of ``_t_index_topk`` exactly:
+        rank(j) = #{valid i : s_i > s_j} + #{valid i < j : s_i == s_j} —
+        descending score with deterministic lowest-index tie-break; NaN
+        scores inside the valid prefix are excluded; candidates at or
+        beyond the row's valid count are never observed; slots beyond a
+        row's valid count are idx=-1 / bias=0.0; bias = s_j / ||s_valid||_2.
+        """
+        s = self.tensor(fam.inputs[0]).astype(np.float64)
+        valid = self.tensor(fam.inputs[1])
+        idx = self.tensor(fam.outputs[0])
+        bias = self.tensor(fam.outputs[1])
+        k = fam.params["k"]
+        (b,) = coords
+        row = s[b]
+        m = row.shape[0]
+        vc = int(valid[b])
+        vc = max(0, min(vc, m))
+        valid_mask = np.zeros(m, dtype=bool)
+        valid_mask[:vc] = True
+        finite = np.isfinite(row)
+        cand = valid_mask & finite  # NaN canaries inside the prefix lose
+        # rank by comparison counting (the template's exact tie-break).
+        gt = (row[None, :] > row[:, None]) & cand[None, :]
+        eq_lower = (row[None, :] == row[:, None]) & cand[None, :] & (np.arange(m)[None, :] < np.arange(m)[:, None])
+        rank = gt.sum(axis=1) + eq_lower.sum(axis=1)
+        sel = cand & (rank < k)
+        idx_row = np.full(k, -1, dtype=np.int32)
+        bias_row = np.zeros(k, dtype=bias.dtype)
+        sel_idx = np.nonzero(sel)[0]
+        idx_row[rank[sel_idx]] = sel_idx.astype(np.int32)
+        if vc > 0:
+            valid_finite = row[:vc][finite[:vc]]
+            norm = np.sqrt((valid_finite**2).sum()) if valid_finite.size else 0.0
+        else:
+            norm = 0.0
+        if norm > 0.0:
+            bias_row[rank[sel_idx]] = (row[sel_idx] / norm).astype(bias.dtype)
+        idx[b, :] = idx_row
+        bias[b, :] = bias_row
+
+
     def _body_layernorm(self, fam: TaskFamily, coords, scalars) -> None:
         x = self.tensor(fam.inputs[0]).astype(np.float64)
         g = self.tensor(fam.inputs[1])
@@ -455,13 +644,13 @@ class ReferenceExecutor:
             b, h = coords
             row, g_row = x[b, h], gate[b, h]
             y[b, h] = (
-                row * np.reciprocal(np.sqrt((row * row).mean() + eps)) * g * _sigmoid(g_row)
+                row * np.reciprocal(np.sqrt((row * row).mean() + eps)) * g * _stable_sigmoid(g_row)
             ).astype(y.dtype)
         else:
             r = coords[0]
             row, g_row = x[r], gate[r]
             y[r] = (
-                row * np.reciprocal(np.sqrt((row * row).mean() + eps)) * g * _sigmoid(g_row)
+                row * np.reciprocal(np.sqrt((row * row).mean() + eps)) * g * _stable_sigmoid(g_row)
             ).astype(y.dtype)
 
     def _body_rope(self, fam: TaskFamily, coords, scalars) -> None:
@@ -485,6 +674,22 @@ class ReferenceExecutor:
             out = row.copy()
             out[:half] = x1 * c - x2 * s
             out[half:rot] = x2 * c + x1 * s
+            y[b, h] = out.astype(y.dtype)
+            return
+        if fam.params.get("convention", "rotate_half") == "interleaved":
+            # GPT-J adjacent-pair rotation (issue #95, DeepSeek-V4): pairs
+            # (2i, 2i+1), c/s indexed by PAIR index i at the row's position;
+            # dims [rotary_dim, D) pass through. PINNED convention: pair
+            # stride 2, tables [max_pos, rotary_dim//2], c_i = cos[p, i],
+            # s_i = sin[p, i].
+            rot = fam.params["rotary_dim"]
+            half = rot // 2
+            c = cos_t[p][:half].astype(np.float64)
+            s = sin_t[p][:half].astype(np.float64)
+            x_even, x_odd = row[0:rot:2], row[1:rot:2]
+            out = row.copy()
+            out[0:rot:2] = x_even * c - x_odd * s
+            out[1:rot:2] = x_odd * c + x_even * s
             y[b, h] = out.astype(y.dtype)
             return
         half = row.shape[-1] // 2
@@ -532,6 +737,56 @@ class ReferenceExecutor:
             row = row + pos[self._row_pos_value(fam, b, scalars), c0:c1].astype(np.float64)
         y[b, c0:c1] = row.astype(y.dtype)
 
+    def _body_compressor_append(self, fam: TaskFamily, coords, scalars) -> None:
+        """Issue #96: emit one compressed entry at the m-token boundary.
+
+        One task per (batch, layer). Rows not at a boundary (``p % m !=
+        m-1``) are exact no-ops. Emission (fp32 accumulated, mirrored in
+        fp64 here — tile-exact against the device contract):
+
+            w = softmax(gates[b]) ; e = Σ_t w_t·window[b,t]
+            e = e/sqrt(mean(e²)+eps)·rms_weight ; e = rotate_half(e, cos[b], sin[b])
+            entry_pool[b,l,slot,cb_len,:] = bf16(e)
+
+        then series bookkeeping: cb_len += 1; at cb_len == r//m the
+        completed Cb becomes Ca (slots ping-pong) and Cb restarts.
+        """
+        pool = self.tensor(fam.inputs[0])
+        state = self.tensor(fam.inputs[1])
+        window = self.tensor(fam.inputs[2])
+        gates = self.tensor(fam.inputs[3])
+        rms_w = self.tensor(fam.inputs[4])
+        cos = self.tensor(fam.inputs[5])
+        sin = self.tensor(fam.inputs[6])
+        b, l = coords
+        p = self._row_pos_value(fam, b, scalars)
+        m = fam.params["m"]
+        if p % m != m - 1:
+            return  # not a boundary token for this row: exact no-op
+        R = fam.params["r"] // m
+        eps = fam.params["eps"]
+        slot = int(state[b, l, 0])
+        cb_len = int(state[b, l, 1])
+        # fp32-accumulated emission (fp64 mirror here, tile-exact rounding
+        # applied only at the bf16 store).
+        g = gates[b].astype(np.float64)
+        gmax = g.max()
+        ex = np.exp(g - gmax)
+        w = ex / ex.sum()
+        e = (w[:, None] * window[b].astype(np.float64)).sum(axis=0)
+        e = e * np.reciprocal(np.sqrt((e * e).mean() + eps)) * rms_w.astype(np.float64)
+        half = e.shape[0] // 2
+        ch, sh = cos[b].astype(np.float64), sin[b].astype(np.float64)
+        e1, e2 = e[:half], e[half:]
+        e_rot = np.concatenate([e1 * ch - e2 * sh, e2 * ch + e1 * sh])
+        pool[b, l, slot, cb_len, :] = e_rot.astype(pool.dtype)
+        cb_len += 1
+        if cb_len == R:
+            state[b, l, 0] = 1 - slot
+            state[b, l, 1] = 0
+        else:
+            state[b, l, 1] = cb_len
+
     def _body_cache_append(self, fam: TaskFamily, coords, scalars) -> None:
         k_cache = self.tensor(fam.inputs[0])
         v_cache = self.tensor(fam.inputs[1])
@@ -573,7 +828,7 @@ class ReferenceExecutor:
         k_new = self.tensor(fam.inputs[3])
         v_new = self.tensor(fam.inputs[4])
         b, h = coords
-        p = int(scalars["p"])
+        p = self._row_pos_value(fam, b, scalars)  # #93 ragged: per-row bound
         slot = int(table[b, p])  # write lands at slot_table[b, p_row] (#94)
         k_pool[slot, h, :] = k_new[b, h, :]
         v_pool[slot, h, :] = v_new[b, h, :]
@@ -585,7 +840,7 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         b, h = coords
         kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
-        p = int(scalars["p"])
+        p = self._row_pos_value(fam, b, scalars)  # #93 ragged: per-row bound
         scale = fam.params["scale"]
         # Gathered masked load: only positions [0, p] map through the table;
         # slot 0 is the reserved null/sink page (never written by a live row).
@@ -599,10 +854,81 @@ class ReferenceExecutor:
         y = self.tensor(fam.outputs[0])
         b, h = coords
         kvh = h // fam.params["group"] if fam.params.get("group", 1) > 1 else h
-        p = int(scalars["p"])
+        p = self._row_pos_value(fam, b, scalars)  # #93 ragged: per-row bound
         # Gathered masked: V rows beyond p are never gathered (NaN slots must not leak).
         slots = table[b, : p + 1].astype(np.int64)
         y[b, h, :] = (probs[b, h, : p + 1] @ v_pool[slots, kvh, :]).astype(y.dtype)
+    def _body_mhc_pre(self, fam: TaskFamily, coords, scalars) -> None:
+        """mHC hyper-connection pre-mix over one batch row.
+
+        fp64 oracle arithmetic mirroring floe
+        ``DeepseekV4HyperConnection.forward`` / ``Glm53HyperConnection``
+        (device math is fp32; the fp64 mirror is the bare-environment
+        oracle pin — issue #99 validation doctrine): unweighted RMSNorm
+        over the flattened streams, one [mix, hc·C] GEMV projection,
+        sigmoid pre/post gates, softmax + Sinkhorn-Knopp alternate row/col
+        normalization (eps inside every denominator) and the pre-weighted
+        stream collapse.
+        """
+        streams = self.tensor(fam.inputs[0])  # [B, hc, C]
+        fn = self.tensor(fam.inputs[1])  # [mix, hc·C]
+        base = self.tensor(fam.inputs[2])  # [mix]
+        scale = self.tensor(fam.inputs[3])  # [3]
+        h_in = self.tensor(fam.outputs[0])  # [B, C]
+        post_o = self.tensor(fam.outputs[1])  # [B, hc]
+        comb_out = self.tensor(fam.outputs[2])  # [B, hc, hc]
+        (bb,) = coords
+        hc, C = streams.shape[1], streams.shape[2]
+        iters, eps = int(fam.params["iters"]), float(fam.params["eps"])
+        rms_eps = float(fam.params["rms_eps"])
+
+        flat = streams[bb].astype(np.float64).reshape(-1)  # [hc·C]
+        flat = flat / np.sqrt(np.mean(flat * flat) + rms_eps)  # unweighted RMSNorm
+        # floe F.linear(flat, fn) — NO bias on the projection; base enters
+        # only inside the gates below (adding it here double-counts it)
+        logits = fn.astype(np.float64) @ flat  # [mix]
+        pre_w, post_w, comb_w = (
+            logits[:hc], logits[hc : 2 * hc], logits[2 * hc :].reshape(hc, hc),
+        )
+        pre_s, post_s, comb_s = (float(scale[0]), float(scale[1]), float(scale[2]))
+        pre_b, post_b, comb_b = (
+            base.astype(np.float64)[:hc],
+            base.astype(np.float64)[hc : 2 * hc],
+            base.astype(np.float64)[2 * hc :].reshape(hc, hc),
+        )
+
+        pre = 1.0 / (1.0 + np.exp(-(pre_w * pre_s + pre_b))) + eps
+        post = 2.0 / (1.0 + np.exp(-(post_w * post_s + post_b)))
+        comb_logits = comb_w * comb_s + comb_b
+        comb_logits = comb_logits - comb_logits.max(axis=-1, keepdims=True)
+        comb = np.exp(comb_logits)
+        comb = comb / comb.sum(axis=-1, keepdims=True) + eps
+        # Sinkhorn-Knopp: initial column normalization, then (iters−1)
+        # alternate row/col passes — eps inside every denominator, exactly
+        # as floe conditions them.
+        comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
+        for _ in range(iters - 1):
+            comb = comb / (comb.sum(axis=-1, keepdims=True) + eps)
+            comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
+
+        h_in[bb] = (pre[:, None] * streams[bb].astype(np.float64)).sum(axis=0).astype(h_in.dtype)
+        post_o[bb] = post.astype(post_o.dtype)
+        comb_out[bb] = comb.astype(comb_out.dtype)
+
+    def _body_mhc_post(self, fam: TaskFamily, coords, scalars) -> None:
+        """mHC post-compose over one (batch, stream j) task (fp64 mirror of
+        floe ``_mhc_compose``):
+        ``streams'[j] = post[j]·body_out + Σ_k comb[k, j]·streams[k]``."""
+        streams = self.tensor(fam.inputs[0])  # [B, hc, C]
+        body_out = self.tensor(fam.inputs[1])  # [B, C]
+        post_w = self.tensor(fam.inputs[2])  # [B, hc]
+        comb = self.tensor(fam.inputs[3])  # [B, hc, hc]
+        streams_post = self.tensor(fam.outputs[0])  # [B, hc, C]
+        bb, j = coords
+        acc = (comb[bb, :, j].astype(np.float64)[:, None] * streams[bb].astype(np.float64)).sum(axis=0)
+        acc = acc + float(post_w[bb, j]) * body_out[bb].astype(np.float64)
+        streams_post[bb, j] = acc.astype(streams_post.dtype)
+
     def _body_gdn_delta(self, fam: TaskFamily, coords, scalars) -> None:
         """Gated delta rule decode step over one (batch, value head) task.
 
@@ -703,76 +1029,6 @@ class ReferenceExecutor:
         # plain readout; gated norm (rms_norm_gated) is a separate op
         o = (s * qn[:, None]).sum(axis=0)  # [V] = sum_k s[k,v]*qn[k]
         out[bb, h] = o.astype(out.dtype)
-    def _body_mhc_pre(self, fam: TaskFamily, coords, scalars) -> None:
-        """mHC hyper-connection pre-mix over one batch row.
-
-        fp64 oracle arithmetic mirroring floe
-        ``DeepseekV4HyperConnection.forward`` / ``Glm53HyperConnection``
-        (device math is fp32; the fp64 mirror is the bare-environment
-        oracle pin — issue #99 validation doctrine): unweighted RMSNorm
-        over the flattened streams, one [mix, hc·C] GEMV projection,
-        sigmoid pre/post gates, softmax + Sinkhorn-Knopp alternate row/col
-        normalization (eps inside every denominator) and the pre-weighted
-        stream collapse.
-        """
-        streams = self.tensor(fam.inputs[0])  # [B, hc, C]
-        fn = self.tensor(fam.inputs[1])  # [mix, hc·C]
-        base = self.tensor(fam.inputs[2])  # [mix]
-        scale = self.tensor(fam.inputs[3])  # [3]
-        h_in = self.tensor(fam.outputs[0])  # [B, C]
-        post_o = self.tensor(fam.outputs[1])  # [B, hc]
-        comb_out = self.tensor(fam.outputs[2])  # [B, hc, hc]
-        (bb,) = coords
-        hc, C = streams.shape[1], streams.shape[2]
-        iters, eps = int(fam.params["iters"]), float(fam.params["eps"])
-        rms_eps = float(fam.params["rms_eps"])
-
-        flat = streams[bb].astype(np.float64).reshape(-1)  # [hc·C]
-        flat = flat / np.sqrt(np.mean(flat * flat) + rms_eps)  # unweighted RMSNorm
-        # floe F.linear(flat, fn) — NO bias on the projection; base enters
-        # only inside the gates below (adding it here double-counts it)
-        logits = fn.astype(np.float64) @ flat  # [mix]
-        pre_w, post_w, comb_w = (
-            logits[:hc], logits[hc : 2 * hc], logits[2 * hc :].reshape(hc, hc),
-        )
-        pre_s, post_s, comb_s = (float(scale[0]), float(scale[1]), float(scale[2]))
-        pre_b, post_b, comb_b = (
-            base.astype(np.float64)[:hc],
-            base.astype(np.float64)[hc : 2 * hc],
-            base.astype(np.float64)[2 * hc :].reshape(hc, hc),
-        )
-
-        pre = 1.0 / (1.0 + np.exp(-(pre_w * pre_s + pre_b))) + eps
-        post = 2.0 / (1.0 + np.exp(-(post_w * post_s + post_b)))
-        comb_logits = comb_w * comb_s + comb_b
-        comb_logits = comb_logits - comb_logits.max(axis=-1, keepdims=True)
-        comb = np.exp(comb_logits)
-        comb = comb / comb.sum(axis=-1, keepdims=True) + eps
-        # Sinkhorn-Knopp: initial column normalization, then (iters−1)
-        # alternate row/col passes — eps inside every denominator, exactly
-        # as floe conditions them.
-        comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
-        for _ in range(iters - 1):
-            comb = comb / (comb.sum(axis=-1, keepdims=True) + eps)
-            comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
-
-        h_in[bb] = (pre[:, None] * streams[bb].astype(np.float64)).sum(axis=0).astype(h_in.dtype)
-        post_o[bb] = post.astype(post_o.dtype)
-        comb_out[bb] = comb.astype(comb_out.dtype)
-
-    def _body_mhc_post(self, fam: TaskFamily, coords, scalars) -> None:
-        """mHC post-compose over one (batch, stream j) task (fp64 mirror of
-        floe ``_mhc_compose``):
-        ``streams'[j] = post[j]·body_out + Σ_k comb[k, j]·streams[k]``."""
-        streams = self.tensor(fam.inputs[0])  # [B, hc, C]
-        body_out = self.tensor(fam.inputs[1])  # [B, C]
-        post_w = self.tensor(fam.inputs[2])  # [B, hc]
-        comb = self.tensor(fam.inputs[3])  # [B, hc, hc]
-        streams_post = self.tensor(fam.outputs[0])  # [B, hc, C]
-        bb, j = coords
-        acc = (comb[bb, :, j].astype(np.float64)[:, None] * streams[bb].astype(np.float64)).sum(axis=0)
-        acc = acc + float(post_w[bb, j]) * body_out[bb].astype(np.float64)
-        streams_post[bb, j] = acc.astype(streams_post.dtype)
 
     def _body_attention_scores(self, fam: TaskFamily, coords, scalars) -> None:
         q = self.tensor(fam.inputs[0]).astype(np.float64)
@@ -910,4 +1166,11 @@ class ReferenceExecutor:
         vlen = self._valid_len(fam, b, scalars)
         # Masked: V rows beyond pos[b] are never loaded (per-row NaN-tail
         # contract, issue #93).
-        y[b, h, :] = (probs[b, h, :vlen] @ v_cache[b, kvh, :vlen, :]).astype(y.dtype)
+        acc = probs[b, h, :vlen] @ v_cache[b, kvh, :vlen, :]
+        if fam.params.get("gated", False):
+            # Issue #92: per-head sigmoid output gate fused into the values
+            # task — fp64 reference of the device's fp32 epilogue
+            # y = acc * sigmoid(gate[b,h,:]) with no extra barrier.
+            gate = self.tensor(fam.inputs[2]).astype(np.float64)
+            acc = acc * _stable_sigmoid(gate[b, h, :])
+        y[b, h, :] = acc.astype(y.dtype)

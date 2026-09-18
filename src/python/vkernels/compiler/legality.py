@@ -21,10 +21,22 @@ POSITION_CONSUMERS = frozenset(
     {
         "embedding",
         "cache_append",
+        "compressor_append",
         "attention_scores",
         "softmax",
         "attention_values",
         "rope",
+        # MLA decode (issue #95): fused latent-attention scores/values and
+        # the conjugate output-side rope all bind the runtime decode position
+        # (window bound t in (p-W, p], per-row rope position).
+        "cache_append_paged",
+        "attention_scores_paged",
+        "attention_values_paged",
+        "mla_scores",
+        "mla_values",
+        "conjugate_rope",
+        # #94 paged trio: same runtime-bound contracts as their dense twins,
+        # extended to the per-row form (issue #93 x #94 composition).
     }
 )
 
