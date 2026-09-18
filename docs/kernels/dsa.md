@@ -140,11 +140,13 @@ delegates to the plain kernel (null scratch allowed).
 
 The recommended split comes from `dsa_sparse_fwd_split_for(S_q, H,
 topk, block_I, num_cu)`: 1 for prefill (the plain grid already fills
-the CUs), else `min(ceil(sqrt(2*topk)), topk)` for decode — fitted to
-the measured sweep (`docs/performance/dsa/gfx942.md`): the optimum sits
-at 8–32 keys per split (the serial chain, NOT CU filling, binds; the
-indexer's floor formula is 5–6x off here), and the sqrt fit lands on
-the measured best on all four decode shapes (20.0x at full topk).
+the CUs), else `32` for `topk >= 1024` and `min(topk, 16)` for decode —
+re-fitted to the issue-#137 sweep after the vectorized partial landed
+(`docs/performance/dsa/gfx942.md`): the unfused vectorized kernel
+measures 99.0 us / 679 GB/s at topk=2048 split=32 (the pre-#137 serial
+floor was 156-169 us at split=64) and 40.0/31.2 us at split=8 for
+topk=256/128, so the band recommendation sits on the measured optimum
+or within ~2% of it on all four decode shapes (31.9x at full topk).
 
 ## C ABI
 

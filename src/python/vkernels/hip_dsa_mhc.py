@@ -293,14 +293,19 @@ def dsa_split_for(s_q: int, h: int, topk: int, block_i: int = 1) -> int:
     """Recommended ``split_kv`` (dsa.hpp, issue #51 follow-up, MI300A):
 
     ``1`` when the plain grid already fills the CUs (prefill — splitting
-    would only add combine traffic), else ``ceil(sqrt(2*topk))`` (lands on
-    the measured best or nearest neighbour on all four swept decode
-    shapes: 2048→64 = measured best 19.7x, 256→23 (best 16), 128→16).
+    would only add combine traffic), else ``32`` for ``topk >= 1024`` and
+    ``min(topk, 16)`` otherwise (issue #137 re-fit, jobs 641060/641089/
+    641098: the unfused vectorized partial measures 99.0 us / 679 GB/s at
+    topk=2048 split=32 — the old ceil(sqrt(2*topk)) → 64 serial floor was
+    156-169 us — and 40.0/31.2 us at split=8 for topk=256/128, within ~2%
+    of the band-16 recommendation; DSv3 keeps 16 in the db regime).
     Pure arithmetic on documented device constants.
     """
     if -(-s_q // block_i) * h >= NUM_CU_GFX942:
         return 1
-    return min(int(math.ceil(math.sqrt(2 * topk))), int(topk))
+    if topk >= 1024:
+        return 32
+    return min(int(topk), 16)
 
 
 def dsa_sparse_fwd_split(
