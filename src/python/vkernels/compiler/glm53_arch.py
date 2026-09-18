@@ -195,11 +195,18 @@ class _LazyWeight:
         raise RuntimeError("lazy weight materialized outside compile-only mode")
 
 
-def random_glm53_weights(cfg: Glm53Config, seed: int = 20260917, *, real_experts: bool = True) -> Glm53Weights:
+def random_glm53_weights(
+    cfg: Glm53Config, seed: int = 20260917, *, real_experts: bool = True, realize: bool = True
+) -> Glm53Weights:
+    """Random GLM-5.3 weights. ``realize=False`` returns lazy ``np.zeros``
+    placeholders with the real shapes instead of drawn values — the
+    real-dims compile smoke (~20 GB of fp64 weight draws at the published
+    dims, 12 layers) only exercises shapes, never values; lazy zeros keep
+    the compile-only path at ~0 RSS (untouched calloc pages)."""
     rng = np.random.default_rng(seed)
 
     def n(*shape: int, s: float = 0.05) -> np.ndarray:
-        return rng.normal(0.0, s, size=shape)
+        return rng.normal(0.0, s, size=shape) if realize else np.zeros(shape)
 
     C, H, D = cfg.hidden_size, cfg.linear_num_heads, cfg.linear_head_dim
     qkv, I, Imoe, E = cfg.qkv_dim, cfg.intermediate_size, cfg.moe_intermediate_size, cfg.n_routed_experts

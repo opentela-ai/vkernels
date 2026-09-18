@@ -61,7 +61,8 @@ TOL = 1.5e-4  # fp32 storage vs fp64 mirror (deep 3-layer stack, squashing gates
 
 def _compile(cfg: Glm53Config, seed: int, batch: int, workers: int, *, materialize_hosts: bool = True):
     recorder = RecordingBackend()
-    weights = random_glm53_weights(cfg, seed=seed, real_experts=materialize_hosts)
+    weights = random_glm53_weights(cfg, seed=seed, real_experts=materialize_hosts,
+                                   realize=materialize_hosts)
     args = Glm53ModelArgs(recorder, cfg, weights, batch=batch, materialize_hosts=materialize_hosts)
     out = build_glm53_forward(recorder, args)
     graph = recorder.graph
@@ -329,7 +330,8 @@ def test_real_dims_state_pool_count():
     from vkernels.compiler.glm53_arch import real_glm53_dims_config
     cfg = real_glm53_dims_config(num_hidden_layers=12)
     rec = RecordingBackend()
-    args = Glm53ModelArgs(rec, cfg, random_glm53_weights(cfg, seed=29, real_experts=False),
+    args = Glm53ModelArgs(rec, cfg, random_glm53_weights(cfg, seed=29, real_experts=False,
+                                                          realize=False),
                           batch=1, materialize_hosts=False)
     build_glm53_forward(rec, args)
     assert len(args.conv_state) == 12 and len(args.ssm_state) == 12
