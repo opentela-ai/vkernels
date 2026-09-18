@@ -125,6 +125,7 @@ EXPECTED_KERNELS = [
     ("kda_chunked_phase_times", "kda"),
     ("kda_pack_bitmatrix", "kda"),
     ("mhc_pre_gemm_sqrsum_cpu", "mhc"),
+    ("mhc_pre_gemm_sqrsum_cpu_f64", "mhc"),
     ("mhc_post_cpu", "mhc"),
     ("mhc_pre_gemm_sqrsum", "mhc"),
     ("mhc_pre_gemm_sqrsum_blocked", "mhc"),
