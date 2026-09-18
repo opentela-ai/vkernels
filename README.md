@@ -6,6 +6,12 @@ beside them. Everything ships with a **CPU reference implementation** so it can 
 and measured for coverage on machines **without a GPU**, and a CUDA implementation that is
 compiled automatically when a CUDA toolkit is present.
 
+> **Documentation in depth:** the [project wiki](https://github.com/opentela-ai/vkernels/wiki)
+> distills the engineering knowledge — the roofline method, the kernel optimization ladder,
+> occupancy/latency findings, cross-architecture lessons (MI300A vs GB10 vs MI250X), numerics
+> and oracle contracts, LDS layout, CUDA-graph capture rules, debugging case files, and the
+> per-kernel catalog with gaps to speed of light.
+
 ## Layout
 
 ```
