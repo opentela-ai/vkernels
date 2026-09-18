@@ -70,11 +70,12 @@ EOF
       hipcc -O2 -o "$T/tiny" "$T/tiny.hip" 2>&1 | tail -2
       "$T/tiny"; echo "tiny-kernel rc=$?"
       rocprof --version 2>&1 | head -2
-      # rocprof exits non-zero even on successful collection
-      rocprof --stats -o "$T/rp_clean" "$T/tiny" >"$T/rocprof.log" 2>&1 || true
+      # rocprof exits non-zero even on successful collection; rocprof 6.3
+      # requires the output name to end in uppercase .CSV
+      rocprof --stats -o "$T/rp_clean.CSV" "$T/tiny" >"$T/rocprof.log" 2>&1 || true
       tail -5 "$T/rocprof.log"
       echo "--- artifacts produced:"; ls -la "$T" | grep -v tiny.hip
-      CSV=$(ls "$T"/rp_clean*.csv "$T"/*.csv 2>/dev/null | head -1)
+      CSV=$(ls "$T"/rp_clean*.CSV "$T"/rp_clean*.csv "$T"/*.csv 2>/dev/null | head -1)
       if [ -n "${CSV:-}" ]; then
         echo "--- clean capture: $CSV"
         "$PY" "$HERE/issue45_rocprof_attention_assert.py" "$CSV" --json "$T/ac3_clean.json" \
