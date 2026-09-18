@@ -268,6 +268,16 @@ if(VKERNELS_HAS_HIP)
   target_compile_features(test_mla_correct PRIVATE cxx_std_17)
   vkernels_set_warnings(test_mla_correct)
 
+  # MLA stream/graph-capture safety (issues #45/#69): exercises the C ABI
+  # entry `vk_hip_mla_fwd_stream` under hipStreamBeginCapture — cold
+  # workspace (fallback path), warm workspace (split path in the graph),
+  # re-feed replay, and legacy/stream parity. vkernels for the CPU oracle,
+  # vkernels_hip for the C ABI (vk_hip_mla_fwd / vk_hip_mla_fwd_stream).
+  add_executable(test_mla_capture test_mla_capture.hip)
+  target_link_libraries(test_mla_capture PRIVATE vkernels::vkernels vkernels::vkernels_hip)
+  target_compile_features(test_mla_capture PRIVATE cxx_std_17)
+  vkernels_set_warnings(test_mla_capture)
+
   add_executable(test_kda_correct test_kda_correct.hip)
   target_link_libraries(test_kda_correct PRIVATE vkernels::vkernels)
   target_compile_features(test_kda_correct PRIVATE cxx_std_17)
