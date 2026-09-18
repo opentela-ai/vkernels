@@ -544,7 +544,6 @@ def _simulate_t_index_topk(s, valid, k, workers, tile):
     row, fp32 rank-by-comparison-counting sweep, -1/0.0 fill then rank-
     addressed scatter, bias = s / ||s_valid||_2 in fp32."""
     b, m = s.shape
-    kp = _next_pow2(k)
     idx = np.full((b, k), -2, dtype=np.int32)  # -2 sentinel: must be overwritten by fill/scatter
     bias = np.full((b, k), np.nan, dtype=np.float32)
     for wk in range(workers):
@@ -688,6 +687,7 @@ def test_device_t_indexer_scores_and_topk_match_oracle():
     pytest.importorskip("triton")
     import torch
 
+    from tests.python._megakernel_launch import launch_task_body
     from vkernels.compiler.device_triton import _t_index_topk, _t_indexer_scores
 
     b, h, d, m, k = 2, 4, 32, 256, 32
@@ -702,12 +702,12 @@ def test_device_t_indexer_scores_and_topk_match_oracle():
     c_t = torch.from_numpy(c).to(dev)
     w_t = torch.from_numpy(w).to(dev)
     s_t = torch.empty(b, m, device=dev, dtype=torch.float32)
-    _t_indexer_scores[(4,)](q_t, c_t, w_t, s_t, b, h, d, m, 64, d**-0.5, num_warps=4)
+    launch_task_body(_t_indexer_scores, q_t, c_t, w_t, s_t, b, h, d, m, 64, d**-0.5)
 
     idx_t = torch.full((b, k), -1, device=dev, dtype=torch.int32)
     bias_t = torch.empty(b, k, device=dev, dtype=torch.float32)
     vc_t = torch.from_numpy(vc).to(dev)
-    _t_index_topk[(2,)](s_t, vc_t, idx_t, bias_t, b, m, k, _next_pow2(k), 128, num_warps=4)
+    launch_task_body(_t_index_topk, s_t, vc_t, idx_t, bias_t, b, m, k, _next_pow2(k), 128)
     torch.cuda.synchronize()
 
     oracle_s = _oracle_scores(q, c, w, d**-0.5)

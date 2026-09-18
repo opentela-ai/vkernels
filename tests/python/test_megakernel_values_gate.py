@@ -139,7 +139,7 @@ def test_hazards_order_projection_before_gated_values():
     gate = ops.view_of(gate_flat, "gate_view", (B, H, D))     # per-(b,h) rows
     sc = ops.attention_scores(q, kc, position, scale=0.5, layer=0)
     pr = ops.softmax(sc, position, layer=0)
-    ctx = ops.attention_values(pr, vc, position, layer=0, gate=gate)
+    ops.attention_values(pr, vc, position, layer=0, gate=gate)
     hazards = compute_hazards(ops.graph.ops)
     raw = {(h.producer, h.consumer) for h in hazards if h.kind == "RAW"}
     assert any(
@@ -360,8 +360,7 @@ def test_single_launch_accounting_gated_vs_ungated():
         exe = ReferenceExecutor(sched, workers=2, storage_arrays=st, graph=ops.graph, workspace_plan=ws_plan, canary=True)
         trace = exe.run({})
         traces[gated] = (trace.kernel_launches, trace.phases if hasattr(trace, "phases") else None, sched)
-        fams = lower_graph(ops.graph)
-        n_tasks = sum(len(f.domain_coords() if hasattr(f, "domain_coords") else []) or 0 for f in fams)
+        lower_graph(ops.graph)
     assert traces[True][0] == traces[False][0] == 1
     # identical phase structure
     fams_g = [f.kind for f in lower_graph(_gated_attention_graph(B, H, S, D, kv_heads=kv_heads, gated=True)[0].graph)]
@@ -420,8 +419,8 @@ def test_device_template_parity_cuda():
     pytest.importorskip("torch")
     pytest.importorskip("triton")
     import torch
-    import triton
 
+    from tests.python._megakernel_launch import launch_task_body
     from vkernels.compiler.device_triton import _t_values, _t_values_gated
 
     B, H, KVH, S, D = 3, 4, 2, 16, 32
@@ -435,8 +434,8 @@ def test_device_template_parity_cuda():
     y_g = torch.empty(B, H, D, device=dev, dtype=torch.float32)
     y_u = torch.empty(B, H, D, device=dev, dtype=torch.float32)
     BT = 8
-    _t_values_gated[(1,)](1, 1, probs, v, gate, slots, pos, y_g, B, H, KVH, D, S, BT)
-    _t_values[(1,)](1, 1, probs, v, slots, pos, y_u, B, H, KVH, D, S, BT)
+    launch_task_body(_t_values_gated, probs, v, gate, slots, pos, y_g, B, H, KVH, D, S, BT)
+    launch_task_body(_t_values, probs, v, slots, pos, y_u, B, H, KVH, D, S, BT)
     sig = torch.sigmoid(gate.double())
     ref = (y_u.double() * sig).float()
     torch.testing.assert_close(y_g, ref, rtol=1e-4, atol=1e-5)

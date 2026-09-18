@@ -286,7 +286,7 @@ def test_kda_delta_two_layer_hazards_are_state_ordered():
 
 def test_lowering_kda_delta_task_decomposition():
     recorder = RecordingBackend()
-    h = _capture_kda(recorder)
+    _capture_kda(recorder)
     families = lower_graph(recorder.graph)
     kda = [f for f in families if f.kind == "kda_delta"]
     assert len(kda) == 1
@@ -452,7 +452,6 @@ def test_reference_kda_delta_state_drift_bounds():
         x_dt = feeds["f"].astype(np.float64) + P["dt_bias"][None]
         g = LB / (1.0 + np.exp(-(A[:, None] * x_dt)))
         q64 = feeds["q"].astype(np.float64)
-        k64 = feeds["k"].astype(np.float64)
         scale = D ** -0.5
         qn = q64 / np.sqrt((q64 ** 2).sum(-1, keepdims=True) + _EPS_L2) * scale
         kn = feeds["k"].astype(np.float64)
@@ -714,9 +713,9 @@ def test_device_t_kda_heads_batched_matches_numpy_mirror():
     fp64 numpy mirror on real per-(head, k-dim) gates — the element-wise
     decay is the whole point of the op, so the template must reproduce it
     exactly (in-place state RMW on the device pool)."""
-    pytest.importorskip("torch")
     torch = pytest.importorskip("torch")
     pytest.importorskip("triton")
+    from tests.python._megakernel_launch import launch_task_body
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     from vkernels.compiler.device_triton import _t_kda_heads_batched
@@ -733,13 +732,10 @@ def test_device_t_kda_heads_batched_matches_numpy_mirror():
     dt = torch.from_numpy(P["dt_bias"].astype(np.float32)).to(dev)
     alog = torch.from_numpy(P["A_log"].astype(np.float32)).to(dev)
     out = torch.empty(B, H, D, device=dev, dtype=torch.float32)
-    # worker=0, P=1: a single program covers every (batch, head) task via
-    # the task-striding loop; the compiled path passes worker=pid, P=grid
-    # (same direct-launch contract as the #88 rope fix).
-    _t_kda_heads_batched[(1,)](
-        0, 1,
+    launch_task_body(
+        _t_kda_heads_batched,
         tensors["q"], tensors["k"], tensors["v"], tensors["f"], tensors["b"],
-        dt, alog, state_t, out, B, H, D, D, scale=D ** -0.5, lower_bound=LB, num_warps=4,
+        dt, alog, state_t, out, B, H, D, D, scale=D ** -0.5, lower_bound=LB,
     )
     torch.cuda.synchronize()
     # numpy mirror

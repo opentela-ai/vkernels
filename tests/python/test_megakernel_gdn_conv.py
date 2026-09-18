@@ -40,7 +40,6 @@ from vkernels.compiler.memory import plan_memory  # noqa: E402
 from vkernels.compiler.operator_ir import compute_hazards  # noqa: E402
 from vkernels.compiler.reference_exec import ReferenceExecutor  # noqa: E402
 from vkernels.compiler.schedule_phase import PhaseSchedule  # noqa: E402
-from vkernels.compiler.task_ir import TileDomain  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -313,12 +312,12 @@ def test_device_t_gdn_conv_tiled_matches_oracle():
     random FIR weight ``w`` and must reproduce silu(FIR) + the time-major
     state shift for exactly that ``w`` (fp64 recomputation).
 
-    Launch contract: ``worker``/``P`` are the runtime worker id / worker
-    count; the kernel mutates the state pool in place, so the test runs a
-    single worker (grid (1,), worker=0, P=1) that walks all (batch, tile)
-    tasks sequentially — deterministic, no double-shift races.
+    The launch runs a single worker that walks all (batch, tile) tasks
+    sequentially — deterministic, no double-shift races (see
+    ``_megakernel_launch`` for the direct-launch contract).
     """
     pytest.importorskip("triton")
+    from tests.python._megakernel_launch import launch_task_body
     from vkernels.compiler.device_triton import _t_gdn_conv_tiled
 
     dev = torch.device("cuda")
@@ -333,7 +332,7 @@ def test_device_t_gdn_conv_tiled_matches_oracle():
     out = torch.empty(B, CONV_DIM, device=dev, dtype=torch.float32)
 
     ELEM = 32  # exact tiling of the tiny conv_dim
-    _t_gdn_conv_tiled[(1,)](0, 1, state_t, w_t, x_t, out, B, CONV_DIM, ELEM, K, num_warps=4)
+    launch_task_body(_t_gdn_conv_tiled, state_t, w_t, x_t, out, B, CONV_DIM, ELEM, K)
     torch.cuda.synchronize()
 
     # fp64 oracle on the SAME random w the kernel received (matches the CPU

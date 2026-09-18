@@ -530,7 +530,6 @@ def test_reference_sink_absorbs_mass_but_contributes_no_value():
     softmax mass (sink column -> 1, context -> 0); (2) a -inf sink is
     exactly equivalent to a candidate-only softmax (dead mass, no
     renormalization of the survivors)."""
-    rng = np.random.default_rng(11)
     b, h, d, s, m, k, w, rot = 2, 3, 16, 32, 4, 2, 8, 8
     p0 = 20
 
@@ -653,7 +652,6 @@ def test_reference_interleaved_convention_pinned():
     """PINNED convention (slice/stride/pairing): pairs (0,1),(2,3) over the
     first ROT dims, tables indexed by PAIR index; hand-computed exact
     values, dims [ROT, D) pass through."""
-    rng = np.random.default_rng(14)
     b, h, d, s, rot, p0 = 1, 1, 8, 32, 4, 3
     recorder = RecordingBackend()
     p = recorder.define_position(s)
@@ -818,7 +816,7 @@ def test_reference_bf16_single_store_epilogue():
     ctx_bf16 = recorder.fresh_buffer("mla_ctx_bf16", (b, h, d), BF16)
     ctx = recorder.mla_values(probs, latent, wtable, comp, compidx, p, layer=0, window=w, out=ctx_bf16)
     assert recorder.graph.tensors[ctx.value.name].dtype == BF16
-    o = recorder.conjugate_rope(ctx, cos_t, sin_t, p, layer=0, which="o", convention="interleaved")
+    recorder.conjugate_rope(ctx, cos_t, sin_t, p, layer=0, which="o", convention="interleaved")
     data = _standard_data(rng, b, h, d, s, m, k, rot)
     arrays = {101: data["cos"], 102: data["sin"], 103: data["latent"],
               104: np.tile(np.arange(s, dtype=np.int32), (b, 1)), 105: data["comp"],
@@ -842,9 +840,6 @@ def test_reference_bf16_single_store_epilogue():
     ctx_out = np.array(executor.tensor(ctx.value.name), copy=True)
     assert ctx_out.dtype == np.float16
     q_ref = _rope_il(data["q_in"], data["cos"], data["sin"], p0, rot)
-    probs_ref = _oracle_scores(q_ref, data["latent"], wtable=None, comp=data["comp"], compidx=None,
-                               sink=data["sink"], bias=None, pos=p0, W=w, K=k, scale=d**-0.5) \
-        if False else None
     # oracle via the standard path (wtable/compidx from the arrays above)
     wtable_a = arrays[104]
     compidx_a = arrays[106]
@@ -1036,11 +1031,14 @@ def test_device_t_mla_scores_and_values_match_oracle():
     pytest.importorskip("triton")
     import torch
 
+    from tests.python._megakernel_launch import launch_task_body
     from vkernels.compiler.device_triton import _t_mla_scores, _t_mla_values
 
     b, h, d, s, m, W, K = 2, 4, 128, 512, 64, 256, 16
     rng = np.random.default_rng(95)
-    theta = rng.uniform(0, 2 * np.pi, (64, d // 2))
+    # rope tables must cover the largest position (400) — pos 100 exercises
+    # the short-history regime (p < W), pos 400 the full-window regime
+    theta = rng.uniform(0, 2 * np.pi, (s, d // 2))
     cos_t, sin_t = np.cos(theta).astype(np.float32), np.sin(theta).astype(np.float32)
     q_in = rng.standard_normal((b, h, d)).astype(np.float32)
     latent = rng.standard_normal((b, s, d)).astype(np.float16)
@@ -1051,29 +1049,34 @@ def test_device_t_mla_scores_and_values_match_oracle():
     pos = np.array([100, 400], dtype=np.int32)
     scale = d**-0.5
 
-    q_ref = _rope_il(q_in, cos_t, sin_t, int(pos[0]), d)  # per-row handled below
+    # mla_scores consumes ALREADY-ROPE'D q (rope is a separate op upstream);
+    # the kernel and the oracle must see the same rotated q per row
+    q_dev = np.stack([
+        _rope_il(q_in[bi : bi + 1], cos_t, sin_t, int(p0), d)[0].astype(np.float32)
+        for bi, p0 in enumerate(pos)
+    ])
     probs_ref = np.zeros((b, h, W + K + 1))
     for bi, p0 in enumerate(pos):
-        q_r = _rope_il(q_in[bi : bi + 1], cos_t, sin_t, int(p0), d)
-        probs_ref[bi] = _oracle_scores(q_r, latent[bi : bi + 1], wtable[bi : bi + 1], comp[bi : bi + 1],
+        probs_ref[bi] = _oracle_scores(q_dev[bi : bi + 1].astype(np.float64), latent[bi : bi + 1],
+                                       wtable[bi : bi + 1], comp[bi : bi + 1],
                                        compidx[bi : bi + 1], sink, None, int(p0), W, K, scale)
     ctx_ref = _oracle_values(probs_ref, latent, wtable, comp, compidx, pos, W, K)
 
     dev = torch.device("cuda")
     tt = lambda a, dt: torch.from_numpy(a).to(device=dev, dtype=dt)
-    q_t = tt(q_in, torch.float32)
+    q_t = tt(q_dev, torch.float32)
     probs_t = torch.empty((b, h, W + K + 1), device=dev, dtype=torch.float32)
     ctx_t = torch.empty((b, h, d), device=dev, dtype=torch.float32)
-    P = 4
-    _t_mla_scores[(1,)](P, P, q_t, tt(latent, torch.bfloat16), tt(wtable, torch.int32),
-                        tt(comp, torch.bfloat16), tt(compidx, torch.int32), tt(sink, torch.float32),
-                        q_t, tt(pos, torch.int32), probs_t,
-                        B=b, H=h, D=d, W=W, K=K, SPOOL=s, MPOOL=m, HAS_BIAS=False,
-                        scale=scale)
+    launch_task_body(_t_mla_scores, q_t, tt(latent, torch.float16), tt(wtable, torch.int32),
+                     tt(comp, torch.float16), tt(compidx, torch.int32), tt(sink, torch.float32),
+                     q_t, tt(pos, torch.int32), probs_t,
+                     B=b, H=h, D=d, W=W, K=K, SPOOL=s, MPOOL=m, HAS_BIAS=False,
+                     scale=scale)
     torch.cuda.synchronize()
     assert (probs_t.cpu().numpy() - probs_ref).max() < 1e-4
-    _t_mla_values[(1,)](P, P, probs_t, tt(latent, torch.bfloat16), tt(wtable, torch.int32),
-                        tt(comp, torch.bfloat16), tt(compidx, torch.int32), tt(pos, torch.int32),
-                        ctx_t, B=b, H=h, D=d, W=W, K=K, SPOOL=s, MPOOL=m)
+    launch_task_body(_t_mla_values, probs_t, tt(latent, torch.float16), tt(wtable, torch.int32),
+                     tt(comp, torch.float16), tt(compidx, torch.int32),
+                     tt(pos, torch.int32),
+                     ctx_t, B=b, H=h, D=d, W=W, K=K, SPOOL=s, MPOOL=m)
     torch.cuda.synchronize()
     assert (ctx_t.cpu().numpy() - ctx_ref.astype(np.float32)).max() < 1e-3

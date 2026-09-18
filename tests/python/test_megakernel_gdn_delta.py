@@ -88,7 +88,7 @@ def _floe_condition_and_recurse(gdn, qwen35_gdn, q, k, v, z, a, b, ssm_state):
     recurrence, then the per-head RMSNorm + z-gate readout. Returns
     ``(o_gated [nv, hv], new_ssm_state [nv, hv, hk])`` for one batch row.
     """
-    scale, eps = gdn.scale, gdn.cfg.rms_norm_eps
+    scale = gdn.scale
     A = torch.exp(gdn.A_log)
     a_f, b_f = a.to(torch.float32), b.to(torch.float32)
     q_f32, k_f32, v_f32 = q.to(torch.float32), k.to(torch.float32), v.to(torch.float32)
@@ -456,7 +456,7 @@ def test_reference_gdn_conv_then_delta_matches_full_floe_forward():
     state and conv pools evolving in place across steps."""
     gdn, cfg, qwen35_gdn = _floe_gdn()
     conv_dim = gdn.conv_dim
-    key_dim, value_dim, hidden = gdn.key_dim, gdn.value_dim, cfg.hidden_size
+    value_dim, hidden = gdn.value_dim, cfg.hidden_size
     K = gdn.conv_kernel
     rng = np.random.default_rng(55)
     S_CONV, S_SSM, S_HID, S_WQKV, S_WFIR, S_WZ, S_WA, S_WB, S_WOUT = range(701, 710)
@@ -559,6 +559,7 @@ gpu = pytest.mark.skipif(
 @gpu
 def test_device_t_gdn_heads_batched_matches_floe_oracle():
     pytest.importorskip("triton")
+    from tests.python._megakernel_launch import launch_task_body
     from vkernels.compiler.device_triton import _t_gdn_heads_batched
 
     gdn, _cfg, qwen35_gdn = _floe_gdn()
@@ -576,10 +577,11 @@ def test_device_t_gdn_heads_batched_matches_floe_oracle():
     norm_w = torch.from_numpy(gdn.norm.weight.detach().numpy().copy()).to(dev)
     out = torch.empty(B, NV, HV, device=dev, dtype=torch.float32)
 
-    _t_gdn_heads_batched[(4,)](
+    launch_task_body(
+        _t_gdn_heads_batched,
         tensors["q"], tensors["k"], tensors["v"], tensors["z"], tensors["a"], tensors["b"],
         a_log, dt_bias, norm_w, state_t, out, B, NV, NK, HV, HK,
-        eps=_EPS, scale=_SCALE, num_warps=4,
+        eps=_EPS, scale=_SCALE,
     )
     torch.cuda.synchronize()
 
