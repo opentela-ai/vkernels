@@ -2,9 +2,12 @@
 //
 // End-to-end correctness test for the MHC multi-head hybrid-attention
 // pre-norm kernels (issue #51, part 2) on gfx942, against the CPU references
-// in vkernels::kernels::{mhc_pre_gemm_sqrsum_cpu, mhc_post_cpu}.
+// in vkernels::kernels::{mhc_pre_gemm_sqrsum_cpu, mhc_pre_gemm_sqrsum_cpu_f64,
+// mhc_post_cpu}.
 //
-//   hip::mhc_pre_gemm_sqrsum  vs  mhc_pre_gemm_sqrsum_cpu
+//   hip::mhc_pre_gemm_sqrsum  vs  mhc_pre_gemm_sqrsum_cpu      (fp32 oracle)
+//                             vs  mhc_pre_gemm_sqrsum_cpu_f64  (fp64 ref, #138)
+//   hip::mhc_pre_gemm_sqrsum_blocked (NSLICE ladder) vs both
 //   hip::mhc_post             vs  mhc_post_cpu
 //
 // Shapes: the GLM-5.3-Flash family the issue calls out —
@@ -15,11 +18,11 @@
 //   * post: hc=4, hidden=4096 and hidden=7168 (GLM), plus hc=2/8 shapes.
 //
 // Method (mirrors test_dsa_correct.hip / test_gemm_bf16_correct.hip). The
-// CPU oracles are fp32 end-to-end; the device kernels are bf16 storage /
+// CPU oracles are fp32/fp64 end-to-end; the device kernels are bf16 storage /
 // fp32 accumulation (the established gfx942 convention). To isolate kernel
 // correctness from bf16 input quantization, the fp32 source (x for pre, b/d
-// for post) is rounded to bf16 FIRST (host RNE), then the CPU oracle runs on
-// the recovered fp32 and the device on the bf16 inputs. Only accumulation
+// for post) is rounded to bf16 FIRST (host RNE), then the oracles run on the
+// recovered fp32 and the device on the bf16 inputs. Only accumulation
 // ordering and the single RNE on store (mhc_post) differ:
 //   * pre_gemm_sqrsum: out is fp32 on both paths (no store rounding); the
 //     GEMM accumulation is left-to-right identical, so out agrees to ~1e-6.
@@ -28,6 +31,38 @@
 //     ~1e-5 (associativity only).
 //   * post: out is bf16 on the device vs fp32 on the CPU, so we tolerate
 //     ~2e-2 (one bf16 ULP, as test_dsa_correct.hip / test_gemm_bf16 do).
+//
+// ---------------------------------------------------------------------------
+// GATE POLICY (issue #138 — supersedes the report-only blocked ladder of #79)
+// ---------------------------------------------------------------------------
+// The legacy gate compared the device fp32 output against the fp32 oracle's
+// STRICT sequential chain at PRE_THRESH = 1e-4. That gate is order-fragile:
+// the oracle chain itself deviates from the exact sum by ~1e-4 rel on the
+// GLM shapes, so ANY parallel regrouping (including a provably-correct
+// blocked-order one) lands at the same scale and the PASS/FAIL verdict is
+// seed-dependent (ns=2/16/32 failed on the #79 measurement seed while
+// ns=4/8 passed). Issue #138 replaces the DEFAULT gate with an fp64-reference
+// comparison:
+//
+//   default gate:  max_rel(device fp32, fp64 reference) < PRE_THRESH_F64
+//                  (out AND sqrsum), PRE_THRESH_F64 overridable via
+//                  VK_MHC_F64_THRESH (default pinned from the measured
+//                  multi-seed envelope, see docs/performance/mhc/gfx942.md).
+//
+//   The fp64 reference is order-invariant: every correct accumulation order
+//   sits within the fp32 blocked-accumulation envelope (~1e-5 rel) of it,
+//   while real kernel bugs (index off-by-one, dropped terms, wrong weights)
+//   land >= 1e-3. The gate is therefore BOTH seed-stable at NSLICE >= 16 AND
+//   strictly tighter than the legacy 1e-4 oracle-chain gate.
+//
+//   legacy gate:  VK_MHC_STRICT_GATE=1 restores the strict 1e-4
+//                 oracle-chain comparison for every row (the #79 policy;
+//                 kept available because it is the only gate under which the
+//                 NSLICE=1 blocked variant is BITWISE-exact by construction).
+//
+// Both comparisons are printed for every row regardless of which gate decides.
+// A deliberately corrupted blocked kernel (fn row off by one — a realistic
+// index bug) is run as a negative control and MUST fail the active gate.
 
 #include <hip/hip_runtime.h>
 
@@ -87,28 +122,52 @@ void cmp(const std::vector<float>& got, const std::vector<float>& ref,
   }
 }
 
+// fp64-reference comparison: the denominator uses the fp64 magnitude (>= 1),
+// so the reported rel is directly comparable to the fp32-oracle rows.
+void cmp_f64(const std::vector<float>& got, const std::vector<double>& ref,
+             Stats* s) {
+  for (size_t i = 0; i < ref.size(); ++i) {
+    double e = std::fabs((double)got[i] - ref[i]);
+    if (e > s->max_abs) s->max_abs = e;
+    double d = std::fmax(std::fabs(ref[i]), 1.0);
+    if (e / d > s->max_rel) s->max_rel = e / d;
+  }
+}
+
 // --- mhc_pre_gemm_sqrsum ---------------------------------------------------
-Stats run_pre(int num_tokens, int hc_mult, int hidden,
-              const std::vector<float>& x_src,   // fp32 source
-              const std::vector<float>& fn,      // fp32 source (no rounding)
-              uint16_t* dx, float* dfn, float* dout, float* dsqrsum,
-              int variant = 0, int nslice = 256) {
+struct PreStats {
+  Stats oracle{};   // device vs fp32 sequential-chain oracle (out + sqrsum,
+                    // worse-of, exactly the #79 measurement)
+  Stats f64_out{};  // device out vs fp64 reference
+  Stats f64_sq{};   // device sqrsum vs fp64 reference
+};
+
+PreStats run_pre(int num_tokens, int hc_mult, int hidden,
+                 const std::vector<float>& x_src,   // fp32 source
+                 const std::vector<float>& fn,      // fp32 source (no rounding)
+                 uint16_t* dx, float* dfn, float* dout, float* dsqrsum,
+                 int variant = 0, int nslice = 256) {
   const int hc_hidden = hc_mult * hidden;
   const int hc_mult3 = hc_mult * (2 + hc_mult);
   const size_t nx = (size_t)num_tokens * hc_hidden;
   const size_t nfn = (size_t)hc_mult3 * hc_hidden;
   const size_t nout = (size_t)num_tokens * hc_mult3;
 
-  // Round x -> bf16, recover to fp32 (the value BOTH paths see).
+  // Round x -> bf16, recover to fp32 (the value ALL paths see).
   std::vector<uint16_t> xb(nx);
   std::vector<float> xr(nx);
   for (size_t i = 0; i < nx; ++i) { xb[i] = f2bf(x_src[i]); xr[i] = bf2f(xb[i]); }
 
-  // CPU oracle on the bf16-recovered x, fp32 fn.
+  // CPU oracles on the bf16-recovered x: fp32 sequential chain (legacy gate)
+  // and fp64 (issue #138 gate).
   std::vector<float> ref(nout, 0.0f), rsq(num_tokens, 0.0f);
   vkernels::kernels::mhc_pre_gemm_sqrsum_cpu(num_tokens, hc_mult, hidden,
                                              xr.data(), fn.data(), ref.data(),
                                              rsq.data());
+  std::vector<double> ref64(nout, 0.0), rsq64(num_tokens, 0.0);
+  vkernels::kernels::mhc_pre_gemm_sqrsum_cpu_f64(num_tokens, hc_mult, hidden,
+                                                 xr.data(), fn.data(),
+                                                 ref64.data(), rsq64.data());
 
   // Device.
   CK(hipMemcpy(dx, xb.data(), nx * 2, hipMemcpyHostToDevice), "cpyx");
@@ -129,12 +188,128 @@ Stats run_pre(int num_tokens, int hc_mult, int hidden,
   CK(hipMemcpy(gsq.data(), dsqrsum, num_tokens * 4,
                hipMemcpyDeviceToHost), "rdsq");
 
-  Stats s{}, sq{};
-  cmp(got, ref, &s);
-  cmp(gsq, rsq, &sq);
-  // Report the worse of out/sqrsum.
-  if (sq.max_abs > s.max_abs) s.max_abs = sq.max_abs;
-  if (sq.max_rel > s.max_rel) s.max_rel = sq.max_rel;
+  PreStats s{};
+  cmp(got, ref, &s.oracle);
+  cmp(gsq, rsq, &s.oracle);   // worse-of, as the #79 rows reported
+  cmp_f64(got, ref64, &s.f64_out);
+  cmp_f64(gsq, rsq64, &s.f64_sq);
+  return s;
+}
+
+__device__ float tst_bf16_to_f32(uint16_t h) {  // test-local bf16->f32
+  uint32_t u = (uint32_t)h << 16;
+  float f;
+  std::memcpy(&f, &u, sizeof(float));
+  return f;
+}
+
+// --- corrupted blocked kernel (negative control, issue #138) ---------------
+//
+// A copy of the NSLICE=16 blocked kernel body with ONE realistic bug: the fn
+// row pointer is off by one element (reads fn[o*hc_hidden + h + 1], clamped
+// at the very end of the buffer) — the classic index-shift bug a gate must
+// catch. sqrsum is computed correctly so ONLY the out path is corrupted; the
+// fp64 gate must still FAIL the row on the f64_out statistic.
+template <int NSLICE>
+__global__ void mhc_pre_blocked_corrupt_kernel(
+    const uint16_t* __restrict__ x, const float* __restrict__ fn,
+    float* __restrict__ out, float* __restrict__ sqrsum,
+    int num_tokens, int hc_mult3, int hc_hidden_size) {
+  const int n = blockIdx.x;
+  const int o = blockIdx.y;
+  if (n >= num_tokens || o >= hc_mult3) return;
+  const int tid = threadIdx.x;
+  const uint16_t* x_row = x + (size_t)n * hc_hidden_size;
+  const float* fn_row = fn + (size_t)o * hc_hidden_size + 1;  // BUG: +1 shift
+  const size_t fn_total = (size_t)hc_mult3 * hc_hidden_size;
+
+  __shared__ float sRed[256];
+  __shared__ float sPart[256];
+
+  if (o == 0) {  // correct sqrsum (corruption targets the out path only)
+    float sq = 0.0f;
+    for (int h = tid; h < hc_hidden_size; h += 256) {
+      float xv = tst_bf16_to_f32(x_row[h]);
+      sq += xv * xv;
+    }
+    sRed[tid] = sq;
+    __syncthreads();
+#pragma unroll
+    for (int off = 128; off > 0; off >>= 1) {
+      if (tid < off) sRed[tid] += sRed[tid + off];
+      __syncthreads();
+    }
+    if (tid == 0) sqrsum[n] = sRed[0];
+  }
+
+  const int slice = (hc_hidden_size + NSLICE - 1) / NSLICE;
+  const int h0 = tid * slice;
+  float part = 0.0f;
+  if (tid < NSLICE && h0 < hc_hidden_size) {
+    const int h1 = (h0 + slice < hc_hidden_size) ? h0 + slice
+                                                 : hc_hidden_size;
+#pragma unroll 4
+    for (int h = h0; h < h1; ++h) {
+      float fv = ((size_t)o * hc_hidden_size + h + 1 < fn_total)
+                     ? fn_row[h] : 0.0f;  // clamp the one-element overrun
+      part = fmaf(tst_bf16_to_f32(x_row[h]), fv, part);
+    }
+  }
+  sPart[tid] = part;
+  __syncthreads();
+  if (tid == 0) {
+    float acc = 0.0f;
+#pragma unroll 8
+    for (int t = 0; t < 256; ++t) acc += sPart[t];
+    out[(size_t)n * hc_mult3 + o] = acc;
+  }
+}
+
+// Negative control harness: the corrupted kernel at NSLICE=16 on the same
+// inputs run_pre just used (same device buffers still hold x/fn).
+PreStats run_pre_corrupt(int num_tokens, int hc_mult, int hidden,
+                         uint16_t* dx, float* dfn, float* dout,
+                         float* dsqrsum) {
+  const int hc_hidden = hc_mult * hidden;
+  const int hc_mult3 = hc_mult * (2 + hc_mult);
+  const size_t nx = (size_t)num_tokens * hc_hidden;
+  const size_t nout = (size_t)num_tokens * hc_mult3;
+
+  // Rebuild the host-side references from the buffers run_pre left in place:
+  // x on device is the bf16-rounded input; recover it (both oracles ran on
+  // exactly this recovered fp32 in run_pre).
+  std::vector<uint16_t> xb(nx);
+  CK(hipMemcpy(xb.data(), dx, nx * 2, hipMemcpyDeviceToHost), "rdx");
+  std::vector<float> xr(nx);
+  for (size_t i = 0; i < nx; ++i) xr[i] = bf2f(xb[i]);
+  std::vector<float> fn((size_t)hc_mult3 * hc_hidden);
+  CK(hipMemcpy(fn.data(), dfn, fn.size() * 4, hipMemcpyDeviceToHost),
+    "rdfn");
+
+  std::vector<float> ref(nout, 0.0f), rsq(num_tokens, 0.0f);
+  vkernels::kernels::mhc_pre_gemm_sqrsum_cpu(num_tokens, hc_mult, hidden,
+                                             xr.data(), fn.data(), ref.data(),
+                                             rsq.data());
+  std::vector<double> ref64(nout, 0.0), rsq64(num_tokens, 0.0);
+  vkernels::kernels::mhc_pre_gemm_sqrsum_cpu_f64(num_tokens, hc_mult, hidden,
+                                                 xr.data(), fn.data(),
+                                                 ref64.data(), rsq64.data());
+
+  mhc_pre_blocked_corrupt_kernel<16><<<dim3(num_tokens, hc_mult3), 256>>>(
+      reinterpret_cast<const uint16_t*>(dx), dfn, dout, dsqrsum,
+      num_tokens, hc_mult3, hc_hidden);
+  CK(hipDeviceSynchronize(), "sync-corrupt");
+
+  std::vector<float> got(nout), gsq(num_tokens);
+  CK(hipMemcpy(got.data(), dout, nout * 4, hipMemcpyDeviceToHost), "rdout");
+  CK(hipMemcpy(gsq.data(), dsqrsum, num_tokens * 4,
+               hipMemcpyDeviceToHost), "rdsq");
+
+  PreStats s{};
+  cmp(got, ref, &s.oracle);
+  cmp(gsq, rsq, &s.oracle);
+  cmp_f64(got, ref64, &s.f64_out);
+  cmp_f64(gsq, rsq64, &s.f64_sq);
   return s;
 }
 
@@ -189,6 +364,21 @@ int main() {
   CK(hipGetDeviceProperties(&p, 0), "props");
   std::printf("GPU: %s (arch=%s)\n", p.name, p.gcnArchName);
 
+  // Gate policy (issue #138): default = fp64-reference comparison;
+  // VK_MHC_STRICT_GATE=1 = legacy 1e-4 oracle-chain gate (the #79 policy).
+  const float PRE_THRESH = 1e-4f;   // legacy oracle-chain gate (kept)
+  float f64_thresh = 2e-5f;         // provisional; pinned from the measured
+                                    // multi-seed envelope (see the perf doc)
+  if (const char* e = std::getenv("VK_MHC_F64_THRESH"))
+    f64_thresh = std::strtof(e, nullptr);
+  const char* strict_env = std::getenv("VK_MHC_STRICT_GATE");
+  const bool strict_gate = strict_env && strict_env[0] == '1';
+  std::printf("\ngate policy: %s (f64 thresh %.1e%s)\n",
+              strict_gate ? "LEGACY oracle-chain 1e-4 (VK_MHC_STRICT_GATE=1)"
+                          : "fp64-reference (issue #138)",
+              f64_thresh, getenv("VK_MHC_F64_THRESH") ? " via env" : " default");
+  const float POST_THRESH = 2e-2f;  // bf16 store + input rounding
+
   // Peak buffers across all cases.
   const int Tnmax = 64, Hcmax = 28672, Hcmult3max = 32;  // pre
   const int Hcmax2 = 8, Hiddenmax = 7168;                // post
@@ -205,47 +395,81 @@ int main() {
   CK(hipMalloc(&doutp, (size_t)Tnmax * Hcmax2 * Hiddenmax * 2), "alloc out(post)");
 
   int fails = 0;
-  const float PRE_THRESH = 1e-4f;   // fp32 both paths; associativity only
-  const float POST_THRESH = 2e-2f;  // bf16 store + input rounding
 
   // --- mhc_pre_gemm_sqrsum ---
-  std::printf("\nmhc_pre_gemm_sqrsum (vs CPU reference, fp32 both paths):\n");
-  struct PreCfg { int num_tokens, hc_mult, hidden; };
+  std::printf("\nmhc_pre_gemm_sqrsum (vs CPU reference; oracle = fp32 chain,"
+              " f64 = issue #138 reference):\n");
+  struct PreCfg { int num_tokens, hc_mult, hidden; int nseeds; };
   const PreCfg pcfgs[] = {
-      {1, 2, 2},                    // tiny sanity
-      {7, 3, 3},
-      {1, 4, 4096},                 // GLM-5.3: hc_hidden=16384, hc_mult3=24
-      {7, 4, 4096},                 // GLM-5.3, multi-token
-      {1, 4, 7168},                 // larger branch: hc_hidden=28672
+      {1, 2, 2, 1},                 // tiny sanity
+      {7, 3, 3, 1},
+      {1, 4, 4096, 5},              // GLM-5.3: hc_hidden=16384, hc_mult3=24
+      {7, 4, 4096, 5},              // GLM-5.3, multi-token
+      {1, 4, 7168, 5},              // larger branch: hc_hidden=28672
   };
   for (const auto& c : pcfgs) {
     const int hc_hidden = c.hc_mult * c.hidden;
     const int hc_mult3 = c.hc_mult * (2 + c.hc_mult);
-    std::vector<float> x((size_t)c.num_tokens * hc_hidden);
-    std::vector<float> fn((size_t)hc_mult3 * hc_hidden);
-    for (size_t i = 0; i < x.size(); ++i) x[i] = rnd(1, (int)i);
-    for (size_t i = 0; i < fn.size(); ++i) fn[i] = rnd(2, (int)i);
-    auto s = run_pre(c.num_tokens, c.hc_mult, c.hidden, x, fn,
-                     dx, dfn, dout, dsqrsum);
-    bool ok = s.max_rel < PRE_THRESH;
-    std::printf("  n=%-2d hc_mult=%d hidden=%-4d (hc_hidden=%-5d hc_mult3=%-2d)"
-                "  abs=%.4e rel=%.4e  %s\n",
-                c.num_tokens, c.hc_mult, c.hidden, hc_hidden, hc_mult3,
-                s.max_abs, s.max_rel, ok ? "PASS" : "FAIL");
-    if (!ok) ++fails;
+    for (int seed = 1; seed <= c.nseeds; ++seed) {
+      // seed 1 reproduces the historical #79 measurement inputs exactly
+      // (x = rnd(1, i), fn = rnd(2, i)); seeds 2..n decorrelate both.
+      std::vector<float> x((size_t)c.num_tokens * hc_hidden);
+      std::vector<float> fn((size_t)hc_mult3 * hc_hidden);
+      for (size_t i = 0; i < x.size(); ++i) x[i] = rnd(2 * seed - 1, (int)i);
+      for (size_t i = 0; i < fn.size(); ++i) fn[i] = rnd(2 * seed, (int)i);
 
-    // Blocked-order ladder (issue #79 gate experiment): REPORT-ONLY --
-    // sweeps NSLICE to find the fastest gate-compliant point. NSLICE=1 is
-    // the oracle's own strict chain (bitwise-exact anchor).
-    std::printf("  blocked ladder n=%-2d hc_mult=%d hidden=%-4d:\n",
-                c.num_tokens, c.hc_mult, c.hidden);
-    for (int ns : {256, 128, 64, 32, 16, 8, 4, 2, 1}) {
-      auto sb = run_pre(c.num_tokens, c.hc_mult, c.hidden, x, fn,
-                        dx, dfn, dout, dsqrsum, 1, ns);
-      std::printf("    ns=%-3d abs=%.4e rel=%.4e  %s (2e-5: %s)\n",
-                  ns, sb.max_abs, sb.max_rel,
-                  sb.max_rel < PRE_THRESH ? "PASS" : "FAIL",
-                  sb.max_rel < 2e-5f ? "yes" : "no");
+      // Strict split (the shipped correctness path): legacy gate, unchanged.
+      auto s0 = run_pre(c.num_tokens, c.hc_mult, c.hidden, x, fn,
+                        dx, dfn, dout, dsqrsum);
+      bool ok0 = s0.oracle.max_rel < PRE_THRESH;
+      std::printf("  [seed %d] strict split n=%-2d hc_mult=%d hidden=%-4d"
+                  "  oracle abs=%.4e rel=%.4e  %s   f64 out=%.2e sq=%.2e\n",
+                  seed, c.num_tokens, c.hc_mult, c.hidden,
+                  s0.oracle.max_abs, s0.oracle.max_rel,
+                  ok0 ? "PASS" : "FAIL", s0.f64_out.max_rel,
+                  s0.f64_sq.max_rel);
+      if (!ok0) ++fails;
+
+      // Blocked ladder (issue #138 gate): every NSLICE must pass the
+      // order-invariant fp64 gate on EVERY seed; under the legacy gate the
+      // same rows are printed for the seed-fragility record.
+      std::printf("  [seed %d] blocked ladder n=%-2d hc_mult=%d hidden=%-4d:"
+                  "  (gate = %s)\n", seed, c.num_tokens, c.hc_mult, c.hidden,
+                  strict_gate ? "legacy 1e-4" : "fp64");
+      for (int ns : {256, 128, 64, 32, 16, 8, 4, 2, 1}) {
+        auto sb = run_pre(c.num_tokens, c.hc_mult, c.hidden, x, fn,
+                          dx, dfn, dout, dsqrsum, 1, ns);
+        bool ok = strict_gate
+                      ? sb.oracle.max_rel < PRE_THRESH
+                      : (sb.f64_out.max_rel < f64_thresh &&
+                         sb.f64_sq.max_rel < f64_thresh);
+        std::printf("    ns=%-3d oracle abs=%.4e rel=%.4e (%s)"
+                    "  f64 out=%.3e sq=%.3e  GATE %s\n",
+                    ns, sb.oracle.max_abs, sb.oracle.max_rel,
+                    sb.oracle.max_rel < PRE_THRESH ? "P1e-4" : "F1e-4",
+                    sb.f64_out.max_rel, sb.f64_sq.max_rel,
+                    ok ? "PASS" : "FAIL");
+        if (!ok) ++fails;
+      }
+
+      // Negative control (GLM decode shape only): the corrupted kernel MUST
+      // fail the active gate. Counted as a failure if it slips through.
+      if (c.num_tokens == 1 && c.hc_mult == 4 && c.hidden == 4096) {
+        auto sc = run_pre_corrupt(c.num_tokens, c.hc_mult, c.hidden,
+                                  dx, dfn, dout, dsqrsum);
+        bool ok = strict_gate
+                      ? sc.oracle.max_rel < PRE_THRESH
+                      : (sc.f64_out.max_rel < f64_thresh &&
+                         sc.f64_sq.max_rel < f64_thresh);
+        std::printf("  [seed %d] NEGATIVE CONTROL (fn row +1) n=1 hc_mult=4"
+                    " hidden=4096:  oracle rel=%.3e  f64 out=%.3e sq=%.3e"
+                    "  GATE %s %s\n", seed, sc.oracle.max_rel,
+                    sc.f64_out.max_rel, sc.f64_sq.max_rel,
+                    ok ? "PASS" : "FAIL",
+                    ok ? "(<-- UNEXPECTED: gate missed a corrupted kernel!)"
+                       : "(expected: gate catches the corruption)");
+        if (ok) ++fails;
+      }
     }
   }
 

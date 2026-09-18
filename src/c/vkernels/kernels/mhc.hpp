@@ -58,6 +58,22 @@ void mhc_pre_gemm_sqrsum_cpu(int num_tokens, int hc_mult, int hidden_size,
                              const float* x, const float* fn,
                              float* out, float* sqrsum);
 
+// fp64 reference for the mhc_pre gate (issue #138). Same math as
+// mhc_pre_gemm_sqrsum_cpu but accumulated in double, so a device fp32 result
+// can be gated against the (nearly) EXACT sum instead of against the fp32
+// oracle's own sequential-chain rounding path. Background: the fp32 oracle's
+// left-to-right chain deviates from the exact sum by up to ~1e-4 rel on the
+// GLM shapes, which is the same order as ANY parallel regrouping's deviation
+// from the oracle -- so an oracle-chain gate cannot distinguish a correct
+// blocked-order kernel from a broken one at NSLICE >= 16 (issue #79's
+// seed-dependent ns=2/16/32 FAILs). The fp64 reference removes that
+// ambiguity: every correct accumulation order lands within the fp32
+// blocked-accumulation envelope (~1e-5 rel) of it, while real kernel bugs
+// (index off-by-one, dropped terms, wrong weights) land at >= 1e-3.
+void mhc_pre_gemm_sqrsum_cpu_f64(int num_tokens, int hc_mult, int hidden_size,
+                                 const float* x, const float* fn,
+                                 double* out, double* sqrsum);
+
 // CPU reference (oracle) for mhc_post, fp32 throughout (the bf16 round-trip
 // the device kernel does is the only divergence).
 //
