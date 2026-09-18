@@ -505,10 +505,11 @@ def mhc_pre_gemm_sqrsum(
         if rc != 0:
             raise RuntimeError(f"vk_hip_mhc_pre_gemm_sqrsum failed: rc={rc}")
         return out, sqrsum
-    if nslice not in (1, 32):
+    if nslice != 1:
         raise RuntimeError(
-            "nslice != 1/32 requires libvkernels_hip with "
-            "vk_hip_mhc_pre_gemm_sqrsum_blocked_stream (issue #147)")
+            "nslice != 1 requires libvkernels_hip with "
+            "vk_hip_mhc_pre_gemm_sqrsum_blocked_stream (issue #147); "
+            "this library's non-suffixed entry serves the strict chain")
     f = lib.vk_hip_mhc_pre_gemm_sqrsum
     f.restype = None
     f.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
