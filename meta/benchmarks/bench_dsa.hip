@@ -126,6 +126,8 @@ static void bench_shapes(const GpuInfo& info, hipEvent_t start,
       {64,    1,  128, 256,  0,  128},  // decode, topk=128
       { 8,   64,  256, 256,  0,  128},  // short
       { 1, 8192, 1024, 256,  0,  128},  // long prefill
+      {64, 8192, 1024, 256,  0,  128},  // serving prefill (H-fold kv re-read;
+                                        // #149: DRAM traffic is the true roof)
       // DeepSeek-V3 (tail_dim > 0).
       {16,    1,  256, 576, 64,  256},  // decode, d_v=512
       {16,    1,  512, 576, 64,  256},  // decode, more keys
