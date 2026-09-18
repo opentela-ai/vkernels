@@ -1003,18 +1003,22 @@ int launch_partial_vec(const void* q, const void* kv, const void* indices,
                        int split_kv, hipStream_t stream) {
   // Issue #137 A/B diagnostics (same pattern as VK_DSA_DB):
   //   VK_DSA_VEC=0  never (legacy serial/db dispatch)
-  //   VK_DSA_VEC=1  auto: engage where admitted once the db gate declines
-  //   VK_DSA_VEC=2  force: take precedence over the db occupancy gate
-  // VK_DSA_FUSE=0/1 selects the fused combine (default on); VK_DSA_VECG
-  // overrides the register batch size G (1/2/4/8; 1 = vectorization only,
-  // no batching -- the A/B that isolates the two effects).
+  //   VK_DSA_VEC=1  auto: engage wherever the shape is admitted
+  //   VK_DSA_VEC=2  force (identical to auto since the gate was removed;
+  //                 kept for backward compat with the 641060/641089 runs)
+  // VK_DSA_FUSE=1 selects the fused combine (default OFF: the unfused
+  // separate-combine launch measured 20-25% FASTER at the optimum and 2x
+  // faster at high split -- the fence + atomic + last-warp merge tail
+  // costs more than a launch); VK_DSA_VECG overrides the register batch
+  // size G (1/2/4/8; default 1 = vectorization only, no batching -- the
+  // A/B that isolates the two effects; G>1 measured slower).
   static const int vec_mode = [] {
     const char* e = std::getenv("VK_DSA_VEC");
     return e ? std::atoi(e) : 1;
   }();
   static const int fuse_mode = [] {
     const char* e = std::getenv("VK_DSA_FUSE");
-    return e ? std::atoi(e) : 1;
+    return e ? std::atoi(e) : 0;
   }();
   static const int g_ovr = [] {
     const char* e = std::getenv("VK_DSA_VECG");
@@ -1022,30 +1026,20 @@ int launch_partial_vec(const void* q, const void* kv, const void* indices,
   }();
   if (vec_mode == 0) return 0;
   if (tail_dim != 0 || dim <= 0 || dim % 4 != 0 || dim > 4 * 64) return 0;
-  // Issue #137 occupancy/TLP gate (auto mode only; VK_DSA_VEC=2 bypasses it
-  // for diagnostics). Measured sweep (job 641060, MI300A): the vectorized
-  // kernel wins while the per-split key chunk is LONG (>= ~32 keys/split)
-  // AND the grid is small enough that per-block latency dominates
-  // (<= ~2048 blocks = ~10 waves on 228 CUs): at topk=2048 it beats the
-  // serial kernel at split 2-32 (132.5 vs 247.8 us at split=16) but LOSES
-  // once the grid spills into pure TLP territory (split=64: 239 vs 168.7),
-  // and at small topk the serial/db kernels win at split>=16 (few keys per
-  // block). Both boundaries in one gate:
-  static const int num_cu = [] {
-    int dev = 0, n = 0;
-    if (hipGetDevice(&dev) != hipSuccess ||
-        hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount,
-                              dev) != hipSuccess || n <= 0)
-      return 228;  // gfx942 CU count, same default as the db gate above
-    return n;
-  }();
-  if (vec_mode == 1) {
-    const long keys_per_split = ((long)topk + split_kv - 1) / split_kv;
-    const long total_blocks =
-        (long)((S_q + BQ - 1) / BQ) * (long)H * (long)split_kv;
-    if (keys_per_split < 32 || total_blocks > 10L * num_cu) return 0;
-  }
-  const int g = (g_ovr == 1 || g_ovr == 2 || g_ovr == 8) ? g_ovr : 4;
+  // No occupancy/TLP gate in auto mode: the UNFUSED vectorized kernel
+  // (G=1, separate combine launch) measured >= the serial AND db kernels
+  // at EVERY admitted (shape, split) point across the issue-#137 sweeps
+  // (jobs 641060 + 641089, MI300A): topk=2048 split=32 -> 99.0 us /
+  // 679 GB/s vs serial's best 168.4 (split=64) and db's 208+; topk=256
+  // split=8 -> 40.0 vs db 55.1; topk=128 split=8 -> 31.2 vs db 43.5;
+  // even at 1 key/split it ties serial (182.6 vs 183.1 at topk=128
+  // split=128). The FUSED variant (VK_DSA_FUSE=1) is the exception: its
+  // fence + atomic + last-warp merge tail costs 20-25% at the optimum
+  // (132.2 vs 107.4 us at topk=2048 split=16) and 2x at high split
+  // (243.3 vs 127.5 at split=64), so it ships OFF.
+  const int g = (g_ovr == 1 || g_ovr == 2 || g_ovr == 4 || g_ovr == 8)
+                    ? g_ovr
+                    : 1;
 
   int fuse = fuse_mode ? 1 : 0;
   int* counters = nullptr;
@@ -1079,12 +1073,12 @@ int launch_partial_vec(const void* q, const void* kv, const void* indices,
   return fuse ? 2 : 1;
 }
 
-// Issue #80/#137: dispatch the split partial: vectorized+batched kernel
-// first (its gate region -- long per-split key chunks on a small grid --
-// strictly dominates db + serial there, measured in job 641060), then the
-// double-buffered kernel (its measured win region at low split / few keys
-// per block), then the serial dsa_sparse_fwd_partial_kernel as the
-// fallback. Returns true when a separate combine launch is still required.
+// Issue #80/#137: dispatch the split partial: the vectorized kernel first
+// wherever the shape is admitted (it measured >= db + serial at every
+// admitted point, jobs 641060 + 641089), then the double-buffered kernel
+// (its measured win region: DSv3 / tail_dim != 0 widths at low split),
+// then the serial dsa_sparse_fwd_partial_kernel as the fallback. Returns
+// true when a separate combine launch is still required.
 template <int BQ>
 bool launch_partial_auto(const void* q, const void* kv, const void* indices,
                          void* part_out, void* part_lse, int S_q, int S_kv,

@@ -356,20 +356,16 @@ int dsa_sparse_fwd_split_for(int S_q, int H, int topk, int block_I,
   // key's global read is a load->use dependency, ~1.2 us unpipelined), not
   // by CU filling -- over-subscription up to ~18 waves measured strictly
   // beneficial for the pre-#137 serial/db dispatch, whose best sat at 8-32
-  // keys per split. Issue #137 (vectorized partial + fused combine, job
-  // 641060) shifted the full-topk optimum to a LONGER per-block chunk
-  // (shorter per-key chain, one uint2 load per key): topk=2048 now measures
-  // its best at split=16 (128 keys/split, 132.5 us / 507 GB/s vs the old
-  // split=64's 156-169 us), while topk=256/128 and DSv3 keep split=16 as
-  // the best (db/serial regime there: 55.1 / 43.5 / 85.4 us). The measured
-  // optimum is 16 on EVERY decode shape under the shipped three-way
-  // dispatch (vec gate / db occupancy gate / serial), so the
-  // ceil(sqrt(2*topk)) heuristic is replaced by the measured constant,
-  // capped at topk. block_I stays reserved for the future tiled-key
-  // variant (whose split cap WILL be ceildiv(topk, block_I)); any split in
-  // [1, topk] is legal.
+  // keys per split. Issue #137 (unfused vectorized partial, jobs 641060 +
+  // 641089) shifted the optima: topk=2048 -> 32 (99.0 us / 679 GB/s, 64
+  // keys/split), topk=256 -> 8 (40.0 us, 32 keys/split; 16 within 2%),
+  // topk=128 -> 8 (31.2 us, 16 keys/split), DSv3 -> 16 (db regime, 85.4
+  // us). The recommendation tracks the measured best with two bands:
+  // topk >= 1024 -> 32, else min(topk, 16). block_I stays reserved for the
+  // future tiled-key variant (whose split cap WILL be ceildiv(topk,
+  // block_I)); any split in [1, topk] is legal.
   (void)block_I;
-  int s = topk < 16 ? topk : 16;
+  int s = topk >= 1024 ? 32 : (topk < 16 ? topk : 16);
   return s < 1 ? 1 : s;
 }
 

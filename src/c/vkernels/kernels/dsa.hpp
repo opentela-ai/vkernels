@@ -309,14 +309,16 @@ int dsa_topk_logits_split_for(int batch_size, int max_seq_len, int block);
 
 // The optimal split for the HIP dsa_sparse_fwd_split forward. The decode
 // dispatch is three-way since issue #137 (vectorized register-batched
-// partial behind a long-chunk/small-grid gate -> double-buffered LDS kernel
-// behind its occupancy gate -> serial fallback), and the measured optimum
-// under that dispatch is split=16 on every decode shape (topk=2048: 132.5
-// us / 507 GB/s at split=16 with the vec kernel, vs 156-169 us at the old
-// split=64; topk=256/128 and DSv3: 55.1 / 43.5 / 85.4 us at split=16 in
-// the db regime):
+// partial for tail_dim==0 dim<=256 shapes -> double-buffered LDS kernel
+// behind its occupancy gate -> serial fallback), and the unfused vectorized
+// kernel measured >= the other two at EVERY admitted point (jobs 641060 +
+// 641089, MI300A). The measured optima: topk=2048 -> split=32 (99.0 us /
+// 679 GB/s, 31.6x vs unsplit serial; the old split=64 serial floor was
+// 156-169 us), topk=256 -> 8 (40.0 us), topk=128 -> 8 (31.2 us), DSv3 ->
+// 16 (db regime, 85.4 us), encoded as two bands:
 //
 //   split = 1                                   if ceildiv(S_q,BQ)*H >= NUM_CU
+//         = 32                                  if topk >= 1024
 //         = min(topk, 16)                       otherwise
 //
 // with NUM_CU = 228 (MI300A / gfx942; hipDeviceProp_t::multiProcessorCount,

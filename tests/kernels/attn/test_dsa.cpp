@@ -710,19 +710,20 @@ TEST(DsaTopk, SplitFor) {
 }
 
 // dsa_sparse_fwd_split_for: the forward's split recommendation, re-fitted
-// to the issue-#137 measured sweep (docs/performance/dsa/gfx942.md): prefill
-// returns 1 (the plain grid already fills the CUs); decode returns
-// min(topk, 16) -- the measured optimum under the three-way vec/db/serial
-// dispatch is 16 on every decode shape (topk=2048: 132.5 us / 507 GB/s with
-// the vectorized kernel at split=16, vs 156-169 us at the old split=64).
+// to the issue-#137 measured sweeps (docs/performance/dsa/gfx942.md):
+// prefill returns 1 (the plain grid already fills the CUs); decode returns
+// 32 for topk >= 1024 and min(topk, 16) otherwise -- the measured optima
+// under the shipped three-way vec/db/serial dispatch (topk=2048: 99.0 us /
+// 679 GB/s with the unfused vectorized kernel at split=32, vs 156-169 us
+// at the old split=64 serial floor).
 TEST(DsaSparse, SplitFor) {
   using vkernels::kernels::dsa_sparse_fwd_split_for;
-  // GLM-5.3-Flash full-topk decode: measured best split = 16 (issue #137,
-  // job 641060: 132.5 us / 507 GB/s, -15% vs the old split=64 serial 156).
-  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 228), 16);
-  // topk=256 decode: measured best 16 (db regime, 55.1 us).
+  // GLM-5.3-Flash full-topk decode: measured best split = 32 (issue #137,
+  // job 641089: 99.0 us / 679 GB/s, -37% vs the old split=64 serial 156).
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 228), 32);
+  // topk=256 decode: measured best 8 (40.0 us; 16 within 2%) -> band 16.
   EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 256, 64, 228), 16);
-  // topk=128 decode: measured best 16 (db regime, 43.5 us).
+  // topk=128 decode: measured best 8 (31.2 us; 4-sample 0 artifact) -> 16.
   EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 128, 64, 228), 16);
   // DeepSeek-V3 decode (H=16): 16 blocks, still under-filled -> 16.
   EXPECT_EQ(dsa_sparse_fwd_split_for(1, 16, 256, 64, 228), 16);
@@ -736,6 +737,6 @@ TEST(DsaSparse, SplitFor) {
   // Degenerate inputs -> safe 1.
   EXPECT_EQ(dsa_sparse_fwd_split_for(0, 64, 2048, 64, 228), 1);
   EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 0, 64, 228), 1);
-  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 0, 228), 16);  // block_I unused
-  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 0), 16);   // default CUs
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 0, 228), 32);  // block_I unused
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 0), 32);   // default CUs
 }
