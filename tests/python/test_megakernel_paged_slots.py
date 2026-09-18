@@ -94,8 +94,6 @@ def test_capture_records_paged_kinds_and_external_table():
     assert "slot_table" in append.inputs
     assert all(w.indirect_table is not None for w in append.write_regions)
     assert append.write_regions[0].indirect_axis == 0
-    # post-append views bump storage versions (§4.3)
-    versions = rec.graph.storage_versions
 
 
 def test_hazards_order_paged_append_before_scores():

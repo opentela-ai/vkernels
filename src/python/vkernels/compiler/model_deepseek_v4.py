@@ -37,7 +37,6 @@ class DeepseekV4ModelArgs:
         H, HI = config.heads, config.index_heads
         E, I = config.n_experts, config.moe_intermediate
         Is = config.shared_intermediate
-        M = config.entry_capacity
         R = config.entries_per_series
 
         self.token = ops.external_tensor("token_emb", (config.vocab, config.hc * C), F32, storage_id=sid("token_emb"))
@@ -120,7 +119,7 @@ def build_deepseek_v4_forward(ops, args, ids, position, config: DeepseekV4Config
     cfg = config
     B, C, D = cfg.batch, cfg.hidden, cfg.latent_dim
     S, H, HI = cfg.cache_capacity, cfg.heads, cfg.index_heads
-    M, R = cfg.entry_capacity, cfg.entries_per_series
+    M = cfg.entry_capacity
 
     # embedding → initial stream stack [B, hc, C] (the table is [V, hc·C])
     emb = ops.embedding(ids, args.token, None, position)

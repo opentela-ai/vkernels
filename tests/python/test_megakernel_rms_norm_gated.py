@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import os
 import sys
-import types
 
 import numpy as np
 import pytest
@@ -131,7 +130,6 @@ def test_capture_records_gate_input_and_activation_attribute():
 
 def test_capture_accepts_head_view_shapes():
     graph, h = _capture_gated((2, 4, 16))
-    op = graph.ops[0]
     assert h["y"].value.shape == (2, 4, 16)
     assert len([d for d in check_graph(graph) if d.severity == "error"]) == 0
 
@@ -205,7 +203,7 @@ def test_lowering_head_view_domain_one_task_per_head():
     fam = lower_graph(graph)[0]
     assert fam.task_count == b * heads
     assert fam.domain.dims == ((b, 1), (heads, 1))
-    coords = fam.coords(9)  # task = b * heads + h -> b=1, h=2
+    fam.coords(9)  # task = b * heads + h -> b=1, h=2
     r = fam.reads(9)
     assert r[0].boxes == ((1, 2), (2, 3), (0, d))
     assert r[1].boxes == ((1, 2), (2, 3), (0, d))

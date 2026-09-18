@@ -15,7 +15,7 @@ try:
 except ImportError:  # pragma: no cover
     np = None
 
-from vkernels import _backend, comm
+from vkernels import _backend
 from vkernels._types import Gather2DRun, Result, StagedRun1D, StagedRun2D, Topology
 from vkernels.comm import (
     BlockingQueue,

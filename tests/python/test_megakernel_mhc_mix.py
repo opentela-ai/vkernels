@@ -277,7 +277,7 @@ def test_mhc_chain_hazards():
     """pre -> body -> post orders via RAW hazards on the h_in / post / comb
     workspaces; layer 1's pre consumes layer 0's streams_post view."""
     rng = np.random.default_rng(7)
-    w = _weights(rng)
+    _weights(rng)
     rec = RecordingBackend()
     streams0 = rec.external_tensor("streams", (B, HC, C), storage_id=S_STREAMS)
     fn = rec.external_tensor("fn", (MIX, HC * C), storage_id=S_FN)
@@ -670,7 +670,6 @@ def test_triton_device_templates_match_mirror(hc):
     pytest.importorskip("triton")
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    from vkernels.compiler.device_triton import _t_mhc_post, _t_mhc_pre
     # module-level launcher kernels (defined with triton importable at the
     # top; worker/P are supplied per program here exactly as the megakernel
     # composes them)

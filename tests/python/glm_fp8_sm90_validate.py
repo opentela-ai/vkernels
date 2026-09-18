@@ -112,7 +112,7 @@ def main() -> int:
 
         prepared = kmod.prepare(a8, asc, b8, bsc, out)
         t_kernel = bench(lambda: kmod.run(prepared))
-        t_glue = bench(lambda: kernel(a8, asc, b8, bsc, out))
+        bench(lambda: kernel(a8, asc, b8, bsc, out))
         t_oracle = bench(
             lambda: mod._torch_blockwise_gemm(a8, asc, b8, bsc, ref), iters=3
         )

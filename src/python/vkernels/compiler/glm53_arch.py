@@ -286,7 +286,7 @@ def _kda_layer_decode(
     w: Glm53Weights, cfg: Glm53Config, layer: int,
     conv_state: np.ndarray, ssm_state: np.ndarray,  # pools, mutated
 ) -> np.ndarray:
-    C, H, D = cfg.hidden_size, cfg.linear_num_heads, cfg.linear_head_dim
+    H, D = cfg.linear_num_heads, cfg.linear_head_dim
     qkv, K = cfg.qkv_dim, cfg.linear_conv_kernel_dim
     B = h.shape[0]
     # fused qkv projection + depthwise causal FIR conv (raw-input state)
@@ -326,7 +326,7 @@ def _kda_layer_decode(
 def _moe_block(
     h: np.ndarray, w: Glm53Weights, cfg: Glm53Config, layer: int,
 ) -> np.ndarray:
-    E, Imoe = cfg.n_routed_experts, cfg.moe_intermediate_size
+    Imoe = cfg.moe_intermediate_size
     logits = h @ w.router_w[layer].T
     scores = _sigmoid(logits)
     choice = scores + w.router_bias[layer]

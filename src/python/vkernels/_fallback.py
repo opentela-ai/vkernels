@@ -757,7 +757,7 @@ def mxfp4_moe_sort(A, sorted_ids, M: int, hidden: int, top_k: int, EM: int):
         flat = int(ids[r])
         if 0 <= flat < M * top_k:
             out[r] = A_arr[flat // top_k]
-    return out.reshape(EM * hidden) if False else out.ravel()
+    return out.ravel()
 
 
 def mxfp4_moe_sort_scales(

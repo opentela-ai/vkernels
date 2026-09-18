@@ -389,8 +389,6 @@ def test_k_equals_E_bit_parity_vs_dense_every_expert():
     data = _rand_block(rng, B=B, H=H, E=E, K=K, I=I)
     ex, _ = _run_schedule(rec.graph, _externals(rec, data))
     y = np.array(ex.tensor(ex.graph.ops[-1].outputs[0]))
-    ids = np.array(ex.tensor("route_ids"))
-    weights = np.array(ex.tensor("route_w"))
     for b in range(B):
         sel, w = _route_mirror(data["x"][b], data["router_w"], mode="learned",
                                score_fn="sqrtsoftplus", top_k=E)

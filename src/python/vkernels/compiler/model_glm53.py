@@ -26,7 +26,6 @@ import numpy as np
 from .capture import RecordingBackend, SymbolicTensor
 from .operator_ir import F32, I32
 from .glm53_arch import Glm53Config, Glm53Weights
-from .model_gpt2 import _stable_storage_id
 
 
 class Glm53ModelArgs:
@@ -35,10 +34,9 @@ class Glm53ModelArgs:
     def __init__(self, ops: RecordingBackend, cfg: Glm53Config, weights: Glm53Weights, batch: int = 3, *,
                  materialize_hosts: bool = True):
         B, C = batch, cfg.hidden_size
-        H, D, qkv = cfg.linear_num_heads, cfg.linear_head_dim, cfg.qkv_dim
-        hc, mix = cfg.hc_mult, cfg.hc_mix
+        H, D = cfg.linear_num_heads, cfg.linear_head_dim
+        hc = cfg.hc_mult
         K, Cc = cfg.linear_conv_kernel_dim, cfg.conv_dim
-        I, Imoe, E = cfg.intermediate_size, cfg.moe_intermediate_size, cfg.n_routed_experts
         self.cfg, self.batch = cfg, B
 
         def ext(name: str, arr: np.ndarray, dtype=F32) -> SymbolicTensor:

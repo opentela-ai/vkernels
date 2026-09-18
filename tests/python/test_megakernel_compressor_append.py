@@ -96,7 +96,6 @@ def _mirror_walk(positions_per_step, windows, gate_sets, cos_sin, rms_w):
                 continue
             for l in range(L):
                 slot, cb = int(state[b, l, 0]), int(state[b, l, 1])
-                j = len(log[b])
                 e = _mirror_emission(windows[s][b], gate_sets[s][b], rms_w, cos_sin[s][b][0], cos_sin[s][b][1])
                 pool[b, l, slot, cb, :] = e
                 log[b].append(e)
@@ -377,7 +376,6 @@ def test_overlap_geometry_window_slides_by_r():
     assert state[0, 0, 0] in (0, 1) and state[0, 0, 1] == (3 * R + 1) % R
     # window content check via the mirror: Ca∪Cb for row0/layer0 equals
     # global entries [k*R, k*R + 2R) for the current rotation k
-    k = (3 * R + 1) // R - 1 if (3 * R + 1) % R == 0 else (3 * R + 1) // R
     pool = sa[STOR_POOL].reshape(B, L, 2, R, D)
     ca_slot = 1 - state[0, 0, 0]
     window_entries = np.concatenate([pool[0, 0, ca_slot, :, :], pool[0, 0, state[0, 0, 0], :, :]], axis=0)

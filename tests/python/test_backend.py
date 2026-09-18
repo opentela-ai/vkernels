@@ -34,7 +34,6 @@ class BackendTest(unittest.TestCase):
         )
 
     def test_version(self):
-        import re
         self.assertRegex(vkernels.__version__, r"^\d+\.\d+\.\d+$")
 
     def test_submodules_import_lazily(self):

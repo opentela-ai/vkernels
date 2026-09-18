@@ -28,7 +28,7 @@ from vkernels.compiler.capture import CaptureError, RecordingBackend, SymbolicTe
 from vkernels.compiler.legality import LegalityError, check_graph, enforce
 from vkernels.compiler.lowerings import lower_graph
 from vkernels.compiler.memory import plan_memory
-from vkernels.compiler.operator_ir import F32, I32, Operator, Region, TensorValue, ValidLength
+from vkernels.compiler.operator_ir import F32, I32, Region, TensorValue, ValidLength
 from vkernels.compiler.reference_exec import ReferenceExecutor
 from vkernels.compiler.schedule_phase import PhaseSchedule
 

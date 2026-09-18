@@ -138,7 +138,7 @@ def build_qwen35_forward(ops, args, ids, position, config: Qwen35Config):
     regions, so the step is ragged-batch safe end to end.
     """
     cfg = config
-    B, C = cfg.batch, cfg.hidden
+    B = cfg.batch
     NK, HK, NV, HV = cfg.gdn_k_heads, cfg.head_k_dim, cfg.gdn_v_heads, cfg.head_v_dim
     H, KVH, D = cfg.heads, cfg.kv_heads, cfg.head_dim
     F = cfg.intermediate

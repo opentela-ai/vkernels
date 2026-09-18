@@ -1,6 +1,5 @@
 """Selected-expert FP8 GEMV contract checks and optional GPU parity."""
 
-import importlib
 import subprocess
 import sys
 

@@ -18,7 +18,7 @@ fused sigmoid output gate (#92, ``attention_values(..., gate=...)``).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -396,11 +396,10 @@ def qwen35_reference_decode_step(
     """
     st = state.copy()
     cfg = config
-    B, C = cfg.batch, cfg.hidden
+    B = cfg.batch
     NK, HK, NV, HV = cfg.gdn_k_heads, cfg.head_k_dim, cfg.gdn_v_heads, cfg.head_v_dim
     H, KVH, D, RD = cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.rotary_dim
     F = cfg.intermediate
-    C_conv = cfg.gdn_kv_dim
     qb = cfg.fp8_quant_block
 
     x = weights.token_emb[st.ids].astype(np.float64)  # [B, C]

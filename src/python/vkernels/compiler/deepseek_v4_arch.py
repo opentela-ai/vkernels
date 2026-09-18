@@ -15,7 +15,7 @@ the same contracts, so numerics disagreements localize the bug.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -263,7 +263,7 @@ def _seed_history(config: DeepseekV4Config, st: DeepseekV4DecodeState, rng: np.r
     slots, compressor emissions fire at every boundary t < p, and the window
     holds the row's last m latents."""
     cfg = config
-    B, S, L, D = cfg.batch, cfg.cache_capacity, cfg.layers, cfg.latent_dim
+    B, L, D = cfg.batch, cfg.layers, cfg.latent_dim
     m, R = cfg.compress_m, cfg.entries_per_series
     for b in range(B):
         p = int(st.row_positions[b])
