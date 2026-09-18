@@ -307,20 +307,17 @@ bool dsa_topk_logits_fits_lds_wmma(int num_heads, int head_dim, int block,
 // different CU count.
 int dsa_topk_logits_split_for(int batch_size, int max_seq_len, int block);
 
-// The optimal split for the HIP dsa_sparse_fwd_split forward. Unlike the
-// indexer's split_kv (pure CU-filling, floor formula), the forward's decode
-// optimum is set by the per-block SERIAL key chain: each split block's
-// key loop is a load->use dependency chain (~1.2 us per key unpipelined),
-// so over-subscribing the CUs up to ~18 waves measured strictly beneficial
-// and the CU-filling formula is 5-6x off (recommends 3-4 at H=64 where the
-// measured best is 16-64). The split sweep (docs/performance/dsa/gfx942.md,
-// MI300A) puts the best at 8-32 keys per split on every decode shape, and
-// ceil(sqrt(2*topk)) lands on the measured best or its nearest neighbor on
-// all four shapes (topk=2048 -> 64 = measured best, 19.7x; 256 -> 23, best
-// 16; 128 -> 16 = measured best; DSv3 256 -> 23, best 16):
+// The optimal split for the HIP dsa_sparse_fwd_split forward. The decode
+// dispatch is three-way since issue #137 (vectorized register-batched
+// partial behind a long-chunk/small-grid gate -> double-buffered LDS kernel
+// behind its occupancy gate -> serial fallback), and the measured optimum
+// under that dispatch is split=16 on every decode shape (topk=2048: 132.5
+// us / 507 GB/s at split=16 with the vec kernel, vs 156-169 us at the old
+// split=64; topk=256/128 and DSv3: 55.1 / 43.5 / 85.4 us at split=16 in
+// the db regime):
 //
 //   split = 1                                   if ceildiv(S_q,BQ)*H >= NUM_CU
-//         = min(ceil(sqrt(2*topk)), topk)       otherwise
+//         = min(topk, 16)                       otherwise
 //
 // with NUM_CU = 228 (MI300A / gfx942; hipDeviceProp_t::multiProcessorCount,
 // verified on a CSCS beverin node). The plain-grid term returns 1 for

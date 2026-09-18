@@ -355,19 +355,21 @@ int dsa_sparse_fwd_split_for(int S_q, int H, int topk, int block_I,
   // Decode shapes: the optimum is set by the per-block SERIAL key chain (a
   // key's global read is a load->use dependency, ~1.2 us unpipelined), not
   // by CU filling -- over-subscription up to ~18 waves measured strictly
-  // beneficial. The split sweep (docs/performance/dsa/gfx942.md, MI300A)
-  // puts the best at 8-32 keys per split on every decode shape, and
-  // ceil(sqrt(2*topk)) lands on the measured best or its nearest measured
-  // neighbor on all four: topk=2048 -> 64 (19.7x), 256 -> 23 (best 16),
-  // 128 -> 16 (4.1x), DSv3 256 -> 23 (best 16). The indexer's floor-division
-  // formula (num_cu/blocks) is WRONG here: it recommends 3-4 at H=64, 5-6x
-  // off the measured optimum, because it models CU filling, not the serial
-  // chain. block_I stays reserved for the future tiled-key variant (whose
-  // split cap WILL be ceildiv(topk, block_I)); the streaming partial kernel
-  // reads one key at a time, so any split in [1, topk] is legal.
+  // beneficial for the pre-#137 serial/db dispatch, whose best sat at 8-32
+  // keys per split. Issue #137 (vectorized partial + fused combine, job
+  // 641060) shifted the full-topk optimum to a LONGER per-block chunk
+  // (shorter per-key chain, one uint2 load per key): topk=2048 now measures
+  // its best at split=16 (128 keys/split, 132.5 us / 507 GB/s vs the old
+  // split=64's 156-169 us), while topk=256/128 and DSv3 keep split=16 as
+  // the best (db/serial regime there: 55.1 / 43.5 / 85.4 us). The measured
+  // optimum is 16 on EVERY decode shape under the shipped three-way
+  // dispatch (vec gate / db occupancy gate / serial), so the
+  // ceil(sqrt(2*topk)) heuristic is replaced by the measured constant,
+  // capped at topk. block_I stays reserved for the future tiled-key
+  // variant (whose split cap WILL be ceildiv(topk, block_I)); any split in
+  // [1, topk] is legal.
   (void)block_I;
-  int s = (int)std::ceil(std::sqrt(2.0 * (double)topk));
-  if (s > topk) s = topk;   // every split keeps >= 1 key
+  int s = topk < 16 ? topk : 16;
   return s < 1 ? 1 : s;
 }
 

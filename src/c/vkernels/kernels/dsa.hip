@@ -1018,10 +1018,33 @@ int launch_partial_vec(const void* q, const void* kv, const void* indices,
   }();
   static const int g_ovr = [] {
     const char* e = std::getenv("VK_DSA_VECG");
-    return e ? std::atoi(e) : 4;
+    return e ? std::atoi(e) : 1;
   }();
   if (vec_mode == 0) return 0;
   if (tail_dim != 0 || dim <= 0 || dim % 4 != 0 || dim > 4 * 64) return 0;
+  // Issue #137 occupancy/TLP gate (auto mode only; VK_DSA_VEC=2 bypasses it
+  // for diagnostics). Measured sweep (job 641060, MI300A): the vectorized
+  // kernel wins while the per-split key chunk is LONG (>= ~32 keys/split)
+  // AND the grid is small enough that per-block latency dominates
+  // (<= ~2048 blocks = ~10 waves on 228 CUs): at topk=2048 it beats the
+  // serial kernel at split 2-32 (132.5 vs 247.8 us at split=16) but LOSES
+  // once the grid spills into pure TLP territory (split=64: 239 vs 168.7),
+  // and at small topk the serial/db kernels win at split>=16 (few keys per
+  // block). Both boundaries in one gate:
+  static const int num_cu = [] {
+    int dev = 0, n = 0;
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount,
+                              dev) != hipSuccess || n <= 0)
+      return 228;  // gfx942 CU count, same default as the db gate above
+    return n;
+  }();
+  if (vec_mode == 1) {
+    const long keys_per_split = ((long)topk + split_kv - 1) / split_kv;
+    const long total_blocks =
+        (long)((S_q + BQ - 1) / BQ) * (long)H * (long)split_kv;
+    if (keys_per_split < 32 || total_blocks > 10L * num_cu) return 0;
+  }
   const int g = (g_ovr == 1 || g_ovr == 2 || g_ovr == 8) ? g_ovr : 4;
 
   int fuse = fuse_mode ? 1 : 0;
@@ -1056,11 +1079,12 @@ int launch_partial_vec(const void* q, const void* kv, const void* indices,
   return fuse ? 2 : 1;
 }
 
-// Issue #80/#137: dispatch the split partial through the vectorized+
-// batched kernel (default, lever (a)) or the double-buffered kernel (its
-// measured win region at low split), falling back to the serial
-// dsa_sparse_fwd_partial_kernel only when neither is admitted. Returns
-// true when a separate combine launch is still required.
+// Issue #80/#137: dispatch the split partial: vectorized+batched kernel
+// first (its gate region -- long per-split key chunks on a small grid --
+// strictly dominates db + serial there, measured in job 641060), then the
+// double-buffered kernel (its measured win region at low split / few keys
+// per block), then the serial dsa_sparse_fwd_partial_kernel as the
+// fallback. Returns true when a separate combine launch is still required.
 template <int BQ>
 bool launch_partial_auto(const void* q, const void* kv, const void* indices,
                          void* part_out, void* part_lse, int S_q, int S_kv,
@@ -1068,28 +1092,17 @@ bool launch_partial_auto(const void* q, const void* kv, const void* indices,
                          float sm_scale, int split_kv, bool return_lse,
                          void* out, void* lse,
                          hipStream_t stream = nullptr) {
-  static const int vec_mode = [] {
-    const char* e = std::getenv("VK_DSA_VEC");
-    return e ? std::atoi(e) : 1;
-  }();
-  // VK_DSA_VEC=2: the vec kernel takes precedence even over the db gate.
-  if (vec_mode == 2 &&
-      launch_partial_vec<BQ>(q, kv, indices, part_out, part_lse, out, lse,
-                             S_q, S_kv, H, dim, tail_dim, topk, sm_scale,
-                             return_lse, split_kv, stream) == 2)
-    return false;
-  int kti = 0;
-  if (launch_partial_db<BQ>(q, kv, indices, part_out, part_lse, S_q, S_kv, H,
-                            dim, tail_dim, topk, kv_group, sm_scale,
-                            split_kv, kti, stream))
-    return true;
-  // db gate declined (or VK_DSA_DB=0): vec kernel when admitted.
   const int vec = launch_partial_vec<BQ>(q, kv, indices, part_out, part_lse,
                                          out, lse, S_q, S_kv, H, dim,
                                          tail_dim, topk, sm_scale,
                                          return_lse, split_kv, stream);
   if (vec == 2) return false;  // fused: no combine launch
   if (vec == 1) return true;   // partial only: combine still needed
+  int kti = 0;
+  if (launch_partial_db<BQ>(q, kv, indices, part_out, part_lse, S_q, S_kv, H,
+                            dim, tail_dim, topk, kv_group, sm_scale,
+                            split_kv, kti, stream))
+    return true;
   launch_partial<BQ>(q, kv, indices, part_out, part_lse, S_q, S_kv, H, dim,
                      tail_dim, topk, kv_group, sm_scale, split_kv, stream);
   return true;
