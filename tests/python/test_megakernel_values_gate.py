@@ -420,6 +420,9 @@ def test_device_template_parity_cuda():
     pytest.importorskip("triton")
     import torch
 
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA — device templates are mirrored on CPU above")
+
     from tests.python._megakernel_launch import launch_task_body
     from vkernels.compiler.device_triton import _t_values, _t_values_gated
 

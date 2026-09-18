@@ -671,13 +671,15 @@ def test_codegen_knows_the_indexer_templates():
 
 
 # ===========================================================================
-# Device templates — CUDA only (UNVERIFIED in this CPU-only environment;
-# same flagged gap as PRs #88/#113/#114/#115)
+# Device templates — CUDA only (oracle-mirrored on CPU above; device parity
+# verified on GB10/sm_121 via the shared cuda_available() gate)
 # ===========================================================================
 
+from tests.python._megakernel_launch import cuda_available  # noqa: E402
+
 gpu = pytest.mark.skipif(
-    not __import__("torch").cuda.is_available() if "torch" in sys.modules else True,
-    reason="requires CUDA — CPU-only lane: device templates are mirrored on CPU above",
+    not cuda_available(),
+    reason="requires CUDA — device templates are mirrored on CPU above",
 )
 
 

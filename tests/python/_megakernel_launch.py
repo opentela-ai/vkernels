@@ -19,6 +19,23 @@ behaviour), wrap the body in a ``@triton.jit`` launcher that injects
 from __future__ import annotations
 
 
+def cuda_available() -> bool:
+    """True when torch imports AND a CUDA device is visible.
+
+    Collection-time safe in all three stacks: torch-less (host CI runs
+    plain ``uv run`` without the ``[compiler]`` extra) -> False; torch
+    present without a GPU -> False; CUDA box -> True. Importing torch here
+    at collection time also puts it in ``sys.modules``, so later-collected
+    test modules evaluate their torch lookups consistently regardless of
+    file order — never write "torch in sys.modules" guards by hand.
+    """
+    try:
+        import torch
+    except ImportError:
+        return False
+    return torch.cuda.is_available()
+
+
 def launch_task_body(kern, *args, num_warps=4, **kwargs) -> None:
     """Direct-launch a batched task body: one program strided-covers all tasks."""
     kern[(1,)](0, 1, *args, num_warps=num_warps, **kwargs)
