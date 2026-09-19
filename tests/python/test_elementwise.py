@@ -142,6 +142,15 @@ def test_gpu_parity(torch):
     torch.testing.assert_close(ro_q, ro_q_r)
     torch.testing.assert_close(ro_k, ro_k_r)
 
+    # fused qk_norm+rope must match the two-kernel chain bit-for-bit
+    from vkernels.torch_ops.elementwise import qk_norm_rope
+
+    fq, fk = qk_norm_rope(q, k, q_norm, k_norm, cos, sin)
+    nq, nk = qk_norm(q, k, q_norm, k_norm)
+    rq, rk = rotary(nq, nk, cos, sin)
+    torch.testing.assert_close(fq, rq)
+    torch.testing.assert_close(fk, rk)
+
     gate = torch.randn(4, 5, 16, device=dev, dtype=dt)
     up = torch.randn(4, 5, 16, device=dev, dtype=dt)
     torch.testing.assert_close(silu_mul(gate, up), silu_mul_reference(gate, up))

@@ -164,7 +164,55 @@ def _kernels():
         tl.store(KC + (slot * H + head) * D + col, k, mask)
         tl.store(VC + (slot * H + head) * D + col, v, mask)
 
-    return _norm, _qk_norm, _rope, _silu_mul, _store_kv
+    @triton.jit
+    def _qk_norm_rope(
+        Q,
+        K,
+        WQ,
+        WK,
+        C,
+        S,
+        OQ,
+        OK,
+        HQ: tl.constexpr,
+        HK: tl.constexpr,
+        D: tl.constexpr,
+        QS: tl.constexpr,
+        KS: tl.constexpr,
+        QE: tl.constexpr,
+        KE: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row, head = tl.program_id(0), tl.program_id(1)
+        col = tl.arange(0, BLOCK)
+        mask = col < D
+        other = (col + D // 2) % D
+        c = tl.load(C + row * D + col, mask, 0).to(tl.float32)
+        s = tl.load(S + row * D + col, mask, 0).to(tl.float32)
+        sign = tl.where(col < D // 2, -1.0, 1.0)
+        if head < HQ:
+            x = tl.load(Q + row * QS + head * D + col, mask, 0).to(tl.float32)
+            xp = tl.load(Q + row * QS + head * D + other, mask, 0).to(tl.float32)
+            w = tl.load(WQ + col, mask, 0).to(tl.float32)
+            inv = tl.rsqrt(tl.sum(x * x, 0) / D + QE)
+            y = ((x * inv).to(Q.dtype.element_ty).to(tl.float32) * w).to(Q.dtype.element_ty).to(tl.float32)
+            yp = ((xp * inv).to(Q.dtype.element_ty).to(tl.float32) * w).to(Q.dtype.element_ty).to(tl.float32)
+            a = (y * c).to(Q.dtype.element_ty).to(tl.float32)
+            b = (yp * sign * s).to(Q.dtype.element_ty).to(tl.float32)
+            tl.store(OQ + (row * HQ + head) * D + col, a + b, mask)
+        else:
+            h = head - HQ
+            x = tl.load(K + row * KS + h * D + col, mask, 0).to(tl.float32)
+            xp = tl.load(K + row * KS + h * D + other, mask, 0).to(tl.float32)
+            w = tl.load(WK + col, mask, 0).to(tl.float32)
+            inv = tl.rsqrt(tl.sum(x * x, 0) / D + KE)
+            y = ((x * inv).to(K.dtype.element_ty).to(tl.float32) * w).to(K.dtype.element_ty).to(tl.float32)
+            yp = ((xp * inv).to(K.dtype.element_ty).to(tl.float32) * w).to(K.dtype.element_ty).to(tl.float32)
+            a = (y * c).to(K.dtype.element_ty).to(tl.float32)
+            b = (yp * sign * s).to(K.dtype.element_ty).to(tl.float32)
+            tl.store(OK + (row * HK + h) * D + col, a + b, mask)
+
+    return _norm, _qk_norm, _rope, _silu_mul, _store_kv, _qk_norm_rope
 
 
 def rms_norm(x, module, residual=None):
@@ -177,7 +225,7 @@ def rms_norm(x, module, residual=None):
     summed = x if residual is None else torch.empty_like(x)
     r = x if residual is None else residual.contiguous()
     d = x.shape[-1]
-    norm, _, _, _, _ = _kernels()
+    norm, _, _, _, _, _ = _kernels()
     norm[(x.numel() // d,)](
         x,
         module.weight,
@@ -201,7 +249,7 @@ def qk_norm(q, k, q_norm, k_norm):
     q3, k3 = q.reshape(-1, hq, d), k.reshape(-1, hk, d)
     oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     ok = torch.empty(k.shape, device=k.device, dtype=k.dtype)
-    _, qk_n, _, _, _ = _kernels()
+    _, qk_n, _, _, _, _ = _kernels()
     qk_n[(q3.shape[0], hq + hk)](
         q3,
         k3,
@@ -230,7 +278,7 @@ def rotary(q, k, cos, sin):
     q3, k3 = q.reshape(-1, hq, d), k.reshape(-1, hk, d)
     oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     ok = torch.empty(k.shape, device=k.device, dtype=k.dtype)
-    _, _, rope, _, _ = _kernels()
+    _, _, rope, _, _, _ = _kernels()
     rope[(q3.shape[0], hq + hk)](
         q3,
         k3,
@@ -265,7 +313,7 @@ def qk_norm_rope(q, k, q_norm, k_norm, cos, sin):
     q3, k3 = q.reshape(-1, hq, d), k.reshape(-1, hk, d)
     oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     ok = torch.empty(k.shape, device=k.device, dtype=k.dtype)
-    _, _, _, _, qk_rope = _kernels()
+    _, _, _, _, _, qk_rope = _kernels()
     qk_rope[(q3.shape[0], hq + hk)](
         q3,
         k3,
@@ -295,7 +343,7 @@ def silu_mul(gate, up):
     d = gate.shape[-1]
     g, u = gate.reshape(-1, d), up.reshape(-1, d)
     out = torch.empty(gate.shape, device=gate.device, dtype=gate.dtype)
-    _, _, _, sm, _ = _kernels()
+    _, _, _, sm, _, _ = _kernels()
     sm[(g.shape[0], triton.cdiv(d, 256))](
         g,
         u,
@@ -317,7 +365,7 @@ def store_kv(k, v, kc, vc, block_table, seqlens, scratch_slot):
     k3, v3 = k.reshape(-1, h, d), v.reshape(-1, h, d)
     # Token count is runtime data, not a JIT specialization: captured decode
     # initializes the same kernel used for arbitrary-length fresh prefills.
-    _, _, _, _, sk = _kernels()
+    _, _, _, _, sk, _ = _kernels()
     sk[(b, n, h)](
         k3,
         v3,
