@@ -116,3 +116,64 @@ def test_decode_attention_split_matches_reference():
         out2 = decode_attention_split(q, kc, vc, bt, sl2, max_len_hint=T)
         err2 = (out2.float() - ref2).abs().max().item()
         assert err2 < 0.02, f"split-vs-ref ragged err {err2} @ B={B} T={T}"
+
+
+def test_fused_kv_store_parity():
+    """decode_attention{,_split} with k_new/v_new must match the two-step
+    store_kv-then-attend sequence bit-for-bit, and must not touch the
+    scratch page."""
+    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch.cuda")
+    import torch as th
+    if not th.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vkernels.torch_ops.triton_attn import (
+        decode_attention,
+        decode_attention_split,
+    )
+
+    th.manual_seed(0)
+    dev = "cuda"
+    for B, n_q, n_kv, D, T in ((4, 16, 8, 128, 600), (2, 4, 2, 64, 77), (3, 8, 8, 64, 1300)):
+        q = th.randn(B, n_q, D, device=dev, dtype=th.bfloat16)
+        pool = T + 16  # per-batch disjoint slot ranges -> no cross-batch collision
+        kc = th.randn(B * pool, n_kv, D, device=dev, dtype=th.bfloat16)
+        vc = th.randn(B * pool, n_kv, D, device=dev, dtype=th.bfloat16)
+        bt = th.stack(
+            [th.randperm(pool - 16, device=dev)[:T].to(th.int32) + b * pool for b in range(B)]
+        )
+        scratch = B * pool - 1
+        # last batch's new token lands on the scratch page: never written
+        bt[-1, T - 1] = scratch
+        sl = th.full((B,), T, device=dev, dtype=th.int32)
+        kn = th.randn(B, n_kv, D, device=dev, dtype=th.bfloat16)
+        vn = th.randn(B, n_kv, D, device=dev, dtype=th.bfloat16)
+        kc0, vc0 = kc.clone(), vc.clone()
+        kcs, vcs = kc.clone(), vc.clone()
+        # reference: two-step (store then attend). The scratch batch's
+        # attention math still uses the fresh k/v (the kernel substitutes
+        # from registers; only the pool write is suppressed), so model the
+        # substitution in kc0 too -- only b=-1 hits scratch, and scratch
+        # lies in the unused tail no live batch reads.
+        slots = th.gather(bt, 1, ((sl - 1)[:, None]).to(th.int64))[:, 0]  # [B]
+        live = slots != scratch
+        kc0[slots[live].long()] = kn[live]
+        vc0[slots[live].long()] = vn[live]
+        kc0[scratch] = kn[-1]
+        vc0[scratch] = vn[-1]
+        ref = decode_attention(q, kc0, vc0, bt, sl)
+        ref_s = decode_attention_split(q, kc0, vc0, bt, sl, max_len_hint=T)
+        # fused: store folded into the attention kernel
+        out = decode_attention(q, kc, vc, bt, sl, k_new=kn, v_new=vn, scratch_slot=scratch)
+        out_s = decode_attention_split(q, kc, vc, bt, sl, max_len_hint=T, k_new=kn, v_new=vn, scratch_slot=scratch)
+        th.testing.assert_close(out, ref)
+        th.testing.assert_close(out_s, ref_s)
+        # pool state: unchanged everywhere except the written slots
+        # (scratch untouched)
+        keep = th.ones(kc.shape[0], dtype=th.bool, device=dev)
+        written = slots[live].long()
+        keep[written] = False
+        th.testing.assert_close(kcs[keep], kc[keep])
+        th.testing.assert_close(vcs[keep], vc[keep])
+        th.testing.assert_close(kc[written], kn[live])
+        th.testing.assert_close(vc[written], vn[live])

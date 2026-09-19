@@ -29,6 +29,8 @@ def _kernel():
         bt_ptr,
         sl_ptr,
         o_ptr,
+        kn_ptr,
+        vn_ptr,
         scale,
         stride_qb,
         stride_qh,
@@ -39,9 +41,13 @@ def _kernel():
         stride_btb,
         stride_ob,
         stride_oh,
+        stride_knb,
+        stride_knh,
         G: tl.constexpr,
         D: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        HAS_NEW: tl.constexpr,
+        SCRATCH: tl.constexpr,
     ):
         pid_b = tl.program_id(0)
         pid_h = tl.program_id(1)
@@ -51,6 +57,19 @@ def _kernel():
             tl.float32
         )
         seq = tl.load(sl_ptr + pid_b)
+        slot = 0
+        if HAS_NEW:
+            # Fused new-token store: this program owns kv head ``hkv`` for
+            # batch ``pid_b``; the fresh k/v is substituted into the
+            # attention math from registers (below) and written to the
+            # pool by one q-head program per group.
+            slot = tl.load(bt_ptr + pid_b * stride_btb + (seq - 1))
+            if slot != SCRATCH:
+                if pid_h % G == 0:
+                    kn = tl.load(kn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d)
+                    tl.store(k_ptr + slot * stride_kb + hkv * stride_kh + offs_d, kn)
+                    vn = tl.load(vn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d)
+                    tl.store(v_ptr + slot * stride_vb + hkv * stride_vh + offs_d, vn)
         m = float("-inf")
         l = 0.0
         acc = tl.zeros([D], dtype=tl.float32)
@@ -63,6 +82,9 @@ def _kernel():
                 mask=mask[:, None],
                 other=0.0,
             ).to(tl.float32)
+            if HAS_NEW:
+                kn = tl.load(kn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d).to(tl.float32)
+                kblk = tl.where((idx == slot)[:, None], kn[None, :], kblk)
             scores = tl.sum(kblk * qt[None, :], axis=1) * scale
             scores = tl.where(mask, scores, float("-inf"))
             m_new = tl.maximum(m, tl.max(scores, axis=0))
@@ -74,6 +96,9 @@ def _kernel():
                 mask=mask[:, None],
                 other=0.0,
             ).to(tl.float32)
+            if HAS_NEW:
+                vn = tl.load(vn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d).to(tl.float32)
+                vblk = tl.where((idx == slot)[:, None], vn[None, :], vblk)
             acc = acc * alpha + tl.sum(p[:, None] * vblk, axis=0)
             m = m_new
         tl.store(
@@ -84,10 +109,16 @@ def _kernel():
     return _paged_decode_attn
 
 
-def decode_attention(q, kc, vc, block_table, seq_lens):
+def decode_attention(q, kc, vc, block_table, seq_lens, *, k_new=None, v_new=None, scratch_slot=None):
     """Decode attention for one token per batch: q [B, n_q, D], KV pages
     ``kc``/``vc`` [max_total, n_kv, D], per-batch page table and lengths.
-    Returns [B, n_q, D] in the query dtype."""
+    Returns [B, n_q, D] in the query dtype.
+
+    ``k_new``/``v_new`` ([B, n_kv, D]) fuse the new token's KV store into
+    this kernel: the fresh values are used directly in the attention math
+    and written to the pool by one program per (batch, kv head), replacing
+    the separate ``store_kv`` launch. ``scratch_slot`` (the shared null
+    page) is never written."""
     import math
 
     import torch
@@ -104,6 +135,9 @@ def decode_attention(q, kc, vc, block_table, seq_lens):
     if not sl.is_contiguous():
         sl = sl.contiguous()
     out = torch.empty_like(q)
+    has_new = k_new is not None and v_new is not None
+    if has_new and k_new.shape != (B, n_kv, D):
+        raise ValueError(f"k_new must be [B, n_kv, D], got {tuple(k_new.shape)}")
 
     _kernel()[(B, n_q)](
         q,
@@ -112,6 +146,8 @@ def decode_attention(q, kc, vc, block_table, seq_lens):
         bt,
         sl,
         out,
+        k_new if has_new else q,  # unused dummy pointer when HAS_NEW=0
+        v_new if has_new else q,
         1.0 / math.sqrt(D),
         q.stride(0),
         q.stride(1),
@@ -122,9 +158,13 @@ def decode_attention(q, kc, vc, block_table, seq_lens):
         bt.stride(0),
         out.stride(0),
         out.stride(1),
+        k_new.stride(0) if has_new else 0,
+        k_new.stride(1) if has_new else 0,
         G=G,
         D=D,
         BLOCK_N=128,
+        HAS_NEW=has_new,
+        SCRATCH=scratch_slot if scratch_slot is not None else -1,
         num_warps=4,
     )
     return out
@@ -176,6 +216,7 @@ def _split_kernels():
     def _paged_decode_attn_s1(
         q_ptr, k_ptr, v_ptr, bt_ptr, sl_ptr,
         acc_ptr, m_ptr, l_ptr,
+        kn_ptr, vn_ptr,
         scale,
         split_len,
         stride_qb, stride_qh,
@@ -184,7 +225,9 @@ def _split_kernels():
         stride_btb,
         stride_ab, stride_ah, stride_as,
         stride_mb, stride_mh,
+        stride_knb, stride_knh,
         G: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr, SPLITS: tl.constexpr,
+        HAS_NEW: tl.constexpr, SCRATCH: tl.constexpr,
     ):
         pid_b = tl.program_id(0)
         pid_h = tl.program_id(1)
@@ -195,6 +238,22 @@ def _split_kernels():
         start = pid_s * split_len
         out_off = pid_b * stride_ab + pid_h * stride_ah + pid_s * stride_as
         m_off = pid_b * stride_mb + pid_h * stride_mh + pid_s
+        slot = 0
+        owns_new = False
+        if HAS_NEW:
+            # Exactly one split covers the new token's position (seq-1);
+            # that program substitutes the fresh k/v into its attention
+            # math and (one q-head per group) writes the pool. No cross-CTA
+            # ordering needed: no other program reads this slot.
+            slot = tl.load(bt_ptr + pid_b * stride_btb + (seq - 1))
+            end_all = tl.minimum(start + split_len, seq)
+            owns_new = (seq - 1) >= start and (seq - 1) < end_all
+            if slot != SCRATCH and owns_new:
+                if pid_h % G == 0:
+                    kn = tl.load(kn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d)
+                    tl.store(k_ptr + slot * stride_kb + hkv * stride_kh + offs_d, kn)
+                    vn = tl.load(vn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d)
+                    tl.store(v_ptr + slot * stride_vb + hkv * stride_vh + offs_d, vn)
         if start < seq:
             end = tl.minimum(start + split_len, seq)
             qt = tl.load(q_ptr + pid_b * stride_qb + pid_h * stride_qh + offs_d).to(tl.float32)
@@ -209,6 +268,9 @@ def _split_kernels():
                     k_ptr + idx[:, None] * stride_kb + hkv * stride_kh + offs_d[None, :],
                     mask=mask[:, None], other=0.0,
                 ).to(tl.float32)
+                if HAS_NEW:
+                    kn = tl.load(kn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d).to(tl.float32)
+                    kblk = tl.where((idx == slot)[:, None], kn[None, :], kblk)
                 scores = tl.sum(kblk * qt[None, :], axis=1) * scale
                 scores = tl.where(mask, scores, float("-inf"))
                 m_new = tl.maximum(m, tl.max(scores, axis=0))
@@ -219,6 +281,9 @@ def _split_kernels():
                     v_ptr + idx[:, None] * stride_vb + hkv * stride_vh + offs_d[None, :],
                     mask=mask[:, None], other=0.0,
                 ).to(tl.float32)
+                if HAS_NEW:
+                    vn = tl.load(vn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d).to(tl.float32)
+                    vblk = tl.where((idx == slot)[:, None], vn[None, :], vblk)
                 acc = acc * alpha + tl.sum(p[:, None] * vblk, axis=0)
                 m = m_new
             tl.store(acc_ptr + out_off + offs_d, acc)
@@ -263,7 +328,7 @@ def _split_kernels():
     return _paged_decode_attn_s1, _paged_decode_attn_s2
 
 
-def decode_attention_split(q, kc, vc, block_table, seq_lens, *, max_splits=_MAX_KV_SPLITS, block_n=64, max_len_hint=None):
+def decode_attention_split(q, kc, vc, block_table, seq_lens, *, max_splits=_MAX_KV_SPLITS, block_n=64, max_len_hint=None, k_new=None, v_new=None, scratch_slot=None):
     """Split-KV decode attention: same contract as :func:`decode_attention`.
 
     Splits each sequence's KV range across ``max_splits`` programs per
@@ -296,10 +361,15 @@ def decode_attention_split(q, kc, vc, block_table, seq_lens, *, max_splits=_MAX_
     acc = torch.empty(B, n_q, splits, D, dtype=torch.float32, device=dev)
     ml = torch.empty(2, B, n_q, splits, dtype=torch.float32, device=dev)
     out = torch.empty_like(q)
+    has_new = k_new is not None and v_new is not None
+    if has_new and k_new.shape != (B, n_kv, D):
+        raise ValueError(f"k_new must be [B, n_kv, D], got {tuple(k_new.shape)}")
     k1, k2 = _split_kernels()
     k1[(B, n_q, splits)](
         q, kc, vc, bt, sl,
         acc, ml[0], ml[1],
+        k_new if has_new else q,  # unused dummy pointer when HAS_NEW=0
+        v_new if has_new else q,
         1.0 / math.sqrt(D),
         split_len,
         q.stride(0), q.stride(1),
@@ -308,7 +378,11 @@ def decode_attention_split(q, kc, vc, block_table, seq_lens, *, max_splits=_MAX_
         bt.stride(0),
         acc.stride(0), acc.stride(1), acc.stride(2),
         ml[0].stride(0), ml[0].stride(1),
+        k_new.stride(0) if has_new else 0,
+        k_new.stride(1) if has_new else 0,
         G=G, D=D, BLOCK_N=block_n, SPLITS=splits,
+        HAS_NEW=has_new,
+        SCRATCH=scratch_slot if scratch_slot is not None else -1,
         num_warps=2,
     )
     k2[(B, n_q)](
