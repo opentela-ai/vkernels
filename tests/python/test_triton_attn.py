@@ -84,3 +84,35 @@ def test_gpu_parity_vs_reference(torch):
     out = decode_attention(q, kc, vc, block_table, seq_lens)
     out_r = decode_attention_reference(q, kc, vc, block_table, seq_lens)
     torch.testing.assert_close(out.float(), out_r.float(), atol=1e-3, rtol=1e-3)
+
+
+def test_decode_attention_split_matches_reference():
+    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch.cuda")
+    import torch as th
+    if not th.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vkernels.torch_ops.triton_attn import (
+        decode_attention_reference,
+        decode_attention_split,
+    )
+
+    th.manual_seed(0)
+    dev = "cuda"
+    for B, n_q, n_kv, D, T in ((4, 16, 8, 128, 600), (1, 8, 8, 128, 64), (2, 4, 2, 64, 2048)):
+        q = th.randn(B, n_q, D, device=dev, dtype=th.bfloat16)
+        kc = th.randn(4096, n_kv, D, device=dev, dtype=th.bfloat16)
+        vc = th.randn(4096, n_kv, D, device=dev, dtype=th.bfloat16)
+        bt = th.stack([th.randperm(4000, device=dev)[:T].to(th.int32) for _ in range(B)])
+        sl = th.full((B,), T, device=dev, dtype=th.int32)
+        ref = decode_attention_reference(q, kc, vc, bt, sl)
+        out = decode_attention_split(q, kc, vc, bt, sl, max_len_hint=T)
+        err = (out.float() - ref).abs().max().item()
+        assert err < 0.02, f"split-vs-ref err {err} @ B={B} T={T}"
+        # ragged lens
+        sl2 = sl.clone()
+        sl2[0] = T // 3
+        ref2 = decode_attention_reference(q, kc, vc, bt, sl2)
+        out2 = decode_attention_split(q, kc, vc, bt, sl2, max_len_hint=T)
+        err2 = (out2.float() - ref2).abs().max().item()
+        assert err2 < 0.02, f"split-vs-ref ragged err {err2} @ B={B} T={T}"
