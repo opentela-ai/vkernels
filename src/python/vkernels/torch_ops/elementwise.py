@@ -249,6 +249,45 @@ def rotary(q, k, cos, sin):
     return oq, ok
 
 
+def qk_norm_rope(q, k, q_norm, k_norm, cos, sin):
+    """Fused per-head QK-RMSNorm + rotary embedding (one kernel).
+
+    Equivalent to :func:`qk_norm` followed by :func:`rotary` on the normed
+    tensors (the rounding sequence matches: norm result is rounded to the
+    input dtype before the rope multiply, then each rope half is rounded
+    before the add). Removes one launch and one full read+write of q/k
+    per layer on the decode hot path.
+    """
+    import triton  # lazy: launches need triton only
+    import torch
+
+    d, hq, hk = q.shape[-1], q.shape[-2], k.shape[-2]
+    q3, k3 = q.reshape(-1, hq, d), k.reshape(-1, hk, d)
+    oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    ok = torch.empty(k.shape, device=k.device, dtype=k.dtype)
+    _, _, _, _, qk_rope = _kernels()
+    qk_rope[(q3.shape[0], hq + hk)](
+        q3,
+        k3,
+        q_norm.weight,
+        k_norm.weight,
+        cos.contiguous(),
+        sin.contiguous(),
+        oq,
+        ok,
+        hq,
+        hk,
+        d,
+        q3.stride(0),
+        k3.stride(0),
+        q_norm.variance_epsilon,
+        k_norm.variance_epsilon,
+        triton.next_power_of_2(d),
+        enable_fp_fusion=False,
+    )
+    return oq, ok
+
+
 def silu_mul(gate, up):
     import triton  # lazy: launches need triton only
     import torch

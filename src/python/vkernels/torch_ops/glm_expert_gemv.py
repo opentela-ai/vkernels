@@ -239,6 +239,12 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn"):
                 )
             else:
                 kernel = gemv if torch.version.hip else gemv_native
+                # _expert_gemv (HIP/fnuz) takes a trailing FNUZ constexpr;
+                # _expert_gemv_native (CUDA) does NOT — binding 12 args
+                # against its 11-param signature raised
+                # "dynamic_func() takes 11 positional arguments but 12 were
+                # given" (regression from the fnuz-storage commit d5678ec).
+                extra_fnuz = [False] if torch.version.hip else []
                 kernel[(t * k, triton.cdiv(o, 4))](
                     x,
                     weights.view(torch.uint8),
@@ -251,7 +257,7 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn"):
                     x.ndim == 2,
                     4,
                     triton.next_power_of_2(i),
-                    False,
+                    *extra_fnuz,
                     num_warps=4,
                     enable_fp_fusion=False,
                 )

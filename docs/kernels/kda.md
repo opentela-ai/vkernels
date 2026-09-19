@@ -14,7 +14,10 @@ that flag.
 - **Source (HIP)**: `src/c/vkernels/kernels/kda.hip`
 - **Header**: `src/c/vkernels/kernels/kda.hpp`
 - **Tests**: `tests/kernels/attn/test_kda.cpp` (host, 12 cases incl. a
-  chunked-vs-naive cross-check at K3 head shapes)
+  chunked-vs-naive cross-check at K3 head shapes),
+  `tests/kernels/attn/test_kda_k3_chunked.cpp` (the per-key-dim chunked WY
+  derivation), `tests/kernels/attn/test_kda_cp.cpp` (the state-handoff /
+  context-parallel composition contract)
 
 ---
 
@@ -59,13 +62,56 @@ cross-checked against `kda_naive_delta_rule_fwd_cpu` at K3 head shapes
 (`B,H,S,D,chunk` up to `{1,1,64,8,16}`) and matches to within fp32
 round-off.
 
+## Context-parallel state handoff (chunked-scan state API, #CP)
+
+Because the delta-rule recurrence is Markov in `S_t`, KDA layers compose
+across sequence shards: running shard `[S0,S1)` with initial state `S_in`
+and shard `[S1,S2)` seeded with the exported `S_out` equals the monolithic
+`[S0,S2)` run. That is exactly what a context-parallel (CP) rank ring needs:
+each rank processes its sequence shard and hands the `D×D` per-head state
+to the next rank (the attention KV still crosses the wire per layer; the
+linear-attention state is the O(1) summary that makes the KDA path
+ring-composable).
+
+Two CPU entry points (state layout: the canonical `[B, H, D, D]` float of
+the HIP state scratch, row-major `S[v][k]`):
+
+- `kda_naive_delta_rule_fwd_state_cpu` — the per-token oracle with an
+  explicit `S_0 = state_in` and exported `S_S = state_out` (the state-carrying
+  counterpart of `kda_naive_delta_rule_fwd_cpu`, which hard-codes `S_0 = 0`).
+- `kda_delta_rule_fwd_state_cpu` — the **chunked-scan state API**: the affine
+  WY form (the math of `hip::kda_delta_rule_fwd_chunked_with_scratch`) with
+  `C_{-1} = state_in` and the final `C` exported to `state_out`. The caller
+  hands a whole shard; chunking is internal (`chunk_size` divides the shard
+  length). `state_out` may alias `state_in` (one ring buffer per `(b,h)`;
+  the seed is fully read before the export).
+
+Contract: same input regime as the HIP chunked kernel (`k` L2-normalised,
+`g` in (0,1], `β ≤ 1`). `tests/kernels/attn/test_kda_cp.cpp` checks: the
+WY state forward vs the state-carrying oracle at zero and random seeded
+states (incl. the K3 head shapes `D=64/128`, `cs=64`), the ring-handoff
+composition (4 shards == monolithic, in outputs AND final state), in-place
+state aliasing, and the null/chunk contracts.
+
+**HIP status: no HIP change is required.**
+`hip::kda_delta_rule_fwd_with_scratch` and
+`hip::kda_delta_rule_fwd_chunked_with_scratch` already implement the
+seed/export contract (the `state` buffer is in-out: pre-fill with the
+gathered initial state, read the final state back after the call — the
+multi-turn decode-with-scratch path). The new CPU functions are the host
+oracle for exactly that contract, which until now was validated only
+on GPU machines against the cooperative kernel. A CP rank ring therefore
+needs only a transport for the `B·H·D·D` state buffer (see
+[comm-context-parallel.md](../comm-context-parallel.md)); per rank shard
+the GPU path is unchanged.
+
 ## Two-implementation model
 
 | Operation | CPU (`kda.cpp`) | HIP (`kda.hip`) |
 |---|---|---|
 | `layer_norm_gated_fwd` | `kda_layer_norm_gated_cpu` | `kda_layer_norm_gated` |
 | `kda_gate_chunk_cumsum_vector_kernel` | `kda_gate_chunk_cumsum_cpu` | `kda_gate_chunk_cumsum` |
-| `chunk_gated_delta_rule_fwd_kernel` | `kda_naive_delta_rule_fwd_cpu` (oracle) + `kda_delta_rule_fwd_cpu` (chunked) | `kda_delta_rule_fwd` (cooperative recurrence) |
+| `chunk_gated_delta_rule_fwd_kernel` | `kda_naive_delta_rule_fwd_cpu` (oracle) + `kda_delta_rule_fwd_cpu` (chunked) + `kda_naive_delta_rule_fwd_state_cpu` (state-carrying oracle) + `kda_delta_rule_fwd_state_cpu` (chunked WY with explicit state) | `kda_delta_rule_fwd` (cooperative recurrence) |
 | `chunk_kda_fwd_kernel_intra_sub_chunk` | `kda_delta_rule_intra_cpu` | (subsumed by the cooperative forward) |
 | `chunk_kda_fwd_kernel_inter_solve_fused` | `kda_delta_rule_inter_cpu` | (subsumed by the cooperative forward) |
 | `chunk_gla_fwd_kernel_o` | `kda_gla_fwd_o_cpu` | (subsumed by the cooperative forward) |
