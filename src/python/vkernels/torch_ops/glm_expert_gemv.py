@@ -17,6 +17,7 @@ autograd backward. Graph capture: warm up eagerly per shape first (the
 autotune-free kernel still compiles on first launch).
 """
 
+from ._dispatch import OpNotEligible
 import os
 from functools import lru_cache
 
@@ -177,34 +178,34 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn"):
     import torch
 
     if storage not in ("e4m3fn", "e4m3fnuz"):
-        raise ValueError(f"unknown weight storage {storage!r}")
+        raise OpNotEligible(f"unknown weight storage {storage!r}")
     fnuz = storage == "e4m3fnuz"
     want = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
     cap = _t_cap()
     if weights.ndim != 3 or indices.ndim != 2:
-        raise ValueError("expected weights [E,O,I] and indices [T,K]")
+        raise OpNotEligible("expected weights [E,O,I] and indices [T,K]")
     e, o, i = weights.shape
     t, k = indices.shape
     if not e or not o or not i or o % 128 or i % 128 or t > cap:
-        raise ValueError(f"requires positive block-128 dimensions and T<={cap}")
+        raise OpNotEligible(f"requires positive block-128 dimensions and T<={cap}")
     if x.shape not in ((t, i), (t, k, i)):
-        raise ValueError("expected x[T,I] or x[T,K,I]")
+        raise OpNotEligible("expected x[T,I] or x[T,K,I]")
     if scales.shape != (e, o // 128, i // 128):
-        raise ValueError("expected scales [E,O/128,I/128]")
+        raise OpNotEligible("expected scales [E,O/128,I/128]")
     if (
         x.dtype != torch.bfloat16
         or weights.dtype != want
         or scales.dtype != torch.float32
         or indices.dtype != torch.int64
     ):
-        raise TypeError(
+        raise OpNotEligible(
             "requires BF16 activations, "
             f"{'E4M3FNUZ' if fnuz else 'E4M3FN'} weights, FP32 scales, int64 indices"
         )
     if any(not v.is_cuda or v.device != weights.device for v in (x, scales, indices)):
-        raise ValueError("inputs must share a GPU device")
+        raise OpNotEligible("inputs must share a GPU device")
     if any(not v.is_contiguous() for v in (x, weights, scales, indices)):
-        raise ValueError("inputs must be contiguous")
+        raise OpNotEligible("inputs must be contiguous")
     out = torch.empty((t, k, o), device=x.device, dtype=torch.bfloat16)
     if t and k:
         import triton  # lazy: validation above needs only torch
@@ -268,8 +269,15 @@ def expert_gemv_reference(x, weights, scales, indices):
     """Gather-dequant + einsum reference (fp32 dot, BF16 output).
 
     Mirrors the kernel's rounding contract: the scaled weight is rounded
-    to BF16 *before* the fp32 product reduction (matching
-    gather-dequant followed by GEMV).
+    to BF16 *before* the fp32 product reduction (matching gather-dequant
+    followed by GEMV). The decode runs GATHER-FIRST and chunked — both
+    bit-identical (the byte decode is elementwise) — so the oracle's fp32
+    temporaries stay bounded: the un-chunked form materialized ~6x the
+    full [E,O,I] fp32 stack and OOMed a 128 GiB MI300A through the
+    plugin-shape acceptance test even after its memory guard passed
+    (beverin job 644666). Gathering through the uint8 view also keeps the
+    oracle working on builds where CPU fp8 fancy-indexing is
+    unimplemented.
     """
     import torch
 
@@ -277,19 +285,24 @@ def expert_gemv_reference(x, weights, scales, indices):
     e, o, i = weights.shape
     t, k = indices.shape
     if t > cap:
-        raise ValueError(f"T={t} exceeds the cap {cap}")
-    raw = weights.view(torch.uint8).to(torch.int32)
-    exponent, mantissa = (raw >> 3) & 15, raw & 7
-    bits = (((exponent + 120) << 23) | (mantissa << 20)).to(torch.int32)
-    value = bits.view(torch.float32)
-    value = torch.where(
-        exponent == 0, mantissa.to(torch.float32) * (1.0 / 512.0), value
-    )
-    value = torch.where((raw & 127) == 127, float("nan"), value)
-    value = value * torch.where((raw & 128) != 0, -1.0, 1.0)
-    scale = scales.repeat_interleave(128, dim=1).repeat_interleave(128, dim=2)
-    weight = (value * scale[:, :o, :i]).to(torch.bfloat16)
-    selected = weight[indices]  # [T,K,O,I] bf16
+        raise OpNotEligible(f"T={t} exceeds the cap {cap}")
+    sel_w8 = weights.view(torch.uint8)[indices]  # [T,K,O,I] raw bytes
+    sel_scale = scales[indices]  # [T,K,O/128,I/128]
+    expand = sel_scale.repeat_interleave(128, dim=2).repeat_interleave(128, dim=3)
+    flat = sel_w8.reshape(-1)
+    vals = torch.empty(flat.shape, dtype=torch.float32, device=flat.device)
+    chunk = 1 << 26  # 64 Mi elements: ~1.5 GiB of fp32 temporaries per slice
+    for beg in range(0, flat.numel(), chunk):
+        raw = flat[beg:beg + chunk].to(torch.int32)
+        exponent, mantissa = (raw >> 3) & 15, raw & 7
+        bits = (((exponent + 120) << 23) | (mantissa << 20)).to(torch.int32)
+        value = bits.view(torch.float32)
+        value = torch.where(
+            exponent == 0, mantissa.to(torch.float32) * (1.0 / 512.0), value
+        )
+        value = torch.where((raw & 127) == 127, float("nan"), value)
+        vals[beg:beg + chunk] = value * torch.where((raw & 128) != 0, -1.0, 1.0)
+    weight = (vals.reshape(t, k, o, i) * expand).to(torch.bfloat16)
     x3 = x if x.ndim == 3 else x[:, None, :].expand(t, k, i)
-    out = torch.einsum("tki,tkoi->tko", x3.float(), selected.float())
+    out = torch.einsum("tki,tkoi->tko", x3.float(), weight.float())
     return out.to(torch.bfloat16)

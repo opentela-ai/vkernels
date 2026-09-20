@@ -15,9 +15,24 @@ is deliberately owned here, next to the kernels it gates: it encodes which
 HF blocks/heads the kernels cover (and rejects Gemma-style offset-weight
 norms), keeping floe's adapter thin. Extend it whenever ``transformers``
 renames or restructures the covered classes.
+
+Every public op also validates its own per-call eligibility (CUDA residency,
+dtype, shape agreement — the ``torch_ops`` dispatch convention) and raises
+:class:`OpNotEligible` when the fused launch cannot take the inputs, so
+callers fall back to the eager path instead of pre-gating on hardware.
 """
 
 from functools import lru_cache
+
+from ._dispatch import require
+
+
+def _same_gpu(*tensors):
+    """Shared eligibility floor: every tensor CUDA-resident on one device."""
+    require(tensors[0].is_cuda,
+            "inputs must be CUDA-resident (CPU callers take the *_reference/eager path)")
+    require(all(t.device == tensors[0].device for t in tensors),
+            "inputs must share one GPU device")
 
 
 @lru_cache(maxsize=1)
@@ -194,9 +209,13 @@ def _kernels():
             x = tl.load(Q + row * QS + head * D + col, mask, 0).to(tl.float32)
             xp = tl.load(Q + row * QS + head * D + other, mask, 0).to(tl.float32)
             w = tl.load(WQ + col, mask, 0).to(tl.float32)
+            # the PAIRED element keeps ITS OWN norm weight (the chain norms
+            # every element with its own column weight before rotary), so
+            # yp's weight loads at `other`, not at `col`.
+            wp = tl.load(WQ + other, mask, 0).to(tl.float32)
             inv = tl.rsqrt(tl.sum(x * x, 0) / D + QE)
             y = ((x * inv).to(Q.dtype.element_ty).to(tl.float32) * w).to(Q.dtype.element_ty).to(tl.float32)
-            yp = ((xp * inv).to(Q.dtype.element_ty).to(tl.float32) * w).to(Q.dtype.element_ty).to(tl.float32)
+            yp = ((xp * inv).to(Q.dtype.element_ty).to(tl.float32) * wp).to(Q.dtype.element_ty).to(tl.float32)
             a = (y * c).to(Q.dtype.element_ty).to(tl.float32)
             b = (yp * sign * s).to(Q.dtype.element_ty).to(tl.float32)
             tl.store(OQ + (row * HQ + head) * D + col, a + b, mask)
@@ -205,27 +224,83 @@ def _kernels():
             x = tl.load(K + row * KS + h * D + col, mask, 0).to(tl.float32)
             xp = tl.load(K + row * KS + h * D + other, mask, 0).to(tl.float32)
             w = tl.load(WK + col, mask, 0).to(tl.float32)
+            wp = tl.load(WK + other, mask, 0).to(tl.float32)
             inv = tl.rsqrt(tl.sum(x * x, 0) / D + KE)
             y = ((x * inv).to(K.dtype.element_ty).to(tl.float32) * w).to(K.dtype.element_ty).to(tl.float32)
-            yp = ((xp * inv).to(K.dtype.element_ty).to(tl.float32) * w).to(K.dtype.element_ty).to(tl.float32)
+            yp = ((xp * inv).to(K.dtype.element_ty).to(tl.float32) * wp).to(K.dtype.element_ty).to(tl.float32)
             a = (y * c).to(K.dtype.element_ty).to(tl.float32)
             b = (yp * sign * s).to(K.dtype.element_ty).to(tl.float32)
             tl.store(OK + (row * HK + h) * D + col, a + b, mask)
 
-    return _norm, _qk_norm, _rope, _silu_mul, _store_kv, _qk_norm_rope
+    @triton.jit
+    def _norm_uw(
+        X,
+        Y,
+        D: tl.constexpr,
+        EPS: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        col = tl.arange(0, BLOCK)
+        mask = col < D
+        x = tl.load(X + row * D + col, mask, 0).to(tl.float32)
+        # The eager form is `x * rsqrt(...).to(dtype)`: the inverse is rounded
+        # to the storage dtype BEFORE the multiply, so round here too.
+        inv = tl.rsqrt(tl.sum(x * x, 0) / D + EPS).to(Y.dtype.element_ty).to(tl.float32)
+        tl.store(Y + row * D + col, (x * inv).to(Y.dtype.element_ty), mask)
+
+    @triton.jit
+    def _norm_gated(
+        X,
+        W,
+        G,
+        Y,
+        D: tl.constexpr,
+        EPS: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        col = tl.arange(0, BLOCK)
+        mask = col < D
+        x = tl.load(X + row * D + col, mask, 0).to(tl.float32)
+        inv = tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
+        w = tl.load(W + col, mask, 0).to(tl.float32)
+        gate = tl.load(G + row * D + col, mask, 0).to(tl.float32)
+        # strict fp32 throughout, one rounding on store -- and the same
+        # left-to-right multiply order as the eager reference
+        tl.store(Y + row * D + col, (((x * inv) * w) * tl.sigmoid(gate)).to(Y.dtype.element_ty), mask)
+
+    return _norm, _qk_norm, _rope, _silu_mul, _store_kv, _qk_norm_rope, _norm_uw, _norm_gated
 
 
 def rms_norm(x, module, residual=None):
-    """Return (normalized value, rounded residual sum), without aliasing writes."""
-    import triton  # lazy: launches need triton only
+    """Return (normalized value, rounded residual sum), without aliasing writes.
+
+    Eligibility: CUDA bf16/fp16 ``x`` whose ``module.weight`` shares its dtype
+    (the eager expression's output dtype follows the weight's, so a mismatched
+    weight would change the result dtype, not just the speed) and an optional
+    ``residual`` of the same shape/dtype/device. Anything else raises
+    :class:`OpNotEligible` — callers fall back to :func:`rms_norm_reference`.
+    """
     import torch
+
+    _same_gpu(x, module.weight, *((residual,) if residual is not None else ()))
+    require(x.dtype in (torch.float32, torch.bfloat16, torch.float16),
+            f"rms_norm runs fp32/bf16/fp16, got {x.dtype}")
+    require(module.weight.dtype == x.dtype,
+            f"weight dtype {module.weight.dtype} must match x ({x.dtype})")
+    require(module.weight.is_contiguous(), "weight must be contiguous")
+    if residual is not None:
+        require(residual.shape == x.shape and residual.dtype == x.dtype,
+                "residual must match x's shape and dtype")
+    import triton  # lazy: launches need triton only
 
     x = x.contiguous()
     out = torch.empty_like(x)
     summed = x if residual is None else torch.empty_like(x)
     r = x if residual is None else residual.contiguous()
     d = x.shape[-1]
-    norm, _, _, _, _, _ = _kernels()
+    norm = _kernels()[0]
     norm[(x.numel() // d,)](
         x,
         module.weight,
@@ -242,14 +317,29 @@ def rms_norm(x, module, residual=None):
 
 
 def qk_norm(q, k, q_norm, k_norm):
-    import triton  # lazy: launches need triton only
+    """Per-head QK-RMSNorm in one launch over both projections.
+
+    Eligibility: CUDA bf16/fp16 ``q``/``k`` sharing device, token grid and
+    head dim; norm weights contiguous. Raises :class:`OpNotEligible`
+    otherwise (the eager two-norm chain is the fallback).
+    """
     import torch
+
+    _same_gpu(q, k, q_norm.weight, k_norm.weight)
+    require(q.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and k.dtype in (torch.float32, torch.bfloat16, torch.float16),
+            f"qk_norm runs fp32/bf16/fp16, got {q.dtype}/{k.dtype}")
+    require(q.shape[:-2] == k.shape[:-2] and q.shape[-1] == k.shape[-1],
+            "q and k must share their token grid and head dim")
+    require(q_norm.weight.is_contiguous() and k_norm.weight.is_contiguous(),
+            "norm weights must be contiguous")
+    import triton  # lazy: launches need triton only
 
     d, hq, hk = q.shape[-1], q.shape[-2], k.shape[-2]
     q3, k3 = q.reshape(-1, hq, d), k.reshape(-1, hk, d)
     oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     ok = torch.empty(k.shape, device=k.device, dtype=k.dtype)
-    _, qk_n, _, _, _, _ = _kernels()
+    qk_n = _kernels()[1]
     qk_n[(q3.shape[0], hq + hk)](
         q3,
         k3,
@@ -271,14 +361,34 @@ def qk_norm(q, k, q_norm, k_norm):
 
 
 def rotary(q, k, cos, sin):
-    import triton  # lazy: launches need triton only
+    """Half-rotation rotary embedding over every head in one launch.
+
+    Eligibility: CUDA ``q``/``k``/``cos``/``sin`` on one device, ``q``/``k``
+    bf16/fp16 sharing their token grid and (even) head dim, ``cos``/``sin``
+    contiguous with one row per token. Raises :class:`OpNotEligible`
+    otherwise (:func:`rotary_reference` is the eager form).
+    """
     import torch
+
+    _same_gpu(q, k, cos, sin)
+    require(q.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and k.dtype in (torch.float32, torch.bfloat16, torch.float16),
+            f"rotary runs fp32/bf16/fp16, got {q.dtype}/{k.dtype}")
+    require(q.shape[:-2] == k.shape[:-2] and q.shape[-1] == k.shape[-1]
+            and q.shape[-1] % 2 == 0,
+            "q and k must share their token grid and an even head dim")
+    d = q.shape[-1]
+    tokens = q.numel() // (q.shape[-2] * d)
+    require(cos.is_contiguous() and sin.is_contiguous()
+            and cos.numel() == tokens * d and sin.numel() == tokens * d,
+            "cos/sin must be contiguous with one row per token")
+    import triton  # lazy: launches need triton only
 
     d, hq, hk = q.shape[-1], q.shape[-2], k.shape[-2]
     q3, k3 = q.reshape(-1, hq, d), k.reshape(-1, hk, d)
     oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     ok = torch.empty(k.shape, device=k.device, dtype=k.dtype)
-    _, _, rope, _, _, _ = _kernels()
+    rope = _kernels()[2]
     rope[(q3.shape[0], hq + hk)](
         q3,
         k3,
@@ -305,15 +415,34 @@ def qk_norm_rope(q, k, q_norm, k_norm, cos, sin):
     input dtype before the rope multiply, then each rope half is rounded
     before the add). Removes one launch and one full read+write of q/k
     per layer on the decode hot path.
+
+    Eligibility: the :func:`qk_norm` constraints plus :func:`rotary`'s
+    cos/sin constraints; raises :class:`OpNotEligible` otherwise (the eager
+    two-kernel chain is the fallback).
     """
-    import triton  # lazy: launches need triton only
     import torch
+    import triton  # lazy: launches need triton only
+
+    _same_gpu(q, k, q_norm.weight, k_norm.weight, cos, sin)
+    require(q.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and k.dtype in (torch.float32, torch.bfloat16, torch.float16),
+            f"qk_norm_rope runs fp32/bf16/fp16, got {q.dtype}/{k.dtype}")
+    require(q.shape[:-2] == k.shape[:-2] and q.shape[-1] == k.shape[-1]
+            and q.shape[-1] % 2 == 0,
+            "q and k must share their token grid and an even head dim")
+    require(q_norm.weight.is_contiguous() and k_norm.weight.is_contiguous(),
+            "norm weights must be contiguous")
+    d = q.shape[-1]
+    tokens = q.numel() // (q.shape[-2] * d)
+    require(cos.is_contiguous() and sin.is_contiguous()
+            and cos.numel() == tokens * d and sin.numel() == tokens * d,
+            "cos/sin must be contiguous with one row per token")
 
     d, hq, hk = q.shape[-1], q.shape[-2], k.shape[-2]
     q3, k3 = q.reshape(-1, hq, d), k.reshape(-1, hk, d)
     oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     ok = torch.empty(k.shape, device=k.device, dtype=k.dtype)
-    _, _, _, _, _, qk_rope = _kernels()
+    qk_rope = _kernels()[5]
     qk_rope[(q3.shape[0], hq + hk)](
         q3,
         k3,
@@ -337,13 +466,24 @@ def qk_norm_rope(q, k, q_norm, k_norm, cos, sin):
 
 
 def silu_mul(gate, up):
-    import triton  # lazy: launches need triton only
+    """SiLU(gate) * up in one launch (SiLU rounds before the product).
+
+    Eligibility: CUDA bf16/fp16 ``gate``/``up`` of the same shape and dtype
+    on one device; raises :class:`OpNotEligible` otherwise.
+    """
     import torch
+    import triton  # lazy: launches need triton only
+
+    _same_gpu(gate, up)
+    require(gate.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and up.dtype == gate.dtype,
+            f"silu_mul runs fp32/bf16/fp16 with matching dtypes, got {gate.dtype}/{up.dtype}")
+    require(up.shape == gate.shape, "gate and up must share a shape")
 
     d = gate.shape[-1]
     g, u = gate.reshape(-1, d), up.reshape(-1, d)
     out = torch.empty(gate.shape, device=gate.device, dtype=gate.dtype)
-    _, _, _, sm, _, _ = _kernels()
+    sm = _kernels()[3]
     sm[(g.shape[0], triton.cdiv(d, 256))](
         g,
         u,
@@ -358,14 +498,37 @@ def silu_mul(gate, up):
 
 
 def store_kv(k, v, kc, vc, block_table, seqlens, scratch_slot):
-    """Resolve virtual slots and scatter K and V in one graph-safe launch."""
+    """Resolve virtual slots and scatter K and V in one graph-safe launch.
+
+    Eligibility: CUDA-resident tensors on one device; ``kc``/``vc`` pools
+    contiguous with the incoming ``k``/``v`` dtypes (the scatter is a raw
+    copy — a dtype mismatch would corrupt the pool, so it is rejected, not
+    launched); integer ``block_table``/``seqlens``. Raises
+    :class:`OpNotEligible` otherwise.
+    """
     import triton  # lazy: launches need triton only
+
+    _same_gpu(k, v, kc, vc, block_table, seqlens)
+    require(k.dim() == 4, "expected k/v [B, n, H, D]")
+    require(kc.dtype == k.dtype and vc.dtype == v.dtype,
+            "cache pools must store k/v's dtype (raw copy)")
+    # kc/vc are indexed with raw pointer math (no stride args) — contiguous
+    # pools only. block_table may be a column slice of a wider table: the
+    # kernel takes its row stride, but walks the slot dimension with a unit
+    # inner stride; seqlens' 1-D stride is a kernel parameter.
+    require(kc.is_contiguous() and vc.is_contiguous(),
+            "cache pools must be contiguous")
+    require(block_table.stride(-1) == 1,
+            "block_table must be unit-stride in the slot dimension")
+    require(block_table.dtype.is_floating_point is False
+            and seqlens.dtype.is_floating_point is False,
+            "block_table and seqlens must be integer tensors")
 
     b, n, h, d = k.shape
     k3, v3 = k.reshape(-1, h, d), v.reshape(-1, h, d)
     # Token count is runtime data, not a JIT specialization: captured decode
     # initializes the same kernel used for arbitrary-length fresh prefills.
-    _, _, _, _, sk, _ = _kernels()
+    sk = _kernels()[4]
     sk[(b, n, h)](
         k3,
         v3,
@@ -385,6 +548,71 @@ def store_kv(k, v, kc, vc, block_table, seqlens, scratch_slot):
     )
 
 
+def rms_norm_unweighted(x, module):
+    """RMSNorm without a learned scale (mHC ``input_norm``), returning a new tensor.
+
+    Eligibility: CUDA bf16/fp16 ``x``; raises :class:`OpNotEligible`
+    otherwise (:func:`rms_norm_unweighted_reference` is the eager form).
+    """
+    import torch
+    import triton  # lazy: launches need triton only
+
+    _same_gpu(x)
+    require(x.dtype in (torch.float32, torch.bfloat16, torch.float16),
+            f"rms_norm_unweighted runs fp32/bf16/fp16, got {x.dtype}")
+
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    d = x.shape[-1]
+    *_, unw, _gated = _kernels()
+    unw[(x.numel() // d,)](
+        x,
+        out,
+        d,
+        module.eps,
+        triton.next_power_of_2(d),
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+def rms_norm_gated(x, gate, module):
+    """``weight * norm(x) * sigmoid(gate)`` — one launch, strict fp32 math.
+
+    ``gate`` must match ``x`` exactly (same shape — the kernel does not
+    broadcast). Eligibility: CUDA bf16/fp16 ``x``/``gate`` of one shape and
+    dtype on one device, contiguous ``module.weight``; raises
+    :class:`OpNotEligible` otherwise
+    (:func:`rms_norm_gated_reference` is the eager form).
+    """
+    import torch
+    import triton  # lazy: launches need triton only
+
+    _same_gpu(x, gate, module.weight)
+    require(x.dtype in (torch.float32, torch.bfloat16, torch.float16),
+            f"rms_norm_gated runs fp32/bf16/fp16, got {x.dtype}")
+    require(gate.shape == x.shape and gate.dtype == x.dtype,
+            "gate must match x's shape and dtype (no broadcast)")
+    require(module.weight.is_contiguous(), "weight must be contiguous")
+
+    x = x.contiguous()
+    gate = gate.contiguous()
+    out = torch.empty_like(x)
+    d = x.shape[-1]
+    *_, _unw, gated = _kernels()
+    gated[(x.numel() // d,)](
+        x,
+        module.weight,
+        gate,
+        out,
+        d,
+        module.variance_epsilon,
+        triton.next_power_of_2(d),
+        enable_fp_fusion=False,
+    )
+    return out
+
+
 def rms_norm_reference(x, module, residual=None):
     """Eager HF oracle for :func:`rms_norm` (exact intermediate rounding)."""
     import torch
@@ -400,6 +628,24 @@ def rms_norm_reference(x, module, residual=None):
     )
     y = ((x32 * inv).to(x.dtype).float() * module.weight.float()).to(x.dtype)
     return y, summed
+
+
+def rms_norm_unweighted_reference(x, module):
+    """Eager HF oracle for :func:`rms_norm_unweighted` (exact intermediate rounding)."""
+    import torch
+
+    inv = torch.rsqrt(x.float().square().mean(-1, keepdim=True) + module.eps).to(x.dtype)
+    return x * inv
+
+
+def rms_norm_gated_reference(x, gate, module):
+    """Eager HF oracle for :func:`rms_norm_gated` (exact intermediate rounding)."""
+    import torch
+
+    x32 = x.float()
+    inv = torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + module.variance_epsilon)
+    y = (x32 * inv) * module.weight.float()
+    return (y * torch.sigmoid(gate.float())).to(x.dtype)
 
 
 def qk_norm_reference(q, k, q_norm, k_norm):

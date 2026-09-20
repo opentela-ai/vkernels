@@ -628,7 +628,7 @@ class HybridMegakernel:
         self.bar = torch.zeros(1, device=dev, dtype=torch.int64)
         self._bar_base = 0
 
-    def run(self, token: int, position: int, *, check_counter: bool = False, tap_layers=()):
+    def run(self, token: int, position: int, *, check_counter: bool = False):
         """One 27B decode step = one kernel launch (B=1)."""
         if not (0 <= position < self.capacity):
             raise ValueError(f"position {position} out of [0, {self.capacity})")

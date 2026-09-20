@@ -9,12 +9,12 @@
 
 #if defined(VKERNELS_C_HAS_CUDA) && !defined(__CUDA_ARCH__)
 
+#  include "vkernels/comm/c_abi_catch.hpp"
 #  include "vkernels/comm/kv_scatter_cuda.hpp"
 
 #  include <cstddef>
 #  include <exception>
 #  include <functional>
-#  include <stdexcept>
 
 namespace {
 
@@ -22,10 +22,10 @@ vkernels_status_t wrap(const std::function<void()>& fn) {
   try {
     fn();
     return VKERNELS_OK;
-  } catch (const std::invalid_argument&) {
-    return VKERNELS_ERR_INVALID_ARGUMENT;
-  } catch (const std::exception&) {
-    return VKERNELS_ERR_INTERNAL;
+  } catch (const std::exception& e) {
+    return vkernels::comm::cabi::translate<vkernels_status_t,
+                                           VKERNELS_ERR_INVALID_ARGUMENT,
+                                           VKERNELS_ERR_INTERNAL>(e);
   } catch (...) {
     return VKERNELS_ERR_INTERNAL;
   }

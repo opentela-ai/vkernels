@@ -44,9 +44,10 @@ compiled = []
 cute = ["nvidia-cutlass-dsl>=4.7", "cuda-python>=13"]
 # Megakernel model compiler (src/python/vkernels/compiler/ — capture →
 # operator IR → schedule → Triton/CuTe codegen, with the GPT-2/dense-Qwen3
-# model definitions). Needs torch + triton; without them the subpackage is
+# model definitions). Needs torch + triton (+ safetensors for the hybrid
+# path's checkpoint-shard loading); without them the subpackage is
 # simply not imported (the floe repo consumes it via vkernels-cli[compiler]).
-compiler = ["torch", "triton"]
+compiler = ["torch", "triton", "safetensors"]
 
 [project.scripts]
 vkl = "vkernels.cli.main:main"
@@ -56,6 +57,10 @@ dev = [
     "pytest>=8",
     "build>=1.0",
     "twine>=5.0",
+    # Checkpoint-shard loading for the megakernel feasibility tests
+    # (tests/python/test_megakernel_27b.py) and the compiler's hybrid
+    # checkpoint path (device_triton_hybrid).
+    "safetensors>=0.4",
 ]
 
 # src-layout: the `vkernels` package lives under src/python/.
@@ -79,6 +84,10 @@ include-package-data = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
+# `python -m pytest` / `python -m unittest` put the repo root on sys.path
+# (so `from tests.python._megakernel_launch import ...` resolves); the
+# plain `pytest` binary does not — declare it explicitly instead.
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py310"

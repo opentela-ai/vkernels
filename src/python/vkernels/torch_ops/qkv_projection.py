@@ -10,6 +10,7 @@ retune in a fresh process after hardware or software changes. Inputs are
 read-only, and this inference-only operator has no autograd backward.
 """
 
+from ._dispatch import OpNotEligible
 from functools import lru_cache
 
 _WARMED = set()
@@ -19,16 +20,16 @@ def _validate(x, weights, *, gpu):
     import torch
 
     if x.ndim < 1 or x.shape[-1] != 4096 or any(tuple(w.shape) != (8192, 4096) for w in weights):
-        raise ValueError("expected x [...,4096] and three weights [8192,4096]")
+        raise OpNotEligible("expected x [...,4096] and three weights [8192,4096]")
     tokens = x.numel() // 4096
     if tokens not in (1, 2):
-        raise ValueError("QKV projection supports one or two activation rows")
+        raise OpNotEligible("QKV projection supports one or two activation rows")
     if x.dtype != torch.bfloat16 or any(w.dtype != torch.bfloat16 for w in weights):
-        raise TypeError("QKV projection requires BF16 inputs")
+        raise OpNotEligible("QKV projection requires BF16 inputs")
     if any(w.device != x.device for w in weights) or (gpu and not x.is_cuda):
-        raise ValueError("inputs must share a GPU device" if gpu else "inputs must share a device")
+        raise OpNotEligible("inputs must share a GPU device" if gpu else "inputs must share a device")
     if not x.is_contiguous() or any(not w.is_contiguous() for w in weights):
-        raise ValueError("QKV projection requires contiguous inputs")
+        raise OpNotEligible("QKV projection requires contiguous inputs")
     return tokens
 
 

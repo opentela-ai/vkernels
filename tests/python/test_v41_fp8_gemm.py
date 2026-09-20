@@ -151,3 +151,32 @@ def test_gpu_decode_gemm_matches_reference(torch):
         if n >= 2048 and m <= block:
             assert torch.equal(auto, got), tag  # auto picked the kernel
 
+
+
+def test_blockwise_fallback_warns_once(torch, monkeypatch, capsys):
+    """The blockwise->oracle fallback keeps its result contract and logs the
+    first failure once per process (no silent downgrade to the reference)."""
+    import threading
+    import types
+
+    from vkernels.torch_ops import glm_fp8_blockwise_gemm, v41_fp8_gemm
+
+    monkeypatch.setenv("VKERNELS_V41_FP8_GEMM_BACKEND", "reference")
+    monkeypatch.setattr(v41_fp8_gemm, "_BLOCKWISE_FALLBACK_WARNED", threading.Event())
+    monkeypatch.setattr(
+        glm_fp8_blockwise_gemm,
+        "fp8_blockwise_gemm",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    sentinel = object()
+    monkeypatch.setattr(v41_fp8_gemm, "fp8_block_gemm_reference", lambda *a, **k: sentinel)
+
+    fake = types.SimpleNamespace(is_cuda=True, shape=(128, 128))
+    out = v41_fp8_gemm.fp8_block_gemm(fake, fake, fake, fake, block=128)
+    assert out is sentinel  # fallback result contract unchanged
+    first = capsys.readouterr().out
+    assert "[vkernels.v41_fp8_gemm]" in first
+    assert "unavailable or failed" in first
+    # second failure: same fallback result, no second warning (one-shot)
+    assert v41_fp8_gemm.fp8_block_gemm(fake, fake, fake, fake, block=128) is sentinel
+    assert "[vkernels.v41_fp8_gemm]" not in capsys.readouterr().out

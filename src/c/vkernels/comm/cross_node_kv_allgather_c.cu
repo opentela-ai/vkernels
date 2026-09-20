@@ -4,8 +4,8 @@
 
 #include <cstring>
 #include <exception>
-#include <stdexcept>
 
+#include "vkernels/comm/c_abi_catch.hpp"
 #include "vkernels/comm/cross_node_kv_allgather_cuda.hpp"
 
 namespace {
@@ -14,9 +14,9 @@ using Communicator = vkernels::comm::cuda::NcclCommunicator;
 using AllGatherPlan = vkernels::comm::cuda::CrossNodeKvAllGatherPlan;
 
 vkernels_fi_status_t exception_status(const std::exception& error) {
-  return dynamic_cast<const std::invalid_argument*>(&error) != nullptr
-             ? VKERNELS_FI_ERR_INVALID_ARGUMENT
-             : VKERNELS_FI_ERR_INTERNAL;
+  return vkernels::comm::cabi::translate<vkernels_fi_status_t,
+                                         VKERNELS_FI_ERR_INVALID_ARGUMENT,
+                                         VKERNELS_FI_ERR_INTERNAL>(error);
 }
 
 Communicator* as_communicator(vkernels_nccl_communicator_t* comm) {

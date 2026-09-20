@@ -12,6 +12,7 @@ Tuning is in-process, keyed by device ordinal and row count, not a portable
 deployment artifact. Retune in a fresh process after changing hardware/software.
 """
 
+from ._dispatch import OpNotEligible
 from functools import lru_cache
 
 _WARMED = set()
@@ -21,16 +22,16 @@ def _validate(x, weight, *, gpu):
     import torch
 
     if x.ndim < 1 or x.shape[-1] != 16384 or tuple(weight.shape) != (24, 16384):
-        raise ValueError("expected x [...,16384] and weight [24,16384]")
+        raise OpNotEligible("expected x [...,16384] and weight [24,16384]")
     rows = x.numel() // 16384
     if rows not in (1, 2):
-        raise ValueError("mHC projection supports one or two activation rows")
+        raise OpNotEligible("mHC projection supports one or two activation rows")
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
-        raise TypeError("mHC projection requires BF16 inputs")
+        raise OpNotEligible("mHC projection requires BF16 inputs")
     if x.device != weight.device or (gpu and not x.is_cuda):
-        raise ValueError("inputs must share a GPU device" if gpu else "inputs must share a device")
+        raise OpNotEligible("inputs must share a GPU device" if gpu else "inputs must share a device")
     if not x.is_contiguous() or not weight.is_contiguous():
-        raise ValueError("mHC projection requires contiguous inputs")
+        raise OpNotEligible("mHC projection requires contiguous inputs")
     return rows
 
 

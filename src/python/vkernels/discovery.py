@@ -20,9 +20,17 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-# Headers that only expose implementation detail (e.g. the CUDA-only
-# declarations in p2p_gather_cuda.hpp) are not public API and are skipped.
+# Headers that only expose implementation detail are not public API and
+# are skipped: the CUDA-only declarations (e.g. p2p_gather_cuda.hpp) and
+# the shared C-ABI catch/translate helper that the comm *_c.{cu,cpp}
+# translation units include (c_abi_catch.hpp).
 _SKIP_HEADER_SUFFIXES = ("_cuda.hpp",)
+_SKIP_HEADER_NAMES = frozenset({"c_abi_catch.hpp"})
+
+
+def _is_internal_header(name: str) -> bool:
+    """True for headers that declare no public vkl API (see skip lists)."""
+    return name.endswith(_SKIP_HEADER_SUFFIXES) or name in _SKIP_HEADER_NAMES
 
 _KERNELS_DIR = "src/c/vkernels/kernels"
 _COMM_DIR = "src/c/vkernels/comm"
@@ -264,11 +272,11 @@ def discover(root: Path) -> Discovery:
     kernels: list[Entry] = []
     comm: list[Entry] = []
     for header in sorted((root / _KERNELS_DIR).glob("*.hpp")):
-        if header.name.endswith(_SKIP_HEADER_SUFFIXES):
+        if _is_internal_header(header.name):
             continue
         kernels.extend(_parse_header(header, root))
     for header in sorted((root / _COMM_DIR).glob("*.hpp")):
-        if header.name.endswith(_SKIP_HEADER_SUFFIXES):
+        if _is_internal_header(header.name):
             continue
         comm.extend(_parse_header(header, root))
     return Discovery(root=root, kernels=kernels, comm=comm)

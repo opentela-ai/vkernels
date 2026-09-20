@@ -347,7 +347,7 @@ class CaptureSafeScratchTest(unittest.TestCase):
         events = []
 
         def probe():
-            return len(events) % 2 == 1  # odd calls = "capturing"
+            return len(events) % 2 == 0  # even calls = "capturing"
 
         s = CaptureSafeScratch(capture_probe=probe)
         dev = self._dev()

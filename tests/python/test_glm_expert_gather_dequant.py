@@ -40,7 +40,10 @@ def test_reference_matches_native_fp8_decode(torch):
 
     weights, scales, indices = make_inputs(torch)
     expand = scales.repeat_interleave(128, 1).repeat_interleave(128, 2)
-    expected = (weights[indices].to(torch.float32) * expand[indices]).to(torch.bfloat16)
+    # Gather through the uint8 view: CPU fp8 fancy-indexing is not
+    # implemented on every torch build (seen on the beverin container).
+    gathered = weights.view(torch.uint8)[indices].view(torch.float8_e4m3fn)
+    expected = (gathered.to(torch.float32) * expand[indices]).to(torch.bfloat16)
     actual = gather_dequant_reference(weights, scales, indices)
     assert actual.shape == (2, 3, 256, 256)
     torch.testing.assert_close(actual.float(), expected.float())

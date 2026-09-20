@@ -8,12 +8,12 @@
 
 #if defined(VKERNELS_C_HAS_CUDA) && !defined(__CUDA_ARCH__)
 
+#  include "vkernels/comm/c_abi_catch.hpp"
 #  include "vkernels/comm/p2p_kv_restore_cuda.hpp"
 
 #  include <cstddef>
 #  include <exception>
 #  include <functional>
-#  include <stdexcept>
 
 namespace {
 
@@ -21,10 +21,10 @@ vkernels_status_t wrap(const std::function<void()>& fn) {
   try {
     fn();
     return VKERNELS_OK;
-  } catch (const std::invalid_argument&) {
-    return VKERNELS_ERR_INVALID_ARGUMENT;
-  } catch (const std::exception&) {
-    return VKERNELS_ERR_INTERNAL;
+  } catch (const std::exception& e) {
+    return vkernels::comm::cabi::translate<vkernels_status_t,
+                                           VKERNELS_ERR_INVALID_ARGUMENT,
+                                           VKERNELS_ERR_INTERNAL>(e);
   } catch (...) {
     return VKERNELS_ERR_INTERNAL;
   }
@@ -94,10 +94,9 @@ extern "C" vkernels_p2p_kv_restore_plan_t* vkernels_p2p_kv_restore_plan_create(
             slot_ids, peer_src_ptrs, num_pages, page_size));
   } catch (const std::exception& e) {
     if (status_out) {
-      if (dynamic_cast<const std::invalid_argument*>(&e))
-        *status_out = VKERNELS_ERR_INVALID_ARGUMENT;
-      else
-        *status_out = VKERNELS_ERR_INTERNAL;
+      *status_out = vkernels::comm::cabi::translate<vkernels_status_t,
+                                                    VKERNELS_ERR_INVALID_ARGUMENT,
+                                                    VKERNELS_ERR_INTERNAL>(e);
     }
     return nullptr;
   }
@@ -119,10 +118,9 @@ vkernels_p2p_kv_restore_plan_create_device_slots(
             page_size));
   } catch (const std::exception& e) {
     if (status_out) {
-      if (dynamic_cast<const std::invalid_argument*>(&e))
-        *status_out = VKERNELS_ERR_INVALID_ARGUMENT;
-      else
-        *status_out = VKERNELS_ERR_INTERNAL;
+      *status_out = vkernels::comm::cabi::translate<vkernels_status_t,
+                                                    VKERNELS_ERR_INVALID_ARGUMENT,
+                                                    VKERNELS_ERR_INTERNAL>(e);
     }
     return nullptr;
   }
@@ -144,10 +142,9 @@ vkernels_p2p_kv_restore_plan_create_device_slots_int64(
             page_size));
   } catch (const std::exception& e) {
     if (status_out) {
-      if (dynamic_cast<const std::invalid_argument*>(&e))
-        *status_out = VKERNELS_ERR_INVALID_ARGUMENT;
-      else
-        *status_out = VKERNELS_ERR_INTERNAL;
+      *status_out = vkernels::comm::cabi::translate<vkernels_status_t,
+                                                    VKERNELS_ERR_INVALID_ARGUMENT,
+                                                    VKERNELS_ERR_INTERNAL>(e);
     }
     return nullptr;
   }

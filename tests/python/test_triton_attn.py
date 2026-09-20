@@ -88,7 +88,7 @@ def test_gpu_parity_vs_reference(torch):
 
 def test_decode_attention_split_matches_reference():
     pytest.importorskip("torch")
-    torch = pytest.importorskip("torch.cuda")
+    pytest.importorskip("torch.cuda")
     import torch as th
     if not th.cuda.is_available():
         pytest.skip("CUDA required")
@@ -123,7 +123,7 @@ def test_fused_kv_store_parity():
     store_kv-then-attend sequence bit-for-bit, and must not touch the
     scratch page."""
     pytest.importorskip("torch")
-    torch = pytest.importorskip("torch.cuda")
+    pytest.importorskip("torch.cuda")
     import torch as th
     if not th.cuda.is_available():
         pytest.skip("CUDA required")
@@ -183,7 +183,7 @@ def test_decode_attention_gqa_matches_reference():
     """GQA-grouped kernel (one program per KV head, tl.dot) vs the eager
     oracle, uniform and ragged lengths."""
     pytest.importorskip("torch")
-    torch = pytest.importorskip("torch.cuda")
+    pytest.importorskip("torch.cuda")
     import torch as th
     if not th.cuda.is_available():
         pytest.skip("CUDA required")
@@ -227,7 +227,7 @@ def test_gqa_fused_kv_store_parity():
     """decode_attention_gqa with k_new/v_new matches the two-step
     store-then-attend sequence and never writes the scratch page."""
     pytest.importorskip("torch")
-    torch = pytest.importorskip("torch.cuda")
+    pytest.importorskip("torch.cuda")
     import torch as th
     if not th.cuda.is_available():
         pytest.skip("CUDA required")

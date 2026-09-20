@@ -14,6 +14,7 @@ thin-adapter model extended to the whole GLM-5 Triton set).
 Torch and Triton load lazily. Inference-only, no autograd backward.
 """
 
+from ._dispatch import OpNotEligible
 import math
 from functools import lru_cache
 
@@ -70,21 +71,21 @@ def mhc_mix(logits, base, scale, hc=4, eps=1e-6, sinkhorn_iters=20):
     import torch
 
     if hc not in (2, 4):
-        raise ValueError("supported hc values are 2 and 4")
+        raise OpNotEligible("supported hc values are 2 and 4")
     if not isinstance(sinkhorn_iters, int) or sinkhorn_iters < 1:
-        raise ValueError("sinkhorn_iters must be a positive integer")
+        raise OpNotEligible("sinkhorn_iters must be a positive integer")
     if not math.isfinite(eps) or eps < 0:
-        raise ValueError("eps must be finite and nonnegative")
+        raise OpNotEligible("eps must be finite and nonnegative")
     width = hc * (hc + 2)
     if logits.ndim < 1 or logits.shape[-1] != width:
-        raise ValueError("incorrect logits width")
+        raise OpNotEligible("incorrect logits width")
     if base.shape != (width,) or scale.shape != (3,):
-        raise ValueError("expected base [hc*(hc+2)] and scale [3]")
+        raise OpNotEligible("expected base [hc*(hc+2)] and scale [3]")
     for x in (logits, base, scale):
         if x.dtype != torch.float32:
-            raise TypeError("mHC control tensors must be FP32")
+            raise OpNotEligible("mHC control tensors must be FP32")
         if not x.is_cuda or x.device != logits.device or not x.is_contiguous():
-            raise ValueError("inputs must be contiguous tensors on the same GPU")
+            raise OpNotEligible("inputs must be contiguous tensors on the same GPU")
     pre = torch.empty(
         (*logits.shape[:-1], hc), device=logits.device, dtype=torch.float32
     )

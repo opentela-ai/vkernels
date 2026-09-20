@@ -114,6 +114,12 @@ EXPECTED_KERNELS = [
     ("kda_delta_rule_inter_cpu", "kda"),
     ("kda_gla_fwd_o_cpu", "kda"),
     ("kda_delta_rule_fwd_cpu", "kda"),
+    # Context-parallel kda path (d9e4be2): state-in/state-out CPU variants
+    # of the naive delta-rule forward for the ring handoff (one state
+    # buffer per head, read-before-write per (b,h)), declared in kda.hpp
+    # between kda_delta_rule_fwd_cpu and kda_pack_bitmatrix_cpu.
+    ("kda_naive_delta_rule_fwd_state_cpu", "kda"),
+    ("kda_delta_rule_fwd_state_cpu", "kda"),
     ("kda_pack_bitmatrix_cpu", "kda"),
     ("kda_layer_norm_gated", "kda"),
     ("kda_gate_chunk_cumsum", "kda"),

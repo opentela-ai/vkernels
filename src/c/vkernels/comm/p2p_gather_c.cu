@@ -14,26 +14,29 @@
 #if defined(VKERNELS_C_HAS_CUDA)
 
 // The wrapper functions below are HOST-ONLY: they use C++ exceptions
-// (try/catch, std::exception, dynamic_cast) to fold vkernels contract
-// violations into status codes. nvcc compiles a .cu file in both host and
-// device modes; guard the whole body so the device pass emits nothing.
+// (try/catch, std::exception) folded into status codes via the shared
+// translation helper in c_abi_catch.hpp. nvcc compiles a .cu file in both
+// host and device modes; guard the whole body so the device pass emits
+// nothing.
 #  ifndef __CUDA_ARCH__
 
+#  include "vkernels/comm/c_abi_catch.hpp"
 #  include "vkernels/comm/p2p_gather_cuda.hpp"
 
 #  include <exception>
-#  include <stdexcept>
 
 namespace {
 
 // Map a caught C++ exception to an ABI status code. Contract violations
-// (VK_EXPECTS) arrive as std::invalid_argument; launch/post-condition
-// failures (VK_ENSURES) arrive as std::runtime_error. Anything else is
-// reported as the most conservative "something was wrong" code.
+// (VK_EXPECTS) arrive as std::invalid_argument; everything else (launch /
+// post-condition failures via VK_ENSURES' std::runtime_error, bad_alloc)
+// is reported as the most conservative "something was wrong" code. The
+// shared policy lives in c_abi_catch.hpp; only this ABI's status constants
+// are stated here.
 vkernels_status_t to_status(const std::exception& e) {
-  if (dynamic_cast<const std::invalid_argument*>(&e)) return VKERNELS_ERR_INVALID_ARGUMENT;
-  if (dynamic_cast<const std::runtime_error*>(&e)) return VKERNELS_ERR_INTERNAL;
-  return VKERNELS_ERR_INTERNAL;
+  return vkernels::comm::cabi::translate<vkernels_status_t,
+                                         VKERNELS_ERR_INVALID_ARGUMENT,
+                                         VKERNELS_ERR_INTERNAL>(e);
 }
 
 }  // namespace

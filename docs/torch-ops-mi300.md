@@ -5,6 +5,10 @@ back the GLM-5.3-Flash / floe roadmap, GitHub **#63** and subissues
 **#64–#70**) is validated and benchmarked on CSCS **beverin** `mi300`
 (MI300A / gfx942) compute nodes by a single self-contained driver:
 
+> Module reference (calling convention, `OpNotEligible` eligibility
+> contract, per-op inventory incl. `triton_attn` and the vendored vLLM
+> KDA / sparse-MLA kernels): [torch-ops.md](torch-ops.md).
+
 ```bash
 # from a beverin login node, with the repo checked out at $SRC
 sbatch meta/scripts/run_issue63_torchops_mi300.sh

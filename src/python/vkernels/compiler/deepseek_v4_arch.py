@@ -305,21 +305,6 @@ def _rms(x: np.ndarray, gamma: np.ndarray, eps: float) -> np.ndarray:
     return x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps) * gamma
 
 
-def _rope_interleaved(x: np.ndarray, cos_row: np.ndarray, sin_row: np.ndarray) -> np.ndarray:
-    """x[..., D] rotated with the interleaved convention (issue #95)."""
-    x2 = x.reshape(*x.shape[:-1], -1, 2)
-    lead = x2.shape[:-2]  # e.g. (H,)
-    c = np.broadcast_to(cos_row.reshape((1,) * len(lead) + (-1,)), lead + cos_row.shape)
-    s = np.broadcast_to(sin_row.reshape((1,) * len(lead) + (-1,)), lead + sin_row.shape)
-    x0, x1 = x2[..., 0], x2[..., 1]
-    return np.stack([x0 * c - x1 * s, x1 * c + x0 * s], axis=-1).reshape(x.shape)
-
-
-def _rope_interleaved_inverse(x: np.ndarray, cos_row: np.ndarray, sin_row: np.ndarray) -> np.ndarray:
-    """conjugate_rope: same rotation with sin NEGATED (#95)."""
-    return _rope_interleaved(x, cos_row, -sin_row)
-
-
 def _rotate_half(x: np.ndarray, cos_row: np.ndarray, sin_row: np.ndarray) -> np.ndarray:
     """rotate_half convention (compressor emission, #96 contract)."""
     d = x.shape[-1]

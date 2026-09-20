@@ -32,6 +32,13 @@ from pathlib import Path
 
 _PKG_DIR = Path(__file__).resolve().parent
 
+# Failure types a compiled-extension load can legitimately produce: ImportError
+# for dlopen/dynamic-module problems (wrong interpreter, undefined symbols,
+# missing PyInit), OSError for file-level issues, RuntimeError for in-module
+# init checks (pybind11/numpy ABI-mismatch style). Anything else is a loader
+# or module-init bug and must propagate instead of degrading to the fallback.
+_EXTENSION_LOAD_ERRORS = (ImportError, OSError, RuntimeError)
+
 
 def _repo_root() -> Path | None:
     """Repository root (a directory containing ``src/c/vkernels``), or None."""
@@ -67,7 +74,7 @@ def _load_from_path(path: Path) -> object | None:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
-    except Exception:
+    except _EXTENSION_LOAD_ERRORS:
         return None
 
 
@@ -90,7 +97,7 @@ def load_extension():
     try:
         _loaded = importlib.import_module("vkernels._core")
         return _loaded
-    except ImportError:
+    except _EXTENSION_LOAD_ERRORS:
         pass
 
     # 2. Next to this file (wheel-installed, but step 1 failed — e.g.
