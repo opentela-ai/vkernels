@@ -23,6 +23,7 @@ vkernels_add_test(NAME dsa_kpool_fp8  SOURCES kernels/attn/test_dsa_kpool_fp8.cp
 vkernels_add_test(NAME mhc         SOURCES kernels/attn/test_mhc.cpp)
 vkernels_add_test(NAME kda         SOURCES kernels/attn/test_kda.cpp)
 vkernels_add_test(NAME kda_k3_chunked SOURCES kernels/attn/test_kda_k3_chunked.cpp)
+vkernels_add_test(NAME kda_cp SOURCES kernels/attn/test_kda_cp.cpp)
 vkernels_add_test(NAME moe         SOURCES kernels/moe/test_moe.cpp)
 vkernels_add_test(NAME moe_fused   SOURCES kernels/moe/test_moe_fused.cpp)
 vkernels_add_test(NAME moe_aux     SOURCES kernels/moe/test_moe_aux.cpp)

@@ -348,6 +348,224 @@ void kda_delta_rule_fwd_cpu(const float* q, const float* k, const float* v,
 }
 
 // ---------------------------------------------------------------------------
+// #CP state-carrying per-token oracle (explicit S_0, exports S_S)
+// ---------------------------------------------------------------------------
+void kda_naive_delta_rule_fwd_state_cpu(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, const float* state_in, float* state_out, float* out,
+    int B, int H, int S, int D) {
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || q != nullptr, "q must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || k != nullptr, "k must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || v != nullptr, "v must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || g != nullptr, "g must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || beta != nullptr, "beta must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || state_in != nullptr,
+             "state_in must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || state_out != nullptr,
+             "state_out must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || out != nullptr, "out must not be null");
+  VK_EXPECTS(D > 0, "D must be positive");
+  if (B == 0 || H == 0 || S == 0) return;
+
+  const size_t state_bh = (size_t)D * D;  // per-(b,h) state elements
+  std::vector<float> state(state_bh);
+  std::vector<float> a(D);
+  for (int b = 0; b < B; ++b)
+    for (int h = 0; h < H; ++h) {
+      const size_t sh = ((size_t)(b * H + h)) * state_bh;
+      std::copy(state_in + sh, state_in + sh + state_bh, state.begin());
+      const size_t bh = (size_t)(b * H + h) * S;
+      for (int t = 0; t < S; ++t) {
+        const float* kt = k + (bh + t) * D;
+        const float* vt = v + (bh + t) * D;
+        const float* qt = q + (bh + t) * D;
+        const float* gt = g + (bh + t) * D;   // per-key-dim forget gate [D]
+        const float bt = beta[bh + t];         // scalar delta gate
+        // (1) gate: S'[v,k] *= g_t[k]   (per-key-dim, normal space)
+        for (int vv = 0; vv < D; ++vv) {
+          float* Srow = state.data() + (size_t)vv * D;
+          for (int kk = 0; kk < D; ++kk) Srow[kk] *= gt[kk];
+        }
+        // (2) predict: a[v] = S'[v,:] . k_t   (from GATED state)
+        for (int vv = 0; vv < D; ++vv)
+          a[vv] = dot(state.data() + (size_t)vv * D, kt, D);
+        // (3) update: S_t[v,k] += beta_t * (v_t[v] - a[v]) * k_t[k]
+        for (int vv = 0; vv < D; ++vv) {
+          const float ud = vt[vv] - a[vv];
+          float* Srow = state.data() + (size_t)vv * D;
+          for (int kk = 0; kk < D; ++kk) Srow[kk] += bt * ud * kt[kk];
+        }
+        // (4) output: o_t[v] = S_t[v,:] . q_t
+        for (int vv = 0; vv < D; ++vv)
+          out[(bh + t) * D + vv] = dot(state.data() + (size_t)vv * D, qt, D);
+      }
+      // export the final state (after the full read of state_in for this
+      // (b,h): state_out may alias state_in — the ring handoff buffer)
+      std::copy(state.begin(), state.end(), state_out + sh);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #CP chunked WY forward with explicit state (affine UT-transform form of
+// the K3 per-key-dim recurrence — the math hip::kda_delta_rule_fwd_chunked
+// implements, seeded with S_in and exporting S_S so CP ranks can hand the
+// state along the rank ring over sequence shards).
+//
+// Per chunk (local t = 0..C-1, L_t[k] = per-column within-chunk log-cumsum,
+// end = C-1), identical to the derivation in test_kda_k3_chunked.cpp:
+//   M[t][j] = b_j * Σ_k G_{j+1,t}[k] k_j[k] k_t[k]   (j<t, strict tril)
+//   N[t][j] = b_j * Σ_k G_{j+1,t}[k] k_j[k] q_t[k]   (j<=t, incl diag)
+//   Ainv = (I + tril(M,-1))^{-1}
+//   Kgw[t][k] = exp(L_t[k]) k_t[k]        (G_{0,t} includes g_t: POST-gate)
+//   Qgw[t][k] = exp(L_t[k]) q_t[k]
+//   Kgb[t][k] = b_t exp(L_end[k]-L_t[k]) k_t[k];  diagG[k] = exp(L_end[k])
+//   U_v = Ainv v;  W = Ainv Kgw;  T = N U_v;  P = N W;  Opar = Qgw - P
+//   ---- serial state pass (only row v of C meets column v of u/o) ----
+//   u = U_v - W C^T;  o = T + Opar C^T;  C = diagG (.) C + Kgb^T u
+// with C_{-1} = state_in (the cross-rank delta vs the zero-state form).
+void kda_delta_rule_fwd_state_cpu(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, const float* state_in, float* state_out, float* out,
+    int B, int H, int S, int D, int chunk_size) {
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || q != nullptr, "q must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || k != nullptr, "k must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || v != nullptr, "v must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || g != nullptr, "g must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || beta != nullptr, "beta must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || state_in != nullptr,
+             "state_in must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || state_out != nullptr,
+             "state_out must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || S == 0 || out != nullptr, "out must not be null");
+  VK_EXPECTS(D > 0, "D must be positive");
+  VK_EXPECTS(chunk_size > 0 && S % chunk_size == 0,
+             "chunk_size must divide S");
+  if (B == 0 || H == 0 || S == 0) return;
+
+  const int nc = S / chunk_size;
+  const int cs = chunk_size;
+  const size_t state_bh = (size_t)D * D;
+  std::vector<float> L((size_t)cs * D);
+  std::vector<float> M((size_t)cs * cs, 0.0f), N((size_t)cs * cs, 0.0f),
+      Ainv((size_t)cs * cs, 0.0f);
+  std::vector<float> Kgw((size_t)cs * D), Qgw((size_t)cs * D),
+      Kgb((size_t)cs * D), diagG(D);
+  std::vector<float> U_v((size_t)cs * D), W((size_t)cs * D),
+      T((size_t)cs * D), P((size_t)cs * D), Opar((size_t)cs * D),
+      u((size_t)cs * D);
+  std::vector<float> C(state_bh);  // the carried inter state (per (b,h))
+  for (int b = 0; b < B; ++b)
+  for (int h = 0; h < H; ++h) {
+    const size_t bh = (size_t)(b * H + h) * S;   // token base of this (b,h)
+    const size_t sh = ((size_t)(b * H + h)) * state_bh;
+    // C_{-1} = state_in (explicit initial state; read fully before the
+    // final write, so state_out may alias state_in — the ring buffer)
+    std::copy(state_in + sh, state_in + sh + state_bh, C.begin());
+    for (int c = 0; c < nc; ++c) {
+      const int t0 = c * cs;
+      // per-column within-chunk inclusive log-cumsum
+      for (int kk = 0; kk < D; ++kk) {
+        float acc = 0.0f;
+        for (int t = 0; t < cs; ++t) {
+          acc += log_gate(g[(bh + t0 + t) * D + kk]);
+          L[(size_t)t * D + kk] = acc;
+        }
+      }
+      // grams M (strict tril) / N (incl diag), beta folded in
+      for (int t = 0; t < cs; ++t)
+      for (int j = 0; j <= t; ++j) {
+        const float* kj = k + (bh + t0 + j) * D;
+        const float* kt = k + (bh + t0 + t) * D;
+        const float* qt = q + (bh + t0 + t) * D;
+        const float* Lj = L.data() + (size_t)j * D;
+        const float* Lt = L.data() + (size_t)t * D;
+        float mk = 0.0f, nk = 0.0f;
+        for (int kk = 0; kk < D; ++kk) {
+          const float gw = std::exp(Lt[kk] - Lj[kk]);   // G_{j+1,t}[k]
+          mk += gw * kj[kk] * kt[kk];
+          nk += gw * kj[kk] * qt[kk];
+        }
+        const float bj = beta[bh + t0 + j];
+        N[(size_t)t * cs + j] = bj * nk;
+        M[(size_t)t * cs + j] = (j < t) ? bj * mk : 0.0f;
+      }
+      // Ainv = (I + tril(M,-1))^{-1}, forward substitution per column
+      for (int j = 0; j < cs; ++j)
+      for (int t = j; t < cs; ++t) {
+        float x = (t == j) ? 1.0f : 0.0f;
+        if (t > j) {
+          for (int l = j; l < t; ++l)
+            x -= M[(size_t)t * cs + l] * Ainv[(size_t)l * cs + j];
+        }
+        Ainv[(size_t)t * cs + j] = x;
+      }
+      // chunk-local gated operands
+      const int lend = cs - 1;
+      for (int kk = 0; kk < D; ++kk) diagG[kk] = std::exp(L[(size_t)lend * D + kk]);
+      for (int t = 0; t < cs; ++t) {
+        const float* kt = k + (bh + t0 + t) * D;
+        const float* qt = q + (bh + t0 + t) * D;
+        const float* Lt = L.data() + (size_t)t * D;
+        const float bt = beta[bh + t0 + t];
+        for (int kk = 0; kk < D; ++kk) {
+          const float e0 = std::exp(Lt[kk]);                       // G_{0,t}
+          Kgw[(size_t)t * D + kk] = e0 * kt[kk];
+          Qgw[(size_t)t * D + kk] = e0 * qt[kk];
+          Kgb[(size_t)t * D + kk] =
+              bt * std::exp(L[(size_t)lend * D + kk] - Lt[kk]) * kt[kk];
+        }
+      }
+      // chunk-local GEMMs
+      for (int t = 0; t < cs; ++t)
+      for (int d = 0; d < D; ++d) {
+        float sv = 0.0f, sw = 0.0f;
+        for (int j = 0; j < cs; ++j) {
+          sv += Ainv[(size_t)t * cs + j] * v[(bh + t0 + j) * D + d];
+          sw += Ainv[(size_t)t * cs + j] * Kgw[(size_t)j * D + d];
+        }
+        U_v[(size_t)t * D + d] = sv;
+        W[(size_t)t * D + d] = sw;
+      }
+      for (int t = 0; t < cs; ++t)
+      for (int d = 0; d < D; ++d) {
+        float st = 0.0f, sp = 0.0f;
+        for (int j = 0; j <= t; ++j) {
+          st += N[(size_t)t * cs + j] * U_v[(size_t)j * D + d];
+          sp += N[(size_t)t * cs + j] * W[(size_t)j * D + d];
+        }
+        T[(size_t)t * D + d] = st;
+        P[(size_t)t * D + d] = sp;
+        Opar[(size_t)t * D + d] = Qgw[(size_t)t * D + d] - sp;
+      }
+      // serial state pass (rowblock-splittable: only row v of C appears)
+      for (int t = 0; t < cs; ++t)
+      for (int d = 0; d < D; ++d) {
+        float s = U_v[(size_t)t * D + d];
+        for (int kk = 0; kk < D; ++kk)
+          s -= W[(size_t)t * D + kk] * C[(size_t)d * D + kk];
+        u[(size_t)t * D + d] = s;
+      }
+      for (int t = 0; t < cs; ++t)
+      for (int d = 0; d < D; ++d) {
+        float s = T[(size_t)t * D + d];
+        for (int kk = 0; kk < D; ++kk)
+          s += Opar[(size_t)t * D + kk] * C[(size_t)d * D + kk];
+        out[(bh + t0 + t) * D + d] = s;
+      }
+      for (int d = 0; d < D; ++d)
+      for (int kk = 0; kk < D; ++kk) {
+        float s = diagG[kk] * C[(size_t)d * D + kk];
+        for (int t = 0; t < cs; ++t)
+          s += Kgb[(size_t)t * D + kk] * u[(size_t)t * D + d];
+        C[(size_t)d * D + kk] = s;
+      }
+    }
+    // export the final state S_S for the next rank in the ring
+    std::copy(C.begin(), C.end(), state_out + sh);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // #P pack_bitmatrix (MSB-first)
 // ---------------------------------------------------------------------------
 void kda_pack_bitmatrix_cpu(const uint8_t* bits, uint8_t* packed,

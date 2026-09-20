@@ -220,6 +220,54 @@ void kda_delta_rule_fwd_cpu(const float* q, const float* k, const float* v,
                             int B, int H, int S, int D, int chunk_size);
 
 // ---------------------------------------------------------------------------
+// #CP — chunked-scan state API: explicit initial state in, final state out.
+// The seam context parallelism needs: CP ranks split the sequence into
+// shards and pass the LINEAR-ATTENTION state along the rank ring — rank r
+// runs its shard with S_in = S_out(rank r-1) and exports S_out for rank r+1.
+// (Attention KV still crosses the wire per layer; this state is the O(1)
+// per-head D×D summary that makes the KDA layers ring-composable.)
+//
+// State layout (canonical, matches the HIP state scratch of
+// kda_delta_rule_fwd[_chunked]_with_scratch): [B, H, D, D] float, row-major
+// — state[((b*H + h)*D + v)*D + k] = S[v][k] for head (b,h) (v indexes the
+// value dim, k the key dim).
+
+// Per-token ORACLE with explicit state: runs the K3 per-key-dim recurrence
+// (exactly #L3's math) but seeds S_0 = state_in and exports S_S = state_out
+// instead of assuming S_0 = 0. O(S·D²) per head — reference only.
+//   q, k, v : [B, H, S, D]   float (k L2-normalised by the caller)
+//   g       : [B, H, S, D]   float, per-key-dim forget gate, normal space
+//   beta    : [B, H, S]      float, scalar delta gate
+//   state_in  : [B, H, D, D] float (read-only)
+//   state_out : [B, H, D, D] float (written; may ALIAS state_in — the ring
+//               handoff reuses one buffer per head; the read of a (b,h)
+//               state completes before its write)
+//   out     : [B, H, S, D]   float
+void kda_naive_delta_rule_fwd_state_cpu(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, const float* state_in, float* state_out, float* out,
+    int B, int H, int S, int D);
+
+// CHUNKED-scan forward with explicit state: the affine WY (UT-transform)
+// form of the SAME K3 per-key-dim recurrence (the math the HIP chunked
+// kernel implements), seeded with S_in = state_in and exporting
+// S_S = state_out. Chunking is internal (chunk_size, must divide S) — the
+// caller hands a whole shard; cross-shard composition is the caller's ring.
+// CONTRACT (mirrors hip::kda_delta_rule_fwd_chunked_with_scratch): k
+// L2-NORMALISED by the caller, gates in (0,1], beta <= 1 — the explicit
+// Ainv materialises powers of the strictly-lower gate-weighted Gram, which
+// needs |M| <= 1 (Cauchy-Schwarz) to stay bounded.
+// With a zero state_in and one segment this matches #L3's zero-state oracle.
+// COMPOSITION: running segments [S0..S1) then [S1..S2) with state_out(seg0)
+// seeded as state_in(seg1) equals the monolithic [S0..S2) run in out, final
+// state, to fp32 round-off — the property tests/kernels/attn/test_kda_cp.cpp
+// checks at K3 head shapes (it is what makes ring CP correctness modular).
+void kda_delta_rule_fwd_state_cpu(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, const float* state_in, float* state_out, float* out,
+    int B, int H, int S, int D, int chunk_size);
+
+// ---------------------------------------------------------------------------
 // #P — kda_pack_bitmatrix: pack a binary matrix into bytes (MSB first)
 // ---------------------------------------------------------------------------
 //   bits   : [n_bits]        uint8  (each 0 or 1)

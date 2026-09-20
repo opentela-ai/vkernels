@@ -136,6 +136,8 @@ the delta correction `β_t (v_t − a_t) ⊗ k_t`, with output `o_t = S_t · q_t
 | `kda_layer_norm_gated_cpu / hip::kda_layer_norm_gated` | gated RMSNorm × `silu(gate)` pre-attention normaliser | |
 | `kda_gate_chunk_cumsum_cpu / hip::kda_gate_chunk_cumsum` | intra inclusive + inter exclusive log-gate cumsum | |
 | `kda_delta_rule_intra_cpu` / `kda_delta_rule_inter_cpu` / `kda_gla_fwd_o_cpu` | the chunked pieces (standard rule), standalone | |
+| `kda_naive_delta_rule_fwd_state_cpu(q,k,v,g,beta,state_in,state_out,out,B,H,S,D)` | per-token oracle with EXPLICIT initial state `S_0 = state_in` and exported final state `S_S = state_out` (`[B,H,D,D]`; `state_out` may alias `state_in`) | the context-parallel ring-handoff oracle (see [kernels/kda.md](kernels/kda.md) § state handoff) |
+| `kda_delta_rule_fwd_state_cpu(q,k,v,g,beta,state_in,state_out,out,B,H,S,D,chunk)` | chunked-scan state API: the affine WY chunked forward of the per-key-dim recurrence, seeded with `S_in` and exporting `S_S` — run one sequence shard, hand the state to the next rank | CP ring handoff; composition (shard-by-shard == monolithic) tested in `test_kda_cp.cpp` |
 | `kda_pack_bitmatrix_cpu / hip::kda_pack_bitmatrix` | MSB-first bit packing of binary gate/routing matrices | |
 
 - `k` is L2-normalised by the caller; `g` is `[B,H,S,D]` in normal space
@@ -755,6 +757,17 @@ shard; every rank gathers the full set over the fabric).
   `cross_node_kv_allgather_c.{h,cu}` (stable serving-runtime C ABI)
 - **Docs**: [comm-cross-node-kv-allgather-draft.md](comm-cross-node-kv-allgather-draft.md)
   (draft only; the multi-port result is unmeasured)
+
+### Context-parallel data path (assessment)
+
+What sequence-striped CP needs from the comm layer, mapped against the
+existing primitives (KV all-gather, selected-block gather, ring channels,
+pipeline boundary, overlap executor, the KDA state-handoff API) and the
+gaps: the `cp_ring_pass` state-rotation collective, `CpPlan` shard/chunk
+metadata, the remote selected-block gather plan, and capture-safe overlap
+wiring.
+
+- **Docs**: [comm-context-parallel.md](comm-context-parallel.md)
 
 ---
 
