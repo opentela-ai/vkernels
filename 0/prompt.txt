@@ -1,0 +1,1 @@
+Can we make the compiler more general? Given a model's forward pass, we compile the computation into a big kernel.
