@@ -1,0 +1,1 @@
+For each of the isssues, start a subagent to fix them
