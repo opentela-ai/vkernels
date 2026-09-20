@@ -1,0 +1,1 @@
+Review the entire codebase, and suggest where we have defensive programming patterns
