@@ -11,6 +11,8 @@
 // nothing is ever thrown across the ABI boundary.
 #include "vkernels/comm/fabric_import_c.h"
 
+#include "vkernels/comm/c_abi_catch.hpp"
+
 #include "vkernels/comm/cross_node_kv.hpp"
 
 #include "vkernels/comm/fabric_import.hpp"
@@ -164,8 +166,10 @@ extern "C" vkernels_fi_status_t vkernels_cross_node_kv_select_route(
     out->point_to_point_transport = to_c_transport(route.point_to_point_transport);
     out->graph_capturable = route.graph_capturable ? 1 : 0;
     return VKERNELS_FI_OK;
-  } catch (const std::invalid_argument&) {
-    return VKERNELS_FI_ERR_INVALID_ARGUMENT;
+  } catch (const std::exception& e) {
+    return vkernels::comm::cabi::translate<vkernels_fi_status_t,
+                                           VKERNELS_FI_ERR_INVALID_ARGUMENT,
+                                           VKERNELS_FI_ERR_INTERNAL>(e);
   } catch (...) {  // LCOV_EXCL_LINE (pure value conversion cannot throw otherwise)
     return VKERNELS_FI_ERR_INTERNAL;  // LCOV_EXCL_LINE
   }

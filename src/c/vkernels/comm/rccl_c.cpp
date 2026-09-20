@@ -8,6 +8,7 @@
 // into a status code, so no exception ever crosses the ABI boundary.
 #include "vkernels/comm/rccl_c.h"
 
+#include "vkernels/comm/c_abi_catch.hpp"
 #include "vkernels/comm/channel.hpp"
 #include "vkernels/comm/rccl.hpp"
 
@@ -21,15 +22,16 @@
 namespace {
 
 vkernels_rccl_status_t to_status(const std::exception& e) {
-  if (dynamic_cast<const std::invalid_argument*>(&e))
-    return VKERNELS_RCCL_ERR_INVALID_ARGUMENT;
   // The host reference (rccl.cpp) only throws std::invalid_argument via
-  // VK_EXPECTS; no path across the ABI throws std::out_of_range or
-  // std::runtime_error, so these branches are defensively dead.
+  // VK_EXPECTS; no path across the ABI throws std::out_of_range, so this
+  // branch is defensively dead. Handle it first, then defer the common
+  // invalid_argument-vs-internal mapping to the shared helper in
+  // c_abi_catch.hpp.
   if (dynamic_cast<const std::out_of_range*>(&e))  // LCOV_EXCL_LINE
     return VKERNELS_RCCL_ERR_OUT_OF_RANGE;  // LCOV_EXCL_LINE
-  (void)e;  // LCOV_EXCL_LINE
-  return VKERNELS_RCCL_ERR_INTERNAL;  // LCOV_EXCL_LINE
+  return vkernels::comm::cabi::translate<vkernels_rccl_status_t,
+                                         VKERNELS_RCCL_ERR_INVALID_ARGUMENT,
+                                         VKERNELS_RCCL_ERR_INTERNAL>(e);
 }
 
 void copy_cstr(char* dst, std::size_t cap, const std::string& src) {

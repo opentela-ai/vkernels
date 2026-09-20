@@ -16,6 +16,7 @@
 
 #if defined(VKERNELS_C_HAS_CUDA) && !defined(__CUDA_ARCH__)
 
+#  include "vkernels/comm/c_abi_catch.hpp"
 #  include "vkernels/comm/cross_node_kv_cuda.hpp"
 #  include "vkernels/comm/fabric_import.hpp"
 
@@ -49,10 +50,9 @@ vkernels_cross_node_kv_restore_plan_create(
             imported_device_ptr));
   } catch (const std::exception& e) {
     if (status_out != nullptr) {
-      if (dynamic_cast<const std::invalid_argument*>(&e))
-        *status_out = VKERNELS_FI_ERR_INVALID_ARGUMENT;
-      else
-        *status_out = VKERNELS_FI_ERR_INTERNAL;
+      *status_out = vkernels::comm::cabi::translate<vkernels_fi_status_t,
+                                                    VKERNELS_FI_ERR_INVALID_ARGUMENT,
+                                                    VKERNELS_FI_ERR_INTERNAL>(e);
     }
     return nullptr;
   }
@@ -114,10 +114,9 @@ vkernels_cross_node_kv_donate_plan_create(
             imported_device_ptr));
   } catch (const std::exception& e) {
     if (status_out != nullptr) {
-      if (dynamic_cast<const std::invalid_argument*>(&e))
-        *status_out = VKERNELS_FI_ERR_INVALID_ARGUMENT;
-      else
-        *status_out = VKERNELS_FI_ERR_INTERNAL;
+      *status_out = vkernels::comm::cabi::translate<vkernels_fi_status_t,
+                                                    VKERNELS_FI_ERR_INVALID_ARGUMENT,
+                                                    VKERNELS_FI_ERR_INTERNAL>(e);
     }
     return nullptr;
   }
