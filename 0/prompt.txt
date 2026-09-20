@@ -1,0 +1,1 @@
+For each of these issues, can you create a new subagent to actually work on it? Each subagent can ssh beverin/euler or use the GPU locally for experiments
