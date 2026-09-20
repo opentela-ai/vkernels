@@ -56,8 +56,14 @@ def test_gpu_parity_vs_reference(torch, shape):
         assert rel < 3e-3, rel
 
 
-def test_contract(torch):
+def test_contract(torch, monkeypatch):
     from vkernels.torch_ops.glm_expert_gemv import expert_gemv
+
+    # The T<=cap contract is checked against the DEFAULT cap (2): serving
+    # containers export GLM53_MOE_DECODE_MAX_TOKENS (the floe knob bridge)
+    # and would otherwise widen the cap under the test's feet (seen on
+    # beverin, where the image bakes in 8).
+    monkeypatch.delenv("GLM53_MOE_DECODE_MAX_TOKENS", raising=False)
 
     weights, scales, indices = make_inputs(torch, t=1, k=8)
     x = torch.randn(1, 8, 256, dtype=torch.bfloat16)

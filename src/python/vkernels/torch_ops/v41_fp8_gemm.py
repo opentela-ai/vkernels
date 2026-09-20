@@ -16,6 +16,8 @@ CPU ``*_reference`` is the always-tested oracle. Torch/Triton load lazily.
 Inference-only, no autograd backward.
 """
 
+import threading
+
 
 def quantize_fp8_ue8m0(x, block: int = 32):
     """BF16/FP32 ``[M, K]`` -> (e4m3 ``[M, K]``, fp32 UE8M0 scales
@@ -70,6 +72,11 @@ def fp8_block_gemm_reference(a_fp8, a_scales, b_fp8, b_scales, *, block: int = 3
 # shapes (correct, just slower when N is small).
 _FP8_GEMM_DEFAULT = "auto"
 _FP8_GEMM_TRITON_MIN_N = 2048
+
+# One-shot log for the fp8_blockwise_gemm -> torch-oracle fallback in
+# fp8_block_gemm below: the fallback is correct by contract, but a silent
+# one would hide a genuine kernel failure behind an (only) slower result.
+_BLOCKWISE_FALLBACK_WARNED = threading.Event()
 
 
 def _kernel():
@@ -166,10 +173,19 @@ def fp8_block_gemm(a_fp8, a_scales, b_fp8, b_scales, *, block: int = 32, out_dty
             from .glm_fp8_blockwise_gemm import fp8_blockwise_gemm
 
             return fp8_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out_dtype=out_dtype)
-        except Exception:
+        except Exception as exc:
             # house idiom (glm_fp8_blockwise_gemm): no triton, or a shape the
-            # GLM kernel validates against, translates to the torch oracle
-            pass
+            # GLM kernel validates against, translates to the torch oracle.
+            # Fallback behavior is unchanged; log the first occurrence once so
+            # the fallback (and any genuine kernel failure behind it) is
+            # visible instead of fully silent.
+            if not _BLOCKWISE_FALLBACK_WARNED.is_set():
+                _BLOCKWISE_FALLBACK_WARNED.set()
+                print(
+                    f"[vkernels.v41_fp8_gemm] fp8_blockwise_gemm unavailable or "
+                    f"failed ({type(exc).__name__}: {exc}); using torch reference path",
+                    flush=True,
+                )
     m = a_fp8.shape[0]
     n = b_fp8.shape[0]
     backend = os.environ.get("VKERNELS_V41_FP8_GEMM_BACKEND", _FP8_GEMM_DEFAULT)

@@ -22,12 +22,17 @@ torch = pytest.importorskip(
 
 from vkernels.torch_ops.glm_fp8_blockwise_gemm import (  # noqa: E402
     e4m3fn_to_fnuz,
+    fnuz_required,
     glm_moe_grouped_gemm_native,
     quantize_activations_fnuz,
 )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.skipif(
+    not fnuz_required(),
+    reason="fnuz grouped-gemm kernels are CDNA-only (NVIDIA fp8 is e4m3fn)",
+)
 class TestGroupedNativeMultiTile:
     def test_hot_experts_match_fnuz_oracle(self):
         import torch.nn.functional as F

@@ -209,8 +209,14 @@ def test_grouped_native_inplace_matches_reference(torch):
     from vkernels.torch_ops.glm_fp8_blockwise_gemm import (
         e4m3fn_to_fnuz,
         e4m3fn_to_fnuz_inplace,
+        fnuz_required,
         glm_moe_grouped_gemm_native,
     )
+    if not fnuz_required():
+        pytest.skip(
+            "the fnuz grouped-gemm flavour is CDNA-only; NVIDIA fp8 is "
+            "e4m3fn (glm_fp8_blockwise_gemm.fnuz_required)"
+        )
 
     e, i, h, t, k = 4, 256, 256, 8, 2
     g = torch.Generator().manual_seed(9)

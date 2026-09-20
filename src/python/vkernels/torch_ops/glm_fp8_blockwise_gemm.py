@@ -51,9 +51,15 @@ kernel path imports the DSL lazily.
 from __future__ import annotations
 
 import os
+import threading
 from functools import lru_cache
 
 from ._dispatch import OpNotEligible
+
+# One-shot log for the triton-blockwise -> torch-oracle fallback in
+# fp8_blockwise_gemm: the fallback is correct by contract, but a silent one
+# would hide a genuine kernel failure behind an (only) slower result.
+_TRITON_FALLBACK_WARNED = threading.Event()
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +162,18 @@ def fp8_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out_dtype=None):
             import triton  # noqa: F401
 
             return _triton_backend(a_fp8, a_scales, b_fp8, b_scales, out)
-        except Exception:
-            pass  # no triton (or launch rejected) -> torch oracle
+        except Exception as exc:
+            # no triton (or launch rejected) -> torch oracle. Behavior is
+            # unchanged; log the first occurrence once so the fallback (and
+            # any genuine kernel failure behind it) is visible.
+            if not _TRITON_FALLBACK_WARNED.is_set():
+                _TRITON_FALLBACK_WARNED.set()
+                print(
+                    f"[glm_fp8_blockwise_gemm] triton blockwise kernel "
+                    f"unavailable or failed ({type(exc).__name__}: {exc}); "
+                    f"torch reference path active",
+                    flush=True,
+                )
     return _torch_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out)
 
 

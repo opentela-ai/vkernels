@@ -19,6 +19,9 @@ def fast_path(*tensors) -> bool:
             return False
     try:
         import triton  # noqa: F401  (availability probe)
-    except Exception:
+    except ImportError:
+        # Triton genuinely absent -> no fast path. A *broken* triton install
+        # (corrupt package) raises non-ImportError types, which now propagate
+        # instead of being silently reported as "unavailable".
         return False
     return True

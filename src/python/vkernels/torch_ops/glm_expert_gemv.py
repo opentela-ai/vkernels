@@ -269,8 +269,15 @@ def expert_gemv_reference(x, weights, scales, indices):
     """Gather-dequant + einsum reference (fp32 dot, BF16 output).
 
     Mirrors the kernel's rounding contract: the scaled weight is rounded
-    to BF16 *before* the fp32 product reduction (matching
-    gather-dequant followed by GEMV).
+    to BF16 *before* the fp32 product reduction (matching gather-dequant
+    followed by GEMV). The decode runs GATHER-FIRST and chunked — both
+    bit-identical (the byte decode is elementwise) — so the oracle's fp32
+    temporaries stay bounded: the un-chunked form materialized ~6x the
+    full [E,O,I] fp32 stack and OOMed a 128 GiB MI300A through the
+    plugin-shape acceptance test even after its memory guard passed
+    (beverin job 644666). Gathering through the uint8 view also keeps the
+    oracle working on builds where CPU fp8 fancy-indexing is
+    unimplemented.
     """
     import torch
 
@@ -279,18 +286,23 @@ def expert_gemv_reference(x, weights, scales, indices):
     t, k = indices.shape
     if t > cap:
         raise OpNotEligible(f"T={t} exceeds the cap {cap}")
-    raw = weights.view(torch.uint8).to(torch.int32)
-    exponent, mantissa = (raw >> 3) & 15, raw & 7
-    bits = (((exponent + 120) << 23) | (mantissa << 20)).to(torch.int32)
-    value = bits.view(torch.float32)
-    value = torch.where(
-        exponent == 0, mantissa.to(torch.float32) * (1.0 / 512.0), value
-    )
-    value = torch.where((raw & 127) == 127, float("nan"), value)
-    value = value * torch.where((raw & 128) != 0, -1.0, 1.0)
-    scale = scales.repeat_interleave(128, dim=1).repeat_interleave(128, dim=2)
-    weight = (value * scale[:, :o, :i]).to(torch.bfloat16)
-    selected = weight[indices]  # [T,K,O,I] bf16
+    sel_w8 = weights.view(torch.uint8)[indices]  # [T,K,O,I] raw bytes
+    sel_scale = scales[indices]  # [T,K,O/128,I/128]
+    expand = sel_scale.repeat_interleave(128, dim=2).repeat_interleave(128, dim=3)
+    flat = sel_w8.reshape(-1)
+    vals = torch.empty(flat.shape, dtype=torch.float32, device=flat.device)
+    chunk = 1 << 26  # 64 Mi elements: ~1.5 GiB of fp32 temporaries per slice
+    for beg in range(0, flat.numel(), chunk):
+        raw = flat[beg:beg + chunk].to(torch.int32)
+        exponent, mantissa = (raw >> 3) & 15, raw & 7
+        bits = (((exponent + 120) << 23) | (mantissa << 20)).to(torch.int32)
+        value = bits.view(torch.float32)
+        value = torch.where(
+            exponent == 0, mantissa.to(torch.float32) * (1.0 / 512.0), value
+        )
+        value = torch.where((raw & 127) == 127, float("nan"), value)
+        vals[beg:beg + chunk] = value * torch.where((raw & 128) != 0, -1.0, 1.0)
+    weight = (vals.reshape(t, k, o, i) * expand).to(torch.bfloat16)
     x3 = x if x.ndim == 3 else x[:, None, :].expand(t, k, i)
-    out = torch.einsum("tki,tkoi->tko", x3.float(), selected.float())
+    out = torch.einsum("tki,tkoi->tko", x3.float(), weight.float())
     return out.to(torch.bfloat16)
