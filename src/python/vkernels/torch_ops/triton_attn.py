@@ -109,6 +109,151 @@ def _kernel():
     return _paged_decode_attn
 
 
+@lru_cache(maxsize=1)
+def _gqa_kernel():
+    global tl
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _paged_decode_attn_gqa(
+        q_ptr, k_ptr, v_ptr, bt_ptr, sl_ptr, o_ptr, kn_ptr, vn_ptr,
+        scale,
+        stride_qb, stride_qh,
+        stride_kb, stride_kh,
+        stride_vb, stride_vh,
+        stride_btb,
+        stride_ob, stride_oh,
+        stride_knb, stride_knh,
+        G: tl.constexpr, BG: tl.constexpr,
+        D: tl.constexpr, BLOCK_N: tl.constexpr,
+        HAS_NEW: tl.constexpr, SCRATCH: tl.constexpr,
+    ):
+        # GQA-grouped mapping: one program per (batch, KV head) covering all
+        # G q-heads of the group, so the paged K/V stream is read once per KV
+        # head instead of once per q-head (G x less KV traffic -- the
+        # per-q-head kernel relies on L2 to absorb the duplicate reads).
+        # QK^T and P.V run through tl.dot on tensor cores with the K/V tiles
+        # held in the KV dtype (the per-q-head kernel upcasts whole blocks to
+        # fp32 registers and uses broadcast-mul-sum). tl.dot needs M >= 16,
+        # so the q tile is padded from G to BG rows (masked load/store; the
+        # pad rows' MMA work is free next to the memory-bound K/V reads).
+        pid_b = tl.program_id(0)
+        pid_kv = tl.program_id(1)
+        hq0 = pid_kv * G
+        offs_g = tl.arange(0, BG)
+        offs_d = tl.arange(0, D)
+        mask_g = offs_g < G
+        seq = tl.load(sl_ptr + pid_b)
+        slot = 0
+        kn = tl.zeros([D], dtype=k_ptr.dtype.element_ty)
+        vn = tl.zeros([D], dtype=k_ptr.dtype.element_ty)
+        if HAS_NEW:
+            # Sole owner of (batch, kv head): keep the fresh k/v in
+            # registers for the attention math and write the pool only for
+            # a real slot (parity with the per-q-head kernel: the scratch
+            # page is never written but still substituted in the math).
+            slot = tl.load(bt_ptr + pid_b * stride_btb + (seq - 1))
+            kn = tl.load(kn_ptr + pid_b * stride_knb + pid_kv * stride_knh + offs_d)
+            vn = tl.load(vn_ptr + pid_b * stride_knb + pid_kv * stride_knh + offs_d)
+            if slot != SCRATCH:
+                tl.store(k_ptr + slot * stride_kb + pid_kv * stride_kh + offs_d, kn)
+                tl.store(v_ptr + slot * stride_vb + pid_kv * stride_vh + offs_d, vn)
+        qt = tl.load(
+            q_ptr + pid_b * stride_qb + (hq0 + offs_g)[:, None] * stride_qh + offs_d[None, :],
+            mask=mask_g[:, None], other=0.0,
+        )
+        m = tl.full([BG], float("-inf"), tl.float32)
+        l = tl.zeros([BG], dtype=tl.float32)
+        acc = tl.zeros([BG, D], dtype=tl.float32)
+        for t0 in range(0, seq, BLOCK_N):
+            offs = t0 + tl.arange(0, BLOCK_N)
+            mask = offs < seq
+            idx = tl.load(bt_ptr + pid_b * stride_btb + offs, mask=mask, other=0)
+            kblk = tl.load(  # [D, BLOCK_N] transposed, stays in the KV dtype
+                k_ptr + idx[None, :] * stride_kb + pid_kv * stride_kh + offs_d[:, None],
+                mask=mask[None, :], other=0.0,
+            )
+            if HAS_NEW:
+                kblk = tl.where((idx == slot)[None, :], kn[:, None], kblk)
+            qk = tl.dot(qt, kblk) * scale  # [BG, BLOCK_N] fp32 via tensor cores
+            qk = tl.where(mask[None, :], qk, float("-inf"))
+            m_new = tl.maximum(m, tl.max(qk, 1))
+            alpha = tl.exp(m - m_new)
+            p = tl.exp(qk - m_new[:, None])
+            vblk = tl.load(  # [BLOCK_N, D]
+                v_ptr + idx[:, None] * stride_vb + pid_kv * stride_vh + offs_d[None, :],
+                mask=mask[:, None], other=0.0,
+            )
+            if HAS_NEW:
+                vblk = tl.where((idx == slot)[:, None], vn[None, :], vblk)
+            acc = acc * alpha[:, None] + tl.dot(p.to(vblk.dtype), vblk)
+            l = l * alpha + tl.sum(p, 1)
+            m = m_new
+        tl.store(
+            o_ptr + pid_b * stride_ob + (hq0 + offs_g)[:, None] * stride_oh + offs_d[None, :],
+            (acc / l[:, None]).to(o_ptr.dtype.element_ty),
+            mask=mask_g[:, None],
+        )
+
+    return _paged_decode_attn_gqa
+
+
+def decode_attention_gqa(q, kc, vc, block_table, seq_lens, *, k_new=None, v_new=None, scratch_slot=None, block_n=64, num_warps=2, num_stages=2):
+    """GQA-grouped decode attention: same contract as :func:`decode_attention`.
+
+    One program per (batch, KV head) processes all G = n_q/n_kv q-heads of
+    the group together, so the paged K/V stream streams once per KV head
+    (the per-q-head kernel re-reads it G times, relying on L2) and QK^T /
+    P.V run on tensor cores. Measured on GB10 (bf16, scattered slots,
+    L2-cold rotated windows) vs the per-q-head kernels: G=2 roughly ties
+    at small batch and wins up to -17% at B=16; G=4 wins +9..44% and G=8
+    +36..71% (attention time only), because the dedup grows with G while
+    the BG=16 q-tile padding cost shrinks. Prefer this whenever the grid
+    B*n_kv alone saturates the device or G >= 4; the split-KV kernel
+    keeps the edge for small-G small-B long-context (few CTAs otherwise)."""
+    import math
+
+    import torch
+
+    B, n_q, D = q.shape
+    n_kv = kc.shape[1]
+    if n_q % n_kv:
+        raise ValueError(f"n_q ({n_q}) must be a multiple of n_kv ({n_kv})")
+    G = n_q // n_kv
+    bt = block_table.to(torch.int32)
+    if not bt.is_contiguous():
+        bt = bt.contiguous()
+    sl = seq_lens.to(torch.int32)
+    if not sl.is_contiguous():
+        sl = sl.contiguous()
+    out = torch.empty_like(q)
+    has_new = k_new is not None and v_new is not None
+    if has_new and k_new.shape != (B, n_kv, D):
+        raise ValueError(f"k_new must be [B, n_kv, D], got {tuple(k_new.shape)}")
+    # tl.dot needs M >= 16: pad the group tile up from G
+    bg = max(16, 1 << max(0, G - 1).bit_length())
+    _gqa_kernel()[(B, n_kv)](
+        q, kc, vc, bt, sl, out,
+        k_new if has_new else q,  # unused dummy pointer when HAS_NEW=0
+        v_new if has_new else q,
+        1.0 / math.sqrt(D),
+        q.stride(0), q.stride(1),
+        kc.stride(0), kc.stride(1),
+        vc.stride(0), vc.stride(1),
+        bt.stride(0),
+        out.stride(0), out.stride(1),
+        k_new.stride(0) if has_new else 0,
+        k_new.stride(1) if has_new else 0,
+        G=G, BG=bg, D=D, BLOCK_N=block_n,
+        HAS_NEW=has_new,
+        SCRATCH=scratch_slot if scratch_slot is not None else -1,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out
+
+
 def decode_attention(q, kc, vc, block_table, seq_lens, *, k_new=None, v_new=None, scratch_slot=None):
     """Decode attention for one token per batch: q [B, n_q, D], KV pages
     ``kc``/``vc`` [max_total, n_kv, D], per-batch page table and lengths.

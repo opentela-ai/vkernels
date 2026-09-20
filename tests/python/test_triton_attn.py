@@ -177,3 +177,95 @@ def test_fused_kv_store_parity():
         th.testing.assert_close(vcs[keep], vc[keep])
         th.testing.assert_close(kc[written], kn[live])
         th.testing.assert_close(vc[written], vn[live])
+
+
+def test_decode_attention_gqa_matches_reference():
+    """GQA-grouped kernel (one program per KV head, tl.dot) vs the eager
+    oracle, uniform and ragged lengths."""
+    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch.cuda")
+    import torch as th
+    if not th.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vkernels.torch_ops.triton_attn import (
+        decode_attention_gqa,
+        decode_attention_reference,
+    )
+
+    th.manual_seed(0)
+    dev = "cuda"
+    # G=2 (Qwen3-0.6B shape), G=2 D=64, G=4 and G=8 (larger models: the
+    # grouping win grows with G), plus a G=8 kv=1 shape (MQA-style)
+    for B, n_q, n_kv, D, T in (
+        (4, 16, 8, 128, 600),
+        (1, 8, 8, 128, 64),
+        (2, 4, 2, 64, 2048),
+        (3, 8, 8, 64, 1300),
+        (2, 32, 8, 128, 777),
+        (2, 64, 8, 128, 300),
+        (2, 64, 1, 128, 500),
+    ):
+        q = th.randn(B, n_q, D, device=dev, dtype=th.bfloat16)
+        kc = th.randn(4096, n_kv, D, device=dev, dtype=th.bfloat16)
+        vc = th.randn(4096, n_kv, D, device=dev, dtype=th.bfloat16)
+        bt = th.stack([th.randperm(4000, device=dev)[:T].to(th.int32) for _ in range(B)])
+        sl = th.full((B,), T, device=dev, dtype=th.int32)
+        ref = decode_attention_reference(q, kc, vc, bt, sl)
+        out = decode_attention_gqa(q, kc, vc, bt, sl)
+        err = (out.float() - ref).abs().max().item()
+        assert err < 0.02, f"gqa-vs-ref err {err} @ B={B} q={n_q} kv={n_kv} T={T}"
+        # ragged lens
+        sl2 = sl.clone()
+        sl2[0] = T // 3
+        ref2 = decode_attention_reference(q, kc, vc, bt, sl2)
+        out2 = decode_attention_gqa(q, kc, vc, bt, sl2)
+        err2 = (out2.float() - ref2).abs().max().item()
+        assert err2 < 0.02, f"gqa-vs-ref ragged err {err2} @ B={B} T={T}"
+
+
+def test_gqa_fused_kv_store_parity():
+    """decode_attention_gqa with k_new/v_new matches the two-step
+    store-then-attend sequence and never writes the scratch page."""
+    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch.cuda")
+    import torch as th
+    if not th.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vkernels.torch_ops.triton_attn import (
+        decode_attention,
+        decode_attention_gqa,
+    )
+
+    th.manual_seed(0)
+    dev = "cuda"
+    for B, n_q, n_kv, D, T in ((4, 16, 8, 128, 600), (2, 4, 2, 64, 77), (3, 8, 8, 64, 1300), (2, 64, 8, 128, 300)):
+        pool = T + 16
+        kc = th.randn(B * pool, n_kv, D, device=dev, dtype=th.bfloat16)
+        vc = th.randn(B * pool, n_kv, D, device=dev, dtype=th.bfloat16)
+        bt = th.stack(
+            [th.randperm(pool - 16, device=dev)[:T].to(th.int32) + b * pool for b in range(B)]
+        )
+        scratch = B * pool - 1
+        bt[-1, T - 1] = scratch
+        sl = th.full((B,), T, device=dev, dtype=th.int32)
+        kn = th.randn(B, n_kv, D, device=dev, dtype=th.bfloat16)
+        vn = th.randn(B, n_kv, D, device=dev, dtype=th.bfloat16)
+        q = th.randn(B, n_q, D, device=dev, dtype=th.bfloat16)
+        kc0, vc0 = kc.clone(), vc.clone()
+        slots = th.gather(bt, 1, ((sl - 1)[:, None]).to(th.int64))[:, 0]
+        live = slots != scratch
+        kc0[slots[live].long()] = kn[live]
+        vc0[slots[live].long()] = vn[live]
+        kc0[scratch] = kn[-1]
+        vc0[scratch] = vn[-1]
+        ref = decode_attention(q, kc0, vc0, bt, sl)  # per-q-head two-step oracle
+        kcs, vcs = kc.clone(), vc.clone()
+        out = decode_attention_gqa(q, kc, vc, bt, sl, k_new=kn, v_new=vn, scratch_slot=scratch)
+        err = (out.float() - ref.float()).abs().max().item()
+        assert err < 0.02, f"gqa fused-vs-two-step err {err} @ B={B} T={T}"
+        keep = th.ones(kc.shape[0], dtype=th.bool, device=dev)
+        written = slots[live].long()
+        keep[written] = False
+        assert th.equal(kcs[keep], kc[keep]) and th.equal(vcs[keep], vc[keep])
+        assert th.equal(kc[written], kn[live]) and th.equal(vc[written], vn[live])
+        assert th.equal(kcs[scratch], kc[scratch]) and th.equal(vcs[scratch], vc[scratch])
