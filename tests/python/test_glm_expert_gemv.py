@@ -45,7 +45,7 @@ def test_gpu_parity_vs_reference(torch, shape):
         x = torch.randn((t, 256 if broadcast else k, 256),
                         device="cuda", dtype=torch.bfloat16)
         if broadcast:
-            x = x[:, 0, :]                    # x[T, I]
+            x = x[:, 0, :].contiguous()           # x[T, I] (contract: contiguous)
         actual = expert_gemv(x, weights, scales, indices)
         expected = expert_gemv_reference(x, weights, scales, indices)
         assert actual.shape == (t, k, 256)

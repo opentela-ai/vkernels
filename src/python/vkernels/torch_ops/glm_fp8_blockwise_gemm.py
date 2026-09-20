@@ -53,6 +53,8 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
+from ._dispatch import OpNotEligible
+
 
 # ---------------------------------------------------------------------------
 # 1. activation quantization (DeepSeek per-token per-128-group e4m3)
@@ -189,6 +191,63 @@ def _torch_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out):
 # ---------------------------------------------------------------------------
 # 3. MoE orchestration (sort by expert -> per-active-expert blockwise GEMM)
 # ---------------------------------------------------------------------------
+
+
+def _route_counts(topk_index, n_experts, device):
+    """Host-sync-free routing metadata.
+
+    ``argsort`` is stable, so sorting the flattened (token, slot) expert ids
+    groups the slots by expert in *ascending expert order*: expert ``e`` owns
+    sorted-slot rows ``[seg[e], seg[e] + counts[e])`` where ``seg`` is the
+    exclusive cumsum of ``counts``. Counting with a device-side scatter-add
+    keeps every shape static, which is what makes the dispatch capturable in a
+    CUDA graph — ``torch.unique_consecutive`` must sync to learn its own output
+    size, and reading ``int(toff[-1])`` for a launch grid is a host read of a
+    device scalar. Both are avoided here. ROCm's ``torch.bincount`` is NOT
+    capture-safe (``hipErrorStreamCaptureUnsupported``, beverin job 644282), so
+    the counts come from ``scatter_add_`` on a zeroed int64 row instead.
+    """
+    import torch
+
+    t, k = topk_index.shape
+    flat = topk_index.reshape(-1)
+    tokens = torch.arange(t, device=device).repeat_interleave(k)
+    order = torch.argsort(flat, stable=True)
+    counts = torch.zeros(n_experts, dtype=torch.int64, device=device).scatter_add_(
+        0, flat, torch.ones_like(flat)
+    )
+    seg = torch.cumsum(counts, 0) - counts
+    return order, tokens[order], counts, seg
+
+
+def _tile_map_static(counts, seg, bm, device, cap):
+    """Per-TILE metadata for a grouped launch of *static* grid size ``cap``.
+
+    ``sum_e ceil(c_e / bm) <= min(slots / bm + E, slots)`` for any routing, so ``cap``
+    be computed from tensor shapes alone — no device read, no grid sync. Tiles
+    past the real tile count get ``m = 0`` and ``r0 = 0``: every load and store
+    in the grouped kernel is masked by ``m`` and it returns early when
+    ``m == 0``, so the padding costs only a bounded number of empty blocks.
+    """
+    import torch
+
+    n_e = counts.numel()
+    tiles = (counts + bm - 1) // bm
+    ends = torch.cumsum(tiles, 0)  # inclusive end tile index per expert
+    toff = ends - tiles
+    n_tiles = ends[-1]  # device scalar — deliberately never read on the host
+    tid = torch.arange(cap, device=device)
+    valid = tid < n_tiles
+    e = torch.searchsorted(ends, tid, right=True).clamp(max=n_e - 1)
+    local = tid - toff[e]
+    m = torch.clamp(counts[e] - local * bm, min=0, max=bm)
+    r0 = seg[e] + local * bm
+    zero = torch.zeros_like(tid)
+    return (
+        e.to(torch.int64),
+        torch.where(valid, r0, zero),
+        torch.where(valid, m, zero),
+    )
 
 
 def _route(topk_index, device):
@@ -358,6 +417,22 @@ def _triton_kernel():
         )
 
     return _blockwise_gemm
+
+
+def fnuz_required() -> bool:
+    """Whether this hardware's fp8 tensor cores need the e4m3fnuz flavour.
+
+    CDNA3 (gfx942) has no e4m3fn matrix unit: expert stacks must be rewritten
+    to ``e4m3fnuz`` (halved payloads, doubled scales — ``e4m3fn_to_fnuz``,
+    once per weight version) before any fp8 kernel can consume them. NVIDIA
+    hardware fp8 IS e4m3fn, where that rewrite is pure overhead. This is the
+    arch predicate behind that decision — owned here next to the conversion
+    it drives, so model code asks instead of re-deriving it from
+    ``torch.version.hip``.
+    """
+    import torch
+
+    return torch.version.hip is not None
 
 
 def e4m3fn_to_fnuz(w_fp8, scales):
@@ -545,6 +620,40 @@ def quantize_activations_fnuz(x, group_size: int = 128):
     return e4m3fn_to_fnuz(q, sc)
 
 
+def quantize_activations_native(x, group_size: int = 128):
+    """BF16 [M, K] -> (e4m3fn payload, plain scales) for e4m3fn tensor cores.
+
+    The CUDA counterpart of :func:`quantize_activations_fnuz`. NVIDIA's fp8
+    tensor-core type *is* e4m3fn (bias 7), so the payload and the checkpoint's
+    weight scales are used verbatim: the halve-payload/double-scale round trip
+    that CDNA3 needs to reach ``e4m3fnuz`` would buy nothing here and costs a
+    second resident copy of every expert stack. Same per-token per-128-group
+    quantization as the fnuz form; only the storage flavour (and therefore the
+    scale convention) differs.
+    """
+    return quantize_activations_fp8(x, group_size)
+
+
+def _activation_quantizer(weight_dtype):
+    """The activation quantizer matching the weight storage flavour.
+
+    The grouped kernel is flavour-agnostic -- it loads fp8 operands and dots
+    them -- but payload and scales must come from the *same* convention:
+    e4m3fnuz weights carry halved payloads with doubled scales, e4m3fn weights
+    carry the checkpoint's own bytes and scales.
+    """
+    import torch
+
+    if weight_dtype == torch.float8_e4m3fnuz:
+        return quantize_activations_fnuz
+    if weight_dtype == torch.float8_e4m3fn:
+        return quantize_activations_native
+    raise TypeError(
+        "native-fp8 MoE weights must be e4m3fn or e4m3fnuz, got "
+        f"{weight_dtype}"
+    )
+
+
 @lru_cache(maxsize=1)
 def _grouped_kernel():
     """Single-launch grouped blockwise fp8 GEMM (MoE): one grid covers
@@ -582,6 +691,11 @@ def _grouped_kernel():
         e = tl.load(TILE_EXP + pid_m).to(tl.int64)
         r0 = tl.load(TILE_R0 + pid_m)
         me = tl.load(TILE_M + pid_m)
+        if me == 0:
+            # Padding tile from a statically sized launch: nothing to do.
+            # Exiting before the K loop keeps the padding cost to a prologue
+            # instead of a full pass of masked (but still executed) dots.
+            return
         ri = r0 + tl.arange(0, BM)  # sorted-slot space
         rmask = tl.arange(0, BM) < me
         # A rows: gate_up gathers the shared per-TOKEN activation; the down
@@ -670,45 +784,76 @@ def glm_moe_grouped_gemm_native(
 ):
     """Routed expert MLP via TWO single-launch grouped fp8 GEMMs.
 
-    Inputs: x bf16 [T, H]; gate_up_nz/down_nz the ONE-TIME converted
-    e4m3fnuz expert stacks with DOUBLED scales (e4m3fn_to_fnuz); routing
-    int64 [T, K] + fp weights [T, K]. Returns bf16 [T, H].
+    Inputs: x bf16 [T, H]; gate_up_nz/down_nz the expert stacks as fp8 with
+    their scales; routing int64 [T, K] + fp weights [T, K]. Returns bf16 [T, H].
+
+    Two storage flavours are accepted, discriminated by the weight dtype and
+    kept consistent end to end: ``e4m3fnuz`` (ROCm CDNA3: payloads rewritten
+    once by :func:`e4m3fn_to_fnuz`, scales doubled) and ``e4m3fn`` (NVIDIA
+    tensor cores: checkpoint bytes and scales as they are, no conversion and no
+    second resident weight copy).
 
     Host work per call: one sort, a handful of tiny torch ops for the
     tile map, two grouped launches, one swiglu + per-row quantize — no
     per-expert Python loop (that loop measured host-bound at ~200 ms on
-    MI300A; this replaces it)."""
+    MI300A; this replaces it) and, with the static tile map, no host sync:
+    the routing counts come from a static-shape scatter-add and the launch is
+    sized from tensor shapes, so the whole MoE dispatch is CUDA-graph
+    capturable on both NVIDIA and ROCm (ROCm's ``torch.bincount`` is not)."""
     import torch
 
+    # Up-front contract check (the torch_ops dispatch convention): the floe
+    # ladder gates only on policy (knob + token regime + capture) and relies
+    # on OpNotEligible here for everything device/dtype/shape.
+    if (
+        x.dim() != 2 or not x.is_cuda or x.dtype != torch.bfloat16
+        or gate_up_nz.dim() != 3 or down_nz.dim() != 3
+        or gate_up_nz.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        or down_nz.dtype != gate_up_nz.dtype
+        or gate_up_sc2.dtype != torch.float32 or down_sc2.dtype != torch.float32
+        or topk_index.dtype != torch.int64
+        or topk_index.shape != topk_weights.shape
+        or not topk_weights.is_floating_point()
+        or gate_up_nz.device != x.device or down_nz.device != x.device
+    ):
+        raise OpNotEligible(
+            "grouped native-fp8 MoE wants CUDA bf16 x [T,H], matching fp8 "
+            "(e4m3fn/fnuz) expert stacks with fp32 scales, int64 routing and "
+            "float routing weights on one device")
     t, k = topk_index.shape
     h = x.shape[1]
+    n_experts = gate_up_nz.shape[0]
     two_i = gate_up_nz.shape[1]
     i = two_i // 2
+    if (
+        down_nz.shape[:1] != gate_up_nz.shape[:1]
+        or down_nz.shape[1] != h or down_nz.shape[2] != i
+        or two_i % 2 or h % 128 or i % 128
+        or gate_up_sc2.shape != (n_experts, two_i // 128, h // 128)
+        or down_sc2.shape != (n_experts, h // 128, i // 128)
+    ):
+        raise OpNotEligible(
+            "expert stacks must be [E,2I,H]/[E,H,I] block-128 with matching "
+            "[E,O/128,I/128] scales")
     dev = x.device
 
-    order, sorted_tok, uniq, counts, seg = _route(topk_index, dev)
+    order, sorted_tok, counts, seg = _route_counts(topk_index, n_experts, dev)
 
-    a_nz, asc2 = quantize_activations_fnuz(x)
+    quantize = _activation_quantizer(gate_up_nz.dtype)
+    a_nz, asc2 = quantize(x)
 
     bm = int(os.environ.get("VK_FP8GEMM_TILES", "64,128,4,3").split(",")[0])
-    tiles = (counts + bm - 1) // bm
-    toff = torch.zeros(len(uniq) + 1, device=dev, dtype=torch.int64)
-    toff[1:] = torch.cumsum(tiles, 0)
-    # Per-TILE metadata. An expert with count > bm spans several row tiles;
-    # each tile needs its OWN row start (segment start + local index * bm)
-    # and its own valid-row count (clamped remainder). Repeating the segment
-    # start/count across all of an expert's tiles made every tile rewrite
-    # the first bm rows and left rows beyond the first bm UNWRITTEN
-    # (torch.empty garbage — the #58 NaN).
-    n_tiles = int(toff[-1])
-    tile_local = torch.arange(n_tiles, device=dev, dtype=torch.int64) - torch.repeat_interleave(
-        toff[:-1], tiles, output_size=n_tiles
-    )
-    tile_exp = torch.repeat_interleave(uniq, tiles, output_size=n_tiles)
-    tile_r0 = torch.repeat_interleave(seg[:-1], tiles, output_size=n_tiles) + tile_local * bm
-    tile_m = torch.clamp(torch.repeat_interleave(counts, tiles, output_size=n_tiles) - tile_local * bm, max=bm)
-
     slots = t * k
+    # Static upper bound on the row-tile count (see _tile_map_static). Two
+    # bounds hold for any routing: sum_e ceil(c_e/bm) <= slots/bm + E, and no
+    # tile is empty so tiles <= slots. The second one matters in DECODE, where
+    # E (288) dwarfs the slot count (64 at t=8,k=8): without it the launch pads
+    # to ~290 mostly-empty blocks for ~50 real ones, which measured as a 2.6%
+    # decode regression. Taking the min keeps prefill's tight bound and stops
+    # decode from paying for experts it cannot have routed to.
+    cap = min(slots, slots // bm + n_experts + 1)
+    tile_exp, tile_r0, tile_m = _tile_map_static(counts, seg, bm, dev, cap)
+
     gu = torch.empty((slots, two_i), device=dev, dtype=torch.bfloat16)
     _grouped_backend(
         a_nz,
@@ -729,7 +874,7 @@ def glm_moe_grouped_gemm_native(
 
     # act rows are per-SLOT in sorted order (K expert assignments per
     # token) — the down GEMM indexes A directly, no gather.
-    a2_nz, a2sc2 = quantize_activations_fnuz(act)
+    a2_nz, a2sc2 = quantize(act)
     dn = torch.empty((slots, h), device=dev, dtype=torch.bfloat16)
     _grouped_backend(
         a2_nz,

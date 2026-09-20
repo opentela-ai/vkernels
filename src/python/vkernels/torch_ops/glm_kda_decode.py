@@ -4,6 +4,14 @@ Normalizes raw q/k (L2 with eps, then q scaled by ``D**-0.5``) and advances
 the per-dimension-gated delta-rule state by one decode token, returning
 ``(output, next_state)`` without mutating any input.
 
+The kernel's *accumulation* is FP32 unconditionally (the delta rule's
+contract), but its ABI accepts the serving dtype directly: ``q/k/v/gate/beta``
+may be BF16/FP16 and are widened in-kernel — an exact conversion, so it is bit
+identical to the caller widening first, minus the cast launches and the fp32
+temporaries (5 cast kernels x one KDA layer per decode step). The output
+therefore comes back in the vector dtype (one round on store, exactly where
+the serving path used to round it back) while ``next_state`` stays FP32.
+
 Adopted from floe's ``engine/runner/kernels/glm5_kda_decode.py`` (vkernels
 owns the kernel; floe imports it back through a thin adapter — the #64/#65
 thin-adapter model extended to the whole GLM-5 Triton set).
@@ -11,6 +19,7 @@ thin-adapter model extended to the whole GLM-5 Triton set).
 Torch and Triton load lazily. Inference-only, no autograd backward.
 """
 
+from ._dispatch import OpNotEligible
 from functools import lru_cache
 
 
@@ -38,19 +47,19 @@ def _kernel():
         block = tl.program_id(1)
         rows = tl.arange(0, D)
         cols = block * BV + tl.arange(0, BV)
-        q = tl.load(Q + head * D + rows)
-        k = tl.load(K + head * D + rows)
+        q = tl.load(Q + head * D + rows).to(tl.float32)
+        k = tl.load(K + head * D + rows).to(tl.float32)
         # Reference divides by sqrt(sum(x*x) + eps), then scales q.
         q = tl.div_rn(q, tl.sqrt(tl.sum(q * q, 0) + EPS))
         k = tl.div_rn(k, tl.sqrt(tl.sum(k * k, 0) + EPS))
         q = q * (D**-0.5)
-        decay = tl.exp(tl.load(G + head * D + rows))
+        decay = tl.exp(tl.load(G + head * D + rows).to(tl.float32))
         state_offset = head * D * D + rows[:, None] * D + cols[None, :]
         state = tl.load(STATE + state_offset, cols[None, :] < D, 0)
         state = state * decay[:, None]
         memory = tl.sum(state * k[:, None], 0)
-        value = tl.load(V + head * D + cols, cols < D, 0)
-        delta = (value - memory) * tl.load(BETA + head)
+        value = tl.load(V + head * D + cols, cols < D, 0).to(tl.float32)
+        delta = (value - memory) * tl.load(BETA + head).to(tl.float32)
         state = state + k[:, None] * delta[None, :]
         output = tl.sum(state * q[:, None], 0)
         tl.store(NEXT + state_offset, state, cols[None, :] < D)
@@ -62,32 +71,39 @@ def _kernel():
 def kda_decode(query, key, value, gate, beta, initial_state):
     """Normalize raw q/k and return ``(output, next_state)`` without mutation.
 
-    Vectors must be contiguous FP32 GPU tensors [B,1,H,D], beta [B,1,H],
-    state [B,H,D,D]. Output has the vector shape. Inference only; no autograd.
+    Vectors are contiguous GPU tensors [B,1,H,D] (FP32/BF16/FP16, one dtype),
+    beta [B,1,H] in that dtype, state [B,H,D,D] FP32. The output has the vector
+    shape and dtype (the widened accumulation is rounded once on store);
+    ``next_state`` is FP32. Inference only; no autograd.
     The normalization epsilon is pinned to 1e-6 (kda_decode_reference's
     default); experiment via the reference's ``eps`` argument.
     """
     import torch
 
     if query.ndim != 4 or query.shape[1] != 1:
-        raise ValueError("expected vectors [B,1,H,D]")
+        raise OpNotEligible("expected vectors [B,1,H,D]")
     batch, _, heads, dim = query.shape
     if dim not in (32, 64, 128):
-        raise ValueError("supported head dimensions are 32, 64, 128")
+        raise OpNotEligible("supported head dimensions are 32, 64, 128")
     if any(x.shape != query.shape for x in (key, value, gate)):
-        raise ValueError("query/key/value/gate shapes must match")
+        raise OpNotEligible("query/key/value/gate shapes must match")
     if beta.shape != (batch, 1, heads) or initial_state.shape != (
         batch,
         heads,
         dim,
         dim,
     ):
-        raise ValueError("incorrect beta or state shape")
-    for x in (query, key, value, gate, beta, initial_state):
-        if x.dtype != torch.float32:
-            raise TypeError("all inputs must be FP32")
+        raise OpNotEligible("incorrect beta or state shape")
+    vectors = (query, key, value, gate, beta)
+    if any(x.dtype != query.dtype for x in vectors):
+        raise OpNotEligible("query/key/value/gate/beta must share one dtype")
+    if query.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise OpNotEligible("vectors must be FP32, BF16 or FP16")
+    if initial_state.dtype != torch.float32:
+        raise OpNotEligible("the recurrent state must be FP32")
+    for x in (*vectors, initial_state):
         if not x.is_cuda or x.device != query.device or not x.is_contiguous():
-            raise ValueError("inputs must be contiguous on the same GPU")
+            raise OpNotEligible("inputs must be contiguous on the same GPU")
     out = torch.empty_like(query)
     state = torch.empty_like(initial_state)
     if batch * heads:

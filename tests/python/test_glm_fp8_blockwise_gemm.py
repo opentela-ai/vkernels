@@ -123,7 +123,10 @@ def test_moe_grouped_gemm_matches_gather_reference():
     torch.testing.assert_close(out.float(), ref, rtol=5e-2, atol=5e-2)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.skipif(
+    torch.version.hip is None,
+    reason="fnuz fp8 operands need fp8e4b8 tensor cores (CDNA3); NVIDIA Triton has no fp8e4b8",
+)
 class TestGroupedNativeMultiTile:
     """Regression for #58: experts with count > BM (hot routing) span
     several row tiles. The tile map used to repeat the segment start/count
@@ -216,14 +219,13 @@ class TestGpuKernelParity:
     at the real GLM MoE shapes (E=288 collapsed to active experts, N=4096,
     K=4096 gate_up / N=4096 K=2048 down)."""
 
-    def test_native_cast_gemv_matches_reference(self):
+    def _native_cast_gemv_parity(self, e, o, i, t, kk):
         from vkernels.torch_ops.glm_expert_gemv import (
             expert_gemv,
             expert_gemv_reference,
         )
 
         gen = torch.Generator(device="cuda").manual_seed(11)
-        e, o, i, t, kk = 288, 4096, 4096, 8, 8
         w = (torch.randn(e, o, i, generator=gen, device="cuda") * 0.05).to(
             torch.float8_e4m3fn
         )
@@ -239,6 +241,46 @@ class TestGpuKernelParity:
             got.float() - ref.float()
         ).abs().max() / ref.float().abs().max().clamp_min(1e-6)
         assert rel < 0.02, f"native-cast GEMV parity rel={rel:.4f}"
+
+    def test_native_cast_gemv_matches_reference(self, monkeypatch):
+        """T=8 is the DFlash2 verify/replay block, which the wrapper only
+        admits when the env-widened cap matches (``_t_cap``) — without this
+        the test silently needs an undocumented environment variable.
+
+        Small shapes, so this parity check runs on every GPU: it still crosses
+        block-scale boundaries (2x2 scale blocks) and the fp8 -> bf16 dequant.
+        The plugin shapes are a separate, memory-gated acceptance case below.
+        """
+        t = 8
+        monkeypatch.setenv("GLM53_MOE_DECODE_MAX_TOKENS", str(t))
+        self._native_cast_gemv_parity(24, 256, 256, t, 4)
+
+    def test_native_cast_gemv_matches_reference_at_plugin_shapes(self, monkeypatch):
+        """The same parity at the real MoE shapes (E=288, N=K=4096).
+
+        This one needs a large-memory card to itself: the oracle builds fp32
+        [E, O, I] weights (~19 GiB here) before casting to fp8, and the native
+        kernel dequantizes the whole stack through fp32 temporaries of its own.
+        Measured failure modes: at 3x the guard the op itself OOMed after the
+        guard passed (clariden gate 3455389 — the op's temporaries, not the
+        oracle, were the peak), and 19.3 GiB requests against 4.5 GiB free came
+        from co-tenant jobs on the same node. Require 4x the fp32 stack, so the
+        test skips rather than OOMs on a shared card.
+        """
+        e, o, i, t, kk = 288, 4096, 4096, 8, 8
+        monkeypatch.setenv("GLM53_MOE_DECODE_MAX_TOKENS", str(t))
+        fp32_bytes = e * o * i * 4
+        torch.cuda.empty_cache()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        need_bytes = 4 * fp32_bytes + 8 * 2**30
+        if free_bytes < need_bytes:
+            pytest.skip(
+                f"needs ~{need_bytes / 2**30:.0f} GiB free for the fp32 oracle "
+                f"weights + the kernel's own fp32 temporaries + workspace, "
+                f"have {free_bytes / 2**30:.1f} GiB of "
+                f"{total_bytes / 2**30:.1f} GiB"
+            )
+        self._native_cast_gemv_parity(e, o, i, t, kk)
 
     def test_blockwise_gemm_kernel_if_present(self):
         from vkernels.torch_ops import glm_fp8_blockwise_gemm as mod
@@ -265,3 +307,337 @@ class TestGpuKernelParity:
             out.float() - ref.float()
         ).abs().max() / ref.float().abs().max().clamp_min(1e-6)
         assert rel < 0.02, f"blockwise GEMM kernel parity rel={rel:.4f}"
+
+
+def _oracle_e4m3nv(quantize, x, gu, gus, dn, dns, idx, w, swiglu_limit=7.0):
+    """Per-expert fp32 matmuls on the SAME fp8 operands the kernel reads.
+
+    Isolates the grouped tile map from fp8 noise: the only differences left
+    between kernel and oracle are tile-map bugs and the kernel's own rounding
+    points (bf16 gu before the swiglu, bf16 down output), which are mirrored
+    here exactly as the runner's swiglu has them.
+    """
+    import torch.nn.functional as F
+
+    t, k_route = idx.shape
+    h, i = x.shape[1], gu.shape[1] // 2
+
+    def deq_a(p, s):
+        g = s.shape[-1]
+        return (p.float().view(-1, g, 128) * s.float()[:, :, None]).view(-1, g * 128)
+
+    def deq_w(p, s):
+        g0, g1 = s.shape
+        return (
+            p.float().view(g0, 128, g1, 128) * s.float()[:, None, :, None]
+        ).view(g0 * 128, g1 * 128)
+
+    slots = idx.reshape(-1)
+    toks = torch.arange(t, device=x.device).repeat_interleave(k_route)
+    order = torch.argsort(slots, stable=True)
+    sorted_tok, sorted_exp = toks[order], slots[order]
+    flat_w = w.reshape(-1)[order]
+
+    a_n, asc = quantize(x)
+    gu_v = torch.empty(slots.numel(), 2 * i, device=x.device, dtype=torch.float32)
+    for exp in sorted_exp.unique().tolist():
+        m = sorted_exp == exp
+        gu_v[m] = deq_a(a_n[sorted_tok[m]], asc[sorted_tok[m]]) @ deq_w(gu[exp], gus[exp]).t()
+    gu_v = gu_v.to(torch.bfloat16).float()
+    gate = gu_v[:, :i].clamp(max=swiglu_limit)
+    up = gu_v[:, i:].clamp(min=-swiglu_limit, max=swiglu_limit)
+    act = (F.silu(gate) * up).to(torch.bfloat16)
+    a2_n, a2sc = quantize(act)
+    ref = torch.zeros(t, h, device=x.device, dtype=torch.float32)
+    for exp in sorted_exp.unique().tolist():
+        m = sorted_exp == exp
+        dn_out = (deq_a(a2_n[m], a2sc[m]) @ deq_w(dn[exp], dns[exp]).t()).to(torch.bfloat16).float()
+        ref.index_add_(0, sorted_tok[m], dn_out * flat_w[m].unsqueeze(-1))
+    return ref
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+class TestGroupedNativeE4M3NV:
+    """The NVIDIA flavour of the grouped native-fp8 MoE.
+
+    CDNA3 has no e4m3fn matrix unit, so the ROCm path rewrites every expert
+    stack to ``e4m3fnuz`` (halved payloads, doubled scales). NVIDIA tensor
+    cores *are* e4m3fn, so the checkpoint's bytes and scales are used as they
+    are. The kernel is flavour-agnostic; what must not be mixed is the payload
+    bytes with the wrong scale convention, and the e4m3fn path has to reach the
+    same per-expert result as an oracle run on the *same* operands.
+    """
+
+    def _inputs(self, t, e, k_route, h, i, seed=7):
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        x = torch.randn(t, h, generator=gen, device="cuda", dtype=torch.bfloat16)
+        gu = (
+            (torch.randn(e, 2 * i, h, generator=gen, device="cuda") * 0.05)
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
+        gus = (
+            torch.rand(e, 2 * i // 128, h // 128, generator=gen, device="cuda") + 0.5
+        ).contiguous()
+        dn = (
+            (torch.randn(e, h, i, generator=gen, device="cuda") * 0.05)
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
+        dns = (
+            torch.rand(e, h // 128, i // 128, generator=gen, device="cuda") + 0.5
+        ).contiguous()
+        idx = torch.randint(0, e, (t, k_route), generator=gen, device="cuda", dtype=torch.int64)
+        w = torch.softmax(torch.randn(t, k_route, generator=gen, device="cuda"), -1)
+        return x, gu, gus, dn, dns, idx, w
+
+    def test_e4m3fn_weights_match_per_expert_oracle(self):
+        from vkernels.torch_ops.glm_fp8_blockwise_gemm import (
+            glm_moe_grouped_gemm_native,
+            quantize_activations_native as q,
+        )
+
+        x, gu, gus, dn, dns, idx, w = self._inputs(256, 8, 4, 256, 256)
+        # No e4m3fn_to_fnuz call: the checkpoint storage goes straight in.
+        out = glm_moe_grouped_gemm_native(x, gu, gus, dn, dns, idx, w)
+        ref = _oracle_e4m3nv(q, x, gu, gus, dn, dns, idx, w)
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+
+    def test_hot_experts_span_row_tiles(self):
+        """Regression for #58, in the flavour NVIDIA actually runs.
+
+        Experts with count > BM occupy several row tiles; the tile map used to
+        repeat the segment start across an expert's tiles, leaving rows beyond
+        the first BM unwritten (torch.empty garbage -> NaNs under a dirty
+        allocator). The fnuz test covers this only on ROCm.
+        """
+        from vkernels.torch_ops.glm_fp8_blockwise_gemm import (
+            glm_moe_grouped_gemm_native,
+            quantize_activations_native as q,
+        )
+
+        t, e, k_route = 256, 64, 8  # 2048 slots / 64 experts, BM=64
+        x, gu, gus, dn, dns, idx, w = self._inputs(t, e, k_route, 256, 256)
+        idx = idx.clone()
+        idx[:, :3], idx[:, 3:5] = 0, 1  # experts 0/1 take ~4x the average
+        out = glm_moe_grouped_gemm_native(x, gu, gus, dn, dns, idx, w)
+        assert torch.isfinite(out).all(), "multi-tile experts left rows unwritten"
+        ref = _oracle_e4m3nv(q, x, gu, gus, dn, dns, idx, w)
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+
+    def test_flavour_selector_keeps_bytes_and_scales_consistent(self):
+        from vkernels.torch_ops.glm_fp8_blockwise_gemm import (
+            _activation_quantizer,
+            quantize_activations_fnuz,
+            quantize_activations_native,
+        )
+
+        assert _activation_quantizer(torch.float8_e4m3fn) is quantize_activations_native
+        assert _activation_quantizer(torch.float8_e4m3fnuz) is quantize_activations_fnuz
+        with pytest.raises(TypeError, match="e4m3fn or e4m3fnuz"):
+            _activation_quantizer(torch.bfloat16)
+
+    def test_e4m3nv_is_at_least_as_accurate_as_fnuz(self):
+        """e4m3fn reaches 448, e4m3fnuz only 240 at the same bit width.
+
+        Not a correctness requirement, but it is why the CUDA path cannot be
+        *worse* than the fnuz one on activations beyond fnuz's amax: the
+        halve/double trick is exact only inside fnuz's representable range.
+        """
+        from vkernels.torch_ops.glm_fp8_blockwise_gemm import (
+            quantize_activations_fnuz,
+            quantize_activations_native,
+        )
+
+        gen = torch.Generator(device="cuda").manual_seed(3)
+        x = torch.cat(
+            [
+                torch.randn(4, 128, generator=gen, device="cuda", dtype=torch.bfloat16),
+                torch.full((4, 128), 13.0, device="cuda", dtype=torch.bfloat16),
+            ],
+            dim=0,
+        )
+        n_q, n_s = quantize_activations_native(x)
+        f_q, f_s = quantize_activations_fnuz(x)
+
+        def err(qq, ss):
+            g = ss.shape[-1]
+            deq = (qq.float().view(-1, g, 128) * ss.float()[:, :, None]).view(-1, g * 128)
+            return (deq.float() - x.float()).abs().max().item()
+
+        assert n_q.dtype == torch.float8_e4m3fn and f_q.dtype == torch.float8_e4m3fnuz
+        assert err(n_q, n_s) <= err(f_q, f_s) + 1e-3, (err(n_q, n_s), err(f_q, f_s))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+class TestGroupedNativeStaticTileMap:
+    """⑨b: the grouped dispatch must launch from a *static* grid.
+
+    Verifying the sync removal needs evidence that any host read would break,
+    not just that timings improved, so the primary test is a CUDA graph
+    capture: capture fails loudly the moment the dispatch synchronises or
+    allocates shape-dependent grids from device values. The same operands are
+    then replayed against eager output, including a mutation of the input to
+    prove the captured graph reads live data.
+    """
+
+    @staticmethod
+    def _flavour():
+        """(to_native, quantize) for the fp8 type this device's tensor cores take.
+
+        CDNA3 has no e4m3fn matrix unit, so ROCm rewrites the expert stack to
+        e4m3fnuz (halved payloads, doubled scales) and uses the matching
+        activation quantizer; NVIDIA uses the checkpoint bytes as they are. The
+        dispatch under test here is flavour-independent.
+        """
+        from vkernels.torch_ops.glm_fp8_blockwise_gemm import (
+            e4m3fn_to_fnuz,
+            quantize_activations_fnuz,
+            quantize_activations_native,
+        )
+
+        if torch.version.hip is not None:
+            return e4m3fn_to_fnuz, quantize_activations_fnuz
+        return lambda p, s: (p, s), quantize_activations_native
+
+    def _operands(self, t, e, k_route, h, i, idx_mode="uniform", seed=7, idx_hi=None):
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        x = torch.randn(t, h, generator=gen, device="cuda", dtype=torch.bfloat16)
+        gu = (
+            (torch.randn(e, 2 * i, h, generator=gen, device="cuda") * 0.05)
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
+        gus = (
+            torch.rand(e, 2 * i // 128, h // 128, generator=gen, device="cuda") + 0.5
+        ).contiguous()
+        dn = (
+            (torch.randn(e, h, i, generator=gen, device="cuda") * 0.05)
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
+        dns = (torch.rand(e, h // 128, i // 128, generator=gen, device="cuda") + 0.5).contiguous()
+        if idx_mode == "uniform":
+            idx = torch.randint(
+                0, idx_hi or e, (t, k_route), generator=gen, device="cuda", dtype=torch.int64
+            )
+        else:  # "skewed": hot experts span row tiles at BM=64
+            idx = torch.randint(2, e, (t, k_route), generator=gen, device="cuda", dtype=torch.int64)
+            idx[:, :3] = 0
+            idx[:, 3:5] = 1
+        w = torch.softmax(torch.randn(t, k_route, generator=gen, device="cuda"), -1)
+        to_native, quantize = self._flavour()
+        gu_n, gu_s = to_native(gu, gus)
+        dn_n, dn_s = to_native(dn, dns)
+        return x, gu_n, gu_s, dn_n, dn_s, idx, w, quantize
+
+    def test_dispatch_is_cuda_graph_capturable(self):
+        """A single host read left in the dispatch makes this fail."""
+        from vkernels.torch_ops.glm_fp8_blockwise_gemm import glm_moe_grouped_gemm_native
+
+        args = self._operands(256, 32, 4, 256, 256, idx_mode="skewed")[:7]
+        x = args[0]
+
+        eager = glm_moe_grouped_gemm_native(*args)
+
+        # Warm up on a side stream: Triton's first-call JIT compile may not
+        # happen inside a capture, and the allocator needs its pool warm.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                glm_moe_grouped_gemm_native(*args)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = glm_moe_grouped_gemm_native(*args)
+        graph.replay()
+
+        # Capture must not change the dispatch's semantics. Not bitwise: two
+        # same-input runs of this kernel land ~1 ulp apart where accumulated
+        # terms cancel (observed on MI300A: 2.4e-7 absolute at one element of
+        # 65k), so the check uses the same tolerance class as the golden test
+        # above -- a wrong tile map shows up at ~1e-2, not at 1 ulp.
+        torch.testing.assert_close(captured.float(), eager.float(), rtol=2e-2, atol=2e-2)
+
+        # Replay must consume *live* inputs, not the values frozen at capture.
+        # Halving x moves the output far more than the re-association noise, so
+        # a replay that reuses captured operands would be caught here.
+        x.mul_(0.5)
+        mutated = glm_moe_grouped_gemm_native(*args)
+        graph.replay()
+        torch.testing.assert_close(captured.float(), mutated.float(), rtol=2e-2, atol=2e-2)
+        drift = (captured.float() - eager.float()).abs().max().item()
+        assert drift > 1e-2, f"replay looks frozen at capture-time inputs (max|delta|={drift})"
+
+    def test_zero_count_experts_and_padding_tiles_are_inert(self):
+        """E far above the routing breadth => many empty experts + padding tiles.
+
+        With E=288 (the real GLM expert count) and short routing, most experts
+        have count 0 and the static capacity ``slots // BM + E + 1`` is well
+        above the real tile count. Empty experts must contribute nothing and
+        the padding tiles (``m = 0``) must neither write rows nor poison the
+        sums with uninitialised memory.
+        """
+        from vkernels.torch_ops.glm_fp8_blockwise_gemm import glm_moe_grouped_gemm_native
+
+        x, gu, gus, dn, dns, idx, w, quantize = self._operands(
+            64, 288, 2, 256, 256, idx_mode="uniform", idx_hi=8
+        )
+        assert int(idx.unique().numel()) <= 8  # 280 of 288 experts stay idle
+        n_tiles = int(((torch.bincount(idx.reshape(-1), minlength=288) + 63) // 64).sum())
+        cap = min(64 * 2, 64 * 2 // 64 + 288 + 1)  # same bound the dispatch uses
+        assert cap - n_tiles > 64, (cap, n_tiles)  # lots of padding exercised
+        out = glm_moe_grouped_gemm_native(x, gu, gus, dn, dns, idx, w)
+        ref = _oracle_e4m3nv(quantize, x, gu, gus, dn, dns, idx, w)
+        assert torch.isfinite(out.float()).all()
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+
+    def test_static_tile_map_matches_the_device_built_one(self):
+        """The rewrite must be an optimisation, not a semantic change.
+
+        The old tile map (unique_consecutive + int(toff[-1])) was correct but
+        syncing; rebuilding both and comparing field by field pins the new
+        one to it without needing a second GPU implementation.
+        """
+        import torch as _t
+
+        from vkernels.torch_ops.glm_fp8_blockwise_gemm import (
+            _tile_map_static,
+            glm_moe_grouped_gemm_native,  # noqa: F401  (import check)
+        )
+
+        t, e, k_route, bm = 256, 64, 8, 64
+        gen = _t.Generator(device="cuda").manual_seed(11)
+        idx = _t.randint(0, e, (t, k_route), generator=gen, device="cuda", dtype=_t.int64)
+        idx[:, :3] = 0
+        idx[:, 3:5] = 1
+
+        counts = _t.bincount(idx.reshape(-1), minlength=e)
+        seg = _t.cumsum(counts, 0) - counts
+        tiles = (counts + bm - 1) // bm
+        ends = _t.cumsum(tiles, 0)
+        toff = ends - tiles
+        n_tiles = int(ends[-1])
+
+        # Old construction, exactly as the pre-⑨b code did it.
+        local_old = _t.arange(n_tiles, device="cuda", dtype=_t.int64) - _t.repeat_interleave(
+            toff, tiles, output_size=n_tiles
+        )
+        exp_old = _t.repeat_interleave(_t.arange(e, device="cuda"), tiles, output_size=n_tiles)
+        r0_old = _t.repeat_interleave(seg, tiles, output_size=n_tiles) + local_old * bm
+        m_old = _t.clamp(
+            _t.repeat_interleave(counts, tiles, output_size=n_tiles) - local_old * bm, max=bm
+        )
+
+        cap = min(t * k_route, t * k_route // bm + e + 1)
+        exp_new, r0_new, m_new = _tile_map_static(counts, seg, bm, "cuda", cap)
+        assert cap >= n_tiles, (cap, n_tiles)
+        keep = m_new > 0
+        assert bool(keep.sum() == n_tiles)
+        assert _t.equal(exp_new[keep], exp_old)
+        assert _t.equal(r0_new[keep], r0_old)
+        assert _t.equal(m_new[keep], m_old)
+        assert bool((m_new[~keep] == 0).all()) and bool((r0_new[~keep] == 0).all())

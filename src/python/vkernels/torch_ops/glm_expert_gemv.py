@@ -17,6 +17,7 @@ autograd backward. Graph capture: warm up eagerly per shape first (the
 autotune-free kernel still compiles on first launch).
 """
 
+from ._dispatch import OpNotEligible
 import os
 from functools import lru_cache
 
@@ -177,34 +178,34 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn"):
     import torch
 
     if storage not in ("e4m3fn", "e4m3fnuz"):
-        raise ValueError(f"unknown weight storage {storage!r}")
+        raise OpNotEligible(f"unknown weight storage {storage!r}")
     fnuz = storage == "e4m3fnuz"
     want = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
     cap = _t_cap()
     if weights.ndim != 3 or indices.ndim != 2:
-        raise ValueError("expected weights [E,O,I] and indices [T,K]")
+        raise OpNotEligible("expected weights [E,O,I] and indices [T,K]")
     e, o, i = weights.shape
     t, k = indices.shape
     if not e or not o or not i or o % 128 or i % 128 or t > cap:
-        raise ValueError(f"requires positive block-128 dimensions and T<={cap}")
+        raise OpNotEligible(f"requires positive block-128 dimensions and T<={cap}")
     if x.shape not in ((t, i), (t, k, i)):
-        raise ValueError("expected x[T,I] or x[T,K,I]")
+        raise OpNotEligible("expected x[T,I] or x[T,K,I]")
     if scales.shape != (e, o // 128, i // 128):
-        raise ValueError("expected scales [E,O/128,I/128]")
+        raise OpNotEligible("expected scales [E,O/128,I/128]")
     if (
         x.dtype != torch.bfloat16
         or weights.dtype != want
         or scales.dtype != torch.float32
         or indices.dtype != torch.int64
     ):
-        raise TypeError(
+        raise OpNotEligible(
             "requires BF16 activations, "
             f"{'E4M3FNUZ' if fnuz else 'E4M3FN'} weights, FP32 scales, int64 indices"
         )
     if any(not v.is_cuda or v.device != weights.device for v in (x, scales, indices)):
-        raise ValueError("inputs must share a GPU device")
+        raise OpNotEligible("inputs must share a GPU device")
     if any(not v.is_contiguous() for v in (x, weights, scales, indices)):
-        raise ValueError("inputs must be contiguous")
+        raise OpNotEligible("inputs must be contiguous")
     out = torch.empty((t, k, o), device=x.device, dtype=torch.bfloat16)
     if t and k:
         import triton  # lazy: validation above needs only torch
@@ -277,7 +278,7 @@ def expert_gemv_reference(x, weights, scales, indices):
     e, o, i = weights.shape
     t, k = indices.shape
     if t > cap:
-        raise ValueError(f"T={t} exceeds the cap {cap}")
+        raise OpNotEligible(f"T={t} exceeds the cap {cap}")
     raw = weights.view(torch.uint8).to(torch.int32)
     exponent, mantissa = (raw >> 3) & 15, raw & 7
     bits = (((exponent + 120) << 23) | (mantissa << 20)).to(torch.int32)

@@ -11,6 +11,7 @@ thin-adapter model extended to the whole GLM-5 Triton set).
 Torch and Triton load lazily. Inference-only, no autograd backward.
 """
 
+from ._dispatch import OpNotEligible
 from functools import lru_cache
 
 
@@ -86,28 +87,28 @@ def gather_dequant(weights, scales, indices, dtype=None, storage="e4m3fn"):
     if dtype is None:
         dtype = torch.bfloat16
     if weights.ndim != 3 or indices.ndim != 2:
-        raise ValueError("expected weights [E,O,I] and indices [T,K]")
+        raise OpNotEligible("expected weights [E,O,I] and indices [T,K]")
     e, o, i = weights.shape
     if not e or not o or not i or o % 128 or i % 128:
-        raise ValueError("expert dimensions must be positive multiples of 128")
+        raise OpNotEligible("expert dimensions must be positive multiples of 128")
     if scales.shape != (e, o // 128, i // 128):
-        raise ValueError("expected scales [E,O/128,I/128]")
+        raise OpNotEligible("expected scales [E,O/128,I/128]")
     if storage not in ("e4m3fn", "e4m3fnuz"):
-        raise ValueError(f"unknown weight storage {storage!r}")
+        raise OpNotEligible(f"unknown weight storage {storage!r}")
     fnuz = storage == "e4m3fnuz"
     want = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
     if weights.dtype != want or scales.dtype != torch.float32:
-        raise TypeError(
+        raise OpNotEligible(
             f"expected {'E4M3FNUZ' if fnuz else 'E4M3FN'} weights and FP32 scales"
         )
     if indices.dtype != torch.int64 or dtype not in (torch.bfloat16, torch.float16):
-        raise TypeError("expected int64 indices and BF16 or FP16 output")
+        raise OpNotEligible("expected int64 indices and BF16 or FP16 output")
     if any(
         not x.is_cuda or x.device != weights.device for x in (weights, scales, indices)
     ):
-        raise ValueError("inputs must share a GPU device")
+        raise OpNotEligible("inputs must share a GPU device")
     if any(not x.is_contiguous() for x in (weights, scales, indices)):
-        raise ValueError("inputs must be contiguous")
+        raise OpNotEligible("inputs must be contiguous")
     out = torch.empty((*indices.shape, o, i), device=weights.device, dtype=dtype)
     if indices.numel():
         import triton  # lazy: validation above needs only torch
@@ -137,7 +138,7 @@ def gather_dequant_reference(weights, scales, indices, dtype=None, storage="e4m3
     import torch
 
     if storage not in ("e4m3fn", "e4m3fnuz"):
-        raise ValueError(f"unknown weight storage {storage!r}")
+        raise OpNotEligible(f"unknown weight storage {storage!r}")
     fnuz = storage == "e4m3fnuz"
     if dtype is None:
         dtype = torch.bfloat16
