@@ -1,0 +1,1 @@
+Can we look at the issues https://github.com/opentela-ai/vkernels/issues and close those done?
