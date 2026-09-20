@@ -121,14 +121,17 @@ def sm_version() -> Optional[int]:
     """
     try:
         import torch
-    except Exception:
+    except ImportError:
+        # No torch at all -> no device to query; the cutedsl path is simply
+        # unavailable (same as the CPU-test case below).
         return None
     if not torch.cuda.is_available():
         return None
-    try:
-        return int(torch.cuda.get_device_capability(0)[0])
-    except Exception:
-        return None
+    # Only reached when torch reports CUDA available: if the capability
+    # query now raises, the CUDA runtime is genuinely broken and the eager
+    # fallback would hit the same failure at its first device op — surface
+    # the real error instead of masking it as "unavailable".
+    return int(torch.cuda.get_device_capability(0)[0])
 
 
 def cutedsl_available() -> bool:
@@ -143,6 +146,12 @@ def cutedsl_available() -> bool:
         import cutlass.cute as cute  # noqa: F401  (import-time JIT plumbing)
         from cutlass.cute.runtime import from_dlpack  # noqa: F401
     except Exception:
+        # Deliberately broad: the DSL's import-time JIT plumbing (CUTLASS
+        # 4.5.2) is known to raise non-ImportError types on mismatched
+        # environments, and this is the module's "is the runtime usable"
+        # gate — any import failure here means the same failure at first
+        # kernel use, so classify it as unavailable rather than crashing
+        # the caller's dispatch path.
         return False
     # cute.gemm is the load-bearing primitive every rung builds on; make sure
     # the installed DSL actually exposes it before promising anything.
