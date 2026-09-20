@@ -1,0 +1,1 @@
+Can we make a reference markdown file of all available kernels, achieved performance, tested hardware, gap to speed of light. Make it a comprehensive table.
