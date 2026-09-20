@@ -1,0 +1,1 @@
+For each kernel in the current codebase, can you spin up a subagent to investigate the bottleneck, and file issues if you have some ideas on how to optimize
