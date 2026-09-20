@@ -115,9 +115,6 @@ class RecordingBackend:
 
     def __init__(self, graph: Optional[OperatorGraph] = None):
         self.graph = graph if graph is not None else OperatorGraph()
-        # Live-version tracking per storage, so cache appends produce
-        # ordered read/write versions (§4.3).
-        self._storage_views: dict[int, str] = {}
         self._op_counter = 0
         # Dedupe registry: registering the same external tensor twice returns
         # the same symbolic handle (model bodies re-request parameters).

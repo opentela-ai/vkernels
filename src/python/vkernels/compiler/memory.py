@@ -75,15 +75,6 @@ class WorkspacePlan:
         """Sum without reuse — shows what lifetime planning saves (§9.2)."""
         return sum(b.numel for b in self.buffers) * self.element_size
 
-    def buffer_for_storage(self, storage_id: int) -> BufferPlan | None:
-        for b in self.buffers:
-            if b.storage_id == storage_id:
-                return b
-        return None
-
-    def live_in_phase(self, phase: int) -> list[BufferPlan]:
-        return [b for b in self.buffers if b.first_phase <= phase <= b.last_phase]
-
 
 @dataclass
 class ScratchPlan:

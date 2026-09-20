@@ -278,19 +278,6 @@ class TensorValue:
             offset=self.offset,
         )
 
-    def element_slice(self, name: str, axis: int, valid: ValidLength) -> "TensorValue":
-        """A view of the valid prefix along ``axis`` (used for cache reads)."""
-        return TensorValue(
-            vid=None,
-            name=name,
-            shape=self.shape,
-            dtype=self.dtype,
-            strides=self.strides,
-            storage_id=self.storage_id,
-            offset=self.offset,
-            valid_length=(valid if axis == len(self.shape) - 2 else None),
-        )
-
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return f"TensorValue({self.name}, shape={self.shape}, strides={self.strides}, storage=s{self.storage_id}, offset={self.offset}, vid={self.vid})"
 
@@ -762,15 +749,8 @@ class OperatorGraph:
 
     # -- queries ------------------------------------------------------------
 
-    def arithmetic_ops(self) -> list[Operator]:
-        """Ops that become phases (views and no-ops excluded)."""
-        return list(self.ops)
-
     def tensor(self, name: str) -> TensorValue:
         return self.tensors[name]
-
-    def op_phase_count(self) -> int:
-        return len(self.ops)
 
     def summary(self) -> str:
         lines = [f"OperatorGraph: {len(self.ops)} operators, {len(self.tensors)} tensors"]

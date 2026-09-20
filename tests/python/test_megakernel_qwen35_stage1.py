@@ -454,5 +454,12 @@ def test_floe_eager_oracle_gated():
     venv (the #99 worker's conftest repo-src pin pattern), compare the
     mirror's GDN/FA layer numerics against floe's eager modules."""
     pytest.importorskip("torch")
-    floe = pytest.importorskip("floe")
-    assert hasattr(floe, "qwen35_gdn"), "floe layout changed; re-point the oracle"
+    pytest.importorskip("floe")
+    # floe's qwen35 runner split moved the eager GDN/FA modules out of the
+    # top-level ``floe.qwen35_gdn`` shim into the runner's model package
+    # (engine/runner/models/qwen35/{gdn,forward}.py).
+    gdn = pytest.importorskip("floe.engine.runner.models.qwen35.gdn")
+    forward = pytest.importorskip("floe.engine.runner.models.qwen35.forward")
+    assert hasattr(gdn, "GatedDeltaNet") and hasattr(forward, "FullAttention"), (
+        "floe layout changed; re-point the oracle"
+    )

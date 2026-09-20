@@ -20,7 +20,6 @@ encounters the same sequence of grid barriers.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterator
 
 from .task_ir import TaskFamily
 
@@ -109,12 +108,6 @@ class PhaseSchedule:
     @property
     def total_tasks(self) -> int:
         return sum(p.task_count for p in self.phases)
-
-    def iter_tasks(self) -> Iterator[tuple[PhasePlan, TaskFamily, int]]:
-        for phase in self.phases:
-            for fam in phase.families:
-                for tid in range(fam.task_count):
-                    yield phase, fam, tid
 
     # -- §12 invariants -------------------------------------------------------
 
