@@ -34,9 +34,13 @@ Contracts (shapes follow ``aiter.ops.mhc`` and floe's ``Glm53`` modules):
   :func:`glm_fp8_blockwise_gemm.e4m3fn_to_fnuz`; aiter's ``dtypes.fp8`` is
   fnuz on gfx942, the checkpoint flavour is e4m3fn).
 
-Every wrapper returns None when aiter is unavailable or an input falls
-outside the contract — callers keep their existing path. Importing this
-module stays dependency-free (aiter resolves lazily, probes are cached).
+Every wrapper follows the torch_ops calling convention (``docs/torch-ops.md``
+§1 / ``_dispatch.py``): an eligibility miss — aiter unavailable, non-CUDA
+tensor, wrong dtype/shape/contiguity — raises ``OpNotEligible`` and callers
+catch it and keep their eager path; genuine aiter kernel failures are NOT
+swallowed and propagate. ``aiter_available()`` / ``available()`` / ``report()``
+stay non-raising availability probes. Importing this module stays
+dependency-free (aiter resolves lazily, probes are cached).
 """
 
 from __future__ import annotations
@@ -46,13 +50,14 @@ from typing import Callable, Optional
 
 import torch
 
+from ._dispatch import OpNotEligible
+
 __all__ = [
     "available",
     "report",
     "aiter_mhc_pre",
     "aiter_mhc_post",
     "aiter_available",
-    "per_token_quant_fp8",
     "moe_align_block_size",
     "ck_moe_stage1",
     "ck_moe_stage2",
@@ -76,7 +81,7 @@ def aiter_available() -> bool:
 
     The public availability probe for the ``aiter_*`` ops: ROCm-only, so
     callers use it to skip expensive pre-work (weight conversions, caches)
-    before discovering the op itself would decline with ``None``.
+    before discovering the op itself would decline with ``OpNotEligible``.
     """
     return _aiter() is not None
 
@@ -87,7 +92,7 @@ def _gfx() -> Optional[str]:
     if a is None:
         return None
     try:
-        return aiter.get_gfx()
+        return a.get_gfx()
     except Exception:  # noqa: BLE001
         return None
 
@@ -148,7 +153,9 @@ def aiter_mhc_pre(
     [B*S, hc, D]); ``fn`` [2*hc + hc*hc, hc*D] fp32 contiguous (pre rows,
     post rows, comb mixer rows — the ``[hc | hc | hc*hc]`` split order).
     Returns ``(post_mix [n, hc, 1] fp32, comb_mix [n, hc, hc] fp32,
-    layer_input [n, D] bf16)`` or None outside the contract.
+    layer_input [n, D] bf16)``. Raises ``OpNotEligible`` outside the
+    contract (aiter unavailable, CPU tensor, wrong dtype/shape/contiguity);
+    genuine aiter kernel failures propagate.
 
     ``hc_post_mult_value`` is floe's post gate multiplier (``2 * sigmoid``),
     ``sinkhorn_repeat`` floe's ``hc_sinkhorn_iters``. With ``norm_weight``
@@ -157,25 +164,39 @@ def aiter_mhc_pre(
     (input-RMS-rescaled) stream collapse; floe applies its learned norm at
     the consumer when one exists.
     """
-    a = _aiter()
-    if a is None or not residual.is_cuda or residual.dtype is not torch.bfloat16:
-        return None
-    if residual.dim() != 3 or not residual.is_contiguous() or not fn.is_contiguous():
-        return None
+    if residual.dtype is not torch.bfloat16:
+        raise OpNotEligible(
+            f"aiter_mhc_pre: residual must be bf16, got {residual.dtype}")
+    if residual.dim() != 3:
+        raise OpNotEligible(
+            "aiter_mhc_pre: residual must be [n, hc, D], got shape "
+            f"{tuple(residual.shape)}")
+    if not residual.is_contiguous() or not fn.is_contiguous():
+        raise OpNotEligible(
+            "aiter_mhc_pre: residual and fn must be contiguous")
     n, hc, d = residual.shape
     if fn.dim() != 2 or fn.shape[0] != 2 * hc + hc * hc or fn.shape[1] != hc * d:
-        return None
+        raise OpNotEligible(
+            f"aiter_mhc_pre: fn must be [2*hc + hc*hc, hc*D] = "
+            f"[{2 * hc + hc * hc}, {hc * d}] for residual {tuple(residual.shape)}, "
+            f"got shape {tuple(fn.shape)}")
     if fn.dtype is not torch.float32:
-        return None
-    try:
-        mhc = a.ops.mhc
-        return mhc.mhc_pre(
-            residual, fn, hc_scale, hc_base,
-            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-            sinkhorn_repeat, norm_weight, norm_eps,
-        )
-    except Exception:  # noqa: BLE001 - kernel contract violations fall through
-        return None
+        raise OpNotEligible(f"aiter_mhc_pre: fn must be fp32, got {fn.dtype}")
+    a = _aiter()
+    if a is None:
+        raise OpNotEligible(
+            "aiter_mhc_pre: aiter is not importable on this host "
+            "(ROCm-only gfx942 bridge); not eligible")
+    if not residual.is_cuda:
+        raise OpNotEligible(
+            "aiter_mhc_pre: residual must be a CUDA tensor, got device "
+            f"{residual.device}")
+    mhc = a.ops.mhc
+    return mhc.mhc_pre(
+        residual, fn, hc_scale, hc_base,
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
+        sinkhorn_repeat, norm_weight, norm_eps,
+    )
 
 
 def aiter_mhc_post(
@@ -191,32 +212,56 @@ def aiter_mhc_post(
     ``post_layer_mix`` [n, hc(, 1)] fp32, ``comb_res_mix`` [n, hc, hc] fp32.
     Returns the composed streams ``out`` [n, hc, D] bf16 (allocated when not
     given — the FULL stream tensor, matching vLLM's ``mhc_post`` wrapper:
-    ``empty_like(residual_flat)`` — not just the sublayer shape) or None
-    outside the contract. Same algebra as vkernels' HIP ``mhc_post``.
+    ``empty_like(residual_flat)`` — not just the sublayer shape). Raises
+    ``OpNotEligible`` outside the contract (aiter unavailable, CPU tensor,
+    wrong dtype/shape/contiguity); genuine aiter kernel failures propagate.
+    Same algebra as vkernels' HIP ``mhc_post``.
     """
-    a = _aiter()
-    if a is None or not residual.is_cuda or residual.dtype is not torch.bfloat16:
-        return None
-    if x.dtype is not torch.bfloat16 or not x.is_contiguous() or not residual.is_contiguous():
-        return None
-    if residual.dim() != 3 or x.shape[0] != residual.shape[0]:
-        return None
+    if residual.dtype is not torch.bfloat16:
+        raise OpNotEligible(
+            f"aiter_mhc_post: residual must be bf16, got {residual.dtype}")
+    if x.dtype is not torch.bfloat16:
+        raise OpNotEligible(f"aiter_mhc_post: x must be bf16, got {x.dtype}")
+    if not x.is_contiguous() or not residual.is_contiguous():
+        raise OpNotEligible("aiter_mhc_post: x and residual must be contiguous")
+    if residual.dim() != 3:
+        raise OpNotEligible(
+            "aiter_mhc_post: residual must be [n, hc, D], got shape "
+            f"{tuple(residual.shape)}")
+    if x.shape[0] != residual.shape[0]:
+        raise OpNotEligible(
+            f"aiter_mhc_post: x has {x.shape[0]} rows but residual has "
+            f"{residual.shape[0]}")
     n, hc, d = residual.shape
     if d % 256:
-        return None  # aiter asserts hidden_size % 256 == 0
+        raise OpNotEligible(
+            f"aiter_mhc_post: aiter asserts hidden_size % 256 == 0, got D={d}")
     if post_layer_mix.dtype is not torch.float32 or comb_res_mix.dtype is not torch.float32:
-        return None
+        raise OpNotEligible(
+            "aiter_mhc_post: post_layer_mix and comb_res_mix must be fp32, "
+            f"got {post_layer_mix.dtype} / {comb_res_mix.dtype}")
     post = post_layer_mix.reshape(n, hc, 1) if post_layer_mix.dim() == 2 else post_layer_mix
     if tuple(post.shape) != (n, hc, 1) or tuple(comb_res_mix.shape) != (n, hc, hc):
-        return None
+        raise OpNotEligible(
+            f"aiter_mhc_post: mixes must be [n, hc(, 1)]=[{n}, {hc}(, 1)] and "
+            f"[n, hc, hc]=[{n}, {hc}, {hc}], got "
+            f"{tuple(post.shape)} / {tuple(comb_res_mix.shape)}")
     if out is None:
         out = torch.empty_like(residual)
     elif out.shape != residual.shape or out.dtype is not torch.bfloat16:
-        return None
-    try:
-        a.ops.mhc.mhc_post(out, x.reshape(n, d), residual, post, comb_res_mix)
-    except Exception:  # noqa: BLE001
-        return None
+        raise OpNotEligible(
+            "aiter_mhc_post: out must be [n, hc, D] bf16 like residual, got "
+            f"{tuple(out.shape)} {out.dtype}")
+    a = _aiter()
+    if a is None:
+        raise OpNotEligible(
+            "aiter_mhc_post: aiter is not importable on this host "
+            "(ROCm-only gfx942 bridge); not eligible")
+    if not residual.is_cuda:
+        raise OpNotEligible(
+            "aiter_mhc_post: residual must be a CUDA tensor, got device "
+            f"{residual.device}")
+    a.ops.mhc.mhc_post(out, x.reshape(n, d), residual, post, comb_res_mix)
     return out
 
 
@@ -231,21 +276,29 @@ def per_group_quant_fp8(x: torch.Tensor, group_size: int = 128):
     blockscale MoE kernels expect (``QuantType.per_1x128``): scale is
     ``[..., K/group_size]`` fp32 (NOT the whole-row per-token scalar the
     per-token quant returns — that one is for per_Token kernels and gives
-    wrong results with per_1x128 GEMMs). Returns ``(x_q, scale)`` or None
-    outside the contract.
+    wrong results with per_1x128 GEMMs). Returns ``(x_q, scale)``. Raises
+    ``OpNotEligible`` outside the contract (aiter unavailable, CPU tensor,
+    non-contiguous input, last dim not a multiple of ``group_size``);
+    genuine aiter kernel failures propagate.
     """
-    a = _aiter()
-    if a is None or not x.is_cuda or not x.is_contiguous():
-        return None
     if x.shape[-1] % group_size:
-        return None
-    try:
-        import aiter.ops.quant as quant
-        return quant.per_group_quant_hip(
-            x, quant_dtype=a.dtypes.fp8, group_size=group_size,
-            transpose_scale=False)
-    except Exception:  # noqa: BLE001
-        return None
+        raise OpNotEligible(
+            f"per_group_quant_fp8: last dim {x.shape[-1]} must be a multiple "
+            f"of group_size {group_size}")
+    if not x.is_contiguous():
+        raise OpNotEligible("per_group_quant_fp8: x must be contiguous")
+    a = _aiter()
+    if a is None:
+        raise OpNotEligible(
+            "per_group_quant_fp8: aiter is not importable on this host "
+            "(ROCm-only gfx942 bridge); not eligible")
+    if not x.is_cuda:
+        raise OpNotEligible(
+            f"per_group_quant_fp8: x must be a CUDA tensor, got device {x.device}")
+    import aiter.ops.quant as quant
+    return quant.per_group_quant_hip(
+        x, quant_dtype=a.dtypes.fp8, group_size=group_size,
+        transpose_scale=False)
 
 
 def moe_align_block_size(topk_ids: torch.Tensor, num_experts: int, block_size: int):
@@ -255,10 +308,22 @@ def moe_align_block_size(topk_ids: torch.Tensor, num_experts: int, block_size: i
     ``sorted_token_ids`` holds flattened ``token*topk + slot`` indices
     padded to block multiples with the ``T*topk`` sentinel; ``experts_ids``
     is per-block expert ids. Returns ``(sorted_token_ids, experts_ids,
-    token_nums, num_tokens_post_pad)`` or None."""
+    token_nums, num_tokens_post_pad)``. Raises ``OpNotEligible`` outside
+    the contract (aiter unavailable, non-CUDA ``topk_ids``, ``topk_ids``
+    not [T, topk]); genuine aiter kernel failures propagate."""
+    if topk_ids.dim() != 2:
+        raise OpNotEligible(
+            "moe_align_block_size: topk_ids must be [T, topk], got shape "
+            f"{tuple(topk_ids.shape)}")
     a = _aiter()
-    if a is None or not topk_ids.is_cuda:
-        return None
+    if a is None:
+        raise OpNotEligible(
+            "moe_align_block_size: aiter is not importable on this host "
+            "(ROCm-only gfx942 bridge); not eligible")
+    if not topk_ids.is_cuda:
+        raise OpNotEligible(
+            "moe_align_block_size: topk_ids must be a CUDA tensor, got device "
+            f"{topk_ids.device}")
     t, k = topk_ids.shape
     dev = topk_ids.device
     max_padded = t * k + num_experts * (block_size - 1)
@@ -267,11 +332,8 @@ def moe_align_block_size(topk_ids: torch.Tensor, num_experts: int, block_size: i
     experts_ids = torch.empty(m_blocks, dtype=torch.int32, device=dev)
     token_nums = torch.empty(num_experts, dtype=torch.int32, device=dev)
     num_post = torch.empty(1, dtype=torch.int32, device=dev)
-    try:
-        a.moe_align_block_size(topk_ids.to(torch.int32), num_experts, block_size,
-                               sorted_token_ids, experts_ids, token_nums, num_post)
-    except Exception:  # noqa: BLE001
-        return None
+    a.moe_align_block_size(topk_ids.to(torch.int32), num_experts, block_size,
+                           sorted_token_ids, experts_ids, token_nums, num_post)
     return sorted_token_ids, experts_ids, token_nums, num_post
 
 
@@ -290,22 +352,28 @@ def ck_moe_stage1(x_q, w1, w2, sorted_token_ids, sorted_expert_ids, num_valid_id
     SCATTERS results to token-major ``out`` rows via the sorted_ids values.
     ``w1`` [E, 2I, H] fp8-fnuz with per-128x128 ``w1_scale`` [E, 2I/128,
     H/128]; ``a1_scale`` [T, H/128] fp32 (per_1x128). Returns ``out``
-    [T*topk, 2I] bf16."""
+    [T*topk, 2I] bf16. Raises ``OpNotEligible`` outside the contract
+    (aiter unavailable, wrong w1/w2 rank or odd 2I); genuine aiter kernel
+    failures propagate."""
+    if w1.dim() != 3 or w2.dim() != 3 or w1.shape[1] % 2:
+        raise OpNotEligible(
+            "ck_moe_stage1: w1/w2 must be 3-D [E, 2I, H] / [E, H, I] with "
+            f"an even gate|up dim, got {tuple(w1.shape)} / {tuple(w2.shape)}")
     a = _aiter()
     if a is None:
-        return None
-    if w1.dim() != 3 or w2.dim() != 3 or w1.shape[1] % 2:
-        return None
+        raise OpNotEligible(
+            "ck_moe_stage1: aiter is not importable on this host "
+            "(ROCm-only gfx942 bridge); not eligible")
+    if not x_q.is_cuda:
+        raise OpNotEligible(
+            f"ck_moe_stage1: x_q must be a CUDA tensor, got device {x_q.device}")
     if out is None:
         out = torch.empty((x_q.shape[0] * topk, w1.shape[1]),
                           dtype=torch.bfloat16, device=x_q.device)
-    try:
-        a.ck_moe_stage1_fwd(
-            x_q, w1, w2, sorted_token_ids, sorted_expert_ids, num_valid_ids, out,
-            topk, "", w1_scale, a1_scale, block_m, None,
-            a.QuantType.per_1x128, a.ActivationType.No)
-    except Exception:  # noqa: BLE001
-        return None
+    a.ck_moe_stage1_fwd(
+        x_q, w1, w2, sorted_token_ids, sorted_expert_ids, num_valid_ids, out,
+        topk, "", w1_scale, a1_scale, block_m, None,
+        a.QuantType.per_1x128, a.ActivationType.No)
     return out
 
 
@@ -317,20 +385,24 @@ def ck_moe_stage2(inter_q, w1, w2, sorted_token_ids, sorted_expert_ids, num_vali
     into ``out`` [T, H] — the caller zero-initializes it. Raw signature:
     ``(inter_states, w1, w2, sorted_token_ids, sorted_expert_ids,
     num_valid_ids, out, topk, kernelName, w2_scale, a2_scale, block_m,
-    sorted_weights, quant_type, activation, use_non_temporal_load)``."""
+    sorted_weights, quant_type, activation, use_non_temporal_load)``.
+    Raises ``OpNotEligible`` when aiter is unavailable; genuine aiter
+    kernel failures propagate."""
     a = _aiter()
     if a is None:
-        return None
+        raise OpNotEligible(
+            "ck_moe_stage2: aiter is not importable on this host "
+            "(ROCm-only gfx942 bridge); not eligible")
+    if not inter_q.is_cuda:
+        raise OpNotEligible(
+            f"ck_moe_stage2: inter_q must be a CUDA tensor, got device {inter_q.device}")
     if out is None:
         out = torch.zeros((inter_q.shape[0] // topk, w2.shape[1]),
                           dtype=torch.bfloat16, device=inter_q.device)
-    try:
-        a.ck_moe_stage2_fwd(
-            inter_q, w1, w2, sorted_token_ids, sorted_expert_ids, num_valid_ids, out,
-            topk, "", w2_scale, a2_scale, block_m, sorted_weights,
-            a.QuantType.per_1x128, a.ActivationType.No)
-    except Exception:  # noqa: BLE001
-        return None
+    a.ck_moe_stage2_fwd(
+        inter_q, w1, w2, sorted_token_ids, sorted_expert_ids, num_valid_ids, out,
+        topk, "", w2_scale, a2_scale, block_m, sorted_weights,
+        a.QuantType.per_1x128, a.ActivationType.No)
     return out
 
 
@@ -346,7 +418,7 @@ def fp8_blockscale_experts(
     swiglu: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     swiglu_limit: Optional[float] = None,
     block_m: int = 32,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor:
     """Full grouped fp8-blockscale expert pipeline (EXPERIMENTAL — parity gate
     in bench_aiter_ab.py must pass before any knob flips).
 
@@ -379,42 +451,52 @@ def fp8_blockscale_experts(
 
     ``gate_up`` [E, 2I, H], ``down`` [E, H, I] fp8-fnuz with per-128x128
     block scales; ``swiglu(gate, up)`` applies the caller's activation.
-    Returns ``[T, H]`` bf16 (routing weights applied, tokens summed) or None
-    outside the contract.
+    Returns ``[T, H]`` bf16 (routing weights applied, tokens summed).
+    Raises ``OpNotEligible`` outside the contract (aiter unavailable, CPU
+    tensor, wrong dtype/shape); genuine aiter kernel failures propagate —
+    including the ``OpNotEligible`` of the internal quant/align/stage ops.
     """
-    a = _aiter()
-    if a is None or not x.is_cuda or x.dtype is not torch.bfloat16:
-        return None
+    if x.dtype is not torch.bfloat16:
+        raise OpNotEligible(
+            f"fp8_blockscale_experts: x must be bf16, got {x.dtype}")
+    if topk_index.dim() != 2:
+        raise OpNotEligible(
+            "fp8_blockscale_experts: topk_index must be [T, topk], got shape "
+            f"{tuple(topk_index.shape)}")
     t, k = topk_index.shape
     e = gate_up.shape[0]
     if down.shape[0] != e or topk_weights.shape != topk_index.shape:
-        return None
+        raise OpNotEligible(
+            f"fp8_blockscale_experts: down must have E={e} experts matching "
+            f"gate_up and topk_weights must be [T, topk] like topk_index, "
+            f"got down E={down.shape[0]}, topk_weights "
+            f"{tuple(topk_weights.shape)}")
     if 2 * x.shape[-1] % 128 or down.shape[1] % 128:
-        return None
+        raise OpNotEligible(
+            "fp8_blockscale_experts: gate|up (2*H) and down I must be "
+            f"multiples of 128, got H={x.shape[-1]}, I={down.shape[1]}")
+    a = _aiter()
+    if a is None:
+        raise OpNotEligible(
+            "fp8_blockscale_experts: aiter is not importable on this host "
+            "(ROCm-only gfx942 bridge); not eligible")
+    if not x.is_cuda:
+        raise OpNotEligible(
+            f"fp8_blockscale_experts: x must be a CUDA tensor, got device {x.device}")
     # 1) activation quant (per_1x128 — the CK blockscale format)
-    q1 = per_group_quant_fp8(x)
-    if q1 is None:
-        return None
-    a1, a1_scale = q1
+    a1, a1_scale = per_group_quant_fp8(x)
     # 2) routing alignment
-    aligned = moe_align_block_size(topk_index, e, block_m)
-    if aligned is None:
-        return None
-    sorted_ids, expert_ids, _token_nums, num_post = aligned
+    sorted_ids, expert_ids, _token_nums, num_post = moe_align_block_size(
+        topk_index, e, block_m)
     # 3) stage 1: gate|up, no activation, scattered token-major [T*topk, 2I]
     s1 = ck_moe_stage1(a1, gate_up, down, sorted_ids, expert_ids, num_post,
                        topk=k, w1_scale=gate_up_scale, a1_scale=a1_scale,
                        block_m=block_m)
-    if s1 is None:
-        return None
     # 4) floe's clamp-swiglu on the bf16 intermediate
     gate, up = s1.view(t, k, -1).chunk(2, dim=-1)
     act = swiglu(gate, up).contiguous().view(t * k, -1)
     # 5) requant the activated intermediate
-    q2 = per_group_quant_fp8(act)
-    if q2 is None:
-        return None
-    act_q, a2_scale = q2
+    act_q, a2_scale = per_group_quant_fp8(act)
     # 6) stage 2 with in-kernel routed weights; sentinel slots contribute 0
     flat_w = topk_weights.reshape(-1).to(torch.float32)
     valid = sorted_ids < t * k
@@ -422,9 +504,7 @@ def fp8_blockscale_experts(
         valid, flat_w[sorted_ids.clamp(0, t * k - 1)],
         torch.zeros((), dtype=torch.float32, device=x.device))
     out = torch.zeros((t, x.shape[-1]), dtype=torch.bfloat16, device=x.device)
-    s2 = ck_moe_stage2(act_q, gate_up, down, sorted_ids, expert_ids, num_post,
-                       topk=k, out=out, w2_scale=down_scale, a2_scale=a2_scale,
-                       block_m=block_m, sorted_weights=sorted_w)
-    if s2 is None:
-        return None
+    ck_moe_stage2(act_q, gate_up, down, sorted_ids, expert_ids, num_post,
+                  topk=k, out=out, w2_scale=down_scale, a2_scale=a2_scale,
+                  block_m=block_m, sorted_weights=sorted_w)
     return out

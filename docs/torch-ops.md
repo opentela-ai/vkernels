@@ -109,6 +109,11 @@ dispatches on the GLM-5.3-Flash ROCm path: `aiter_mhc_pre`/`aiter_mhc_post`,
 can A/B AITER against the vkernels HIP/Triton kernel via per-site knobs
 (`aiter_mhc` / `aiter_moe`); `available()` / `report()` expose what the
 bundled aiter (verified: `aiter 7a8ff7dd4`, ROCm 7.0, MI300A) provides.
+The wrappers follow the §1 convention: an eligibility miss — aiter
+unavailable, non-CUDA tensor, wrong dtype/shape/contiguity — raises
+`OpNotEligible` (not a silent `None`), and genuine aiter kernel failures
+propagate; `aiter_available()` / `available()` / `report()` remain
+non-raising availability probes.
 
 ---
 
