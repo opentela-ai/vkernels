@@ -75,6 +75,8 @@ vkernels/
 │       ├── dist/          #   distributed MoE: TP / EP / PP orchestration
 │       └── capi/          #   extern "C" ABI shim (+ exception translation) for non-C++ consumers
 ├── src/python/            # `vkl` CLI + Python bindings (compiled pybind11 OR pure-Python fallback)
+│                          #   + torch_ops/: device-native Triton inference operators
+│                          #     (self-validating op contract, triton_attn, vendored vLLM kernels)
 ├── src/rust/              # Rust bindings: `vkernels-sys` (FFI) + safe `vkernels` crate
 ├── tests/                 # C++ unit tests mirroring src/c/ + tests/python/ + tests/capi/
 ├── meta/                  # build support: cmake helpers, scripts, docker, benchmarks
@@ -96,7 +98,9 @@ Three things to notice up front:
 - **`docs/` is dense and worth reading.** Each kernel has a focused doc
   giving the math, the CPU oracle, the device-kernel strategy, the
   contract, and a measured roofline benchmark. Many also keep
-  per-GPU performance journals under `docs/performance/`.
+  per-GPU performance journals under `docs/performance/`. The Python-side
+  Triton operator layer has its own reference in
+  [`docs/torch-ops.md`](torch-ops.md).
 
 ---
 
