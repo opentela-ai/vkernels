@@ -1,0 +1,1 @@
+yes wire the self-contained device files into the cuda job
