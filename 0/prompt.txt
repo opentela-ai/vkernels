@@ -1,0 +1,1 @@
+can we create a issue summarizing the findings and list where we should optimize
