@@ -1,0 +1,22 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "67818d37ce47",
+  "session_id": "01a0b485-3d51-76de-9eef-adbe7465e417",
+  "strategy": "import",
+  "created_at": "2026-09-18T15:16:15.892Z",
+  "checkpoints_count": 1,
+  "files_touched": null,
+  "agent": "Pi",
+  "model": "zai-org/GLM-5.3-Flash",
+  "checkpoint_transcript_start": 160,
+  "transcript_lines_at_start": 160,
+  "compact_transcript_start": 63,
+  "token_usage": {
+    "input_tokens": 1268789,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 4213,
+    "api_call_count": 12
+  },
+  "kind": "imported"
+}
