@@ -1,0 +1,1 @@
+I think 1.03e-4 is very close to 1e-4 so we can consider it fine
