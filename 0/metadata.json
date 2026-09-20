@@ -1,0 +1,22 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "29a16e0536f7",
+  "session_id": "01a0ae3b-2a6c-72ee-b9d9-7741f52ae433",
+  "strategy": "import",
+  "created_at": "2026-09-17T11:11:27.655Z",
+  "checkpoints_count": 1,
+  "files_touched": null,
+  "agent": "Pi",
+  "model": "15 - DeepSeek-V4.1-Flash on JUWELS Booster",
+  "checkpoint_transcript_start": 271,
+  "transcript_lines_at_start": 271,
+  "compact_transcript_start": 131,
+  "token_usage": {
+    "input_tokens": 161900,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 365,
+    "api_call_count": 3
+  },
+  "kind": "imported"
+}
