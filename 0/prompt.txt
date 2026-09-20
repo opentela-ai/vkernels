@@ -1,0 +1,1 @@
+Review PRs in https://github.com/opentela-ai/vkernels/pulls, and test locally and on beverin if necessary. For each PR, create a subagent to test.
