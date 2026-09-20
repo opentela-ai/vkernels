@@ -1,0 +1,1 @@
+For each of these, you should perhaps write briefly what's the expected implementation (in triton, cutedsl, flydsl, ptx, ...?) and the arithmetics, dtypes?
