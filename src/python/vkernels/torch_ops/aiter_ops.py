@@ -62,6 +62,7 @@ __all__ = [
     "ck_moe_stage1",
     "ck_moe_stage2",
     "fp8_blockscale_experts",
+    "aiter_gemm_a8w8_blockscale",
 ]
 
 
@@ -508,3 +509,71 @@ def fp8_blockscale_experts(
                   topk=k, out=out, w2_scale=down_scale, a2_scale=a2_scale,
                   block_m=block_m, sorted_weights=sorted_w)
     return out
+
+
+# ---------------------------------------------------------------------------
+# blockwise-fp8 dense GEMM (gemm_a8w8_blockscale) — the prefill dequant lever
+# ---------------------------------------------------------------------------
+
+def aiter_gemm_a8w8_blockscale(a_fp8, b_fp8, a_scale, b_scale,
+                               out_dtype: torch.dtype = torch.bfloat16):
+    """Y[M, N] = (A * a_scale) @ (B * b_scale)^T on fp8 tensor cores — no
+    dequant materialization. Bridge for floe's #1 prefill lever (profile
+    job 644226: fp8 dequantize-on-use aten mul+copy = 66% of prefill kernel
+    time before the bf16 bmm); vLLM calls the same op via
+    ``_rocm_aiter_gemm_a8w8_blockscale_impl`` (``aiter.gemm_a8w8_blockscale``).
+
+    Contract — per_1x128 / block-128 scales, exactly floe's DeepSeek-style
+    block-fp8 checkpoint layout (``weight_scale_inv [O/128, I/128]``):
+
+    * ``a_fp8`` ``[M, K]`` float8_e4m3fnuz, row-major contiguous — the
+      activation, quantized per-token-group-128 (emit it with
+      :func:`per_group_quant_fp8`, which produces fnuz + the right scale
+      layout directly; checkpoint-e4m3fn *weights* must be converted once
+      via ``glm_fp8_blockwise_gemm.e4m3fn_to_fnuz`` — gfx942 fp8 is fnuz);
+    * ``b_fp8`` ``[N, K]`` float8_e4m3fnuz, contiguous (weights, row-major);
+    * ``a_scale`` ``[M, K//128]`` fp32 (per-token-group-128);
+    * ``b_scale`` ``[N//128, K//128]`` fp32;
+    * ``K`` and ``N`` multiples of 128; ``out_dtype`` bf16/fp16/fp32.
+
+    Returns ``Y [M, N]`` in ``out_dtype``. Raises ``OpNotEligible`` on any
+    contract miss (aiter unavailable / symbol missing, CPU tensor, wrong
+    dtype/shape/contiguity); genuine aiter kernel failures propagate.
+    """
+    if a_fp8.dtype != torch.float8_e4m3fnuz or b_fp8.dtype != torch.float8_e4m3fnuz:
+        raise OpNotEligible(
+            "aiter_gemm_a8w8_blockscale: operands must be float8_e4m3fnuz "
+            f"(gfx942 fnuz flavour; convert checkpoint e4m3fn once), got "
+            f"{a_fp8.dtype}/{b_fp8.dtype}")
+    if a_fp8.dim() != 2 or b_fp8.dim() != 2:
+        raise OpNotEligible(
+            "aiter_gemm_a8w8_blockscale: 2-D operands required, got "
+            f"{tuple(a_fp8.shape)} / {tuple(b_fp8.shape)}")
+    m, k = a_fp8.shape
+    n, k2 = b_fp8.shape
+    if k != k2 or k % 128 or n % 128:
+        raise OpNotEligible(
+            f"aiter_gemm_a8w8_blockscale: shape mismatch A[{m},{k}] "
+            f"B[{n},{k2}] (K, N multiples of 128)")
+    if not (a_fp8.is_contiguous() and b_fp8.is_contiguous()):
+        raise OpNotEligible("aiter_gemm_a8w8_blockscale: operands must be contiguous")
+    if a_scale.dtype != torch.float32 or b_scale.dtype != torch.float32:
+        raise OpNotEligible(
+            "aiter_gemm_a8w8_blockscale: scales must be fp32, got "
+            f"{a_scale.dtype}/{b_scale.dtype}")
+    if tuple(a_scale.shape) != (m, k // 128) or tuple(b_scale.shape) != (n // 128, k // 128):
+        raise OpNotEligible(
+            f"aiter_gemm_a8w8_blockscale: scale shapes {tuple(a_scale.shape)}/"
+            f"{tuple(b_scale.shape)} do not match the per_1x128 contract "
+            f"([{m}, {k // 128}] / [{n // 128}, {k // 128}])")
+    if not (a_fp8.is_cuda and a_scale.is_cuda and b_scale.is_cuda):
+        raise OpNotEligible(
+            f"aiter_gemm_a8w8_blockscale: CUDA tensors required, got "
+            f"{a_fp8.device}/{a_scale.device}/{b_scale.device}")
+    a = _aiter()
+    gemm = getattr(a, "gemm_a8w8_blockscale", None) if a is not None else None
+    if gemm is None:
+        raise OpNotEligible(
+            "aiter_gemm_a8w8_blockscale: aiter.gemm_a8w8_blockscale is not "
+            "available on this host")
+    return gemm(a_fp8, b_fp8, a_scale, b_scale, out_dtype)

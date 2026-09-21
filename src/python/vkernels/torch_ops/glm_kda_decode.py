@@ -68,7 +68,7 @@ def _kernel():
     return _decode
 
 
-def kda_decode(query, key, value, gate, beta, initial_state):
+def kda_decode(query, key, value, gate, beta, initial_state, *, out_fp32=False):
     """Normalize raw q/k and return ``(output, next_state)`` without mutation.
 
     Vectors are contiguous GPU tensors [B,1,H,D] (FP32/BF16/FP16, one dtype),
@@ -77,6 +77,13 @@ def kda_decode(query, key, value, gate, beta, initial_state):
     ``next_state`` is FP32. Inference only; no autograd.
     The normalization epsilon is pinned to 1e-6 (kda_decode_reference's
     default); experiment via the reference's ``eps`` argument.
+
+    ``out_fp32=True`` allocates the output in FP32 regardless of the vector
+    dtype: the in-kernel widening of BF16/FP16 vectors is exact and the
+    accumulation is FP32 unconditionally, so the FP32 output is bit-identical
+    to the caller widening the vectors first — it only skips the caller-side
+    cast launches. The default (False) keeps the historical ABI where the
+    output shares the vector dtype.
     """
     import torch
 
@@ -104,7 +111,10 @@ def kda_decode(query, key, value, gate, beta, initial_state):
     for x in (*vectors, initial_state):
         if not x.is_cuda or x.device != query.device or not x.is_contiguous():
             raise OpNotEligible("inputs must be contiguous on the same GPU")
-    out = torch.empty_like(query)
+    if out_fp32:
+        out = torch.empty(query.shape, dtype=torch.float32, device=query.device)
+    else:
+        out = torch.empty_like(query)
     state = torch.empty_like(initial_state)
     if batch * heads:
         import triton  # lazy: validation above needs only torch

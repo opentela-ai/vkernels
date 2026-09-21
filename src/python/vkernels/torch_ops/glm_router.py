@@ -43,6 +43,7 @@ def _kernel():
         K: tl.constexpr,
         NORM: tl.constexpr,
         BLOCK_E: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         row = tl.program_id(0)
         e = tl.arange(0, BLOCK_E)
@@ -51,9 +52,10 @@ def _kernel():
         bias = tl.load(BIAS + e, mask=mask, other=0.0).to(tl.float32)
         scores = tl.sigmoid(logits)
         choice = tl.where(mask, scores + bias, float("-inf"))
-        ks = tl.arange(0, K)
+        ks = tl.arange(0, BLOCK_K)
+        kmask = ks < K
         used = e < 0  # all-false
-        weights = tl.zeros([K], dtype=tl.float32)
+        weights = tl.zeros([BLOCK_K], dtype=tl.float32)
         total = 0.0
         for i in tl.static_range(K):
             cand = tl.where(used, float("-inf"), choice)
@@ -67,7 +69,7 @@ def _kernel():
             tl.store(IDX + row * K + i, first)
         if NORM:
             weights = weights / (total + 1.0e-20)
-        tl.store(WGT + row * K + ks, weights * SCALING)
+        tl.store(WGT + row * K + ks, weights * SCALING, mask=kmask)
 
     return _router
 
@@ -123,6 +125,7 @@ def fused_router(logits, bias, top_k, scaling, norm_topk_prob=True,
             top_k,
             bool(norm_topk_prob),
             triton.next_power_of_2(experts),
+            triton.next_power_of_2(top_k),
             num_warps=4,
             enable_fp_fusion=False,
         )
