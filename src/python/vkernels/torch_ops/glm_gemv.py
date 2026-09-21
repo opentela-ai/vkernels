@@ -11,10 +11,13 @@ kv_a at ~700 GB/s) and ~1.5x on the big ones (kda q/k/v 6.99 -> 4.0 us
 at ~4.2 TB/s). Only [8192, 512]-class shapes tie; the dispatch sends
 everything and eats the noise-level delta to keep call sites simple.
 
-Row-group heuristic (best-of the measured sweep): four rows per program
-when O is large (fewer x re-reads, bandwidth-bound) or the reduction
-axis is narrow (I <= 512); one row per program otherwise (more programs
-in flight, latency-bound).
+Row-group / block / warps table (best-of the graph-replayed autotune sweep on
+GH200, job 3462837; keyed by the production (O, I) with >4% gains — everything
+else keeps the fallback heuristic below): four rows per program when O is large
+(fewer x re-reads, bandwidth-bound) or the reduction axis is narrow (I <= 512);
+one row per program otherwise (more programs in flight, latency-bound).
+num_warps=4 wins on wide reductions (I >= 512, O >= 2048) — fewer warps, longer
+per-warp streams; narrow-I shapes want ROWS=8 with warps=8.
 
 Numerics: BF16 weights, FP32 product reduction rounded once to BF16 —
 the same kernel class as the ``skinny_gemv`` torch.mv policy (perf-only
@@ -28,6 +31,21 @@ step has ~15 distinct shapes -> ~15 compilations).
 
 from ._dispatch import OpNotEligible
 from functools import lru_cache
+
+# (O, I) -> (ROWS, BLOCK_I, num_warps); graph-replayed autotune, GH200
+# (clariden job 3462837). Only shapes where the best beat the heuristic by
+# >4% are pinned: kv_b -22%, dense_gu_fused -34%, dense_dn -12%, g_b/f_b
+# -10%, dense_gu -8%, kda_q_ctl -5%, kda_o -4%, q_b/wq_b -5..-10% (warps).
+_CFG = {
+    (4096, 1536): (4, 2048, 4),
+    (4096, 3072): (1, 4096, 4),
+    (4096, 2048): (2, 2048, 4),
+    (8192, 512): (8, 512, 4),
+    (3072, 4096): (2, 4096, 4),
+    (6144, 4096): (4, 4096, 4),
+    (2048, 128): (8, 128, 8),
+    (2048, 4096): (2, 4096, 4),
+}
 
 
 @lru_cache(maxsize=1)
@@ -85,12 +103,17 @@ def dense_gemv(x, w):
     if o <= 0 or i <= 0:
         raise OpNotEligible("empty GEMV")
     tl, triton, kern = _kernel()
-    rows = 4 if (o % 4 == 0 and (o > 2048 or i <= 512)) else 1
-    block_i = triton.next_power_of_2(min(i, 4096))
+    cfg = _CFG.get((o, i))
+    if cfg is not None:
+        rows, block_i, warps = cfg
+    else:
+        rows = 4 if (o % 4 == 0 and (o > 2048 or i <= 512)) else 1
+        block_i = triton.next_power_of_2(min(i, 4096))
+        warps = 8
     y = torch.empty(1, o, device=x.device, dtype=torch.bfloat16)
     with torch.cuda.device(x.device):
         kern[((o + rows - 1) // rows,)](
             x.reshape(i), w, y, o, i, rows, block_i,
-            num_warps=8,
+            num_warps=warps,
         )
     return y if x.ndim == 2 else y[0]
