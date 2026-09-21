@@ -221,7 +221,7 @@ def mhc_pre_big_fuse_reference(
     pre, post, comb = mhc_mix_reference(
         logits.float(), base, scale, hc=hc, eps=eps, sinkhorn_iters=sinkhorn_iters
     )
-    collapsed = (pre.unsqueeze(-1) * streams).sum(dim=2).to(streams.dtype)
+    collapsed = (pre.unsqueeze(-1) * streams).sum(dim=-2).to(streams.dtype)
     x = collapsed.float()
     var = x.pow(2).mean(-1, keepdim=True)
     normalized = (x * torch.rsqrt(var + norm_eps)).to(streams.dtype)
