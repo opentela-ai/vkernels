@@ -203,10 +203,11 @@ def bisect_shape(b, h, s, d, seed, nonzero_state):
         h_recomp = h_in * torch.exp2(gk_last).unsqueeze(-2) \
             + vn_c.transpose(-1, -2) @ kg_c                                 # [B,H,V,K]
         d_recomp = dmax(h_recomp, h_next_fused)
-        # v_new recompute (w*H product check)
+        # v_new recompute (w*H product check; kernel computes u − w·hᵀ in
+        # the h[V,K] transposed layout, hence the .transpose(-1, -2))
         w_c = fu["w"][:, c * CHUNK:(c + 1) * CHUNK].permute(0, 2, 1, 3)
         u_c = fu["u"][:, c * CHUNK:(c + 1) * CHUNK].permute(0, 2, 1, 3)
-        d_vnew = dmax(u_c - w_c @ h_in, vn_c)
+        d_vnew = dmax(u_c - w_c @ h_in.transpose(-1, -2), vn_c)
         worst = max(worst, d_state)
         print(f"chunk {c:2d}: state Δ {d_state:.3e} | update-recompute Δ {d_recomp:.3e} | v_new-recompute Δ {d_vnew:.3e}")
     print(f"worst per-chunk state Δ: {worst:.3e}")
@@ -365,7 +366,9 @@ def fwd_h_config_sweep(q, k, v, gate, beta, state0, fu, cap):
 
     hdr("fwd_h autotune config sweep")
     kernel = V.chunk_gated_delta_rule_fwd_kernel_h_blockdim64
-    full = list(kernel.configs)
+    # @triton.heuristics wraps the @triton.autotune Autotuner
+    tuner = getattr(kernel, "fn", kernel)
+    full = list(tuner.configs)
     print(f"configs ({len(full)}): " + ", ".join(
         f"BV{c.kwargs.get('BV')}/w{c.num_warps}/s{c.num_stages}" for c in full))
     b, hh, s, d = k.shape
@@ -378,16 +381,16 @@ def fwd_h_config_sweep(q, k, v, gate, beta, state0, fu, cap):
     ref_final = cap["state_out"][-1]
     try:
         for cfg in full:
-            kernel.configs = [cfg]
-            kernel.cache = {}
+            tuner.configs = [cfg]
+            tuner.cache = {}
             _, _, final = chunk_gated_delta_rule_fwd_h(
                 k=kg, w=w, u=u, gk=g2, initial_state=h0, output_final_state=True,
                 chunk_size=CHUNK, use_exp2=True)
             dd = dmax(final.transpose(-1, -2), ref_final)
             print(f"  BV{cfg.kwargs.get('BV')}/w{cfg.num_warps}/s{cfg.num_stages}: final Δ {dd:.3e}")
     finally:
-        kernel.configs = full
-        kernel.cache = {}
+        tuner.configs = full
+        tuner.cache = {}
 
 
 def main():
