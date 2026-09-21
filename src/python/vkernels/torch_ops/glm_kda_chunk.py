@@ -24,13 +24,20 @@ kernels run every fp32-operand ``tl.dot`` with ``input_precision="ieee"``
 the fp32 reference, two orders over the 1e-4 parity bar). Remaining
 deviation vs the eager reference is fp32 summation-order noise (blockwise
 ``(I+A)^{-1}`` vs row-by-row forward substitution, exp vs exp2·log2e gate
-evaluation, blocked GEMM orders, mma accumulation order). STATUS: output
-parity is within the 1e-4/1e-4 bar on GH200 (max|Δout| 6.1e-5, job
-3468708); the **final state** is NOT yet (max|Δstate| 7.3e-4 on GH200,
-arch-dependent — ≤1e-4-class on GB10) — open issue, see
-perf-campaign ROUND7-laneC-kda-cuda.md. The gate cumsum fed to the
-pipeline is bit-identical to the reference's (torch.cumsum on the same
-chunked view), so gates are ruled out as the drift source.
+evaluation, blocked GEMM orders, mma accumulation order).
+STATUS (round-7 lane I): the 7.3e-4 GH200 "final-state drift" of round-7
+lane C was NOT sm90 codegen — it was the NGC container defaulting torch
+matmuls to tf32 (``fp32_precision='tf32'``, ``allow_tf32=True``), which
+silently degraded the *eager oracle's* own matmuls; the fused ieee kernel
+was the more accurate side. :func:`kda_chunk_reference` now pins true-fp32
+(ieee) matmuls for the oracle, and the rig re-run closes state parity at
+the 1e-5 level (see ``tests/python/test_glm_kda_chunk.py::
+test_gpu_final_state_parity``). NOTE for the campaign: any other fp32
+reference computed inside this container (including floe's own eager
+``_kda_chunk`` serving path) is tf32-degraded the same way unless pinned.
+The gate cumsum fed to the pipeline is bit-identical to the reference's
+(torch.cumsum on the same chunked view), so gates are ruled out as a
+drift source.
 
 Ragged S is handled by zero-padding to the next chunk multiple BEFORE the
 pipeline (the reference pads identically, and padding to the chunk size
@@ -48,6 +55,33 @@ from ._dispatch import OpNotEligible
 
 _HEAD_DIMS = (64, 128, 256)  # fwd_h splits K into 64-wide register blocks
 _CHUNK_SIZES = (16, 32, 64)  # solve_tril / kkt block structure supports these
+
+
+def _pin_fp32_matmul():
+    """Force torch matmuls to true fp32 (ieee); returns a restore callable.
+
+    The fp32 contract of the KDA core is meaningless if the *reference*
+    computes in tf32: NGC/NVIDIA containers set the torch matmul default to
+    tf32 (``fp32_precision='tf32'``, ``allow_tf32=True``) — stock torch
+    defaults to ieee — which silently degrades every fp32-by-contract torch
+    reference run inside them (round-7 lane C's 7.3e-4 "kernel drift" was
+    exactly this, on the oracle side). The fused Triton pipeline pins its
+    own dots to ieee (``vllm_kda.NV_DOT_PRECISION``); this pins the oracle.
+    """
+    import torch
+
+    matmul = torch.backends.cuda.matmul
+    prev = (matmul.allow_tf32, getattr(matmul, "fp32_precision", None))
+    matmul.allow_tf32 = False
+    if prev[1] is not None:
+        matmul.fp32_precision = "ieee"
+
+    def _restore():
+        matmul.allow_tf32 = prev[0]
+        if prev[1] is not None:
+            matmul.fp32_precision = prev[1]
+
+    return _restore
 
 
 def kda_chunk(
@@ -165,7 +199,33 @@ def kda_chunk_reference(
     Same contract as :func:`kda_chunk`; this is the parity bar the kernel
     tests compare against (kept here so the vkernels suite is
     self-contained — floe's copy is the upstream original).
+
+    Matmuls run under a true-fp32 (ieee) pin for the duration of the call
+    (see :func:`_pin_fp32_matmul`): an fp32 oracle computed with the
+    container's tf32 matmul default is not an fp32 oracle.
     """
+    import torch
+
+    restore = _pin_fp32_matmul()
+    try:
+        return _kda_chunk_reference_impl(
+            query, key, value, g, beta, chunk_size, initial_state, output_final_state
+        )
+    finally:
+        restore()
+
+
+def _kda_chunk_reference_impl(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    chunk_size=64,
+    initial_state=None,
+    output_final_state=False,
+):
+    """Eager FP32 oracle body (called under the ieee matmul pin)."""
     import math
 
     import torch

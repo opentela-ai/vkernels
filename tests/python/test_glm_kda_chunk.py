@@ -182,6 +182,54 @@ def test_gpu_parity_vs_reference(torch):
             torch.testing.assert_close(state, ref_state, atol=1e-4, rtol=1e-4)
 
 
+def test_gpu_final_state_parity(torch):
+    """Round-7 lane I regression pin: the fused pipeline's FINAL recurrent
+    state must track the fp32 chunked oracle to <= 1e-5 max-abs at the rig
+    sequence lengths (S=512/1024/2048, chunk 64; chunk 32 on one shape).
+
+    History: lane C saw 7.3e-4 here on GH200 and attributed it to sm90
+    codegen. The lane I bisect (bench/kda_state_bisect.py) showed the drift
+    was the NGC container's tf32 matmul default degrading the eager oracle
+    itself; with the oracle pinned to true fp32 (ieee), both sides are
+    exact-fp32 and the residual is dot-ordering/exp2 rounding only (~1e-6).
+    The state hands off to the torch recurrent decode path, so this is the
+    number that must never silently regress.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires GPU")
+    pytest.importorskip("triton")
+    from vkernels.torch_ops.glm_kda_chunk import kda_chunk, kda_chunk_reference
+
+    cases = [
+        (1, 64, 512, 128, 64, 41),
+        (1, 64, 1024, 128, 64, 42),
+        (1, 64, 2048, 128, 64, 43),
+        (1, 8, 512, 128, 32, 44),  # chunk 32: solve_tril merge path differs
+    ]
+    for b, h, s, d, cs, seed in cases:
+        q, k, v, gate, beta, state0 = _rand_inputs(
+            torch, b, h, s, d, seed, nonzero_state=True
+        )
+        q, k, v, gate, beta, state0 = (
+            x.cuda() for x in (q, k, v, gate, beta, state0)
+        )
+        out, state = kda_chunk(
+            q, k, v, gate, beta, cs, state0, output_final_state=True
+        )
+        ref_out, ref_state = kda_chunk_reference(
+            q, k, v, gate, beta, cs, state0, output_final_state=True
+        )
+        d_out = (out - ref_out).abs().max().item()
+        d_state = (state - ref_state).abs().max().item()
+        print(f"\nfinal-state parity B={b} H={h} S={s} cs={cs}: "
+              f"max|Δout|={d_out:.3e} max|Δstate|={d_state:.3e}")
+        assert d_out < 1e-4, f"output diff {d_out:.3e} breached the 1e-4 bar"
+        assert d_state <= 1e-5, (
+            f"final-state diff {d_state:.3e} breached the 1e-5 lane I bar "
+            "(dot-precision or oracle-matmul regression)"
+        )
+
+
 def test_gpu_no_mutation_and_ragged_exact_length(torch):
     if not torch.cuda.is_available():
         pytest.skip("requires GPU")
