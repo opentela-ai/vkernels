@@ -24,8 +24,13 @@ kernels run every fp32-operand ``tl.dot`` with ``input_precision="ieee"``
 the fp32 reference, two orders over the 1e-4 parity bar). Remaining
 deviation vs the eager reference is fp32 summation-order noise (blockwise
 ``(I+A)^{-1}`` vs row-by-row forward substitution, exp vs exp2·log2e gate
-evaluation, blocked GEMM orders): measured well under the 1e-4/1e-4 bar
-the kda_decode GPU tests use; the test suite pins it with a drift probe.
+evaluation, blocked GEMM orders, mma accumulation order). STATUS: output
+parity is within the 1e-4/1e-4 bar on GH200 (max|Δout| 6.1e-5, job
+3468708); the **final state** is NOT yet (max|Δstate| 7.3e-4 on GH200,
+arch-dependent — ≤1e-4-class on GB10) — open issue, see
+perf-campaign ROUND7-laneC-kda-cuda.md. The gate cumsum fed to the
+pipeline is bit-identical to the reference's (torch.cumsum on the same
+chunked view), so gates are ruled out as the drift source.
 
 Ragged S is handled by zero-padding to the next chunk multiple BEFORE the
 pipeline (the reference pads identically, and padding to the chunk size
