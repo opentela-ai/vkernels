@@ -82,7 +82,10 @@ BS_LIST = [16, 32]  # cumsum.py conservative branch (portable shared mem)
 # without tf32 and needs no equivalent; the shared kernels in
 # _kda_kernels_common.py already take DOT_PRECISION from their launchers
 # ("ieee" here).
-NV_DOT_PRECISION = "ieee"
+# tl.constexpr (NOT a plain Python global): @triton.jit kernels can only
+# read module globals instantiated as constexpr — a plain string global is a
+# NameError at compile time on the rig's Triton (job 3468678).
+NV_DOT_PRECISION = tl.constexpr("ieee")
 
 
 def cdiv(a: int, b: int) -> int:

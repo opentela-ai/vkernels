@@ -128,7 +128,7 @@ def kda_chunk(
     # lazy: importing torch_ops.vllm_kda pulls torch + triton at module scope
     from vkernels.torch_ops.vllm_kda import kda_chunk_floe
 
-    return kda_chunk_floe(
+    out, final_state = kda_chunk_floe(
         query,
         key,
         value,
@@ -138,6 +138,11 @@ def kda_chunk(
         initial_state=initial_state,
         output_final_state=output_final_state,
     )
+    if pad:
+        # the padded tail rows must not leak: the reference slices its output
+        # to seq_len after padding, and so does the contract (o is [B, S, H, V]).
+        out = out[:, :seq_len]
+    return out, final_state
 
 
 def kda_chunk_reference(

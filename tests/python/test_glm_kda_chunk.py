@@ -90,6 +90,7 @@ def test_oracle_matches_recurrent_rollout(torch):
             gate.transpose(1, 2),
             beta.transpose(1, 2),
             state0,
+            output_final_state=True,
         )
         torch.testing.assert_close(out, rec_out, atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(state, rec_state, atol=1e-4, rtol=1e-4)
@@ -100,7 +101,9 @@ def test_reference_shape_contract(torch):
 
     torch.manual_seed(5)
     b, h, s, d = 2, 3, 100, 16
-    q, k, v, gate, beta, state0 = _rand_inputs(torch, b, h, s, d, 11)
+    q, k, v, gate, beta, state0 = _rand_inputs(
+        torch, b, h, s, d, 11, nonzero_state=True
+    )
     out, state = kda_chunk_reference(
         q, k, v, gate, beta, 64, state0, output_final_state=True
     )
