@@ -72,6 +72,18 @@ FLA_TRIL_PRECISION = "ieee"  # solve_tril.py default; "tf32" not exposed here
 RCP_LN2 = 1.4426950408889634  # 1/ln(2) = log2(e): exp(x) == exp2(x * RCP_LN2)
 BS_LIST = [16, 32]  # cumsum.py conservative branch (portable shared mem)
 
+# floe's KDA core-numerics contract is fp32 (bf16 state accumulation diverges
+# prefill-vs-decode at real dims — beverin bench finding). tl.dot on fp32
+# operands defaults to tf32 on CUDA (10-bit mantissa), which shows up as ~1e-3
+# drift against the fp32 torch reference — two orders over the 1e-4 parity
+# bar. Every fp32-operand dot in this NV file therefore pins
+# input_precision="ieee" (a no-op for bf16 operands, so the standard fla
+# bf16 path is unaffected). The AMD twin (vllm_kda_amd.py) runs on hardware
+# without tf32 and needs no equivalent; the shared kernels in
+# _kda_kernels_common.py already take DOT_PRECISION from their launchers
+# ("ieee" here).
+NV_DOT_PRECISION = "ieee"
+
 
 def cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -91,7 +103,11 @@ def next_power_of_2(n: int) -> int:
         for BS in BS_LIST
         for num_warps in [2, 4, 8]
     ],
-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
+    # S/B dropped from the key (upstream had them): the serving prefill sees
+    # a new S every prompt, and an S-keyed autotune re-benchmarks all six
+    # configs per new length. S only feeds strides (runtime args); B/H-scale
+    # tile choice does not depend on it.
+    key=["H", "BT", "IS_VARLEN", "REVERSE"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_vector_kernel(
@@ -770,25 +786,25 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
         )
         b_w = tl.load(p_w, boundary_check=(0, 1))
-        b_v = tl.dot(b_w, tl.trans(b_h1).to(b_w.dtype))
+        b_v = tl.dot(b_w, tl.trans(b_h1).to(b_w.dtype), input_precision=NV_DOT_PRECISION)
         if K > 64:
             p_w = tl.make_block_ptr(
                 w, (T, K), (stride_w, 1), (i_t * BT, 64), (BT, 64), (1, 0)
             )
             b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v += tl.dot(b_w, tl.trans(b_h2).to(b_w.dtype))
+            b_v += tl.dot(b_w, tl.trans(b_h2).to(b_w.dtype), input_precision=NV_DOT_PRECISION)
         if K > 128:
             p_w = tl.make_block_ptr(
                 w, (T, K), (stride_w, 1), (i_t * BT, 128), (BT, 64), (1, 0)
             )
             b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v += tl.dot(b_w, tl.trans(b_h3).to(b_w.dtype))
+            b_v += tl.dot(b_w, tl.trans(b_h3).to(b_w.dtype), input_precision=NV_DOT_PRECISION)
         if K > 192:
             p_w = tl.make_block_ptr(
                 w, (T, K), (stride_w, 1), (i_t * BT, 192), (BT, 64), (1, 0)
             )
             b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v += tl.dot(b_w, tl.trans(b_h4).to(b_w.dtype))
+            b_v += tl.dot(b_w, tl.trans(b_h4).to(b_w.dtype), input_precision=NV_DOT_PRECISION)
         p_v = tl.make_block_ptr(
             v, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
         )
@@ -872,25 +888,25 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_h1 += tl.trans(tl.dot(b_k, b_v))
+        b_h1 += tl.trans(tl.dot(b_k, b_v, input_precision=NV_DOT_PRECISION))
         if K > 64:
             p_k = tl.make_block_ptr(
                 k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h2 += tl.trans(tl.dot(b_k, b_v))
+            b_h2 += tl.trans(tl.dot(b_k, b_v, input_precision=NV_DOT_PRECISION))
         if K > 128:
             p_k = tl.make_block_ptr(
                 k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h3 += tl.trans(tl.dot(b_k, b_v))
+            b_h3 += tl.trans(tl.dot(b_k, b_v, input_precision=NV_DOT_PRECISION))
         if K > 192:
             p_k = tl.make_block_ptr(
                 k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h4 += tl.trans(tl.dot(b_k, b_v))
+            b_h4 += tl.trans(tl.dot(b_k, b_v, input_precision=NV_DOT_PRECISION))
     # epilogue
     if STORE_FINAL_STATE:
         p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
@@ -1072,11 +1088,11 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
         b_kt = tl.load(b_kt, boundary_check=(0, 1))
         # [BC, BC]
         b_ktg = b_kt * exp2(b_gn[:, None] - b_gk)
-        b_A += tl.dot(b_k, b_ktg)
+        b_A += tl.dot(b_k, b_ktg, input_precision=NV_DOT_PRECISION)
 
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_qg = b_q * exp2(b_g - b_gn[None, :]) * scale
-        b_Aqk += tl.dot(b_qg, b_ktg)
+        b_Aqk += tl.dot(b_qg, b_ktg, input_precision=NV_DOT_PRECISION)
 
     b_A *= b_b[:, None]
 
@@ -1300,7 +1316,7 @@ def chunk_gla_fwd_kernel_o(
         # [BV, BK]
         b_h = tl.load(p_h, boundary_check=(0, 1))
         # [BT, BV]
-        b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
+        b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype), input_precision=NV_DOT_PRECISION)
     p_v = tl.make_block_ptr(
         v + (bos * H + i_h) * V,
         (T, V),
