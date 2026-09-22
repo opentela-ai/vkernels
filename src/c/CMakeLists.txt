@@ -181,7 +181,7 @@ if(VKERNELS_HAS_HIP)
     endif()
     unset(_vk_hip_root)
   endif()
-  target_include_directories(vkernels PRIVATE
+  target_include_directories(vkernels SYSTEM PRIVATE
     ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
   target_sources(vkernels
     PRIVATE
