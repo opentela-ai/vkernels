@@ -60,6 +60,7 @@ from vkernels.torch_ops.vllm_kda import (
     next_power_of_2,
 )
 
+from vkernels.torch_ops.tuning_cache import persistent_autotune
 from vkernels.torch_ops._kda_kernels_common import (
     recompute_w_u_fwd_kernel,
     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra,
@@ -136,11 +137,13 @@ BT_LIST = [8, 16, 32, 64, 128]
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
 
 
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]
     ],
     key=["D"],
+    kernel_name='l2norm_fwd_kernel1',
+    source_files=[__file__],
 )
 @triton.jit
 def l2norm_fwd_kernel1(
@@ -165,13 +168,15 @@ def l2norm_fwd_kernel1(
     tl.store(y + cols, b_y, mask=mask)
 
 
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({"BT": BT}, num_warps=num_warps)
         for num_warps in [1, 2, 4, 8, 16]
         for BT in BT_LIST
     ],
     key=["D"],
+    kernel_name='l2norm_fwd_kernel',
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["NB"])
 def l2norm_fwd_kernel(
@@ -1073,7 +1078,7 @@ def fused_recurrent_kda(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64]
@@ -1081,6 +1086,8 @@ def fused_recurrent_kda(
         for num_stages in [2, 3, 4]
     ],
     key=["BC"],
+    kernel_name='chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter',
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
@@ -1325,7 +1332,7 @@ def recompute_w_u_fwd(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64]
@@ -1334,6 +1341,8 @@ def recompute_w_u_fwd(
         for num_stages in [2, 3, 4]
     ],
     key=["BT"],
+    kernel_name='chunk_gla_fwd_kernel_o',
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -1490,13 +1499,15 @@ def chunk_gla_fwd_o_gk(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({"BD": BD}, num_warps=num_warps)
         for BD in [32, 64]
         for num_warps in [2, 4, 8]
     ],
     key=["H", "D", "BT", "IS_VARLEN"],
+    kernel_name='kda_gate_cumsum_fwd_kernel',
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def kda_gate_cumsum_fwd_kernel(
@@ -1868,7 +1879,7 @@ def chunk_kda_with_fused_gate(
     return o, final_state
 
 
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)
         for bt in BT_LIST_AUTOTUNE
@@ -1876,6 +1887,8 @@ def chunk_kda_with_fused_gate(
         for ns in [2, 3]
     ],
     key=["H", "D"],
+    kernel_name='kda_gate_fwd_kernel',
+    source_files=[__file__],
 )
 @triton.jit
 def kda_gate_fwd_kernel(
@@ -2258,3 +2271,46 @@ def solve_tril_t34(A: torch.Tensor, output_dtype: torch.dtype = torch.float):
         USE_TMA=False, DOT_PRECISION=FLA_TRIL_PRECISION,
     )
     return Ai
+
+
+# ---------------------------------------------------------------------------
+# tuning-cache sweep driver (registry: "kda_chunk_amd")
+# ---------------------------------------------------------------------------
+
+def kda_tune(device="cuda"):
+    """Drive the persistent-autotune sweeps across the KDA pipelines (ROCm).
+
+    The tuner's registry entry (``vkernels.torch_ops.tuner``) calls this.
+    The chunked launches exercise this module's autotuned chunk kernels
+    plus the two shared ones from ``_kda_kernels_common``; the decode
+    launch exercises ``fused_recurrent_kda_fwd_kernel`` and the l2norm
+    pair. With the tuning cache enabled each kernel's per-key winner
+    lands in its own store file.
+    """
+    import torch
+
+    swept = []
+    for T in (256, 1024):
+        b, h, k_dim, v_dim = 2, 4, 128, 128
+        q = torch.randn(b, T, h, k_dim, device=device, dtype=torch.bfloat16)
+        kt = torch.randn(b, T, h, k_dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn(b, T, h, v_dim, device=device, dtype=torch.bfloat16)
+        q = q / q.float().norm(dim=-1, keepdim=True).to(q.dtype)
+        kt = kt / kt.float().norm(dim=-1, keepdim=True).to(kt.dtype)
+        g = -torch.rand(b, T, h, k_dim, device=device, dtype=torch.float32) * 3.0
+        beta = torch.rand(b, T, h, device=device, dtype=torch.bfloat16)
+        chunk_kda(q=q, k=kt, v=v, g=g, beta=beta)
+        torch.cuda.synchronize(device)
+        swept.append((torch.cuda.current_device(), T))
+    # decode path: fused_recurrent over a short accept window
+    b, h, k_dim, v_dim = 1, 8, 128, 128
+    for T in (1, 8):
+        q = torch.randn(b, T, h, k_dim, device=device, dtype=torch.bfloat16)
+        kt = torch.randn(b, T, h, k_dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn(b, T, h, v_dim, device=device, dtype=torch.bfloat16)
+        g = -torch.rand(b, T, h, k_dim, device=device, dtype=torch.float32) * 3.0
+        beta = torch.rand(b, T, h, device=device, dtype=torch.bfloat16)
+        fused_recurrent_kda(q=q, k=kt, v=v, g=g, beta=beta)
+        torch.cuda.synchronize(device)
+        swept.append((torch.cuda.current_device(), "decode", T))
+    return swept

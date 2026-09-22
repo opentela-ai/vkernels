@@ -13,10 +13,19 @@ backends cannot drift apart. House rules:
   every NV launch fail with "missing 2 required positional arguments". The
   dict keys off the launcher's ``qg``/``kg`` arguments — identical semantics
   on both backends.
+* The ``@triton.autotune`` layers are ``persistent_autotune``
+  (:mod:`.tuning_cache`): same configs, same keys, but the sweep winner
+  persists per device in the tuning store, so a warm process replays it
+  instead of re-benchmarking. ``VKERNELS_TUNING_CACHE=off`` restores
+  in-process-only autotune. The dedup parity lock
+  (``tests/python/test_vllm_kda.py::test_shared_kernels_are_the_same_objects``)
+  pins object identity, which this swap preserves.
 """
 
 import triton
 import triton.language as tl
+
+from .tuning_cache import persistent_autotune
 
 @triton.jit
 def exp2(x):
@@ -24,9 +33,11 @@ def exp2(x):
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@persistent_autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
     key=["BK", "BT"],
+    kernel_name="kda_scaled_dot_kkt_intra_sub_intra",
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
@@ -126,13 +137,15 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+    kernel_name="kda_recompute_w_u",
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(

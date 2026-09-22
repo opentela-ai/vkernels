@@ -229,6 +229,8 @@ class Tunable:
     sweep: str | None = None  # triton: "module:callable" driving the sweep
     bench: str | None = None  # native: meta/benchmarks executable (persist-capable)
     persists: bool = True     # False: the harness cannot write the store yet
+    store_names: tuple[str, ...] = ()  # triton: store files a pipeline sweep
+                                      # fills (defaults to (name,))
 
 
 REGISTRY = (
@@ -246,6 +248,51 @@ REGISTRY = (
         "dsa_sparse_fwd_split_for", "native", toolkit="hip",
         description="DSA sparse-MLA split_kv selector (issue #137 optima)",
         bench="dsa_bench_split137", persists=False,
+    ),
+    Tunable(
+        "glm_projection", "triton",
+        "GLM decode projection GEMV+reduce; keys are (N,K,TOKENS,DEVICE)",
+        sweep="vkernels.torch_ops.glm_projection:glm_projection_tune",
+    ),
+    Tunable(
+        "qkv_projection", "triton",
+        "QKV decode projection GEMV; keys are (TOKENS,DEVICE)",
+        sweep="vkernels.torch_ops.qkv_projection:qkv_projection_tune",
+    ),
+    Tunable(
+        "kda_chunk_nv", "triton", toolkit="cuda",
+        description=(
+            "chunked-KDA pipeline (NVIDIA): one end-to-end sweep populates "
+            "the store files for chunk_local_cumsum_vector_kernel, "
+            "solve_tril_16x16_kernel, merge_16x16_to_{32,64}x64_inverse_kernel, "
+            "chunk_gated_delta_rule_fwd_kernel_h_blockdim64, "
+            "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_{intra,inter}, "
+            "kda_recompute_w_u, chunk_gla_fwd_kernel_o"),
+        sweep="vkernels.torch_ops.vllm_kda:kda_tune",
+        store_names=(
+            "chunk_local_cumsum_vector_kernel", "solve_tril_16x16_kernel",
+            "merge_16x16_to_32x32_inverse_kernel",
+            "merge_16x16_to_64x64_inverse_kernel",
+            "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+            "kda_scaled_dot_kkt_intra_sub_intra",
+            "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter",
+            "kda_recompute_w_u", "chunk_gla_fwd_kernel_o",
+        ),
+    ),
+    Tunable(
+        "kda_chunk_amd", "triton", toolkit="hip",
+        description=(
+            "KDA pipelines (ROCm): chunked sweep populates the AMD chunk "
+            "kernel stores (incl. the shared ones) + l2norm_fwd_kernel{,1} "
+            "and fused_recurrent_kda_fwd_kernel on the decode leg"),
+        sweep="vkernels.torch_ops.vllm_kda_amd:kda_tune",
+        store_names=(
+            "l2norm_fwd_kernel1", "l2norm_fwd_kernel",
+            "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter",
+            "chunk_gla_fwd_kernel_o", "kda_gate_cumsum_fwd_kernel",
+            "kda_gate_fwd_kernel", "kda_scaled_dot_kkt_intra_sub_intra",
+            "kda_recompute_w_u",
+        ),
     ),
 )
 
@@ -279,6 +326,22 @@ def _resolve_sweep(spec: str):
     return getattr(importlib.import_module(module_name), attr)
 
 
+def _toolkit_mismatch(toolkit: str) -> str | None:
+    """Reason string when ``toolkit`` cannot run on this host, else None."""
+    if toolkit == "any":
+        return None
+    try:
+        import torch
+
+        is_hip = bool(torch.version.hip)
+    except Exception:
+        return f"{toolkit} toolkit unavailable (no torch)"
+    if (toolkit == "hip") != is_hip:
+        return (f"sweep needs {toolkit}; this torch is "
+                + ("ROCm" if is_hip else "CUDA"))
+    return None
+
+
 def tune(names=(), *, store_dir=None, all=False) -> list[dict]:
     """Run the sweep for the named (or all) registry kernels.
 
@@ -308,14 +371,29 @@ def tune(names=(), *, store_dir=None, all=False) -> list[dict]:
                     row.update(ok=True, skipped=True, detail=(
                         "skipped: sweep harness does not write the store yet "
                         f"({entry.bench}, {entry.toolkit} on-site step)"))
-                else:
-                    row.update(ok=False, detail=(
-                        "sweep harness does not write the store yet "
-                        f"({entry.bench}, {entry.toolkit} on-site step)"))
-            elif entry.tier == "triton":
+                    reports.append(row)
+                    continue
+                row.update(ok=False, detail=(
+                    "sweep harness does not write the store yet "
+                    f"({entry.bench}, {entry.toolkit} on-site step)"))
+                reports.append(row)
+                continue
+            mismatch = _toolkit_mismatch(entry.toolkit)
+            if mismatch is not None:
+                if all:
+                    row.update(ok=True, skipped=True, detail=f"skipped: {mismatch}")
+                    reports.append(row)
+                    continue
+                row.update(ok=False, detail=mismatch)
+                reports.append(row)
+                continue
+            if entry.tier == "triton":
                 _resolve_sweep(entry.sweep)()
-                n = _triton_record_count(entry.name, store)
-                row.update(ok=True, detail=f"{n} record(s) in {store}")
+                names = entry.store_names or (entry.name,)
+                n = sum(_triton_record_count(name, store) for name in names)
+                row.update(ok=True, detail=(
+                    f"{n} record(s) in {store}" + ("" if len(names) == 1
+                    else f" across {len(names)} kernel store(s)")))
             else:
                 binary = find_bench_binary(entry.bench)
                 if binary is None:
