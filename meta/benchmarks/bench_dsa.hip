@@ -391,6 +391,20 @@ static void tile_sweep(const GpuInfo& info, hipEvent_t start, hipEvent_t stop,
     }
     std::printf("    best: BQ=%d (%.1f us)%s\n", best_bq, best_us,
                 best_bq == fbq ? "  formula agrees" : "  OVERRIDE");
+    if (vkernels::core::tuning::enabled()) {
+      // Read-back: what the dispatch override in dsa.hip will select on
+      // the next run with this store (the record a --persist pass wrote,
+      // or a previously shipped sidecar).
+      if (const auto* e = vkernels::core::tuning::find(
+              "dsa_sparse_fwd_tile", {S_q, H, dim, tail_dim, topk})) {
+        const auto *b = e->find("bq"), *pbi = e->find("block_I"),
+                   *pii = e->find("inner_iter");
+        if (b && pbi && pii)
+          std::printf("    store read-back: dispatch would use"
+                      " bq=%lld block_I=%lld inner_iter=%lld\n", *b, *pbi,
+                      *pii);
+      }
+    }
     if (do_persist) {
       vkernels::core::tuning::persist(
           "dsa_sparse_fwd_tile", {S_q, H, dim, tail_dim, topk},
