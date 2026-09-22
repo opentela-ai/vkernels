@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "vkernels/core/tuning.hpp"
 #include "vkernels/kernels/dsa.hpp"
 
 static void check_hip(hipError_t err, const char* ctx) {
