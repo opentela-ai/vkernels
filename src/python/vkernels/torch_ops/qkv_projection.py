@@ -5,7 +5,6 @@ three projections with FP32 tree reductions and rounds the concatenated
 Q/K/V result once to BF16. Reduction order can differ from BLAS.
 
 Torch and Triton load lazily. Warm up each device/row-count eagerly before
-Torch and Triton load lazily. Warm up each device/row-count eagerly before
 capture. Eight configurations are autotuned on first launch; with the tuning
 cache the winner persists per device (``tuning_cache.py``), so a fresh process
 replays the stored choice. Inputs are read-only, and this inference-only

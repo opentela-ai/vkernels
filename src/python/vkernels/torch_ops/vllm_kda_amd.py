@@ -1053,6 +1053,14 @@ def fused_recurrent_kda(
         )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if initial_state is None:
+        # Same convention as chunk_kda: a missing state is a zero state
+        # (fp32 [B, HV, V, K]). The bare-None default previously crashed
+        # inside fused_recurrent_kda_fwd (inplace_final_state=True does
+        # initial_state.stride(0) unconditionally).
+        initial_state = q.new_zeros(
+            q.shape[0], q.shape[2], v.shape[-1], k.shape[-1],
+            dtype=torch.float32)
 
     o, final_state = fused_recurrent_kda_fwd(
         q=q.contiguous(),
@@ -2283,8 +2291,9 @@ def kda_tune(device="cuda"):
     The tuner's registry entry (``vkernels.torch_ops.tuner``) calls this.
     The chunked launches exercise this module's autotuned chunk kernels
     plus the two shared ones from ``_kda_kernels_common``; the decode
-    launch exercises ``fused_recurrent_kda_fwd_kernel`` and the l2norm
-    pair. With the tuning cache enabled each kernel's per-key winner
+    launch is a smoke check only (its kernel has a fixed config, and the
+    l2norm pair is not reached by this driver). With the tuning cache
+    enabled each kernel's per-key winner
     lands in its own store file.
     """
     import torch

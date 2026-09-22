@@ -250,6 +250,23 @@ REGISTRY = (
         bench="dsa_bench_split137", persists=False,
     ),
     Tunable(
+        "dsa_sparse_fwd_tile", "native", toolkit="hip",
+        description=(
+            "DSA sparse-MLA launch tile (bq; block_I/inner_iter reserved "
+            "for the tiled-key kernel); prefill pinning + future-proofing"),
+        bench="dsa_bench",
+    ),
+    Tunable(
+        "mla_fwd_split_for", "native", toolkit="hip",
+        description="MLA decode split-K selector (issue #82)",
+        bench="mla_bench",
+    ),
+    Tunable(
+        "glm_fp8_gemv_pick_sk", "native", toolkit="hip",
+        description="GLM MoE fp8 GEMV split-K pick (host arithmetic)",
+        bench="glm_fp8_gemv_bench",
+    ),
+    Tunable(
         "glm_projection", "triton",
         "GLM decode projection GEMV+reduce; keys are (N,K,TOKENS,DEVICE)",
         sweep="vkernels.torch_ops.glm_projection:glm_projection_tune",
@@ -264,14 +281,15 @@ REGISTRY = (
         description=(
             "chunked-KDA pipeline (NVIDIA): one end-to-end sweep populates "
             "the store files for chunk_local_cumsum_vector_kernel, "
-            "solve_tril_16x16_kernel, merge_16x16_to_{32,64}x64_inverse_kernel, "
+            "merge_16x16_to_64x64_inverse_kernel, "
             "chunk_gated_delta_rule_fwd_kernel_h_blockdim64, "
             "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_{intra,inter}, "
-            "kda_recompute_w_u, chunk_gla_fwd_kernel_o"),
+            "kda_recompute_w_u, chunk_gla_fwd_kernel_o (the sweep runs at "
+            "FLA_CHUNK_SIZE=64, so the BT=16/32 solve_tril kernels are NOT "
+            "reached and their stores stay empty)"),
         sweep="vkernels.torch_ops.vllm_kda:kda_tune",
         store_names=(
-            "chunk_local_cumsum_vector_kernel", "solve_tril_16x16_kernel",
-            "merge_16x16_to_32x32_inverse_kernel",
+            "chunk_local_cumsum_vector_kernel",
             "merge_16x16_to_64x64_inverse_kernel",
             "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
             "kda_scaled_dot_kkt_intra_sub_intra",
@@ -283,14 +301,14 @@ REGISTRY = (
         "kda_chunk_amd", "triton", toolkit="hip",
         description=(
             "KDA pipelines (ROCm): chunked sweep populates the AMD chunk "
-            "kernel stores (incl. the shared ones) + l2norm_fwd_kernel{,1} "
-            "and fused_recurrent_kda_fwd_kernel on the decode leg"),
+            "kernel stores (incl. the shared ones). The decode-leg launch "
+            "is a smoke check only -- fused_recurrent's kernel has a fixed "
+            "config (not autotuned), and the l2norm/gate kernels are not "
+            "reached by this driver"),
         sweep="vkernels.torch_ops.vllm_kda_amd:kda_tune",
         store_names=(
-            "l2norm_fwd_kernel1", "l2norm_fwd_kernel",
             "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter",
-            "chunk_gla_fwd_kernel_o", "kda_gate_cumsum_fwd_kernel",
-            "kda_gate_fwd_kernel", "kda_scaled_dot_kkt_intra_sub_intra",
+            "chunk_gla_fwd_kernel_o", "kda_scaled_dot_kkt_intra_sub_intra",
             "kda_recompute_w_u",
         ),
     ),
@@ -389,11 +407,11 @@ def tune(names=(), *, store_dir=None, all=False) -> list[dict]:
                 continue
             if entry.tier == "triton":
                 _resolve_sweep(entry.sweep)()
-                names = entry.store_names or (entry.name,)
-                n = sum(_triton_record_count(name, store) for name in names)
+                store_files = entry.store_names or (entry.name,)
+                n = sum(_triton_record_count(k, store) for k in store_files)
                 row.update(ok=True, detail=(
-                    f"{n} record(s) in {store}" + ("" if len(names) == 1
-                    else f" across {len(names)} kernel store(s)")))
+                    f"{n} record(s) in {store}" + ("" if len(store_files) == 1
+                    else f" across {len(store_files)} kernel store(s)")))
             else:
                 binary = find_bench_binary(entry.bench)
                 if binary is None:
@@ -465,7 +483,11 @@ def status(*, store_dir=None) -> dict:
 
     registry_rows = []
     for entry in REGISTRY:
-        stored = [f for f in files[entry.tier] if f["kernel"] == entry.name]
+        # Pipeline sweeps write store files named after entry.store_names,
+        # not the registry name -- match on the full set so "tuned" is
+        # honest for them (kda_chunk_nv etc.).
+        wanted = set(entry.store_names or (entry.name,))
+        stored = [f for f in files[entry.tier] if f["kernel"] in wanted]
         registry_rows.append({
             "name": entry.name,
             "tier": entry.tier,
@@ -483,11 +505,17 @@ def status(*, store_dir=None) -> dict:
 
 
 def _triton_doc(path: Path) -> dict:
-    """The records dict of a Triton-tier store (lenient about schemas)."""
-    doc = json.loads(path.read_text())
+    """The records dict of a Triton-tier store (lenient about schemas AND
+    about byte corruption: a truncated/hand-edited file is a miss + fresh
+    re-tune, never a crash on the kernel-launch hot path -- the module's
+    own "lenient by design" contract)."""
+    try:
+        doc = json.loads(path.read_text())
+    except ValueError:
+        return {}
     if doc.get("schema") != "vk-tuning-store/1":
         return {}
-    return doc["records"]
+    return doc.get("records", {})
 
 
 def clear(names=(), *, store_dir=None, all=False) -> list[dict]:
@@ -497,10 +525,15 @@ def clear(names=(), *, store_dir=None, all=False) -> list[dict]:
     rows = []
     for name in targets:
         removed = {"triton": False, "native": False}
-        for suffix, tier in ((".json", "triton"), (".tune", "native")):
-            for path in store.glob(f"{name}.*{suffix}"):
-                path.unlink()
-                removed[tier] = True
+        # Pipeline sweeps write files named after their per-kernel
+        # store_names, so clearing the registry entry must cover those too.
+        entry = next((t for t in REGISTRY if t.name == name), None)
+        kernels = (entry.store_names or (name,)) if entry else (name,)
+        for kernel in kernels:
+            for suffix, tier in ((".json", "triton"), (".tune", "native")):
+                for path in store.glob(f"{kernel}.*{suffix}"):
+                    path.unlink()
+                    removed[tier] = True
         rows.append({"name": name, "cleared": any(removed.values()),
                      "tiers": [t for t, hit in removed.items() if hit]})
     return rows

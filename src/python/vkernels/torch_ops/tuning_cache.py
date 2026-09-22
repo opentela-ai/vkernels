@@ -26,7 +26,7 @@ source. This module keeps the sweep's winner:
   (``TRITON_CACHE_DIR``) is orthogonal and unaffected.
 
 Concurrency: writes are atomic (temp file + ``os.replace``); concurrent
-sweeps last-writer-wins per key, which is benign for benchmark winners.
+sweeps last-writer-wins per FILE (each writer rewrites the whole file from its own snapshot; records other processes added in the meantime are dropped), which is benign for benchmark winners.
 Torch and Triton load lazily and only when a GPU-touching API is called;
 store plumbing (record/lookup/schema) is testable without either.
 """
@@ -324,19 +324,35 @@ class PersistentAutotuner:
         record = self._cache.lookup(key)
         if record is not None:
             return self._config_from_record(record)
-        import triton
-
-        bench = self._bench or triton.testing.do_bench
-        best, best_ms = None, float("inf")
-        for config in self.configs:
-            call = self._GridCall(self, grid, args, kwargs, config)
-            time_ms = bench(call)
-            if time_ms < best_ms:
-                best, best_ms = config, time_ms
+        best, best_ms = self._bench_all(grid, args, kwargs, self.configs)
         self._cache.record(
             key, kwargs=dict(best.kwargs), num_warps=best.num_warps,
             num_stages=best.num_stages, time_ms=best_ms)
         return best
+
+    def _bench_all(self, grid, args, kwargs, configs):
+        """Benchmark every candidate config, pruning the ones that cannot
+        run on this device (e.g. OutOfResources against the shared-memory
+        cap, a compile error on one shape). A config that fails to launch
+        is a poor fit for this device, not a sweep failure -- skipping it
+        keeps first-run tuning resilient across devices. Raises only when
+        NO config can run (the underlying error is surfaced unchanged)."""
+        import triton
+
+        bench = self._bench or triton.testing.do_bench
+        best, best_ms, last_err = None, float("inf"), None
+        for config in configs:
+            call = self._GridCall(self, grid, args, kwargs, config)
+            try:
+                time_ms = bench(call)
+            except Exception as err:  # prune this config, keep sweeping
+                last_err = err
+                continue
+            if time_ms < best_ms:
+                best, best_ms = config, time_ms
+        if best is None:
+            raise last_err
+        return best, best_ms
 
     class _GridCall:
         """``self.fn[grid](...)`` binding that re-evaluates a callable grid
@@ -372,16 +388,7 @@ class PersistentAutotuner:
             if tuning_enabled():
                 config = self._pick(key, grid, args, kwargs)
             else:  # off switch: time every config, keep nothing
-                import triton
-
-                bench = self._bench or triton.testing.do_bench
-                best, best_ms = None, float("inf")
-                for candidate in self.configs:
-                    call = self._GridCall(self, grid, args, kwargs, candidate)
-                    time_ms = bench(call)
-                    if time_ms < best_ms:
-                        best, best_ms = candidate, time_ms
-                config = best
+                config, _ = self._bench_all(grid, args, kwargs, self.configs)
             self.cache[key] = config
         launch = dict(config.kwargs)
         launch["num_warps"] = config.num_warps
