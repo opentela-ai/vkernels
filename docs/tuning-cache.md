@@ -58,13 +58,17 @@ vkl tune run <name>|--all     # sweep and persist (in-process for Triton, bench 
 vkl tune clear <name>|--all   # delete stored configs (both tiers)
 ```
 
-`status` output on a tuned GB10:
+`status` output on a tuned GB10 (plain formatter; with
+[rich](https://rich.readthedocs.io/) installed the same report renders
+as aligned tables — the CLI uses rich when importable and falls back to
+the stdlib formatter otherwise, mirroring `_backend.py`'s fallback
+pattern):
 
 ```
 store: ~/.cache/vkernels/tuning  arch: sm121  enabled
   tier    kernel                           arch       records  path
-  triton  mhc_projection                   sm121            2  .../mhc_projection.sm121.json
-  native  dsa_topk_logits_split_for        sm121            4  .../dsa_topk_logits_split_for.sm121.tune
+  triton  mhc_projection                   sm121            2  mhc_projection.sm121.json
+  native  dsa_topk_logits_split_for        sm121            4  dsa_topk_logits_split_for.sm121.tune
   registry:
     triton  mhc_projection                   tuned         mHC projection (BF16 GEMV+reduce); ...
     native  dsa_topk_logits_split_for        tuned         DSA indexer split_kv selector ...

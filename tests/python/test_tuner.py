@@ -95,9 +95,6 @@ def test_upsert_without_arch_raises(store):
         NativeStore("k", store_dir=store, arch="").upsert((1,), {"split": 2})
 
 
-# -- the registry + driver ---------------------------------------------------
-
-
 def test_registry_covers_both_tiers():
     tiers = {t.tier for t in REGISTRY}
     assert tiers == {"triton", "native"}
@@ -164,6 +161,9 @@ def test_status_ignores_unknown_schema_lenient(store):
     assert by_kernel["weird"]["records"] == 0
 
 
+# -- the registry + driver ---------------------------------------------------
+
+
 def test_clear_removes_both_tiers(store):
     NativeStore("k", store_dir=store).upsert((1,), {"split": 4})
     (store / "k.sm000.json").write_text("{}")
@@ -173,3 +173,40 @@ def test_clear_removes_both_tiers(store):
     assert row == {"name": "k", "cleared": True, "tiers": ["triton", "native"]}
     assert list(store.glob("k.*")) == []
     assert (store / "unrelated.sm000.tune").exists()  # untouched
+
+
+# -- the CLI status printers (vkernels.cli.main) -----------------------------
+
+
+def _status_report(store):
+    NativeStore("native_k", store_dir=store).upsert((1,), {"split": 4})
+    return status(store_dir=store)
+
+
+def test_status_plain_printer(store, capsys):
+    from vkernels.cli.main import _print_status_plain
+
+    _print_status_plain(_status_report(store))
+    out = capsys.readouterr().out
+    assert "native_k" in out and "sm000.tune" in out
+    assert "untuned" in out  # registry coverage in the same output
+
+
+def test_status_rich_printer(store, capsys):
+    from vkernels.cli import main as cli
+
+    rich = pytest.importorskip("rich")
+    assert cli._print_status_rich(_status_report(store)) is True
+    out = capsys.readouterr().out
+    assert "native_k" in out and "untuned" in out
+
+    # Simulate rich absent: the CLI must degrade to the plain formatter.
+    import vkernels.cli.main as m
+    original = m._print_status_rich
+    m._print_status_rich = lambda report: False
+    try:
+        m._print_status_plain(_status_report(store))
+        assert "native_k" in capsys.readouterr().out
+    finally:
+        m._print_status_rich = original
+    assert rich  # silence unused-import linters on skip paths

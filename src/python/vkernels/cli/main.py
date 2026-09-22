@@ -189,6 +189,80 @@ def _cmd_info(root: Path, name: str) -> int:
     return 0
 
 
+def _status_rows(report: dict) -> tuple[list[tuple], list[tuple]]:
+    """The status report flattened into display rows (shared by both printers).
+
+    Paths display as the bare filename: every artifact lives in the store
+    printed in the header, and long absolute paths wrap badly in narrow
+    consoles. The full paths are in the report (and ``--json``).
+    """
+    store_rows = [
+        (s["tier"], s["kernel"], s["file_arch"], s["records"], Path(s["path"]).name)
+        for s in report["stores"]
+    ]
+    registry_rows = []
+    for r in report["registry"]:
+        state = "tuned" if r["tuned"] else \
+            ("formula-only" if not r["persists"] else "untuned")
+        registry_rows.append((r["tier"], r["name"], state, r["detail"]))
+    return store_rows, registry_rows
+
+
+def _print_status_plain(report: dict) -> None:
+    """The stdlib formatter — no third-party imports, always available."""
+    print(f"store: {report['store']}  arch: {report['arch'] or '(none)'}"
+          f"  {'enabled' if report['enabled'] else 'OFF'}")
+    store_rows, registry_rows = _status_rows(report)
+    print(f"  {'tier':<7} {'kernel':<32} {'arch':<10} {'records':>7}  path")
+    for tier, kernel, arch, records, path in store_rows:
+        print(f"  {tier:<7} {kernel:<32} {arch:<10} {records:>7}  {path}")
+    if not store_rows:
+        print("  (nothing tuned yet)")
+    print("  registry:")
+    for tier, name, state, detail in registry_rows:
+        print(f"    {tier:<7} {name:<32} {state:<12} {detail}")
+
+
+def _print_status_rich(report: dict) -> bool:
+    """The rich-formatted status tables. False when rich is not installed."""
+    try:
+        from rich.console import Console
+        from rich.table import Table
+    except ImportError:
+        return False
+
+    console = Console(highlight=False)
+    console.print(
+        f"store: {report['store']}  arch: {report['arch'] or '(none)'}  "
+        + ("[green]enabled[/]" if report["enabled"] else "[red]OFF[/]"))
+
+    stores = Table(box=None, pad_edge=False, header_style="bold")
+    stores.add_column("tier", style="cyan")
+    stores.add_column("kernel")
+    stores.add_column("arch", style="dim")
+    stores.add_column("records", justify="right")
+    stores.add_column("path", style="dim")
+    for tier, kernel, arch, records, path in _status_rows(report)[0]:
+        stores.add_row(tier, kernel, arch, str(records), path)
+    if stores.row_count:
+        console.print(stores)
+    else:
+        console.print("  (nothing tuned yet)")
+
+    registry = Table(
+        box=None, pad_edge=False, header_style="bold", title="registry",
+        title_justify="left", title_style="bold")
+    registry.add_column("tier", style="cyan")
+    registry.add_column("name")
+    registry.add_column("state", justify="right")
+    registry.add_column("detail", style="dim", overflow="fold")
+    for tier, name, state, detail in _status_rows(report)[1]:
+        color = {"tuned": "green", "untuned": "yellow"}.get(state, "dim")
+        registry.add_row(tier, name, f"[{color}]{state}[/]", detail)
+    console.print(registry)
+    return True
+
+
 def _cmd_tune(args: argparse.Namespace) -> int:
     # Imported lazily: the tuner pulls the tuning-cache module, and torch
     # only when a device query or Triton sweep needs it.
@@ -200,19 +274,9 @@ def _cmd_tune(args: argparse.Namespace) -> int:
         if getattr(args, "json", False):
             print(json.dumps(report, indent=2))
             return 0
-        print(f"store: {report['store']}  arch: {report['arch'] or '(none)'}"
-              f"  {'enabled' if report['enabled'] else 'OFF'}")
-        print(f"  {'tier':<7} {'kernel':<32} {'arch':<10} {'records':>7}  path")
-        for s in report["stores"]:
-            print(f"  {s['tier']:<7} {s['kernel']:<32} {s['file_arch']:<10} "
-                  f"{s['records']:>7}  {s['path']}")
-        if not report["stores"]:
-            print("  (nothing tuned yet)")
-        print("  registry:")
-        for r in report["registry"]:
-            mark = "tuned" if r["tuned"] else \
-                ("formula-only" if not r["persists"] else "untuned")
-            print(f"    {r['tier']:<7} {r['name']:<32} {mark:<12} {r['detail']}")
+        if _print_status_rich(report):
+            return 0
+        _print_status_plain(report)
         return 0
     if action == "run":
         if not args.name and not args.all:
