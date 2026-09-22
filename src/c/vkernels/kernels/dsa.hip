@@ -106,7 +106,6 @@ __global__ void dsa_sparse_fwd_kernel(
   const int warp = tid >> 6;           // which query row within the tile
   const int lane = tid & 63;           // strided head index this lane owns
   const int gi = q_tile * BQ + warp;   // global query row
-  if (gi >= S_q) return;
 
   const int W = dim + tail_dim;
   const int d_v = dim - tail_dim;
@@ -125,6 +124,12 @@ __global__ void dsa_sparse_fwd_kernel(
   }
   __syncthreads();
 
+  // Out-of-range rows exit AFTER the staging barrier: the staging loop
+  // above distributes all BQ rows across every warp (r = idx / W spans
+  // warps whenever W > 64), so every warp must help stage sQ even when
+  // S_q < BQ (a store-pinned oversized tile on a decode shape). This
+  // kernel has no later barriers, so exiting here cannot deadlock.
+  if (gi >= S_q) return;
   const float* qrow = &sQ[warp * W];  // this warp's query row (fp32)
   const int32_t* idx_i =
       indices + (size_t)gi * kv_group * topk;  // kv_group == 1 -> gi*topk
@@ -320,7 +325,6 @@ __global__ void dsa_sparse_fwd_partial_kernel(
   const int warp = tid >> 6;           // which query row within the tile
   const int lane = tid & 63;           // strided head index this lane owns
   const int gi = q_tile * BQ + warp;   // global query row
-  if (gi >= S_q) return;
 
   const int W = dim + tail_dim;
   const int d_v = dim - tail_dim;
@@ -345,6 +349,12 @@ __global__ void dsa_sparse_fwd_partial_kernel(
   }
   __syncthreads();
 
+  // Out-of-range rows exit AFTER the staging barrier: the staging loop
+  // above distributes all BQ rows across every warp (r = idx / W spans
+  // warps whenever W > 64), so every warp must help stage sQ even when
+  // S_q < BQ (a store-pinned oversized tile on a decode shape). This
+  // kernel has no later barriers, so exiting here cannot deadlock.
+  if (gi >= S_q) return;
   const float* qrow = &sQ[warp * W];  // this warp's query row (fp32)
   const int32_t* idx_i =
       indices + (size_t)gi * kv_group * topk;  // kv_group == 1 -> gi*topk
@@ -446,7 +456,6 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
   const int warp = tid >> 6;           // which query row within the tile
   const int lane = tid & 63;           // strided head index this lane owns
   const int gi = q_tile * BQ + warp;   // global query row
-  if (gi >= S_q) return;               // whole warp exits: no cross-warp LDS deps
 
   const int W = dim + tail_dim;
   const int d_v = dim - tail_dim;
@@ -473,6 +482,12 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
   }
   __syncthreads();
 
+  // Out-of-range rows exit AFTER the staging barrier: the staging loop
+  // above distributes all BQ rows across every warp (r = idx / W spans
+  // warps whenever W > 64), so every warp must help stage sQ even when
+  // S_q < BQ (a store-pinned oversized tile on a decode shape). This
+  // kernel has no later barriers, so exiting here cannot deadlock.
+  if (gi >= S_q) return;
   uint16_t* sKey = reinterpret_cast<uint16_t*>(sQ + BQ * W);
   int32_t* sIdx = reinterpret_cast<int32_t*>(sKey + (size_t)2 * BQ * kti * W);
 
