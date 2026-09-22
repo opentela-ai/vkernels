@@ -160,6 +160,13 @@ endif()
 
 # HIP sources compile only when ROCm is present.
 if(VKERNELS_HAS_HIP)
+  # Host translation units (core/tuning.cpp) include <hip/hip_runtime.h>
+  # under VKERNELS_HAS_HIP; expose the ROCm headers to the host compiler
+  # too, mirroring the CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES treatment
+  # of the CUDA path above. CMAKE_HIP_TOOLKIT_INCLUDE_DIRECTORIES exists
+  # once enable_language(HIP) has run (CMake 3.21+).
+  target_include_directories(vkernels PRIVATE
+    ${CMAKE_HIP_TOOLKIT_INCLUDE_DIRECTORIES})
   target_sources(vkernels
     PRIVATE
       vkernels/kernels/moe.hip
