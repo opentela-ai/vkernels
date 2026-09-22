@@ -1,9 +1,12 @@
-"""vkl — list and inspect the kernels implemented in the vkernels repository.
+"""vkl — list and inspect the kernels implemented in the vkernels repository,
+and drive their persistent tuning.
 
 Usage (from the repo):
 
     python3 -m vkernels.cli list            # list kernels + comm primitives
     python3 -m vkernels.cli info gemm       # details for one entry
+    python3 -m vkernels.cli tune status     # what is tuned, both tiers
+    python3 -m vkernels.cli tune run --all  # sweep + persist winners
     python3 -m vkernels.cli --version
 
 ``pip install -e ./src`` installs a ``vkl`` console script with the same
@@ -53,6 +56,21 @@ def build_parser() -> argparse.ArgumentParser:
     info_p = sub.add_parser(
         "info", help="show details for one kernel or primitive")
     info_p.add_argument("name", help="kernel or primitive name")
+
+    tune_p = sub.add_parser(
+        "tune", help="persistent launch-config tuning (Triton + native)")
+    tune_sub = tune_p.add_subparsers(dest="tune_command", metavar="ACTION")
+    tune_sub.add_parser("status", help="what is tuned, both tiers") \
+        .add_argument("--json", action="store_true",
+                      help="machine-readable JSON output")
+    run_p = tune_sub.add_parser(
+        "run", help="run the sweep and persist the winners")
+    run_p.add_argument("name", nargs="*", help="registry kernel name")
+    run_p.add_argument("--all", action="store_true", help="tune every entry")
+    clear_p = tune_sub.add_parser(
+        "clear", help="delete stored configs (both tiers)")
+    clear_p.add_argument("name", nargs="*", help="registry kernel name")
+    clear_p.add_argument("--all", action="store_true", help="clear every entry")
     return p
 
 
@@ -171,6 +189,52 @@ def _cmd_info(root: Path, name: str) -> int:
     return 0
 
 
+def _cmd_tune(args: argparse.Namespace) -> int:
+    # Imported lazily: the tuner pulls the tuning-cache module, and torch
+    # only when a device query or Triton sweep needs it.
+    from vkernels.torch_ops import tuner
+
+    action = args.tune_command
+    if action in (None, "status"):
+        report = tuner.status()
+        if getattr(args, "json", False):
+            print(json.dumps(report, indent=2))
+            return 0
+        print(f"store: {report['store']}  arch: {report['arch'] or '(none)'}"
+              f"  {'enabled' if report['enabled'] else 'OFF'}")
+        print(f"  {'tier':<7} {'kernel':<32} {'arch':<10} {'records':>7}  path")
+        for s in report["stores"]:
+            print(f"  {s['tier']:<7} {s['kernel']:<32} {s['file_arch']:<10} "
+                  f"{s['records']:>7}  {s['path']}")
+        if not report["stores"]:
+            print("  (nothing tuned yet)")
+        print("  registry:")
+        for r in report["registry"]:
+            mark = "tuned" if r["tuned"] else \
+                ("formula-only" if not r["persists"] else "untuned")
+            print(f"    {r['tier']:<7} {r['name']:<32} {mark:<12} {r['detail']}")
+        return 0
+    if action == "run":
+        if not args.name and not args.all:
+            run_p_help = "vkl tune run: give kernel name(s) or --all"
+            print(f"vkl: error: {run_p_help}", file=sys.stderr)
+            return 2
+        rows = tuner.tune(args.name, all=args.all)
+        ok = True
+        for r in rows:
+            ok &= r["ok"]
+            print(f"  {'OK ' if r['ok'] else 'FAIL'} {r['tier']:<7} "
+                  f"{r['name']:<32} {r['detail']}")
+        return 0 if ok else 1
+    # clear
+    if not args.name and not args.all:
+        print("vkl tune clear: give kernel name(s) or --all", file=sys.stderr)
+        return 2
+    for r in tuner.clear(args.name, all=args.all):
+        print(f"  cleared {r['name']}: {', '.join(r['tiers']) or 'nothing stored'}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command is None:
@@ -183,4 +247,6 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.command == "list":
         return _cmd_list(root, args)
+    if args.command == "tune":
+        return _cmd_tune(args)
     return _cmd_info(root, args.name)

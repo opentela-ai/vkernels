@@ -78,9 +78,16 @@ def device_fingerprint() -> dict:
     import triton
 
     props = torch.cuda.get_device_properties(0)
-    # HIP exposes gcnArchName (e.g. gfx942:sramecc+:xnack-); NVIDIA falls
-    # back to the compute capability.
-    arch = getattr(props, "gcnArchName", None) or f"sm{props.major}{props.minor}"
+    # The arch token must MATCH the native tier (core/tuning.cpp): HIP
+    # gcnArchName (feature flags stripped), CUDA sm<major><minor>. Torch on
+    # CUDA >= 13 exposes a gcnArchName attribute even on NVIDIA (value: the
+    # marketing name), so it is only trusted under ROCm builds — otherwise
+    # the two tiers would name the same device differently.
+    if torch.version.hip:
+        arch = str(getattr(props, "gcnArchName", "")) or \
+            f"sm{props.major}{props.minor}"
+    else:
+        arch = f"sm{props.major}{props.minor}"
     software = {"torch": torch.__version__, "triton": triton.__version__}
     if torch.version.hip:  # ROCm builds; absent on CUDA builds
         software["hip"] = torch.version.hip

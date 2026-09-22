@@ -121,3 +121,23 @@ def mhc_projection_tuning_metadata():
             for key, config in partial.cache.items()
         ],
     }
+
+
+def mhc_projection_tune(device="cuda"):
+    """Drive the persistent-autotune sweep for every key shape.
+
+    The tuner's registry entry (``vkernels.torch_ops.tuner``) calls this:
+    launching the projection once per ``(device, rows)`` key on synthetic
+    tensors is what triggers the sweep; with the tuning cache enabled the
+    winner of each key lands in the store. Returns the swept keys.
+    """
+    import torch
+
+    swept = []
+    for rows in (1, 2):
+        x = torch.randn(rows, 16384, device=device, dtype=torch.bfloat16)
+        weight = torch.randn(24, 16384, device=device, dtype=torch.bfloat16)
+        mhc_projection(x, weight)
+        torch.cuda.synchronize(device)
+        swept.append((torch.cuda.current_device(), rows))
+    return swept

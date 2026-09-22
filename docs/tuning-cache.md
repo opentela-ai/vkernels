@@ -134,7 +134,35 @@ kernels get tunable knobs.
 Everything here is lenient — a stale/malformed/foreign record is a
 re-tune, never an error (the fail-loud frozen-artifact contract stays in
 `tuning_manifest`, and the auditable Python tier is `torch_ops/`).
-Unit tests: `tests/core/test_tuning.cpp`.
+Unit tests: `tests/core/test_tuning.cpp` (C++) and
+`tests/python/test_tuner.py` (the Python mirror — a sidecar written by
+either tier must parse byte-compatibly in the other).
+
+## One tuner (`vkl tune`)
+
+`torch_ops/tuner.py` is the single surface over both tiers. Its
+`REGISTRY` catalogs every tunable kernel with the artifact that tunes it
+(a sweep callable for Triton kernels, a persist-capable bench binary for
+native ones); the CLI drives it:
+
+```
+vkl tune status               # every store artifact, both tiers + registry coverage
+vkl tune run <name>|--all     # sweep and persist (in-process for Triton, bench for native)
+vkl tune clear <name>|--all   # delete stored configs (both tiers)
+```
+
+Adding a kernel to the tuner means two edits: register it in
+`REGISTRY` (with its sweep hook or bench binary), and make the sweep
+write the store — `@persistent_autotune` for Triton kernels,
+`--persist` in the bench for native ones. Kernels whose harness cannot
+persist yet are cataloged as `formula-only` and skipped with a reason
+rather than mis-run.
+
+The arch token is canonical across tiers: HIP `gcnArchName` (feature
+flags stripped), CUDA `sm<major><minor>` — pinned by
+`VKERNELS_TUNING_ARCH`. (Torch on CUDA >= 13 exposes a `gcnArchName`
+attribute even on NVIDIA; `device_fingerprint()` ignores it there so
+both tiers name a device identically.)
 
 ## Build cache
 
