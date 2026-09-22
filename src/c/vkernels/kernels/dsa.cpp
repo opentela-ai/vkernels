@@ -16,6 +16,7 @@
 #include <limits>
 #include <vector>
 
+#include "vkernels/core/tuning.hpp"
 #include "vkernels/util/error.hpp"
 
 namespace vkernels::kernels {
@@ -325,6 +326,16 @@ bool dsa_topk_logits_fits_lds_wmma(int num_heads, int head_dim, int block,
 }
 
 int dsa_topk_logits_split_for(int batch_size, int max_seq_len, int block) {
+  // Tuning-store override (docs/tuning-cache.md): a measured sweep on this
+  // device arch beats the compiled-in formula. Keys match the formula's
+  // arguments so the persisted record is self-describing.
+  if (core::tuning::enabled()) {
+    if (const auto* entry = core::tuning::find(
+            "dsa_topk_logits_split_for",
+            {batch_size, max_seq_len, block}))
+      if (const long long* split = entry->find("split"))
+        return static_cast<int>(*split);
+  }
   // gfx942 (MI300A) CU count (hipDeviceProp_t::multiProcessorCount,
   // verified on a CSCS beverin node). Raise alongside the fp8-Q variant's
   // cap (dsa_topk_logits_fits_lds_fp8q) + tiled-key/MFMA for devices with
@@ -339,6 +350,15 @@ int dsa_topk_logits_split_for(int batch_size, int max_seq_len, int block) {
 
 int dsa_sparse_fwd_split_for(int S_q, int H, int topk, int block_I,
                              int num_cu) {
+  // Tuning-store override (docs/tuning-cache.md), consulted before every
+  // heuristic branch below — the persisted sweep result is ground truth
+  // for this device arch, including the prefill early-out.
+  if (core::tuning::enabled()) {
+    if (const auto* entry = core::tuning::find(
+            "dsa_sparse_fwd_split_for", {S_q, H, topk, block_I, num_cu}))
+      if (const long long* split = entry->find("split"))
+        return static_cast<int>(*split);
+  }
   // Same CU count as dsa_topk_logits_split_for (MI300A / gfx942, verified on
   // a CSCS beverin node); parameterized so a caller can pass the device's
   // hipDeviceProp_t::multiProcessorCount instead of the default.

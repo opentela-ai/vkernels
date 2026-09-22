@@ -11,6 +11,7 @@ target_include_directories(vkernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_sources(vkernels
   PRIVATE
     vkernels/core/stream.cpp
+    vkernels/core/tuning.cpp
     vkernels/kernels/elementwise.cpp
     vkernels/kernels/reduce.cpp
     vkernels/kernels/gemm.cpp

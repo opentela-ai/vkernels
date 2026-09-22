@@ -20,6 +20,19 @@ option(VKERNELS_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(VKERNELS_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
 option(VKERNELS_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 
+# The build cache (docs/tuning-cache.md "Build cache"): route compiles
+# through ccache when available so rebuilds across presets / branches hit
+# the same persistent object cache. Auto = use it when found.
+option(VKERNELS_USE_CCACHE "Use ccache for recompiles when found" ON)
+if(VKERNELS_USE_CCACHE)
+  find_program(VKERNELS_CCACHE_PROGRAM ccache)
+  if(VKERNELS_CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${VKERNELS_CCACHE_PROGRAM}")
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${VKERNELS_CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${VKERNELS_CCACHE_PROGRAM}")
+  endif()
+endif()
+
 set(VKERNELS_TEST_FRAMEWORK "minitest"
   CACHE STRING "Test framework to use: minitest (bundled, no deps) or gtest (fetched)")
 set_property(CACHE VKERNELS_TEST_FRAMEWORK PROPERTY STRINGS minitest gtest)
@@ -107,6 +120,7 @@ endif()
   message(STATUS "  OFI/CXI plugin: ${VKERNELS_HAS_OFI} (issue #19)")
 message(STATUS "  Tests         : ${VKERNELS_BUILD_TESTS} (${VKERNELS_TEST_FRAMEWORK})")
 message(STATUS "  Benchmarks    : ${VKERNELS_BUILD_BENCHMARKS}")
+message(STATUS "  ccache        : ${VKERNELS_CCACHE_PROGRAM}")
 message(STATUS "  Python bindings: ${VKERNELS_BUILD_PYTHON}")
 message(STATUS "  Rust bindings  : ${VKERNELS_BUILD_RUST}")
 message(STATUS "  Coverage      : ${VKERNELS_ENABLE_COVERAGE}")

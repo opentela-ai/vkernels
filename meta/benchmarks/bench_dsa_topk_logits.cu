@@ -22,6 +22,7 @@
 // it distinct from the HIP bench, so both build side by side on a
 // dual-toolkit box (see meta/benchmarks/CMakeLists.txt).
 
+#include "vkernels/core/tuning.hpp"
 #include "vkernels/kernels/dsa.hpp"
 
 // Roofline + timing machinery shared with bench_gemm_bf16.cu.
@@ -53,7 +54,121 @@ static void build_kvcache(std::vector<uint8_t>& kv_u8,
   }
 }
 
-int main() {
+// --- tuning-store sweep (--persist) ---------------------------------------
+//
+// Sweeps split_kv per decode shape, picks the argmin, and writes the
+// winner into the native tuning store (core/tuning.hpp) — the artifact
+// dsa_topk_logits_split_for consults BEFORE its compiled-in formula, so a
+// re-fitted config from this bench replays on every box that ships the
+// store (VKERNELS_TUNING_CACHE, default ~/.cache/vkernels/tuning). The
+// main table below times the EXPLICIT split values, not split_for(), so
+// an already-populated store cannot feed back into its own sweep.
+static void persist_split_sweep(cudaEvent_t start, cudaEvent_t stop) {
+  struct Shape { int bs, H, D, B, mt, nb; };
+  const Shape shapes[] = {
+      {1, 32, 128, 64,  8,  8},   // GLM-5.3 indexer decode,  512 tokens
+      {1, 32, 128, 64, 16, 16},   //                          1024
+      {1, 32, 128, 64, 64, 64},   //                          4096
+      {8, 32, 128, 64,  8,  8},   // batch-8 decode
+  };
+  const int splits[] = {1, 2, 4, 8, 16, 32, 64};
+
+  std::printf("\n=== split_kv sweep -> tuning store (%s) ===\n",
+              vkernels::core::tuning::store_dir().c_str());
+  std::printf("  %4s %7s %6s %9s  %s\n", "bs", "ms_len", "split", "us(med)",
+              "verdict");
+  for (const auto& s : shapes) {
+    const int bs = s.bs, H = s.H, D = s.D, B = s.B;
+    const int mt = s.mt, nb = s.nb;
+    const int max_seq_len = mt * B;
+    const size_t nq = (size_t)bs * H * D;
+    const size_t nkvbytes = (size_t)nb * B * (D + 4);
+    const size_t nw = (size_t)bs * H;
+    const size_t nout = (size_t)bs * max_seq_len;
+    std::vector<uint8_t> q_u8(nq), kv_u8;
+    std::vector<float> weight(nw), k_scale;
+    std::vector<int32_t> sl(bs), pt((size_t)bs * mt);
+    build_kvcache(kv_u8, k_scale, nb, B, D);
+    for (size_t i = 0; i < nq; ++i) q_u8[i] = rnd_fp8(1, (int)i);
+    for (size_t i = 0; i < nw; ++i) weight[i] = rnd(4, (int)i);
+    for (int b = 0; b < bs; ++b) sl[b] = max_seq_len;
+    for (int b = 0; b < bs; ++b)
+      for (int i = 0; i < mt; ++i)
+        pt[(size_t)b * mt + i] =
+            (int32_t)(((unsigned)(b * 7 + i * 13)) % (unsigned)nb);
+
+    uint8_t *dq, *dkv, *dout;
+    float* dw;
+    int32_t *dsl, *dpt;
+    check_cuda(cudaMalloc(&dq, nq), "q");
+    check_cuda(cudaMalloc(&dkv, nkvbytes), "kv");
+    check_cuda(cudaMalloc(&dw, nw * 4), "w");
+    check_cuda(cudaMalloc(&dsl, (size_t)bs * 4), "sl");
+    check_cuda(cudaMalloc(&dpt, (size_t)bs * mt * 4), "pt");
+    check_cuda(cudaMalloc(&dout, nout * 4), "out");
+    check_cuda(cudaMemcpy(dq, q_u8.data(), nq, cudaMemcpyHostToDevice), "cpyq");
+    check_cuda(cudaMemcpy(dkv, kv_u8.data(), nkvbytes, cudaMemcpyHostToDevice),
+               "cpykv");
+    check_cuda(cudaMemcpy(dw, weight.data(), nw * 4, cudaMemcpyHostToDevice),
+               "cpyw");
+    check_cuda(cudaMemcpy(dsl, sl.data(), (size_t)bs * 4,
+               cudaMemcpyHostToDevice), "cpysl");
+    check_cuda(cudaMemcpy(dpt, pt.data(), (size_t)bs * mt * 4,
+               cudaMemcpyHostToDevice), "cpypt");
+
+    double best_us = -1.0;
+    int best_split = 1;
+    for (const int split : splits) {
+      auto L = [&] {
+        vkernels::kernels::cuda::dsa_topk_logits(
+            bs, H, D, B, mt, max_seq_len, split, dq, dkv, dw, dsl, dpt, dout);
+      };
+      const double us = bench_us(L, start, stop).median_us;
+      if (best_us < 0.0 || us < best_us) {
+        best_us = us;
+        best_split = split;
+      }
+      std::printf("  %4d %7d %6d %9.1f\n", bs, max_seq_len, split, us);
+    }
+    const int formula = vkernels::kernels::dsa_topk_logits_split_for(
+        bs, max_seq_len, B);
+    std::printf("  -> winner split=%d (%.1f us); formula says %d %s\n",
+                best_split, best_us, formula,
+                best_split == formula ? "(agree)" : "(OVERRIDE)");
+    vkernels::core::tuning::persist(
+        "dsa_topk_logits_split_for", {bs, max_seq_len, B},
+        {{"split", best_split}}, "bench_dsa_topk_logits");
+
+    check_cuda(cudaFree(dq), "fq");
+    check_cuda(cudaFree(dkv), "fkv");
+    check_cuda(cudaFree(dw), "fw");
+    check_cuda(cudaFree(dsl), "fsl");
+    check_cuda(cudaFree(dpt), "fpt");
+    check_cuda(cudaFree(dout), "fout");
+  }
+  std::printf("  Stored under %s; delete the file (or the store) to re-tune.\n",
+              vkernels::core::tuning::store_dir().c_str());
+}
+
+int main(int argc, char** argv) {
+  // --persist [dir]: also run the tuning sweep and write the winners into
+  // the native tuning store. A bare --persist uses the store's default
+  // location; --persist=<dir> pins (and exports) VKERNELS_TUNING_CACHE.
+  bool do_persist = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--persist") {
+      do_persist = true;
+    } else if (arg.rfind("--persist=", 0) == 0) {
+      do_persist = true;
+      ::setenv("VKERNELS_TUNING_CACHE", arg.substr(10).c_str(), 1);
+    }
+  }
+  if (do_persist && !vkernels::core::tuning::enabled()) {
+    std::printf("--persist: tuning store is off (VKERNELS_TUNING_CACHE=off)\n");
+    do_persist = false;
+  }
+
   cudaEvent_t start, stop;
   check_cuda(cudaEventCreate(&start), "ev_start");
   check_cuda(cudaEventCreate(&stop), "ev_stop");
@@ -189,6 +304,8 @@ int main() {
               "      grid is ONE wavefront (one of GB10's %d SMs). split_kv (>=2)\n"
               "      lifts that by adding grid blocks.\n",
               info.tflops, info.bw, info.sms);
+
+  if (do_persist) persist_split_sweep(start, stop);
 
   // --- variant sweep: force fp32-Q / fp8-Q / wmma at the GLM-5.3 shape
   //     (H=32 fits ALL three on GB10's opt-in cap) to keep every path

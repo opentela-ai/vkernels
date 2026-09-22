@@ -8,6 +8,13 @@ dirtying capture); a hand-tuned config table can only be produced by
 copy-pasting benchmark output into source comments. The tuning cache
 keeps the sweep's winner.
 
+The same idea covers the **native tier**: the C++/HIP/CUDA kernels in
+`src/c/` don't autotune at all — their launch configs are heuristic
+formulas frozen in the headers, re-fitted by hand after each measured
+sweep (`docs/performance/dsa/gfx942.md`). The native store replaces the
+copy-paste step: the sweep benches write the winner, the launchers read
+it back. See [Native tier](#native-tier-c-hipcudakernels) below.
+
 ## The store
 
 One JSON file per (kernel, device):
@@ -85,3 +92,62 @@ strings — the constexprs that shape the launch); the per-key values are
 stored verbatim, so do not key on tensor arguments.
 
 Deleting a kernel's stored choices: `TuningCache(kernel_name).clear()`.
+
+## Native tier (C++/HIP/CUDA kernels)
+
+`src/c/vkernels/core/tuning.{hpp,cpp}` implements the same store for the
+compiled kernels. One line-format sidecar per (kernel, device arch):
+
+```
+$VKERNELS_TUNING_CACHE/<kernel>.<arch>.tune     # e.g. dsa_topk_logits_split_for.sm121.tune
+```
+
+```
+# vk-native-tuning/1
+# arch=sm121 cu_count=48 written_by=bench_dsa_topk_logits
+key=1,512,64
+split=32
+```
+
+| Piece | What it does |
+| --- | --- |
+| `tuning::find(kernel, key)` | the persisted record, or `nullptr` on any miss. The arch token matches the Python tier (`gcnArchName` on HIP, `smXY` on CUDA); a single foreign-arch file is honored (one-machine rule), two are ambiguous and miss. `VKERNELS_TUNING_ARCH` pins the token (tests, cross-arch inspection). |
+| `tuning::persist(kernel, key, params, written_by)` | merge-write the winner (atomic whole-file rewrite, unknown records kept). |
+| `VKERNELS_TUNING_CACHE=off` | disables reads *and* writes — pure compiled-in formulas. |
+
+**Seam contract:** config-selector formulas consult the store BEFORE their
+heuristics; a persisted winner is ground truth for the device arch,
+including prefill early-outs. The keys mirror the formula's arguments, so
+a record is self-describing and a stale one is just a re-tune. First
+adopter: `dsa_topk_logits_split_for` / `dsa_sparse_fwd_split_for`
+(`kernels/dsa.cpp`) — the two formulas that previously had their measured
+sweeps copy-pasted into comments (#137).
+
+**Sweep harness:** the benches own the tuning loop. `bench_dsa_topk_logits
+--persist[=<dir>]` sweeps split_kv per decode shape, prints the winner vs
+the formula, and persists (`meta/benchmarks/bench_dsa_topk_logits.cu`).
+On GB10 the measured winners override the formula at several decode
+shapes (e.g. `bs=1, msl=512`: split 32, 10.8 us vs formula's 8 at 47 us).
+Extend the same `--persist` pattern to the other bench binaries as their
+kernels get tunable knobs.
+
+Everything here is lenient — a stale/malformed/foreign record is a
+re-tune, never an error (the fail-loud frozen-artifact contract stays in
+`tuning_manifest`, and the auditable Python tier is `torch_ops/`).
+Unit tests: `tests/core/test_tuning.cpp`.
+
+## Build cache
+
+Two orthogonal caches; pin both for fully warm builds:
+
+* **Object cache** — `ccache` in front of the compilers:
+  `VKERNELS_USE_CCACHE` (ON by default; auto-detects `ccache`, logs it in
+  the configure banner). CMake sets `CMAKE_{C,CXX,CUDA}_COMPILER_LAUNCHER`
+  for every target, so rebuilds across presets/branches share
+  `$CCACHE_DIR` (default `~/.cache/ccache`). Install ccache and the first
+  build populates it; `ccache -s` for hit rates.
+* **Build tree** — every preset pins `binaryDir` to `build/<preset>` and
+  the Makefile wraps it (`make configure|build|test P=cuda`), so branch
+  switches reuse the configured tree instead of re-running CMake from
+  scratch. The build dir is disposable; the object cache above is what
+  makes recreating it cheap.
