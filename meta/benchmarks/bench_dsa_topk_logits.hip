@@ -50,8 +50,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <vector>
 
+#include "vkernels/core/tuning.hpp"
 #include "vkernels/kernels/dsa.hpp"
 
 static void check_hip(hipError_t err, const char* ctx) {
@@ -340,6 +342,105 @@ static void bench_indexer(const GpuInfo& info, hipEvent_t start,
               info.tflops, info.bw);
 }
 
+// --- tuning-store sweep (--persist) ---------------------------------------
+//
+// Sweeps split_kv per GLM-5.3 decode shape, picks the argmin, and writes
+// the winner into the native tuning store (core/tuning.hpp) — the artifact
+// dsa_topk_logits_split_for consults BEFORE its compiled-in formula, so a
+// measured config replays on every box that ships the store
+// (VKERNELS_TUNING_CACHE, default ~/.cache/vkernels/tuning). The sweeps
+// time EXPLICIT split values, not split_for(), so an already-populated
+// store cannot feed back into its own sweep.
+static void persist_split_sweep(const GpuInfo& info, hipEvent_t start,
+                                hipEvent_t stop) {
+  struct Shape { int bs, H, D, B, mt, nb; };
+  const Shape shapes[] = {
+      {1, 32, 128, 64,  8,  8},   // GLM-5.3 indexer decode,  512 tokens
+      {1, 32, 128, 64, 16, 16},   //                          1024
+      {1, 32, 128, 64, 64, 64},   //                          4096
+      {8, 32, 128, 64,  8,  8},   // batch-8 decode
+  };
+
+  std::printf("\n=== split_kv sweep -> tuning store (%s) ===\n",
+              vkernels::core::tuning::store_dir().c_str());
+  std::printf("  %4s %7s %6s %9s\n", "bs", "ms_len", "split", "us(med)");
+  for (const auto& s : shapes) {
+    const int bs = s.bs, H = s.H, D = s.D, B = s.B;
+    const int mt = s.mt, nb = s.nb;
+    const int max_seq_len = mt * B;
+    const int max_split = (max_seq_len + B - 1) / B;
+    const size_t nq = (size_t)bs * H * D;
+    const size_t nkvbytes = (size_t)nb * B * (D + 4);
+    const size_t nw = (size_t)bs * H;
+    const size_t nout = (size_t)bs * max_seq_len;
+    std::vector<uint8_t> q_u8(nq), kv_u8;
+    std::vector<float> weight(nw), k_scale;
+    std::vector<int32_t> sl(bs), pt((size_t)bs * mt);
+    build_kvcache(kv_u8, k_scale, nb, B, D);
+    for (size_t i = 0; i < nq; ++i) q_u8[i] = rnd_fp8(1, (int)i);
+    for (size_t i = 0; i < nw; ++i) weight[i] = rnd(4, (int)i);
+    for (int b = 0; b < bs; ++b) sl[b] = max_seq_len;
+    for (int b = 0; b < bs; ++b)
+      for (int i = 0; i < mt; ++i)
+        pt[(size_t)b * mt + i] =
+            (int32_t)(((unsigned)(b * 7 + i * 13)) % (unsigned)nb);
+
+    uint8_t *dq, *dkv, *dout;
+    float* dw;
+    int32_t *dsl, *dpt;
+    check_hip(hipMalloc(&dq,   nq), "q");
+    check_hip(hipMalloc(&dkv,  nkvbytes), "kv");
+    check_hip(hipMalloc(&dw,   nw * 4), "w");
+    check_hip(hipMalloc(&dsl,  (size_t)bs * 4), "sl");
+    check_hip(hipMalloc(&dpt,  (size_t)bs * mt * 4), "pt");
+    check_hip(hipMalloc(&dout, nout * 4), "out");
+    check_hip(hipMemcpy(dq,   q_u8.data(),  nq, hipMemcpyHostToDevice),
+              "cpyq");
+    check_hip(hipMemcpy(dkv,  kv_u8.data(), nkvbytes, hipMemcpyHostToDevice),
+              "cpykv");
+    check_hip(hipMemcpy(dw,   weight.data(), nw * 4, hipMemcpyHostToDevice),
+              "cpyw");
+    check_hip(hipMemcpy(dsl,  sl.data(), (size_t)bs * 4,
+              hipMemcpyHostToDevice), "cpysl");
+    check_hip(hipMemcpy(dpt,  pt.data(), (size_t)bs * mt * 4,
+              hipMemcpyHostToDevice), "cpypt");
+
+    double best_us = -1.0;
+    int best_split = 1;
+    const int splits[] = {1, 2, 4, 8, 16, 32, 64};
+    for (const int split : splits) {
+      if (split > max_split) continue;
+      auto L = [&] {
+        vkernels::kernels::hip::dsa_topk_logits(
+            bs, H, D, B, mt, max_seq_len, split, dq, dkv, dw, dsl, dpt, dout);
+      };
+      const double us = bench_us(L, start, stop).median_us;
+      if (best_us < 0.0 || us < best_us) {
+        best_us = us;
+        best_split = split;
+      }
+      std::printf("  %4d %7d %6d %9.1f\n", bs, max_seq_len, split, us);
+    }
+    const int formula = vkernels::kernels::dsa_topk_logits_split_for(
+        bs, max_seq_len, B);
+    std::printf("  -> winner split=%d (%.1f us); formula says %d %s\n",
+                best_split, best_us, formula,
+                best_split == formula ? "(agree)" : "(OVERRIDE)");
+    vkernels::core::tuning::persist(
+        "dsa_topk_logits_split_for", {bs, max_seq_len, B},
+        {{"split", best_split}}, "bench_dsa_topk_logits_hip");
+
+    check_hip(hipFree(dq), "fq");
+    check_hip(hipFree(dkv), "fkv");
+    check_hip(hipFree(dw), "fw");
+    check_hip(hipFree(dsl), "fsl");
+    check_hip(hipFree(dpt), "fpt");
+    check_hip(hipFree(dout), "fout");
+  }
+  std::printf("  Stored under %s; delete the file (or the store) to re-tune.\n",
+              vkernels::core::tuning::store_dir().c_str());
+}
+
 // ---------------------------------------------------------------------------
 // split_kv sweep on the largest decode shape: perf-only, grouping-
 // independent. Prints median-us per split so the caller can see whether
@@ -513,7 +614,25 @@ static void bench_variants(const GpuInfo& info, hipEvent_t start,
   check_hip(hipFree(dout), "fout");
 }
 
-int main() {
+int main(int argc, char** argv) {
+  // --persist [dir]: also run the tuning sweep and write the winners into
+  // the native tuning store. A bare --persist uses the store's default
+  // location; --persist=<dir> pins (and exports) VKERNELS_TUNING_CACHE.
+  bool do_persist = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--persist") {
+      do_persist = true;
+    } else if (arg.rfind("--persist=", 0) == 0) {
+      do_persist = true;
+      ::setenv("VKERNELS_TUNING_CACHE", arg.substr(10).c_str(), 1);
+    }
+  }
+  if (do_persist && !vkernels::core::tuning::enabled()) {
+    std::printf("--persist: tuning store is off (VKERNELS_TUNING_CACHE=off)\n");
+    do_persist = false;
+  }
+
   const GpuInfo info = get_gpu_info();
   std::printf("GPU: %s (arch=%s)  %d CUs,  roof %.0f TFLOP/s bf16,"
               " %.0f GB/s HBM3, ridge ~%.0f FLOP/B\n",
@@ -527,6 +646,7 @@ int main() {
   check_hip(hipEventCreate(&start), "ev_start");
   check_hip(hipEventCreate(&stop), "ev_stop");
 
+  if (do_persist) persist_split_sweep(info, start, stop);
   bench_indexer(info, start, stop);
   bench_split(info, start, stop);
   bench_variants(info, start, stop);
