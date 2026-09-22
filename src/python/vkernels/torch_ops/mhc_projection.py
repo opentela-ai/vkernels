@@ -8,11 +8,16 @@ Reduction order differs from BLAS, so bitwise BLAS equivalence is not promised.
 Torch and Triton are optional and loaded only on invocation. Call once eagerly
 for each device/row-count before graph capture: this compiles and autotunes six
 launch configurations. The warmed path allocates graph-pool-compatible scratch.
-Tuning is in-process, keyed by device ordinal and row count, not a portable
-deployment artifact. Retune in a fresh process after changing hardware/software.
+With the tuning cache (:mod:`.tuning_cache`) the winning config persists per
+device under ``$VKERNELS_TUNING_CACHE``, so a fresh process replays the stored
+choice instead of re-benchmarking; ``VKERNELS_TUNING_CACHE=off`` restores the
+historical in-process-only behavior. Either way, retune after changing
+hardware or software — a stale store entry degrades to a re-tune, never to a
+wrong config.
 """
 
 from ._dispatch import OpNotEligible
+from .tuning_cache import persistent_autotune
 from functools import lru_cache
 
 _WARMED = set()
@@ -50,10 +55,12 @@ def _kernels():
     import triton
     import triton.language as tl
 
-    @triton.autotune(
+    @persistent_autotune(
         configs=[triton.Config({"ROWS": rows}, num_warps=warps)
                  for rows in (1, 2, 4) for warps in (4, 8)],
         key=["TOKENS", "DEVICE"],
+        kernel_name="mhc_projection",
+        source_files=[__file__],
     )
     @triton.jit
     def partial(X, W, P, TOKENS: tl.constexpr, DEVICE: tl.constexpr, ROWS: tl.constexpr):
