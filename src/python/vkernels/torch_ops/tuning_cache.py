@@ -299,6 +299,13 @@ class PersistentAutotuner:
                                   store_dir=store_dir, strict=strict)
         self._bench = None  # injectable for tests
 
+    @property
+    def arg_names(self):
+        """Delegate: ``@triton.heuristics`` stacks over this object and
+        constructs itself from ``fn.arg_names``, like it does for Triton's
+        own Autotuner."""
+        return self.fn.arg_names
+
     def _config_from_record(self, record):
         import triton
 
@@ -350,31 +357,45 @@ class PersistentAutotuner:
     def __getitem__(self, grid):
         return _BoundLaunch(self, grid)
 
+    def run(self, *args, grid=None, warmup=False, **kwargs):
+        """KernelInterface dispatch — how ``@triton.heuristics`` stacks call
+        down into us (``self.fn.run(*args, **kwargs)`` with ``grid``/``warmup``
+        inside ``kwargs``). Direct ``fn[grid](...)`` launches take the
+        equivalent ``__getitem__`` path; both funnel through here.
+        """
+        if warmup:
+            # Compile-only: no launch, no benchmarking, no store write.
+            return self.fn.run(*args, grid=grid, warmup=True, **kwargs)
+        key = self._key_of(args, kwargs)
+        config = self.cache.get(key)
+        if config is None:
+            if tuning_enabled():
+                config = self._pick(key, grid, args, kwargs)
+            else:  # off switch: time every config, keep nothing
+                import triton
+
+                bench = self._bench or triton.testing.do_bench
+                best, best_ms = None, float("inf")
+                for candidate in self.configs:
+                    call = self._GridCall(self, grid, args, kwargs, candidate)
+                    time_ms = bench(call)
+                    if time_ms < best_ms:
+                        best, best_ms = candidate, time_ms
+                config = best
+            self.cache[key] = config
+        launch = dict(config.kwargs)
+        launch["num_warps"] = config.num_warps
+        launch["num_stages"] = config.num_stages
+        return self.fn.run(*args, grid=grid, warmup=False,
+                           **launch, **kwargs)
+
 
 class _BoundLaunch:
     def __init__(self, tuner, grid):
         self._tuner, self._grid = tuner, grid
 
     def __call__(self, *args, **kwargs):
-        tuner = self._tuner
-        key = tuner._key_of(args, kwargs)
-        config = tuner.cache.get(key)
-        if config is None:
-            if tuning_enabled():
-                config = tuner._pick(key, self._grid, args, kwargs)
-            else:  # off switch: time every config, keep nothing
-                import triton
-
-                bench = tuner._bench or triton.testing.do_bench
-                best, best_ms = None, float("inf")
-                for candidate in tuner.configs:
-                    call = PersistentAutotuner._GridCall(tuner, self._grid, args, kwargs, candidate)
-                    time_ms = bench(call)
-                    if time_ms < best_ms:
-                        best, best_ms = candidate, time_ms
-                config = best
-            tuner.cache[key] = config
-        PersistentAutotuner._GridCall(tuner, self._grid, args, kwargs, config)()
+        return self._tuner.run(*args, grid=self._grid, warmup=False, **kwargs)
 
 
 def persistent_autotune(configs, key, *, kernel_name, source_files=(),

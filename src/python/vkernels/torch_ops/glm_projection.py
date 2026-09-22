@@ -19,11 +19,15 @@ autotuned SPLITK; the zeroing is one small memset (<= 384 KB) that
 captures and replays like the mHC operator's scratch.
 
 Torch and Triton load lazily. Warm up each (device, rows, N, K) eagerly
-before graph capture. Tuning is in-process only. Inputs are read-only and
+before graph capture. With the tuning cache the winning config persists per
+device (``tuning_cache.py``); a fresh process replays the stored choice
+instead of re-benchmarking. Inputs are read-only and
 this inference-only operator has no autograd backward.
 """
 
 from functools import lru_cache
+
+from .tuning_cache import persistent_autotune
 
 _WARMED = set()
 
@@ -62,12 +66,14 @@ def _kernels():
     import triton
     import triton.language as tl
 
-    @triton.autotune(
+    @persistent_autotune(
         configs=[triton.Config({"ROWS": rows, "SPLITK": split}, num_warps=warps)
                  for rows in (1, 2, 4, 8, 16, 32)
                  for split in (1, 2, 4, 8, 16)
                  for warps in (4, 8)],
         key=["N", "K", "TOKENS", "DEVICE"],
+        kernel_name="glm_projection",
+        source_files=[__file__],
     )
     @triton.jit
     def partial(X, W, P, N, K: tl.constexpr, TOKENS: tl.constexpr,
@@ -133,6 +139,27 @@ def glm_projection(x, weight):
         reduce[((total + 15) // 16,)](scratch, out, total, 16, enable_fp_fusion=False)
         _WARMED.add(key)
     return out
+
+
+def glm_projection_tune(device="cuda"):
+    """Drive the persistent-autotune sweep for the GLM serving shapes.
+
+    The tuner's registry entry (``vkernels.torch_ops.tuner``) calls this:
+    one launch per (tokens, N, K) key on synthetic tensors triggers the
+    sweep; with the tuning cache enabled each key's winner lands in the
+    store. Keys mirror the serving family from the module docstring.
+    """
+    import torch
+
+    swept = []
+    for tokens in (1, 2):
+        for n, k in ((1536, 4096), (512, 4096), (128, 4096), (64, 4096)):
+            x = torch.randn(tokens, k, device=device, dtype=torch.bfloat16)
+            weight = torch.randn(n, k, device=device, dtype=torch.bfloat16)
+            glm_projection(x, weight)
+            torch.cuda.synchronize(device)
+            swept.append((torch.cuda.current_device(), tokens, n, k))
+    return swept
 
 
 def glm_projection_tuning_metadata():

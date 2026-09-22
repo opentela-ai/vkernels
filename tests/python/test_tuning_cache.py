@@ -163,23 +163,27 @@ def test_first_run_tunes_and_persists(tmp_path):
 
 @gpu
 def test_fresh_tuner_replays_store_without_benchmarking(tmp_path):
+    # N=50 (not 100): the constant-bench stub makes configs[0] (BLOCK=64)
+    # the deterministic winner, and the launch must cover N on its own —
+    # with N=100 this test only passed when the unwritten tail of the
+    # empty output buffer happened to hold x+1 from an earlier trial.
     add = _make_add_kernel(_CONFIGS, kernel_name="add_one", store_dir=tmp_path)
-    x = torch.arange(100, device="cuda", dtype=torch.float32)
+    x = torch.arange(50, device="cuda", dtype=torch.float32)
     y = torch.empty_like(x)
     add._bench = lambda call: 1.0
-    add[lambda meta: (1,)](x, y, 100)  # tunes + persists
+    add[lambda meta: (1,)](x, y, 50)  # tunes + persists
 
     # A fresh tuner (fresh process analog): benchmarking raises — a store
     # hit must never bench.
     add2 = _make_add_kernel(_CONFIGS, kernel_name="add_one", store_dir=tmp_path)
     add2._bench = lambda call: pytest.fail("replayed tuner must not benchmark")
     y2 = torch.empty_like(x)
-    add2[lambda meta: (1,)](x, y2, 100)
+    add2[lambda meta: (1,)](x, y2, 50)
     torch.cuda.synchronize()
     torch.testing.assert_close(y2, x + 1)
-    winner = add.cache[(100,)]
-    assert add2.cache[(100,)].kwargs == winner.kwargs
-    assert add2.cache[(100,)].num_warps == winner.num_warps
+    winner = add.cache[(50,)]
+    assert add2.cache[(50,)].kwargs == winner.kwargs
+    assert add2.cache[(50,)].num_warps == winner.num_warps
 
 
 @gpu
@@ -207,13 +211,13 @@ def test_fingerprint_change_forces_retune(tmp_path):
 def test_off_switch_keeps_autotune_in_process_only(tmp_path, monkeypatch):
     monkeypatch.setenv("VKERNELS_TUNING_CACHE", "off")
     add = _make_add_kernel(_CONFIGS, kernel_name="add_one", store_dir=tmp_path)
-    x = torch.arange(100, device="cuda", dtype=torch.float32)
+    x = torch.arange(50, device="cuda", dtype=torch.float32)
     y = torch.empty_like(x)
     add._bench = lambda call: 1.0
-    add[lambda meta: (1,)](x, y, 100)
+    add[lambda meta: (1,)](x, y, 50)
     torch.testing.assert_close(y, x + 1)
     assert not tmp_path.exists() or not list(tmp_path.iterdir())
-    assert list(add.cache) == [(100,)]  # in-process choice still made
+    assert list(add.cache) == [(50,)]  # in-process choice still made
 
 
 # ---------------------------------------------------------------------------
