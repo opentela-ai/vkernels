@@ -39,6 +39,16 @@ directory and ship it with boxes of the same GPU arch, or leave it local
 their own (Triton kernels on first launch of each key shape, native
 config selectors on every launch).
 
+Measured stores captured in-tree: `meta/tuning-stores/` carries the
+sidecars recorded on real hardware (MI300A, A100, GB10). Copy the file
+for your arch into your store directory to start from measured configs
+instead of the compiled-in formulas:
+
+```bash
+mkdir -p ~/.cache/vkernels/tuning
+cp meta/tuning-stores/<kernel>.<arch>.tune ~/.cache/vkernels/tuning/
+```
+
 (In-repo, `vkl` is `make vkl ARGS='tune status'` or
 `python3 -m vkernels.cli tune status`; the console script comes from
 `pip install -e ./src`.)
