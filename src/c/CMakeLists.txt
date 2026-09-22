@@ -164,9 +164,25 @@ if(VKERNELS_HAS_HIP)
   # under VKERNELS_HAS_HIP; expose the ROCm headers to the host compiler
   # too, mirroring the CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES treatment
   # of the CUDA path above. CMAKE_HIP_TOOLKIT_INCLUDE_DIRECTORIES exists
-  # once enable_language(HIP) has run (CMake 3.21+).
+  # once enable_language(HIP) has run (CMake 3.21+) but is left EMPTY on
+  # current clang/hipcc toolchains (verified: CMake 3.28 + ROCm 6.3), so
+  # derive the ROCm root from the compiler path (…/rocm-X.Y/lib/llvm/bin
+  # -> …/rocm-X.Y/include) with the canonical /opt/rocm/include symlink
+  # as the fallback hint.
+  set(VKERNELS_HIP_RUNTIME_INCLUDE_DIRS "${CMAKE_HIP_TOOLKIT_INCLUDE_DIRECTORIES}")
+  if(NOT VKERNELS_HIP_RUNTIME_INCLUDE_DIRS)
+    get_filename_component(_vk_hip_root "${CMAKE_HIP_COMPILER}" DIRECTORY)
+    get_filename_component(_vk_hip_root "${_vk_hip_root}/../../.." ABSOLUTE)
+    find_path(VKERNELS_HIP_RUNTIME_INCLUDE_DIR hip/hip_runtime.h
+      HINTS "${_vk_hip_root}/include" "/opt/rocm/include")
+    if(VKERNELS_HIP_RUNTIME_INCLUDE_DIR)
+      list(APPEND VKERNELS_HIP_RUNTIME_INCLUDE_DIRS
+        "${VKERNELS_HIP_RUNTIME_INCLUDE_DIR}")
+    endif()
+    unset(_vk_hip_root)
+  endif()
   target_include_directories(vkernels PRIVATE
-    ${CMAKE_HIP_TOOLKIT_INCLUDE_DIRECTORIES})
+    ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
   target_sources(vkernels
     PRIVATE
       vkernels/kernels/moe.hip
