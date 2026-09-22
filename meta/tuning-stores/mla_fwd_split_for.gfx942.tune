@@ -1,0 +1,10 @@
+# vk-native-tuning/1
+# arch=gfx942 cu_count=228 written_by=bench_mla
+key=1,1,1,8192
+split=128
+key=1,16,1,8192
+split=128
+key=4,16,1,8192
+split=64
+key=1,64,1,2048
+split=64

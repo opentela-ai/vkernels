@@ -205,7 +205,7 @@ compiled kernels. Reading:
 
 | Piece | What it does |
 | --- | --- |
-| `tuning::find(kernel, key)` | the persisted record, or `nullptr` on any miss. A single foreign-arch file is honored (one-machine rule), two are ambiguous and miss. |
+| `tuning::find(kernel, key)` | the persisted record as an owned snapshot (`std::shared_ptr<const Entry>`), or null on any miss. A single foreign-arch file is honored (one-machine rule), two are ambiguous and miss. |
 | `tuning::persist(kernel, key, params, written_by)` | merge-write the winner (atomic whole-file rewrite, unknown records kept). |
 | `VKERNELS_TUNING_CACHE=off` | disables reads *and* writes — pure compiled-in formulas. |
 
@@ -213,12 +213,17 @@ compiled kernels. Reading:
 their heuristics; a persisted winner is ground truth for the device
 arch, including prefill early-outs. The keys mirror the formula's
 arguments, so a record is self-describing and a stale one is just a
-re-tune. First adopter: `dsa_topk_logits_split_for` /
+re-tune. First adopters: `dsa_topk_logits_split_for` /
 `dsa_sparse_fwd_split_for` (`kernels/dsa.cpp`) — the two formulas that
-previously had their measured sweeps copy-pasted into comments (#137).
-Measured effect on GB10: the sweep's winners override the formula at
-several decode shapes (e.g. `bs=1, msl=512`: split 32, 10.8 us vs the
-formula's 8 at 47 us).
+previously had their measured sweeps copy-pasted into comments (#137) —
+since joined by `dsa_sparse_fwd_tile` (`dsa.hip`/`dsa.cpp`, consulted
+by the HIP dispatch itself), `mla_fwd_split_for` (`kernels/mla.cpp`,
+on every MLA launch), and `glm_fp8_gemv_pick_sk` (`kernels/glm_moe.cpp`,
+host arithmetic shared by the public API and the internal pick).
+`find` returns an owned snapshot, so a `persist` from another thread
+cannot invalidate a dispatch site's read. Measured effect on GB10: the
+sweep's winners override the formula at several decode shapes (e.g.
+`bs=1, msl=512`: split 32, 10.8 us vs the formula's 8 at 47 us).
 
 **Sweep harnesses:** the benches own the tuning loop —
 `bench_dsa_topk_logits --persist[=<dir>]` sweeps split_kv per decode

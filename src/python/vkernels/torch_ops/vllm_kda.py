@@ -59,6 +59,7 @@ import torch
 import triton
 import triton.language as tl
 
+from vkernels.torch_ops.tuning_cache import persistent_autotune
 from vkernels.torch_ops._kda_kernels_common import (
     recompute_w_u_fwd_kernel,
     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra,
@@ -100,7 +101,7 @@ def next_power_of_2(n: int) -> int:
 # cumsum.py — chunk-local cumulative sum of the per-dim log-gates
 # ---------------------------------------------------------------------------
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({"BS": BS}, num_warps=num_warps)
         for BS in BS_LIST
@@ -111,6 +112,8 @@ def next_power_of_2(n: int) -> int:
     # configs per new length. S only feeds strides (runtime args); B/H-scale
     # tile choice does not depend on it.
     key=["H", "BT", "IS_VARLEN", "REVERSE"],
+    kernel_name='chunk_local_cumsum_vector_kernel',
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_vector_kernel(
@@ -229,13 +232,15 @@ def chunk_local_cumsum(
 # solve_tril.py — (I + A)^-1 for strictly-lower-triangular A, BT in {16,32,64}
 # ---------------------------------------------------------------------------
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4, 5]
     ],
     key=["BT"],
+    kernel_name='solve_tril_16x16_kernel',
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def solve_tril_16x16_kernel(
@@ -301,13 +306,15 @@ def solve_tril_16x16_kernel(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4, 5]
     ],
     key=["H", "BT", "IS_VARLEN"],
+    kernel_name='merge_16x16_to_32x32_inverse_kernel',
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_32x32_inverse_kernel(
@@ -406,13 +413,15 @@ def merge_16x16_to_32x32_inverse_kernel(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4, 5]
     ],
     key=["H", "BT", "IS_VARLEN"],
+    kernel_name='merge_16x16_to_64x64_inverse_kernel',
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_64x64_inverse_kernel(
@@ -646,7 +655,7 @@ def solve_tril(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
@@ -654,6 +663,8 @@ def solve_tril(
         for BV in [32, 64]
     ],
     key=["H", "K", "V", "BT"],
+    kernel_name='chunk_gated_delta_rule_fwd_kernel_h_blockdim64',
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
@@ -1004,9 +1015,11 @@ def chunk_gated_delta_rule_fwd_h(
 # transposed (K,T)/(1,H·K) block pointers on triton 3.4 / MI300A and
 # faults the GPU (job 644327 gpucore; bisect 644348). BK is pinned to
 # next_power_of_2(K) — one variant, the one upstream ships.
-@triton.autotune(
+@persistent_autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
     key=["BK", "BT"],
+    kernel_name='chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter',
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
@@ -1231,7 +1244,7 @@ def recompute_w_u_fwd(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@persistent_autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64]
@@ -1240,6 +1253,8 @@ def recompute_w_u_fwd(
         for num_stages in [2, 3, 4]
     ],
     key=["BT"],
+    kernel_name='chunk_gla_fwd_kernel_o',
+    source_files=[__file__],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -1610,3 +1625,35 @@ def kda_chunk_floe(
         # fla [B,H,V,K] -> floe [B,H,K,V]
         final_state = final_state.transpose(-1, -2).contiguous()
     return o, final_state
+
+
+# ---------------------------------------------------------------------------
+# tuning-cache sweep driver (registry: "kda_chunk_nv")
+# ---------------------------------------------------------------------------
+
+def kda_tune(device="cuda"):
+    """Drive the persistent-autotune sweeps across the chunked-KDA pipeline.
+
+    The tuner's registry entry (``vkernels.torch_ops.tuner``) calls this.
+    Each synthetic ``chunk_kda`` launch exercises every autotuned kernel in
+    this module plus the two shared ones from ``_kda_kernels_common``;
+    with the tuning cache enabled each kernel's per-key winner lands in
+    its own store file. Sweep sizes stay small: the keys are shape-class
+    buckets (BT/H/BK/BV constexprs), not per-token lengths.
+    """
+    import torch
+
+    swept = []
+    for T in (256, 1024):
+        b, h, k_dim, v_dim = 2, 4, 128, 128
+        q = torch.randn(b, T, h, k_dim, device=device, dtype=torch.bfloat16)
+        kt = torch.randn(b, T, h, k_dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn(b, T, h, v_dim, device=device, dtype=torch.bfloat16)
+        q = q / q.float().norm(dim=-1, keepdim=True).to(q.dtype)
+        kt = kt / kt.float().norm(dim=-1, keepdim=True).to(kt.dtype)
+        g = -torch.rand(b, T, h, k_dim, device=device, dtype=torch.float32) * 3.0
+        beta = torch.rand(b, T, h, device=device, dtype=torch.bfloat16)
+        chunk_kda(q=q, k=kt, v=v, g=g, beta=beta)
+        torch.cuda.synchronize(device)
+        swept.append((torch.cuda.current_device(), T))
+    return swept

@@ -28,6 +28,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -66,14 +67,20 @@ std::vector<Entry> parse_body(const std::string& text);
 void warm(const std::string& dir);
 void reset_for_test();
 
-// The persisted record for `key`, or nullptr on any miss (disabled,
+// The persisted record for `key`, or null on any miss (disabled,
 // unknown kernel, arch mismatch, absent key). Lenient by design.
-const Entry* find(const std::string& kernel,
-                  const std::vector<long long>& key);
+// Returns an owned snapshot (shared ownership with the store cache): the
+// pointer stays valid even if persist()/reset_for_test() reload the store
+// while a dispatch site is still reading the entry -- selectors dereference
+// the result outside the store lock, so a raw pointer into the cache would
+// be a use-after-free waiting to happen.
+std::shared_ptr<const Entry> find(const std::string& kernel,
+                                  const std::vector<long long>& key);
 
-// Merge a winner into `<dir>/<kernel>.<arch>.tune` (read-modify-write,
-// atomic rename; concurrent sweeps last-writer-wins per key, benign for
-// benchmark winners).
+// Merge a winner into `<dir>/<kernel>.<arch>.tune` (read-modify-write via
+// tmp + rename so a concurrent process's lazy warm() never sees a torn
+// file; concurrent sweeps last-writer-wins per key, benign for benchmark
+// winners).
 void persist(const std::string& kernel, const std::vector<long long>& key,
              const std::vector<std::pair<std::string, long long>>& params,
              const std::string& written_by);

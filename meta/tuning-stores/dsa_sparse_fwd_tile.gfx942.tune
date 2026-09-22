@@ -1,0 +1,30 @@
+# vk-native-tuning/1
+# arch=gfx942 cu_count=228 written_by=bench_dsa
+key=1,64,256,0,2048
+bq=1
+block_I=64
+inner_iter=8
+key=1,64,256,0,256
+bq=1
+block_I=64
+inner_iter=4
+key=1,64,256,0,128
+bq=1
+block_I=64
+inner_iter=2
+key=1,16,576,64,256
+bq=1
+block_I=64
+inner_iter=4
+key=64,8,256,0,128
+bq=1
+block_I=64
+inner_iter=2
+key=8192,1,256,0,128
+bq=4
+block_I=64
+inner_iter=2
+key=8192,1,576,64,256
+bq=4
+block_I=64
+inner_iter=4

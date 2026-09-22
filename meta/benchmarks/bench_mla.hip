@@ -30,6 +30,7 @@
 #include <functional>
 #include <vector>
 
+#include "vkernels/core/tuning.hpp"
 #include "vkernels/kernels/mla.hpp"
 
 static void check_hip(hipError_t err, const char* ctx) {
@@ -302,12 +303,179 @@ static void autotune(const GpuInfo& info, hipEvent_t start, hipEvent_t stop) {
 }
 
 // ---------------------------------------------------------------------------
-int main() {
+// Split-K decode sweep (issue #82 tuning): for each decode shape (S_q=1)
+// sweep the split count via mla_fwd_with_split, correctness-gate the split
+// path against the plain path, and --persist the argmin into the tuning
+// store under "mla_fwd_split_for" keyed {B, H, S_q, S_kv}.
+static void split_sweep(hipEvent_t start, hipEvent_t stop, bool do_persist) {
+  const int kv = 512, pe = 64, Dq = kv + pe;
+  const float scale = 1.0f / std::sqrt((float)Dq);
+
+  struct Cfg { int B, H, S_kv; };
+  const Cfg cfgs[] = {
+      {1, 1,  8192},   // single-head decode, long KV
+      {1, 16, 8192},   // serving-ish head count, long KV
+      {4, 16, 8192},   // batched decode, long KV
+      {1, 64, 2048},   // wide heads, short context
+  };
+  const int splits[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
+
+  std::printf("\n=== MLA split-K sweep (decode, S_q=1; kv=%d pe=%d)%s ===\n",
+              kv, pe, do_persist ? "  (store sweep armed)" : "");
+  for (const auto& c : cfgs) {
+    const int B = c.B, H = c.H, S_q = 1, S_kv = c.S_kv;
+    const size_t nq = (size_t)B * H * S_q * Dq;
+    const size_t nkc = (size_t)B * S_kv * kv, nkpe = (size_t)B * S_kv * pe;
+    const size_t nv = (size_t)B * S_kv * kv, nout = (size_t)B * H * S_q * kv;
+    std::vector<float> q(nq), kc(nkc), kpe(nkpe), v(nv), out(nout, 0.0f);
+    for (size_t i = 0; i < nq; ++i)  q[i]   = rnd(1, (int)i);
+    for (size_t i = 0; i < nkc; ++i) kc[i]  = rnd(2, (int)i);
+    for (size_t i = 0; i < nkpe; ++i) kpe[i] = rnd(3, (int)i);
+    for (size_t i = 0; i < nv; ++i)  v[i]   = rnd(4, (int)i);
+    float *dq, *dkc, *dkpe, *dv, *dout;
+    check_hip(hipMalloc(&dq,   nq   * 4), "q");
+    check_hip(hipMalloc(&dkc,  nkc  * 4), "kc");
+    check_hip(hipMalloc(&dkpe, nkpe * 4), "kpe");
+    check_hip(hipMalloc(&dv,   nv   * 4), "v");
+    check_hip(hipMalloc(&dout, nout * 4), "out");
+    check_hip(hipMemcpy(dq,   q.data(),   nq   * 4, hipMemcpyHostToDevice),
+              "cpyq");
+    check_hip(hipMemcpy(dkc,  kc.data(),  nkc  * 4, hipMemcpyHostToDevice),
+              "cpykc");
+    check_hip(hipMemcpy(dkpe, kpe.data(), nkpe * 4, hipMemcpyHostToDevice),
+              "cpykpe");
+    check_hip(hipMemcpy(dv,   v.data(),   nv   * 4, hipMemcpyHostToDevice),
+              "cpyv");
+
+    // Correctness gate: split path vs the PLAIN path on device (fp32
+    // outputs, different summation order -> loose abs tolerance). The ref
+    // MUST be an explicit split=1 launch: mla_fwd routes through
+    // mla_fwd_split_for, which takes the split path on every decode shape
+    // here -- using it as "ref" would make this gate a self-comparison
+    // that cannot fail (a numerically broken split path would pass and be
+    // persisted for serving).
+    const int split_for = vkernels::kernels::mla_fwd_split_for(B, H, S_q, S_kv);
+    std::vector<float> ref;
+    {
+      vkernels::kernels::hip::mla_fwd_with_split(
+          B, H, S_q, S_kv, 0, 0, kv, pe, scale, dq, dkc, dkpe, dv, dout,
+          /*split=*/1);  // explicit plain-path reference
+      ref.resize(nout);
+      check_hip(hipMemcpy(ref.data(), dout, nout * 4, hipMemcpyDeviceToHost),
+                "ref");
+      vkernels::kernels::hip::mla_fwd_with_split(
+          B, H, S_q, S_kv, 0, 0, kv, pe, scale, dq, dkc, dkpe, dv, dout,
+          split_for > 1 ? split_for : 4);
+      std::vector<float> got(nout);
+      check_hip(hipMemcpy(got.data(), dout, nout * 4, hipMemcpyDeviceToHost),
+                "got");
+      double max_ref = 0, max_diff = 0;
+      for (size_t i = 0; i < nout; ++i) {
+        max_ref = std::max(max_ref, (double)std::fabs(ref[i]));
+        max_diff = std::max(max_diff, (double)std::fabs(ref[i] - got[i]));
+      }
+      if (max_diff > 1e-2 * std::max(1.0, max_ref)) {
+        std::printf("  B=%d H=%d S_kv=%d: CORRECTNESS FAIL (max_diff=%g, "
+                    "max_ref=%g) -- shape skipped\n",
+                    B, H, S_kv, max_diff, max_ref);
+        check_hip(hipFree(dq), "fq"); check_hip(hipFree(dkc), "fkc");
+        check_hip(hipFree(dkpe), "fkpe"); check_hip(hipFree(dv), "fv");
+        check_hip(hipFree(dout), "fout");
+        continue;
+      }
+    }
+
+    std::printf("  B=%d H=%d S_kv=%d (formula split=%d):\n", B, H, S_kv,
+                split_for);
+    std::printf("    %5s %9s %9s %8s  %s\n", "split", "us(min)", "us(med)",
+                "speedup", "note");
+    double base_us = 0.0, best_us = -1.0;
+    int best_split = 1;
+    for (int s : splits) {
+      if (s > 1 && s > S_kv / vkernels::kernels::kMlaMinSplitKeys) continue;
+      auto L = [&] {
+        vkernels::kernels::hip::mla_fwd_with_split(
+            B, H, S_q, S_kv, 0, 0, kv, pe, scale, dq, dkc, dkpe, dv, dout, s);
+      };
+      auto r = bench_us(L, start, stop, 5, 200);
+      if (s == 1) base_us = r.median_us;
+      if (best_us < 0.0 || r.median_us < best_us) {
+        best_us = r.median_us;
+        best_split = s;
+      }
+      std::printf("    %5d %9.1f %9.1f %7.1fx  %s\n", s, r.min_us,
+                  r.median_us, base_us / r.median_us,
+                  s == split_for ? "<- split_for" : "");
+    }
+    if (do_persist) {
+      // Gate the eventual winner too, not just split_for: the sweep's best
+      // split can differ from the formula's, and only the winner gets
+      // persisted for serving.
+      vkernels::kernels::hip::mla_fwd_with_split(
+          B, H, S_q, S_kv, 0, 0, kv, pe, scale, dq, dkc, dkpe, dv, dout,
+          best_split);
+      std::vector<float> got_best(nout);
+      check_hip(hipMemcpy(got_best.data(), dout, nout * 4,
+                          hipMemcpyDeviceToHost),
+                "got_best");
+      double max_ref = 0, max_diff = 0;
+      for (size_t i = 0; i < nout; ++i) {
+        max_ref = std::max(max_ref, (double)std::fabs(ref[i]));
+        max_diff = std::max(max_diff, (double)std::fabs(ref[i] - got_best[i]));
+      }
+      if (max_diff > 1e-2 * std::max(1.0, max_ref)) {
+        std::printf("    winner split=%d CORRECTNESS FAIL (max_diff=%g, "
+                    "max_ref=%g) -- NOT stored\n",
+                    best_split, max_diff, max_ref);
+        check_hip(hipFree(dq), "fq"); check_hip(hipFree(dkc), "fkc");
+        check_hip(hipFree(dkpe), "fkpe"); check_hip(hipFree(dv), "fv");
+        check_hip(hipFree(dout), "fout");
+        continue;
+      }
+      vkernels::core::tuning::persist(
+          "mla_fwd_split_for", {B, H, S_q, S_kv}, {{"split", best_split}},
+          "bench_mla");
+      std::printf("    -> winner split=%d (%.1f us); formula says %d %s%s\n",
+                  best_split, best_us, split_for,
+                  best_split == split_for ? "(agree)" : "(OVERRIDE)",
+                  "  [stored]");
+    }
+    check_hip(hipFree(dq),   "fq");
+    check_hip(hipFree(dkc),  "fkc");
+    check_hip(hipFree(dkpe), "fkpe");
+    check_hip(hipFree(dv),   "fv");
+    check_hip(hipFree(dout), "fout");
+  }
+  if (do_persist)
+    std::printf("\n  Stored under %s.\n",
+                vkernels::core::tuning::store_dir().c_str());
+}
+
+// ---------------------------------------------------------------------------
+int main(int argc, char** argv) {
+  // --persist [dir]: also write the per-shape split winners into the native
+  // tuning store. A bare --persist uses the store's default location;
+  // --persist=<dir> pins (and exports) VKERNELS_TUNING_CACHE.
+  bool do_persist = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--persist") {
+      do_persist = true;
+    } else if (arg.rfind("--persist=", 0) == 0) {
+      do_persist = true;
+      ::setenv("VKERNELS_TUNING_CACHE", arg.substr(10).c_str(), 1);
+    }
+  }
+  if (do_persist && !vkernels::core::tuning::enabled()) {
+    std::printf("--persist: tuning store is off (VKERNELS_TUNING_CACHE=off)\n");
+    do_persist = false;
+  }
   auto info = get_gpu_info();
   std::printf("GPU: %s  arch=%d  bf16=%.0f TFLOP/s  HBM=%.0f GB/s\n",
               info.name.c_str(), info.arch, info.tflops, info.bw);
   hipEvent_t start, stop;
   hipEventCreate(&start); hipEventCreate(&stop);
+  split_sweep(start, stop, do_persist);
   bench_shapes(info, start, stop);
   autotune(info, start, stop);
   hipEventDestroy(start); hipEventDestroy(stop);
