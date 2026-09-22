@@ -173,10 +173,10 @@ int main(int argc, char** argv) {
   check_cuda(cudaEventCreate(&start), "ev_start");
   check_cuda(cudaEventCreate(&stop), "ev_stop");
   const GpuInfo info = get_gpu_info(start, stop);
-  std::printf("GPU: %s (sm_121)  %d SMs,  roof %.0f TFLOP/s bf16,"
+  std::printf("GPU: %s (sm_%d%d)  %d SMs,  roof %.0f TFLOP/s bf16,"
               " %.0f GB/s, ridge ~%.0f FLOP/B\n",
-              info.name.c_str(), info.sms, info.tflops, info.bw,
-              info.tflops * 1e3 / info.bw);
+              info.name.c_str(), info.major, info.minor, info.sms,
+              info.tflops, info.bw, info.tflops * 1e3 / info.bw);
 
   struct Cfg { int bs, H, D, B, mt, nb, split; };
   const Cfg cfgs[] = {

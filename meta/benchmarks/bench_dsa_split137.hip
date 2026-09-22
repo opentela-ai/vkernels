@@ -11,6 +11,16 @@
 // shapes and the split grid the perf record sweeps, so several variants
 // fit one mi300 partition slot (1 h hard limit).
 
+// --persist [dir]: after the A/B table, write the per-shape argmin split
+// into the native tuning store (core/tuning.hpp) -- the artifact
+// dsa_sparse_fwd_split_for consults BEFORE its compiled-in formula, so a
+// measured config replays on every gfx942 box that ships the store
+// (VKERNELS_TUNING_CACHE, default ~/.cache/vkernels/tuning). The table
+// times EXPLICIT split values, not split_for(), so an already-populated
+// store cannot feed back into its own sweep. Refuses to persist under any
+// VK_DSA_* env override: the winner would describe a diagnostic dispatch
+// variant, not the one serving runs (default env = auto/fused-off).
+
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -20,8 +30,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <vector>
 
+#include "vkernels/core/tuning.hpp"
 #include "vkernels/kernels/dsa.hpp"
 
 static void check_hip(hipError_t err, const char* ctx) {
@@ -87,7 +99,37 @@ static float rnd(int seed, int i) {
   return (float)((int)x % 200000) / 100000.0f - 1.0f;  // [-1, 1)
 }
 
-int main() {
+int main(int argc, char** argv) {
+  // --persist [dir]: also write the per-shape winners into the native
+  // tuning store. A bare --persist uses the store's default location;
+  // --persist=<dir> pins (and exports) VKERNELS_TUNING_CACHE.
+  bool do_persist = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--persist") {
+      do_persist = true;
+    } else if (arg.rfind("--persist=", 0) == 0) {
+      do_persist = true;
+      ::setenv("VKERNELS_TUNING_CACHE", arg.substr(10).c_str(), 1);
+    }
+  }
+  if (do_persist && !vkernels::core::tuning::enabled()) {
+    std::printf("--persist: tuning store is off (VKERNELS_TUNING_CACHE=off)\n");
+    do_persist = false;
+  }
+  // A winner measured under a diagnostic dispatch variant is the wrong
+  // artifact -- only the default env is what serving runs.
+  const char* env_override = nullptr;
+  for (const char* k : {"VK_DSA_DB", "VK_DSA_VEC", "VK_DSA_FUSE",
+                        "VK_DSA_VECG"})
+    if (std::getenv(k)) env_override = k;
+  if (do_persist && env_override) {
+    std::printf("--persist: refused, %s selects a diagnostic dispatch "
+                "variant (unset it to tune the serving path)\n",
+                env_override);
+    do_persist = false;
+  }
+
   hipDeviceProp_t p;
   check_hip(hipGetDeviceProperties(&p, 0), "props");
   std::printf("GPU: %s (arch=%s)\n", p.name, p.gcnArchName);
@@ -150,13 +192,16 @@ int main() {
               "cpyidx");
 
     const int rec = vkernels::kernels::dsa_sparse_fwd_split_for(
-        S_q, H, topk, /*block_I=*/64, /*num_cu=*/228);
+        S_q, H, topk, /*block_I=*/64, /*num_cu=*/p.multiProcessorCount);
     std::printf("\n  H=%d S_q=%d topk=%d (dim=%d tail=%d):"
-                " dsa_sparse_fwd_split_for = %d\n",
-                H, S_q, topk, dim, tail_dim, rec);
+                " dsa_sparse_fwd_split_for = %d%s\n",
+                H, S_q, topk, dim, tail_dim, rec,
+                do_persist ? "  (store sweep armed)" : "");
     std::printf("    %5s %9s %9s %9s %8s  %s\n", "split", "us(min)",
                 "us(med)", "GB/s", "speedup", "note");
     double base_us = 0.0;
+    double best_us = -1.0;
+    int best_split = 1;
     for (int s : splits) {
       if (s > topk) continue;
       auto L = [&] {
@@ -167,6 +212,10 @@ int main() {
       };
       auto r = bench_us(L, start, stop);
       if (s == 1) base_us = r.median_us;
+      if (best_us < 0.0 || r.median_us < best_us) {
+        best_us = r.median_us;
+        best_split = s;
+      }
       // Same byte model as bench_dsa.hip: kv re-read once per head.
       double bytes = 2.0 * ((double)S_q * H * W + (double)S_q * H * d_v +
                             (double)S_q * H * topk * W)
@@ -176,6 +225,16 @@ int main() {
                   r.median_us, gbs, base_us / r.median_us,
                   s == rec ? "<- split_for" : "");
     }
+    if (do_persist) {
+      vkernels::core::tuning::persist(
+          "dsa_sparse_fwd_split_for", {S_q, H, topk, /*block_I=*/64,
+                                       p.multiProcessorCount},
+          {{"split", best_split}}, "bench_dsa_split137");
+      std::printf("    -> winner split=%d (%.1f us); formula says %d %s"
+                  "  [stored]\n",
+                  best_split, best_us, rec,
+                  best_split == rec ? "(agree)" : "(OVERRIDE)");
+    }
     check_hip(hipFree(dq),   "fq");
     check_hip(hipFree(dkv),  "fkv");
     check_hip(hipFree(didx), "fidx");
@@ -184,6 +243,9 @@ int main() {
     check_hip(hipFree(dpart_out), "fpart_out");
     check_hip(hipFree(dpart_lse), "fpart_lse");
   }
+  if (do_persist)
+    std::printf("\n  Stored under %s; delete the file (or the store) to "
+                "re-tune.\n", vkernels::core::tuning::store_dir().c_str());
   hipEventDestroy(start); hipEventDestroy(stop);
   return 0;
 }

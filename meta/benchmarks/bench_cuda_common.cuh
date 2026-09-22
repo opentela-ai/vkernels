@@ -41,7 +41,7 @@ inline void check_cuda(cudaError_t err, const char* ctx) {
   }
 }
 
-struct GpuInfo { std::string name; int sms; double tflops, bw; };
+struct GpuInfo { std::string name; int sms; double tflops, bw; int major, minor; };
 
 // Read-only copy micro-kernel: every thread loads + stores a contiguous
 // uint4 stride. Used to measure the practical global-memory bandwidth.
@@ -133,6 +133,8 @@ inline GpuInfo get_gpu_info(cudaEvent_t start, cudaEvent_t stop) {
   GpuInfo i;
   i.name = p.name;
   i.sms = p.multiProcessorCount;
+  i.major = p.major;
+  i.minor = p.minor;
   i.bw = measure_bw(512ULL * 1024 * 1024);        // 512 MiB read/write
   i.tflops = measure_tflops(i.sms, start, stop);  // empirical bf16 peak
   return i;
