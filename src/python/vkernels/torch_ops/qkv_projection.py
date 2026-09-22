@@ -5,12 +5,14 @@ three projections with FP32 tree reductions and rounds the concatenated
 Q/K/V result once to BF16. Reduction order can differ from BLAS.
 
 Torch and Triton load lazily. Warm up each device/row-count eagerly before
-graph capture. Eight configurations are autotuned in process, not persisted;
-retune in a fresh process after hardware or software changes. Inputs are
-read-only, and this inference-only operator has no autograd backward.
+capture. Eight configurations are autotuned on first launch; with the tuning
+cache the winner persists per device (``tuning_cache.py``), so a fresh process
+replays the stored choice. Inputs are read-only, and this inference-only
+operator has no autograd backward.
 """
 
 from ._dispatch import OpNotEligible
+from .tuning_cache import persistent_autotune
 from functools import lru_cache
 
 _WARMED = set()
@@ -51,10 +53,12 @@ def _kernel():
     import triton
     import triton.language as tl
 
-    @triton.autotune(
+    @persistent_autotune(
         configs=[triton.Config({"ROWS": rows}, num_warps=warps)
                  for rows in (1, 2, 4, 8) for warps in (4, 8)],
         key=["TOKENS", "DEVICE"],
+        kernel_name="qkv_projection",
+        source_files=[__file__],
     )
     @triton.jit
     def project(X, Q, K, V, Y, TOKENS: tl.constexpr, DEVICE: tl.constexpr, ROWS: tl.constexpr):
@@ -95,6 +99,26 @@ def qkv_projection(x, q_weight, k_weight, v_weight):
         )
         _WARMED.add(key)
     return out
+
+
+def qkv_projection_tune(device="cuda"):
+    """Drive the persistent-autotune sweep for every (device, rows) key.
+
+    Registry entry (``vkernels.torch_ops.tuner``) calls this: one launch
+    per row-count on synthetic tensors triggers the sweep; with the tuning
+    cache enabled the winner of each key lands in the store.
+    """
+    import torch
+
+    swept = []
+    for tokens in (1, 2):
+        x = torch.randn(tokens, 4096, device=device, dtype=torch.bfloat16)
+        weights = [torch.randn(8192, 4096, device=device, dtype=torch.bfloat16)
+                   for _ in range(3)]
+        qkv_projection(x, *weights)
+        torch.cuda.synchronize(device)
+        swept.append((torch.cuda.current_device(), tokens))
+    return swept
 
 
 def qkv_projection_tuning_metadata():

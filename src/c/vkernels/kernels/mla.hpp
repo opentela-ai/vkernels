@@ -111,6 +111,16 @@ void mla_fwd(int B, int H, int S_q, int S_kv, int q_start, int kv_start,
              const float* q, const float* k_c, const float* k_pe,
              const float* v_c, float* out, void* stream = nullptr);
 
+// `mla_fwd` with an explicit split-K count (perf/tuning harness entry,
+// same relationship to mla_fwd as dsa_sparse_fwd_split has to dsa_sparse_fwd):
+// split <= 1 or a failed split launch (capture-unsafe workspace resize)
+// falls back to the plain single-block path. Same stream contract.
+void mla_fwd_with_split(int B, int H, int S_q, int S_kv, int q_start,
+                        int kv_start, int kv_lora_rank, int qk_rope_head_dim,
+                        float scale, const float* q, const float* k_c,
+                        const float* k_pe, const float* v_c, float* out,
+                        int split, void* stream = nullptr);
+
 // Explicit-tile entry point (offline autotuner hook). Dispatches the
 // concrete (bq, bn_kv) tile; threads is derived as max(bq,1)*64 capped at 256.
 // Same stream contract as mla_fwd.

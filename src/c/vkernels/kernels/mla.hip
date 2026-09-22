@@ -391,6 +391,11 @@ bool launch_split(const float* q, const float* k_c, const float* k_pe,
   mla_fwd_split_kernel<<<gridS, block, Dq * sizeof(float), st>>>(
       q, k_c, k_pe, v_c, w.partial_out, w.partial_lse, H, S_q, S_kv, q_start,
       kv_start, lr, rhd, scale, split, kvs);
+  // A failed split-kernel launch would leave the grow-only workspace with
+  // stale contents that the combine below would fold into `out` -- the
+  // wrong-but-plausible failure mode. Report failure so the caller falls
+  // back to the plain (unsplit) path instead.
+  if (hipGetLastError() != hipSuccess) return false;
   const dim3 gridC(S_q, H, B);
   mla_fwd_split_combine_kernel<<<gridC, block, split * sizeof(float), st>>>(
       w.partial_out, w.partial_lse, out, S_q, split, lr);
@@ -429,6 +434,25 @@ void mla_fwd(int B, int H, int S_q, int S_kv, int q_start, int kv_start,
   // (issue #82); mla_fwd_split_for returns 1 for prefill shapes and for
   // grids that already fill them, which then run exactly as before.
   const int split = ::vkernels::kernels::mla_fwd_split_for(B, H, S_q, S_kv);
+  if (split > 1 &&
+      launch_split(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
+                   kv_lora_rank, qk_rope_head_dim, scale, split, st)) {
+    return;
+  }
+  int bq = 0, bn = 0, th = 0;
+  ::vkernels::kernels::mla_config_for(S_q, kv_lora_rank, qk_rope_head_dim,
+                                      &bq, &bn, &th);
+  mla_fwd_with_tile(B, H, S_q, S_kv, q_start, kv_start, kv_lora_rank,
+                    qk_rope_head_dim, scale, q, k_c, k_pe, v_c, out, bq, bn,
+                    stream);
+}
+
+void mla_fwd_with_split(int B, int H, int S_q, int S_kv, int q_start,
+                        int kv_start, int kv_lora_rank, int qk_rope_head_dim,
+                        float scale, const float* q, const float* k_c,
+                        const float* k_pe, const float* v_c, float* out,
+                        int split, void* stream) {
+  hipStream_t st = static_cast<hipStream_t>(stream);
   if (split > 1 &&
       launch_split(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
                    kv_lora_rank, qk_rope_head_dim, scale, split, st)) {

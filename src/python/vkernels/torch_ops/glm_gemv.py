@@ -47,6 +47,30 @@ _CFG = {
     (2048, 4096): (2, 4096, 4),
 }
 
+# MI300A (gfx942) overrides — CUDA-graph-replayed autotune on beverin
+# (E13 job 647045, 8-call graphs x 50 replays; SCR/k8e13/gemv_best_table.json).
+# Only shapes beating the GH200 pin by >7% are overridden ((4096, 4096) at 5.3%
+# rides the noise floor but pays for itself across the ~15-site family):
+# the MI300A win pattern wants MORE programs in flight than GH200 — rows=4
+# with wide reductions, rows=1 only on the widest O. Measured per-shape wins
+# (graph GPU time): (4096,2048) 5.13->3.95us, (2048,4096) 4.62->3.48,
+# (8192,512) 4.91->3.64, (4096,3072) 7.67->6.45, (3072,4096) 5.98->5.09,
+# (4096,512) 3.32->2.93, (2048,128) 3.72->3.38, (128,4096) 3.57->3.28,
+# (4096,4096) 9.26->8.77, (6144,4096) 16.39->15.17. Full 15-shape step total
+# (vs cuBLAS splitK): 685.7 -> 90.0 us = 7.6x.
+_CFG_MI300A = {
+    (4096, 4096): (4, 4096, 2),
+    (4096, 3072): (4, 4096, 8),
+    (4096, 2048): (4, 2048, 8),
+    (4096, 512): (2, 512, 2),
+    (8192, 512): (4, 512, 2),
+    (3072, 4096): (4, 4096, 8),
+    (6144, 4096): (1, 4096, 2),
+    (2048, 128): (4, 128, 8),
+    (2048, 4096): (1, 4096, 2),
+    (128, 4096): (8, 4096, 8),
+}
+
 
 @lru_cache(maxsize=1)
 def _kernel():
@@ -104,6 +128,8 @@ def dense_gemv(x, w):
         raise OpNotEligible("empty GEMV")
     tl, triton, kern = _kernel()
     cfg = _CFG.get((o, i))
+    if cfg is not None and torch.version.hip:
+        cfg = _CFG_MI300A.get((o, i), cfg)
     if cfg is not None:
         rows, block_i, warps = cfg
     else:

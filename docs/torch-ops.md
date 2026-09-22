@@ -88,6 +88,21 @@ FP8 blockwise GEMM, MXFP4 dequant/GEMV, DSA indexer top-k, sparse attention
 — the DeepSeek-V4.1 serving vertical (see [ORIENTATION.md](ORIENTATION.md)
 §4 and the kernels-reference table for measured numbers).
 
+### Tuning persistence (`tuning_cache.py`, `tuning_manifest.py`)
+
+Two complementary artifacts, one philosophy (fingerprinted producers,
+device/software blocks, no silent downgrades):
+
+* `tuning_cache.persistent_autotune` — a drop-in for `triton.autotune`
+  that persists the sweep winner per (kernel, device) under
+  `$VKERNELS_TUNING_CACHE` (schema `vk-tuning-store/1`); a fresh process
+  replays the stored config with zero benchmarking, a stale entry is a
+  re-tune, never an error. Exemplar: `mhc_projection`.
+  See [tuning-cache.md](tuning-cache.md).
+* `tuning_manifest` — the frozen, fail-loud sidecar manifests for
+  TunableOp CSV deployment artifacts (#67). See
+  [tuning-qualification.md](tuning-qualification.md).
+
 ### Vendored vLLM kernels
 
 | Module | Provenance | Role |

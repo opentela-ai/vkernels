@@ -1,0 +1,6 @@
+# vk-native-tuning/1
+# arch=gfx942 cu_count=228 written_by=bench_glm_fp8_gemv
+key=4096,4096
+sk=8
+key=4096,2048
+sk=2

@@ -139,16 +139,6 @@ __global__ void glm_fp8_gemv_reduce_kernel(const float* __restrict__ part,
   out[idx] = f32_to_bf16(acc);
 }
 
-int gemv_pick_sk(int N, int K) {
-  // Fill MI300A's 228 CUs with ~4 blocks each where the segment budget
-  // allows, within {1,2,4,8} and divisibility of K/128.
-  int sk = (912 * 32 + N - 1) / N;
-  if (sk < 1) sk = 1;
-  if (sk > 8) sk = 8;
-  while (sk > 1 && (K / 128) % sk != 0) sk >>= 1;   // must divide K/128
-  return sk;
-}
-
 }  // namespace
 
 void glm_fp8_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
@@ -178,13 +168,11 @@ void glm_fp8_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
   glm_fp8_gemv_reduce_kernel<<<(mn + kTh - 1) / kTh, kTh>>>(part, out, mn, sk);
 }
 
-int glm_fp8_gemv_pick_sk(int N, int K) { return gemv_pick_sk(N, K); }
-
 void glm_fp8_block_gemv(const uint16_t* x, const uint8_t* w,
                         const float* scales, uint16_t* out,
                         int M, int N, int K) {
   if (M <= 0 || N <= 0 || K <= 0) return;
-  const int sk = gemv_pick_sk(N, K);
+  const int sk = gemv_pick_sk(N, K);  // vkernels::kernels, store-aware
   float* part = nullptr;
   hipMalloc(&part, (size_t)M * N * sk * sizeof(float));
   glm_fp8_block_gemv_with_scratch(x, w, scales, out, part, M, N, K, sk);

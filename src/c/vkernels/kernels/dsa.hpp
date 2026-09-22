@@ -93,6 +93,16 @@ void dsa_sparse_fwd_cpu(int S_q, int S_kv, int H, int dim, int tail_dim,
 void dsa_config_for(int S_q, int H, int dim, int topk, int* bq, int* threads,
                     int* block_I, int* inner_iter);
 
+// Tuning-store tile override for the dsa_sparse_fwd launch tile (shared by
+// the HIP dispatch in dsa.hip and the split-K selector below). Returns the
+// record's (bq, block_I, inner_iter) when a valid `dsa_sparse_fwd_tile`
+// record exists for key {S_q, H, dim, tail_dim, topk}; false on any miss or
+// malformed record (callers fall back to dsa_config_for -- a store must
+// never break serving). Validation happens in long long before any
+// narrowing, so a corrupt record cannot wrap into a "valid" config.
+bool dsa_tile_from_store(int S_q, int H, int dim, int tail_dim, int topk,
+                         int* bq, int* block_I, int* inner_iter);
+
 // ---------------------------------------------------------------------------
 //  DSA paged-MQA gated top-k logits (issue #51, the kpool>1 indexer path).
 //
@@ -333,8 +343,14 @@ int dsa_topk_logits_split_for(int batch_size, int max_seq_len, int block);
 // will be ceildiv(topk, block_I)); the streaming partial kernel reads one
 // key at a time, so any split in [1, topk] is legal. Host unit tests:
 // tests/kernels/attn/test_dsa.cpp :: DsaSparse::SplitFor.
+//
+// `dim`/`tail_dim`, when both > 0, let the prefill early-out honor a
+// `dsa_sparse_fwd_tile` store override (the tile changes how many blocks
+// the plain grid launches, which is exactly what the early-out reasons
+// about). Callers that know the full shape should pass them; the default
+// keeps source compatibility and falls back to the formula tile.
 int dsa_sparse_fwd_split_for(int S_q, int H, int topk, int block_I,
-                             int num_cu);
+                             int num_cu, int dim = 0, int tail_dim = 0);
 
 }  // namespace vkernels::kernels
 
