@@ -100,6 +100,8 @@ void dsa_config_for(int S_q, int H, int dim, int topk, int* bq, int* threads,
 // malformed record (callers fall back to dsa_config_for -- a store must
 // never break serving). Validation happens in long long before any
 // narrowing, so a corrupt record cannot wrap into a "valid" config.
+bool dsa_tile_from_store(int S_q, int H, int dim, int tail_dim, int topk,
+                         int* bq, int* block_I, int* inner_iter);
 
 // ---------------------------------------------------------------------------
 //  DSA paged-MQA gated top-k logits (issue #51, the kpool>1 indexer path).
