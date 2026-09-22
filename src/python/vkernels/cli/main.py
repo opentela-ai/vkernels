@@ -227,6 +227,7 @@ def _print_status_rich(report: dict) -> bool:
     """The rich-formatted status tables. False when rich is not installed."""
     try:
         from rich.console import Console
+        from rich import box
         from rich.table import Table
     except ImportError:
         return False
@@ -236,12 +237,12 @@ def _print_status_rich(report: dict) -> bool:
         f"store: {report['store']}  arch: {report['arch'] or '(none)'}  "
         + ("[green]enabled[/]" if report["enabled"] else "[red]OFF[/]"))
 
-    stores = Table(box=None, pad_edge=False, header_style="bold")
+    stores = Table(box=box.SIMPLE_HEAVY, pad_edge=False, header_style="bold")
     stores.add_column("tier", style="cyan")
-    stores.add_column("kernel")
+    stores.add_column("kernel", overflow="fold")
     stores.add_column("arch", style="dim")
     stores.add_column("records", justify="right")
-    stores.add_column("path", style="dim")
+    stores.add_column("path", style="dim", overflow="fold")
     for tier, kernel, arch, records, path in _status_rows(report)[0]:
         stores.add_row(tier, kernel, arch, str(records), path)
     if stores.row_count:
@@ -250,10 +251,10 @@ def _print_status_rich(report: dict) -> bool:
         console.print("  (nothing tuned yet)")
 
     registry = Table(
-        box=None, pad_edge=False, header_style="bold", title="registry",
+        box=box.SIMPLE_HEAVY, pad_edge=False, header_style="bold", title="registry",
         title_justify="left", title_style="bold")
     registry.add_column("tier", style="cyan")
-    registry.add_column("name")
+    registry.add_column("name", overflow="fold")
     registry.add_column("state", justify="right")
     registry.add_column("detail", style="dim", overflow="fold")
     for tier, name, state, detail in _status_rows(report)[1]:
