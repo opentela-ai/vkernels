@@ -3,6 +3,7 @@
 // CPU reference (oracle) for the GLM block-FP8 expert primitives
 // (issue #64). See glm_moe.hpp for the format contract.
 
+#include "vkernels/core/tuning.hpp"
 #include "vkernels/kernels/glm_moe.hpp"
 
 #include <cstring>
@@ -27,6 +28,29 @@ uint16_t f32_to_bf16_cpu(float v) {
 }
 
 }  // namespace
+
+int gemv_pick_sk(int N, int K) {
+  // Tuning-store override (docs/tuning-cache.md): a measured sweep on this
+  // device arch (bench_glm_fp8_gemv --persist) beats the compiled-in
+  // formula below. The record is validated against the with_scratch
+  // contract (sk in {1,2,4,8} dividing K/128) before it is trusted.
+  if (core::tuning::enabled()) {
+    if (const auto* entry =
+            core::tuning::find("glm_fp8_gemv_pick_sk", {N, K}))
+      if (const long long* sk = entry->find("sk"))
+        if (*sk >= 1 && *sk <= 8 && (K / 128) % *sk == 0)
+          return static_cast<int>(*sk);
+  }
+  // Fill MI300A's 228 CUs with ~4 blocks each where the segment budget
+  // allows, within {1,2,4,8} and divisibility of K/128.
+  int sk = (912 * 32 + N - 1) / N;
+  if (sk < 1) sk = 1;
+  if (sk > 8) sk = 8;
+  while (sk > 1 && (K / 128) % sk != 0) sk >>= 1;   // must divide K/128
+  return sk;
+}
+
+int glm_fp8_gemv_pick_sk(int N, int K) { return gemv_pick_sk(N, K); }
 
 float glm_e4m3_to_f32_cpu(uint8_t v) {
   const uint32_t sign = (uint32_t)(v >> 7) & 1u;

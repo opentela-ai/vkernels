@@ -47,6 +47,15 @@ void glm_fp8_block_gemv_cpu(const uint16_t* x, const uint8_t* w,
 // E4M3FN decode shared by the tests (exact CPU/GPU agreement).
 float glm_e4m3_to_f32_cpu(uint8_t v);
 
+// Split-K pick for the HIP block-FP8 GEMV launch (host arithmetic, always
+// compiled — same seam as mla_fwd_split_for). Fills MI300A's 228 CUs with
+// ~4 blocks each where the segment budget allows, within {1,2,4,8} and
+// divisibility of K/128. glm_fp8_block_gemv consults this on every launch;
+// the tuning store (bench_glm_fp8_gemv --persist) overrides it per
+// (N, K) when a measured winner exists for the device arch.
+int gemv_pick_sk(int N, int K);
+int glm_fp8_gemv_pick_sk(int N, int K);
+
 }  // namespace vkernels::kernels
 
 // HIP declarations only (no hip/hip_runtime.h here — glm_moe.cpp is a
@@ -57,9 +66,8 @@ namespace vkernels::kernels::hip {
 
 // Device counterpart of glm_fp8_block_gemv_cpu, split-K (see glm_moe.hip):
 // partial kernel grid (N/32, sk) + fixed-order reduce. sk in {1,2,4,8}
-// dividing K/128; glm_fp8_gemv_pick_sk gives the occupancy heuristic the
-// plain wrapper uses (>= ~2 blocks per CU on 228-CU MI300A).
-int glm_fp8_gemv_pick_sk(int N, int K);
+// dividing K/128; the split pick is vkernels::kernels::gemv_pick_sk (host
+// arithmetic above, tuning-store aware).
 
 void glm_fp8_block_gemv(const uint16_t* x, const uint8_t* w,
                         const float* scales, uint16_t* out,

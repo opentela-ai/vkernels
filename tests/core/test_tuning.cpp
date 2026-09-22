@@ -15,6 +15,8 @@
 
 #include "vkernels/core/tuning.hpp"
 #include "vkernels/kernels/dsa.hpp"
+#include "vkernels/kernels/glm_moe.hpp"
+#include "vkernels/kernels/mla.hpp"
 
 namespace tuning = vkernels::core::tuning;
 using tuning::Entry;
@@ -199,5 +201,33 @@ TEST(tuning, selector_seam) {
   EXPECT_NE(formula, 7);  // otherwise the seam is untested at this key
 
   // A different key still takes the compiled-in formula (>= 1 by contract).
-  EXPECT_GE(vkernels::kernels::dsa_topk_logits_split_for(bs + 1, msl, block), 1);
+  EXPECT_GE(vkernels::kernels::dsa_topk_logits_split_for(bs + 1, msl, block),
+            1);
+
+  // MLA decode split (issue #82): same seam on the second native selector.
+  const int B = 1, H = 8, S_q = 1, S_kv = 8192;
+  const int mla_formula =
+      vkernels::kernels::mla_fwd_split_for(B, H, S_q, S_kv);
+  tuning::persist("mla_fwd_split_for", {B, H, S_q, S_kv}, {{"split", 5}},
+                  "test");
+  EXPECT_EQ(vkernels::kernels::mla_fwd_split_for(B, H, S_q, S_kv), 5);
+  EXPECT_NE(mla_formula, 5);  // otherwise the seam is untested at this key
+  // A different key still takes the compiled-in formula (>= 1 by contract).
+  EXPECT_GE(
+      vkernels::kernels::mla_fwd_split_for(B + 1, H, S_q, S_kv), 1);
+
+  // GLM MoE fp8 GEMV split-K pick: host arithmetic (glm_moe.cpp), consult
+  // covers glm_fp8_block_gemv's internal pick. The record must pass the
+  // with_scratch contract (sk in {1,2,4,8} dividing K/128) to be used.
+  const int N = 4096, K = 4096;
+  const int glm_formula = vkernels::kernels::glm_fp8_gemv_pick_sk(N, K);
+  tuning::persist("glm_fp8_gemv_pick_sk", {N, K}, {{"sk", 2}}, "test");
+  EXPECT_EQ(vkernels::kernels::glm_fp8_gemv_pick_sk(N, K), 2);
+  EXPECT_NE(glm_formula, 2);  // otherwise the seam is untested at this key
+  // An out-of-contract record is ignored (falls back to the formula):
+  // sk=6 does not divide K2/128=33.
+  const int K2 = K + 128;
+  const int glm_formula2 = vkernels::kernels::glm_fp8_gemv_pick_sk(N, K2);
+  tuning::persist("glm_fp8_gemv_pick_sk", {N, K2}, {{"sk", 6}}, "test");
+  EXPECT_EQ(vkernels::kernels::glm_fp8_gemv_pick_sk(N, K2), glm_formula2);
 }

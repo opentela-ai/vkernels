@@ -27,8 +27,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <vector>
 
+#include "vkernels/core/tuning.hpp"
 #include "vkernels/kernels/glm_moe.hpp"
 
 #define CK(e, m)                                                          \
@@ -137,12 +139,31 @@ float rnd(int seed, int i) {
 
 int main(int argc, char** argv) {
   namespace h = vkernels::kernels::hip;
+  // --persist [dir]: write the per-shape sk winner (decode row M=1, the path
+  // the sk pick exists for) into the native tuning store under
+  // "glm_fp8_gemv_pick_sk" keyed {N, K}. A bare --persist uses the store's
+  // default location; --persist=<dir> pins (and exports)
+  // VKERNELS_TUNING_CACHE.
+  bool do_persist = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--persist") {
+      do_persist = true;
+    } else if (arg.rfind("--persist=", 0) == 0) {
+      do_persist = true;
+      ::setenv("VKERNELS_TUNING_CACHE", arg.substr(10).c_str(), 1);
+    }
+  }
+  if (do_persist && !vkernels::core::tuning::enabled()) {
+    std::printf("--persist: tuning store is off (VKERNELS_TUNING_CACHE=off)\n");
+    do_persist = false;
+  }
   hipDeviceProp_t p;
   CK(hipGetDeviceProperties(&p, 0), "props");
   const double roof_gbs = std::strstr(p.gcnArchName, "gfx942") ? 5300.0 : 1000.0;
   std::printf("GPU: %s (arch=%s)  roof=%.0f GB/s\n", p.name, p.gcnArchName,
               roof_gbs);
-  const int iters = argc > 1 ? std::atoi(argv[1]) : 60;
+  const int iters = argc > 1 && argv[1][0] != '-' ? std::atoi(argv[1]) : 60;
 
   struct Cfg { const char* tag; int N, K; };
   const Cfg cfgs[] = {
@@ -182,7 +203,7 @@ int main(int argc, char** argv) {
       CK(hipMalloc(&ds, ns * 4), "as");
       CK(hipMalloc(&dout, (size_t)M * c.N * 2), "ao");
       CK(hipMalloc(&dwb, nw * 2), "ab");
-      const int sk = h::glm_fp8_gemv_pick_sk(c.N, c.K);
+      const int sk = vkernels::kernels::glm_fp8_gemv_pick_sk(c.N, c.K);
       CK(hipMalloc(&dpart, (size_t)M * c.N * 8 * 4), "ap");
       CK(hipMemcpy(dx, x.data(), nx * 2, hipMemcpyHostToDevice), "cx");
       CK(hipMemcpy(dw, w.data(), nw, hipMemcpyHostToDevice), "cw");
@@ -218,6 +239,17 @@ int main(int argc, char** argv) {
                   "(best sk=%d of {1,2,4,8}, roofs %.1f/%.1f us)\n",
                   c.tag, M, fused, fgb, mat, mgb, dq,
                   mat / (fused > 0 ? fused : 1), best_sk, roof_f, roof_m);
+      if (do_persist && M == 1) {
+        const int formula_sk =
+            vkernels::kernels::glm_fp8_gemv_pick_sk(c.N, c.K);  // store read-back
+        vkernels::core::tuning::persist(
+            "glm_fp8_gemv_pick_sk", {c.N, c.K}, {{"sk", best_sk}},
+            "bench_glm_fp8_gemv");
+        std::printf("    -> winner sk=%d (%.1f us); formula says %d %s%s\n",
+                    best_sk, fused, formula_sk,
+                    best_sk == formula_sk ? "(agree)" : "(OVERRIDE)",
+                    "  [stored]");
+      }
       hipFree(dx); hipFree(dw); hipFree(ds); hipFree(dout); hipFree(dwb);
       hipFree(dpart);
     }

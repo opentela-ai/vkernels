@@ -442,6 +442,25 @@ void mla_fwd(int B, int H, int S_q, int S_kv, int q_start, int kv_start,
                     stream);
 }
 
+void mla_fwd_with_split(int B, int H, int S_q, int S_kv, int q_start,
+                        int kv_start, int kv_lora_rank, int qk_rope_head_dim,
+                        float scale, const float* q, const float* k_c,
+                        const float* k_pe, const float* v_c, float* out,
+                        int split, void* stream) {
+  hipStream_t st = static_cast<hipStream_t>(stream);
+  if (split > 1 &&
+      launch_split(q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start,
+                   kv_lora_rank, qk_rope_head_dim, scale, split, st)) {
+    return;
+  }
+  int bq = 0, bn = 0, th = 0;
+  ::vkernels::kernels::mla_config_for(S_q, kv_lora_rank, qk_rope_head_dim,
+                                      &bq, &bn, &th);
+  mla_fwd_with_tile(B, H, S_q, S_kv, q_start, kv_start, kv_lora_rank,
+                    qk_rope_head_dim, scale, q, k_c, k_pe, v_c, out, bq, bn,
+                    stream);
+}
+
 }  // namespace vkernels::kernels::hip
 
 #endif  // VKERNELS_HAS_HIP
