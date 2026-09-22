@@ -59,11 +59,40 @@
 #include "vkernels/util/error.hpp"  // VK_EXPECTS (host: throws std::invalid_argument)
 
 #if VKERNELS_HAS_HIP
+#  include "vkernels/core/tuning.hpp"
 #  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 #  include "vkernels/kernels/dsa_topk_device.cuh"  // shared scalar dsa_topk_logits kernels
 #  include <hip/hip_runtime.h>
 
 namespace vkernels::kernels::hip {
+
+// Tuning-store tile override (docs/tuning-cache.md): consulted by BOTH
+// dsa_sparse_fwd and dsa_sparse_fwd_split ahead of dsa_config_for, so a
+// measured per-shape sweep on this device arch pins the launch tile.
+// Key {S_q, H, dim, tail_dim, topk} uses exactly the dispatch sites'
+// arguments (the C API / torch op passes dim and tail_dim verbatim).
+// Only `bq` is live today (block_I / inner_iter are reserved by the
+// baseline kernels -- see with_tile's (void) casts); they are persisted
+// anyway so a future tiled-key kernel inherits the store untouched.
+// A malformed or stale record falls back to the formula: a store must
+// never break serving.
+inline bool dsa_tile_from_store(int S_q, int H, int dim, int tail_dim,
+                                int topk, int* bq, int* bi, int* ii) {
+  if (!core::tuning::enabled()) return false;
+  const auto* entry = core::tuning::find(
+      "dsa_sparse_fwd_tile", {S_q, H, dim, tail_dim, topk});
+  if (!entry) return false;
+  const auto *pb = entry->find("bq"), *pbi = entry->find("block_I"),
+             *pii = entry->find("inner_iter");
+  if (!pb || !pbi || !pii) return false;
+  const int qb = (int)*pb, ki = (int)*pbi, ni = (int)*pii;
+  if (qb != 1 && qb != 2 && qb != 4 && qb != 8) return false;
+  if (ki <= 0 || ni <= 0 || topk % (ki * ni) != 0) return false;
+  *bq = qb;
+  *bi = ki;
+  *ii = ni;
+  return true;
+}
 
 // MFMA helpers for the bf16 gated-logit kernel below. Mirrors the verified
 // gemm_bf16.hip declarations verbatim; kept in an anonymous namespace so the
@@ -268,7 +297,8 @@ void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
   VK_EXPECTS(topk % (block_I * inner_iter) == 0,
              "topk must be a multiple of block_I*inner_iter");
   int bq = 0, th = 0, bi = 0, ii = 0;
-  ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
+  if (!dsa_tile_from_store(S_q, H, dim, tail_dim, topk, &bq, &bi, &ii))
+    ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
   (void)th;
   (void)block_I;
   (void)inner_iter;
@@ -1149,7 +1179,8 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
                                  lse != partial_lse)),
              "out/lse must not alias the partial scratch");
   int bq = 0, th = 0, bi = 0, ii = 0;
-  ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
+  if (!dsa_tile_from_store(S_q, H, dim, tail_dim, topk, &bq, &bi, &ii))
+    ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
   (void)th;
   // The partial kernel now double-buffers its key tiles in LDS (issue
   // #80) or runs the vectorized register-batched serial variant with the

@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "vkernels/kernels/dsa.hpp"
@@ -286,6 +287,126 @@ static void autotune(const GpuInfo& info, hipEvent_t start, hipEvent_t stop) {
 }
 
 // ---------------------------------------------------------------------------
+// Tile sweep + tuning-store persist. The launch tile is (bq, threads,
+// block_I, inner_iter) from dsa_config_for; with_tile ignores block_I /
+// inner_iter today (reserved for the tiled-key prefetch) so the live
+// dimension is bq -- flat at decode (S_q=1 always launches one row per
+// block), live at prefill where ceil(S_q/bq)*H sets the grid. The sweep
+// therefore covers the decode serving shapes (to pin the store where the
+// formula is expected to agree) AND the prefill shapes (where a real
+// override can exist). A 6-point degenerate sweep on one decode shape
+// documents that the reserved params are timing-invariant. --persist
+// writes the per-shape argmin under "dsa_sparse_fwd_tile" (key
+// {S_q,H,dim,tail_dim,topk}, params bq/block_I/inner_iter) so the
+// dispatch override in dsa.hip picks it up on the next run.
+static void tile_sweep(const GpuInfo& info, hipEvent_t start, hipEvent_t stop,
+                       bool do_persist) {
+  (void)info;
+  struct Cfg { int H, S_q, S_kv, dim, tail_dim, topk; const char* tag; };
+  const Cfg cfgs[] = {
+      {64,    1, 2048, 256,  0, 2048, "GLM decode full-topk"},
+      {64,    1,  256, 256,  0,  256, "GLM decode topk=256"},
+      {64,    1,  128, 256,  0,  128, "GLM decode topk=128"},
+      {16,    1,  512, 576, 64,  256, "DSv3 decode"},
+      {16,    1,  256, 576, 64,  256, "DSv3 decode S_kv=256"},
+      { 8,   64,  256, 256,  0,  128, "GLM short prefill"},
+      { 1, 8192, 1024, 256,  0,  128, "GLM long prefill"},
+      { 1, 8192, 1024, 576, 64,  256, "DSv3 long prefill"},
+  };
+  const int bqs[] = {1, 2, 4, 8};
+  constexpr int nBQ = sizeof(bqs) / sizeof(bqs[0]);
+
+  for (const auto& c : cfgs) {
+    const int H = c.H, S_q = c.S_q, S_kv = c.S_kv, dim = c.dim;
+    const int tail_dim = c.tail_dim, topk = c.topk;
+    const int W = dim + tail_dim, d_v = dim - tail_dim;
+    const float sm_scale = (1.0f / std::sqrt((float)W)) * 1.4426950408889634f;
+    const size_t nq = (size_t)S_q * H * W, nkv = (size_t)S_kv * W;
+    const size_t nidx = (size_t)S_q * topk, nout = (size_t)S_q * H * d_v;
+    std::vector<uint16_t> q(nq), kv(nkv), out(nout, 0);
+    std::vector<int32_t> idx(nidx);
+    for (size_t i = 0; i < nq; ++i)  q[i]  = f2bf(rnd(1, (int)i));
+    for (size_t i = 0; i < nkv; ++i) kv[i] = f2bf(rnd(2, (int)i));
+    for (int i = 0; i < S_q; ++i)
+      for (int k = 0; k < topk; ++k)
+        idx[(size_t)i * topk + k] =
+            (k % 10 == 9) ? -1 : (int32_t)(((unsigned)(i * 31 + k * 7)) %
+                                           (unsigned)S_kv);
+    uint16_t *dq, *dkv, *dout;
+    int32_t* didx;
+    float* dlse;
+    check_hip(hipMalloc(&dq,   nq   * 2), "q");
+    check_hip(hipMalloc(&dkv,  nkv  * 2), "kv");
+    check_hip(hipMalloc(&didx, nidx * 4), "idx");
+    check_hip(hipMalloc(&dout, nout * 2), "out");
+    check_hip(hipMalloc(&dlse, (size_t)S_q * H * 4), "lse");
+    check_hip(hipMemcpy(dq,   q.data(),   nq   * 2, hipMemcpyHostToDevice),
+              "cpyq");
+    check_hip(hipMemcpy(dkv,  kv.data(),  nkv  * 2, hipMemcpyHostToDevice),
+              "cpykv");
+    check_hip(hipMemcpy(didx, idx.data(), nidx * 4, hipMemcpyHostToDevice),
+              "cpyidx");
+
+    int fbq = 0, fth = 0, fbi = 0, fii = 0;
+    vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &fbq, &fth, &fbi,
+                                      &fii);
+    std::printf("\n=== DSA tile sweep (H=%d S_q=%d dim=%d tail=%d topk=%d;"
+                " %s): formula BQ=%d block_I=%d inner_iter=%d ===\n",
+                H, S_q, dim, tail_dim, topk, c.tag, fbq, fbi, fii);
+    std::printf("    %3s %6s %9s %9s  %s\n", "bq", "", "us(min)", "us(med)",
+                "note");
+    int best_bq = bqs[0]; double best_us = 1e18;
+    for (int bq : bqs) {
+      auto L = [&] {
+        vkernels::kernels::hip::dsa_sparse_fwd_with_tile(
+            S_q, S_kv, H, dim, tail_dim, topk, 1, sm_scale, /*lse=*/true,
+            dq, dkv, didx, dout, dlse, bq, /*block_I=*/fbi,
+            /*inner_iter=*/fii, /*bn_kv=*/0);
+      };
+      auto r = bench_us(L, start, stop, 3, 60);
+      std::printf("    %3d %6s %9.1f %9.1f  %s\n", bq, "", r.min_us,
+                  r.median_us, bq == fbq ? "<- formula" : "");
+      if (r.median_us < best_us) { best_us = r.median_us; best_bq = bq; }
+    }
+    if (S_q == 1) {
+      // Reserved-param flatness probe: block_I x inner_iter at fixed bq.
+      // with_tile (void)s both today, so the row MUST be flat; if it ever
+      // is not, the baseline grew a live block_I and this probe catches it.
+      std::printf("    (reserved-param probe at bq=%d:)", best_bq);
+      for (int bi : {32, 64, 128}) {
+        for (int ii : {1, 2}) {
+          if (topk % (bi * ii) != 0) continue;  // with_tile precondition
+          auto L = [&] {
+            vkernels::kernels::hip::dsa_sparse_fwd_with_tile(
+                S_q, S_kv, H, dim, tail_dim, topk, 1, sm_scale, true,
+                dq, dkv, didx, dout, dlse, best_bq, bi, ii, 0);
+          };
+          auto r = bench_us(L, start, stop, 3, 30);
+          std::printf("\n      block_I=%-3d inner_iter=%d  %8.1f us", bi, ii,
+                      r.median_us);
+        }
+      }
+      std::printf("\n");
+    }
+    std::printf("    best: BQ=%d (%.1f us)%s\n", best_bq, best_us,
+                best_bq == fbq ? "  formula agrees" : "  OVERRIDE");
+    if (do_persist) {
+      vkernels::core::tuning::persist(
+          "dsa_sparse_fwd_tile", {S_q, H, dim, tail_dim, topk},
+          {{"bq", best_bq}, {"block_I", fbi}, {"inner_iter", fii}},
+          "bench_dsa");
+      std::printf("    -> stored bq=%d block_I=%d inner_iter=%d"
+                  "  [dsa_sparse_fwd_tile]\n", best_bq, fbi, fii);
+    }
+    check_hip(hipFree(dq),   "fq");
+    check_hip(hipFree(dkv),  "fkv");
+    check_hip(hipFree(didx), "fidx");
+    check_hip(hipFree(dout), "fout");
+    check_hip(hipFree(dlse), "flse");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Split-key sweep (decode occupancy fix, issue #51 follow-up): the plain
 // forward's grid is (ceil(S_q/BQ), H) -- 64 blocks on 228 CUs at the
 // GLM-5.3-Flash decode shape -- so decode is occupancy-bound, not
@@ -383,7 +504,38 @@ static void split_sweep(const GpuInfo& info, hipEvent_t start,
 }
 
 // ---------------------------------------------------------------------------
-int main() {
+int main(int argc, char** argv) {
+  // --persist [dir]: write the per-shape tile winners into the native
+  // tuning store (same contract as bench_dsa_split137.hip). A bare
+  // --persist uses the store's default location; --persist=<dir> pins
+  // (and exports) VKERNELS_TUNING_CACHE.
+  bool do_persist = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--persist") {
+      do_persist = true;
+    } else if (arg.rfind("--persist=", 0) == 0) {
+      do_persist = true;
+      ::setenv("VKERNELS_TUNING_CACHE", arg.substr(10).c_str(), 1);
+    }
+  }
+  if (do_persist && !vkernels::core::tuning::enabled()) {
+    std::printf("--persist: tuning store is off (VKERNELS_TUNING_CACHE=off)\n");
+    do_persist = false;
+  }
+  // A winner measured under a diagnostic dispatch variant is the wrong
+  // artifact -- only the default env is what serving runs.
+  const char* env_override = nullptr;
+  for (const char* k : {"VK_DSA_DB", "VK_DSA_VEC", "VK_DSA_FUSE",
+                        "VK_DSA_VECG"})
+    if (std::getenv(k)) env_override = k;
+  if (do_persist && env_override) {
+    std::printf("--persist: refused, %s selects a diagnostic dispatch "
+                "variant (unset it to tune the serving path)\n",
+                env_override);
+    do_persist = false;
+  }
+
   auto info = get_gpu_info();
   std::printf("GPU: %s  arch=%d  bf16=%.0f TFLOP/s  HBM=%.0f GB/s\n",
               info.name.c_str(), info.arch, info.tflops, info.bw);
@@ -392,6 +544,11 @@ int main() {
   bench_shapes(info, start, stop);
   autotune(info, start, stop);
   split_sweep(info, start, stop);
+  tile_sweep(info, start, stop, do_persist);
+  if (do_persist)
+    std::printf("\n  Tile winners stored under %s; delete the file (or the "
+                "store) to re-tune.\n",
+                vkernels::core::tuning::store_dir().c_str());
   hipEventDestroy(start); hipEventDestroy(stop);
   return 0;
 }
