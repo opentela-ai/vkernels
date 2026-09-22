@@ -5,31 +5,58 @@
 // single-file fallback). The config-selector seam is checked through
 // dsa_topk_logits_split_for (host arithmetic, always compiled).
 #include <ctime>
-#include <filesystem>
+#include <dirent.h>
 #include <fstream>
 #include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "minitest.hpp"
 
 #include "vkernels/core/tuning.hpp"
 #include "vkernels/kernels/dsa.hpp"
 
-namespace fs = std::filesystem;
 namespace tuning = vkernels::core::tuning;
 using tuning::Entry;
 
 namespace {
 
+// mkdir -p (POSIX; the test suite builds on pre-<filesystem> hosts too).
+void mkdir_p(const std::string& dir) {
+  std::string path;
+  size_t pos = 0;
+  while (pos <= dir.size()) {
+    const size_t slash = dir.find('/', pos);
+    path = dir.substr(0, slash == std::string::npos ? dir.size() : slash);
+    if (!path.empty() && path != "/") (void)::mkdir(path.c_str(), 0755);
+    if (slash == std::string::npos) break;
+    pos = slash + 1;
+  }
+}
+
+void rm_rf(const std::string& dir) {
+  if (DIR* d = opendir(dir.c_str())) {
+    while (const dirent* de = readdir(d)) {
+      const std::string name = de->d_name;
+      if (name == "." || name == "..") continue;
+      (void)::unlink((dir + "/" + name).c_str());
+    }
+    closedir(d);
+  }
+  (void)::rmdir(dir.c_str());
+}
+
 // A temp store + pinned (fake) arch for one test; resets the loader on
 // scope exit. The arch pin (VKERNELS_TUNING_ARCH) makes every rule
 // deterministic on any host — GPU or not.
 struct TempStore {
-  fs::path dir;
-  explicit TempStore(const std::string& name)
-      : dir(fs::temp_directory_path() /
-            ("vk_tuning_test_" + name + "_" + std::to_string(::time(nullptr)))) {
-    fs::create_directories(dir);
-    ::setenv("VKERNELS_TUNING_CACHE", dir.string().c_str(), 1);
+  std::string dir;
+  explicit TempStore(const std::string& name) {
+    const char* tmp = std::getenv("TMPDIR");
+    dir = std::string(tmp && *tmp ? tmp : "/tmp") + "/vk_tuning_test_" + name
+          + "_" + std::to_string(::time(nullptr));
+    mkdir_p(dir);
+    ::setenv("VKERNELS_TUNING_CACHE", dir.c_str(), 1);
     ::setenv("VKERNELS_TUNING_ARCH", "sm000", 1);
     tuning::reset_for_test();
   }
@@ -37,21 +64,26 @@ struct TempStore {
     ::setenv("VKERNELS_TUNING_CACHE", "", 1);
     ::setenv("VKERNELS_TUNING_ARCH", "", 1);
     tuning::reset_for_test();
-    std::error_code ec;
-    fs::remove_all(dir, ec);
+    rm_rf(dir);
   }
 
-  fs::path sole_tune_file(const std::string& kernel) const {
-    fs::path found;
-    for (const auto& f : fs::directory_iterator(dir))
-      if (f.path().filename().string().rfind(kernel + ".", 0) == 0 &&
-          f.path().extension() == ".tune")
-        found = f.path();
+  // The single .tune file for `kernel`, or "" when none exists.
+  std::string sole_tune_file(const std::string& kernel) const {
+    std::string found;
+    DIR* d = opendir(dir.c_str());
+    if (d == nullptr) return found;
+    while (const dirent* de = readdir(d)) {
+      const std::string name = de->d_name;
+      if (name.rfind(kernel + ".", 0) == 0 &&
+          name.size() >= 5 && name.rfind(".tune") == name.size() - 5)
+        found = dir + "/" + name;
+    }
+    closedir(d);
     return found;
   }
 };
 
-std::string slurp(const fs::path& path) {
+std::string slurp(const std::string& path) {
   std::ifstream in(path);
   std::ostringstream body;
   body << in.rdbuf();
@@ -98,7 +130,7 @@ TEST(tuning, persist_find_roundtrip) {
   EXPECT_EQ(*hit->find("split"), (long long)64);
 
   // The .tune sidecar is the only file written for a native kernel.
-  EXPECT_TRUE(store.sole_tune_file("k") != fs::path());
+  EXPECT_TRUE(!store.sole_tune_file("k").empty());
 
   EXPECT_TRUE(tuning::find("k", {9, 9, 9}) == nullptr);  // absent key
   EXPECT_TRUE(tuning::find("other", key) == nullptr);    // absent kernel
@@ -119,13 +151,13 @@ TEST(tuning, arch_selection) {
   const auto* hit = tuning::find("single", key);
   ASSERT_TRUE(hit != nullptr);
   EXPECT_EQ(*hit->find("split"), (long long)16);
-  EXPECT_TRUE(store.sole_tune_file("single").filename() ==
-              "single.sm000.tune");
+  EXPECT_TRUE(store.sole_tune_file("single")
+              .rfind("/single.sm000.tune") != std::string::npos);
 
   // Single-file fallback: one file, no arch match -> honored (the
   // one-machine convenience rule).
   {
-    std::ofstream out(store.dir / "one.gfx942.tune");
+    std::ofstream out(store.dir + "/one.gfx942.tune");
     out << "# vk-native-tuning/1\n# arch=gfx942\nkey=1,2,3\nsplit=64\n";
   }
   tuning::reset_for_test();
@@ -135,9 +167,9 @@ TEST(tuning, arch_selection) {
 
   // Multi-arch, none matching this device: ambiguous -> miss (lenient).
   {
-    std::ofstream out(store.dir / "two.gfx942.tune");
+    std::ofstream out(store.dir + "/two.gfx942.tune");
     out << "# vk-native-tuning/1\n# arch=gfx942\nkey=1,2,3\nsplit=64\n";
-    std::ofstream out2(store.dir / "two.gfx90a.tune");
+    std::ofstream out2(store.dir + "/two.gfx90a.tune");
     out2 << "# vk-native-tuning/1\n# arch=gfx90a\nkey=1,2,3\nsplit=32\n";
   }
   tuning::reset_for_test();

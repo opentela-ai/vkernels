@@ -20,17 +20,45 @@
 #include "vkernels/util/config.hpp"
 
 #if VKERNELS_HAS_HIP
+#  ifndef __HIP_PLATFORM_AMD__
+#    ifndef __HIP_PLATFORM_NVIDIA__
+       // HIP headers require exactly one platform macro; the host compiler
+       // does not get hipcc's automatic define (and HIP-on-NVIDIA builds of
+       // this TU take the CUDA branch below instead).
+#      define __HIP_PLATFORM_AMD__ 1
+#    endif
+#  endif
 #  include <hip/hip_runtime.h>
 #elif VKERNELS_HAS_CUDA
 #  include <cuda_runtime.h>
 #endif
 
-#include <filesystem>
+// Directory walking/creation without <filesystem>: the tier is core/ and
+// must compile on pre-C++17-filesystem host toolchains (SLES gcc 7 on CSCS
+// beverin/clariden). Only the three operations below are needed.
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 namespace vkernels::core::tuning {
 namespace {
 
-namespace fs = std::filesystem;
+// mkdir -p. Components are created top-down; existing ones (or EACCES on
+// an already-complete path) are not errors — persist() fails naturally at
+// the ofstream if the directory truly cannot be made.
+void mkdir_p(const std::string& dir) {
+  if (dir.empty()) return;
+  std::string path;
+  size_t pos = 0;
+  while (pos <= dir.size()) {
+    const size_t slash = dir.find('/', pos);
+    path = dir.substr(0, slash == std::string::npos ? dir.size() : slash);
+    if (!path.empty() && path != "/")
+      (void)::mkdir(path.c_str(), 0755);
+    if (slash == std::string::npos) break;
+    pos = slash + 1;
+  }
+}
 
 std::mutex g_mutex;
 // kernel -> (arch -> entries)
@@ -101,7 +129,7 @@ bool parse_key_list(const std::string& text, std::vector<long long>& out) {
 
 // The arch a store file carries: from its `# arch=` header, else the
 // filename (`<kernel>.<arch>.tune` — both parts are dot-free).
-std::string file_arch(const fs::path& path, const std::string& body) {
+std::string file_arch(const std::string& name, const std::string& body) {
   std::istringstream stream(body);
   std::string line;
   while (std::getline(stream, line)) {
@@ -114,7 +142,6 @@ std::string file_arch(const fs::path& path, const std::string& body) {
       return arch.substr(0, end == std::string::npos ? arch.size() : end);
     }
   }
-  const std::string name = path.filename().string();
   const auto first_dot = name.find('.');
   const auto suffix = name.rfind(".tune");
   if (first_dot == std::string::npos || suffix == std::string::npos ||
@@ -147,20 +174,22 @@ std::string render_body(const std::string& arch, int cu_count,
 void warm_locked(const std::string& dir) {
   g_stores.clear();
   g_warmed = true;
-  if (dir.empty() || dir == "off" || !fs::exists(dir)) return;
-  std::error_code ec;
-  for (const auto& file : fs::directory_iterator(dir, ec)) {
-    const std::string name = file.path().filename().string();
+  if (dir.empty() || dir == "off") return;
+  DIR* d = opendir(dir.c_str());
+  if (d == nullptr) return;
+  while (const dirent* de = readdir(d)) {
+    const std::string name = de->d_name;
     const auto dot = name.find('.');
     if (dot == std::string::npos || name.rfind(".tune") == std::string::npos)
       continue;
-    std::ifstream in(file.path());
+    std::ifstream in(dir + "/" + name);
     if (!in) continue;
     std::ostringstream body;
     body << in.rdbuf();
-    g_stores[name.substr(0, dot)][file_arch(file.path(), body.str())] =
+    g_stores[name.substr(0, dot)][file_arch(name, body.str())] =
         parse_body(body.str());
   }
+  closedir(d);
 }
 
 }  // namespace
@@ -260,13 +289,12 @@ void persist(const std::string& kernel, const std::vector<long long>& key,
              const std::vector<std::pair<std::string, long long>>& params,
              const std::string& written_by) {
   if (!enabled() || device_arch().empty()) return;
-  const fs::path dir = store_dir();
-  std::error_code ec;
-  fs::create_directories(dir, ec);
+  const std::string dir = store_dir();
+  mkdir_p(dir);
 
   // Read-modify-write: keep every record the file already carries.
   std::vector<Entry> entries;
-  const fs::path path = dir / (kernel + "." + device_arch() + ".tune");
+  const std::string path = dir + "/" + kernel + "." + device_arch() + ".tune";
   {
     std::ifstream in(path);
     if (in) {
