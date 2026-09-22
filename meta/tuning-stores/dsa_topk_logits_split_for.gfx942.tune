@@ -1,0 +1,10 @@
+# vk-native-tuning/1
+# arch=gfx942 cu_count=228 written_by=bench_dsa_topk_logits_hip
+key=1,512,64
+split=8
+key=1,1024,64
+split=16
+key=1,4096,64
+split=64
+key=8,512,64
+split=8
