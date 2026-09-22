@@ -119,6 +119,16 @@ def test_tune_non_persisting_entry_is_a_clean_skip(store):
     assert "does not write the store" in report["detail"]
 
 
+def test_tune_all_skips_formula_only_but_exits_clean(store):
+    # Batch runs tune what they can: the formula-only entry is a skip
+    # (ok=True), not a failure that spoils --all's exit code.
+    rows = tune(all=True, store_dir=store)
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["dsa_sparse_fwd_split_for"]["ok"] is True
+    assert by_name["dsa_sparse_fwd_split_for"]["skipped"] is True
+    assert all(r["ok"] for r in rows)
+
+
 def test_tune_native_missing_bench(store, monkeypatch):
     import vkernels.torch_ops.tuner as tuner_mod
 

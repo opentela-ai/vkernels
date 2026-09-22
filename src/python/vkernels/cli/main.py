@@ -223,8 +223,8 @@ def _cmd_tune(args: argparse.Namespace) -> int:
         ok = True
         for r in rows:
             ok &= r["ok"]
-            print(f"  {'OK ' if r['ok'] else 'FAIL'} {r['tier']:<7} "
-                  f"{r['name']:<32} {r['detail']}")
+            mark = "SKIP" if r.get("skipped") else ("OK " if r["ok"] else "FAIL")
+            print(f"  {mark} {r['tier']:<7} {r['name']:<32} {r['detail']}")
         return 0 if ok else 1
     # clear
     if not args.name and not args.all:

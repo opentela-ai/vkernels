@@ -302,9 +302,16 @@ def tune(names=(), *, store_dir=None, all=False) -> list[dict]:
         row = {"name": entry.name, "tier": entry.tier}
         try:
             if not entry.persists:
-                row.update(ok=False, detail=(
-                    "sweep harness does not write the store yet "
-                    f"({entry.bench}, {entry.toolkit} on-site step)"))
+                if all:
+                    # Batch runs tune what they can: a harness that cannot
+                    # write the store is a skip, not a failure.
+                    row.update(ok=True, skipped=True, detail=(
+                        "skipped: sweep harness does not write the store yet "
+                        f"({entry.bench}, {entry.toolkit} on-site step)"))
+                else:
+                    row.update(ok=False, detail=(
+                        "sweep harness does not write the store yet "
+                        f"({entry.bench}, {entry.toolkit} on-site step)"))
             elif entry.tier == "triton":
                 _resolve_sweep(entry.sweep)()
                 n = _triton_record_count(entry.name, store)

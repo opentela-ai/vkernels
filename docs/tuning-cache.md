@@ -1,39 +1,135 @@
-# Persistent autotune (`vkernels.torch_ops.tuning_cache`)
+# Persistent tuning cache — how to use it
 
-Triton's `@triton.autotune` re-benchmarks every config in every fresh
-process and discards the result at exit. Warmup paths pay the full sweep
-on every boot (and inherit its graph-capture pollution hazards —
-`mhc_projection` and `glm_projection` both document first-call trials
-dirtying capture); a hand-tuned config table can only be produced by
-copy-pasting benchmark output into source comments. The tuning cache
-keeps the sweep's winner.
+vkernels kernels come in two tiers, and both used to lose their tuning:
 
-The same idea covers the **native tier**: the C++/HIP/CUDA kernels in
-`src/c/` don't autotune at all — their launch configs are heuristic
-formulas frozen in the headers, re-fitted by hand after each measured
-sweep (`docs/performance/dsa/gfx942.md`). The native store replaces the
-copy-paste step: the sweep benches write the winner, the launchers read
-it back. See [Native tier](#native-tier-c-hipcudakernels) below.
+* **Triton** (`torch_ops/`) — `@triton.autotune` re-benchmarks every
+  config in every fresh process and discards the result at exit. Warmup
+  paths pay the full sweep on every boot (and inherit its graph-capture
+  pollution hazards — `mhc_projection` and `glm_projection` both document
+  first-call trials dirtying capture).
+* **Native** (`src/c/`, the C++/HIP/CUDA kernels) — no autotune at all;
+  launch configs are heuristic formulas re-fitted by hand after each
+  measured sweep, with the results copy-pasted into source comments
+  (issue #137).
 
-## The store
+The tuning cache persists the sweep's winner for both tiers in one store,
+and `vkl tune` is the one command that drives it.
 
-One JSON file per (kernel, device):
+## Quick start (new box / new hardware)
+
+```bash
+# 0. Build once with the benches (native sweeps live in meta/benchmarks):
+cmake --preset cuda -DVKERNELS_BUILD_BENCHMARKS=ON && cmake --build --preset cuda -j8
+
+# 1. See what is tunable and what is already tuned:
+vkl tune status
+
+# 2. Sweep every registered kernel and persist the winners (one-time
+#    per device arch; GPU required, takes ~minutes):
+vkl tune run --all
+
+# 3. Point serving at the store. Every launch now replays the stored
+#    config — no benchmarking, no code changes:
+export VKERNELS_TUNING_CACHE=~/.cache/vkernels/tuning   # this is the default
+```
+
+That's the whole workflow. The store is a deployable artifact: tar the
+directory and ship it with boxes of the same GPU arch, or leave it local
+— nothing needs `vkl tune` at serving time, launchers read the store on
+their own (Triton kernels on first launch of each key shape, native
+config selectors on every launch).
+
+(In-repo, `vkl` is `make vkl ARGS='tune status'` or
+`python3 -m vkernels.cli tune status`; the console script comes from
+`pip install -e ./src`.)
+
+**When to re-tune:** the records self-invalidate. A different device
+arch, a torch/triton/HIP upgrade, or changed producer sources turns the
+record into a **miss** — the next launch re-sweeps that key and
+re-persists. It never errors and never picks a config tuned for other
+hardware; delete the store (`vkl tune clear --all`) only to force a full
+clean sweep sooner.
+
+## Commands
 
 ```
-$VKERNELS_TUNING_CACHE/<kernel>.<arch>.json     # default ~/.cache/vkernels/tuning
+vkl tune status               # every store artifact, both tiers + registry coverage
+vkl tune run <name>|--all     # sweep and persist (in-process for Triton, bench for native)
+vkl tune clear <name>|--all   # delete stored configs (both tiers)
 ```
 
-Schema `vk-tuning-store/1`, in the spirit of the frozen-artifact
-manifests (#67, `tuning_manifest.py`):
+`status` output on a tuned GB10:
 
-| Field | Meaning |
+```
+store: ~/.cache/vkernels/tuning  arch: sm121  enabled
+  tier    kernel                           arch       records  path
+  triton  mhc_projection                   sm121            2  .../mhc_projection.sm121.json
+  native  dsa_topk_logits_split_for        sm121            4  .../dsa_topk_logits_split_for.sm121.tune
+  registry:
+    triton  mhc_projection                   tuned         mHC projection (BF16 GEMV+reduce); ...
+    native  dsa_topk_logits_split_for        tuned         DSA indexer split_kv selector ...
+    native  dsa_sparse_fwd_split_for         formula-only  DSA sparse-MLA split_kv selector ...
+```
+
+* `tuned` — a store artifact exists for this kernel.
+* `untuned` — registered but never swept; `vkl tune run <name>` fills it.
+* `formula-only` — registered, but the sweep harness cannot write the
+  store yet (needs on-site hardware); `run` skips it with a reason
+  instead of mis-running. The kernel still uses its compiled-in formula.
+
+`run` is idempotent and incremental: an existing record for a key is
+re-measured and replaced only by the (possibly same) winner. A failing
+kernel's sweep never blocks the others — the report marks it `FAIL` with
+the reason and moves on. A `formula-only` entry is a `FAIL` when named
+explicitly (you asked for it, it can't run) but only a `SKIP` under
+`--all` (batch runs tune what they can), so the quick-start above exits
+clean.
+
+## Environment variables
+
+| Variable | Effect |
 | --- | --- |
-| `kernel`, `schema` | store identity + format version |
-| `device` | name, arch (gcnArchName or `smXY`), CU count, torch/triton/HIP versions — **no device index** (ordinals are not stable across boots or `CUDA_VISIBLE_DEVICES`) |
-| `records` | per-key: chosen config (kwargs + num_warps + num_stages), measured `time_ms`, device block, producer fingerprints (sha256 of the producing sources), `measured_at` |
+| `VKERNELS_TUNING_CACHE=<dir>` | store root. Default `~/.cache/vkernels/tuning`. |
+| `VKERNELS_TUNING_CACHE=off` | disable reads *and* writes — pure in-process autotune / compiled-in formulas (historical behavior). |
+| `VKERNELS_TUNING_ARCH=<token>` | pin the arch token used in file names (tests, cross-arch artifact inspection). Otherwise: HIP `gcnArchName` (feature flags stripped), CUDA `sm<major><minor>`. |
+| `TRITON_CACHE_DIR` | orthogonal: Triton's **binary** (cubin) cache. This module persists *choices*, Triton persists *cubins* — pin both for fully warm boots. |
+| `CCACHE_DIR` / `VKERNELS_USE_CCACHE` | the build cache (see [Build cache](#build-cache)). |
 
-Writes are atomic (temp file + `os.replace`); concurrent sweeps
-last-writer-wins per key, benign for benchmark winners.
+The arch token is canonical across tiers — both name a device
+identically. (Torch on CUDA >= 13 exposes a `gcnArchName` attribute even
+on NVIDIA holding the marketing name; the Python tier ignores it there.)
+
+## Store layout
+
+One artifact per (kernel, device arch), two formats in one directory:
+
+```
+$VKERNELS_TUNING_CACHE/
+  mhc_projection.sm121.json                  # triton tier (schema vk-tuning-store/1)
+  dsa_topk_logits_split_for.sm121.tune       # native tier (vk-native-tuning/1)
+```
+
+The native sidecar is line-based (the C++ reader takes no dependencies):
+
+```
+# vk-native-tuning/1
+# arch=sm121 cu_count=48 written_by=bench_dsa_topk_logits
+key=1,512,64
+split=32
+```
+
+Writes are atomic (temp + rename) in both tiers; concurrent sweeps
+last-writer-wins per key, benign for benchmark winners. The JSON tier
+also stores the measured time, the full device/software block, and
+sha256 producer fingerprints — see [The decorator](#the-decorator) and
+[Lenient by design](#lenient-by-design).
+
+---
+
+# Reference
+
+The sections below are the design/implementation detail behind the
+workflow above.
 
 ## The decorator
 
@@ -73,96 +169,74 @@ fail-loud contract for *frozen, shared* artifacts lives in
 `strict=True` (optionally with a repo-path `store_dir`) to get
 `TuningCacheError` on any mismatch for auditable stores.
 
-## Knobs
+## The Triton store schema
 
-* `VKERNELS_TUNING_CACHE=<dir>` — store root.
-* `VKERNELS_TUNING_CACHE=off` — pure in-process autotune (historical
-  behavior); nothing is read or written.
-* The Triton JIT **binary** cache (`TRITON_CACHE_DIR`) is orthogonal and
-  unaffected: this module persists *choices*, Triton persists *cubins*.
-  Pin both for fully warm boots.
+```
+$VKERNELS_TUNING_CACHE/<kernel>.<arch>.json
+```
 
-## Adoption
+Schema `vk-tuning-store/1`, in the spirit of the frozen-artifact
+manifests (#67, `tuning_manifest.py`):
 
-Exemplar: `torch_ops/mhc_projection.py`. To migrate another kernel,
-replace `@triton.autotune(configs=..., key=...)` with
-`@persistent_autotune(configs=..., key=..., kernel_name=<unique stem>,
-source_files=[__file__])`. Keys must be JSON-able scalars (ints, bools,
-strings — the constexprs that shape the launch); the per-key values are
-stored verbatim, so do not key on tensor arguments.
-
-Deleting a kernel's stored choices: `TuningCache(kernel_name).clear()`.
+| Field | Meaning |
+| --- | --- |
+| `kernel`, `schema` | store identity + format version |
+| `device` | name, arch, CU count, torch/triton/HIP versions — **no device index** (ordinals are not stable across boots or `CUDA_VISIBLE_DEVICES`) |
+| `records` | per-key: chosen config (kwargs + num_warps + num_stages), measured `time_ms`, device block, producer fingerprints (sha256 of the producing sources), `measured_at` |
 
 ## Native tier (C++/HIP/CUDA kernels)
 
-`src/c/vkernels/core/tuning.{hpp,cpp}` implements the same store for the
-compiled kernels. One line-format sidecar per (kernel, device arch):
-
-```
-$VKERNELS_TUNING_CACHE/<kernel>.<arch>.tune     # e.g. dsa_topk_logits_split_for.sm121.tune
-```
-
-```
-# vk-native-tuning/1
-# arch=sm121 cu_count=48 written_by=bench_dsa_topk_logits
-key=1,512,64
-split=32
-```
+`src/c/vkernels/core/tuning.{hpp,cpp}` implements the store for the
+compiled kernels. Reading:
 
 | Piece | What it does |
 | --- | --- |
-| `tuning::find(kernel, key)` | the persisted record, or `nullptr` on any miss. The arch token matches the Python tier (`gcnArchName` on HIP, `smXY` on CUDA); a single foreign-arch file is honored (one-machine rule), two are ambiguous and miss. `VKERNELS_TUNING_ARCH` pins the token (tests, cross-arch inspection). |
+| `tuning::find(kernel, key)` | the persisted record, or `nullptr` on any miss. A single foreign-arch file is honored (one-machine rule), two are ambiguous and miss. |
 | `tuning::persist(kernel, key, params, written_by)` | merge-write the winner (atomic whole-file rewrite, unknown records kept). |
 | `VKERNELS_TUNING_CACHE=off` | disables reads *and* writes — pure compiled-in formulas. |
 
-**Seam contract:** config-selector formulas consult the store BEFORE their
-heuristics; a persisted winner is ground truth for the device arch,
-including prefill early-outs. The keys mirror the formula's arguments, so
-a record is self-describing and a stale one is just a re-tune. First
-adopter: `dsa_topk_logits_split_for` / `dsa_sparse_fwd_split_for`
-(`kernels/dsa.cpp`) — the two formulas that previously had their measured
-sweeps copy-pasted into comments (#137).
+**Seam contract:** config-selector formulas consult the store BEFORE
+their heuristics; a persisted winner is ground truth for the device
+arch, including prefill early-outs. The keys mirror the formula's
+arguments, so a record is self-describing and a stale one is just a
+re-tune. First adopter: `dsa_topk_logits_split_for` /
+`dsa_sparse_fwd_split_for` (`kernels/dsa.cpp`) — the two formulas that
+previously had their measured sweeps copy-pasted into comments (#137).
+Measured effect on GB10: the sweep's winners override the formula at
+several decode shapes (e.g. `bs=1, msl=512`: split 32, 10.8 us vs the
+formula's 8 at 47 us).
 
-**Sweep harness:** the benches own the tuning loop. `bench_dsa_topk_logits
---persist[=<dir>]` sweeps split_kv per decode shape, prints the winner vs
-the formula, and persists (`meta/benchmarks/bench_dsa_topk_logits.cu`).
-On GB10 the measured winners override the formula at several decode
-shapes (e.g. `bs=1, msl=512`: split 32, 10.8 us vs formula's 8 at 47 us).
-Extend the same `--persist` pattern to the other bench binaries as their
-kernels get tunable knobs.
+**Sweep harnesses:** the benches own the tuning loop —
+`bench_dsa_topk_logits --persist[=<dir>]` sweeps split_kv per decode
+shape, prints the winner vs the formula, and writes the store
+(`meta/benchmarks/bench_dsa_topk_logits.cu`). `vkl tune run` invokes the
+registered bench for you. Extend the same `--persist` pattern to the
+other bench binaries as their kernels get tunable knobs.
 
-Everything here is lenient — a stale/malformed/foreign record is a
-re-tune, never an error (the fail-loud frozen-artifact contract stays in
-`tuning_manifest`, and the auditable Python tier is `torch_ops/`).
 Unit tests: `tests/core/test_tuning.cpp` (C++) and
 `tests/python/test_tuner.py` (the Python mirror — a sidecar written by
 either tier must parse byte-compatibly in the other).
 
-## One tuner (`vkl tune`)
+## One tuner (`torch_ops/tuner.py`)
 
-`torch_ops/tuner.py` is the single surface over both tiers. Its
-`REGISTRY` catalogs every tunable kernel with the artifact that tunes it
-(a sweep callable for Triton kernels, a persist-capable bench binary for
-native ones); the CLI drives it:
+The `REGISTRY` catalogs every tunable kernel with the artifact that
+tunes it — a sweep callable for Triton kernels, a persist-capable bench
+binary for native ones. Adding a kernel means two edits: register it in
+`REGISTRY`, and make its sweep write the store
+(`@persistent_autotune` or bench `--persist`).
 
-```
-vkl tune status               # every store artifact, both tiers + registry coverage
-vkl tune run <name>|--all     # sweep and persist (in-process for Triton, bench for native)
-vkl tune clear <name>|--all   # delete stored configs (both tiers)
-```
+## Adopting in torch_ops
 
-Adding a kernel to the tuner means two edits: register it in
-`REGISTRY` (with its sweep hook or bench binary), and make the sweep
-write the store — `@persistent_autotune` for Triton kernels,
-`--persist` in the bench for native ones. Kernels whose harness cannot
-persist yet are cataloged as `formula-only` and skipped with a reason
-rather than mis-run.
-
-The arch token is canonical across tiers: HIP `gcnArchName` (feature
-flags stripped), CUDA `sm<major><minor>` — pinned by
-`VKERNELS_TUNING_ARCH`. (Torch on CUDA >= 13 exposes a `gcnArchName`
-attribute even on NVIDIA; `device_fingerprint()` ignores it there so
-both tiers name a device identically.)
+Exemplar: `torch_ops/mhc_projection.py` (including
+`mhc_projection_tune`, the sweep hook the registry calls). To migrate
+another kernel, replace `@triton.autotune(configs=..., key=...)` with
+`@persistent_autotune(configs=..., key=..., kernel_name=<unique stem>,
+source_files=[__file__])`, then register it in
+`torch_ops/tuner.py::REGISTRY` with a `tune` hook that launches the
+kernel once per key shape on synthetic tensors. Keys must be JSON-able
+scalars (ints, bools, strings — the constexprs that shape the launch);
+the per-key values are stored verbatim, so do not key on tensor
+arguments.
 
 ## Build cache
 

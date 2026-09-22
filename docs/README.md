@@ -10,7 +10,9 @@
 > safety), see [serving-c-abi.md](serving-c-abi.md). For the Python-side
 > Triton inference operators (`torch_ops` — the self-validating op contract,
 > `triton_attn`, and the vendored vLLM KDA / sparse-MLA kernels), see
-> [torch-ops.md](torch-ops.md).
+> [torch-ops.md](torch-ops.md). For persistent launch-config tuning (the
+> `vkl tune` workflow, both the Triton and native kernels), see
+> [tuning-cache.md](tuning-cache.md).
 
 This document lists every kernel and communication primitive in vkernels,
 along with the mathematical computation each performs. Every operation follows
