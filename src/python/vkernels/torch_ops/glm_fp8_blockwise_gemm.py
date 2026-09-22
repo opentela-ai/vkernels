@@ -55,6 +55,22 @@ import threading
 from functools import lru_cache
 
 from ._dispatch import OpNotEligible
+from .tile_configs import lookup_tiles
+
+
+def _tiles(op: str, m: int, default: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Tile selection for the triton launchers (round-8 M3).
+
+    Precedence: ``VK_FP8GEMM_TILES`` (live single-shape override) > the
+    op's M-bucketed JSON sidecar via :func:`tile_configs.lookup_tiles` >
+    the built-in default. A sidecar miss keeps the default; a malformed
+    sidecar or a stale manifest raises (audited artifacts never silently
+    downgrade).
+    """
+    cfg = os.environ.get("VK_FP8GEMM_TILES", "")
+    if cfg:
+        return tuple(int(x) for x in cfg.split(","))
+    return lookup_tiles(op, m) or default
 
 # One-shot log for the triton-blockwise -> torch-oracle fallback in
 # fp8_blockwise_gemm: the fallback is correct by contract, but a silent one
@@ -601,10 +617,7 @@ def _triton_native_backend(a_fnuz, a_scales, b_fnuz, b_scales, out):
     n = b_fnuz.shape[0]
     import triton
 
-    bm, bn, warps, stages = 128, 128, 4, 3
-    cfg = os.environ.get("VK_FP8GEMM_TILES", "")
-    if cfg:
-        bm, bn, warps, stages = (int(x) for x in cfg.split(","))
+    bm, bn, warps, stages = _tiles("glm_fp8_dense_fnuz", m, (128, 128, 4, 3))
     grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
     kfn[grid](
         a_fnuz,
@@ -756,10 +769,7 @@ def _grouped_backend(
     `out` rows are always in sorted-slot order ([n_slots, n])."""
 
     kfn = _grouped_kernel()
-    bm, bn, warps, stages = 64, 128, 4, 3
-    cfg = os.environ.get("VK_FP8GEMM_TILES", "")
-    if cfg:
-        bm, bn, warps, stages = (int(x) for x in cfg.split(","))
+    bm, bn, warps, stages = _tiles("glm_fp8_grouped", len(tile_m), (64, 128, 4, 3))
     import triton
 
     grid = (triton.cdiv(n, bn), len(tile_m))
@@ -858,8 +868,8 @@ def glm_moe_grouped_gemm_native(
     quantize = _activation_quantizer(gate_up_nz.dtype)
     a_nz, asc2 = quantize(x)
 
-    bm = int(os.environ.get("VK_FP8GEMM_TILES", "64,128,4,3").split(",")[0])
     slots = t * k
+    bm = _tiles("glm_fp8_grouped", slots, (64, 128, 4, 3))[0]
     # Static upper bound on the row-tile count (see _tile_map_static). Two
     # bounds hold for any routing: sum_e ceil(c_e/bm) <= slots/bm + E, and no
     # tile is empty so tiles <= slots. The second one matters in DECODE, where
@@ -924,10 +934,7 @@ def _triton_backend(a_fp8, a_scales, b_fp8, b_scales, out):
     b8 = b_fp8.view(torch.uint8)
     import triton
 
-    bm, bn, warps, stages = 128, 128, 8, 3
-    cfg = os.environ.get("VK_FP8GEMM_TILES", "")
-    if cfg:
-        bm, bn, warps, stages = (int(x) for x in cfg.split(","))
+    bm, bn, warps, stages = _tiles("glm_fp8_dense_fn", m, (128, 128, 8, 3))
     grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
     kfn[grid](
         a8,
