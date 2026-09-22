@@ -20,6 +20,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include "vkernels/kernels/glm_moe.hpp"  // glm_fp8_block_gemv_cpu (persistence parity gate)
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -240,6 +242,42 @@ int main(int argc, char** argv) {
                   c.tag, M, fused, fgb, mat, mgb, dq,
                   mat / (fused > 0 ? fused : 1), best_sk, roof_f, roof_m);
       if (do_persist && M == 1) {
+        // Parity gate before persisting: the winner must match the CPU
+        // oracle (bf16 tolerance). The selector-side contract check catches
+        // a structurally invalid sk but not a numerically broken one, and
+        // only the winner gets persisted for serving.
+        std::vector<uint16_t> ref_out((size_t)M * c.N);
+        vkernels::kernels::glm_fp8_block_gemv_cpu(
+            x.data(), w.data(), s.data(), ref_out.data(), M, c.N, c.K);
+        std::vector<uint16_t> got_out((size_t)M * c.N);
+        CK(hipMemcpy(got_out.data(), dout, got_out.size() * 2,
+                     hipMemcpyDeviceToHost),
+           "parity-cpy");
+        double max_ref = 0, max_diff = 0;
+        bool nan_seen = false;
+        for (size_t i = 0; i < got_out.size(); ++i) {
+          const float a = [&] {
+            uint32_t u = (uint32_t)ref_out[i] << 16;
+            float f;
+            std::memcpy(&f, &u, 4);
+            return f;
+          }();
+          const float b = [&] {
+            uint32_t u = (uint32_t)got_out[i] << 16;
+            float f;
+            std::memcpy(&f, &u, 4);
+            return f;
+          }();
+          if (std::isnan(a) || std::isnan(b)) nan_seen = true;
+          max_ref = std::max(max_ref, (double)std::fabs(a));
+          max_diff = std::max(max_diff, (double)std::fabs(a - b));
+        }
+        if (nan_seen || max_diff > 1e-1 * std::max(1.0, max_ref)) {
+          std::printf("    winner sk=%d PARITY FAIL vs CPU oracle "
+                      "(max_diff=%g, max_ref=%g%s) -- NOT stored\n",
+                      best_sk, max_diff, max_ref,
+                      nan_seen ? ", NaN" : "");
+        } else {
         const int formula_sk =
             vkernels::kernels::glm_fp8_gemv_pick_sk(c.N, c.K);  // store read-back
         vkernels::core::tuning::persist(
@@ -249,6 +287,7 @@ int main(int argc, char** argv) {
                     best_sk, fused, formula_sk,
                     best_sk == formula_sk ? "(agree)" : "(OVERRIDE)",
                     "  [stored]");
+        }
       }
       hipFree(dx); hipFree(dw); hipFree(ds); hipFree(dout); hipFree(dwb);
       hipFree(dpart);

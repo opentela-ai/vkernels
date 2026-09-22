@@ -124,10 +124,19 @@ int mla_fwd_split_for(int B, int H, int S_q, int S_kv) {
   // formula. Keys match the formula's arguments so the persisted record is
   // self-describing.
   if (core::tuning::enabled()) {
-    if (const auto* entry = core::tuning::find(
+    if (const auto entry = core::tuning::find(
             "mla_fwd_split_for", {B, H, S_q, S_kv}))
-      if (const long long* split = entry->find("split"))
-        if (*split >= 1) return static_cast<int>(*split);
+      if (const long long* split = entry->find("split")) {
+        // Clamp to what a launch can actually use: splits past the key
+        // window are pure empty-slice waste, and gridDim.z = B*split must
+        // stay under the 65535 hardware limit. A corrupted or hand-edited
+        // record degrades to the clamped value, never to a bad launch or
+        // an int truncation.
+        const long long cap = std::min((long long)S_kv,
+                                       65535LL / (B > 0 ? B : 1));
+        const long long s = std::min(*split, cap);
+        if (s >= 1) return static_cast<int>(s);
+      }
   }
   // Decode only: the split re-launches the shared latent reads from a grid
   // that would otherwise leave CUs idle. Prefill keeps its single-block path

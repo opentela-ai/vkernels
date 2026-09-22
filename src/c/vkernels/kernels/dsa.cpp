@@ -330,7 +330,7 @@ int dsa_topk_logits_split_for(int batch_size, int max_seq_len, int block) {
   // device arch beats the compiled-in formula. Keys match the formula's
   // arguments so the persisted record is self-describing.
   if (core::tuning::enabled()) {
-    if (const auto* entry = core::tuning::find(
+    if (const auto entry = core::tuning::find(
             "dsa_topk_logits_split_for",
             {batch_size, max_seq_len, block}))
       if (const long long* split = entry->find("split"))
@@ -348,13 +348,34 @@ int dsa_topk_logits_split_for(int batch_size, int max_seq_len, int block) {
   return s < 1 ? 1 : s;
 }
 
+bool dsa_tile_from_store(int S_q, int H, int dim, int tail_dim, int topk,
+                         int* bq, int* block_I, int* inner_iter) {
+  if (!core::tuning::enabled()) return false;
+  const auto entry = core::tuning::find(
+      "dsa_sparse_fwd_tile", {S_q, H, dim, tail_dim, topk});
+  if (!entry) return false;
+  const long long *pb = entry->find("bq"), *pbi = entry->find("block_I"),
+                  *pii = entry->find("inner_iter");
+  if (!pb || !pbi || !pii) return false;
+  // Validate in long long before narrowing: a corrupt record must wrap to
+  // "invalid", never to a plausible-looking config.
+  if (*pb != 1 && *pb != 2 && *pb != 4 && *pb != 8) return false;
+  if (*pbi <= 0 || *pii <= 0 || *pbi > topk ||
+      (long long)topk % (*pbi * *pii) != 0)
+    return false;
+  *bq = (int)*pb;
+  *block_I = (int)*pbi;
+  *inner_iter = (int)*pii;
+  return true;
+}
+
 int dsa_sparse_fwd_split_for(int S_q, int H, int topk, int block_I,
-                             int num_cu) {
+                             int num_cu, int dim, int tail_dim) {
   // Tuning-store override (docs/tuning-cache.md), consulted before every
   // heuristic branch below — the persisted sweep result is ground truth
   // for this device arch, including the prefill early-out.
   if (core::tuning::enabled()) {
-    if (const auto* entry = core::tuning::find(
+    if (const auto entry = core::tuning::find(
             "dsa_sparse_fwd_split_for", {S_q, H, topk, block_I, num_cu}))
       if (const long long* split = entry->find("split"))
         return static_cast<int>(*split);
@@ -365,7 +386,13 @@ int dsa_sparse_fwd_split_for(int S_q, int H, int topk, int block_I,
   if (num_cu <= 0) num_cu = 228;
   if (S_q <= 0 || H <= 0 || topk <= 0) return 1;
   int bq = 0, th = 0, bi = 0, ii = 0;
-  dsa_config_for(S_q, H, /*dim=*/0, topk, &bq, &th, &bi, &ii);
+  if (dim > 0 && tail_dim >= 0 &&
+      dsa_tile_from_store(S_q, H, dim, tail_dim, topk, &bq, &bi, &ii)) {
+    // Tile override from the store: its bq is what dispatch will actually
+    // launch with, so reason about THAT grid, not the formula's.
+  } else {
+    dsa_config_for(S_q, H, /*dim=*/0, topk, &bq, &th, &bi, &ii);
+  }
   const int blocks = ((S_q + bq - 1) / bq) * H;   // blocks per single split
   // Prefill / wide-H shapes: the plain grid already fills (or over-fills)
   // the CUs, so serial key streaming is amortized across blocks -- splitting

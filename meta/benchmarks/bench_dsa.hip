@@ -108,6 +108,12 @@ static uint16_t f2bf(float v) {
   b += 0x7FFFu + lsb;
   return (uint16_t)(b >> 16);
 }
+static float bf2f(uint16_t h) {
+  uint32_t b = (uint32_t)h << 16;
+  float v;
+  std::memcpy(&v, &b, sizeof(float));
+  return v;
+}
 static float rnd(int seed, int i) {
   unsigned x = (unsigned)(seed * 2654435761u + (unsigned)i * 40503u);
   x ^= x >> 13; x *= 0x5bd1e995u; x ^= x >> 15;
@@ -357,6 +363,11 @@ static void tile_sweep(const GpuInfo& info, hipEvent_t start, hipEvent_t stop,
     std::printf("    %3s %6s %9s %9s  %s\n", "bq", "", "us(min)", "us(med)",
                 "note");
     int best_bq = bqs[0]; double best_us = 1e18;
+    // Per-combo correctness cross-check: every swept bq must match the
+    // bq=1 output (bf16 tolerance) before it can win -- test_dsa_correct
+    // only exercises the formula's bq, so without this a numerically
+    // broken instantiation could be pinned as ground truth for serving.
+    std::vector<uint16_t> ref_out;
     for (int bq : bqs) {
       auto L = [&] {
         vkernels::kernels::hip::dsa_sparse_fwd_with_tile(
@@ -365,6 +376,25 @@ static void tile_sweep(const GpuInfo& info, hipEvent_t start, hipEvent_t stop,
             /*inner_iter=*/fii, /*bn_kv=*/0);
       };
       auto r = bench_us(L, start, stop, 3, 60);
+      std::vector<uint16_t> got(nout);
+      check_hip(hipMemcpy(got.data(), dout, nout * 2, hipMemcpyDeviceToHost),
+                "got");
+      if (bq == bqs[0]) {
+        ref_out = got;
+      } else {
+        double max_ref = 0, max_diff = 0;
+        for (size_t i = 0; i < nout; ++i) {
+          const float a = bf2f(ref_out[i]), b = bf2f(got[i]);
+          max_ref = std::max(max_ref, (double)std::fabs(a));
+          max_diff = std::max(max_diff, (double)std::fabs(a - b));
+        }
+        if (max_diff > 2e-2 * std::max(1.0, max_ref)) {
+          std::printf("    bq=%d CORRECTNESS FAIL vs bq=1 (max_diff=%g, "
+                      "max_ref=%g) -- excluded from argmin\n",
+                      bq, max_diff, max_ref);
+          continue;
+        }
+      }
       std::printf("    %3d %6s %9.1f %9.1f  %s\n", bq, "", r.min_us,
                   r.median_us, bq == fbq ? "<- formula" : "");
       if (r.median_us < best_us) { best_us = r.median_us; best_bq = bq; }
@@ -395,7 +425,7 @@ static void tile_sweep(const GpuInfo& info, hipEvent_t start, hipEvent_t stop,
       // Read-back: what the dispatch override in dsa.hip will select on
       // the next run with this store (the record a --persist pass wrote,
       // or a previously shipped sidecar).
-      if (const auto* e = vkernels::core::tuning::find(
+      if (const auto e = vkernels::core::tuning::find(
               "dsa_sparse_fwd_tile", {S_q, H, dim, tail_dim, topk})) {
         const auto *b = e->find("bq"), *pbi = e->find("block_I"),
                    *pii = e->find("inner_iter");
@@ -482,7 +512,7 @@ static void split_sweep(const GpuInfo& info, hipEvent_t start,
               "cpyidx");
 
     const int rec = vkernels::kernels::dsa_sparse_fwd_split_for(
-        S_q, H, topk, /*block_I=*/64, /*num_cu=*/228);
+        S_q, H, topk, /*block_I=*/64, /*num_cu=*/228, dim, tail_dim);
     std::printf("\n  H=%d S_q=%d topk=%d (dim=%d tail=%d):"
                 " dsa_sparse_fwd_split_for = %d\n",
                 H, S_q, topk, dim, tail_dim, rec);

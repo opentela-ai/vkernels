@@ -110,7 +110,7 @@ Mirrors `mla.{hpp,cpp,hip}` from issue #21:
 |---|---|---|
 | `sparse_mla_fwd_decode_partial` (+ combine) | `dsa_sparse_fwd_cpu` | `dsa_sparse_fwd` |
 | `sparse_attention_fwd_kernel_v1/v2` (prefill) | `dsa_sparse_fwd_cpu` | `dsa_sparse_fwd` |
-| tile selector | `dsa_config_for` | `dsa_config_for` (decode ≤8 q/block; prefill BQ q/block × 256 th) |
+| tile selector | `dsa_config_for` (formula) or `dsa_tile_from_store` (a `dsa_sparse_fwd_tile` tuning-store record pinned by `dsa_bench --persist`; malformed records fall back to the formula) | same store-or-formula resolution, shared helper in `dsa.cpp` (decode ≤8 q/block; prefill BQ q/block × 256 th) |
 
 The CPU reference is a numerically-stable two-pass base-2 softmax, fp32
 throughout (always compiled; the oracle on host CI). The HIP kernel is an

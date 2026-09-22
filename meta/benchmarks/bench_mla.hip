@@ -347,13 +347,20 @@ static void split_sweep(hipEvent_t start, hipEvent_t stop, bool do_persist) {
     check_hip(hipMemcpy(dv,   v.data(),   nv   * 4, hipMemcpyHostToDevice),
               "cpyv");
 
-    // Correctness gate: split path vs plain path on-device (fp32 outputs,
-    // different summation order -> loose abs tolerance).
+    // Correctness gate: split path vs the PLAIN path on device (fp32
+    // outputs, different summation order -> loose abs tolerance). The ref
+    // MUST be an explicit split=1 launch: mla_fwd routes through
+    // mla_fwd_split_for, which takes the split path on every decode shape
+    // here -- using it as "ref" would make this gate a self-comparison
+    // that cannot fail (a numerically broken split path would pass and be
+    // persisted for serving).
     const int split_for = vkernels::kernels::mla_fwd_split_for(B, H, S_q, S_kv);
+    std::vector<float> ref;
     {
-      vkernels::kernels::hip::mla_fwd(
-          B, H, S_q, S_kv, 0, 0, kv, pe, scale, dq, dkc, dkpe, dv, dout);
-      std::vector<float> ref(nout);
+      vkernels::kernels::hip::mla_fwd_with_split(
+          B, H, S_q, S_kv, 0, 0, kv, pe, scale, dq, dkc, dkpe, dv, dout,
+          /*split=*/1);  // explicit plain-path reference
+      ref.resize(nout);
       check_hip(hipMemcpy(ref.data(), dout, nout * 4, hipMemcpyDeviceToHost),
                 "ref");
       vkernels::kernels::hip::mla_fwd_with_split(
@@ -401,6 +408,30 @@ static void split_sweep(hipEvent_t start, hipEvent_t stop, bool do_persist) {
                   s == split_for ? "<- split_for" : "");
     }
     if (do_persist) {
+      // Gate the eventual winner too, not just split_for: the sweep's best
+      // split can differ from the formula's, and only the winner gets
+      // persisted for serving.
+      vkernels::kernels::hip::mla_fwd_with_split(
+          B, H, S_q, S_kv, 0, 0, kv, pe, scale, dq, dkc, dkpe, dv, dout,
+          best_split);
+      std::vector<float> got_best(nout);
+      check_hip(hipMemcpy(got_best.data(), dout, nout * 4,
+                          hipMemcpyDeviceToHost),
+                "got_best");
+      double max_ref = 0, max_diff = 0;
+      for (size_t i = 0; i < nout; ++i) {
+        max_ref = std::max(max_ref, (double)std::fabs(ref[i]));
+        max_diff = std::max(max_diff, (double)std::fabs(ref[i] - got_best[i]));
+      }
+      if (max_diff > 1e-2 * std::max(1.0, max_ref)) {
+        std::printf("    winner split=%d CORRECTNESS FAIL (max_diff=%g, "
+                    "max_ref=%g) -- NOT stored\n",
+                    best_split, max_diff, max_ref);
+        check_hip(hipFree(dq), "fq"); check_hip(hipFree(dkc), "fkc");
+        check_hip(hipFree(dkpe), "fkpe"); check_hip(hipFree(dv), "fv");
+        check_hip(hipFree(dout), "fout");
+        continue;
+      }
       vkernels::core::tuning::persist(
           "mla_fwd_split_for", {B, H, S_q, S_kv}, {{"split", best_split}},
           "bench_mla");

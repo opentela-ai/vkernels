@@ -35,7 +35,7 @@ int gemv_pick_sk(int N, int K) {
   // formula below. The record is validated against the with_scratch
   // contract (sk in {1,2,4,8} dividing K/128) before it is trusted.
   if (core::tuning::enabled()) {
-    if (const auto* entry =
+    if (const auto entry =
             core::tuning::find("glm_fp8_gemv_pick_sk", {N, K}))
       if (const long long* sk = entry->find("sk"))
         if (*sk >= 1 && *sk <= 8 && (K / 128) % *sk == 0)

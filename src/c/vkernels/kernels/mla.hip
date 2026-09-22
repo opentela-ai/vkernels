@@ -391,6 +391,11 @@ bool launch_split(const float* q, const float* k_c, const float* k_pe,
   mla_fwd_split_kernel<<<gridS, block, Dq * sizeof(float), st>>>(
       q, k_c, k_pe, v_c, w.partial_out, w.partial_lse, H, S_q, S_kv, q_start,
       kv_start, lr, rhd, scale, split, kvs);
+  // A failed split-kernel launch would leave the grow-only workspace with
+  // stale contents that the combine below would fold into `out` -- the
+  // wrong-but-plausible failure mode. Report failure so the caller falls
+  // back to the plain (unsplit) path instead.
+  if (hipGetLastError() != hipSuccess) return false;
   const dim3 gridC(S_q, H, B);
   mla_fwd_split_combine_kernel<<<gridC, block, split * sizeof(float), st>>>(
       w.partial_out, w.partial_lse, out, S_q, split, lr);

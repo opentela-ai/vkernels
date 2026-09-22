@@ -62,7 +62,9 @@ void mkdir_p(const std::string& dir) {
 
 std::mutex g_mutex;
 // kernel -> (arch -> entries)
-std::map<std::string, std::map<std::string, std::vector<Entry>>> g_stores;
+std::map<std::string,
+         std::map<std::string, std::vector<std::shared_ptr<const Entry>>>>
+    g_stores;
 bool g_warmed = false;
 
 std::string env_or_default_dir() {
@@ -187,7 +189,12 @@ void warm_locked(const std::string& dir) {
     std::ostringstream body;
     body << in.rdbuf();
     g_stores[name.substr(0, dot)][file_arch(name, body.str())] =
-        parse_body(body.str());
+        [&] {
+          std::vector<std::shared_ptr<const Entry>> owned;
+          for (auto& e : parse_body(body.str()))
+            owned.push_back(std::make_shared<const Entry>(std::move(e)));
+          return owned;
+        }();
   }
   closedir(d);
 }
@@ -266,7 +273,8 @@ void reset_for_test() {
   g_warmed = false;
 }
 
-const Entry* find(const std::string& kernel, const std::vector<long long>& key) {
+std::shared_ptr<const Entry> find(const std::string& kernel,
+                                  const std::vector<long long>& key) {
   if (!enabled()) return nullptr;
   std::lock_guard<std::mutex> lock(g_mutex);
   if (!g_warmed) warm_locked(store_dir());  // lazy first use
@@ -281,7 +289,7 @@ const Entry* find(const std::string& kernel, const std::vector<long long>& key) 
     arch_it = arches.begin();
   }
   for (const auto& entry : arch_it->second)
-    if (entry.key == key) return &entry;
+    if (entry->key == key) return entry;
   return nullptr;
 }
 
@@ -308,9 +316,19 @@ void persist(const std::string& kernel, const std::vector<long long>& key,
                 entries.end());
   entries.push_back(Entry{key, params});
 
-  std::ofstream out(path, std::ios::trunc);
-  out << render_body(device_arch(), query_cu_count(), written_by, entries);
-  out.close();
+  // Write via tmp + rename so a concurrent process's lazy warm() never
+  // sees a torn file (the doc's atomicity claim, now actually true).
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    out << render_body(device_arch(), query_cu_count(), written_by, entries);
+    out.close();
+    if (!out) {
+      std::remove(tmp.c_str());  // disk full / permissions: keep old file
+      return;
+    }
+  }
+  std::rename(tmp.c_str(), path.c_str());
 
   // Refresh this process's view (a bench that tunes then re-queries the
   // selector in the same process must see its own winner, and a find()

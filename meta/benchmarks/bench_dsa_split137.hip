@@ -192,7 +192,8 @@ int main(int argc, char** argv) {
               "cpyidx");
 
     const int rec = vkernels::kernels::dsa_sparse_fwd_split_for(
-        S_q, H, topk, /*block_I=*/64, /*num_cu=*/p.multiProcessorCount);
+        S_q, H, topk, /*block_I=*/64, /*num_cu=*/p.multiProcessorCount,
+        dim, tail_dim);
     std::printf("\n  H=%d S_q=%d topk=%d (dim=%d tail=%d):"
                 " dsa_sparse_fwd_split_for = %d%s\n",
                 H, S_q, topk, dim, tail_dim, rec,

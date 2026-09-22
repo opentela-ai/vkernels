@@ -127,7 +127,7 @@ TEST(tuning, persist_find_roundtrip) {
   const std::vector<long long> key{1, 4096, 64};
   tuning::persist("k", key, {{"split", 64}}, "test");
 
-  const auto* hit = tuning::find("k", key);
+  const auto hit = tuning::find("k", key);
   ASSERT_TRUE(hit != nullptr);
   EXPECT_EQ(*hit->find("split"), (long long)64);
 
@@ -150,7 +150,7 @@ TEST(tuning, arch_selection) {
 
   // Exact-arch match wins.
   tuning::persist("single", key, {{"split", 16}}, "test");
-  const auto* hit = tuning::find("single", key);
+  const auto hit = tuning::find("single", key);
   ASSERT_TRUE(hit != nullptr);
   EXPECT_EQ(*hit->find("split"), (long long)16);
   EXPECT_TRUE(store.sole_tune_file("single")
@@ -163,7 +163,7 @@ TEST(tuning, arch_selection) {
     out << "# vk-native-tuning/1\n# arch=gfx942\nkey=1,2,3\nsplit=64\n";
   }
   tuning::reset_for_test();
-  const auto* fell_back = tuning::find("one", key);
+  const auto fell_back = tuning::find("one", key);
   ASSERT_TRUE(fell_back != nullptr);
   EXPECT_EQ(*fell_back->find("split"), (long long)64);
 
