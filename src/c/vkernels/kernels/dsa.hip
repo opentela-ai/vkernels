@@ -737,6 +737,92 @@ void dsa_sparse_fwd_with_tile(int S_q, int S_kv, int H, int dim, int tail_dim,
               kv_group, sm_scale, return_lse, static_cast<hipStream_t>(stream));
 }
 
+// ---------------------------------------------------------------------------
+//  Issue #155: decode auto-split. The plain forward's decode grid is
+//  (ceil(S_q/BQ), H) -- 64 blocks on MI300A's 228 CUs at the serving
+//  GLM-5.3-Flash decode shape, each streaming its `topk` keys through the
+//  serial score->softmax->gather chain (measured 397 us at topk=256, FLAT
+//  across topk AND the BQ sweep: latency-bound on the per-token chain, not
+//  throughput-bound -- docs/performance/dsa/gfx942.md). The split+combine
+//  machinery below (issue #51/#80/#137) already removes exactly that wall:
+//  block-per-KV-chunk partials add the missing intra-token parallelism and
+//  the combine merges the log2-domain states. It was PERF-ONLY, reachable
+//  solely through dsa_sparse_fwd_split with caller-owned scratch. This
+//  dispatches it AUTOMATICALLY from the plain dsa_sparse_fwd whenever
+//  dsa_sparse_fwd_split_for recommends a split > 1 (the decode regime; the
+//  prefill early-out keeps every long-S_q shape on the plain path), using
+//  an internally managed scratch so no caller changes are needed. The
+//  explicit-tile entry (dsa_sparse_fwd_with_tile, the autotuner's hook) and
+//  the degenerate split_kv == 1 delegation keep the plain serial behavior.
+//  VK_DSA_DECODE_SPLIT=0 restores the pre-#155 serial decode dispatch.
+
+// Internally managed partial scratch for the auto split: one fp32 partial-
+// output + one fp32 partial-lse buffer, grown on demand and never shrunk.
+// Retired generations are intentionally NOT hipFree'd (a pending kernel
+// could still reference an old buffer; the leak is bounded by the number of
+// grow steps and is tiny -- the same rationale as vec_combine_counters's
+// counter buffer above).
+namespace {
+struct DsaAutoSplitScratch {
+  float* part_out = nullptr;
+  float* part_lse = nullptr;
+  size_t cap_out = 0;  // floats
+  size_t cap_lse = 0;  // floats
+};
+bool dsa_auto_split_scratch(size_t n_out, size_t n_lse, float** p_out,
+                            float** p_lse) {
+  static DsaAutoSplitScratch s;
+  if (n_out > s.cap_out || n_lse > s.cap_lse) {
+    float* no = nullptr;
+    float* nl = nullptr;
+    if (hipMalloc(&no, n_out * sizeof(float)) != hipSuccess) return false;
+    if (hipMalloc(&nl, n_lse * sizeof(float)) != hipSuccess) {
+      hipFree(no);
+      return false;
+    }
+    s.part_out = no;  // previous generation intentionally abandoned
+    s.part_lse = nl;
+    s.cap_out = n_out;
+    s.cap_lse = n_lse;
+  }
+  *p_out = s.part_out;
+  *p_lse = s.part_lse;
+  return true;
+}
+}  // namespace
+
+// Shared split dispatch: the partial launch ladder + the combine launch --
+// factored out of dsa_sparse_fwd_split so the issue-#155 auto path runs the
+// EXACT same kernel selection (vec -> db -> serial partial, then combine).
+// Declared here (defined just before dsa_sparse_fwd_split, after the
+// partial kernels it dispatches).
+void dsa_sparse_fwd_split_run(int S_q, int S_kv, int H, int dim, int tail_dim,
+                              int topk, int kv_group, float sm_scale,
+                              bool return_lse, int split_kv, const void* q,
+                              const void* kv, const void* indices, void* out,
+                              void* lse, void* partial_out, void* partial_lse,
+                              int bq, void* stream);
+
+// The plain (unsplit) ladder: tile selection + dsa_sparse_fwd_with_tile.
+// Shared by the public forward's non-decode fall-through and the degenerate
+// split_kv == 1 delegation of dsa_sparse_fwd_split (which must BYPASS the
+// auto split below: an explicit split request of 1 means "no split").
+namespace {
+void dsa_sparse_fwd_plain(int S_q, int S_kv, int H, int dim, int tail_dim,
+                          int topk, int kv_group, float sm_scale,
+                          bool return_lse, const void* q, const void* kv,
+                          const void* indices, void* out, void* lse,
+                          void* stream) {
+  int bq = 0, th = 0, bi = 0, ii = 0;
+  if (!dsa_tile_from_store(S_q, H, dim, tail_dim, topk, &bq, &bi, &ii))
+    ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
+  (void)th;
+  dsa_sparse_fwd_with_tile(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
+                           sm_scale, return_lse, q, kv, indices, out, lse,
+                           bq, bi, ii, 0, stream);
+}
+}  // namespace
+
 void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
                     int topk, int kv_group, int block_I, int inner_iter,
                     float sm_scale, bool return_lse,
@@ -758,11 +844,47 @@ void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
   if (!dsa_tile_from_store(S_q, H, dim, tail_dim, topk, &bq, &bi, &ii))
     ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
   (void)th;
-  (void)block_I;
-  (void)inner_iter;
-  dsa_sparse_fwd_with_tile(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
-                           sm_scale, return_lse, q, kv, indices, out, lse,
-                           bq, bi, ii, 0, stream);
+
+  // Issue #155 auto split (see the block comment above dsa_auto_split_scratch):
+  // route the decode regime (dsa_sparse_fwd_split_for > 1, i.e. the plain
+  // grid under-fills the CUs) through the split+combine machinery with the
+  // internally managed scratch. The split_for recommendation already
+  // consults the tuning store and carries the prefill early-out (plain grid
+  // >= CUs -> 1), so prefill / wide-H shapes are untouched. A scratch
+  // allocation failure falls back to the plain ladder -- an OOM must never
+  // break serving.
+  static const int auto_split_mode = [] {
+    const char* e = std::getenv("VK_DSA_DECODE_SPLIT");
+    return e ? std::atoi(e) : 1;
+  }();
+  if (auto_split_mode != 0 && S_q > 0 && H > 0 && topk > 0) {
+    static const int num_cu = [] {
+      int dev = 0, n = 0;
+      if (hipGetDevice(&dev) != hipSuccess ||
+          hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount,
+                                dev) != hipSuccess || n <= 0)
+        return 228;  // gfx942 CU count, same default as dsa_sparse_fwd_split_for
+      return n;
+    }();
+    int split_kv = ::vkernels::kernels::dsa_sparse_fwd_split_for(
+        S_q, H, topk, block_I, num_cu, dim, tail_dim);
+    if (split_kv > topk) split_kv = topk;  // defensive: every split >= 1 key
+    if (split_kv > 1) {
+      const int d_v = dim - tail_dim;
+      float* part_out = nullptr;
+      float* part_lse = nullptr;
+      if (dsa_auto_split_scratch((size_t)S_q * H * split_kv * d_v,
+                                 (size_t)S_q * H * split_kv, &part_out,
+                                 &part_lse)) {
+        dsa_sparse_fwd_split_run(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
+                                 sm_scale, return_lse, split_kv, q, kv, indices,
+                                 out, lse, part_out, part_lse, bq, stream);
+        return;
+      }
+    }
+  }
+  dsa_sparse_fwd_plain(S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale,
+                       return_lse, q, kv, indices, out, lse, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -1601,6 +1723,53 @@ bool launch_partial_auto(const void* q, const void* kv, const void* indices,
 }
 }  // namespace
 
+// Issue #155: the split dispatch itself (partial ladder + combine launch),
+// factored out of dsa_sparse_fwd_split so the auto decode path in
+// dsa_sparse_fwd runs the EXACT same kernel selection. `bq` is the launch
+// tile the caller's store/config selected (the ladder clamps it to the
+// supported BQ set, exactly like dsa_sparse_fwd_with_tile).
+void dsa_sparse_fwd_split_run(int S_q, int S_kv, int H, int dim, int tail_dim,
+                              int topk, int kv_group, float sm_scale,
+                              bool return_lse, int split_kv, const void* q,
+                              const void* kv, const void* indices, void* out,
+                              void* lse, void* partial_out, void* partial_lse,
+                              int bq, void* stream) {
+  // The partial kernel now double-buffers its key tiles in LDS (issue
+  // #80) or runs the vectorized register-batched serial variant with the
+  // optional fused combine (issue #137); block_I/inner_iter remain
+  // cached-pipeline params. launch_partial_auto reports whether the
+  // separate combine launch is still required (the fused vec path already
+  // wrote out/lse).
+  bool need_combine = true;
+  if (bq <= 1)
+    need_combine = launch_partial_auto<1>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
+  else if (bq <= 2)
+    need_combine = launch_partial_auto<2>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
+  else if (bq <= 4)
+    need_combine = launch_partial_auto<4>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
+  else
+    need_combine = launch_partial_auto<8>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
+  if (!need_combine) return;
+  dim3 cgrid(S_q, H);
+  dsa_sparse_fwd_combine_kernel<<<cgrid, 64, 0, static_cast<hipStream_t>(stream)>>>(
+      reinterpret_cast<const float*>(partial_out),
+      reinterpret_cast<const float*>(partial_lse),
+      reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
+      S_q, H, dim - tail_dim, split_kv, return_lse);
+}
+
 void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
                           int topk, int kv_group, int block_I, int inner_iter,
                           float sm_scale, bool return_lse, int split_kv,
@@ -1634,9 +1803,12 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
   VK_EXPECTS(!return_lse || lse != nullptr, "lse must not be null");
   if (split_kv == 1) {
     // Degenerate split: identical to the plain forward, no scratch needed.
-    dsa_sparse_fwd(S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I,
-                   inner_iter, sm_scale, return_lse, q, kv, indices, out,
-                   lse);
+    // The plain ladder (NOT dsa_sparse_fwd) deliberately: an explicit split
+    // request of 1 means "no split", so the issue-#155 auto-split gate must
+    // not re-engage here.
+    dsa_sparse_fwd_plain(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
+                         sm_scale, return_lse, q, kv, indices, out, lse,
+                         /*stream=*/nullptr);
     return;
   }
   VK_EXPECTS(partial_out != nullptr && partial_lse != nullptr,
@@ -1650,42 +1822,9 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
   if (!dsa_tile_from_store(S_q, H, dim, tail_dim, topk, &bq, &bi, &ii))
     ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
   (void)th;
-  // The partial kernel now double-buffers its key tiles in LDS (issue
-  // #80) or runs the vectorized register-batched serial variant with the
-  // optional fused combine (issue #137); block_I/inner_iter remain
-  // cached-pipeline params. launch_partial_auto reports whether the
-  // separate combine launch is still required (the fused vec path already
-  // wrote out/lse).
-  (void)block_I;
-  (void)inner_iter;
-  bool need_combine = true;
-  if (bq <= 1)
-    need_combine = launch_partial_auto<1>(
-        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
-        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
-        static_cast<hipStream_t>(stream));
-  else if (bq <= 2)
-    need_combine = launch_partial_auto<2>(
-        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
-        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
-        static_cast<hipStream_t>(stream));
-  else if (bq <= 4)
-    need_combine = launch_partial_auto<4>(
-        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
-        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
-        static_cast<hipStream_t>(stream));
-  else
-    need_combine = launch_partial_auto<8>(
-        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
-        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
-        static_cast<hipStream_t>(stream));
-  if (!need_combine) return;
-  dim3 cgrid(S_q, H);
-  dsa_sparse_fwd_combine_kernel<<<cgrid, 64, 0, static_cast<hipStream_t>(stream)>>>(
-      reinterpret_cast<const float*>(partial_out),
-      reinterpret_cast<const float*>(partial_lse),
-      reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
-      S_q, H, d_v, split_kv, return_lse);
+  dsa_sparse_fwd_split_run(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
+                           sm_scale, return_lse, split_kv, q, kv, indices,
+                           out, lse, partial_out, partial_lse, bq, stream);
 }
 
 // ---------------------------------------------------------------------------
