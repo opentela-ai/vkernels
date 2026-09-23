@@ -53,16 +53,18 @@ def _kernel():
         ROWS: tl.constexpr,
         COLS: tl.constexpr,
         FNUZ: tl.constexpr,
+        FNUZ_NATIVE: tl.constexpr = False,
     ):
         selected = tl.program_id(0)
         row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
         col = tl.arange(0, COLS)
         expert = tl.load(IDX + selected).to(tl.int64)
-        raw = tl.load(
+        raw8 = tl.load(
             W + expert * (O * I) + row[:, None] * I + col[None, :],
             (row[:, None] < O) & (col[None, :] < I),
             0,
-        ).to(tl.int32)
+        )
+        raw = raw8.to(tl.int32)
         exponent, mantissa = (raw >> 3) & 15, raw & 7
         if FNUZ:
             # e4m3fnuz storage (AMD-native fp8; issue #71 in-place
@@ -70,16 +72,23 @@ def _kernel():
             # is no -0), subnormals m*2^-10. The stored scales are the
             # DOUBLED scales from e4m3fn_to_fnuz_inplace, so value*scale
             # reproduces the original e4m3fn weight exactly (verified
-            # exhaustive over all 256 bytes). No hardware shortcut: CUDA
-            # has no fnuz dtype and this Triton rejects direct fp8-pointer
-            # loads, so both backends take the manual bit-decode.
-            bits = ((exponent + 119) << 23) | (mantissa << 20)
-            value = tl.where(
-                exponent == 0,
-                mantissa.to(tl.float32) * 0.0009765625,
-                bits.to(tl.float32, bitcast=True),
-            )
-            value = tl.where(raw == 128, float("nan"), value)
+            # exhaustive over all 256 bytes). FNUZ_NATIVE (issue #148): let
+            # the hardware fnuz converter decode (uint8 bitcast to
+            # float8e4b8) — value-identical to the manual decode (the
+            # fnuz->f32 convert is exact, NaN 0x80 included), one cvt
+            # instead of ~10 ALU/SEL ops per weight element; enabled via
+            # GLM53_GEMV_FNUZ_NATIVE=1, measured in
+            # meta/benchmarks/bench_glm_issue148_decode.py.
+            if FNUZ_NATIVE:
+                value = raw8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
+            else:
+                bits = ((exponent + 119) << 23) | (mantissa << 20)
+                value = tl.where(
+                    exponent == 0,
+                    mantissa.to(tl.float32) * 0.0009765625,
+                    bits.to(tl.float32, bitcast=True),
+                )
+                value = tl.where(raw == 128, float("nan"), value)
         else:
             bits = ((exponent + 120) << 23) | (mantissa << 20)
             value = tl.where(
@@ -221,6 +230,15 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn"):
             # no fnuz dtype to bitcast to, and the doubled-scale convention
             # is part of the in-place conversion contract (issue #71).
             if fnuz:
+                # GLM53_GEMV_FNUZ_NATIVE=1 (issue #148) switches the fnuz
+                # decode to the hardware float8e4b8 convert — numerics are
+                # identical (exact convert); keep-or-drop is decided by the
+                # measured A/B, since LLVM may lower the convert to the
+                # same bit-twiddle the manual path spells out.
+                fnuz_native = os.environ.get("GLM53_GEMV_FNUZ_NATIVE", "0") not in (
+                    "",
+                    "0",
+                )
                 gemv[(t * k, triton.cdiv(o, 4))](
                     x,
                     weights.view(torch.uint8),
@@ -234,6 +252,7 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn"):
                     4,
                     triton.next_power_of_2(i),
                     True,
+                    fnuz_native,
                     num_warps=4,
                     enable_fp_fusion=False,
                 )

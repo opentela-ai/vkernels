@@ -118,6 +118,129 @@ int main() {
     hipFree(dx); hipFree(dw); hipFree(ds); hipFree(dout);
   }
 
+  std::printf("\n--- glm_fp8_fnuz_block_gemv vs CPU oracle (issue #148, hardware fnuz cvt decode) ---\n");
+  for (const auto& c : cfgs) {
+    const size_t nx = (size_t)c.M * c.K;
+    const size_t nw = (size_t)c.N * c.K;
+    const size_t ns = (size_t)(c.N / 128) * (c.K / 128);
+    std::vector<float> xf(nx);
+    for (size_t i = 0; i < nx; ++i) xf[i] = rnd(1, (int)i);
+    std::vector<uint16_t> x(nx);
+    for (size_t i = 0; i < nx; ++i) x[i] = f32_to_bf16_bits(xf[i]);
+    std::vector<uint8_t> w(nw);
+    for (size_t i = 0; i < nw; ++i) {
+      w[i] = (uint8_t)(rnd(2, (int)i) * 127.0f + 128.0f);  // [1,255]
+      if (w[i] == 0x80u) w[i] = 0x00u;                     // fnuz NaN code
+    }
+    std::vector<float> scales(ns);
+    for (size_t i = 0; i < ns; ++i)
+      scales[i] = 0.0625f * (float)(1 + (i % 128));        // DOUBLED scales
+    std::vector<uint16_t> ref((size_t)c.M * c.N), host((size_t)c.M * c.N, 0);
+    vkernels::kernels::glm_fp8_fnuz_block_gemv_cpu(
+        x.data(), w.data(), scales.data(), ref.data(), c.M, c.N, c.K);
+
+    uint16_t* dx; uint8_t* dw; float* ds; uint16_t* dout;
+    CK(hipMalloc(&dx, nx * 2), "ax");
+    CK(hipMalloc(&dw, nw), "aw");
+    CK(hipMalloc(&ds, ns * 4), "as");
+    CK(hipMalloc(&dout, (size_t)c.M * c.N * 2), "ao");
+    CK(hipMemcpy(dx, x.data(), nx * 2, hipMemcpyHostToDevice), "cx");
+    CK(hipMemcpy(dw, w.data(), nw, hipMemcpyHostToDevice), "cw");
+    CK(hipMemcpy(ds, scales.data(), ns * 4, hipMemcpyHostToDevice), "cs");
+    vkernels::kernels::hip::glm_fp8_fnuz_block_gemv(dx, dw, ds, dout,
+                                                    c.M, c.N, c.K);
+    CK(hipDeviceSynchronize(), "sync");
+    CK(hipMemcpy(host.data(), dout, host.size() * 2,
+                 hipMemcpyDeviceToHost), "co");
+
+    double max_abs = 0.0, max_rel = 0.0;
+    for (size_t i = 0; i < host.size(); ++i) {
+      uint32_t a = (uint32_t)host[i] << 16, b = (uint32_t)ref[i] << 16;
+      float fa, fb;
+      std::memcpy(&fa, &a, 4);
+      std::memcpy(&fb, &b, 4);
+      double e = std::fabs((double)fa - fb);
+      if (e > max_abs) max_abs = e;
+      double d = std::fmax(std::fabs((double)fb), 1.0);
+      if (e / d > max_rel) max_rel = e / d;
+    }
+    bool ok = max_rel < THRESH;
+    std::printf("  M=%d N=%-4d K=%-4d  max_abs=%.4f max_rel=%.6f  %s\n",
+                c.M, c.N, c.K, max_abs, max_rel, ok ? "PASS" : "FAIL");
+    ok ? ++passes : ++fails;
+    fflush(stdout);
+    hipFree(dx); hipFree(dw); hipFree(ds); hipFree(dout);
+  }
+
+  std::printf("\n--- glm_fp8_fnuz_mfma_block_gemv vs CPU oracle (issue #148, tensor-core fp8) ---\n");
+  for (const auto& c : cfgs) {
+    if (c.N % 64 != 0) continue;
+    const size_t nx = (size_t)c.M * c.K;
+    const size_t nw = (size_t)c.N * c.K;
+    const size_t ns = (size_t)(c.N / 128) * (c.K / 128);
+    std::vector<float> xf(nx);
+    for (size_t i = 0; i < nx; ++i) xf[i] = rnd(1, (int)i);
+    std::vector<uint16_t> x(nx);
+    for (size_t i = 0; i < nx; ++i) x[i] = f32_to_bf16_bits(xf[i]);
+    std::vector<uint8_t> w(nw);
+    for (size_t i = 0; i < nw; ++i) {
+      w[i] = (uint8_t)(rnd(2, (int)i) * 127.0f + 128.0f);  // [1,255]
+      if (w[i] == 0x80u) w[i] = 0x00u;                     // fnuz NaN code
+    }
+    std::vector<float> scales(ns);
+    for (size_t i = 0; i < ns; ++i)
+      scales[i] = 0.0625f * (float)(1 + (i % 128));        // DOUBLED scales
+    std::vector<uint16_t> ref((size_t)c.M * c.N), host((size_t)c.M * c.N, 0);
+    // the mfma oracle models the kernel's fused fp8 payload quantize:
+    // a plain-fp32-x oracle cannot validate a fused-quantize kernel
+    // within a 2e-2 gate (fp8 noise with |w| in [~0.01, 240])
+    vkernels::kernels::glm_fp8_fnuz_mfma_oracle_cpu(
+        x.data(), w.data(), scales.data(), ref.data(), c.M, c.N, c.K);
+
+    uint16_t* dx; uint8_t* dw; float* ds; uint16_t* dout;
+    CK(hipMalloc(&dx, nx * 2), "ax");
+    CK(hipMalloc(&dw, nw), "aw");
+    CK(hipMalloc(&ds, ns * 4), "as");
+    CK(hipMalloc(&dout, (size_t)c.M * c.N * 2), "ao");
+    CK(hipMemcpy(dx, x.data(), nx * 2, hipMemcpyHostToDevice), "cx");
+    CK(hipMemcpy(dw, w.data(), nw, hipMemcpyHostToDevice), "cw");
+    CK(hipMemcpy(ds, scales.data(), ns * 4, hipMemcpyHostToDevice), "cs");
+    vkernels::kernels::hip::glm_fp8_fnuz_mfma_block_gemv(dx, dw, ds, dout,
+                                                         c.M, c.N, c.K);
+    CK(hipDeviceSynchronize(), "sync");
+    CK(hipMemcpy(host.data(), dout, host.size() * 2,
+                 hipMemcpyDeviceToHost), "co");
+
+    double max_abs = 0.0, max_rel = 0.0;
+    size_t bad = (size_t)-1;
+    for (size_t i = 0; i < host.size(); ++i) {
+      uint32_t a = (uint32_t)host[i] << 16, b = (uint32_t)ref[i] << 16;
+      float fa, fb;
+      std::memcpy(&fa, &a, 4);
+      std::memcpy(&fb, &b, 4);
+      double e = std::fabs((double)fa - fb);
+      if (e > max_abs) max_abs = e;
+      double d = std::fmax(std::fabs((double)fb), 1.0);
+      if (e / d > max_rel) { max_rel = e / d; bad = i; }
+    }
+    bool ok = max_rel < THRESH;
+    std::printf("  M=%d N=%-4d K=%-4d  max_abs=%.4f max_rel=%.6f  %s",
+                c.M, c.N, c.K, max_abs, max_rel, ok ? "PASS" : "FAIL");
+    if (!ok && bad != (size_t)-1) {
+      const int n_bad = (int)(bad % (size_t)c.N), m_bad = (int)(bad / (size_t)c.N);
+      uint32_t a = (uint32_t)host[bad] << 16, b = (uint32_t)ref[bad] << 16;
+      float fa, fb;
+      std::memcpy(&fa, &a, 4);
+      std::memcpy(&fb, &b, 4);
+      std::printf("  first-bad [m=%d n=%d] got=%.4f want=%.4f",
+                  m_bad, n_bad, fa, fb);
+    }
+    std::printf("\n");
+    ok ? ++passes : ++fails;
+    fflush(stdout);
+    hipFree(dx); hipFree(dw); hipFree(ds); hipFree(dout);
+  }
+
   std::printf("\n%s (%d/%d PASS)\n", fails ? "FAIL" : "PASS",
               passes, passes + fails);
   return fails ? 1 : 0;
