@@ -1,0 +1,86 @@
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+
+--- serving M=8 (public hip::gemm_bf16) ---
+  M=8    N=6288 K=7168 beta=0.0  max_abs=0.2500 max_rel=0.007692  PASS
+  M=8    N=3584 K=7168 beta=0.0  max_abs=0.1250 max_rel=0.007092  PASS
+  M=8    N=896  K=7168 beta=0.0  max_abs=0.0156 max_rel=0.004329  PASS
+  M=8    N=2112 K=7168 beta=0.5  max_abs=0.0312 max_rel=0.006452  PASS
+  M=8    N=1536 K=7168 beta=0.0  max_abs=0.0312 max_rel=0.006757  PASS
+  M=8    N=7168 K=1536 beta=0.0  max_abs=0.0625 max_rel=0.007752  PASS
+  M=8    N=7168 K=768  beta=0.0  max_abs=0.0002 max_rel=0.000244  PASS
+  M=8    N=7168 K=3584 beta=0.0  max_abs=0.2500 max_rel=0.007576  PASS
+  M=8    N=2304 K=1536 beta=0.0  max_abs=0.0000 max_rel=0.000000  PASS
+  M=8    N=3072 K=512  beta=0.5  max_abs=0.0000 max_rel=0.000015  PASS
+  M=8    N=1536 K=128  beta=0.0  max_abs=0.0000 max_rel=0.000000  PASS
+
+--- serving M=64 (public hip::gemm_bf16) ---
+  M=64   N=6288 K=7168 beta=0.0  max_abs=0.2500 max_rel=0.007752  PASS
+  M=64   N=3584 K=7168 beta=0.0  max_abs=0.5000 max_rel=0.007752  PASS
+  M=64   N=896  K=7168 beta=0.5  max_abs=0.2500 max_rel=0.007299  PASS
+  M=64   N=2112 K=7168 beta=0.0  max_abs=0.2500 max_rel=0.007752  PASS
+  M=64   N=1536 K=7168 beta=0.5  max_abs=0.1250 max_rel=0.007353  PASS
+  M=64   N=7168 K=1536 beta=0.0  max_abs=0.1250 max_rel=0.007752  PASS
+  M=64   N=7168 K=768  beta=0.0  max_abs=0.0625 max_rel=0.007576  PASS
+  M=64   N=7168 K=3584 beta=0.0  max_abs=0.2500 max_rel=0.007576  PASS
+  M=64   N=2304 K=1536 beta=0.0  max_abs=0.1250 max_rel=0.007692  PASS
+  M=64   N=3072 K=512  beta=0.0  max_abs=0.0312 max_rel=0.005952  PASS
+  M=64   N=1536 K=128  beta=0.5  max_abs=0.0156 max_rel=0.004695  PASS
+
+--- warmup M=8192 (public hip::gemm_bf16) ---
+  M=8192 N=1536 K=128   max_abs=0.0625 max_rel=0.007812  PASS
+  M=8192 N=3072 K=512   max_abs=0.1250 max_rel=0.007812  PASS
+  M=8192 N=64   K=7168  max_abs=0.2500 max_rel=0.007812  PASS
+
+--- explicit-tile sweep (M=16 N=100 K=128, hip::gemm_bf16_with_config) ---
+  tile 16x16   max_abs=0.0000 max_rel=0.000000  PASS
+  tile 16x64   max_abs=0.0000 max_rel=0.000000  PASS
+  tile 16x128  max_abs=0.0000 max_rel=0.000000  PASS
+  tile 32x64   max_abs=0.0000 max_rel=0.000000  PASS
+  tile 32x128  max_abs=0.0000 max_rel=0.000000  PASS
+  tile 64x64   max_abs=0.0000 max_rel=0.000000  PASS
+  tile 64x128  max_abs=0.0000 max_rel=0.000000  PASS
+
+--- cross-tile B-reuse sweep (M=128 N=128 K=256, beta=0.5) ---
+  BM=16 BN=64  RM=4  max_abs=0.0000 max_rel=0.000000  PASS
+  BM=32 BN=64  RM=2  max_abs=0.0000 max_rel=0.000000  PASS
+  BM=32 BN=64  RM=4  max_abs=0.0000 max_rel=0.000000  PASS
+
+--- cross-tile B-reuse, unaligned N (M=128 N=100 K=128) ---
+  BM=32 BN=64 RM=4  max_abs=0.0000 max_rel=0.000000  PASS
+
+--- split-K sweep (explicit gemm_bf16_splitk_with_config) ---
+  M=8   N=128  K=128  S=2 beta=0.0  max_abs=0.0000 max_rel=0.000000  PASS  (K=128 minimum split (1 K-tile/split))
+  M=8   N=128  K=256  S=3 beta=0.0  max_abs=0.0000 max_rel=0.000000  PASS  (odd S=3, K=256 (whole-tile split))
+  M=16  N=100  K=192  S=3 beta=0.5  max_abs=0.0000 max_rel=0.000000  PASS  (unaligned N=100, odd S=3, beta!=0)
+  M=64  N=6288 K=7168 S=8 beta=0.5  max_abs=0.5000 max_rel=0.007692  PASS  (QKV shape, S=8, beta!=0)
+  M=8   N=128  K=128  S=9 beta=0.0  max_abs=0.0000 max_rel=0.000000  PASS  (S=9 clamped to ceil(K/BK)=2)
+  M=8   N=128  K=64   S=8 beta=0.0  max_abs=0.0000 max_rel=0.000000  PASS  (S=8 clamped to ceil(K/BK)=1 (unsplit))
+  M=8   N=3072 K=512  S=8 beta=0.0  max_abs=0.0039 max_rel=0.003906  PASS  (S=8, kts=1: odd kt0 splits (ring parity))
+  M=8   N=7168 K=1536 S=8 beta=0.0  max_abs=0.1250 max_rel=0.006329  PASS  (S=8, kts=3: odd kt0 splits (ring parity))
+  M=5   N=3584 K=7168 S=16 beta=0.0  max_abs=0.0625 max_rel=0.007407  PASS  (S=16, kts=7: odd kt0 splits (ring parity))
+  M=5   N=6288 K=7168 S=16 beta=0.0  max_abs=0.1250 max_rel=0.007576  PASS  (QKV shape, S=16, kts=7 (ring parity))
+
+--- block-FP8 split-K (gemm_fp8_block_splitk_with_config) ---
+  M=5   N=6288 K=7168 S=8 beta=0.0 16x16  max_abs=0.2500 max_rel=0.007634  PASS  (QKV shape, tile 16x16, S=8)
+  M=8   N=3584 K=7168 S=8 beta=0.0 16x64  max_abs=0.2500 max_rel=0.007407  PASS  (gate shape, tile 16x64, S=8)
+  M=16  N=896  K=7168 S=4 beta=0.5 16x16  max_abs=0.2500 max_rel=0.003937  PASS  (small-N shape, beta!=0, S=4)
+  M=5   N=6288 K=7168 S=9 beta=0.0 32x64  max_abs=0.1250 max_rel=0.007634  PASS  (QKV shape, tile 32x64, S=9 clamp)
+  M=5   N=128  K=256  S=3 beta=0.0 16x16  max_abs=0.0000 max_rel=0.000000  PASS  (tiny shape, odd S=3)
+  N%8!=0 rejection (N=100): C untouched  PASS
+
+--- decode-GEMV split-K (gemv_decode_*_splitk) ---
+  M=5  N=6288 K=7168 S=32  tb=8 th=64  beta=0.0 bf16  max_abs=0.1250 max_rel=0.006993  PASS  (QKV shape bf16 S=32 tb=8)
+  M=5  N=6288 K=7168 S=31  tb=8 th=64  beta=0.0 bf16  max_abs=0.1250 max_rel=0.006993  PASS  (odd prime S=31 (element splits))
+  M=5  N=6288 K=7168 S=32  tb=4 th=64  beta=0.0 bf16  max_abs=0.1250 max_rel=0.006993  PASS  (tb=4 narrow columns)
+  M=5  N=6288 K=7168 S=64  tb=8 th=128 beta=0.0 bf16  max_abs=0.1250 max_rel=0.006993  PASS  (th=128 blocks)
+  M=5  N=3584 K=7168 S=32  tb=8 th=64  beta=0.5 bf16  max_abs=0.0156 max_rel=0.003968  PASS  (beta!=0)
+  M=8  N=896  K=7168 S=64  tb=8 th=64  beta=0.0 bf16  max_abs=0.2500 max_rel=0.006369  PASS  (small-N shape)
+  M=2  N=128  K=257  S=32  tb=8 th=64  beta=0.0 bf16  max_abs=0.0000 max_rel=0.000000  PASS  (odd K=257 element splits)
+  M=1  N=896  K=7168 S=32  tb=8 th=64  beta=0.0 bf16  max_abs=0.0625 max_rel=0.005181  PASS  (M=1 pure GEMV)
+  M=5  N=6288 K=7168 S=32  tb=8 th=64  beta=0.0 fp8   max_abs=0.0625 max_rel=0.006536  PASS  (QKV shape fp8 S=32)
+  M=5  N=3584 K=7168 S=33  tb=8 th=64  beta=0.5 fp8   max_abs=0.1250 max_rel=0.007519  PASS  (fp8 odd S=33, beta!=0)
+  M=5  N=128  K=256  S=3   tb=8 th=64  beta=0.0 fp8   max_abs=0.0000 max_rel=0.000000  PASS  (fp8 tiny, odd S=3)
+  M=2  N=896  K=7168 S=64  tb=4 th=64  beta=0.0 fp8   max_abs=0.2500 max_rel=0.005102  PASS  (fp8 tb=4)
+  M=9 rejection (M>8): C untouched  PASS
+
+PASS (0 failure(s))
