@@ -695,6 +695,20 @@ int main(int argc, char** argv) {
     run_case("decode E=256 h7168 ispp=4096 M=64 (oracle sanity)", 256, 7168,
              4096, 16, 64, 16, route_full, kSiTU);
 
+  // 16. issue #150: the 128-row M-tile prefill config at the big shape
+  //     (same route as case 6, aligned per 128 rows).  Only meaningful
+  //     under VK_MOE_PF_VARIANT=6 — the launcher maps block_size=128 to
+  //     the BM=128 tiles there and to the 64-row v5 path otherwise.
+  if (only == 0 || only == 16) {
+    const char* venv = std::getenv("VK_MOE_PF_VARIANT");
+    const int pf_variant = venv ? std::atoi(venv) : 5;
+    if (pf_variant == 6)
+      run_case("prefill ispp=4096 M=64 no-padding block=128", 256, 7168, 4096,
+               16, 64, 128, route_full, kSiTU);
+    else
+      std::printf("--- case 16 skipped (requires VK_MOE_PF_VARIANT=6)\n");
+  }
+
   if (g_failures) {
     std::printf("\n%d case(s) FAILED\n", g_failures);
     return 1;
