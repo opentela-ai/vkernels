@@ -1,0 +1,14 @@
+Task: CONTEXT: You are reviewing the tuning-triton-persist lane of PR #154 in the vkernels repo (READ-ONLY - do not edit, commit, or push anything; ignore the dirty uncommitted WIP files, review committed content only).
+
+The full diff is materialized for you at /tmp/pr154-triton.patch (git diff 69a1743..origin/tuning-triton-persist, 771 lines). You can also read the post-change files directly in the worktree /local/home/xiayao/Documents/code/worktrees/vkernels/pi-worktree-9707ccf7-f567-4bd8-a017-367908f9e1d5-s0-0 (branch tip 8f898e9 = origin/tuning-triton-persist), and the pre-change files in the main checkout (which is at the base).
+
+Background: the tuning-cache infrastructure (docs/tuning-cache.md, src/python/vkernels/torch_ops/tuning_cache.py, tuner.py) persists measured Triton launch configs per (kernel, key, arch) so serving processes stop re-benchmarking on first launch. This lane swapped 14 bare @triton.autotune sites to the persistent_autotune decorator across glm_projection.py, qkv_projection.py, vllm_kda.py, vllm_kda_amd.py, _kda_kernels_common.py, plus infra changes in tuning_cache.py and tuner.py.
+
+Focus:
+1. tuning_cache.py PersistentAutotuner: the new KernelInterface.run dispatch and arg_names delegation - does it preserve @triton.autotune semantics exactly (key functions, warmup, do_bench timing, prune_configs_by, cache key ordering)? Does @triton.heuristics stacking still work in all orders (heuristics-on-top-of-autotune AND autotune-on-top-of-heuristics)? Any divergence in how configs are re-cached after a store hit (bench_count, best_config, pre_hook firing)?
+2. The 14 adoption sites: configs and key shapes preserved verbatim as claimed? kernel_name uniqueness/collision across files? source_files provenance correct? Any site where the persistent decorator changes behavior when the store is EMPTY (first run must still sweep)?
+3. tuner.py: the 4 new registry rows + toolkit gate - does a HIP-only sweep skip cleanly on CUDA (no crash, honest status)? Are store_names in the end-to-end pipeline sweeps honest (do the listed kernels actually get persisted by that driver)?
+4. The two fixed tests in tests/python/test_tuning_cache.py: are the new stubs actually deterministic (N=50 claim)?
+5. Failure modes: what happens under a corrupt store file, a store written by a different Triton version (config schema drift), or concurrent writes from two processes? Is any of that mitigated or at least fail-safe?
+
+Findings format: [BLOCKER|SHOULD-FIX|NIT] file:line - issue - concrete suggested fix. End with an explicit verdict line: "NO BLOCKERS" or "N BLOCKERS". Do not rubber-stamp: if you find nothing wrong in a category, say what you checked.
