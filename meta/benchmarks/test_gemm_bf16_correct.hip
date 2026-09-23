@@ -47,6 +47,11 @@ void gemm_bf16_reuse_with_config(std::size_t M, std::size_t N, std::size_t K,
                                  float alpha, const uint16_t* A,
                                  const uint16_t* B, float beta, uint16_t* C,
                                  int bm, int bn, int rm);
+// Split-K dispatcher (issue #146; same forward-declaration pattern).
+void gemm_bf16_splitk_with_config(std::size_t M, std::size_t N, std::size_t K,
+                                  float alpha, const uint16_t* A,
+                                  const uint16_t* B, float beta, uint16_t* C,
+                                  int bm, int bn, int S);
 }  // namespace vkernels::kernels::hip
 
 #define CK(e, m)                                                       \
@@ -299,6 +304,48 @@ int main() {
     std::printf("  BM=32 BN=64 RM=4  max_abs=%.4f max_rel=%.6f  %s\n",
                 st.max_abs, st.max_rel, ok ? "PASS" : "FAIL");
     if (!ok) ++fails;
+  }
+
+  // --- (4) split-K kernel (issue #146) -----------------------------------
+  // The public hip::gemm_bf16 now routes M <= 64 (K >= 256) through the
+  // split-K path, so section (1) already exercises it end-to-end on every
+  // K3 serving shape. This section exercises the EXPLICIT split dispatcher
+  // on corners the auto-routing cannot reach: odd split counts (S not a
+  // power of two, including S > K/BK clamping), the K = 128 minimum-split
+  // corner, beta != 0 (combine reads the pre-fill C), and the unaligned-N
+  // bounds-check paths.
+  {
+    struct Case { int M, N, K, S; float beta; const char* what; };
+    const Case cases[] = {
+        {8,   128,  128, 2, 0.0f, "K=128 minimum split (1 K-tile/split)"},
+        {8,   128,  256, 3, 0.0f, "odd S=3, K=256 (whole-tile split)"},
+        {16,  100,  192, 3, 0.5f, "unaligned N=100, odd S=3, beta!=0"},
+        {64,  6288, 7168, 8, 0.5f, "QKV shape, S=8, beta!=0"},
+        {8,   128,  128, 9, 0.0f, "S=9 clamped to ceil(K/BK)=2"},
+        {8,   128,   64, 8, 0.0f, "S=8 clamped to ceil(K/BK)=1 (unsplit)"},
+    };
+    std::printf("\n--- split-K sweep (explicit gemm_bf16_splitk_with_config)"
+                " ---\n");
+    for (const auto& c : cases) {
+      std::vector<uint16_t> A((size_t)c.M * c.K), B((size_t)c.K * c.N),
+          C((size_t)c.M * c.N, 0);
+      fill_AB(A, B, c.M, c.N, c.K, 13);
+      for (size_t i = 0; i < C.size(); ++i) C[i] = f2bf(rnd(5, (int)i) * 0.3f);
+      auto st = run_case_impl(
+          c.M, c.N, c.K, 1.0f, c.beta, A, B, C, dA, dB, dC,
+          [&](int m, int n, int k, float a, const uint16_t* pA,
+              const uint16_t* pB, float b, uint16_t* pC) {
+            vkernels::kernels::hip::gemm_bf16_splitk_with_config(
+                (size_t)m, (size_t)n, (size_t)k, a, pA, pB, b, pC, 16, 16,
+                c.S);
+          });
+      bool ok = st.max_rel < THRESH;
+      std::printf("  M=%-3d N=%-4d K=%-4d S=%d beta=%.1f  max_abs=%.4f "
+                  "max_rel=%.6f  %s  (%s)\n",
+                  c.M, c.N, c.K, c.S, c.beta, st.max_abs, st.max_rel,
+                  ok ? "PASS" : "FAIL", c.what);
+      if (!ok) ++fails;
+    }
   }
 
   hipFree(dA); hipFree(dB); hipFree(dC);
