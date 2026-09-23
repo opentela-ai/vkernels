@@ -1,0 +1,80 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "01M3796XCFGQKJ6ZXE1EWF3JS0",
+  "session_id": "01a0c80f-fdaf-70aa-83b6-3891a9efd08a",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-23T14:02:45.911636271Z",
+  "branch": "e13-soup-fusion",
+  "checkpoints_count": 2,
+  "save_step_count": 1,
+  "files_touched": [
+    "bench/kda_state_bisect.py",
+    "src/python/vkernels/torch_ops/_fp32.py",
+    "src/python/vkernels/torch_ops/glm_kda_chunk.py",
+    "src/python/vkernels/torch_ops/glm_mhc_big_fuse.py",
+    "src/python/vkernels/torch_ops/glm_mhc_mix.py",
+    "src/python/vkernels/torch_ops/mhc_compose.py",
+    "src/python/vkernels/torch_ops/vllm_kda.py",
+    "tests/python/test_glm_mhc_big_fuse.py"
+  ],
+  "agent": "Pi",
+  "model": "glm-5.3",
+  "turn_id": "d7990b41bd4e",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 185984,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 6160448,
+    "output_tokens": 81156,
+    "api_call_count": 67
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "pi-skill-thermo-nuclear-code-quality-review-2026-09-22T07:41:38.129Z-0",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "thermo-nuclear-code-quality-review"
+      },
+      "source": {
+        "agent": "pi",
+        "signal": "input_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "28fd3afeef90",
+      "timestamp": "2026-09-22T07:41:38.129Z",
+      "native": {
+        "command": "/skill:thermo-nuclear-code-quality-review"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/skill:thermo-nuclear-code-quality-review",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-23T14:02:45.858350995Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 3837,
+    "human_modified": 245,
+    "human_removed": 0,
+    "total_committed": 4082,
+    "total_lines_changed": 4110,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}
