@@ -21,6 +21,8 @@ from __future__ import annotations
 import types
 
 import pytest
+
+pytest.importorskip("torch")
 import torch
 
 from vkernels.torch_ops import aiter_ops
