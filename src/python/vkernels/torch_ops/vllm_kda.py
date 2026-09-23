@@ -188,7 +188,7 @@ def chunk_local_cumsum_vector_kernel(
         )
     # [BT, BS]
     b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
-    b_o = tl.dot(m_s, b_s, allow_tf32=False)
+    b_o = tl.dot(m_s, b_s, input_precision=NV_DOT_PRECISION)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -1359,7 +1359,7 @@ def chunk_gla_fwd_kernel_o(
     # [BT, BT]
     b_A = tl.load(p_A, boundary_check=(0, 1))
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
-    b_o += tl.dot(b_A, b_v, allow_tf32=False)
+    b_o += tl.dot(b_A, b_v, input_precision=NV_DOT_PRECISION)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -1474,15 +1474,16 @@ def chunk_kda_fwd(
     """Natural-log gates in, exp2 pipeline internally (upstream convention).
 
     ``g_is_cumulative=True``: ``g`` is ALREADY the chunk-local cumulative
-    sum (natural-log space). The fp32 parity path (``glm_kda_chunk``) uses
-    this to feed a ``torch.cumsum``-computed cumsum that is bit-identical
-    to the eager fp32 reference oracle: the blocked log2-space Triton
-    cumsum rounds differently (~5e-5 absolute at rig gate magnitudes), and
-    that difference compounds multiplicatively through the exp2 chunk scan
-    into the final state (~7e-4 after 8 chunks — GH200 job 3468708), an
-    order over the 1e-4 parity bar. Same op on the same tensor as the
-    reference -> same bits -> the residual kernel-vs-reference delta is
-    down to exp2-vs-exp and dot ordering (~1e-5).
+    sum (natural-log space) — what :func:`kda_chunk_floe` feeds whenever S
+    is a chunk multiple, computing it with ``torch.cumsum`` on the same
+    chunked view as the eager fp32 reference so the gates are bit-identical
+    to the oracle's: the blocked log2-space Triton cumsum rounds differently
+    (~5e-5 absolute at rig gate magnitudes), and that difference compounds
+    multiplicatively through the exp2 chunk scan into the final state
+    (~7e-4 after 8 chunks — GH200 job 3468708), an order over the 1e-4
+    parity bar. Same op on the same tensor as the reference -> same bits ->
+    the residual kernel-vs-reference delta is down to exp2-vs-exp and dot
+    ordering (~1e-5).
     """
     if not g_is_cumulative:
         g = chunk_local_cumsum(
@@ -1556,7 +1557,6 @@ def kda_chunk_floe(
     chunk_size: int = 64,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
-    g_cumsum: torch.Tensor | None = None,
 ):
     """Drop-in for ``floe ...::forward.py::_kda_chunk`` (same contract).
 
@@ -1567,12 +1567,12 @@ def kda_chunk_floe(
     ``[B, H, K, V]`` fp32 or None. Returns ``(core_attn_out [B, S, H, V] in
     the input dtype, final_state [B, H, K, V] fp32 or None)``.
 
-    ``g_cumsum`` (optional): pre-computed chunk-local cumulative log-gates
-    [B, H, S, K], natural-log space, S a multiple of ``chunk_size``. The
-    fp32 parity path passes a ``torch.cumsum``-computed one (bit-identical
-    to the eager reference oracle — see ``chunk_kda_fwd``). When None and S
-    is a chunk multiple, this adapter computes the same ``torch.cumsum``
-    itself; only ragged S falls back to the fla Triton cumsum kernel.
+    Gate cumsum: when S is a chunk multiple (always, after
+    ``glm_kda_chunk``'s padding), the chunk-local cumsum is computed with
+    the same ``torch.cumsum`` on the same chunked view as the eager fp32
+    reference — bit-identical gates into the exp2 pipeline (see
+    ``chunk_kda_fwd`` for why that matters); only ragged S falls back to
+    the fla Triton cumsum kernel.
 
     Numerics: with fp32 inputs the state/dot path accumulates in fp32
     (floe's core contract); with bf16 inputs the standard fla bf16 rounding
@@ -1585,7 +1585,6 @@ def kda_chunk_floe(
     q_t = query.transpose(1, 2).contiguous()
     k_t = key.transpose(1, 2).contiguous()
     v_t = value.transpose(1, 2).contiguous()
-    g_t = g.transpose(1, 2).contiguous()
     beta_t = beta.transpose(1, 2).contiguous()
 
     if initial_state is not None:
@@ -1594,31 +1593,36 @@ def kda_chunk_floe(
     else:
         h0 = None
 
-    if g_cumsum is None and s % chunk_size == 0:
+    if s % chunk_size == 0:
         # Exact-parity chunk-local cumsum: the same torch.cumsum op on the
         # same chunked view as the eager fp32 reference, so the gate values
         # entering the exp2 pipeline are bit-identical to the oracle's.
         # NOTE computed on the floe-layout g [B,H,S,K] (S is dim 2, the
-        # chunked view splits dim 2); g_t is [B,S,H,K] — different layout.
-        g_cumsum = (
+        # chunked view splits dim 2), then moved to the fla [B,S,H,K]
+        # layout the pipeline takes.
+        g_t = (
             g.reshape(b, h, s // chunk_size, chunk_size, k_dim)
             .cumsum(-2)
             .reshape(b, h, s, k_dim)
             .transpose(1, 2)
             .contiguous()
         )
+        g_is_cumulative = True
+    else:
+        g_t = g.transpose(1, 2).contiguous()
+        g_is_cumulative = False
 
     o, final_state = chunk_kda(
         q=q_t,
         k=k_t,
         v=v_t,
-        g=g_t if g_cumsum is None else g_cumsum,
+        g=g_t,
         beta=beta_t,
         scale=k_dim ** -0.5,
         initial_state=h0,
         output_final_state=output_final_state,
         chunk_size=chunk_size,
-        g_is_cumulative=g_cumsum is not None,
+        g_is_cumulative=g_is_cumulative,
     )
     # fla o [B,T,H,V] is already floe's [B,S,H,V] memory order.
     if output_final_state and final_state is not None:

@@ -22,6 +22,7 @@ Torch and Triton load lazily. Inference-only, no autograd backward.
 """
 
 from ._dispatch import OpNotEligible
+from ._fp32 import pin_fp32_matmul
 from functools import lru_cache
 
 
@@ -183,32 +184,25 @@ def mhc_compose(post, comb, sublayer_out, residual, hc=4):
 
 
 def mhc_collapse_reference(pre, streams, hc=4):
-    """Eager oracle: FP32 multiply/sum, one round on store."""
+    """Eager oracle: FP32 multiply/sum over the ``hc`` axis, one round on
+    store — ``collapsed[j] = sum_k pre[k] * streams[k, j]`` for streams
+    ``[..., hc, d]`` (the kernel's layout; the raw floe eager expression
+    ``.sum(dim=2)`` assumes hc-last streams and is wrong here)."""
 
-    return (pre.unsqueeze(-1) * streams).sum(dim=2).to(streams.dtype)
+    return (pre.unsqueeze(-1) * streams).sum(dim=-2).to(streams.dtype)
 
 
 def _exact_fp32_matmul(a, b):
-    """``a @ b`` in true fp32, never TF32.
-
-    NGC torch and any container that sets ``fp32_precision="tf32"`` (or the
-    legacy ``TORCH_ALLOW_TF32_CUBLAS_OVERRIDE``) silently lower fp32 matmuls
-    to TF32, which moves this oracle by ~2**-11 relative — far more than the
-    kernels' own rounding. The oracle must be the *exact* expression, so pin
-    the precision for the call and restore it afterwards.
-    """
+    """``a @ b`` in true fp32, never TF32 — see :mod:`._fp32`: the oracle
+    must be the exact expression even in containers that default matmuls
+    to tf32."""
     import torch
 
-    cuda_backend = getattr(getattr(torch.backends, "cuda", None), "matmul", None)
-    previous = None
-    if cuda_backend is not None and hasattr(cuda_backend, "allow_tf32"):
-        previous = cuda_backend.allow_tf32
-        cuda_backend.allow_tf32 = False
+    restore = pin_fp32_matmul()
     try:
         return torch.matmul(a, b)
     finally:
-        if previous is not None:
-            cuda_backend.allow_tf32 = previous
+        restore()
 
 
 def mhc_compose_reference(post, comb, sublayer_out, residual, hc=4):

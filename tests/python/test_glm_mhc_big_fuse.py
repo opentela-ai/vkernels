@@ -55,20 +55,27 @@ def _rig_inputs(torch, tokens, seed=11, sinkhorn_iters=20):
 
 
 def test_contract(torch):
+    """Contract checks on CPU tensors (raised before any GPU work — the
+    torch_ops convention: CPU-only environments still run the contract)."""
     from vkernels.torch_ops.glm_mhc_big_fuse import mhc_pre_big_fuse
 
-    logits, base, scale, streams, norm_weight, iters = _rig_inputs(torch, 2)
+    logits = torch.randn(2, WIDTH)
+    base = torch.randn(WIDTH)
+    scale = torch.randn(3)
+    streams = torch.randn(2, HC, D).to(torch.bfloat16)
+    norm_weight = torch.randn(D)
     with pytest.raises(ValueError, match="hc values"):
         mhc_pre_big_fuse(logits, base, scale, streams, norm_weight, hc=3)
     with pytest.raises(ValueError, match="width"):
-        mhc_pre_big_fuse(torch.randn(2, 23, device="cuda"), base, scale, streams, norm_weight)
+        mhc_pre_big_fuse(torch.randn(2, 23), base, scale, streams, norm_weight)
     with pytest.raises(ValueError, match="FP32"):
         mhc_pre_big_fuse(logits, base.double(), scale, streams, norm_weight)
     with pytest.raises(ValueError, match="GPU"):
-        mhc_pre_big_fuse(logits.cpu(), base, scale, streams.cpu(), norm_weight)
+        mhc_pre_big_fuse(logits, base, scale, streams, norm_weight)
     with pytest.raises(ValueError, match="power of two"):
-        bad = torch.randn(2, HC, 4000, device="cuda").to(torch.bfloat16)
-        mhc_pre_big_fuse(logits, base, scale, bad, torch.randn(4000, device="cuda"))
+        bad = torch.randn(2, HC, 4000).to(torch.bfloat16)
+        mhc_pre_big_fuse(logits, base, scale, bad, torch.randn(4000))
+
 
 def test_gpu_parity_and_drift(torch):
     """Per-bucket parity vs the composed eager chain + drift probe."""
