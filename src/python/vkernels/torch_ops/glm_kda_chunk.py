@@ -204,8 +204,6 @@ def kda_chunk_reference(
     (see :func:`_pin_fp32_matmul`): an fp32 oracle computed with the
     container's tf32 matmul default is not an fp32 oracle.
     """
-    import torch
-
     restore = _pin_fp32_matmul()
     try:
         return _kda_chunk_reference_impl(
