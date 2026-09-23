@@ -148,6 +148,33 @@ def _kernels():
         act = (g / (1.0 + tl.exp(-g))).to(G.dtype.element_ty).to(tl.float32)
         tl.store(Y + row * D + col, act * u, col < D)
 
+    @triton.jit
+    def _swiglu_limit(
+        G,
+        U,
+        Y,
+        LIMIT,
+        D: tl.constexpr,
+        GS: tl.constexpr,
+        US: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        g = tl.load(G + row * GS + col, col < D, 0).to(tl.float32)
+        u = tl.load(U + row * US + col, col < D, 0).to(tl.float32)
+        # GLM swiglu: clamp(gate, max=limit) * clamp(up, ±limit), silu gate.
+        # The eager chain CLAMPS IN FP32 (TensorIterator opmath) and STORES
+        # bf16 between every step, so each intermediate is rounded to the
+        # storage dtype before the next op reads it — round the clamped
+        # values (and the silu result) exactly there.
+        g = tl.minimum(g, LIMIT).to(G.dtype.element_ty).to(tl.float32)
+        u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT).to(G.dtype.element_ty).to(
+            tl.float32
+        )
+        act = (g / (1.0 + tl.exp(-g))).to(G.dtype.element_ty).to(tl.float32)
+        tl.store(Y + row * D + col, act * u, col < D)
+
     @triton.jit(do_not_specialize=["N"])
     def _store_kv(
         K,
@@ -270,7 +297,7 @@ def _kernels():
         # left-to-right multiply order as the eager reference
         tl.store(Y + row * D + col, (((x * inv) * w) * tl.sigmoid(gate)).to(Y.dtype.element_ty), mask)
 
-    return _norm, _qk_norm, _rope, _silu_mul, _store_kv, _qk_norm_rope, _norm_uw, _norm_gated
+    return _norm, _qk_norm, _rope, _silu_mul, _store_kv, _qk_norm_rope, _norm_uw, _norm_gated, _swiglu_limit
 
 
 def rms_norm(x, module, residual=None):
@@ -495,6 +522,58 @@ def silu_mul(gate, up):
         enable_fp_fusion=False,
     )
     return out
+
+
+def swiglu_limit(gate, up, limit):
+    """GLM swiglu in one launch: ``silu(clamp(gate, max=limit)) * clamp(up, ±limit)``.
+
+    Bit-identical to the eager four-kernel chain (clamp, clamp, F.silu, mul):
+    every intermediate rounds at exactly the storage-dtype boundary the eager
+    TensorIterator ops round at (clamp in fp32 opmath -> bf16 store; silu in
+    fp32 -> bf16 store; product in fp32 -> bf16 store). The silu core mirrors
+    the landed :func:`silu_mul` kernel (which carries the same rounding
+    contract vs ``F.silu``).
+
+    Eligibility: CUDA bf16/fp16/fp32 ``gate``/``up`` of the same shape and
+    dtype on one device; raises :class:`OpNotEligible` otherwise.
+    """
+    import torch
+    import triton  # lazy: launches need triton only
+
+    _same_gpu(gate, up)
+    require(
+        gate.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and up.dtype == gate.dtype,
+        f"swiglu_limit runs fp32/bf16/fp16 with matching dtypes, got {gate.dtype}/{up.dtype}",
+    )
+    require(up.shape == gate.shape, "gate and up must share a shape")
+
+    d = gate.shape[-1]
+    g, u = gate.reshape(-1, d), up.reshape(-1, d)
+    out = torch.empty(gate.shape, device=gate.device, dtype=gate.dtype)
+    sm = _kernels()[8]
+    sm[(g.shape[0], triton.cdiv(d, 256))](
+        g,
+        u,
+        out,
+        float(limit),
+        d,
+        g.stride(0),
+        u.stride(0),
+        256,
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+def swiglu_limit_reference(gate, up, limit):
+    """Eager oracle for :func:`swiglu_limit` — the exact torch chain."""
+    import torch
+    import torch.nn.functional as F
+
+    gate = gate.clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    return F.silu(gate) * up
 
 
 def store_kv(k, v, kc, vc, block_table, seqlens, scratch_slot):

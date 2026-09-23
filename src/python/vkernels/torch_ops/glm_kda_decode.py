@@ -155,3 +155,101 @@ def kda_decode_reference(query, key, value, gate, beta, initial_state, eps=1e-6)
     state = state + k[..., :, None] * ((v - memory) * b[..., None])[..., None, :]
     out = (state * q[..., :, None]).sum(-2)
     return out.unsqueeze(1), state
+
+
+@lru_cache(maxsize=1)
+def _conv_decode_kernel():
+    global tl
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _conv_decode(S, X, W, OUT, C, KS: tl.constexpr, BC: tl.constexpr):
+        b = tl.program_id(0)
+        cb = tl.program_id(1)
+        c = cb * BC + tl.arange(0, BC)
+        cmask = c < C
+        # (state[:, :, i] * w[:, i]) products run bf16 (one round per
+        # product, exactly the eager broadcast-mul store), the k=4 tail
+        # sum accumulates in FP32 (torch's bf16 acc_type) and rounds once
+        # on store, then SiLU computes in FP32 on the stored value and
+        # rounds again — the same four rounding points as the eager
+        # cat -> mul -> sum(-1) -> silu chain it replaces.
+        acc = tl.zeros((BC,), tl.float32)
+        for i in tl.static_range(KS):
+            w = tl.load(W + c * KS + i, cmask, 0).to(tl.float32)
+            if i < KS - 1:
+                v = tl.load(S + b * C * (KS - 1) + c * (KS - 1) + i, cmask, 0)
+            else:
+                v = tl.load(X + b * C + c, cmask, 0)
+            acc += (v.to(tl.float32) * w).to(OUT.dtype.element_ty).to(tl.float32)
+        out = acc.to(OUT.dtype.element_ty).to(tl.float32)
+        act = (out / (1.0 + tl.exp(-out))).to(OUT.dtype.element_ty)
+        tl.store(OUT + b * C + c, act, mask=cmask)
+
+    return _conv_decode
+
+
+def kda_conv_decode(state, x, weight, kernel_size):
+    """Single-token causal depthwise conv + SiLU in one launch (GLM KDA).
+
+    Replaces the eager four-kernel decode step
+    ``silu((cat([state, x], -1) * weight).sum(-1))``:
+    ``state`` ``[B, C, K-1]``, ``x`` ``[B, C, 1]``, ``weight`` ``[C, 1, K]``
+    (``nn.Conv1d`` layout), output ``[B, C]`` in the input dtype. Bit-identical
+    rounding contract vs the eager chain: bf16 product rounding per tap, FP32
+    tail accumulation, one round on the conv store, SiLU in FP32 on the stored
+    value with one round (see the kernel comment).
+
+    Eligibility: CUDA bf16/fp16 inputs of one dtype on one device, contiguous,
+    ``K == kernel_size`` in (2, 3, 4, 8); raises :class:`OpNotEligible`
+    otherwise (fp32 eager callers keep the torch path — the decode site only
+    ever runs the serving dtype).
+    """
+    import torch
+
+    if kernel_size not in (2, 3, 4, 8):
+        raise OpNotEligible("unsupported conv kernel size")
+    if state.dim() != 3 or state.shape[-1] != kernel_size - 1:
+        raise OpNotEligible("state must be [B, C, K-1]")
+    if x.dim() != 3 or x.shape[-1] != 1 or x.shape[:2] != state.shape[:2]:
+        raise OpNotEligible("x must be [B, C, 1] matching the state batch/channels")
+    if weight.shape != (state.shape[1], 1, kernel_size):
+        raise OpNotEligible("weight must be the nn.Conv1d [C, 1, K] layout")
+    if (
+        state.dtype not in (torch.bfloat16, torch.float16)
+        or x.dtype != state.dtype
+        or weight.dtype != state.dtype
+    ):
+        raise OpNotEligible("state/x/weight must be BF16 or FP16 of one dtype")
+    for t in (state, x, weight):
+        if not t.is_cuda or t.device != state.device or not t.is_contiguous():
+            raise OpNotEligible("inputs must be contiguous on the same GPU")
+    batch, channels = state.shape[0], state.shape[1]
+    out = torch.empty((batch, channels), device=state.device, dtype=state.dtype)
+    if batch * channels:
+        import triton  # lazy: validation above needs only torch
+
+        with torch.cuda.device(state.device):
+            _conv_decode_kernel()[(batch, triton.cdiv(channels, 1024))](
+                state,
+                x,
+                weight,
+                out,
+                channels,
+                kernel_size,
+                1024,
+                num_warps=4,
+                enable_fp_fusion=False,
+            )
+    return out
+
+
+def kda_conv_decode_reference(state, x, weight, kernel_size):
+    """Eager oracle for :func:`kda_conv_decode` — the exact torch chain."""
+    import torch
+    import torch.nn.functional as F
+
+    window = torch.cat([state, x], dim=-1)
+    out = (window * weight.squeeze(1)).sum(dim=-1)
+    return F.silu(out)
