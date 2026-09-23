@@ -211,6 +211,172 @@ CrossNodeKvRoute select_cross_node_kv_route(const CrossNodeKvAccess& access,
 // across all model layers (40 for Qwen3-14B) by varying the per-layer
 // (k_dst, v_dst, source_layer_offset_bytes) at every execute(). Exactly the
 // KVAAS restore pattern, now cross-node.
+// ---------------------------------------------------------------------------
+// Striped lanes -- 2-rank multi-HCA chunk striping (issue #152)
+// ---------------------------------------------------------------------------
+//
+// On a 2-node fabric the point-to-point relationship caps at ONE HCA port
+// (NCCL builds a 1-peer ring/tree and cannot stripe a single transfer
+// across the node's HCAs -- docs/comm-cross-node-kv.md). The striped
+// variant opens one independent channel LANE per HCA between the same two
+// ranks (one QP/RC pair per fabric -- each lane is individually a
+// "1-peer" connection, so the NCCL limitation does not apply) and ships
+// the layer as contiguous per-lane chunks. The host reference models a
+// lane as a plain ByteChannel; a real deployment binds each lane to one
+// HCA (libfabric/NIXL endpoint, or a per-HCA-pinned NCCL communicator in
+// the bench). The host model is the byte-exact oracle for whichever
+// transport carries the lanes.
+//
+// The chunk layout is DETERMINISTIC from the plan geometry: both sides
+// construct their plans with the same (geometry, config), derive the same
+// chunk list, and need no metadata exchange. Small transfers collapse to
+// a single lane (chunk 0) so sub-MiB layers do not pay per-lane setup.
+struct CrossNodeKvStripeConfig {
+  // Independent lanes (one per HCA). 1 = the plain single-lane transfer.
+  std::size_t lane_count = 1;
+  // Below this many bytes per lane the transfer stays on one lane
+  // (issue #152: "small transfers stay on a single QP to avoid setup
+  // overhead").
+  std::size_t min_chunk_bytes = 1u << 20;
+};
+
+// One contiguous chunk of the layer region assigned to one lane.
+struct CrossNodeKvStripeChunk {
+  std::size_t offset = 0;  // byte offset into the [num_pages, page_size, 2,
+                           // heads, head_dim] contiguous layer region
+  std::size_t bytes = 0;   // chunk length
+  std::size_t lane = 0;    // lane index carrying this chunk
+};
+
+// Split `total_bytes` into contiguous near-equal chunks, one per lane
+// (lane l carries chunk l; the remainder folds into the chunk lengths,
+// keeping the layout contiguous). When total_bytes < lane_count *
+// min_chunk_bytes the result is a single chunk on lane 0. Throws
+// std::invalid_argument when lane_count is zero or min_chunk_bytes is
+// zero. total_bytes == 0 yields an empty chunk list (no-op plan).
+std::vector<CrossNodeKvStripeChunk> compute_cross_node_kv_stripes(
+    std::size_t total_bytes, const CrossNodeKvStripeConfig& config);
+
+// Build `lanes` independent in-process byte links (one per HCA lane).
+// Returns (a_side, b_side): a_side[l] is the channel A sends into / recvs
+// from for lane l, b_side[l] its far end -- each pair is a full
+// make_byte_link().
+std::pair<std::vector<std::unique_ptr<ByteChannel>>,
+          std::vector<std::unique_ptr<ByteChannel>>>
+make_striped_byte_links(std::size_t lanes);
+
+// ---------------------------------------------------------------------------
+// CrossNodeKvStripedRestorePlan -- striped host-transport restore (#152)
+// ---------------------------------------------------------------------------
+//
+// The striped twin of the CrossNodeKvRestorePlan host-bounce path: the
+// far-side donor gathers local slots and ships the contiguous layer AS
+// lane chunks (one ByteChannel per HCA); this side recvs one chunk per
+// lane, reassembles the layer region in order, and scatters into local
+// slots with the existing kv_scatter -- byte-identical to the single-lane
+// bounce path (the chunks concatenate to the same bytes). Host-transport
+// only: the fabric-mapped direct path needs no striping (one import, one
+// kernel), so the CUDA mirror (cross_node_kv.cu) is unchanged.
+class CrossNodeKvStripedRestorePlan {
+ public:
+  // Same geometry contract as CrossNodeKvRestorePlan (validated slot map,
+  // non-BF16/FP16 rejection, zero-dimension rejection). `stripe` fixes the
+  // lane layout; BOTH sides must pass the same geometry AND config or the
+  // per-lane chunk sizes will not match (the recv validates them).
+  CrossNodeKvStripedRestorePlan(std::size_t num_slots,
+                                std::size_t num_kv_heads,
+                                std::size_t head_dim, std::size_t elem_size,
+                                const int* slot_ids, std::size_t num_pages,
+                                std::size_t page_size,
+                                const CrossNodeKvStripeConfig& stripe = {});
+
+  CrossNodeKvStripedRestorePlan(const CrossNodeKvStripedRestorePlan&) = delete;
+  CrossNodeKvStripedRestorePlan& operator=(
+      const CrossNodeKvStripedRestorePlan&) = delete;
+
+  std::size_t num_pages() const { return num_pages_; }
+  std::size_t page_size() const { return page_size_; }
+  std::size_t num_slots() const { return num_slots_; }
+  std::size_t total_bytes() const { return total_bytes_; }
+  const CrossNodeKvStripeConfig& stripe_config() const { return stripe_; }
+  const std::vector<CrossNodeKvStripeChunk>& stripes() const {
+    return stripes_;
+  }
+
+  // Recv one chunk per lane (in deterministic chunk order), reassemble the
+  // contiguous layer region, and scatter into (k_dst, v_dst). `lanes` must
+  // hold at least stripe_config().lane_count channels (lane l = lanes[l]).
+  // `source_layer_offset_bytes` is accepted for API parity with the
+  // single-lane plan; like the bounce path there, the offset selects the
+  // remote layer and is resolved by the caller's buffer choice, so it does
+  // not change the wire format. Graph: eager-breaks exactly like the
+  // host-bounce path (#10). A null stream runs to completion; a non-null
+  // stream submits one task.
+  void execute(void* k_dst, void* v_dst,
+               std::size_t source_layer_offset_bytes, Stream* stream = nullptr,
+               GraphCapture* graph = nullptr,
+               const std::vector<ByteChannel*>& lanes = {}) const;
+
+ private:
+  CrossNodeKvStripeConfig stripe_;
+  std::size_t num_slots_, num_kv_heads_, head_dim_, elem_size_;
+  std::size_t page_size_, num_pages_, total_bytes_;
+  std::vector<int> owned_slots_;  // validated slot map
+  std::vector<CrossNodeKvStripeChunk> stripes_;
+};
+
+// ---------------------------------------------------------------------------
+// CrossNodeKvStripedDonatePlan -- striped host-transport donate (#152)
+// ---------------------------------------------------------------------------
+//
+// The mirror of CrossNodeKvStripedRestorePlan: gathers the indexed local
+// K/V slots into a contiguous scratch with the existing kv_gather (the
+// SAME bytes as the single-lane bounce path), then sends one chunk per
+// lane. The far-side striped restore reassembles in order.
+class CrossNodeKvStripedDonatePlan {
+ public:
+  // Same geometry contract as CrossNodeKvDonatePlan (bounds-validated,
+  // repeat-allowed slot map). Both sides must pass the same geometry AND
+  // stripe config (deterministic chunk layout, no metadata exchange).
+  CrossNodeKvStripedDonatePlan(std::size_t num_slots,
+                               std::size_t num_kv_heads,
+                               std::size_t head_dim, std::size_t elem_size,
+                               const int* slot_ids, std::size_t num_pages,
+                               std::size_t page_size,
+                               const CrossNodeKvStripeConfig& stripe = {});
+
+  CrossNodeKvStripedDonatePlan(const CrossNodeKvStripedDonatePlan&) = delete;
+  CrossNodeKvStripedDonatePlan& operator=(
+      const CrossNodeKvStripedDonatePlan&) = delete;
+
+  std::size_t num_pages() const { return num_pages_; }
+  std::size_t page_size() const { return page_size_; }
+  std::size_t num_slots() const { return num_slots_; }
+  std::size_t total_bytes() const { return total_bytes_; }
+  const CrossNodeKvStripeConfig& stripe_config() const { return stripe_; }
+  const std::vector<CrossNodeKvStripeChunk>& stripes() const {
+    return stripes_;
+  }
+
+  // Gather local slots into the contiguous layer region, then send one
+  // chunk per lane (chunk l over lanes[l]). `remote` is accepted for API
+  // parity with the single-lane plan and unused on the host-transport
+  // path (the bytes go over the lanes to the far-side restore). Graph:
+  // eager-breaks exactly like the host-bounce path (#10). A null stream
+  // runs to completion; a non-null stream submits one task.
+  void execute(const void* k_src, const void* v_src, FabricHandle* remote,
+               std::size_t destination_layer_offset_bytes,
+               Stream* stream = nullptr, GraphCapture* graph = nullptr,
+               const std::vector<ByteChannel*>& lanes = {}) const;
+
+ private:
+  CrossNodeKvStripeConfig stripe_;
+  std::size_t num_slots_, num_kv_heads_, head_dim_, elem_size_;
+  std::size_t page_size_, num_pages_, total_bytes_;
+  std::vector<int> owned_slots_;  // validated slot map
+  std::vector<CrossNodeKvStripeChunk> stripes_;
+};
+
 class CrossNodeKvRestorePlan {
  public:
   // Host-input plan. `transport` is the resolved fabric import transport
