@@ -643,7 +643,9 @@ def rms_norm_unweighted(x, module):
     x = x.contiguous()
     out = torch.empty_like(x)
     d = x.shape[-1]
-    *_, unw, _gated = _kernels()
+    # Index-based access: the _kernels() tuple grew (_swiglu_limit appended);
+    # tail unpacks ("*_ , unw, gated = ...") silently rebind on any append.
+    unw, _gated = _kernels()[6], _kernels()[7]
     unw[(x.numel() // d,)](
         x,
         out,
@@ -678,7 +680,8 @@ def rms_norm_gated(x, gate, module):
     gate = gate.contiguous()
     out = torch.empty_like(x)
     d = x.shape[-1]
-    *_, _unw, gated = _kernels()
+    # Index-based access — see the note in rms_norm_unweighted above.
+    _unw, gated = _kernels()[6], _kernels()[7]
     gated[(x.numel() // d,)](
         x,
         module.weight,
