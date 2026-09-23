@@ -226,9 +226,18 @@ max_rel ≤ 5e-6).
 
 | kernel | shape | us(med) | GB/s |
 |---|---|--:|--:|
-| `kda_layer_norm_gated` | N=8192 D=128 | 174 | 72 |
+| `kda_layer_norm_gated` | N=8192 D=128 | 4.8 (was 174) | ~2600 (was 72) |
 | `kda_gate_chunk_cumsum` | B=1 H=16 nc=8 cs=64 | 13 | 5 |
 
-`layer_norm_gated` at N=8192 launches only 32 blocks (one per 256 rows) on
-304 CUs — a clear occupancy target (raise the block count or vectorise the
-row reduction).
+`layer_norm_gated` was occupancy-bound at N=8192: 32 blocks (one per 256
+rows) on 228 CUs, 72 GB/s = 1.4% of HBM. Issue #144 rewrote it as
+**one warp per token row with `float4` loads** (256-thread block → 8 rows
+→ `N/8 = 1024` blocks; lane `l` holds elements `4l..4l+3`; sum-of-squares
+via a 5-step `__shfl_xor` butterfly; normalize+SiLU write also `float4`).
+Measured on beverin MI300A (nid003020, ROCm 6.3): **170.7 → 4.8 µs
+(74 → ~2600 GB/s ≈ 49% of the 5300 GB/s HBM roof, ~35×)**, batched
+1000-launch event timing (`meta/scripts` A/B standalone, job 641303);
+rocprof per-launch average 6.15 µs. Output identical to the one-thread
+layout (max_abs_diff 3e-7) and to the CPU oracle (max_rel 1e-6,
+test_kda_correct 11/11 PASS). The one-thread-per-row kernel remains as
+the fallback for `D % 4 != 0`.

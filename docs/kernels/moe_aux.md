@@ -163,8 +163,11 @@ Routed combine of the expert-local fp32 partials back onto each output
 token — a bias-free weighted scatter-add. For each sorted row `r`,
 `out[sorted_ids[r] // top_k, :] += topk_w[r // top_k, r % top_k] * partial[r, :]`
 (the routing weight is looked up by token, not by sorted row). Multiple
-sorted rows map to the same output token (`top_k > 1`), so the HIP kernel
-uses `atomicAdd`; the caller must zero-initialise `out`. This is the
+sorted rows map to the same output token (`top_k > 1`). The CPU reference
+accumulates into (pre-zeroed) `out`; the HIP kernel (#145) implements the
+same math as an atomic-free token-major gather and fully overwrites `out`
+(a well-formed `sorted_ids` contributes exactly `top_k` rows per token,
+so the caller-side memset is unnecessary on the device path). This is the
 bias-free form of `moe_combine_cpu` (`moe_fused.cpp`), which adds bias +
 weight + scatter in one pass.
 
@@ -200,10 +203,16 @@ algorithms:
   row, a generic gather over `elem = sizeof(element)` bytes (bf16 → 2,
   ue8m0 → 1), strided across the row.
 - **`mxfp4_moe_scatter_reduce`** / **`mxfp4_moe_scatter_reduce_q`**:
-  `atomicAdd` into `out` so multiple sorted rows mapping to the same token
-  accumulate correctly, mirroring `down_combine_kernel` in `moe_fused.hip`.
-  The `_q` kernel dequantizes each group against its ue8m0 scale before
-  the atomic add.
+  (#145) **token-major gather** — an inverse permutation `inv[sorted_ids[r]] = r`
+  (micro-kernel + cached device scratch, or prebuilt via
+  `mxfp4_moe_build_inv`) lets each block own one output token and read its
+  `top_k` partial rows contiguously; plain stores, no atomics, no
+  pre-zeroed `out`. The `_q` kernel dequantizes each group against its
+  ue8m0 scale before accumulating. Output is deterministic (fixed
+  k-ascending order per token).
+  Before #145 the kernels used `atomicAdd` (one block per sorted row,
+  16-way same-address contention), running at 45.4% of L2 vs sort's 70%;
+  the gather form closes that gap (see the benchmark section).
 
 ---
 
@@ -262,11 +271,13 @@ The two configs exercised:
 
 The quant and two sort ops are pure data movement / integer quantization (no
 floating accumulation across blocks) and so are bit-exact. The two
-scatter-reduce ops accumulate into each output token with `atomicAdd`; with
-`top_k = 2` the two addends commute (bit-exact), while the K3 shape
-(`top_k = 16`) has sixteen addends per token and so genuinely exercises the
-relative tolerance — the observed `~2e-7` is two orders of magnitude inside
-`1e-5`.
+scatter-reduce ops reduce `top_k` addends per output token; the device
+gather (#145) accumulates in k-ascending order per token while the CPU
+oracle walks rows r-ascending, so orders can differ. With `top_k = 2` the
+two addends commute (bit-exact), while the K3 shape (`top_k = 16`) has
+sixteen addends per token and so genuinely exercises the relative
+tolerance — the observed `~2e-7` is two orders of magnitude inside `1e-5`
+(and the device order is now deterministic, cf. #132).
 
 Build & run (bare-metal, ROCm 6.3; the compute node has the runtime, so no
 container is needed):
@@ -301,26 +312,37 @@ HBM. Two streaming-copy references bracket the roof:
 | HBM copy (L2-bypassed, 4096 blocks) | 512 MB | 2868 GB/s |
 | L2 copy (K3-sized, 1024 blocks) | 28 MB | 3219 GB/s |
 
-K3 row (`M=112`, `EM=2048`), latency primary, effective GB/s secondary:
+K3 row (`M=112`, `EM=2048`), latency primary, effective GB/s secondary.
+Post-#145 numbers (native ROCm 6.3 run, 2026-09-18, this run's L2 roof
+2754 GB/s / HBM 2938 GB/s) — `scatter_reduce` improved 42.4 → 20.2 µs
+(2.1×, 95% of the 3219 GB/s L2 roof recorded above) and `_q`
+43.7 → 22.6 µs (1.9×, atomic traffic gone; the residual is the E2M1
+dequant round-trip), and the caller-side `out` memset left the path:
 
 | op | lat (µs) | GB/s | %L2 |
 |---|---|---|---|
-| `mxfp4_moe_quant` | 17.8 | 114 | 3.6% |
-| `mxfp4_moe_sort` | 24.4 | 2253 | 70.0% |
-| `mxfp4_moe_sort_scales` | 5.6 | 155 | 4.8% |
-| `mxfp4_moe_scatter_reduce` | 42.4 | 1461 | 45.4% |
-| `mxfp4_moe_scatter_reduce_q` | 43.7 | 252 | 7.8% |
+| `mxfp4_moe_quant` | 20.8 | 98 | 3.6% |
+| `mxfp4_moe_sort` | 26.7 | 2060 | 74.8% |
+| `mxfp4_moe_sort_scales` | 8.6 | 100 | 3.6% |
+| `mxfp4_moe_scatter_reduce` | **20.2** | **3066** | **95.2% of 3219** |
+| `mxfp4_moe_scatter_reduce_q` | **22.6** | **487** | 17.7% |
+
+(pre-#145, same shapes: quant 17.8, sort 24.4, sort_scales 5.6,
+scatter_reduce 42.4 @ 45.4% L2, scatter_reduce_q 43.7 @ 7.8%.)
 
 Interpretation:
 
-- **`mxfp4_moe_sort`** (69.9% L2) and **`mxfp4_moe_scatter_reduce`**
-  (45.4% L2) are the pure data-movement paths and approach the bandwidth
-  roof; the latter is held below by `atomicAdd` contention (16 sorted rows
-  per output token).
+- **`mxfp4_moe_sort`** (69.9% L2 pre-#145) and **`mxfp4_moe_scatter_reduce`**
+  (45.4% L2 pre-#145 → **95% post**) are the pure data-movement paths and
+  approach the bandwidth roof; the latter's gap was `atomicAdd` contention
+  (16 sorted rows per output token), removed by the #145 token-major
+  gather.
 - **`mxfp4_moe_quant`** and **`mxfp4_moe_scatter_reduce_q`** are
   partially **compute-bound**: the per-element E2M1 round-trip (branchy
   nibble quantize / dequantize + shared-memory amax reduction) dominates
-  over the small memory footprint, so GB/s is low despite fast latency.
+  over the small memory footprint, so GB/s is low despite fast latency
+  (post-#145 the `_q` combine's atomic cost is gone; the remaining 22.6 µs
+  is the dequant round-trip).
 - **`mxfp4_moe_sort_scales`** (0.8 MB, 5.6 µs) is **launch-bound** — the
   kernel runtime is dominated by dispatch overhead.
 

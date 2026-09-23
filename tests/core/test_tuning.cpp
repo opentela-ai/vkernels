@@ -110,6 +110,14 @@ TEST(tuning, parse_body) {
   const auto entries = tuning::parse_body(body);
   EXPECT_EQ(entries.size(), (size_t)2);
 
+  // Trailing whitespace and CRLF endings are trimmed before parsing —
+  // a store written on Windows or by a sloppy generator still loads.
+  const auto crlf = tuning::parse_body(
+      "key=1,2\r\nbq=2   \r\nblock_I=64\r\ninner_iter=1\r\n");
+  EXPECT_EQ(crlf.size(), (size_t)1);
+  EXPECT_EQ(*crlf[0].find("bq"), (long long)2);
+  EXPECT_EQ(*crlf[0].find("block_I"), (long long)64);
+
   EXPECT_TRUE(entries[0].key == (std::vector<long long>{1, 4096, 64}));
   EXPECT_EQ(entries[0].params.size(), (size_t)1);
   EXPECT_EQ(*entries[0].find("split"), (long long)64);
@@ -230,4 +238,111 @@ TEST(tuning, selector_seam) {
   const int glm_formula2 = vkernels::kernels::glm_fp8_gemv_pick_sk(N, K2);
   tuning::persist("glm_fp8_gemv_pick_sk", {N, K2}, {{"sk", 6}}, "test");
   EXPECT_EQ(vkernels::kernels::glm_fp8_gemv_pick_sk(N, K2), glm_formula2);
+}
+
+TEST(tuning, store_dir_default) {
+  // With the cache env unset/empty the store falls back to
+  // $HOME/.cache/vkernels/tuning, and with no HOME at all it is off.
+  const char* saved_cache = ::getenv("VKERNELS_TUNING_CACHE");
+  const char* saved_home = ::getenv("HOME");
+  const char* tmp = ::getenv("TMPDIR");
+  const std::string home = std::string(tmp && *tmp ? tmp : "/tmp");
+
+  ::setenv("VKERNELS_TUNING_CACHE", "", 1);  // empty == unset here
+  ::setenv("HOME", home.c_str(), 1);
+  EXPECT_EQ(tuning::store_dir(), home + "/.cache/vkernels/tuning");
+  EXPECT_TRUE(tuning::enabled());
+
+  ::setenv("HOME", "", 1);  // neither env set -> no store
+  EXPECT_TRUE(tuning::store_dir().empty());
+  EXPECT_FALSE(tuning::enabled());
+
+  if (saved_home)
+    ::setenv("HOME", saved_home, 1);
+  else
+    ::unsetenv("HOME");
+  if (saved_cache)
+    ::setenv("VKERNELS_TUNING_CACHE", saved_cache, 1);
+  else
+    ::unsetenv("VKERNELS_TUNING_CACHE");
+  tuning::reset_for_test();
+}
+
+TEST(tuning, device_arch_query_fallback) {
+  // Without the VKERNELS_TUNING_ARCH pin the seam falls through to the
+  // device query ("" on a toolkit-less host, the real arch on a GPU);
+  // whatever it yields, it is cached and stable for the process.
+  const char* saved = ::getenv("VKERNELS_TUNING_ARCH");
+  ::setenv("VKERNELS_TUNING_ARCH", "", 1);
+  const std::string queried = tuning::device_arch();
+  EXPECT_TRUE(tuning::device_arch() == queried);
+  if (saved)
+    ::setenv("VKERNELS_TUNING_ARCH", saved, 1);
+  else
+    ::unsetenv("VKERNELS_TUNING_ARCH");
+}
+
+TEST(tuning, warm_public_wrapper) {
+  // warm() is the explicit re-read entry point (bench campaigns refresh
+  // between phases); after it, find() sees hand-written files.
+  const TempStore store("warmwrap");
+  const std::vector<long long> key{4, 5, 6};
+  {
+    std::ofstream out(store.dir + "/w.sm000.tune");
+    out << "# vk-native-tuning/1\n# arch=sm000\nkey=4,5,6\nsplit=9\n";
+  }
+  tuning::warm(store.dir);
+  const auto hit = tuning::find("w", key);
+  ASSERT_TRUE(hit != nullptr);
+  EXPECT_EQ(*hit->find("split"), (long long)9);
+}
+
+TEST(tuning, file_arch_from_filename) {
+  // A store file with no `# arch=` header takes its arch from the
+  // <kernel>.<arch>.tune filename; the one-machine convenience rule
+  // then still honors it for a differently-named device.
+  const TempStore store("hdrless");
+  const std::vector<long long> key{7, 8};
+  {
+    std::ofstream out(store.dir + "/hdrless.gfx942.tune");
+    out << "key=7,8\nsplit=11\n";  // deliberately headerless
+  }
+  tuning::reset_for_test();
+  const auto hit = tuning::find("hdrless", key);  // pinned sm000 != gfx942
+  ASSERT_TRUE(hit != nullptr);
+  EXPECT_EQ(*hit->find("split"), (long long)11);
+}
+
+TEST(tuning, persist_write_failure_is_lenient) {
+  // The store root's parent is a regular file: mkdir_p cannot help, the
+  // tmp ofstream fails, and persist() gives up quietly instead of
+  // throwing or leaving a partial store behind.
+  const char* tmp = ::getenv("TMPDIR");
+  const std::string base = std::string(tmp && *tmp ? tmp : "/tmp");
+  const std::string blocker =
+      base + "/vk_tuning_blocker_" + std::to_string(::time(nullptr));
+  {
+    std::ofstream out(blocker);
+    out << "regular file, not a directory\n";
+  }
+
+  const char* saved_cache = ::getenv("VKERNELS_TUNING_CACHE");
+  const char* saved_arch = ::getenv("VKERNELS_TUNING_ARCH");
+  ::setenv("VKERNELS_TUNING_CACHE", (blocker + "/store").c_str(), 1);
+  ::setenv("VKERNELS_TUNING_ARCH", "sm000", 1);
+  tuning::reset_for_test();
+
+  tuning::persist("k", {1}, {{"split", 4}}, "test");  // must not throw
+  EXPECT_TRUE(tuning::find("k", {1}) == nullptr);     // nothing persisted
+
+  if (saved_cache)
+    ::setenv("VKERNELS_TUNING_CACHE", saved_cache, 1);
+  else
+    ::unsetenv("VKERNELS_TUNING_CACHE");
+  if (saved_arch)
+    ::setenv("VKERNELS_TUNING_ARCH", saved_arch, 1);
+  else
+    ::unsetenv("VKERNELS_TUNING_ARCH");
+  tuning::reset_for_test();
+  (void)::unlink(blocker.c_str());
 }

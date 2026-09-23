@@ -34,6 +34,18 @@
 //                point-to-point channel structure; if it also caps at
 //                one port, the collective's algorithm / rank count is
 //                not reaching the 4-port aggregate.
+//   nccl-stripe : the 2-rank multi-HCA striping variant (issue #152). The
+//                layer is split into `--stripe N` contiguous chunks and
+//                chunk l is shipped rank0->rank1 over stripe communicator
+//                l on its own stream. Each stripe communicator is pinned
+//                to one HCA via NCCL_IB_HCA set just before its init (a
+//                BENCH-ONLY pinning trick: NCCL reads the env at comm
+//                init). Production striping opens one channel/QP per HCA
+//                behind CrossNodeKvStriped{Donate,Restore}Plan
+//                (cross_node_kv.hpp); this row measures whether parallel
+//                per-HCA point-to-point relationships lift the 1-port
+//                cap. Success criterion (issue #152): >=3x usefGB at
+//                16384+ toks vs nccl-xfer.
 //   d2d-local  : same-device cudaMemcpyAsync of the same layer on rank0
 //                (2*bytes through HBM, read+write), the same-node ceiling
 //                a cross-node hop is graded against (matches
@@ -52,9 +64,9 @@
 // combos (the GIN/GDR NCCL path works regardless); the default run
 // reports only the fabric measurements.
 //
-// Build:  nvcc -std=c++17 -O2 bench_cross_node_nccl.cu -lnccl -lcudart -lcuda
-// Run:    srun --mpi=pmix -N2 -n2 --ntasks-per-node=1 --gres=gpu:1
+// Build:  nvcc -std=c++17 -O2 bench_cross_node_nccl.cu -lnccl -lcudart -lcuda// Run:    srun --mpi=pmix -N2 -n2 --ntasks-per-node=1 --gres=gpu:1
 //         ./cross_node_nccl_bench [--iters N] [--warmups W] [--probe-vram]
+//                                 [--stripe N (lanes, default 4)]
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -215,20 +227,194 @@ void print_row(int toks, const Row& r) {
               r.ok ? "ok" : "MISMATCH");
 }
 
+// --- issue #152: 2-rank multi-HCA striping -------------------------------
+//
+// One stripe communicator per HCA lane. NCCL reads NCCL_IB_HCA at comm
+// init, so pinning is done by setting the env just before each init and
+// clearing it after (bench-only trick; a production lane is a per-HCA
+// libfabric/NIXL endpoint behind the striped plans in cross_node_kv.hpp).
+struct StripeComms {
+  int lanes = 0;
+  std::vector<ncclComm_t> comms;
+  std::vector<cudaStream_t> streams;
+
+  bool valid() const {
+    return lanes > 0 && comms.size() == static_cast<size_t>(lanes) &&
+           streams.size() == static_cast<size_t>(lanes);
+  }
+};
+
+// Contiguous near-equal chunk split of `bytes` over `lanes` lanes -- the
+// SAME layout rule as compute_cross_node_kv_stripes (cross_node_kv.cpp):
+// lane l carries base + (l < rem), tiling [0, bytes) in order.
+void stripe_chunks(size_t bytes, int lanes, std::vector<size_t>& off,
+                   std::vector<size_t>& len) {
+  off.assign(static_cast<size_t>(lanes), 0);
+  len.assign(static_cast<size_t>(lanes), 0);
+  const size_t base = bytes / static_cast<size_t>(lanes);
+  const size_t rem = bytes % static_cast<size_t>(lanes);
+  size_t o = 0;
+  for (int l = 0; l < lanes; ++l) {
+    len[static_cast<size_t>(l)] = base + (static_cast<size_t>(l) < rem);
+    off[static_cast<size_t>(l)] = o;
+    o += len[static_cast<size_t>(l)];
+  }
+}
+
+// Device-time distribution for the striped transfer: per iteration the
+// exec() issues one ncclSend/ncclRecv PER LANE on its own stream; the
+// sample is the MAX elapsed over lanes (the transfer completes when the
+// slowest lane completes).
+Stats time_stats_striped(int warmups, int iters, const StripeComms& sc,
+                         const std::function<void()>& exec) {
+  std::vector<cudaEvent_t> b(sc.lanes), e(sc.lanes);
+  for (int l = 0; l < sc.lanes; ++l) {
+    CKCuda(cudaEventCreate(&b[static_cast<size_t>(l)]));
+    CKCuda(cudaEventCreate(&e[static_cast<size_t>(l)]));
+  }
+  auto once = [&]() {
+    exec();
+    for (int l = 0; l < sc.lanes; ++l)
+      CKCuda(cudaEventRecord(e[static_cast<size_t>(l)],
+                             sc.streams[static_cast<size_t>(l)]));
+    float best = 0.0f;
+    for (int l = 0; l < sc.lanes; ++l) {
+      CKCuda(cudaEventSynchronize(e[static_cast<size_t>(l)]));
+      float ms = 0.0f;
+      CKCuda(cudaEventElapsedTime(&ms, b[static_cast<size_t>(l)],
+                                  e[static_cast<size_t>(l)]));
+      if (ms > best) best = ms;
+    }
+    return best * 1.0e3f;  // us
+  };
+  // Events must be recorded before they are timed; prime one pass.
+  for (int l = 0; l < sc.lanes; ++l)
+    CKCuda(cudaEventRecord(b[static_cast<size_t>(l)],
+                           sc.streams[static_cast<size_t>(l)]));
+  for (int w = 0; w < warmups; ++w) once();
+  std::vector<double> us;
+  us.reserve(static_cast<size_t>(iters));
+  for (int i = 0; i < iters; ++i) {
+    for (int l = 0; l < sc.lanes; ++l)
+      CKCuda(cudaEventRecord(b[static_cast<size_t>(l)],
+                             sc.streams[static_cast<size_t>(l)]));
+    us.push_back(once());
+  }
+  for (int l = 0; l < sc.lanes; ++l) {
+    CKCuda(cudaEventDestroy(b[static_cast<size_t>(l)]));
+    CKCuda(cudaEventDestroy(e[static_cast<size_t>(l)]));
+  }
+  std::sort(us.begin(), us.end());
+  const size_t n = us.size();
+  double sum = 0.0; for (double v : us) sum += v;
+  double mean = sum / static_cast<double>(n);
+  double var = 0.0; for (double v : us) { double d = v - mean; var += d * d; }
+  var /= (n > 1) ? static_cast<double>(n - 1) : 1.0;
+  const double sd = std::sqrt(var);
+  return { us.front(), us[n / 2], mean, sd,
+           mean ? sd / mean * 100.0 : 0.0 };
+}
+
+// Set up `lanes` extra communicators, each pinned to one HCA via
+// NCCL_IB_HCA at init. Rank 0 writes one uniqueId file per lane (the main
+// id file pattern); rank 1 polls for them. Collective across ranks.
+StripeComms stripe_comms_setup(int lanes, int rank, const char* id_dir) {
+  StripeComms sc;
+  sc.lanes = lanes;
+  sc.comms.assign(static_cast<size_t>(lanes), nullptr);
+  sc.streams.assign(static_cast<size_t>(lanes), nullptr);
+
+  std::vector<ncclUniqueId> ids(static_cast<size_t>(lanes));
+  if (rank == 0) {
+    for (int l = 0; l < lanes; ++l) {
+      CKNccl(ncclGetUniqueId(&ids[static_cast<size_t>(l)]));
+      std::string tmp = std::string(id_dir) + ".stripe" + std::to_string(l) +
+                        ".tmp";
+      { std::ofstream f(tmp, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(&ids[static_cast<size_t>(l)]),
+                sizeof(ncclUniqueId)); f.flush(); }
+      std::rename(tmp.c_str(), (std::string(id_dir) + ".stripe" +
+                                std::to_string(l)).c_str());
+    }
+  } else {
+    for (int l = 0; l < lanes; ++l) {
+      const std::string path = std::string(id_dir) + ".stripe" +
+                               std::to_string(l);
+      bool got = false;
+      for (int t = 0; t < 400 && !got; ++t) {
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (f && static_cast<std::streamoff>(f.tellg()) >=
+                 static_cast<std::streamoff>(sizeof(ncclUniqueId))) {
+          f.seekg(0);
+          f.read(reinterpret_cast<char*>(&ids[static_cast<size_t>(l)]),
+                 sizeof(ncclUniqueId));
+          got = true;
+        } else {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+      }
+      if (!got) {
+        std::fprintf(stderr, "[rank %d] FATAL: no stripe id file %s\n",
+                     rank, path.c_str());
+        std::exit(1);
+      }
+    }
+  }
+
+  for (int l = 0; l < lanes; ++l) {
+    // Pin THIS communicator to one HCA for its lifetime (read at init).
+    const std::string hca = "mlx5_" + std::to_string(l);
+    setenv("NCCL_IB_HCA", hca.c_str(), 1);
+    ncclResult_t r = ncclCommInitRank(&sc.comms[static_cast<size_t>(l)],
+                                      2, ids[static_cast<size_t>(l)],
+                                      /*rank=*/rank);
+    unsetenv("NCCL_IB_HCA");
+    if (r != ncclSuccess) {
+      std::fprintf(stderr,
+                   "[rank %d] stripe comm %d (%s) init failed: %s "
+                   "(fewer HCAs than lanes? check ibstat / NCCL_DEBUG=INFO)\n",
+                   rank, l, hca.c_str(), ncclGetErrorString(r));
+      sc.lanes = l;  // only the lanes that came up are usable
+      break;
+    }
+    CKCuda(cudaStreamCreate(&sc.streams[static_cast<size_t>(l)]));
+  }
+  if (sc.lanes < lanes && rank == 0)
+    std::fprintf(stderr,
+                 "# WARNING: only %d/%d stripe lanes initialized; the "
+                 "nccl-stripe row measures %d lanes\n",
+                 sc.lanes, lanes, sc.lanes);
+  return sc;
+}
+
+void stripe_comms_teardown(StripeComms& sc) {
+  for (int l = 0; l < sc.lanes; ++l) {
+    if (sc.streams[static_cast<size_t>(l)])
+      CKCuda(cudaStreamDestroy(sc.streams[static_cast<size_t>(l)]));
+    if (sc.comms[static_cast<size_t>(l)]) CKNccl(ncclCommDestroy(sc.comms[static_cast<size_t>(l)]));
+  }
+  sc.comms.clear();
+  sc.streams.clear();
+  sc.lanes = 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   int iters = 101, warmups = 5;
   bool probe_vram = false;
+  int stripe_lanes = 4;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
     else if (a == "--warmups" && i + 1 < argc) warmups = std::atoi(argv[++i]);
     else if (a == "--quick") { iters = 11; warmups = 3; }
     else if (a == "--probe-vram") probe_vram = true;
+    else if (a == "--stripe" && i + 1 < argc) stripe_lanes = std::atoi(argv[++i]);
   }
   if (iters < 1) iters = 1;
   if (warmups < 0) warmups = 0;
+  if (stripe_lanes < 1) stripe_lanes = 1;
 
   // --- NCCL bootstrap via shared file (no MPI) -------------------------
   // SLURM task env: SLURM_PROCID (0-based rank), SLURM_NPROCS (ranks),
@@ -271,6 +457,19 @@ int main(int argc, char** argv) {
   cudaStream_t stream;
   CKCuda(cudaStreamCreate(&stream));
   if (rank == 0) std::remove(kIdFile);
+
+  // --- stripe communicators (issue #152) --------------------------------
+  // One per-HCA-pinned comm + stream per lane. A 2-rank NCCL ring/tree
+  // cannot stripe a single p2p relationship across HCAs (measured:
+  // nccl-xfer/pipe/allred all cap at one HDR-200 port); the stripe rows
+  // test whether PARALLEL per-HCA point-to-point relationships do.
+  StripeComms stripe;
+  if (n_ranks == 2 && stripe_lanes > 1) {
+    stripe = stripe_comms_setup(stripe_lanes, rank, kIdFile);
+  }
+  if (rank == 0 && stripe.valid())
+    std::printf("#   stripe: %d lanes, one NCCL communicator per lane, "
+                "pinned via NCCL_IB_HCA=mlx5_<l> at init\n", stripe.lanes);
 
   // --- header (rank 0) -------------------------------------------------
   if (rank == 0) {
@@ -436,6 +635,30 @@ int main(int argc, char** argv) {
       CKCuda(cudaFree(ar));
     }
 
+    // nccl-stripe (issue #152): chunk the layer over the per-HCA-pinned
+    // stripe communicators, one stream per lane; the sample is the MAX
+    // elapsed over lanes (transfer completes when the slowest lane does).
+    Stats s_stripe{0, 0, 0, 0, 0};
+    bool stripe_active = stripe.valid();
+    std::vector<size_t> soff, slen;
+    if (stripe_active) {
+      stripe_chunks(bytes, stripe.lanes, soff, slen);
+      s_stripe = time_stats_striped(warmups, iters, stripe, [&] {
+        CKNccl(ncclGroupStart());
+        for (int l = 0; l < stripe.lanes; ++l) {
+          const size_t li = static_cast<size_t>(l);
+          if (slen[li] == 0) continue;
+          if (rank == 0)
+            CKNccl(ncclSend(static_cast<char*>(src) + soff[li], slen[li],
+                            ncclInt8, 1, stripe.comms[li], stripe.streams[li]));
+          else if (rank == 1)
+            CKNccl(ncclRecv(static_cast<char*>(dst) + soff[li], slen[li],
+                            ncclInt8, 0, stripe.comms[li], stripe.streams[li]));
+        }
+        CKNccl(ncclGroupEnd());
+      });
+    }
+
     // verify: one final send||recv, then D2H + memcmp on rank 1. The
     // allgather result is also checked on every rank against the padded
     // full-layer image. The ok flag is allreduced (min) so a failure on
@@ -475,6 +698,47 @@ int main(int argc, char** argv) {
     if (rank == 0) ok = (recv_ok == 1);
     CKCuda(cudaFree(dev_ok));
 
+    // striped-path verification: one striped send||recv, then D2H +
+    // memcmp on rank 1 (same size-dependent pattern contract).
+    bool stripe_ok = ok;
+    if (stripe_active) {
+      if (rank == 1) CKCuda(cudaMemset(dst, 0, bytes));
+      CKNccl(ncclGroupStart());
+      for (int l = 0; l < stripe.lanes; ++l) {
+        const size_t li = static_cast<size_t>(l);
+        if (slen[li] == 0) continue;
+        if (rank == 0)
+          CKNccl(ncclSend(static_cast<char*>(src) + soff[li], slen[li],
+                          ncclInt8, 1, stripe.comms[li], stripe.streams[li]));
+        else if (rank == 1)
+          CKNccl(ncclRecv(static_cast<char*>(dst) + soff[li], slen[li],
+                          ncclInt8, 0, stripe.comms[li], stripe.streams[li]));
+      }
+      CKNccl(ncclGroupEnd());
+      for (int l = 0; l < stripe.lanes; ++l)
+        CKCuda(cudaStreamSynchronize(stripe.streams[static_cast<size_t>(l)]));
+      if (rank == 1) {
+        std::vector<unsigned char> got(bytes), want(bytes);
+        CKCuda(cudaMemcpy(got.data(), dst, bytes, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < bytes; ++i)
+          want[i] = pattern_byte(i, toks);
+        stripe_ok = (std::memcmp(got.data(), want.data(), bytes) == 0);
+      }
+      // Min-reduce the stripe ok flag so a failure on any rank fails.
+      int s_host_ok = stripe_ok ? 1 : 0;
+      int* s_dev_ok = nullptr; CKCuda(cudaMalloc(&s_dev_ok, sizeof(int)));
+      CKCuda(cudaMemcpy(s_dev_ok, &s_host_ok, sizeof(int),
+                        cudaMemcpyHostToDevice));
+      CKNccl(ncclAllReduce(s_dev_ok, s_dev_ok, 1, ncclInt, ncclMin, comm,
+                           stream));
+      CKCuda(cudaStreamSynchronize(stream));
+      int s_recv_ok = 0;
+      CKCuda(cudaMemcpy(&s_recv_ok, s_dev_ok, sizeof(int),
+                        cudaMemcpyDeviceToHost));
+      if (rank == 0) stripe_ok = (s_recv_ok == 1);
+      CKCuda(cudaFree(s_dev_ok));
+    }
+
     if (rank == 0) {
       const double allgather_wire_bytes =
           static_cast<double>(n_ranks - 1) * static_cast<double>(shard_bytes);
@@ -483,6 +747,9 @@ int main(int argc, char** argv) {
       Row rg = row_sustained("nccl-allgthr", bytes, allgather_wire_bytes,
                              allgather_us);
       Row ra = row_sustained("nccl-allred", bytes, bytes, allred_us);
+      Row rs{0};
+      if (stripe_active)
+        rs = row("nccl-stripe", s_stripe, bytes, bytes);
       // same-node ceiling: d2d copy reads src AND writes dst = 2*bytes
       // through HBM, so grade 2*bytes against the HBM roof (matches
       // bench_cross_node_kv_cuda.cu 'direct', ~96-104% HBM).
@@ -492,13 +759,19 @@ int main(int argc, char** argv) {
       });
       Row rd = row("d2d-local", s_d2d, 2.0 * bytes, 2.0 * bytes);
       rx.ok = rp.ok = rg.ok = ra.ok = rd.ok = ok;
+      rs.ok = stripe_active ? stripe_ok : ok;
       print_row(toks, rx);
       print_row(toks, rp);
       print_row(toks, rg);
       print_row(toks, ra);
+      if (stripe_active) print_row(toks, rs);
       print_row(toks, rd);
     }
   }
+
+  stripe_comms_teardown(stripe);
+  CKCuda(cudaStreamDestroy(stream));
+  CKNccl(ncclCommDestroy(comm));
 
   if (rank == 0) {
     std::printf("\n# Reading the table:\n");
@@ -524,6 +797,15 @@ int main(int argc, char** argv) {
     std::printf("#               limit above is point-to-point channel\n");
     std::printf("#               structure; if it too caps at one port, this\n");
     std::printf("#               rank count / algorithm is not reaching 4-port.\n");
+    std::printf("#   nccl-stripe: issue #152 striping -- the layer split into\n");
+    std::printf("#               contiguous chunks, chunk l shipped over the\n");
+    std::printf("#               per-HCA-pinned lane l (NCCL_IB_HCA=mlx5_<l> at\n");
+    std::printf("#               comm init, one stream per lane; us = max over\n");
+    std::printf("#               lanes). If this reaches %%p100 while xfer/pipe\n");
+    std::printf("#               cap at one port, parallel per-HCA point-to-point\n");
+    std::printf("#               relationships lift the 2-rank cap -- the\n");
+    std::printf("#               CrossNodeKvStriped{Donate,Restore}Plan host model\n");
+    std::printf("#               (cross_node_kv.hpp) is the production shape.\n");
     std::printf("#   d2d-local  : same-device cudaMemcpyAsync of the same layer\n");
     std::printf("#               (2*bytes through HBM), the same-node ceiling a\n");
     std::printf("#               cross-node hop is graded against (matches\n");

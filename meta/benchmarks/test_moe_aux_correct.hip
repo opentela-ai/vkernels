@@ -6,13 +6,14 @@
 //
 // The five ops are pure data-movement / integer-quantization primitives
 // (no floating accumulation across blocks), so the quant and two sort ops
-// are checked bit-exact. The two scatter-reduce ops accumulate into each
-// output token with atomicAdd (top_k > 1 -> several sorted rows land on
-// one token), so the reduction order can differ host vs device; those are
-// checked with a small relative tolerance. With top_k=2 the sum has only
-// two addends per token so float addition is commutative and the result is
-// bit-exact; the K3 config (top_k=16) has sixteen addends per token and so
-// genuinely exercises the 1e-5 tolerance.
+// are checked bit-exact. The two scatter-reduce ops accumulate top_k rows
+// per output token (issue #145: token-major gather with k-ascending order
+// on device vs the CPU oracle's r-ascending row walk), so the reduction
+// order can differ host vs device; those are checked with a small relative
+// tolerance. With top_k=2 the sum has only two addends per token so float
+// addition is commutative and the result is bit-exact; the K3 config
+// (top_k=16) has sixteen addends per token and so genuinely exercises the
+// 1e-5 tolerance.
 //
 // Two configs are run:
 //   small : M=8   hidden=256  top_k=2  E=4   (fast, bit-exact scatter)
@@ -49,13 +50,15 @@ void mxfp4_moe_sort_scales(const uint8_t* scales, const int32_t* sorted_ids,
                            int top_k, int EM);
 void mxfp4_moe_scatter_reduce(const float* partial, const float* topk_w,
                               const int32_t* sorted_ids, float* out,
-                              int M, int width, int top_k, int EM);
+                              int M, int width, int top_k, int EM,
+                              int32_t* inv_prebuilt = nullptr);
 void mxfp4_moe_scatter_reduce_q(const uint8_t* partial_q,
                                 const uint8_t* partial_s,
                                 const float* topk_w,
                                 const int32_t* sorted_ids, float* out,
                                 int M, int width, int top_k, int EM,
-                                int group_size);
+                                int group_size,
+                                int32_t* inv_prebuilt = nullptr);
 }  // namespace vkernels::kernels::hip
 
 #define CK(e, m)                                                       \
@@ -311,8 +314,10 @@ int run_one(const char* label, int M, int hidden, int top_k, int E,
              (size_t)EM * hidden / 2);
   check_bits("mxfp4_moe_quant(partial).scales", partial_s.data(), ps_g.data(),
              (size_t)EM * n_groups);
-  // Scatter-reduce uses atomicAdd -> tolerant comparison (more addends with
-  // larger top_k -> more ordering sensitivity, still well within 1e-5).
+  // Scatter-reduce reduces top_k addends per token in a device-specific
+  // deterministic order (k-ascending gather) vs the CPU's r-ascending walk
+  // -> tolerant comparison (more addends with larger top_k -> more ordering
+  // sensitivity, still well within 1e-5).
   check_float("mxfp4_moe_scatter_reduce", out_c.data(), out_g.data(),
               (size_t)M * hidden, 1e-5);
   check_float("mxfp4_moe_scatter_reduce_q", out_q_c.data(), out_q_g.data(),

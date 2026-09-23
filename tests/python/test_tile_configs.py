@@ -26,9 +26,7 @@ import json
 import pytest
 
 pytest.importorskip("torch")
-import torch
 
-from vkernels.torch_ops import tile_configs
 from vkernels.torch_ops.tile_configs import (
     TileConfigError,
     build_tile_manifest,

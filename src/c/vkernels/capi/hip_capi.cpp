@@ -420,6 +420,17 @@ extern "C" int vk_hip_mhc_pre_gemm_sqrsum_stream(int num_tokens, int hc_mult3,
   return (int)hipGetLastError();
 }
 
+// Issue #147: explicit nslice control (1 = bitwise-oracle strict chain;
+// else the blocked ladder, rounded up to the next power of two).
+extern "C" int vk_hip_mhc_pre_gemm_sqrsum_blocked_stream(
+    int num_tokens, int hc_mult3, int hc_hidden_size, const void* x,
+    const void* fn, void* out, void* sqrsum, int nslice, void* stream) {
+  vkernels::kernels::hip::mhc_pre_gemm_sqrsum(num_tokens, hc_mult3,
+                                              hc_hidden_size, x, fn, out,
+                                              sqrsum, stream, nslice);
+  return (int)hipGetLastError();
+}
+
 extern "C" int vk_hip_mhc_post_stream(int num_tokens, int hc, int hidden,
                                       const void* a, const void* b,
                                       const void* c, const void* d, void* out,

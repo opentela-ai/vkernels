@@ -41,7 +41,6 @@ from pathlib import Path
 from .tuning_manifest import (
     ManifestError,
     SCHEMA,
-    collect_environment,
     default_quality_gates,
     fingerprint_files,
     load_manifest,

@@ -71,6 +71,49 @@ void gemm_bf16(std::size_t M, std::size_t N, std::size_t K, float alpha,
                const uint16_t* A, const uint16_t* B, float beta,
                uint16_t* C);
 
+// Block-FP8 decode GEMM entry point (gfx942, issue #156). Offline-autotuner
+// / harness hook (like gemm_bf16_with_config, not routed from gemm_bf16):
+//
+//   C[M, N] = alpha * A[M, K] @ dequant(W8, scales)^T ... (B-layout [K, N])
+//
+// with A bf16 [M, K], C bf16 [M, N], and the WEIGHTS stored as block-FP8
+// (half the bytes of the bf16 B stream -> 2x bandwidth ceiling):
+//   W8     : uint8 [K, N], E4M3FNUZ codes (MI300A-native fnuz encoding,
+//            the glm_moe kernels' format; NOT OCP E4M3FN),
+//   scales : float32 [ceil(K/128), ceil(N/8)], one scale per
+//            (128-row K x 8-col N) block, row-major;
+//   dequant(W8, scales)[k][n] = fp8(W8[k*N+n]) * scales[(k/128)][n/8].
+// fp8(...) is the branchless fnuz -> fp32 bit decode (glm_moe.hip pattern:
+// reinterpret the 7-bit payload as fp32 exponent/mantissa bits, which is
+// fnuz_value * 2^-119 uniformly; the 2^119 folds into the scale). The
+// dequantization is fused into the split-K sB staging, then the MFMA body,
+// split-K grid, fp32 partial planes and fixed-order combine are identical
+// to the bf16 split-K path (alpha/beta applied once in the combine).
+// Requires N % 8 == 0 && K % 8 == 0 and a compiled tile (bm, bn) in
+// {(16,16), (16,64), (32,64), (64,64)}; otherwise prints to stderr and
+// leaves C untouched. S is the split count, clamped to [1, ceil(K/64)].
+void gemm_fp8_block_splitk_with_config(
+    std::size_t M, std::size_t N, std::size_t K, float alpha,
+    const uint16_t* A, const uint8_t* W8, const float* scales,
+    float beta, uint16_t* C, int bm, int bn, int S);
+
+// Decode-GEMV split-K entries (issue #156): tiny-M (M <= 8) kernel with NO
+// weight LDS staging and NO per-tile barriers -- each thread owns `tb`
+// consecutive N columns (8 or 4; one uint4/uint2 of B per K row), walks the
+// split's K range with fp32 FMAs, and S splits at element granularity feed
+// the same fixed-order combine as the MFMA split-K path. `threads` = block
+// size (64/128/256). Returns false (C untouched) when N % 8 != 0 or M not
+// in [1, 8] -- callers fall back to gemm_bf16_splitk_with_config.
+bool gemv_decode_bf16_splitk(std::size_t M, std::size_t N, std::size_t K,
+                             float alpha, const uint16_t* A,
+                             const uint16_t* B, float beta, uint16_t* C,
+                             int S, int tb, int threads);
+bool gemv_decode_fp8_splitk(std::size_t M, std::size_t N, std::size_t K,
+                            float alpha, const uint16_t* A,
+                            const uint8_t* W8, const float* scales,
+                            float beta, uint16_t* C, int S, int tb,
+                            int threads);
+
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP
 

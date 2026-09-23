@@ -1,0 +1,268 @@
+=== node: nid002522 === date: Wed Sep 23 07:04:08 PM CEST 2026
+=== correctness gate (AFTER, auto-split ON = default) ===
+/var/spool/slurmd/job649392/slurm_script: line 11: ./test_dsa_correct: No such file or directory
+=== correctness gate (AFTER, VK_DSA_DECODE_SPLIT=0: plain path) ===
+/var/spool/slurmd/job649392/slurm_script: line 13: ./test_dsa_correct: No such file or directory
+=== correctness gate (AFTER, reps=3 nondeterminism probe) ===
+/var/spool/slurmd/job649392/slurm_script: line 15: ./test_dsa_correct: No such file or directory
+=== A/B batched probe: [1] baseline binary ===
+=== vk155 batched dsa probe === GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+VK_DSA_DECODE_SPLIT=(unset)
+DVFS warmup (~15 s of launches)...
+  dsa_sparse_fwd S_q=1 S_kv=256 H=64 dim=256 tail=0 topk=256:
+    batch 0: 295.38 us/launch
+    batch 1: 295.45 us/launch
+    batch 2: 295.44 us/launch
+    batch 3: 295.41 us/launch   out-bitsum=531215618
+    (ref) dsa_sparse_fwd_split split=16:
+    batch 0: 35.18 us/launch
+    batch 1: 35.17 us/launch
+    batch 2: 35.21 us/launch
+    batch 3: 35.19 us/launch   out-bitsum=531215617
+  dsa_sparse_fwd S_q=1 S_kv=256 H=64 dim=256 tail=0 topk=128:
+    batch 0: 149.38 us/launch
+    batch 1: 149.41 us/launch
+    batch 2: 149.44 us/launch
+    batch 3: 149.46 us/launch   out-bitsum=538227689
+    (ref) dsa_sparse_fwd_split split=16:
+    batch 0: 30.68 us/launch
+    batch 1: 30.68 us/launch
+    batch 2: 30.70 us/launch
+    batch 3: 30.71 us/launch   out-bitsum=538227691
+  dsa_sparse_fwd S_q=1 S_kv=2048 H=64 dim=256 tail=0 topk=2048:
+    batch 0: 2341.55 us/launch
+    batch 1: 2341.39 us/launch
+    batch 2: 2341.48 us/launch
+    batch 3: 2341.84 us/launch   out-bitsum=526300104
+    (ref) dsa_sparse_fwd_split split=32:
+    batch 0: 91.84 us/launch
+    batch 1: 91.85 us/launch
+    batch 2: 91.86 us/launch
+    batch 3: 91.88 us/launch   out-bitsum=526300105
+  dsa_sparse_fwd S_q=1 S_kv=256 H=16 dim=576 tail=64 topk=256:
+    batch 0: 537.51 us/launch
+    batch 1: 537.56 us/launch
+    batch 2: 537.77 us/launch
+    batch 3: 537.79 us/launch   out-bitsum=260299025
+    (ref) dsa_sparse_fwd_split split=16:
+    batch 0: 80.29 us/launch
+    batch 1: 80.34 us/launch
+    batch 2: 80.35 us/launch
+    batch 3: 80.35 us/launch   out-bitsum=260299025
+  dsa_sparse_fwd S_q=64 S_kv=256 H=64 dim=256 tail=0 topk=128:
+    batch 0: 141.22 us/launch
+    batch 1: 140.67 us/launch
+    batch 2: 140.82 us/launch
+    batch 3: 141.14 us/launch   out-bitsum=33910152348
+  dsa_sparse_fwd S_q=8192 S_kv=4096 H=1 dim=256 tail=0 topk=128:
+    batch 0: 266.02 us/launch
+    batch 1: 266.08 us/launch
+    batch 2: 266.28 us/launch
+    batch 3: 266.36 us/launch   out-bitsum=67625996934
+=== vk155 done ===
+=== A/B batched probe: [2] new binary, VK_DSA_DECODE_SPLIT=0 (gate off) ===
+=== vk155 batched dsa probe === GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+VK_DSA_DECODE_SPLIT=0
+DVFS warmup (~15 s of launches)...
+  dsa_sparse_fwd S_q=1 S_kv=256 H=64 dim=256 tail=0 topk=256:
+    batch 0: 295.24 us/launch
+    batch 1: 295.33 us/launch
+    batch 2: 295.30 us/launch
+    batch 3: 295.24 us/launch   out-bitsum=531215618
+    (ref) dsa_sparse_fwd_split split=16:
+    batch 0: 35.25 us/launch
+    batch 1: 35.26 us/launch
+    batch 2: 35.25 us/launch
+    batch 3: 35.25 us/launch   out-bitsum=531215617
+  dsa_sparse_fwd S_q=1 S_kv=256 H=64 dim=256 tail=0 topk=128:
+    batch 0: 149.38 us/launch
+    batch 1: 149.39 us/launch
+    batch 2: 149.40 us/launch
+    batch 3: 149.40 us/launch   out-bitsum=538227689
+    (ref) dsa_sparse_fwd_split split=16:
+    batch 0: 30.64 us/launch
+    batch 1: 30.65 us/launch
+    batch 2: 30.67 us/launch
+    batch 3: 30.68 us/launch   out-bitsum=538227691
+  dsa_sparse_fwd S_q=1 S_kv=2048 H=64 dim=256 tail=0 topk=2048:
+    batch 0: 2340.59 us/launch
+    batch 1: 2340.50 us/launch
+    batch 2: 2340.91 us/launch
+    batch 3: 2341.06 us/launch   out-bitsum=526300104
+    (ref) dsa_sparse_fwd_split split=32:
+    batch 0: 91.94 us/launch
+    batch 1: 91.95 us/launch
+    batch 2: 91.97 us/launch
+    batch 3: 91.95 us/launch   out-bitsum=526300105
+  dsa_sparse_fwd S_q=1 S_kv=256 H=16 dim=576 tail=64 topk=256:
+    batch 0: 537.22 us/launch
+    batch 1: 537.33 us/launch
+    batch 2: 537.35 us/launch
+    batch 3: 537.32 us/launch   out-bitsum=260299025
+    (ref) dsa_sparse_fwd_split split=16:
+    batch 0: 80.03 us/launch
+    batch 1: 80.06 us/launch
+    batch 2: 80.12 us/launch
+    batch 3: 80.10 us/launch   out-bitsum=260299025
+  dsa_sparse_fwd S_q=64 S_kv=256 H=64 dim=256 tail=0 topk=128:
+    batch 0: 141.48 us/launch
+    batch 1: 140.75 us/launch
+    batch 2: 140.88 us/launch
+    batch 3: 141.25 us/launch   out-bitsum=33910152348
+  dsa_sparse_fwd S_q=8192 S_kv=4096 H=1 dim=256 tail=0 topk=128:
+    batch 0: 265.62 us/launch
+    batch 1: 265.23 us/launch
+    batch 2: 265.44 us/launch
+    batch 3: 265.60 us/launch   out-bitsum=67625996934
+=== vk155 done ===
+=== A/B batched probe: [3] new binary, VK_DSA_DECODE_SPLIT=1 (auto split) ===
+=== vk155 batched dsa probe === GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+VK_DSA_DECODE_SPLIT=1
+DVFS warmup (~15 s of launches)...
+  dsa_sparse_fwd S_q=1 S_kv=256 H=64 dim=256 tail=0 topk=256:
+    batch 0: 33.51 us/launch
+    batch 1: 33.56 us/launch
+    batch 2: 33.57 us/launch
+    batch 3: 33.59 us/launch   out-bitsum=531215618
+    (ref) dsa_sparse_fwd_split split=16:
+    batch 0: 34.87 us/launch
+    batch 1: 34.84 us/launch
+    batch 2: 34.87 us/launch
+    batch 3: 34.87 us/launch   out-bitsum=531215617
+  dsa_sparse_fwd S_q=1 S_kv=256 H=64 dim=256 tail=0 topk=128:
+    batch 0: 25.07 us/launch
+    batch 1: 25.07 us/launch
+    batch 2: 25.10 us/launch
+    batch 3: 25.10 us/launch   out-bitsum=538227690
+    (ref) dsa_sparse_fwd_split split=16:
+    batch 0: 30.38 us/launch
+    batch 1: 30.38 us/launch
+    batch 2: 30.42 us/launch
+    batch 3: 30.42 us/launch   out-bitsum=538227691
+  dsa_sparse_fwd S_q=1 S_kv=2048 H=64 dim=256 tail=0 topk=2048:
+    batch 0: 85.16 us/launch
+    batch 1: 85.17 us/launch
+    batch 2: 85.20 us/launch
+    batch 3: 85.21 us/launch   out-bitsum=526300105
+    (ref) dsa_sparse_fwd_split split=32:
+    batch 0: 85.24 us/launch
+    batch 1: 85.25 us/launch
+    batch 2: 85.26 us/launch
+    batch 3: 85.27 us/launch   out-bitsum=526300105
+  dsa_sparse_fwd S_q=1 S_kv=256 H=16 dim=576 tail=64 topk=256:
+    batch 0: 80.12 us/launch
+    batch 1: 80.15 us/launch
+    batch 2: 80.14 us/launch
+    batch 3: 80.14 us/launch   out-bitsum=260299025
+    (ref) dsa_sparse_fwd_split split=16:
+    batch 0: 80.25 us/launch
+    batch 1: 80.26 us/launch
+    batch 2: 80.28 us/launch
+    batch 3: 80.28 us/launch   out-bitsum=260299025
+  dsa_sparse_fwd S_q=64 S_kv=256 H=64 dim=256 tail=0 topk=128:
+    batch 0: 142.06 us/launch
+    batch 1: 140.82 us/launch
+    batch 2: 141.23 us/launch
+    batch 3: 141.38 us/launch   out-bitsum=33910152348
+  dsa_sparse_fwd S_q=8192 S_kv=4096 H=1 dim=256 tail=0 topk=128:
+    batch 0: 266.82 us/launch
+    batch 1: 266.51 us/launch
+    batch 2: 266.56 us/launch
+    batch 3: 266.68 us/launch   out-bitsum=67625996934
+=== vk155 done ===
+=== sclk trace ===
+GPU[0]		: sclk clock level: 1: (1768Mhz)
+GPU[0]		: sclk clock level: 1: (1784Mhz)
+/var/spool/slurmd/job649392/slurm_script: line 26: 12013 Terminated              ( for i in $(seq 1 600);
+do
+    rocm-smi --showclocks | grep sclk | head -1; sleep 2;
+done ) > ab-sclk.log
+GPU[0]		: sclk clock level: 1: (2100Mhz)
+GPU[0]		: sclk clock level: 1: (1812Mhz)
+=== done Wed Sep 23 07:05:05 PM CEST 2026 ===
+
+===== correctness gates (test-649402) =====
+=== node: nid002664 === date: Wed Sep 23 07:07:43 PM CEST 2026
+=== correctness gate (AFTER, auto-split ON = default) ===
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+=== correctness gate (AFTER, VK_DSA_DECODE_SPLIT=0: plain path) ===
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+=== correctness gate (AFTER, reps=3 nondeterminism probe, default) ===
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+########## rep=2 ##########
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+=== done Wed Sep 23 07:07:52 PM CEST 2026 ===
+
+===== sclk trace (ab-sclk.log) =====
+GPU[0]		: sclk clock level: S: (95Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2107Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2107Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2105Mhz)
+GPU[0]		: sclk clock level: 1: (2108Mhz)
+GPU[0]		: sclk clock level: 1: (1768Mhz)
+GPU[0]		: sclk clock level: 1: (2107Mhz)
+GPU[0]		: sclk clock level: 1: (2107Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2107Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2106Mhz)
+GPU[0]		: sclk clock level: 1: (2108Mhz)
+GPU[0]		: sclk clock level: 1: (1784Mhz)
+GPU[0]		: sclk clock level: 1: (2100Mhz)
+GPU[0]		: sclk clock level: 1: (1812Mhz)

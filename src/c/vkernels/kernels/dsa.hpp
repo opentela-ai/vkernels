@@ -367,6 +367,18 @@ namespace vkernels::kernels::hip {
 // internal synchronisation (graph-capture safe); nullptr = legacy default
 // stream. These launchers never internally sync either way (the kernels
 // are single-launch); ordering is the caller's.
+//
+// Issue #155: in the DECODE regime (dsa_sparse_fwd_split_for > 1 -- the
+// plain grid under-fills the CUs; the recommendation's prefill early-out
+// keeps long-S_q shapes on the plain path) this entry automatically engages
+// the split+combine machinery below (block-per-KV-chunk partials + log2-
+// domain combine) with an internally managed scratch, removing the
+// per-token serial-chain latency wall (397 -> ~40 us at serving topk=256).
+// The result stays bf16-tolerant vs dsa_sparse_fwd_cpu (the merge is exact
+// in the log2 domain; test_dsa_correct.hip). VK_DSA_DECODE_SPLIT=0 restores
+// the pre-#155 serial decode dispatch; dsa_sparse_fwd_with_tile (the
+// autotuner hook) and dsa_sparse_fwd_split's split_kv == 1 delegation are
+// unaffected (always plain).
 void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
                     int topk, int kv_group, int block_I, int inner_iter,
                     float sm_scale, bool return_lse,

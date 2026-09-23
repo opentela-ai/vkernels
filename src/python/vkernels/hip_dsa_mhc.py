@@ -440,6 +440,7 @@ def mhc_pre_gemm_sqrsum(
     out: Optional[torch.Tensor] = None,
     sqrsum: Optional[torch.Tensor] = None,
     stream=None,
+    nslice: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``out = x @ fn.T`` (fp32) + per-token ``sum(x^2)`` (device).
 
@@ -447,6 +448,12 @@ def mhc_pre_gemm_sqrsum(
     * ``fn``     fp32 ``[hc_mult3, hc_hidden_size]`` (hc_mult3 <= 32)
     * ``out``    fp32 ``[num_tokens, hc_mult3]``
     * ``sqrsum`` fp32 ``[num_tokens]``
+    * ``nslice`` blocked-accumulation slice count (issue #147). Default 32
+      -- the measured-fastest admissible point under the #141 fp64 gate
+      (30.8 us vs 816 us for the retired strict-chain default at decode
+      n=1, hc_hidden=16384). ``nslice=1`` selects the bitwise-oracle strict
+      chain; other values are rounded up to the next power of two (1..256).
+      Env ``VK_MHC_PRE_STRICT=1`` pins the strict chain regardless.
 
     The RMS rescale ``rsqrt(sqrsum/(hc_mult*hidden) + eps)`` stays with the
     caller (floe applies it in torch, exactly like the CPU path).
@@ -460,6 +467,7 @@ def mhc_pre_gemm_sqrsum(
         raise ValueError(f"fn width {fn.shape[1]} != x width {hc_hidden}")
     if hc_mult3 > 32:
         raise ValueError(f"hc_mult3 {hc_mult3} > 32 (kernel limit)")
+    nslice = int(nslice)
     x = _contig(x, "x", torch.bfloat16)
     fn = _contig(fn, "fn", torch.float32)
     if out is None:
@@ -470,8 +478,24 @@ def mhc_pre_gemm_sqrsum(
         sqrsum = torch.empty(n, dtype=torch.float32, device=x.device)
     else:
         _contig(sqrsum, "sqrsum", torch.float32)
+    # Prefer the explicit-nslice entry (issue #147); the legacy _stream
+    # fallback only exists on pre-#147 libraries, where the served default
+    # was the strict chain -- so only route nslice=1 through it.
+    fsb = _sym(lib, "vk_hip_mhc_pre_gemm_sqrsum_blocked_stream")
+    if fsb is not None:
+        fsb.restype = _INT
+        fsb.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
+                        _INT, _VOIDP]
+        with _device_guard(x):
+            rc = fsb(int(n), int(hc_mult3), int(hc_hidden), _dptr(x),
+                     _dptr(fn), _dptr(out), _dptr(sqrsum), nslice,
+                     _stream_ptr(stream))
+        if rc != 0:
+            raise RuntimeError(
+                f"vk_hip_mhc_pre_gemm_sqrsum_blocked failed: rc={rc}")
+        return out, sqrsum
     fs = _sym(lib, "vk_hip_mhc_pre_gemm_sqrsum_stream")
-    if fs is not None:
+    if fs is not None and nslice == 1:
         fs.restype = _INT
         fs.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
         with _device_guard(x):
@@ -480,10 +504,16 @@ def mhc_pre_gemm_sqrsum(
                     _stream_ptr(stream))
         if rc != 0:
             raise RuntimeError(f"vk_hip_mhc_pre_gemm_sqrsum failed: rc={rc}")
-    else:
-        f = lib.vk_hip_mhc_pre_gemm_sqrsum
-        f.restype = None
-        f.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
+        return out, sqrsum
+    if nslice != 1:
+        raise RuntimeError(
+            "nslice != 1 requires libvkernels_hip with "
+            "vk_hip_mhc_pre_gemm_sqrsum_blocked_stream (issue #147); "
+            "this library's non-suffixed entry serves the strict chain")
+    f = lib.vk_hip_mhc_pre_gemm_sqrsum
+    f.restype = None
+    f.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
+    with _device_guard(x):
         f(int(n), int(hc_mult3), int(hc_hidden), _dptr(x), _dptr(fn),
           _dptr(out), _dptr(sqrsum))
     return out, sqrsum

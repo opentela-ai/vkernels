@@ -122,6 +122,13 @@ int main() {
       {1, 1, 64},    // decode, short
       {1, 16, 64},   // decode, multi-head
       {1, 1, 8192},  // prefill (single head; H=128 × 8192 is too slow for CPU)
+      // Fused-head prefill (issue #151): exercises the head-group batching
+      // (H=8 → 4 groups of 2 on the wide path; H=128 → 64 groups of 2),
+      // the wide-rank float4 pipeline at kv=512, and partial last query
+      // tiles.
+      {1, 8, 512},
+      {1, 16, 512},
+      {1, 128, 64},
   };
 
   for (const auto& c : cfgs) {
@@ -157,6 +164,12 @@ int main() {
       {1, 1, 8, 2048, 2047, 0},  // multi-row decode
       {1, 1, 1, 64, 32, 0},      // query offset: masked keys in the last split
       {1, 1, 1, 64, 50, 100},    // every key masked: combine zero-row branch
+      // Chunked / short prefill via the BQ=4 split variant (issue #151):
+      // causal boundaries inside split slices, partial last query tiles
+      // (S_q=9 with BQ=4), and masked keys in the FIRST split slices.
+      {1, 1, 64, 8192, 63, 0},   // the target chunked-prefill shape (K3 KV)
+      {1, 2, 9, 512, 8, 0},      // partial last query tile + multi-head
+      {1, 1, 64, 4096, 100, 64}, // masked keys in the first split slices
   };
   for (const auto& c : scfgs) {
     std::vector<float> q((size_t)c.B * c.H * c.S_q * Dq);

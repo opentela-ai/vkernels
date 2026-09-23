@@ -1,0 +1,192 @@
+=== issue #156 batched probe (phase=gemv) ===
+GPU: AMD Instinct MI300A (gfx942:sramecc+:xnack-)
+ -- shape N=6288 K=7168 M=5 --
+ -- shape N=3584 K=7168 M=5 --
+ -- shape N=896 K=7168 M=5 --
+ -- gemv-bf16 shape N=6288 K=7168 M=5 --
+  gemv-bf16 S=32 tb=4 th=64 N=6288           batches: 60.5 60.6 60.6 61.2  | med 60.62 us  sum=325.65279
+      -> 1489 GB/s (bytes model 90.3 MB)
+      -> cpu max_rel=0.00769 PASS
+  gemv-bf16 S=64 tb=4 th=64 N=6288           batches: 61.0 61.1 61.2 61.5  | med 61.17 us  sum=325.64946
+      -> 1476 GB/s (bytes model 90.3 MB)
+      -> cpu max_rel=0.00769 PASS
+  gemv-bf16 S=96 tb=4 th=64 N=6288           batches: 70.1 70.1 70.2 70.4  | med 70.18 us  sum=325.65819
+      -> 1286 GB/s (bytes model 90.3 MB)
+      -> cpu max_rel=0.00769 PASS
+  gemv-bf16 S=64 tb=4 th=128 N=6288          batches: 56.9 56.9 56.9 57.0  | med 56.94 us  sum=325.64946
+      -> 1585 GB/s (bytes model 90.3 MB)
+      -> cpu max_rel=0.00769 PASS
+  gemv-bf16 S=96 tb=4 th=128 N=6288          batches: 67.4 67.4 67.4 67.5  | med 67.42 us  sum=325.65819
+      -> 1339 GB/s (bytes model 90.3 MB)
+      -> cpu max_rel=0.00769 PASS
+  gemv-bf16 S=64 tb=4 th=256 N=6288          batches: 54.7 54.8 54.8 54.9  | med 54.76 us  sum=325.64946
+      -> 1649 GB/s (bytes model 90.3 MB)
+      -> cpu max_rel=0.00769 PASS
+  gemv-bf16 S=32 tb=4 th=256 N=6288          batches: 53.4 53.4 53.5 53.5  | med 53.49 us  sum=325.65279
+      -> 1688 GB/s (bytes model 90.3 MB)
+      -> cpu max_rel=0.00769 PASS
+  gemv-bf16 S=64 tb=8 th=64 N=6288           batches: 65.6 65.6 65.7 66.0  | med 65.69 us  sum=325.64946
+      -> 1374 GB/s (bytes model 90.3 MB)
+      -> cpu max_rel=0.00769 PASS
+  gemv-bf16 S=64 tb=8 th=128 N=6288          batches: 62.8 62.8 62.9 63.4  | med 62.86 us  sum=325.64946
+      -> 1436 GB/s (bytes model 90.3 MB)
+      -> cpu max_rel=0.00769 PASS
+  gemv-bf16 S=128 tb=4 th=128 N=6288         batches: 78.6 78.7 78.7 78.9  | med 78.70 us  sum=325.64445
+      -> 1147 GB/s (bytes model 90.3 MB)
+      -> cpu max_rel=0.00769 PASS
+ -- gemv-fp8 shape N=6288 K=7168 M=5 --
+  gemv-fp8 S=32 tb=4 th=64 N=6288            batches: 82.3 82.3 82.4 82.4  | med 82.36 us  sum=272.09359
+      -> 551 GB/s (bytes model 45.4 MB)
+      -> cpu max_rel=0.0068 PASS
+  gemv-fp8 S=64 tb=4 th=64 N=6288            batches: 79.0 79.1 79.1 79.1  | med 79.11 us  sum=272.03551
+      -> 574 GB/s (bytes model 45.4 MB)
+      -> cpu max_rel=0.00752 PASS
+  gemv-fp8 S=96 tb=4 th=64 N=6288            batches: 80.5 80.6 80.7 80.8  | med 80.74 us  sum=272.0668
+      -> 562 GB/s (bytes model 45.4 MB)
+      -> cpu max_rel=0.00752 PASS
+  gemv-fp8 S=64 tb=4 th=128 N=6288           batches: 68.6 68.7 68.8 68.9  | med 68.78 us  sum=272.03551
+      -> 660 GB/s (bytes model 45.4 MB)
+      -> cpu max_rel=0.00752 PASS
+  gemv-fp8 S=96 tb=4 th=128 N=6288           batches: 76.0 76.3 76.6 76.6  | med 76.57 us  sum=272.0668
+      -> 593 GB/s (bytes model 45.4 MB)
+      -> cpu max_rel=0.00752 PASS
+  gemv-fp8 S=64 tb=4 th=256 N=6288           batches: 61.8 61.9 61.9 61.9  | med 61.86 us  sum=272.03551
+      -> 734 GB/s (bytes model 45.4 MB)
+      -> cpu max_rel=0.00752 PASS
+  gemv-fp8 S=32 tb=4 th=256 N=6288           batches: 62.6 62.6 62.7 62.7  | med 62.67 us  sum=272.09359
+      -> 724 GB/s (bytes model 45.4 MB)
+      -> cpu max_rel=0.0068 PASS
+  gemv-fp8 S=64 tb=8 th=64 N=6288            batches: 74.7 74.7 74.8 74.8  | med 74.77 us  sum=272.03551
+      -> 607 GB/s (bytes model 45.4 MB)
+      -> cpu max_rel=0.00752 PASS
+  gemv-fp8 S=64 tb=8 th=128 N=6288           batches: 73.8 73.9 73.9 73.9  | med 73.86 us  sum=272.03551
+      -> 614 GB/s (bytes model 45.4 MB)
+      -> cpu max_rel=0.00752 PASS
+  gemv-fp8 S=128 tb=4 th=128 N=6288          batches: 87.3 87.5 87.7 87.9  | med 87.73 us  sum=272.09405
+      -> 517 GB/s (bytes model 45.4 MB)
+      -> cpu max_rel=0.0068 PASS
+ -- gemv-bf16 shape N=3584 K=7168 M=5 --
+  gemv-bf16 S=32 tb=4 th=64 N=3584           batches: 48.5 48.5 48.5 48.6  | med 48.48 us  sum=899.5838
+      -> 1062 GB/s (bytes model 51.5 MB)
+      -> cpu max_rel=0.0073 PASS
+  gemv-bf16 S=64 tb=4 th=64 N=3584           batches: 41.4 41.4 41.4 41.4  | med 41.38 us  sum=899.55454
+      -> 1244 GB/s (bytes model 51.5 MB)
+      -> cpu max_rel=0.0073 PASS
+  gemv-bf16 S=96 tb=4 th=64 N=3584           batches: 47.9 48.0 48.0 48.0  | med 47.98 us  sum=899.53702
+      -> 1073 GB/s (bytes model 51.5 MB)
+      -> cpu max_rel=0.0073 PASS
+  gemv-bf16 S=64 tb=4 th=128 N=3584          batches: 40.7 40.7 40.7 40.8  | med 40.73 us  sum=899.55454
+      -> 1264 GB/s (bytes model 51.5 MB)
+      -> cpu max_rel=0.0073 PASS
+  gemv-bf16 S=96 tb=4 th=128 N=3584          batches: 47.2 47.2 47.3 47.5  | med 47.27 us  sum=899.53702
+      -> 1089 GB/s (bytes model 51.5 MB)
+      -> cpu max_rel=0.0073 PASS
+  gemv-bf16 S=64 tb=4 th=256 N=3584          batches: 42.8 42.8 42.8 43.0  | med 42.78 us  sum=899.55454
+      -> 1204 GB/s (bytes model 51.5 MB)
+      -> cpu max_rel=0.0073 PASS
+  gemv-bf16 S=32 tb=4 th=256 N=3584          batches: 45.9 45.9 45.9 45.9  | med 45.93 us  sum=899.5838
+      -> 1121 GB/s (bytes model 51.5 MB)
+      -> cpu max_rel=0.0073 PASS
+  gemv-bf16 S=64 tb=8 th=64 N=3584           batches: 43.9 43.9 43.9 43.9  | med 43.88 us  sum=899.55454
+      -> 1173 GB/s (bytes model 51.5 MB)
+      -> cpu max_rel=0.0073 PASS
+  gemv-bf16 S=64 tb=8 th=128 N=3584          batches: 51.4 51.4 51.4 51.4  | med 51.39 us  sum=899.55454
+      -> 1002 GB/s (bytes model 51.5 MB)
+      -> cpu max_rel=0.0073 PASS
+  gemv-bf16 S=128 tb=4 th=128 N=3584         batches: 55.5 55.5 55.6 55.6  | med 55.57 us  sum=899.59356
+      -> 926 GB/s (bytes model 51.5 MB)
+      -> cpu max_rel=0.0073 PASS
+ -- gemv-fp8 shape N=3584 K=7168 M=5 --
+  gemv-fp8 S=32 tb=4 th=64 N=3584            batches: 56.3 56.3 56.3 56.3  | med 56.33 us  sum=901.87267
+      -> 460 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00637 PASS
+  gemv-fp8 S=64 tb=4 th=64 N=3584            batches: 52.2 52.2 52.2 52.2  | med 52.20 us  sum=901.84337
+      -> 496 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+  gemv-fp8 S=96 tb=4 th=64 N=3584            batches: 57.3 57.3 57.3 57.4  | med 57.35 us  sum=901.87462
+      -> 452 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+  gemv-fp8 S=64 tb=4 th=128 N=3584           batches: 51.7 51.7 51.8 51.8  | med 51.75 us  sum=901.84337
+      -> 500 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+  gemv-fp8 S=96 tb=4 th=128 N=3584           batches: 52.0 52.0 52.0 52.0  | med 52.01 us  sum=901.87462
+      -> 498 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+  gemv-fp8 S=64 tb=4 th=256 N=3584           batches: 53.6 53.6 53.6 53.6  | med 53.60 us  sum=901.84337
+      -> 483 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+  gemv-fp8 S=32 tb=4 th=256 N=3584           batches: 54.7 54.7 54.8 54.8  | med 54.75 us  sum=901.87267
+      -> 473 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00637 PASS
+  gemv-fp8 S=64 tb=8 th=64 N=3584            batches: 51.8 51.8 51.8 51.8  | med 51.80 us  sum=901.84337
+      -> 500 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+  gemv-fp8 S=64 tb=8 th=128 N=3584           batches: 69.2 69.2 69.2 69.2  | med 69.20 us  sum=901.84337
+      -> 374 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+  gemv-fp8 S=128 tb=4 th=128 N=3584          batches: 60.3 60.4 60.4 60.5  | med 60.40 us  sum=901.83751
+      -> 429 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+ -- gemv-bf16 shape N=896 K=7168 M=5 --
+  gemv-bf16 S=32 tb=4 th=64 N=896            batches: 38.4 38.4 38.4 38.6  | med 38.41 us  sum=381.52185
+      -> 337 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  gemv-bf16 S=64 tb=4 th=64 N=896            batches: 32.7 32.7 32.7 32.7  | med 32.67 us  sum=381.52185
+      -> 396 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  gemv-bf16 S=96 tb=4 th=64 N=896            batches: 37.7 37.7 37.7 37.7  | med 37.73 us  sum=381.52185
+      -> 343 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  gemv-bf16 S=64 tb=4 th=128 N=896           batches: 31.8 31.8 31.8 31.8  | med 31.79 us  sum=381.52185
+      -> 407 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  gemv-bf16 S=96 tb=4 th=128 N=896           batches: 36.3 36.3 36.3 36.3  | med 36.29 us  sum=381.52185
+      -> 356 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  gemv-bf16 S=64 tb=4 th=256 N=896           batches: 32.3 32.3 32.3 32.3  | med 32.27 us  sum=381.52185
+      -> 401 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  gemv-bf16 S=32 tb=4 th=256 N=896           batches: 37.1 37.2 37.2 37.2  | med 37.16 us  sum=381.52185
+      -> 348 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  gemv-bf16 S=64 tb=8 th=64 N=896            batches: 37.9 37.9 37.9 37.9  | med 37.89 us  sum=381.52185
+      -> 341 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  gemv-bf16 S=64 tb=8 th=128 N=896           batches: 38.0 38.0 38.0 38.0  | med 37.99 us  sum=381.52185
+      -> 340 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  gemv-bf16 S=128 tb=4 th=128 N=896          batches: 43.0 43.0 43.0 43.1  | med 43.04 us  sum=381.51794
+      -> 300 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+ -- gemv-fp8 shape N=896 K=7168 M=5 --
+  gemv-fp8 S=32 tb=4 th=64 N=896             batches: 54.4 54.5 54.5 54.5  | med 54.46 us  sum=392.41809
+      -> 120 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  gemv-fp8 S=64 tb=4 th=64 N=896             batches: 40.9 40.9 41.0 41.0  | med 40.95 us  sum=392.41809
+      -> 159 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  gemv-fp8 S=96 tb=4 th=64 N=896             batches: 41.6 41.6 41.6 41.6  | med 41.60 us  sum=392.41809
+      -> 157 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  gemv-fp8 S=64 tb=4 th=128 N=896            batches: 40.0 40.0 40.0 40.0  | med 39.99 us  sum=392.41809
+      -> 163 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  gemv-fp8 S=96 tb=4 th=128 N=896            batches: 40.9 40.9 40.9 40.9  | med 40.91 us  sum=392.41809
+      -> 160 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  gemv-fp8 S=64 tb=4 th=256 N=896            batches: 40.7 40.7 40.7 40.7  | med 40.69 us  sum=392.41809
+      -> 160 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  gemv-fp8 S=32 tb=4 th=256 N=896            batches: 53.7 53.7 53.7 53.7  | med 53.68 us  sum=392.41809
+      -> 122 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  gemv-fp8 S=64 tb=8 th=64 N=896             batches: 49.8 49.8 49.8 49.8  | med 49.81 us  sum=392.41809
+      -> 131 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  gemv-fp8 S=64 tb=8 th=128 N=896            batches: 50.0 50.0 50.0 50.0  | med 50.04 us  sum=392.41809
+      -> 130 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  gemv-fp8 S=128 tb=4 th=128 N=896           batches: 48.6 48.6 48.6 48.6  | med 48.61 us  sum=392.41809
+      -> 134 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+=== probe done ===

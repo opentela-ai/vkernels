@@ -28,6 +28,7 @@
 #include "vkernels/comm/cross_node_kv.hpp"
 #include "vkernels/comm/slot_map.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -70,6 +71,200 @@ CrossNodeKvRoute select_cross_node_kv_route(
       all_gather ? access.collective_graph_supported
                  : is_import_graph_capturable(route.point_to_point_transport);
   return route;
+}
+
+// ---------------------------------------------------------------------------
+// Striped lanes (issue #152) -- deterministic chunk layout + plan plumbing
+// ---------------------------------------------------------------------------
+
+std::vector<CrossNodeKvStripeChunk> compute_cross_node_kv_stripes(
+    std::size_t total_bytes, const CrossNodeKvStripeConfig& config) {
+  VK_EXPECTS(config.lane_count > 0, "stripe lane_count must be positive");
+  VK_EXPECTS(config.min_chunk_bytes > 0, "stripe min_chunk_bytes must be positive");
+  std::vector<CrossNodeKvStripeChunk> chunks;
+  if (total_bytes == 0) return chunks;  // valid no-op layout
+  // Small transfer: a single lane pays less setup than lane_count QPs.
+  if (total_bytes < config.lane_count * config.min_chunk_bytes) {
+    chunks.push_back({0, total_bytes, 0});
+    return chunks;
+  }
+  // Contiguous near-equal split: lane l carries chunk l; the remainder
+  // total_bytes % lane_count is folded into the first chunks' lengths so
+  // the chunk list tiles [0, total_bytes) exactly, in order.
+  const std::size_t base = total_bytes / config.lane_count;
+  const std::size_t rem = total_bytes % config.lane_count;
+  chunks.reserve(config.lane_count);
+  std::size_t offset = 0;
+  for (std::size_t l = 0; l < config.lane_count; ++l) {
+    const std::size_t bytes = base + (l < rem ? 1u : 0u);
+    chunks.push_back({offset, bytes, l});
+    offset += bytes;
+  }
+  return chunks;
+}
+
+std::pair<std::vector<std::unique_ptr<ByteChannel>>,
+          std::vector<std::unique_ptr<ByteChannel>>>
+make_striped_byte_links(std::size_t lanes) {
+  VK_EXPECTS(lanes > 0, "striped links need at least one lane");
+  std::vector<std::unique_ptr<ByteChannel>> a_side, b_side;
+  a_side.reserve(lanes);
+  b_side.reserve(lanes);
+  for (std::size_t l = 0; l < lanes; ++l) {
+    auto link = make_byte_link();
+    a_side.push_back(std::move(link.first));
+    b_side.push_back(std::move(link.second));
+  }
+  return {std::move(a_side), std::move(b_side)};
+}
+
+CrossNodeKvStripedRestorePlan::CrossNodeKvStripedRestorePlan(
+    std::size_t num_slots, std::size_t num_kv_heads, std::size_t head_dim,
+    std::size_t elem_size, const int* slot_ids, std::size_t num_pages,
+    std::size_t page_size, const CrossNodeKvStripeConfig& stripe)
+    : stripe_(stripe),
+      num_slots_(num_slots),
+      num_kv_heads_(num_kv_heads),
+      head_dim_(head_dim),
+      elem_size_(elem_size),
+      page_size_(page_size),
+      num_pages_(num_pages),
+      total_bytes_(0) {
+  validate_kv_plan_shape(num_slots, num_kv_heads, head_dim, elem_size,
+                          num_pages, page_size);
+  if (num_pages_ == 0) return;  // valid no-op plan
+
+  VK_EXPECTS(slot_ids != nullptr, "slot_ids must be non-null");
+  const std::size_t total_tokens = checked_mul(
+      num_pages_, page_size_, "cross-node striped restore token count");
+  validate_unique_slots(slot_ids, total_tokens, num_slots_);
+  owned_slots_.assign(slot_ids, slot_ids + total_tokens);
+
+  const std::size_t page_layer_bytes = checked_mul(
+      page_size_, token_stride_bytes(num_kv_heads_, head_dim_, elem_size_),
+      "cross-node striped restore page bytes");
+  total_bytes_ = checked_mul(num_pages_, page_layer_bytes,
+                             "cross-node striped restore total bytes");
+  stripes_ = compute_cross_node_kv_stripes(total_bytes_, stripe_);
+}
+
+void CrossNodeKvStripedRestorePlan::execute(
+    void* k_dst, void* v_dst, std::size_t /*source_layer_offset_bytes*/,
+    Stream* stream, GraphCapture* graph,
+    const std::vector<ByteChannel*>& lanes) const {
+  VK_EXPECTS(k_dst != nullptr || num_pages_ == 0, "k_dst must be non-null");
+  VK_EXPECTS(v_dst != nullptr || num_pages_ == 0, "v_dst must be non-null");
+  if (num_pages_ == 0) return;  // valid no-op plan
+  VK_EXPECTS(lanes.size() >= stripe_.lane_count,
+             "striped restore needs one channel per configured lane");
+  // By-value lane pointer copy: submit() defers the task to the stream's
+  // worker thread, so the task must not reference caller-owned storage.
+  const std::vector<ByteChannel*> lane_ptrs = lanes;
+  const CrossNodeKvStripedRestorePlan* self = this;
+  auto run = [self, k_dst, v_dst, lane_ptrs] {
+    // Reassemble the contiguous layer region: chunk l arrives on lanes[l]
+    // (deterministic layout, no metadata); each recv is validated against
+    // the expected chunk size so a geometry mismatch cannot silently
+    // corrupt the scatter. The reassembled bytes are identical to the
+    // single-lane bounce payload, so kv_scatter produces the SAME result.
+    std::vector<std::uint8_t> buf(self->total_bytes_);
+    for (const CrossNodeKvStripeChunk& c : self->stripes_) {
+      std::vector<std::uint8_t> chunk = lane_ptrs[c.lane]->recv();
+      VK_EXPECTS(chunk.size() == c.bytes,
+                 "striped restore recv: lane chunk size mismatch");
+      std::memcpy(buf.data() + c.offset, chunk.data(), c.bytes);
+    }
+    kv_scatter(k_dst, v_dst, /*scratch=*/buf.data(),
+               self->owned_slots_.data(), self->num_pages_, self->page_size_,
+               self->num_kv_heads_, self->head_dim_, self->elem_size_,
+               /*stream=*/nullptr);
+  };
+  if (graph != nullptr && graph->in_capture()) {
+    // Eager-break (ties into #10), identical to the single-lane bounce
+    // path: the per-lane recvs are host progress, so exclude them from
+    // the captured segment (end, transfer, begin).
+    graph->end();
+    run();
+    graph->begin();
+    return;
+  }
+  if (stream != nullptr)
+    stream->submit(std::move(run));
+  else
+    run();
+}
+
+CrossNodeKvStripedDonatePlan::CrossNodeKvStripedDonatePlan(
+    std::size_t num_slots, std::size_t num_kv_heads, std::size_t head_dim,
+    std::size_t elem_size, const int* slot_ids, std::size_t num_pages,
+    std::size_t page_size, const CrossNodeKvStripeConfig& stripe)
+    : stripe_(stripe),
+      num_slots_(num_slots),
+      num_kv_heads_(num_kv_heads),
+      head_dim_(head_dim),
+      elem_size_(elem_size),
+      page_size_(page_size),
+      num_pages_(num_pages),
+      total_bytes_(0) {
+  validate_kv_plan_shape(num_slots, num_kv_heads, head_dim, elem_size,
+                          num_pages, page_size);
+  if (num_pages_ == 0) return;  // valid no-op plan
+
+  VK_EXPECTS(slot_ids != nullptr, "slot_ids must be non-null");
+  const std::size_t total_tokens = checked_mul(
+      num_pages_, page_size_, "cross-node striped donate token count");
+  validate_slot_bounds(slot_ids, total_tokens, num_slots_);
+  owned_slots_.assign(slot_ids, slot_ids + total_tokens);
+
+  const std::size_t page_layer_bytes = checked_mul(
+      page_size_, token_stride_bytes(num_kv_heads_, head_dim_, elem_size_),
+      "cross-node striped donate page bytes");
+  total_bytes_ = checked_mul(num_pages_, page_layer_bytes,
+                             "cross-node striped donate total bytes");
+  stripes_ = compute_cross_node_kv_stripes(total_bytes_, stripe_);
+}
+
+void CrossNodeKvStripedDonatePlan::execute(
+    const void* k_src, const void* v_src, FabricHandle* /*remote*/,
+    std::size_t /*destination_layer_offset_bytes*/, Stream* stream,
+    GraphCapture* graph, const std::vector<ByteChannel*>& lanes) const {
+  VK_EXPECTS(k_src != nullptr || num_pages_ == 0, "k_src must be non-null");
+  VK_EXPECTS(v_src != nullptr || num_pages_ == 0, "v_src must be non-null");
+  if (num_pages_ == 0) return;  // valid no-op plan
+  VK_EXPECTS(lanes.size() >= stripe_.lane_count,
+             "striped donate needs one channel per configured lane");
+  // By-value lane pointer copy: submit() defers the task to the stream's
+  // worker thread, so the task must not reference caller-owned storage.
+  const std::vector<ByteChannel*> lane_ptrs = lanes;
+  const CrossNodeKvStripedDonatePlan* self = this;
+  auto run = [self, k_src, v_src, lane_ptrs] {
+    // Gather once into the contiguous layer region (the SAME bytes as the
+    // single-lane bounce path, proved by the two-stage oracle), then ship
+    // one contiguous chunk per lane. Lane l carries chunk l; the far-side
+    // striped restore reassembles in the same deterministic order.
+    std::vector<std::uint8_t> scratch(self->total_bytes_);
+    kv_gather(scratch.data(), k_src, v_src, self->owned_slots_.data(),
+              self->num_pages_, self->page_size_, self->num_kv_heads_,
+              self->head_dim_, self->elem_size_, /*stream=*/nullptr);
+    for (const CrossNodeKvStripeChunk& c : self->stripes_) {
+      lane_ptrs[c.lane]->send(std::vector<std::uint8_t>(
+          scratch.begin() + static_cast<std::ptrdiff_t>(c.offset),
+          scratch.begin() +
+              static_cast<std::ptrdiff_t>(c.offset + c.bytes)));
+    }
+  };
+  if (graph != nullptr && graph->in_capture()) {
+    // Eager-break (ties into #10), identical to the single-lane bounce
+    // path: the gather + per-lane sends are host progress.
+    graph->end();
+    run();
+    graph->begin();
+    return;
+  }
+  if (stream != nullptr)
+    stream->submit(std::move(run));
+  else
+    run();
 }
 
 // ---------------------------------------------------------------------------

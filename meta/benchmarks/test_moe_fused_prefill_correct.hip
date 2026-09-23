@@ -70,10 +70,13 @@ uint16_t f2bf(float v) {
 }
 
 // Run one prefill correctness case. Returns true on PASS.
+// `gpu_block_m` is the alignment the GPU path consumes: 64 for the shipped
+// prefill tiles, 128 for the issue-#150 M-tile config (VK_MOE_PF_VARIANT=6;
+// the launcher falls back to the 64-row v5 path when the alignment is 64).
 bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E,
-             int activation) {
+             int activation, int gpu_block_m) {
   constexpr int CPU_BLOCK_M = 16;
-  constexpr int GPU_BLOCK_M = 64;
+  const int GPU_BLOCK_M = gpu_block_m;
   constexpr int group_size = 32;
   constexpr float LIMIT = 4.0f;
 
@@ -216,10 +219,21 @@ int main(int argc, char** argv) {
   std::printf("activation=%s\n", situ ? "situ" : "swiglu");
 
   // Clean prefill: 64 tokens/expert -> one full 64-row block, no padding.
-  bool ok1 = run_case("clean", 128, 512, 256, 2, 4, activation);
+  bool ok1 = run_case("clean64", 128, 512, 256, 2, 4, activation, 64);
   // Padded prefill: 40 tokens/expert -> 24 padding rows per expert.
-  bool ok2 = run_case("padded", 80, 512, 256, 2, 4, activation);
+  bool ok2 = run_case("padded64", 80, 512, 256, 2, 4, activation, 64);
 
-  std::printf("%s\n", (ok1 && ok2) ? "PASS" : "FAIL");
-  return (ok1 && ok2) ? 0 : 1;
+  // Issue #150: the 128-row M-tile config (VK_MOE_PF_VARIANT=6) plus its
+  // 64-row fall-back.  The padded case exercises 128-row alignment with
+  // heavy per-expert padding (40 real of 128 rows).
+  bool ok3 = true, ok4 = true;
+  const char* venv = std::getenv("VK_MOE_PF_VARIANT");
+  const int pf_variant = venv ? std::atoi(venv) : 5;
+  if (pf_variant == 6) {
+    ok3 = run_case("clean128", 128, 512, 256, 2, 4, activation, 128);
+    ok4 = run_case("padded128", 80, 512, 256, 2, 4, activation, 128);
+  }
+
+  std::printf("%s\n", (ok1 && ok2 && ok3 && ok4) ? "PASS" : "FAIL");
+  return (ok1 && ok2 && ok3 && ok4) ? 0 : 1;
 }

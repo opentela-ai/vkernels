@@ -148,7 +148,7 @@ std::string file_arch(const std::string& name, const std::string& body) {
   const auto suffix = name.rfind(".tune");
   if (first_dot == std::string::npos || suffix == std::string::npos ||
       first_dot > suffix)
-    return "";
+    return "";  // LCOV_EXCL_LINE (unreachable: warm_locked pre-filters the name)
   return name.substr(first_dot + 1, suffix - first_dot - 1);
 }
 
@@ -189,7 +189,7 @@ void warm_locked(const std::string& dir) {
     std::ostringstream body;
     body << in.rdbuf();
     g_stores[name.substr(0, dot)][file_arch(name, body.str())] =
-        [&] {
+        [&] {  // LCOV_EXCL_LINE (gcov cannot attribute the lambda-entry counter)
           std::vector<std::shared_ptr<const Entry>> owned;
           for (auto& e : parse_body(body.str()))
             owned.push_back(std::make_shared<const Entry>(std::move(e)));
@@ -214,14 +214,15 @@ bool enabled() {
   return !dir.empty() && dir != "off";
 }
 
-const std::string& device_arch() {
-  static const std::string arch = []() -> std::string {
-    // Test/inspection seam: pin the arch token without a GPU.
-    const char* env = std::getenv("VKERNELS_TUNING_ARCH");
-    if (env != nullptr && *env != '\0') return env;
-    return query_arch();
-  }();
-  return arch;
+std::string device_arch() {
+  // Test/inspection seam: pin the arch token without a GPU. The pin wins
+  // whenever it is set (re-read per call, so tests can toggle it); the
+  // device query runs once, on the first override-free call, and is
+  // cached from then on.
+  const char* env = std::getenv("VKERNELS_TUNING_ARCH");
+  if (env != nullptr && *env != '\0') return env;
+  static const std::string queried = query_arch();
+  return queried;
 }
 
 std::vector<Entry> parse_body(const std::string& text) {

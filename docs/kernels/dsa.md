@@ -120,6 +120,26 @@ in prefill — streams its `topk` selected keys in `block_I` tiles repeated
 with bf16 storage. It matches the oracle to bf16 tolerance for both
 `tail_dim == 0` and `tail_dim > 0`.
 
+### Prefill latency hiding (`dsa_sparse_fwd_pf_kernel`, issue #149)
+
+The serial key chain binds prefill too — enough query blocks fill the
+CUs, but each warp still stalls load→use once per key. In the prefill
+regime (`S_q > 8`) the plain dispatcher therefore prefers the
+**register-prefetch kernel**: width-specialized instantiations
+(`dim/tail_dim` = 256/0 → 4 tiles/lane, 576/64 → 10) that load key
+`k+1`'s row + index into per-lane registers while the online-softmax
+update consumes register-held key `k` — two key rows in flight per warp
+with zero LDS, so occupancy is untouched. Per-key arithmetic order is
+identical to the serial kernel (same ascending-d score loop, same
+reduction trees); dynamic widths fall back to the serial kernel.
+Measured 1.77x/2.20x on the GLM/DSv3 prefill rows
+(`docs/performance/dsa/gfx942.md`). `VK_DSA_PF=0` forces the serial
+kernel, `VK_DSA_PF=2` forces the pf kernel at every shape (decode
+included; correctness-covered). An LDS double-buffered plain variant
+(`dsa_sparse_fwd_stage_kernel`, `VK_DSA_STAGE=2`, tile depth
+`VK_DSA_KTI`) is kept opt-in for A/B — its LDS footprint costs blocks/CU
+and it loses to the pf kernel on every measured shape.
+
 ### Split-key decode (`dsa_sparse_fwd_split`)
 
 The plain forward's decode grid is `(S_q/BQ, H)` — 64 blocks on MI300A's

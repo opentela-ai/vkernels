@@ -107,6 +107,13 @@ void mxfp4_moe_sort_scales(const uint8_t* scales, const int32_t* sorted_ids,
 //
 // This is the bias-free form of `moe_combine_cpu` (see moe_fused.hpp); bias
 // is added separately in the W4A4 path. Matches AITER `mxfp4_moe_scatter_reduce`.
+//
+// HIP note (#145): the device path in moe_aux.hip implements this as an
+// atomic-free token-major gather via an inverse permutation of sorted_ids.
+// Given the contract that sorted_ids is a bijection on [0, M*top_k), every
+// output element receives exactly top_k contributions, so the HIP kernel
+// fully OVERWRITES `out` — a caller-side zero-init memset is unnecessary
+// there (the CPU reference above keeps the accumulate-into-zeroed form).
 void mxfp4_moe_scatter_reduce(const float* partial, const float* topk_w,
                               const int32_t* sorted_ids, float* out,
                               int M, int width, int top_k, int EM);

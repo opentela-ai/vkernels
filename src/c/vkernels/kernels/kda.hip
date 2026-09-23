@@ -4,7 +4,10 @@
 // only with VKERNELS_HAS_HIP. Each kernel is the device counterpart of the
 // CPU reference in kda.cpp and shares its contract (see kda.hpp):
 //
-//   kda_layer_norm_gated   -- gated RMSNorm, one thread per token row.
+//   kda_layer_norm_gated   -- gated RMSNorm, one warp per token row
+//                             (float4 loads, warp-shuffle reduction; issue
+//                             #144 — the one-thread-per-row layout was
+//                             occupancy-bound at 32 blocks / 228 CUs).
 //   kda_gate_chunk_cumsum  -- within-chunk inclusive log-cumsum (one block
 //                             per (b,h,c) chunk) + a second pass for the
 //                             cross-chunk exclusive log-cumsum.
@@ -46,8 +49,53 @@ namespace vkernels::kernels::hip {
 static constexpr int kTh    = 256;   // cooperating threads per (b,h) block
 
 // ===========================================================================
-//  #L1 layer_norm_gated — one thread per token row
+//  #L1 layer_norm_gated — one warp per token row, float4 loads (issue #144)
+//
+//  The original layout (one thread per row, two serial scalar D-loops)
+//  launched only N/256 blocks — 32 blocks on MI300A's 228 CUs at the K3
+//  shape N=8192, D=128 — and was occupancy/latency-bound at 72 GB/s
+//  (1.4% of HBM). Here a warp owns a row: 256-thread block → 8 rows →
+//  N/8 blocks (1024 at the K3 shape), and lane l holds elements 4l..4l+3
+//  as float4 (D=128 → exactly one 16 B load per lane per pass). The
+//  sum-of-squares reduces through a 5-step __shfl_xor butterfly (warp-local,
+//  __syncwarp only); the normalize+SiLU write is also float4.
+//  The one-thread-per-row kernel is kept as the fallback for D % 4 != 0.
 // ===========================================================================
+__global__ void kda_layer_norm_gated_kernel_row(const float* __restrict__ x,
+                                                const float* __restrict__ weight,
+                                                const float* __restrict__ gate,
+                                                float* __restrict__ out,
+                                                int N, int D, float eps) {
+  const int warp = (blockDim.x * blockIdx.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= N) return;
+  const float4* x4 = reinterpret_cast<const float4*>(x + (size_t)warp * D);
+  const float4* g4 = reinterpret_cast<const float4*>(gate + (size_t)warp * D);
+  const float4* w4 = reinterpret_cast<const float4*>(weight);
+  float4* o4 = reinterpret_cast<float4*>(out + (size_t)warp * D);
+  const int n4 = D >> 2;                       // float4s per row
+  float sq = 0.0f;
+  for (int v = lane; v < n4; v += 32) {
+    const float4 xv = x4[v];
+    sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+  }
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    sq += __shfl_xor(sq, off);   // full-warp butterfly (AMD detail shfl; all lanes active)
+  const float inv = 1.0f / sqrtf(sq / static_cast<float>(D) + eps);
+  for (int v = lane; v < n4; v += 32) {
+    const float4 xv = x4[v];
+    const float4 gv = g4[v];
+    const float4 wv = w4[v];
+    float4 ov;
+    ov.x = xv.x * inv * wv.x * (gv.x / (1.0f + __expf(-gv.x)));
+    ov.y = xv.y * inv * wv.y * (gv.y / (1.0f + __expf(-gv.y)));
+    ov.z = xv.z * inv * wv.z * (gv.z / (1.0f + __expf(-gv.z)));
+    ov.w = xv.w * inv * wv.w * (gv.w / (1.0f + __expf(-gv.w)));
+    o4[v] = ov;
+  }
+}
+
 __global__ void kda_layer_norm_gated_kernel(const float* __restrict__ x,
                                             const float* __restrict__ weight,
                                             const float* __restrict__ gate,
@@ -70,10 +118,20 @@ __global__ void kda_layer_norm_gated_kernel(const float* __restrict__ x,
 void kda_layer_norm_gated(const float* x, const float* weight,
                           const float* gate, float* out,
                           int N, int D, float eps) {
-  const int block = 256;
-  const int grid = (N + block - 1) / block;
-  kda_layer_norm_gated_kernel<<<grid, block, 0, 0>>>(
-      x, weight, gate, out, N, D, eps);
+  if (D % 4 == 0 && D > 0) {
+    // 256 threads = 8 warps = 8 rows per block (issue #144: N/8 blocks,
+    // 32x the device occupancy of the one-thread-per-row layout).
+    const int block = 256;
+    const int rows_per_block = block / 32;
+    const int grid = (N + rows_per_block - 1) / rows_per_block;
+    kda_layer_norm_gated_kernel_row<<<grid, block, 0, 0>>>(
+        x, weight, gate, out, N, D, eps);
+  } else {
+    const int block = 256;
+    const int grid = (N + block - 1) / block;
+    kda_layer_norm_gated_kernel<<<grid, block, 0, 0>>>(
+        x, weight, gate, out, N, D, eps);
+  }
 }
 
 // ===========================================================================

@@ -192,11 +192,35 @@ TEST(MlaConfig, DecodeVsPrefill) {
   mla_config_for(8, 512, 64, &bq, &bn, &th);
   EXPECT_EQ(bq, 1);
   EXPECT_EQ(th, 64);
-  // S_q == 9 crosses into prefill.
+  // S_q == 9 crosses into prefill: fused-head kernel (issue #151). BQ=4
+  // rows ride with heads per block; the wide-rank (kv=512) pipelined
+  // variant caps the block at 12 wavefronts → 4·2 = 8 wavefronts, 512 th.
   mla_config_for(9, 512, 64, &bq, &bn, &th);
   EXPECT_EQ(bq, 4);
-  EXPECT_EQ(bn, 64);
-  EXPECT_EQ(th, 256);
+  EXPECT_EQ(bn, 8);
+  EXPECT_EQ(th, 512);
+  // Narrow ranks keep the generic fused kernel (up to 16 wavefronts).
+  mla_config_for(9, 128, 64, &bq, &bn, &th);
+  EXPECT_EQ(th, 1024);
+}
+
+TEST(MlaPrefillHeadsPerBlock, CapsHeadsByThreadBudget) {
+  using vkernels::kernels::mla_prefill_heads_per_block;
+  // bq=4: cap 16/4 = 4 heads per block (1024-thread workgroup), rounded to
+  // a power of two, and never more than H.
+  EXPECT_EQ(mla_prefill_heads_per_block(4, 128), 4);
+  EXPECT_EQ(mla_prefill_heads_per_block(4, 16), 4);
+  EXPECT_EQ(mla_prefill_heads_per_block(4, 4), 4);
+  EXPECT_EQ(mla_prefill_heads_per_block(4, 3), 2);   // power-of-two floor
+  EXPECT_EQ(mla_prefill_heads_per_block(4, 2), 2);
+  EXPECT_EQ(mla_prefill_heads_per_block(4, 1), 1);   // single head
+  // bq=8: cap 2; bq=2: cap 8; bq=1: cap 16.
+  EXPECT_EQ(mla_prefill_heads_per_block(8, 128), 2);
+  EXPECT_EQ(mla_prefill_heads_per_block(2, 128), 8);
+  EXPECT_EQ(mla_prefill_heads_per_block(1, 128), 16);
+  // Degenerate shapes fall back to 1.
+  EXPECT_EQ(mla_prefill_heads_per_block(4, 0), 1);
+  EXPECT_EQ(mla_prefill_heads_per_block(0, 128), 1);
 }
 
 TEST(MlaSplitFor, DecodeSplits) {
@@ -206,9 +230,19 @@ TEST(MlaSplitFor, DecodeSplits) {
   // The documented worst case: a single query row -> fill the machine with
   // splits, capped only by the min-keys-per-split floor.
   EXPECT_EQ(mla_fwd_split_for(1, 1, 1, 8192), kMlaCus);
-  // Prefill shapes never split (S_q > 8).
-  EXPECT_EQ(mla_fwd_split_for(1, 1, 64, 8192), 1);
-  EXPECT_EQ(mla_fwd_split_for(1, 1, 9, 8192), 1);
+  // Chunked / short prefill (issue #151): the fused grid (tiles × head
+  // groups) leaves CUs idle, so the S_kv window splits too. H=1, S_q=64:
+  // 16 tiles × 1 group = 16 blocks → 228/16 = 14 splits.
+  EXPECT_EQ(mla_fwd_split_for(1, 1, 64, 8192), 14);
+  EXPECT_EQ(mla_fwd_split_for(1, 1, 9, 8192), kMlaCus / 3);
+  // Prefill grids that already fill the CUs keep the fused path (split=1).
+  EXPECT_EQ(mla_fwd_split_for(1, 128, 512, 512), 1);
+  EXPECT_EQ(mla_fwd_split_for(1, 16, 512, 512), 1);
+  EXPECT_EQ(mla_fwd_split_for(1, 1, 8192, 8192), 1);
+  // Multi-head short prefill: tiles × groups blocks, split to fill.
+  // H=2, S_q=64: heads_per_block(4,2)=2 → 1 group; 16 tiles = 16 blocks
+  // → 228/16 = 14 splits.
+  EXPECT_EQ(mla_fwd_split_for(1, 2, 64, 8192), 14);
   // Grids that already fill the CUs keep the plain single-block path.
   EXPECT_EQ(mla_fwd_split_for(8, 32, 1, 8192), 1);   // 8*32*1 = 256 > 228
   EXPECT_EQ(mla_fwd_split_for(1, 228, 1, 8192), 1);  // exactly 228 rows

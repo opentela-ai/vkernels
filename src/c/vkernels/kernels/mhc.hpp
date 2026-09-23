@@ -97,32 +97,37 @@ namespace vkernels::kernels::hip {
 // `hc_mult3 <= 32`; `hc_hidden_size <= 28672` (static shared memory budget).
 // Grid is (num_tokens, hc_mult3) -- one block per (token, output column),
 // so the decode n=1 GEMM uses hc_mult3 blocks (issue #79 column split).
-// Threads 1..255 prefetch the block's fn row through a double-buffered
-// shared chunk buffer (coalesced global reads); thread 0 accumulates
-// out[n, o] as a strict sequential fp32 mul+add chain over h -- the SAME
-// rounding path as the CPU oracle (fp32 addition is not associative and
-// the oracle's sequential chain is the correctness gate: any parallel
-// regrouping of the chain measurably breaks the 1e-4 test threshold on the
-// n=7 GLM row, so the chain is run serially by design and the parallelism
-// comes from the per-column blocks + latency-hiding prefetch instead).
+//
+// Serving policy (issue #147): the launcher DISPATCHES to the blocked
+// NSLICE=32 kernel (mhc_pre_gemm_sqrsum_blocked) by default -- 30.8 us vs
+// 816 us at decode n=1 hc_hidden=16384 on MI300A (26x). That was
+// inadmissible under #79's order-fragile 1e-4 oracle-chain gate (which
+// forced the single-thread strict chain); #141 replaced the gate with the
+// order-invariant conditioning-normalized fp64-reference comparison, under
+// which every NSLICE in {1..256} passes on every measured seed. The strict
+// bitwise-oracle chain stays selectable: pass `nslice == 1`, or set env
+// VK_MHC_PRE_STRICT=1 (any value but "0"/empty) to pin it for ALL calls
+// (parity consumers; overrides the nslice argument). `nslice <= 0` (the
+// default) means "auto" = the env policy, else 32. Non-ladder nslice
+// values are rounded UP to the next supported power of two (1..256).
 // sqrsum[n] (order-free) is a cooperative strided-partial + tree reduce in
-// the o == 0 block. No dynamic-shared-memory workaround: per-block shared
-// is a static `hc_hidden_size`-wide bf16 staging buffer (<= 56 KB) + a 4 KB
-// fn double buffer + 1 KB reduction scratch = 62464 B, within MI300A's
-// 64 KB non-optin cap.
+// the o == 0 block. No dynamic-shared-memory workaround.
 // stream (issue #69): caller hipStream_t (as void*); nullptr = legacy.
 void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
                          const void* x, const void* fn,
-                         void* out, void* sqrsum, void* stream = nullptr);
+                         void* out, void* sqrsum, void* stream = nullptr,
+                         int nslice = 0);
 
 // Blocked-order variant (issue #79 gate experiment, admissible under the
-// issue #138 fp64-reference gate): same GEMM, but out[n,o]
-// is accumulated as 256 contiguous-slice left-to-right chains combined in
-// thread order -- the closest parallel regrouping to the CPU oracle's strict
-// sequential chain. Correctness is gated by test_mhc_correct's
+// issue #138 fp64-reference gate, and the SERVED default of
+// mhc_pre_gemm_sqrsum as of issue #147): same GEMM, but out[n,o]
+// is accumulated as NSLICE contiguous-slice left-to-right chains combined
+// in thread order -- the closest parallel regrouping to the CPU oracle's
+// strict sequential chain. Correctness is gated by test_mhc_correct's
 // conditioning-normalized fp64-reference comparison (order-invariant; the
 // legacy strict-1e-4 oracle-chain gate is available via VK_MHC_STRICT_GATE=1
-// and is NOT order-invariant).
+// and is NOT order-invariant). Non-ladder nslice values are rounded UP to
+// the next supported power of two (1..256); nslice <= 0 keeps 256.
 void mhc_pre_gemm_sqrsum_blocked(int num_tokens, int hc_mult3,
                                  int hc_hidden_size,
                                  const void* x, const void* fn,

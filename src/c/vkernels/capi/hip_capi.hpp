@@ -429,6 +429,9 @@ void vk_hip_dsa_kpool_decode_update_fp8(
  *     out    [num_tokens, hc_mult3]        fp32   (= x @ fn^T)
  *     sqrsum [num_tokens]                  fp32   (= sum_h x[n,h]^2)
  *     hc_mult3 <= 32; hc_hidden_size <= 28672.
+ *     Serving policy (issue #147): NSLICE=32 blocked accumulation by
+ *     default (26x over the retired strict-chain default at decode n=1);
+ *     nslice=1 / env VK_MHC_PRE_STRICT=1 restores the strict chain.
  *
  *   mhc_post:
  *     a (comb_res_mix)[num_tokens, hc, hc]    fp32
@@ -531,6 +534,19 @@ int vk_hip_mhc_pre_gemm_sqrsum_stream(int num_tokens, int hc_mult3,
                                       int hc_hidden_size, const void* x,
                                       const void* fn, void* out,
                                       void* sqrsum, void* stream);
+
+/* Issue #147: explicit nslice control over the served pre kernel. nslice
+ * is the blocked-accumulation slice count (power of two 1..256, rounded up
+ * to the ladder; 1 = the bitwise-oracle strict chain). The non-suffixed
+ * and _stream entries above serve the same kernels with the default policy
+ * (NSLICE=32 blocked; env VK_MHC_PRE_STRICT=1 pins nslice=1 for all of
+ * them). Same int-return / never-silently-absorb contract as the other
+ * stream-safe entries. */
+int vk_hip_mhc_pre_gemm_sqrsum_blocked_stream(int num_tokens, int hc_mult3,
+                                              int hc_hidden_size,
+                                              const void* x, const void* fn,
+                                              void* out, void* sqrsum,
+                                              int nslice, void* stream);
 
 int vk_hip_mhc_post_stream(int num_tokens, int hc, int hidden,
                            const void* a, const void* b, const void* c,

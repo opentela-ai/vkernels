@@ -43,6 +43,11 @@ void gemm_bf16_reuse_with_config(std::size_t M, std::size_t N, std::size_t K,
                                  float alpha, const uint16_t* A,
                                  const uint16_t* B, float beta, uint16_t* C,
                                  int bm, int bn, int rm);
+// Split-K dispatcher (issue #146; same forward-declaration pattern).
+void gemm_bf16_splitk_with_config(std::size_t M, std::size_t N, std::size_t K,
+                                  float alpha, const uint16_t* A,
+                                  const uint16_t* B, float beta, uint16_t* C,
+                                  int bm, int bn, int S);
 }  // namespace vkernels::kernels::hip
 
 static void check_hip(hipError_t err, const char* ctx) {
@@ -100,6 +105,11 @@ static BenchResult bench_us(const std::function<void()>& launch,
     double sum = 0;
     for (double t : times) sum += t;
     double mean = sum / n;
+    if (mean <= 0.0) {
+      // All-zero window (the broken-row signature below). Fall through to
+      // the burst fallback instead of widening forever.
+      break;
+    }
     double sum2 = 0;
     for (double t : times) sum2 += t * t;
     double var = sum2 / n - mean * mean;
@@ -109,6 +119,28 @@ static BenchResult bench_us(const std::function<void()>& launch,
       return {times[0], times[n / 2], mean};
     }
     iters *= 2;
+  }
+  // Burst fallback for the ROCm 6.3 event quirk above: short kernels under
+  // rapid-fire event pairs can report elapsed exactly 0.0 for every sample
+  // (observed on MI300A around DVFS transitions; see the comment in the
+  // loop). Time a burst of `burst` back-to-back launches inside ONE event
+  // pair and report the per-launch time -- the event pair is far enough
+  // from the launches to measure reliably, and back-to-back launches have
+  // no inter-launch gaps for the tiny kernels where this triggers.
+  {
+    constexpr int burst = 100;
+    (void)hipDeviceSynchronize();
+    for (int i = 0; i < 3; ++i) launch();
+    hipEventRecord(start);
+    for (int i = 0; i < burst; ++i) launch();
+    hipEventRecord(stop);
+    hipEventSynchronize(stop);
+    float ms = 0;
+    hipEventElapsedTime(&ms, start, stop);
+    if (ms > 0.0f) {
+      double per = ms * 1000.0f / burst;
+      return {per, per, per};
+    }
   }
   return {};
 }
@@ -306,6 +338,63 @@ static void autotune_reuse(const GpuInfo& info, hipEvent_t start,
 }
 
 // ---------------------------------------------------------------------------
+// Split-K sweep (issue #146): the serving / tiny-M regime routed through
+// gemm_bf16_splitk_with_config. Sweeps S at the serving tile (16,16) and
+// prints the same columns as bench_shapes plus the split count, so the
+// S selection in hip::gemm_bf16 can be regenerated from measured data.
+static void bench_splitk(const GpuInfo& info, hipEvent_t start,
+                         hipEvent_t stop) {
+  (void)info;
+  struct NK { int N, K; };
+  const NK k3[] = {
+      {6288, 7168}, {3584, 7168}, {896, 7168}, {2112, 7168}, {1536, 7168},
+      {7168, 1536}, {7168, 768}, {7168, 3584}, {2304, 1536}, {3072, 512},
+      {1536, 128},
+  };
+  const int Ss[] = {2, 4, 8};
+  std::printf("\n=== split-K sweep (gemm_bf16_splitk_with_config, tile 16x16) ===\n");
+  std::printf("  %5s %6s %6s %4s %9s %9s %9s  %s\n",
+              "M", "N", "K", "S", "us(min)", "us(med)", "GB/s", "model");
+  for (int M : {5, 8, 16, 32, 64}) {
+    for (const auto& s : k3) {
+      const int N = s.N, K = s.K;
+      std::vector<uint16_t> A((size_t)M * K), B((size_t)K * N),
+          C((size_t)M * N, 0);
+      for (int i = 0; i < M * K; ++i) A[i] = f2bf(rnd(1, i) * 0.5f);
+      for (int i = 0; i < K * N; ++i) B[i] = f2bf(rnd(2, i) * 0.5f);
+      uint16_t *dA, *dB, *dC;
+      check_hip(hipMalloc(&dA, (size_t)M * K * 2), "A");
+      check_hip(hipMalloc(&dB, (size_t)K * N * 2), "B");
+      check_hip(hipMalloc(&dC, (size_t)M * N * 2), "C");
+      check_hip(hipMemcpy(dA, A.data(), (size_t)M * K * 2,
+                          hipMemcpyHostToDevice), "cpyA");
+      check_hip(hipMemcpy(dB, B.data(), (size_t)K * N * 2,
+                          hipMemcpyHostToDevice), "cpyB");
+      for (int S : Ss) {
+        if (S > K / 64) continue;  // whole K-tiles per split only
+        auto L = [&] {
+          vkernels::kernels::hip::gemm_bf16_splitk_with_config(
+              (size_t)M, (size_t)N, (size_t)K, 1.0f, dA, dB, 0.0f, dC,
+              16, 16, S);
+        };
+        auto r = bench_us(L, start, stop);
+        // Byte model: unsplit traffic (same as bench_shapes at (16,16))
+        // plus one fp32 workspace write+read round-trip (S*M*N*4 each way).
+        double base =
+            2.0 * ((double)M * K * ((N + 15) / 16) +
+                   (double)K * N * ((M + 15) / 16) + (double)M * N);
+        double bytes = base + 2.0 * (double)S * M * N * 4.0;
+        double gbs = bytes / (r.median_us / 1e6) / 1e9;
+        std::printf("  %5d %6d %6d %4d %9.1f %9.1f %9.1f  splitk\n",
+                    M, N, K, S, r.min_us, r.median_us, gbs);
+      }
+      check_hip(hipFree(dA), "fA"); check_hip(hipFree(dB), "fB");
+      check_hip(hipFree(dC), "fC");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 int main() {
   auto info = get_gpu_info();
   std::printf("GPU: %s  arch=%d  bf16=%.0f TFLOP/s  HBM=%.0f GB/s\n",
@@ -321,6 +410,11 @@ int main() {
   }
   if (only && std::string(only) == "reuse") {
     autotune_reuse(info, start, stop);
+    hipEventDestroy(start); hipEventDestroy(stop);
+    return 0;
+  }
+  if (only && std::string(only) == "splitk") {
+    bench_splitk(info, start, stop);
     hipEventDestroy(start); hipEventDestroy(stop);
     return 0;
   }

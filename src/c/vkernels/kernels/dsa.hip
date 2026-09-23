@@ -41,9 +41,12 @@
 //
 // Memory. Each selected key's kv vector is read exactly once from global
 // memory (bf16 -> fp32 on load); the BQ query rows are staged in LDS once per
-// block (bf16 -> fp32). This is the simple, correct baseline (one key at a
-// time, no double-buffered key tile); a tiled key prefetch is a follow-on
-// optimisation, not required for correctness against the oracle. The combined
+// block (bf16 -> fp32). Issue #149 gives the plain path two composable
+// speedups: (1) the kernel is width-specialized (compile-time tile counts at
+// the serving widths) so the output accumulators stay register-resident, and
+// (2) a staged variant double-buffers key tiles in LDS on the prefill path
+// (launch_stage / VK_DSA_STAGE), keeping kti key rows in flight per warp
+// instead of one. Decode shapes keep the serial behavior. The combined
 // result is grouping-independent, so each block streams all of its `topk`
 // keys directly (no separate partial_o / partial_lse + combine kernel).
 //
@@ -92,7 +95,16 @@ static constexpr int kMaxW = 1024;
 static constexpr int kPerLane = (kMaxW + 63) / 64;  // head elements per lane
 
 
-template <int BQ>
+// Width specialization (issue #149 step 1). MAIN_TILES/TAIL_TILES/V_TILES
+// are compile-time tile counts; 0 keeps the dynamic-width fallback (the tile
+// count is then derived from the runtime dim/tail_dim). At the serving
+// widths -- GLM-5.3 (dim=256, tail_dim=0) and DeepSeek-V3 (dim=576,
+// tail_dim=64) -- constant bounds let every t-loop fully unroll, so the
+// `o[kPerLane]` output accumulators index STATICALLY and live in registers
+// instead of scratch (a runtime-bound loop over a local array cannot be
+// unrolled, so the dynamic-width lowering spills it to per-wave scratch and
+// puts ~16 scratch accesses per key on the dependent chain).
+template <int BQ, int MAIN_TILES = 0, int TAIL_TILES = 0, int V_TILES = 0>
 __global__ void dsa_sparse_fwd_kernel(
     const uint16_t* __restrict__ q,
     const uint16_t* __restrict__ kv,
@@ -109,9 +121,13 @@ __global__ void dsa_sparse_fwd_kernel(
 
   const int W = dim + tail_dim;
   const int d_v = dim - tail_dim;
-  const int main_tiles = (dim + 63) / 64;
-  const int tail_tiles = (tail_dim + 63) / 64;  // 0 when tail_dim == 0
-  const int v_tiles = (d_v + 63) / 64;
+  // The ternaries fold to constants in the specialized instantiations, so
+  // every loop below trips a compile-time bound there.
+  const int main_tiles =
+      (MAIN_TILES > 0) ? MAIN_TILES : (dim + 63) / 64;
+  const int tail_tiles =
+      (TAIL_TILES > 0) ? TAIL_TILES : (tail_dim + 63) / 64;  // 0 when tail_dim == 0
+  const int v_tiles = (V_TILES > 0) ? V_TILES : (d_v + 63) / 64;
 
   // --- stage the BQ query rows in LDS once (bf16 -> fp32, per-block) ---
   extern __shared__ float sQ[];       // sQ[BQ][W]
@@ -195,24 +211,479 @@ __global__ void dsa_sparse_fwd_kernel(
 }
 
 // ---------------------------------------------------------------------------
+//  Register-prefetch plain kernel (issue #149 step 2, low-risk variant).
+//  Software-pipelines the serial key chain IN REGISTERS: key k+1's row and
+//  index are loaded into per-lane registers BEFORE the online-softmax update
+//  over key k consumes the register-held key k, so the global loads of the
+//  next key issue ~one key of compute earlier -- 2 key rows in flight per
+//  warp with ZERO LDS and therefore NO residency loss (the LDS-staged kernel
+//  below trades in-flight depth for blocks/CU, which the kti sweep shows it
+//  cannot afford at the DSv3 width or the H=64 grid). Per-key ARITHMETIC is
+//  identical to the serial kernel: the strided main/tail score loops are the
+//  flat loop over WT = main_tiles + tail_tiles tiles in the same ascending-d
+//  order, and the V accumulate reads the same bf16 values, so every
+//  correctness row is bit-comparable to the serial kernel. Specialized
+//  widths only (WT compile-time); dynamic widths keep the serial kernel.
+template <int BQ, int WT, int V_TILES>
+__global__ void dsa_sparse_fwd_pf_kernel(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ kv,
+    const int32_t* __restrict__ indices, uint16_t* __restrict__ out,
+    float* __restrict__ lse_out, int S_q, int S_kv, int H, int dim,
+    int tail_dim, int topk, int kv_group, float sm_scale, bool return_lse) {
+  const int q_tile = blockIdx.x;
+  const int h = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 6;
+  const int lane = tid & 63;
+  const int gi = q_tile * BQ + warp;
+  if (gi >= S_q) return;
+
+  const int W = dim + tail_dim;
+  const int d_v = dim - tail_dim;
+
+  extern __shared__ float sQ[];       // sQ[BQ][W]
+  for (int idx = tid; idx < BQ * W; idx += BQ * 64) {
+    const int r = idx / W, c = idx % W;
+    const int gr = q_tile * BQ + r;
+    sQ[idx] = (gr < S_q) ? bf16_to_f32(
+                  q[((size_t)gr * H + h) * W + c])
+                         : 0.0f;
+  }
+  __syncthreads();
+
+  const float* qrow = &sQ[warp * W];
+  const int32_t* idx_i = indices + (size_t)gi * kv_group * topk;
+
+  float o[kPerLane];
+  for (int t = 0; t < kPerLane; ++t) o[t] = 0.0f;
+  float row_max = -INFINITY;
+  float row_sum = 0.0f;
+
+  // Load key `k`'s row + index into the given register set (masked keys
+  // load as zero rows; validity is re-checked at consume time, exactly
+  // like the staged kernels' zero-filled rows).
+#define VK_DSA_PF_LOAD(ridx_, row_, k_)                                       \
+  do {                                                                        \
+    const int32_t ki_ = idx_i[k_];                                            \
+    (ridx_) = ki_;                                                            \
+    if (ki_ >= 0 && ki_ < S_kv) {                                             \
+      const uint16_t* p_ = kv + (size_t)ki_ * W;                              \
+      _Pragma("unroll")                                                       \
+      for (int t = 0; t < WT; ++t) {                                          \
+        const int d = lane + t * 64;                                          \
+        (row_)[t] = (d < W) ? p_[d] : (uint16_t)0;                            \
+      }                                                                       \
+    } else {                                                                  \
+      _Pragma("unroll")                                                       \
+      for (int t = 0; t < WT; ++t) (row_)[t] = (uint16_t)0;                   \
+    }                                                                         \
+  } while (0)
+
+  int32_t cur_idx;
+  uint16_t cur[WT];
+  VK_DSA_PF_LOAD(cur_idx, cur, 0);
+
+  for (int k = 0; k < topk; ++k) {
+    // Issue key k+1's loads FIRST: they are independent of everything
+    // below, so they fill the in-order issue slots while the warp works.
+    int32_t nxt_idx = -1;
+    uint16_t nxt[WT];
+    if (k + 1 < topk) VK_DSA_PF_LOAD(nxt_idx, nxt, k + 1);
+
+    const bool valid = (cur_idx >= 0) && (cur_idx < S_kv);
+
+    // --- lane-local partial score (main + tail, ascending d), then
+    //     warp-reduce (identical order/tree to the serial kernel) ---
+    float partial = 0.0f;
+    if (valid) {
+      _Pragma("unroll")
+      for (int t = 0; t < WT; ++t) {
+        const int d = lane + t * 64;
+        if (d < W) partial += qrow[d] * bf16_to_f32(cur[t]);
+      }
+    }
+    float score = partial;
+    for (int off = 32; off > 0; off >>= 1)
+      score += __shfl_xor(score, off);
+    score = valid ? (score * sm_scale) : -INFINITY;
+
+    // --- online softmax update (lock-step; identical on every lane) ---
+    const float new_max = fmaxf(row_max, score);
+    const float exp_old =
+        (row_max == -INFINITY) ? 0.0f : exp2f(row_max - new_max);
+    const float exp_s =
+        (score == -INFINITY) ? 0.0f : exp2f(score - new_max);
+    row_sum = row_sum * exp_old + exp_s;
+    for (int t = 0; t < V_TILES; ++t) o[t] *= exp_old;
+    if (valid) {
+      _Pragma("unroll")
+      for (int t = 0; t < V_TILES; ++t) {
+        const int d = lane + t * 64;
+        if (d < d_v) o[t] += exp_s * bf16_to_f32(cur[t]);
+      }
+    }
+    row_max = new_max;
+
+    // Rotate: key k+1 becomes key k (its loads are in flight / done).
+    cur_idx = nxt_idx;
+    _Pragma("unroll")
+    for (int t = 0; t < WT; ++t) cur[t] = nxt[t];
+  }
+#undef VK_DSA_PF_LOAD
+
+  const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
+  uint16_t* orow = out + (((size_t)gi * H + h) * d_v);
+  for (int t = 0; t < V_TILES; ++t) {
+    const int d = lane + t * 64;
+    if (d < d_v) orow[d] = f2bf(o[t] * inv);
+  }
+  if (return_lse) {
+    const float l = (row_sum > 0.0f) ? (row_max + log2f(row_sum)) : -INFINITY;
+    if (lane == 0) lse_out[(size_t)gi * H + h] = l;
+  }
+}
+
+// ---------------------------------------------------------------------------
 //  Launchers
 // ---------------------------------------------------------------------------
 namespace {
+template <int BQ, int MAIN_TILES, int TAIL_TILES, int V_TILES>
+void launch_impl(const void* q, const void* kv, const void* indices, void* out,
+                 void* lse, int S_q, int S_kv, int H, int dim, int tail_dim,
+                 int topk, int kv_group, float sm_scale, bool return_lse,
+                 hipStream_t stream) {
+  const int W = dim + tail_dim;
+  const int shmem = BQ * W * sizeof(float);
+  dim3 block(BQ * 64);
+  dim3 grid((S_q + BQ - 1) / BQ, H, 1);
+  dsa_sparse_fwd_kernel<BQ, MAIN_TILES, TAIL_TILES, V_TILES>
+      <<<grid, block, shmem, stream>>>(
+          reinterpret_cast<const uint16_t*>(q),
+          reinterpret_cast<const uint16_t*>(kv),
+          reinterpret_cast<const int32_t*>(indices),
+          reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
+          S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, return_lse);
+}
+// Width dispatch (issue #149 step 1): the two serving widths get
+// compile-time tile counts (register-resident accumulators, unrolled t-loops);
+// every other shape keeps the dynamic-width fallback.
 template <int BQ>
 void launch(const void* q, const void* kv, const void* indices, void* out,
             void* lse, int S_q, int S_kv, int H, int dim, int tail_dim,
             int topk, int kv_group, float sm_scale, bool return_lse,
             hipStream_t stream = nullptr) {  // #69: caller stream
+  if (dim == 256 && tail_dim == 0) {
+    launch_impl<BQ, 4, 0, 4>(q, kv, indices, out, lse, S_q, S_kv, H, dim,
+                             tail_dim, topk, kv_group, sm_scale, return_lse,
+                             stream);
+  } else if (dim == 576 && tail_dim == 64) {
+    launch_impl<BQ, 9, 1, 8>(q, kv, indices, out, lse, S_q, S_kv, H, dim,
+                             tail_dim, topk, kv_group, sm_scale, return_lse,
+                             stream);
+  } else {
+    launch_impl<BQ, 0, 0, 0>(q, kv, indices, out, lse, S_q, S_kv, H, dim,
+                             tail_dim, topk, kv_group, sm_scale, return_lse,
+                             stream);
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Plain-path staged kernel (issue #149 step 2). The serial kernel above
+//  keeps ~1 key row in flight per warp (load -> use dependency, gfx942
+//  issues in-order), which caps it at ~21-28% of the HBM roof on prefill.
+//  This variant stages key tiles into LDS (the issue-#80 double-buffer
+//  machinery, minus the split/combine) so tile i+1's global loads issue
+//  while the warp runs the online-softmax update over tile i: `kti` key
+//  rows in flight per warp instead of 1. Per-key ARITHMETIC is identical
+//  to the serial kernel (same multiply order, same shfl reduction tree,
+//  same fmaxf/exp2 update sequence), so every correctness row is
+//  unchanged; masked keys stage as zero rows exactly like the db kernel.
+//  Shared layout: sQ[BQ*W f32] | sKey[2*BQ*kti*W u16] | sIdx[2*BQ*kti i32],
+//  one private sKey/sIdx slice per warp, lane-strided staging (issue #80
+//  audit fix), warp-synchronous (no block barriers on the hot path).
+template <int BQ, int MAIN_TILES = 0, int TAIL_TILES = 0, int V_TILES = 0>
+__global__ void dsa_sparse_fwd_stage_kernel(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ kv,
+    const int32_t* __restrict__ indices, uint16_t* __restrict__ out,
+    float* __restrict__ lse_out, int S_q, int S_kv, int H, int dim,
+    int tail_dim, int topk, int kv_group, float sm_scale, bool return_lse,
+    int kti) {
+  const int q_tile = blockIdx.x;
+  const int h = blockIdx.y;            // kv_group == 1: one shared head_kv
+  const int tid = threadIdx.x;
+  const int warp = tid >> 6;           // which query row within the tile
+  const int lane = tid & 63;           // strided head index this lane owns
+  const int gi = q_tile * BQ + warp;   // global query row
+  if (gi >= S_q) return;               // whole warp exits: no cross-warp LDS deps
+
+  const int W = dim + tail_dim;
+  const int d_v = dim - tail_dim;
+  const int main_tiles =
+      (MAIN_TILES > 0) ? MAIN_TILES : (dim + 63) / 64;
+  const int tail_tiles =
+      (TAIL_TILES > 0) ? TAIL_TILES : (tail_dim + 63) / 64;
+  const int v_tiles = (V_TILES > 0) ? V_TILES : (d_v + 63) / 64;
+
+  extern __shared__ float sQ[];       // sQ[BQ][W]
+  for (int idx = tid; idx < BQ * W; idx += BQ * 64) {
+    const int r = idx / W, c = idx % W;
+    const int gr = q_tile * BQ + r;
+    sQ[idx] = (gr < S_q) ? bf16_to_f32(
+                  q[((size_t)gr * H + h) * W + c])
+                         : 0.0f;
+  }
+  __syncthreads();
+
+  uint16_t* sKey = reinterpret_cast<uint16_t*>(sQ + BQ * W);
+  int32_t* sIdx = reinterpret_cast<int32_t*>(sKey + (size_t)2 * BQ * kti * W);
+
+  const float* qrow = &sQ[warp * W];  // this warp's query row (fp32)
+  const int32_t* idx_i =
+      indices + (size_t)gi * kv_group * topk;  // kv_group == 1 -> gi*topk
+
+  // Lane-local slices of the output accumulator (strided by 64 over d_v).
+  float o[kPerLane];
+  for (int t = 0; t < kPerLane; ++t) o[t] = 0.0f;
+  float row_max = -INFINITY;          // running max (same on every lane)
+  float row_sum = 0.0f;               // running denominator (same on every lane)
+
+// gfx942 has no __syncwarp in this HIP toolchain (see the db partial kernel
+// below for the full rationale): one wavefront per warp, LDS executes wave
+// instructions in issue order, so the empty asm is a compiler fence only.
+#if defined(__HIP__)
+#define VK_DSA_PSTAGE_SYNC() asm volatile("" ::: "memory")
+#else
+#define VK_DSA_PSTAGE_SYNC() __syncwarp()
+#endif
+
+// Stage keys [tb, tb + tlen) of this warp's index range into buffer `sbuf`,
+// then a warp barrier. Same body as the db partial kernel's VK_DSA_STAGE_TILE
+// (uint4-vectorized when W % 8 == 0, zero-filled masked rows).
+#define VK_DSA_PSTAGE_TILE(sbuf_, tb_, tlen_)                                 \
+  do {                                                                        \
+    uint16_t* sdst =                                                          \
+        sKey + (size_t)(((sbuf_) * BQ + warp) * kti) * W;                     \
+    int32_t* idst = sIdx + ((sbuf_) * BQ + warp) * kti;                       \
+    if (W % 8 == 0) {                                                         \
+      const int rpp = W / 8; /* chunks (8 elements) per key row */            \
+      for (int ch = lane; ch < (tlen_) * rpp; ch += 64) {                     \
+        const int r = ch / rpp;                                               \
+        const int c = (ch - r * rpp) * 8;                                     \
+        const int32_t kv_idx = idx_i[(tb_) + r];                              \
+        idst[r] = kv_idx;                                                     \
+        uint4 v = {0u, 0u, 0u, 0u};                                           \
+        if (kv_idx >= 0 && kv_idx < S_kv)                                     \
+          v = *reinterpret_cast<const uint4*>(                                \
+              kv + (size_t)kv_idx * W + c);                                   \
+        *reinterpret_cast<uint4*>(sdst + (size_t)r * W + c) = v;              \
+      }                                                                       \
+    } else {                                                                  \
+      for (int e = lane; e < (tlen_) * W; e += 64) {                          \
+        const int r = e / W;                                                  \
+        const int c = e - r * W;                                              \
+        const int32_t kv_idx = idx_i[(tb_) + r];                              \
+        idst[r] = kv_idx;                                                     \
+        sdst[(size_t)r * W + c] =                                             \
+            (kv_idx >= 0 && kv_idx < S_kv)                                    \
+                ? kv[(size_t)kv_idx * W + c]                                  \
+                : (uint16_t)0;                                                \
+      }                                                                       \
+    }                                                                         \
+    VK_DSA_PSTAGE_SYNC(); /* staged tile visible before it is consumed */     \
+  } while (0)
+
+  // Prologue: stage the first tile into buffer 0.
+  VK_DSA_PSTAGE_TILE(0, 0, (topk < kti) ? topk : kti);
+
+  int buf = 0;
+  for (int tb = 0; tb < topk; tb += kti) {
+    const int te = (topk - tb < kti) ? topk : (tb + kti);
+    if (te < topk) {  // prefetch the next tile into buf ^ 1
+      VK_DSA_PSTAGE_TILE(buf ^ 1, te, (topk - te < kti) ? (topk - te) : kti);
+    }
+    for (int k = tb; k < te; ++k) {
+      const int tk = k - tb;
+      const int32_t idx = sIdx[(buf * BQ + warp) * kti + tk];
+      const uint16_t* rowp =
+          sKey + (size_t)((buf * BQ + warp) * kti + tk) * W;
+      const bool valid = (idx >= 0) && (idx < S_kv);
+
+      // --- lane-local partial score (main + tail), then warp-reduce ---
+      float partial = 0.0f;
+      if (valid) {
+        for (int t = 0; t < main_tiles; ++t) {
+          const int d = lane + t * 64;
+          if (d < dim) partial += qrow[d] * bf16_to_f32(rowp[d]);
+        }
+        for (int t = 0; t < tail_tiles; ++t) {  // 0 iters when tail_dim == 0
+          const int d = lane + t * 64;
+          if (d < tail_dim)
+            partial += qrow[dim + d] * bf16_to_f32(rowp[dim + d]);
+        }
+      }
+      float score = partial;
+      for (int off = 32; off > 0; off >>= 1)  // warp-wide sum -> broadcast
+        score += __shfl_xor(score, off);
+      score = valid ? (score * sm_scale) : -INFINITY;
+
+      // --- online softmax update (lock-step; identical on every lane) ---
+      const float new_max = fmaxf(row_max, score);
+      const float exp_old =
+          (row_max == -INFINITY) ? 0.0f : exp2f(row_max - new_max);
+      const float exp_s =
+          (score == -INFINITY) ? 0.0f : exp2f(score - new_max);
+      row_sum = row_sum * exp_old + exp_s;
+      for (int t = 0; t < v_tiles; ++t) o[t] *= exp_old;
+      if (valid) {
+        for (int t = 0; t < v_tiles; ++t) {
+          const int d = lane + t * 64;
+          if (d < d_v) o[t] += exp_s * bf16_to_f32(rowp[d]);
+        }
+      }
+      row_max = new_max;
+    }
+    buf ^= 1;
+    VK_DSA_PSTAGE_SYNC(); /* buffer fully consumed before its next restaging */
+  }
+#undef VK_DSA_PSTAGE_TILE
+#undef VK_DSA_PSTAGE_SYNC
+
+  // --- normalise and write the lane-local output slice (fp32 -> bf16) ---
+  const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
+  uint16_t* orow = out + (((size_t)gi * H + h) * d_v);
+  for (int t = 0; t < v_tiles; ++t) {
+    const int d = lane + t * 64;
+    if (d < d_v) orow[d] = f2bf(o[t] * inv);
+  }
+  if (return_lse) {
+    const float l = (row_sum > 0.0f) ? (row_max + log2f(row_sum)) : -INFINITY;
+    if (lane == 0) lse_out[(size_t)gi * H + h] = l;
+  }
+}
+
+template <int BQ, int MAIN_TILES, int TAIL_TILES, int V_TILES>
+bool launch_stage_impl(const void* q, const void* kv, const void* indices,
+                       void* out, void* lse, int S_q, int S_kv, int H, int dim,
+                       int tail_dim, int topk, int kv_group, float sm_scale,
+                       bool return_lse, int kti, hipStream_t stream) {
+  const int W = dim + tail_dim;
+  const size_t shmem = (size_t)BQ * W * 4u +
+                       (size_t)kti * (2u * BQ * ((size_t)W * 2u + 4u));
+  dim3 block(BQ * 64);
+  dim3 grid((S_q + BQ - 1) / BQ, H, 1);
+  dsa_sparse_fwd_stage_kernel<BQ, MAIN_TILES, TAIL_TILES, V_TILES>
+      <<<grid, block, shmem, stream>>>(
+          reinterpret_cast<const uint16_t*>(q),
+          reinterpret_cast<const uint16_t*>(kv),
+          reinterpret_cast<const int32_t*>(indices),
+          reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
+          S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, return_lse,
+          kti);
+  return true;
+}
+
+// Prefill-aware staging gate for the plain forward. Engaged ONLY where the
+// issue-#80 data says staging wins -- LONG key blocks (prefill), the opposite
+// regime from the split path's thousands-of-tiny-blocks loss. VK_DSA_STAGE:
+// 0 forces the serial kernel, 1 (default) applies the gate, 2 forces staging
+// at every shape (correctness coverage). VK_DSA_KTI=<n> overrides the
+// keys-per-tile (0 = auto: 4, ~21 KB LDS at BQ=4/W=256 -> 3 blocks/CU, 4 key
+// rows in flight per warp).
+template <int BQ>
+bool launch_stage(const void* q, const void* kv, const void* indices, void* out,
+                  void* lse, int S_q, int S_kv, int H, int dim, int tail_dim,
+                  int topk, int kv_group, float sm_scale, bool return_lse,
+                  hipStream_t stream) {
+  static const int stage_mode = [] {
+    const char* e = std::getenv("VK_DSA_STAGE");
+    return e ? std::atoi(e) : 1;
+  }();
+  static const int kti_ovr = [] {
+    const char* e = std::getenv("VK_DSA_KTI");
+    return e ? std::atoi(e) : 0;
+  }();
+  if (stage_mode == 0) return false;
+  if (stage_mode == 1 && !(S_q > 8 && topk >= 64)) return false;
+  const int W = dim + tail_dim;
+  const size_t shq = (size_t)BQ * (size_t)W * 4u;                // sQ
+  const size_t per_key = (size_t)2 * BQ * ((size_t)W * 2u + 4u); // 2 key bufs + idx
+  constexpr size_t kCap = 44u * 1024u;  // gfx942 48 KB no-attribute cap, margin
+  if (shq >= kCap) return false;
+  const int budget = (int)((kCap - shq) / per_key);
+  int kti = (kti_ovr > 0) ? kti_ovr : 4;
+  if (kti > budget) kti = budget;
+  if (kti < 1) return false;
+  if (dim == 256 && tail_dim == 0)
+    return launch_stage_impl<BQ, 4, 0, 4>(q, kv, indices, out, lse, S_q, S_kv,
+                                          H, dim, tail_dim, topk, kv_group,
+                                          sm_scale, return_lse, kti, stream);
+  if (dim == 576 && tail_dim == 64)
+    return launch_stage_impl<BQ, 9, 1, 8>(q, kv, indices, out, lse, S_q, S_kv,
+                                          H, dim, tail_dim, topk, kv_group,
+                                          sm_scale, return_lse, kti, stream);
+  return launch_stage_impl<BQ, 0, 0, 0>(q, kv, indices, out, lse, S_q, S_kv, H,
+                                        dim, tail_dim, topk, kv_group,
+                                        sm_scale, return_lse, kti, stream);
+}
+
+// Register-prefetch dispatch (issue #149). VK_DSA_PF: 0 forces the plain
+// serial kernel, 1 (default) engages the pf kernel in the prefill regime
+// (S_q > 8, any topk -- the loads issue one key early regardless of list
+// length), 2 forces it at every shape (correctness coverage).
+template <int BQ>
+bool launch_pf(const void* q, const void* kv, const void* indices, void* out,
+               void* lse, int S_q, int S_kv, int H, int dim, int tail_dim,
+               int topk, int kv_group, float sm_scale, bool return_lse,
+               hipStream_t stream) {
+  static const int pf_mode = [] {
+    const char* e = std::getenv("VK_DSA_PF");
+    return e ? std::atoi(e) : 1;
+  }();
+  if (pf_mode == 0) return false;
+  if (pf_mode == 1 && !(S_q > 8)) return false;
   const int W = dim + tail_dim;
   const int shmem = BQ * W * sizeof(float);
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, 1);
-  dsa_sparse_fwd_kernel<BQ><<<grid, block, shmem, stream>>>(
-      reinterpret_cast<const uint16_t*>(q),
-      reinterpret_cast<const uint16_t*>(kv),
-      reinterpret_cast<const int32_t*>(indices),
-      reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
-      S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, return_lse);
+  if (dim == 256 && tail_dim == 0) {
+    dsa_sparse_fwd_pf_kernel<BQ, 4, 4><<<grid, block, shmem, stream>>>(
+        reinterpret_cast<const uint16_t*>(q),
+        reinterpret_cast<const uint16_t*>(kv),
+        reinterpret_cast<const int32_t*>(indices),
+        reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
+        S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, return_lse);
+    return true;
+  }
+  if (dim == 576 && tail_dim == 64) {
+    dsa_sparse_fwd_pf_kernel<BQ, 10, 8><<<grid, block, shmem, stream>>>(
+        reinterpret_cast<const uint16_t*>(q),
+        reinterpret_cast<const uint16_t*>(kv),
+        reinterpret_cast<const int32_t*>(indices),
+        reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
+        S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, return_lse);
+    return true;
+  }
+  return false;  // dynamic widths keep the serial kernel
+}
+
+// Plain-forward dispatch (issue #149): staged kernel when its gate admits
+// it AND VK_DSA_PF does not claim the shape first (the pf kernel hides the
+// same latency with no LDS residency cost, so it wins the priority), then
+// the pf kernel, then the serial kernel. Decode shapes keep the measured
+// serial behavior under both gates.
+template <int BQ>
+void launch_auto(const void* q, const void* kv, const void* indices, void* out,
+                 void* lse, int S_q, int S_kv, int H, int dim, int tail_dim,
+                 int topk, int kv_group, float sm_scale, bool return_lse,
+                 hipStream_t stream = nullptr) {  // #69: caller stream
+  if (launch_pf<BQ>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim,
+                    topk, kv_group, sm_scale, return_lse, stream))
+    return;
+  if (launch_stage<BQ>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim,
+                       topk, kv_group, sm_scale, return_lse, stream))
+    return;
+  launch<BQ>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
+             kv_group, sm_scale, return_lse, stream);
 }
 }  // namespace
 
@@ -253,18 +724,104 @@ void dsa_sparse_fwd_with_tile(int S_q, int S_kv, int H, int dim, int tail_dim,
   (void)inner_iter;  // future tiled-key prefetch (group-then-combine merge).
   (void)bn_kv;
   if (bq <= 1)
-    launch<1>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
+    launch_auto<1>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
               kv_group, sm_scale, return_lse, static_cast<hipStream_t>(stream));
   else if (bq <= 2)
-    launch<2>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
+    launch_auto<2>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
               kv_group, sm_scale, return_lse, static_cast<hipStream_t>(stream));
   else if (bq <= 4)
-    launch<4>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
+    launch_auto<4>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
               kv_group, sm_scale, return_lse, static_cast<hipStream_t>(stream));
   else
-    launch<8>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
+    launch_auto<8>(q, kv, indices, out, lse, S_q, S_kv, H, dim, tail_dim, topk,
               kv_group, sm_scale, return_lse, static_cast<hipStream_t>(stream));
 }
+
+// ---------------------------------------------------------------------------
+//  Issue #155: decode auto-split. The plain forward's decode grid is
+//  (ceil(S_q/BQ), H) -- 64 blocks on MI300A's 228 CUs at the serving
+//  GLM-5.3-Flash decode shape, each streaming its `topk` keys through the
+//  serial score->softmax->gather chain (measured 397 us at topk=256, FLAT
+//  across topk AND the BQ sweep: latency-bound on the per-token chain, not
+//  throughput-bound -- docs/performance/dsa/gfx942.md). The split+combine
+//  machinery below (issue #51/#80/#137) already removes exactly that wall:
+//  block-per-KV-chunk partials add the missing intra-token parallelism and
+//  the combine merges the log2-domain states. It was PERF-ONLY, reachable
+//  solely through dsa_sparse_fwd_split with caller-owned scratch. This
+//  dispatches it AUTOMATICALLY from the plain dsa_sparse_fwd whenever
+//  dsa_sparse_fwd_split_for recommends a split > 1 (the decode regime; the
+//  prefill early-out keeps every long-S_q shape on the plain path), using
+//  an internally managed scratch so no caller changes are needed. The
+//  explicit-tile entry (dsa_sparse_fwd_with_tile, the autotuner's hook) and
+//  the degenerate split_kv == 1 delegation keep the plain serial behavior.
+//  VK_DSA_DECODE_SPLIT=0 restores the pre-#155 serial decode dispatch.
+
+// Internally managed partial scratch for the auto split: one fp32 partial-
+// output + one fp32 partial-lse buffer, grown on demand and never shrunk.
+// Retired generations are intentionally NOT hipFree'd (a pending kernel
+// could still reference an old buffer; the leak is bounded by the number of
+// grow steps and is tiny -- the same rationale as vec_combine_counters's
+// counter buffer above).
+namespace {
+struct DsaAutoSplitScratch {
+  float* part_out = nullptr;
+  float* part_lse = nullptr;
+  size_t cap_out = 0;  // floats
+  size_t cap_lse = 0;  // floats
+};
+bool dsa_auto_split_scratch(size_t n_out, size_t n_lse, float** p_out,
+                            float** p_lse) {
+  static DsaAutoSplitScratch s;
+  if (n_out > s.cap_out || n_lse > s.cap_lse) {
+    float* no = nullptr;
+    float* nl = nullptr;
+    if (hipMalloc(&no, n_out * sizeof(float)) != hipSuccess) return false;
+    if (hipMalloc(&nl, n_lse * sizeof(float)) != hipSuccess) {
+      hipFree(no);
+      return false;
+    }
+    s.part_out = no;  // previous generation intentionally abandoned
+    s.part_lse = nl;
+    s.cap_out = n_out;
+    s.cap_lse = n_lse;
+  }
+  *p_out = s.part_out;
+  *p_lse = s.part_lse;
+  return true;
+}
+}  // namespace
+
+// Shared split dispatch: the partial launch ladder + the combine launch --
+// factored out of dsa_sparse_fwd_split so the issue-#155 auto path runs the
+// EXACT same kernel selection (vec -> db -> serial partial, then combine).
+// Declared here (defined just before dsa_sparse_fwd_split, after the
+// partial kernels it dispatches).
+void dsa_sparse_fwd_split_run(int S_q, int S_kv, int H, int dim, int tail_dim,
+                              int topk, int kv_group, float sm_scale,
+                              bool return_lse, int split_kv, const void* q,
+                              const void* kv, const void* indices, void* out,
+                              void* lse, void* partial_out, void* partial_lse,
+                              int bq, void* stream);
+
+// The plain (unsplit) ladder: tile selection + dsa_sparse_fwd_with_tile.
+// Shared by the public forward's non-decode fall-through and the degenerate
+// split_kv == 1 delegation of dsa_sparse_fwd_split (which must BYPASS the
+// auto split below: an explicit split request of 1 means "no split").
+namespace {
+void dsa_sparse_fwd_plain(int S_q, int S_kv, int H, int dim, int tail_dim,
+                          int topk, int kv_group, float sm_scale,
+                          bool return_lse, const void* q, const void* kv,
+                          const void* indices, void* out, void* lse,
+                          void* stream) {
+  int bq = 0, th = 0, bi = 0, ii = 0;
+  if (!dsa_tile_from_store(S_q, H, dim, tail_dim, topk, &bq, &bi, &ii))
+    ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
+  (void)th;
+  dsa_sparse_fwd_with_tile(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
+                           sm_scale, return_lse, q, kv, indices, out, lse,
+                           bq, bi, ii, 0, stream);
+}
+}  // namespace
 
 void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
                     int topk, int kv_group, int block_I, int inner_iter,
@@ -287,11 +844,47 @@ void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
   if (!dsa_tile_from_store(S_q, H, dim, tail_dim, topk, &bq, &bi, &ii))
     ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
   (void)th;
-  (void)block_I;
-  (void)inner_iter;
-  dsa_sparse_fwd_with_tile(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
-                           sm_scale, return_lse, q, kv, indices, out, lse,
-                           bq, bi, ii, 0, stream);
+
+  // Issue #155 auto split (see the block comment above dsa_auto_split_scratch):
+  // route the decode regime (dsa_sparse_fwd_split_for > 1, i.e. the plain
+  // grid under-fills the CUs) through the split+combine machinery with the
+  // internally managed scratch. The split_for recommendation already
+  // consults the tuning store and carries the prefill early-out (plain grid
+  // >= CUs -> 1), so prefill / wide-H shapes are untouched. A scratch
+  // allocation failure falls back to the plain ladder -- an OOM must never
+  // break serving.
+  static const int auto_split_mode = [] {
+    const char* e = std::getenv("VK_DSA_DECODE_SPLIT");
+    return e ? std::atoi(e) : 1;
+  }();
+  if (auto_split_mode != 0 && S_q > 0 && H > 0 && topk > 0) {
+    static const int num_cu = [] {
+      int dev = 0, n = 0;
+      if (hipGetDevice(&dev) != hipSuccess ||
+          hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount,
+                                dev) != hipSuccess || n <= 0)
+        return 228;  // gfx942 CU count, same default as dsa_sparse_fwd_split_for
+      return n;
+    }();
+    int split_kv = ::vkernels::kernels::dsa_sparse_fwd_split_for(
+        S_q, H, topk, block_I, num_cu, dim, tail_dim);
+    if (split_kv > topk) split_kv = topk;  // defensive: every split >= 1 key
+    if (split_kv > 1) {
+      const int d_v = dim - tail_dim;
+      float* part_out = nullptr;
+      float* part_lse = nullptr;
+      if (dsa_auto_split_scratch((size_t)S_q * H * split_kv * d_v,
+                                 (size_t)S_q * H * split_kv, &part_out,
+                                 &part_lse)) {
+        dsa_sparse_fwd_split_run(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
+                                 sm_scale, return_lse, split_kv, q, kv, indices,
+                                 out, lse, part_out, part_lse, bq, stream);
+        return;
+      }
+    }
+  }
+  dsa_sparse_fwd_plain(S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale,
+                       return_lse, q, kv, indices, out, lse, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,6 +1723,53 @@ bool launch_partial_auto(const void* q, const void* kv, const void* indices,
 }
 }  // namespace
 
+// Issue #155: the split dispatch itself (partial ladder + combine launch),
+// factored out of dsa_sparse_fwd_split so the auto decode path in
+// dsa_sparse_fwd runs the EXACT same kernel selection. `bq` is the launch
+// tile the caller's store/config selected (the ladder clamps it to the
+// supported BQ set, exactly like dsa_sparse_fwd_with_tile).
+void dsa_sparse_fwd_split_run(int S_q, int S_kv, int H, int dim, int tail_dim,
+                              int topk, int kv_group, float sm_scale,
+                              bool return_lse, int split_kv, const void* q,
+                              const void* kv, const void* indices, void* out,
+                              void* lse, void* partial_out, void* partial_lse,
+                              int bq, void* stream) {
+  // The partial kernel now double-buffers its key tiles in LDS (issue
+  // #80) or runs the vectorized register-batched serial variant with the
+  // optional fused combine (issue #137); block_I/inner_iter remain
+  // cached-pipeline params. launch_partial_auto reports whether the
+  // separate combine launch is still required (the fused vec path already
+  // wrote out/lse).
+  bool need_combine = true;
+  if (bq <= 1)
+    need_combine = launch_partial_auto<1>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
+  else if (bq <= 2)
+    need_combine = launch_partial_auto<2>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
+  else if (bq <= 4)
+    need_combine = launch_partial_auto<4>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
+  else
+    need_combine = launch_partial_auto<8>(
+        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
+        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
+        static_cast<hipStream_t>(stream));
+  if (!need_combine) return;
+  dim3 cgrid(S_q, H);
+  dsa_sparse_fwd_combine_kernel<<<cgrid, 64, 0, static_cast<hipStream_t>(stream)>>>(
+      reinterpret_cast<const float*>(partial_out),
+      reinterpret_cast<const float*>(partial_lse),
+      reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
+      S_q, H, dim - tail_dim, split_kv, return_lse);
+}
+
 void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
                           int topk, int kv_group, int block_I, int inner_iter,
                           float sm_scale, bool return_lse, int split_kv,
@@ -1163,9 +1803,12 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
   VK_EXPECTS(!return_lse || lse != nullptr, "lse must not be null");
   if (split_kv == 1) {
     // Degenerate split: identical to the plain forward, no scratch needed.
-    dsa_sparse_fwd(S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I,
-                   inner_iter, sm_scale, return_lse, q, kv, indices, out,
-                   lse);
+    // The plain ladder (NOT dsa_sparse_fwd) deliberately: an explicit split
+    // request of 1 means "no split", so the issue-#155 auto-split gate must
+    // not re-engage here.
+    dsa_sparse_fwd_plain(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
+                         sm_scale, return_lse, q, kv, indices, out, lse,
+                         /*stream=*/nullptr);
     return;
   }
   VK_EXPECTS(partial_out != nullptr && partial_lse != nullptr,
@@ -1179,42 +1822,9 @@ void dsa_sparse_fwd_split(int S_q, int S_kv, int H, int dim, int tail_dim,
   if (!dsa_tile_from_store(S_q, H, dim, tail_dim, topk, &bq, &bi, &ii))
     ::vkernels::kernels::dsa_config_for(S_q, H, dim, topk, &bq, &th, &bi, &ii);
   (void)th;
-  // The partial kernel now double-buffers its key tiles in LDS (issue
-  // #80) or runs the vectorized register-batched serial variant with the
-  // optional fused combine (issue #137); block_I/inner_iter remain
-  // cached-pipeline params. launch_partial_auto reports whether the
-  // separate combine launch is still required (the fused vec path already
-  // wrote out/lse).
-  (void)block_I;
-  (void)inner_iter;
-  bool need_combine = true;
-  if (bq <= 1)
-    need_combine = launch_partial_auto<1>(
-        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
-        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
-        static_cast<hipStream_t>(stream));
-  else if (bq <= 2)
-    need_combine = launch_partial_auto<2>(
-        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
-        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
-        static_cast<hipStream_t>(stream));
-  else if (bq <= 4)
-    need_combine = launch_partial_auto<4>(
-        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
-        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
-        static_cast<hipStream_t>(stream));
-  else
-    need_combine = launch_partial_auto<8>(
-        q, kv, indices, partial_out, partial_lse, S_q, S_kv, H, dim,
-        tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
-        static_cast<hipStream_t>(stream));
-  if (!need_combine) return;
-  dim3 cgrid(S_q, H);
-  dsa_sparse_fwd_combine_kernel<<<cgrid, 64, 0, static_cast<hipStream_t>(stream)>>>(
-      reinterpret_cast<const float*>(partial_out),
-      reinterpret_cast<const float*>(partial_lse),
-      reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
-      S_q, H, d_v, split_kv, return_lse);
+  dsa_sparse_fwd_split_run(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
+                           sm_scale, return_lse, split_kv, q, kv, indices,
+                           out, lse, partial_out, partial_lse, bq, stream);
 }
 
 // ---------------------------------------------------------------------------

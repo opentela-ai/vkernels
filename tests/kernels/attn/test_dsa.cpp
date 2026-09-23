@@ -10,11 +10,19 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <fstream>
 #include <limits>
 #include <random>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
+#include "vkernels/core/tuning.hpp"
 #include "vkernels/kernels/dsa.hpp"
 
 using vkernels::kernels::dsa_config_for;
@@ -739,4 +747,144 @@ TEST(DsaSparse, SplitFor) {
   EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 0, 64, 228), 1);
   EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 0, 228), 32);  // block_I unused
   EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 0), 32);   // default CUs
+}
+
+namespace {
+
+// Store-exercising tests run against their own temp store with a pinned
+// arch; the previous env is restored on scope exit so the suite's other
+// tests keep seeing the compiled-in formulas.
+struct TuningStoreEnv {
+  std::string dir;
+  const char* saved_cache;
+  const char* saved_arch;
+  explicit TuningStoreEnv(const char* tag) {
+    saved_cache = ::getenv("VKERNELS_TUNING_CACHE");
+    saved_arch = ::getenv("VKERNELS_TUNING_ARCH");
+    const char* tmp = ::getenv("TMPDIR");
+    dir = std::string(tmp && *tmp ? tmp : "/tmp") + "/vk_dsa_tuning_" + tag
+          + "_" + std::to_string(::time(nullptr));
+    ::setenv("VKERNELS_TUNING_CACHE", dir.c_str(), 1);
+    ::setenv("VKERNELS_TUNING_ARCH", "gfx942", 1);
+    vkernels::core::tuning::reset_for_test();
+  }
+  ~TuningStoreEnv() {
+    if (saved_cache)
+      ::setenv("VKERNELS_TUNING_CACHE", saved_cache, 1);
+    else
+      ::unsetenv("VKERNELS_TUNING_CACHE");
+    if (saved_arch)
+      ::setenv("VKERNELS_TUNING_ARCH", saved_arch, 1);
+    else
+      ::unsetenv("VKERNELS_TUNING_ARCH");
+    vkernels::core::tuning::reset_for_test();
+    if (DIR* d = opendir(dir.c_str())) {
+      while (const dirent* de = readdir(d)) {
+        const std::string name = de->d_name;
+        if (name != "." && name != "..")
+          (void)::remove((dir + "/" + name).c_str());
+      }
+      closedir(d);
+    }
+    (void)::rmdir(dir.c_str());
+  }
+};
+
+}  // namespace
+
+// The tuning-store reader for the sparse-attention tile (issue #154):
+// a hit overrides the compiled-in tile defaults, every corrupt shape of
+// record is rejected (never narrowed into a plausible-looking config),
+// and a disabled store leaves the outputs untouched.
+TEST(dsa, tile_from_store) {
+  namespace tuning = vkernels::core::tuning;
+  using vkernels::kernels::dsa_tile_from_store;
+
+  // Store disabled (test_main's default): early-out, outputs untouched.
+  {
+    ::setenv("VKERNELS_TUNING_CACHE", "off", 1);
+    tuning::reset_for_test();
+    int bq = 7, block_I = 8, inner_iter = 9;
+    EXPECT_FALSE(dsa_tile_from_store(1, 64, 576, 512, 2048, &bq, &block_I,
+                                     &inner_iter));
+    EXPECT_EQ(bq, 7);
+    EXPECT_EQ(block_I, 8);
+    EXPECT_EQ(inner_iter, 9);
+  }
+
+  TuningStoreEnv env("tile");
+  const int S_q = 1, H = 64, dim = 576, tail_dim = 512, topk = 2048;
+  int bq = 0, block_I = 0, inner_iter = 0;
+
+  // Enabled store, no record for the key yet -> miss.
+  EXPECT_FALSE(
+      dsa_tile_from_store(S_q, H, dim, tail_dim, topk, &bq, &block_I,
+                          &inner_iter));
+
+  // A well-formed record is honored verbatim.
+  tuning::persist("dsa_sparse_fwd_tile", {S_q, H, dim, tail_dim, topk},
+                  {{"bq", 2}, {"block_I", 64}, {"inner_iter", 1}}, "test");
+  EXPECT_TRUE(
+      dsa_tile_from_store(S_q, H, dim, tail_dim, topk, &bq, &block_I,
+                          &inner_iter));
+  EXPECT_EQ(bq, 2);
+  EXPECT_EQ(block_I, 64);
+  EXPECT_EQ(inner_iter, 1);
+
+  // Key miss (one component differs).
+  EXPECT_FALSE(
+      dsa_tile_from_store(S_q, H, dim, tail_dim, topk + 1, &bq, &block_I,
+                          &inner_iter));
+
+  // Record missing a param -> rejected.
+  tuning::persist("dsa_sparse_fwd_tile", {S_q, H, dim, tail_dim + 1, topk},
+                  {{"bq", 4}}, "test");
+  EXPECT_FALSE(
+      dsa_tile_from_store(S_q, H, dim, tail_dim + 1, topk, &bq, &block_I,
+                          &inner_iter));
+
+  // bq outside {1, 2, 4, 8} -> rejected.
+  tuning::persist("dsa_sparse_fwd_tile", {S_q, H, dim, tail_dim + 2, topk},
+                  {{"bq", 3}, {"block_I", 64}, {"inner_iter", 1}}, "test");
+  EXPECT_FALSE(
+      dsa_tile_from_store(S_q, H, dim, tail_dim + 2, topk, &bq, &block_I,
+                          &inner_iter));
+
+  // block_I > topk -> rejected.
+  tuning::persist("dsa_sparse_fwd_tile", {S_q, H, dim, tail_dim + 3, topk},
+                  {{"bq", 2}, {"block_I", 4096}, {"inner_iter", 1}}, "test");
+  EXPECT_FALSE(
+      dsa_tile_from_store(S_q, H, dim, tail_dim + 3, topk, &bq, &block_I,
+                          &inner_iter));
+
+  // topk % (block_I * inner_iter) != 0 -> rejected.
+  tuning::persist("dsa_sparse_fwd_tile", {S_q, H, dim, tail_dim + 4, topk},
+                  {{"bq", 2}, {"block_I", 96}, {"inner_iter", 1}}, "test");
+  EXPECT_FALSE(
+      dsa_tile_from_store(S_q, H, dim, tail_dim + 4, topk, &bq, &block_I,
+                          &inner_iter));
+}
+
+// The split selector consults the store before its heuristic: a record
+// overrides the compiled-in formula, other keys keep the formula.
+TEST(dsa, split_for_store_override) {
+  namespace tuning = vkernels::core::tuning;
+  TuningStoreEnv env("split");
+  const int formula = dsa_sparse_fwd_split_for(1, 64, 2048, 64, 228);
+  tuning::persist("dsa_sparse_fwd_split_for", {1, 64, 2048, 64, 228},
+                  {{"split", 3}}, "test");
+  EXPECT_EQ(dsa_sparse_fwd_split_for(1, 64, 2048, 64, 228), 3);
+  EXPECT_NE(formula, 3);  // otherwise the override is unproven at this key
+  // A different key still takes the compiled-in formula (>= 1 by contract).
+  EXPECT_GE(dsa_sparse_fwd_split_for(2, 64, 2048, 64, 228), 1);
+
+  // Tile-aware path (issue #155): with dim/tail_dim supplied AND a
+  // dsa_sparse_fwd_tile record in the store, the heuristic reasons about
+  // the store's bq — the grid dispatch will actually launch — instead of
+  // the compiled-in tile's.
+  tuning::persist("dsa_sparse_fwd_tile", {4, 64, 576, 512, 2048},
+                  {{"bq", 4}, {"block_I", 64}, {"inner_iter", 1}}, "test");
+  EXPECT_GE(dsa_sparse_fwd_split_for(4, 64, 2048, 64, 228, 576, 512), 1);
+  // The same key with dim unset (no tile consultation) is still sane.
+  EXPECT_GE(dsa_sparse_fwd_split_for(4, 64, 2048, 64, 228), 1);
 }

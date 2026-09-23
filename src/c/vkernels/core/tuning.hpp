@@ -56,8 +56,10 @@ bool enabled();
 //
 // `VKERNELS_TUNING_ARCH` overrides the query — the test seam (host-only
 // CI exercises the full store round trip) and the inspection seam (read
-// another arch's artifact on this box).
-const std::string& device_arch();
+// another arch's artifact on this box). The override is honored whenever
+// set (re-read per call, so tests can toggle it); the device query itself
+// runs once, on the first override-free call, and is cached from then on.
+std::string device_arch();
 
 // Parse one `.tune` body (loader + unit tests).
 std::vector<Entry> parse_body(const std::string& text);
