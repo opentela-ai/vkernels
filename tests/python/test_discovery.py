@@ -100,6 +100,11 @@ EXPECTED_KERNELS = [
     ("gemm_bf16_cpu", "gemm_bf16"),
     ("gemm_bf16_config_for", "gemm_bf16"),
     ("gemm_bf16", "gemm_bf16"),
+    # Issue #156: the decode-GEMV split-K family shares the gemm_bf16
+    # host namespace, declared after the host gemm_bf16.
+    ("gemm_fp8_block_splitk_with_config", "gemm_bf16"),
+    ("gemv_decode_bf16_splitk", "gemm_bf16"),
+    ("gemv_decode_fp8_splitk", "gemm_bf16"),
     # Same two-namespace model as dsa.hpp: the CUDA wmma GEMM (PR #30)
     # declares gemm_bf16 a second time in vkernels::kernels::cuda.
     ("gemm_bf16", "gemm_bf16"),

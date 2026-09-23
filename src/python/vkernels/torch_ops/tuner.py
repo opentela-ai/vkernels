@@ -406,7 +406,29 @@ def tune(names=(), *, store_dir=None, all=False) -> list[dict]:
                 reports.append(row)
                 continue
             if entry.tier == "triton":
-                _resolve_sweep(entry.sweep)()
+                try:
+                    sweep = _resolve_sweep(entry.sweep)
+                    sweep()
+                except ImportError as exc:
+                    # A sweep that cannot import on this host (typically a
+                    # torch-free box — the harnesses import torch lazily
+                    # inside the sweep) is the triton-tier analogue of the
+                    # toolkit mismatch above: a skip in batch runs, a clean
+                    # failure when asked for by name. A missing import on a
+                    # torch-capable host is a real bug and stays one.
+                    try:
+                        import torch  # noqa: F401
+                    except ImportError:
+                        if all:
+                            row.update(ok=True, skipped=True, detail=(
+                                f"skipped: sweep harness unavailable ({exc})"))
+                            reports.append(row)
+                            continue
+                        row.update(ok=False, detail=(
+                            f"sweep harness unavailable: {exc}"))
+                        reports.append(row)
+                        continue
+                    raise
                 store_files = entry.store_names or (entry.name,)
                 n = sum(_triton_record_count(k, store) for k in store_files)
                 row.update(ok=True, detail=(

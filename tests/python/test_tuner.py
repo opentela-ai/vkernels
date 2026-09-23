@@ -130,6 +130,9 @@ def test_tune_native_missing_bench(store, monkeypatch):
     import vkernels.torch_ops.tuner as tuner_mod
 
     monkeypatch.setattr(tuner_mod, "find_bench_binary", lambda name: None)
+    # The bench check sits behind the toolkit check, which needs torch;
+    # bypass it so this test pins the bench-missing path on any host.
+    monkeypatch.setattr(tuner_mod, "_toolkit_mismatch", lambda toolkit: None)
     (report,) = tune(["dsa_topk_logits_split_for"], store_dir=store)
     assert report["ok"] is False
     assert "bench not built" in report["detail"]
