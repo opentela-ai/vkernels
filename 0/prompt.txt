@@ -1,0 +1,25 @@
+Help me consolidate the worktrees and branches into main branch
+
+---
+
+Yes can you validate and report the performance on mi300a by ssh beverin?
+
+---
+
+what's the current main bottleneck and time spent on?
+
+---
+
+I meant performance wise, what's the biggest bottleneck now?
+
+---
+
+Can you file an issue of both cases, and spawn sub-agents to work on both of them?
+
+---
+
+check progress
+
+---
+
+yes, squash merge them
