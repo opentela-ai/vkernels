@@ -32,6 +32,7 @@ EXPECTED_KERNELS = [
     # dsa_sparse_fwd_cpu (always compiled) + the HIP dsa_sparse_fwd[_with_tile].
     ("dsa_sparse_fwd_cpu", "dsa"),
     ("dsa_config_for", "dsa"),
+    ("dsa_tile_from_store", "dsa"),
     # DSA paged-MQA gated top-k logits (issue #51, the kpool>1 indexer path):
     # the FIRST stage feeding dsa_sparse_fwd. dsa_topk_logits_cpu is the
     # always-compiled host reference; dsa_topk_logits_fits_lds is the
@@ -104,6 +105,7 @@ EXPECTED_KERNELS = [
     ("gemm_bf16", "gemm_bf16"),
     ("glm_fp8_block_gemv_cpu", "glm_moe"),
     ("glm_e4m3_to_f32_cpu", "glm_moe"),
+    ("gemv_pick_sk", "glm_moe"),
     ("glm_fp8_gemv_pick_sk", "glm_moe"),
     ("glm_fp8_block_gemv", "glm_moe"),
     ("glm_fp8_block_gemv_with_scratch", "glm_moe"),
@@ -139,7 +141,9 @@ EXPECTED_KERNELS = [
     ("mla_fwd_cpu", "mla"),
     ("mla_config_for", "mla"),
     ("mla_fwd_split_for", "mla"),
+    ("mla_prefill_heads_per_block", "mla"),
     ("mla_fwd", "mla"),
+    ("mla_fwd_with_split", "mla"),
     ("mla_fwd_with_tile", "mla"),
     ("direct_lds_fill_bf16", "moe"),
     ("fp4_to_bf16_dequant", "moe"),
@@ -193,6 +197,15 @@ EXPECTED_COMM = [
     ("CrossNodeKvAccess", "struct"),
     ("CrossNodeKvRoute", "struct"),
     ("select_cross_node_kv_route", "function"),
+    # cross_node_kv.hpp (issue #152): the striped multi-lane plan variant —
+    # stripe geometry + per-chunk links declared with the restore/donate
+    # plans they parameterise, between route selection and the base plans.
+    ("CrossNodeKvStripeConfig", "struct"),
+    ("CrossNodeKvStripeChunk", "struct"),
+    ("compute_cross_node_kv_stripes", "function"),
+    ("make_striped_byte_links", "function"),
+    ("CrossNodeKvStripedRestorePlan", "class"),
+    ("CrossNodeKvStripedDonatePlan", "class"),
     ("CrossNodeKvRestorePlan", "class"),
     ("CrossNodeKvDonatePlan", "class"),
     # fabric_import.hpp: the transport classification + FabricHandle /
