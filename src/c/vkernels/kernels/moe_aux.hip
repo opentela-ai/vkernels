@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <mutex>
 
 #if VKERNELS_HAS_HIP
@@ -167,6 +168,88 @@ __global__ void moe_sort_kernel(
   }
 }
 
+// ====================================================================== 
+// Fusion — mxfp4_moe_sorted_quant: gather + quantize in one kernel
+//   grid  = EM * n_groups   (one block per (sorted row, group))
+//   block = group_size (≤ 256)
+// Per-group math is IDENTICAL to mxfp4_moe_quant_kernel (same amax tree
+// reduction over the same bf16 values, same sb/scale expression, same
+// nibble staging), so the outputs are bit-identical to quantizing the
+// sort output. The only difference is the source row: A[sorted_ids[r] /
+// top_k] for real rows; for padding rows (flat outside [0, M*top_k)) the
+// implicit all-zero row, which naturally produces the 0xFF scale + zero
+// nibbles that quantizing the zeroed sort output would.
+// ======================================================================
+__global__ void mxfp4_moe_sorted_quant_kernel(
+    const uint16_t* __restrict__ A, const int32_t* __restrict__ sorted_ids,
+    uint8_t* __restrict__ packed, uint8_t* __restrict__ scales, int hidden,
+    int n_groups, int group_size, int top_k, int n_flat) {
+  int rg = blockIdx.x;
+  int r = rg / n_groups;
+  int g = rg % n_groups;
+  int t = threadIdx.x;  // 0 .. group_size-1
+  int base = g * group_size;
+
+  int flat = sorted_ids[r];
+  const bool real = (flat >= 0 && flat < n_flat);
+  const uint16_t* src =
+      real ? (A + (size_t)(flat / top_k) * hidden) : nullptr;
+
+  __shared__ uint8_t s_nib[256];  // group_size ≤ 256
+
+  float a = (t < group_size)
+                ? __builtin_fabsf(
+                      bf16_to_f32(real ? src[base + t] : (uint16_t)0))
+                : 0.0f;
+  // Block-wide amax reduction (group_size ≤ 256 → single __syncthreads tree).
+  // Same statement order as mxfp4_moe_quant_kernel.
+  __shared__ float s_red[256];
+  s_red[t] = a;
+  __syncthreads();
+  for (int s = group_size / 2; s > 0; s >>= 1) {
+    if (t < s) s_red[t] = (s_red[t] > s_red[t + s]) ? s_red[t] : s_red[t + s];
+    __syncthreads();
+  }
+  float amax = s_red[0];
+  __syncthreads();
+
+  // Exactly mirrors the CPU reference and mxfp4_moe_quant_kernel: a zero or
+  // non-finite amax produces the 0xFF (zero) scale and zero nibbles for the
+  // whole group; the scale byte is clamped to [1, 254] (never 0).
+  uint8_t sb;
+  float scale;
+  if (!(amax > 0.0f) || !__builtin_isfinite(amax)) {
+    sb = 0xFF;
+    scale = 0.0f;
+  } else {
+    int e = ceil_log2_f(amax / 3.0f);
+    int s = e + 127;
+    if (s < 1) s = 1;
+    if (s > 254) s = 254;
+    sb = static_cast<uint8_t>(s);
+    scale = ue8m0_decode(sb);
+  }
+
+  if (t == 0) scales[(size_t)r * n_groups + g] = sb;
+  if (sb == 0xFF) {
+    if (t < group_size / 2)
+      packed[(size_t)r * (hidden / 2) + base / 2 + t] = 0;
+    return;
+  }
+
+  // Each thread quantizes its element into shared, then pairs pack a byte.
+  // Only reached for real rows (padding ⇒ amax == 0 ⇒ sb == 0xFF above), so
+  // `src` is valid here.
+  if (t < group_size)
+    s_nib[t] = f32_to_fp4_nib(bf16_to_f32(src[base + t]) / scale);
+  __syncthreads();
+  if (t < group_size / 2) {
+    uint8_t lo = s_nib[2 * t] & 0x0F;
+    uint8_t hi = s_nib[2 * t + 1] & 0x0F;
+    packed[(size_t)r * (hidden / 2) + base / 2 + t] = (hi << 4) | lo;
+  }
+}
+
 // ======================================================================
 // #19 — mxfp4_moe_scatter_reduce (float32 partials) — #145 atomic-free
 //   inv build:  grid = ceil(EM/256), block = 256; inv[sorted_ids[r]] = r
@@ -253,6 +336,23 @@ int32_t* inv_scratch(size_t n_flat) {
   }
   return g_inv_buf;
 }
+
+// Gate-off fallback scratch for mxfp4_moe_sorted_quant (VK_MOE_AUX_FUSED_QUANT=0):
+// a cached [EM, hidden] bf16 buffer for the proven sort → quant composition.
+std::mutex g_sort_mu;
+uint16_t* g_sort_buf = nullptr;
+size_t g_sort_cap = 0;  // elements
+
+uint16_t* sorted_scratch(size_t n) {
+  std::lock_guard<std::mutex> lk(g_sort_mu);
+  if (n > g_sort_cap) {
+    if (g_sort_buf) (void)hipFree(g_sort_buf);
+    hipError_t err = hipMalloc(&g_sort_buf, n * sizeof(uint16_t));
+    VK_ENSURES(err == hipSuccess, "moe_aux sorted-quant scratch hipMalloc failed");
+    g_sort_cap = n;
+  }
+  return g_sort_buf;
+}
 }  // namespace
 
 // #145 — build the inverse permutation inv[sorted_ids[r]] = r for real rows.
@@ -297,6 +397,35 @@ void mxfp4_moe_sort_scales(const uint8_t* scales, const int32_t* sorted_ids,
       scales, sorted_ids, scales_sorted, n_groups, M, top_k, 1);
   hipError_t err = hipGetLastError();
   VK_ENSURES(err == hipSuccess, "mxfp4_moe_sort_scales launch failed");
+}
+
+// Fusion — gather + quantize in one launch. Env kill-switch
+// VK_MOE_AUX_FUSED_QUANT=0 routes to the proven sort → quant composition
+// (quantizing the already-sorted rows makes sort_scales unnecessary, so the
+// fallback is 2 launches instead of 3) for A/B on gfx942; the default (1)
+// is the fused kernel, which is bit-identical to that composition.
+void mxfp4_moe_sorted_quant(const uint16_t* A, const int32_t* sorted_ids,
+                            uint8_t* packed, uint8_t* scales,
+                            int M, int hidden, int group_size, int top_k,
+                            int EM) {
+  if (M <= 0 || hidden <= 0 || EM <= 0) return;
+  static const int fused_mode = [] {
+    const char* e = std::getenv("VK_MOE_AUX_FUSED_QUANT");
+    return e ? std::atoi(e) : 1;
+  }();
+  if (fused_mode == 0) {
+    uint16_t* scratch = sorted_scratch((size_t)EM * hidden);
+    mxfp4_moe_sort(A, sorted_ids, scratch, M, hidden, top_k, EM);
+    mxfp4_moe_quant(scratch, packed, scales, EM, hidden, group_size);
+    return;
+  }
+  int n_groups = hidden / group_size;
+  int gs = group_size < 256 ? group_size : 256;
+  mxfp4_moe_sorted_quant_kernel<<<dim3(EM * n_groups), dim3(gs)>>>(
+      A, sorted_ids, packed, scales, hidden, n_groups, group_size, top_k,
+      M * top_k);
+  hipError_t err = hipGetLastError();
+  VK_ENSURES(err == hipSuccess, "mxfp4_moe_sorted_quant launch failed");
 }
 
 // #145 — token-major gather combine: each block owns one output token and

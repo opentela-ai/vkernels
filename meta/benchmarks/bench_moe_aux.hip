@@ -43,6 +43,9 @@ void mxfp4_moe_sort(const uint16_t* A, const int32_t* sorted_ids,
 void mxfp4_moe_sort_scales(const uint8_t* scales, const int32_t* sorted_ids,
                            uint8_t* scales_sorted, int M, int n_groups,
                            int top_k, int EM);
+void mxfp4_moe_sorted_quant(const uint16_t* A, const int32_t* sorted_ids,
+                            uint8_t* packed, uint8_t* scales, int M,
+                            int hidden, int group_size, int top_k, int EM);
 void mxfp4_moe_build_inv(const int32_t* sorted_ids, int32_t* inv,
                          int M, int top_k, int EM);
 void mxfp4_moe_scatter_reduce(const float* partial, const float* topk_w,
@@ -193,6 +196,15 @@ int main() {
     vkernels::kernels::mxfp4_moe_quant(hpbf.data(), hpq.data(), hps.data(),
                                        EM, hidden, gs);
 
+    // Fusion candidate (mxfp4_moe_sorted_quant): host reference outputs for
+    // the bit-exact parity gate (sort -> quant composition, the oracle path).
+    std::vector<uint8_t> hPk_ref((size_t)EM * hidden / 2),
+        hSc_ref((size_t)EM * n_groups);
+    vkernels::kernels::mxfp4_moe_sort(hA.data(), h_sids.data(), hA_sorted.data(),
+                                      M, hidden, top_k, EM);
+    vkernels::kernels::mxfp4_moe_quant(hA_sorted.data(), hPk_ref.data(),
+                                       hSc_ref.data(), EM, hidden, gs);
+
     // Device buffers.
     uint16_t *dA, *dA_sorted, *dPbf;
     uint8_t *dPacked, *dScales, *dScalesSorted, *dPq, *dPs;
@@ -211,6 +223,9 @@ int main() {
     CK(hipMalloc(&dTw, (size_t)EM * 4), "mTw");
     CK(hipMalloc(&dOut, (size_t)M * hidden * 4), "mOut");
     CK(hipMalloc(&dPartial, (size_t)EM * hidden * 4), "mPartial");
+    uint8_t *dPackedS, *dScalesS;
+    CK(hipMalloc(&dPackedS, (size_t)EM * hidden / 2), "mPackedS");
+    CK(hipMalloc(&dScalesS, (size_t)EM * n_groups), "mScalesS");
     CK(hipMemcpy(dA, hA.data(), (size_t)M * hidden * 2, hipMemcpyHostToDevice), "cA");
     CK(hipMemcpy(dPbf, hpbf.data(), (size_t)EM * hidden * 2, hipMemcpyHostToDevice), "cPbf");
     CK(hipMemcpy(dPq, hpq.data(), (size_t)EM * hidden / 2, hipMemcpyHostToDevice), "cPq");
@@ -218,6 +233,28 @@ int main() {
     CK(hipMemcpy(dSids, h_sids.data(), (size_t)EM * 4, hipMemcpyHostToDevice), "cSids");
     CK(hipMemcpy(dTw, h_tws.data(), (size_t)EM * 4, hipMemcpyHostToDevice), "cTw");
     CK(hipMemcpy(dPartial, hpartial.data(), (size_t)EM * hidden * 4, hipMemcpyHostToDevice), "cPartial");
+
+    // Parity gate: the fused op must be bit-identical to the sort -> quant
+    // composition (packed AND scales) before it is timed. Run with
+    // VK_MOE_AUX_FUSED_QUANT toggled to cover both gate positions.
+    CK(hipMemset(dPackedS, 0x55, (size_t)EM * hidden / 2), "zPackedS");
+    CK(hipMemset(dScalesS, 0x55, (size_t)EM * n_groups), "zScalesS");
+    mxfp4_moe_sorted_quant(dA, dSids, dPackedS, dScalesS, M, hidden, gs,
+                           top_k, EM);
+    {
+      std::vector<uint8_t> gpk((size_t)EM * hidden / 2),
+          gsc((size_t)EM * n_groups);
+      CK(hipMemcpy(gpk.data(), dPackedS, gpk.size(), hipMemcpyDeviceToHost), "gPk");
+      CK(hipMemcpy(gsc.data(), dScalesS, gsc.size(), hipMemcpyDeviceToHost), "gSc");
+      bool ok = (gpk == hPk_ref) && (gsc == hSc_ref);
+      std::printf("%6d %8d  %-22s  parity %s\n", M, EM,
+                  "mxfp4_moe_sorted_quant", ok ? "OK" : "FAIL");
+      if (!ok) {
+        std::fprintf(stderr, "FATAL: fused sorted_quant parity failed "
+                             "(M=%d EM=%d)\n", M, EM);
+        return 1;
+      }
+    }
 
     using namespace vkernels::kernels::hip;
 
@@ -241,6 +278,19 @@ int main() {
       mxfp4_moe_scatter_reduce_q(dPq, dPs, dTw, dSids, dOut, M, hidden, top_k,
                                  EM, gs, dInv);
     };
+    // Fusion candidate: single-launch gather+quantize.
+    auto run_sorted_quant = [&]() {
+      mxfp4_moe_sorted_quant(dA, dSids, dPackedS, dScalesS, M, hidden, gs,
+                             top_k, EM);
+    };
+    // The 3-launch chain it replaces (same A_sorted / scales buffers as the
+    // standalone rows above, EM-row quant like the serving pipeline).
+    auto run_chain = [&]() {
+      mxfp4_moe_sort(dA, dSids, dA_sorted, M, hidden, top_k, EM);
+      mxfp4_moe_quant(dA_sorted, dPackedS, dScalesS, EM, hidden, gs);
+      mxfp4_moe_sort_scales(dScales, dSids, dScalesSorted, M, n_groups, top_k,
+                            EM);
+    };
 
     // Logical bytes (read once + write once) for each op. atomicAdd traffic
     // at L2 (small outputs) is not counted -- these are the bytes that must
@@ -250,6 +300,14 @@ int main() {
     size_t bss_in = (size_t)M * top_k * n_groups, bss_out = (size_t)EM * n_groups;
     size_t bsc_in = (size_t)EM * hidden * 4, bsc_out = (size_t)M * hidden * 4;
     size_t bsq_in = (size_t)EM * hidden / 2 + (size_t)EM * n_groups, bsq_out = (size_t)M * hidden * 4;
+    // Fused gather+quant: gather reads use the same convention as the sort
+    // row (M*top_k row-reads, so the %L2 comparison is apples-to-apples);
+    // it writes only the packed+scales outputs (no A_sorted round-trip).
+    size_t bf_in = (size_t)M * top_k * hidden * 2;
+    size_t bf_out = (size_t)EM * hidden / 2 + (size_t)EM * n_groups;
+    // 3-launch chain: sort + EM-row quant + sort_scales.
+    size_t bchain_in = bs_in + (size_t)EM * hidden * 2 + bss_in;
+    size_t bchain_out = bs_out + (size_t)EM * hidden / 2 + (size_t)EM * n_groups + bss_out;
 
     auto row = [&](const char* name, const Bench& r, size_t in, size_t out) {
       double gb = hbm_gbs(in + out, r.median_us);
@@ -262,6 +320,10 @@ int main() {
     row("mxfp4_moe_quant", bench_us(run_quant, s, t), bq_in, bq_out);
     row("mxfp4_moe_sort", bench_us(run_sort, s, t), bs_in, bs_out);
     row("mxfp4_moe_sort_scales", bench_us(run_sort_s, s, t), bss_in, bss_out);
+    row("mxfp4_moe_sorted_quant", bench_us(run_sorted_quant, s, t), bf_in,
+        bf_out);
+    row("sort+quant+sort_scales", bench_us(run_chain, s, t), bchain_in,
+        bchain_out);
     row("mxfp4_moe_scatter_reduce", bench_us(run_scatter, s, t), bsc_in, bsc_out);
     row("mxfp4_moe_scatter_reduce_q", bench_us(run_scatter_q, s, t), bsq_in,
         bsq_out);
@@ -270,7 +332,7 @@ int main() {
     hipFree(dA); hipFree(dA_sorted); hipFree(dPbf);
     hipFree(dPacked); hipFree(dScales); hipFree(dScalesSorted);
     hipFree(dPq); hipFree(dPs); hipFree(dSids); hipFree(dInv); hipFree(dTw);
-    hipFree(dOut); hipFree(dPartial);
+    hipFree(dOut); hipFree(dPartial); hipFree(dPackedS); hipFree(dScalesS);
   }
 
   hipEventDestroy(s);

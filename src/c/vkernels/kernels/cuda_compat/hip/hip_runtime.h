@@ -63,6 +63,7 @@
 #define hipMemcpyDeviceToHost cudaMemcpyDeviceToHost
 #define hipDeviceSynchronize cudaDeviceSynchronize
 #define hipGetErrorString cudaGetErrorString
+#define hipGetLastError cudaGetLastError
 
 // ---- events ---------------------------------------------------------------
 #define hipEventCreate cudaEventCreate

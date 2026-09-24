@@ -87,7 +87,8 @@ if(VKERNELS_HAS_CUDA)
   # Guarded on !HIP: on a machine with both toolkits the HIP branch below
   # already owns these sources.
   if(NOT VKERNELS_HAS_HIP)
-    set(VKERNELS_CUDA_HIP_SOURCES vkernels/kernels/dsa_kpool.hip)
+    set(VKERNELS_CUDA_HIP_SOURCES vkernels/kernels/dsa_kpool.hip
+                                  vkernels/kernels/moe_aux.hip)
     set_source_files_properties(${VKERNELS_CUDA_HIP_SOURCES} PROPERTIES
       LANGUAGE CUDA COMPILE_DEFINITIONS VKERNELS_HAS_HIP=1)
     target_sources(vkernels PRIVATE ${VKERNELS_CUDA_HIP_SOURCES})

@@ -778,6 +778,26 @@ def mxfp4_moe_sort_scales(
     return out.ravel()
 
 
+def mxfp4_moe_sorted_quant(
+    A, sorted_ids, M: int, hidden: int, group_size: int = 32, top_k: int = 1,
+    EM: int | None = None,
+):
+    """Fused gather + quantize: ``quant(sort(A, sorted_ids))`` in one op.
+
+    Byte-for-byte the composition of :func:`mxfp4_moe_sort` followed by
+    :func:`mxfp4_moe_quant` (padding rows zeroed by the sort, so they
+    quantize to ``0xFF`` + zero nibbles like real zero activations).
+    Kept as a composition of the two per-op oracles so the pure-Python
+    backend stays a faithful oracle for the fused HIP kernel.
+    """
+    if EM is None:
+        EM = np.ascontiguousarray(sorted_ids, dtype=np.int32).ravel().size
+    A_sorted = mxfp4_moe_sort(A, sorted_ids, M, hidden, top_k, EM)
+    return mxfp4_moe_quant(
+        A_sorted.reshape(EM, hidden), M=EM, hidden=hidden, group_size=group_size
+    )
+
+
 def mxfp4_moe_scatter_reduce(
     partial, topk_w, sorted_ids, M: int, width: int, top_k: int, EM: int
 ):

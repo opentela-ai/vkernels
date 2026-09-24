@@ -157,6 +157,9 @@ EXPECTED_KERNELS = [
     ("mxfp4_moe_quant", "moe_aux"),
     ("mxfp4_moe_sort", "moe_aux"),
     ("mxfp4_moe_sort_scales", "moe_aux"),
+    # fused gather+quantize (additive fusion candidate): declared after
+    # sort_scales in moe_aux.hpp, before the scatter-reduce pair.
+    ("mxfp4_moe_sorted_quant", "moe_aux"),
     ("mxfp4_moe_scatter_reduce", "moe_aux"),
     ("mxfp4_moe_scatter_reduce_q", "moe_aux"),
     ("fused_moe_mxfp4_cpu", "moe_fused"),
@@ -346,6 +349,7 @@ class DiscoveryTest(unittest.TestCase):
             "mxfp4_moe_quant",
             "mxfp4_moe_sort",
             "mxfp4_moe_sort_scales",
+            "mxfp4_moe_sorted_quant",
             "mxfp4_moe_scatter_reduce",
             "mxfp4_moe_scatter_reduce_q",
         ):
