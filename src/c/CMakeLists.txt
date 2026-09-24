@@ -89,7 +89,8 @@ if(VKERNELS_HAS_CUDA)
   if(NOT VKERNELS_HAS_HIP)
     set(VKERNELS_CUDA_HIP_SOURCES vkernels/kernels/dsa_kpool.hip
                                   vkernels/kernels/moe_aux.hip
-                                  vkernels/kernels/kda.hip)
+                                  vkernels/kernels/kda.hip
+                                  vkernels/kernels/dsa_topk.hip)
     set_source_files_properties(${VKERNELS_CUDA_HIP_SOURCES} PROPERTIES
       LANGUAGE CUDA COMPILE_DEFINITIONS VKERNELS_HAS_HIP=1)
     # kda.hip: the D=128 gram kernels stage 2 x 64 x 128 x 4 B = 64 KB of
@@ -97,6 +98,14 @@ if(VKERNELS_HAS_CUDA)
     # static limit — the shim build serves D <= 64 only (VKERNELS_KDA_CUDA_SHIM).
     set_source_files_properties(vkernels/kernels/kda.hip PROPERTIES
       COMPILE_DEFINITIONS "VKERNELS_HAS_HIP=1;VKERNELS_KDA_CUDA_SHIM=1")
+    # dsa_topk.hip: the fused cooperative path (VK_DSA_TOPK_FUSED) queries
+    # the CUDA opt-in dynamic-shared ceiling
+    # (cudaDevAttrMaxSharedMemoryPerBlockOptin -- 101,376 B on GB10).
+    # gfx942 has no opt-in (the 64 KB non-optin cap IS the ceiling), so the
+    # query is shim-build-only (VKERNELS_DSA_TOPK_CUDA_SHIM); real HIP builds
+    # run the fits_lds arithmetic against kDsaTopkLdsCapGfx942.
+    set_source_files_properties(vkernels/kernels/dsa_topk.hip PROPERTIES
+      COMPILE_DEFINITIONS "VKERNELS_HAS_HIP=1;VKERNELS_DSA_TOPK_CUDA_SHIM=1")
     target_sources(vkernels PRIVATE ${VKERNELS_CUDA_HIP_SOURCES})
     target_include_directories(vkernels PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/vkernels/kernels/cuda_compat)

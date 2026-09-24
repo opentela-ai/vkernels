@@ -64,7 +64,49 @@ are device pointers; the launch uses the default stream.
 - **Device**: `meta/benchmarks/test_dsa_topk_correct.cu` /
   `test_dsa_topk_correct.hip` (`hip::dsa_topk_transform` vs the CPU oracle),
   `meta/benchmarks/test_capi_dsa_topk.hip` (the C ABI wrapper).
+- **Fused chain (GPU, shim build)**: `tests/kernels/attn/test_dsa_topk_fused_gpu.cpp`
+  — `VK_DSA_TOPK_FUSED` on vs off: bit-identical logits (memcmp over the
+  whole buffer, canary cells included), set-identical transform rows,
+  bit-exact transform vs the CPU oracle, the unsupported-group_topk
+  fallback, and a print-only launch-overhead probe.
 - **Benchmark**: `meta/benchmarks/bench_dsa_topk.hip`.
+
+## Fused logits→transform chain (`VK_DSA_TOPK_FUSED=1`, default off)
+
+`vk_hip_dsa_topk_logits_transform_fused` (in `dsa_topk.hip`) runs the
+whole indexer tail as **one cooperative launch**: phase 1 computes the
+scalar logits row slices (block = (batch, split_kv), lane = KV token — the
+AUTO dispatcher's scalar arms, shared kernels from `dsa_topk_device.cuh`),
+`cg::this_grid().sync()` publishes the complete rows, phase 2 (the
+`blockIdx.y == 0` blocks) runs the VERBATIM transform row body on each
+complete logits row. 2 launches → 1.
+
+- **Default is the proven two-launch chain.** The gate is read per call
+  (`getenv`, the `VK_MHC_PRE_STRICT` pattern); with the gate off the entry
+  IS the proven chain, so callers can wire it unconditionally.
+- **Fallback contract**: gate off, bad args, unsupported `group_topk`, no
+  scalar logits variant under the device LDS cap, no cooperative-launch
+  support, occupancy 0, or a grid beyond co-residency capacity → the proven
+  chain runs silently instead. The launcher clamps `split_kv` to the
+  co-residency capacity instead of failing (grouping-independence of the
+  grouped logit is pinned by `test_dsa_topk_correct` case split=2). On
+  MI300A the serving split formula (`NUM_CU=228`) already keeps
+  `batch·split_kv ≤ 228` — the whole serving matrix is co-resident at one
+  1024-thread block per CU; on GB10 (48 SMs, 1536 threads/SM) the clamp
+  engages.
+- **Numerics**: byte-identical to the proven chain on both paths (the
+  radix machinery is shared verbatim — value desc, index asc tie-break);
+  the transform phase reuses the standalone row body unchanged.
+- **Shim note**: `dsa_topk.hip` compiles under the HIP-on-NVIDIA shim (no
+  vendor intrinsics in the scalar arms), so the fused path is GB10
+  validated. The MFMA fast paths stay in `dsa.hip` — documented shim
+  negative (AMD-only `mfma` builtins) — and are NOT part of the fused path;
+  `q_variant` 0 = auto picks the scalar fp32-Q/fp8-Q arms exactly like the
+  AUTO dispatcher.
+- **GB10 numbers** (GLM decode geometry bs=2 H=32 D=128 B=64 mt=64
+  seq=4096): gate-off 2944 µs vs fused 3086 µs per iteration — launch
+  neutral here (per-iteration sync dominates). The A/B target is MI300A,
+  where per-launch overhead is the thing being removed.
 
 This is the stage that feeds the sparse forward ([dsa.md](dsa.md)) and the
 kpool-cache path ([dsa_kpool.md](dsa_kpool.md)); see
