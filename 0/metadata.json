@@ -1,0 +1,54 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "01M3A6S4YWNFNXDZK6YTAVNEG5",
+  "session_id": "01a0d41e-215e-74d5-96c3-51db82007df4",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-24T17:18:00.962176467Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "save_step_count": 2,
+  "files_touched": [
+    "src/python/vkernels/torch_ops/glm_dense_fp8_gemv.py",
+    "src/python/vkernels/torch_ops/glm_expert_gemv.py",
+    "src/python/vkernels/torch_ops/glm_expert_gemv_fused.py",
+    "tests/python/test_glm_dense_fp8_gemv.py",
+    "tests/python/test_glm_expert_gemv.py",
+    "tests/python/test_glm_expert_gemv_fused.py",
+    "tests/python/test_glm_fp8_blockwise_gemm.py"
+  ],
+  "agent": "Pi",
+  "model": "zai-org/GLM-5.3-Flash",
+  "turn_id": "c1b641b8c23a",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 3233602,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 38318,
+    "api_call_count": 55
+  },
+  "session_metrics": {
+    "turn_count": 5
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-24T17:18:00.934393048Z",
+    "agent_lines": 47,
+    "agent_removed": 72,
+    "human_added": 17,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 64,
+    "total_lines_changed": 146,
+    "agent_percentage": 81.5068493150685,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}

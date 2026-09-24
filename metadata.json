@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "01M3A6S4YWNFNXDZK6YTAVNEG5",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "src/python/vkernels/torch_ops/glm_dense_fp8_gemv.py",
+    "src/python/vkernels/torch_ops/glm_expert_gemv.py",
+    "src/python/vkernels/torch_ops/glm_expert_gemv_fused.py",
+    "tests/python/test_glm_dense_fp8_gemv.py",
+    "tests/python/test_glm_expert_gemv.py",
+    "tests/python/test_glm_expert_gemv_fused.py",
+    "tests/python/test_glm_fp8_blockwise_gemm.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 3233602,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 38318,
+    "api_call_count": 55
+  }
+}
