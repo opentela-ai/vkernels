@@ -133,6 +133,62 @@ The pre-GEMM MoE aux chain for the W4A4 grouped GEMM (docs/kernels/moe_aux.md):
   (out-of-bounds garbage) before the real cause was isolated — both
   scratch harnesses were disposable and are not committed.
 
+## gfx942 validation (beverin MI300A, 2025 follow-up session)
+
+All four fusion candidates ran the full gate suite on real gfx942
+(MI300A, ROCm, `srun -A a-infra02 -p mi300 --gres=gpu:1`); clone at
+`/capstor/scratch/cscs/xyao/vkernels` (home dir is over quota there).
+Build fixes required for the real-HIP toolchain (the nvcc shim masked
+all of these): `dsa_topk.hip` include order, `gemm_bf16.hip` fused-epilogue
+`C` param split (read-only `C_in` + writable `C`, mirroring the combine
+kernel — main's split-K lane had NEVER compiled on real HIP),
+`bench_moe_aux.hip` unqualified-call bug, ROCm hipCG header path, and
+host-compiled test TUs needing `__HIP_PLATFORM_AMD__` (CMake-provided,
+SYSTEM includes; the in-TU heuristic approach fails because the shim
+build's test TUs are also host-compiled — the shim #errors on the
+define). Local: cuda 57/57, host 47/47.
+
+**Correctness gates on MI300A (all PASS):**
+- `test_moe_aux_fused` 7/7 (device-vs-oracle incl. mixed-NaN groups).
+- `test_gemm_bf16_correct` PASS (split-K fused epilogue, fp8 + beta!=0).
+- `test_dsa_topk_fused_gpu` 3/3 — fused tailfold is BIT-IDENTICAL to the
+  proven chain at all probe geometries incl. seq=4096/split_kv=4, and the
+  clamp test verifies grouping independence.
+- `test_kda_chunked_fused_gpu` 1/1 — bit-identity (out AND state) at all
+  5 shapes incl. D=128/S=512. NOTE: the test originally staged raw host
+  `std::vector` pointers as device pointers (GB10 unified memory hid
+  this); gfx942 correctly memory-faulted on them — fixed by explicit
+  hipMalloc staging (60d1024).
+
+**Performance A/B on MI300A (min/med us, serving shapes):**
+- moe_aux quant fuse: FUSED WINS ~1.18x (EM=848: sorted_quant 100.5 vs
+  proven composition 123.3; EM=2048: 229.7 vs 261.1) — parity OK both.
+- kda chunked cumsum fold: neutral (S=1024: 1815.1 vs 1824.0 med;
+  S=2048: 3326.7 vs 3326.0 — launch amortized under 2.2-2.3 TFLOP/s
+  compute).
+- gemm split-K combine fold: neutral (all shapes within ±0.7%, e.g.
+  2112x7168 med 7021.6 vs 6971.2).
+- dsa_topk tailfold: neutral at the decode probe (5373 vs 5373 us/iter,
+  bs=2 seq=4096 — compute-dominated, 200 synced iterations).
+
+**New pre-existing bug found (record-only, follow-up):** the standalone
+radix transform `dsa_topk_transform_kernel<K>` (shared verbatim by both
+chains — NOT introduced by the fusion work) does OOB global reads at
+degenerate/large-seq inputs: when the final radix bin holds more than
+`kSmemInputSize` (=4096, kDynamicSmemBytes-derived) candidates, the
+overflow handling reads uninitialized staged indices and indexes
+`input[row_start + garbage]` (compute-sanitizer: 11 invalid 4B reads,
+~4.4 GB off, in the chain path; exposed by the LaunchOverheadProbe's
+random-fp32-Q geometry, seq=4096, K=512 — never hit by the
+oracle-validated geometries, seq<=1024 well-behaved inputs). Related:
+chain logits at that geometry are not bit-stable run-to-run (same
+degenerate input artifact). Probe sanity was also wrong pre-fix (raw
+dst memcmp — within-row order is atomic-scheduling-dependent; the
+contract is the same SET per row, and its original args violated the
+transform-validity predicate so it was comparing hipMalloc garbage).
+Follow-up: clamp/overflow handling in the radix candidate staging +
+deterministic within-bin order if bit-stable dst is ever needed.
+
 ## Risks / open questions
 
 - gfx942 unvalidated (no ROCm here): the doc's srun sequence
