@@ -351,6 +351,7 @@ template <int BM, int BN, bool Fused = false>
 __global__ void gemm_bf16_splitk_wide_kernel(const uint16_t* __restrict__ A,
                                              const uint16_t* __restrict__ B,
                                              float* __restrict__ P,
+                                             const uint16_t* __restrict__ C,
                                              int M, int N, int K,
                                              int kts_per_split,
                                              int* __restrict__ counters,
@@ -1176,7 +1177,7 @@ bool launch_splitk(const uint16_t* A, const uint16_t* B, uint16_t* C,
   dim3 gridS((M + BM - 1) / BM, (N + BN - 1) / BN, S);
   if (Wide) {
     gemm_bf16_splitk_wide_kernel<BM, BN, Fused><<<gridS, block, 0, 0>>>(
-        A, B, w.partials, M, N, K, kts, counters, S, alpha, beta);
+        A, B, w.partials, C, M, N, K, kts, counters, S, alpha, beta);
   } else {
     gemm_bf16_splitk_kernel<BM, BN><<<gridS, block, 0, 0>>>(
         A, B, w.partials, M, N, K, kts);

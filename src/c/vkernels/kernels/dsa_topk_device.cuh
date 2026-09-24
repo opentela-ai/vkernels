@@ -26,8 +26,14 @@
 // (the scalar logits kernels above deliberately avoid vendor intrinsics).
 #if defined(VKERNELS_HAS_HIP)
 #include <hip/hip_fp16.h>
+// The kernels below use gridDim/blockIdx/threadIdx -- on real HIP these are
+// only declared by <hip/hip_runtime.h> (hipcc does NOT pre-include it for
+// header TUs), and on the CUDA shim build <hip/hip_runtime.h> resolves to
+// cuda_compat/hip/hip_runtime.h via the -I path.
+#include <hip/hip_runtime.h>
 #else
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #endif
 
 #include "vkernels/kernels/device_numeric.cuh"
