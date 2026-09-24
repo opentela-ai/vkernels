@@ -118,17 +118,46 @@ def _kernel():
     return tl, triton, _gemv_fp8
 
 
-def _tiles(o: int) -> tuple[int, int]:
-    """(ROWS, num_warps); ``VK_FP8_DENSE_GEMV_TILES='ROWS,warps'`` overrides
-    (live single-shape tuning knob, the VK_FP8GEMM_TILES convention)."""
+def _next_pow2(n: int) -> int:
+    return 1 << max(n - 1, 1).bit_length()
+
+
+# Per-(O, I) pins (ROWS, BLOCK_I, num_warps) from the H100 tile sweep
+# (/tmp/gemv-sweep_results.json, corroborated wrapper-level by
+# /tmp/gemv-confirm_results.json; GLM-5.3-Flash TP4 decode shapes, M=1).
+# The fp8 win pattern wants warps=2 with a REDUCED BLOCK_I on the wide-O
+# shapes (more programs in flight, shorter per-warp streams) and warps=8 with
+# rows=2 on (512, 4096) — a single global (ROWS, warps) default cannot express
+# that without regressing the other shapes, so the winners are pinned per
+# shape. Only confirm-corroborated wins are listed: (1536, 4096) keeps the
+# heuristic default (the sweep's smaller-BLOCK_I candidates lost at the
+# wrapper level). BLOCK_I stays a multiple of 128 (the scale-group width).
+_TILES = {
+    (512, 4096): (2, 4096, 8),
+    (3072, 4096): (4, 2048, 2),
+    (4096, 512): (8, 512, 2),
+    (4096, 1536): (4, 2048, 2),
+    (4096, 3072): (4, 1024, 2),
+    (4096, 4096): (4, 2048, 2),
+}
+
+
+def _tiles(o: int, i: int) -> tuple[int, int, int]:
+    """(ROWS, BLOCK_I, num_warps). Precedence: the live single-shape tuning
+    knob ``VK_FP8_DENSE_GEMV_TILES='ROWS,warps'`` (BLOCK_I keeps the
+    next-pow-2(min(I, 4096)) default, the VK_FP8GEMM_TILES convention) >
+    the H100 per-shape pin table > the heuristic default."""
     import os
 
     cfg = os.environ.get("VK_FP8_DENSE_GEMV_TILES", "")
     if cfg:
         parts = [int(x) for x in cfg.split(",")]
         if len(parts) == 2:
-            return parts[0], parts[1]
-    return (4 if o % 4 == 0 else 1), 4
+            return parts[0], _next_pow2(min(i, 4096)), parts[1]
+    pin = _TILES.get((o, i))
+    if pin is not None:
+        return pin
+    return (4 if o % 4 == 0 else 1), _next_pow2(min(i, 4096)), 4
 
 
 def dense_gemv_fp8(x, w8, scales, m_cap=None):
@@ -164,8 +193,7 @@ def dense_gemv_fp8(x, w8, scales, m_cap=None):
     if not (x.is_contiguous() and w8.is_contiguous() and scales.is_contiguous()):
         raise OpNotEligible("inputs must be contiguous")
     tl, triton, kern = _kernel()
-    rows, warps = _tiles(o)
-    block_i = triton.next_power_of_2(min(i, 4096))
+    rows, block_i, warps = _tiles(o, i)
     mp = triton.next_power_of_2(m)
     y = torch.empty(m, o, device=x.device, dtype=torch.bfloat16)
     with torch.cuda.device(x.device):

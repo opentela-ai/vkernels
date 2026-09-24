@@ -36,15 +36,26 @@ from functools import lru_cache
 # (clariden job 3462837). Only shapes where the best beat the heuristic by
 # >4% are pinned: kv_b -22%, dense_gu_fused -34%, dense_dn -12%, g_b/f_b
 # -10%, dense_gu -8%, kda_q_ctl -5%, kda_o -4%, q_b/wq_b -5..-10% (warps).
+#
+# H100 (sgs-gpu07) refinements from the wrapper-confirmed tile sweep
+# (/tmp/gemv-sweep_results.json + wrapper-level /tmp/gemv-confirm_results.json,
+# GLM-5.3-Flash TP4 decode shapes, M=1): only confirm-corroborated >4% wins are
+# merged — mHC mix (24,16384) wants the full-I unmasked BLOCK_I (-25%), KDA
+# q/k/v (2048,4096) moves to rows=4 (-4.8%), KDA o_proj (4096,2048) to
+# rows=8/BLOCK_I=256 (-4.5%, ~4.2 TB/s effective — the 16 MB weight is L2
+# resident: above the 3.35 TB/s HBM floor but under the L2 ceiling).
+# (16,4096)/(32,4096)/(128,4096)/(2048,128) and warps on (4096,1536) measured
+# at/below the noise floor: the heuristic or the existing pin already stands.
 _CFG = {
     (4096, 1536): (4, 2048, 4),
     (4096, 3072): (1, 4096, 4),
-    (4096, 2048): (2, 2048, 4),
+    (4096, 2048): (8, 256, 4),
     (8192, 512): (8, 512, 4),
     (3072, 4096): (2, 4096, 4),
     (6144, 4096): (4, 4096, 4),
     (2048, 128): (8, 128, 8),
-    (2048, 4096): (2, 4096, 4),
+    (2048, 4096): (4, 4096, 4),
+    (24, 16384): (1, 16384, 8),
 }
 
 # MI300A (gfx942) overrides — CUDA-graph-replayed autotune on beverin
