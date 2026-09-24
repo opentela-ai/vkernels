@@ -18,20 +18,7 @@ autotune-free kernel still compiles on first launch).
 """
 
 from ._dispatch import OpNotEligible
-import os
 from functools import lru_cache
-
-
-def _t_cap() -> int:
-    """Row cap for the batched GEMV: 2 (the decode-validated limit) unless
-    GLM53_MOE_DECODE_MAX_TOKENS widens it for speculative-decoding blocks
-    (e.g. 8 for DFlash2 verify/replay). The kernel body is shape-generic —
-    one program per (token, expert-slot) pair — so only the wrapper guard
-    needs lifting; parity at the raised T is checked by the caller's job."""
-    try:
-        return max(2, int(os.environ.get("GLM53_MOE_DECODE_MAX_TOKENS", "2")))
-    except ValueError:
-        return 2
 
 
 @lru_cache(maxsize=1)
@@ -162,8 +149,15 @@ def _kernel():
     return _expert_gemv, _expert_gemv_native
 
 
-def expert_gemv(x, weights, scales, indices, storage="e4m3fn"):
-    """Return BF16 [T,K,O] for BF16 x[T,I] or x[T,K,I], T <= _t_cap().
+def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None):
+    """Return BF16 [T,K,O] for BF16 x[T,I] or x[T,K,I], T <= t_cap.
+
+    ``t_cap`` (default 2, the decode-validated limit) is the row cap the
+    CALLER serves with — floe passes its ``moe_decode_max_tokens`` knob
+    (server args: ``--model-opt moe_decode_max_tokens=8``) so DFlash2
+    verify/replay blocks route here. The kernel body is shape-generic —
+    one program per (token, expert-slot) pair — so only this wrapper
+    guard needs the cap; parity at the raised T is the caller's job.
 
     Contiguous GPU inputs and valid expert IDs are required. On NVIDIA the
     FN bytes are hardware-decoded (e4m3FN == e4m3nv semantics there); on
@@ -181,7 +175,7 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn"):
         raise OpNotEligible(f"unknown weight storage {storage!r}")
     fnuz = storage == "e4m3fnuz"
     want = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
-    cap = _t_cap()
+    cap = max(2, int(t_cap)) if t_cap is not None else 2
     if weights.ndim != 3 or indices.ndim != 2:
         raise OpNotEligible("expected weights [E,O,I] and indices [T,K]")
     e, o, i = weights.shape
@@ -265,7 +259,7 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn"):
     return out
 
 
-def expert_gemv_reference(x, weights, scales, indices):
+def expert_gemv_reference(x, weights, scales, indices, t_cap=None):
     """Gather-dequant + einsum reference (fp32 dot, BF16 output).
 
     Mirrors the kernel's rounding contract: the scaled weight is rounded
@@ -281,7 +275,7 @@ def expert_gemv_reference(x, weights, scales, indices):
     """
     import torch
 
-    cap = _t_cap()
+    cap = max(2, int(t_cap)) if t_cap is not None else 2
     e, o, i = weights.shape
     t, k = indices.shape
     if t > cap:

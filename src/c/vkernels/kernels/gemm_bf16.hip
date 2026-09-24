@@ -351,7 +351,8 @@ template <int BM, int BN, bool Fused = false>
 __global__ void gemm_bf16_splitk_wide_kernel(const uint16_t* __restrict__ A,
                                              const uint16_t* __restrict__ B,
                                              float* __restrict__ P,
-                                             const uint16_t* __restrict__ C,
+                                             const uint16_t* __restrict__ C_in,
+                                             uint16_t* __restrict__ C,
                                              int M, int N, int K,
                                              int kts_per_split,
                                              int* __restrict__ counters,
@@ -510,7 +511,7 @@ __global__ void gemm_bf16_splitk_wide_kernel(const uint16_t* __restrict__ A,
           for (int sf = 0; sf < S; ++sf) sum += p0[(size_t)sf * plane_elems];
           float v = alpha * sum;
           if (beta != 0.0f)
-            v += beta * bf16_to_f32(C[(size_t)grow * N + gcol]);
+            v += beta * bf16_to_f32(C_in[(size_t)grow * N + gcol]);
           C[(size_t)grow * N + gcol] = f2bf(v);
         }
       }
@@ -1177,7 +1178,7 @@ bool launch_splitk(const uint16_t* A, const uint16_t* B, uint16_t* C,
   dim3 gridS((M + BM - 1) / BM, (N + BN - 1) / BN, S);
   if (Wide) {
     gemm_bf16_splitk_wide_kernel<BM, BN, Fused><<<gridS, block, 0, 0>>>(
-        A, B, w.partials, C, M, N, K, kts, counters, S, alpha, beta);
+        A, B, w.partials, C, C, M, N, K, kts, counters, S, alpha, beta);
   } else {
     gemm_bf16_splitk_kernel<BM, BN><<<gridS, block, 0, 0>>>(
         A, B, w.partials, M, N, K, kts);

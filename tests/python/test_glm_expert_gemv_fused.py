@@ -187,13 +187,10 @@ def test_gpu_graph_capture_replay(torch):
     assert torch.equal(static_out, expected)
 
 
-def test_contract(torch, monkeypatch):
+def test_contract(torch):
     from vkernels.torch_ops.glm_expert_gemv_fused import expert_gemv_silu
 
-    # Pin the T<=cap contract against the DEFAULT cap (see the sibling
-    # test's note on serving containers exporting GLM53_MOE_DECODE_MAX_TOKENS).
-    monkeypatch.delenv("GLM53_MOE_DECODE_MAX_TOKENS", raising=False)
-
+    # Pin the T<=cap contract against the DEFAULT cap (2).
     weights, scales, indices = make_inputs(torch, t=1, k=8)
     x = torch.randn(1, 8, 256, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="GPU"):

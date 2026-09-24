@@ -27,19 +27,25 @@
 #if VKERNELS_HAS_HIP
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-// CUDA 13 ships <cooperative_groups.h> (a bare <cooperative_groups> does not
-// resolve); ROCm installs the same header name for HIP device code. The
-// real-HIP compile is verified on the MI300A box (this branch is validated
-// on GB10) -- if a ROCm release spells it differently, guard here.
+// Grid sync for the fused cooperative kernel. nvcc (the CUDA shim build)
+// takes CUDA's <cooperative_groups.h> with the cg:: namespace; real HIP
+// (ROCm 6.x, verified on beverin) ships the hipCG compat header
+// <hip/hip_cooperative_groups.h> whose grid_group/this_grid() live in the
+// GLOBAL namespace -- hence the VK_GRID_SYNC indirection below.
+#if defined(__CUDACC__)
 #include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+#define VK_GRID_SYNC() cg::this_grid().sync()
+#else
+#include <hip/hip_cooperative_groups.h>
+#define VK_GRID_SYNC() ::this_grid().sync()
+#endif
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-
-namespace cg = cooperative_groups;
 
 namespace vkernels::kernels::hip {
 namespace {
@@ -318,7 +324,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_logits_transform_co
   dsa_topk_logits_phase1<kFp8Q>(q_fp8, kvcache_u8, weight, seq_lens, page_table,
                                 logits_out, H, D, B, max_table_len, max_seq_len,
                                 split_kv);
-  cg::this_grid().sync();
+  VK_GRID_SYNC();
   if (blockIdx.y == 0) {
     dsa_topk_transform_row<K>(logits_out, t_lengths, dst_token_indices, score_stride,
                               pool_size, out_cols, t_page_table, t_page_table_stride,

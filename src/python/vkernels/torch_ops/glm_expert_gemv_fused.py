@@ -49,7 +49,6 @@ autograd backward. Graph capture: warm up eagerly per shape first.
 """
 
 from ._dispatch import OpNotEligible
-from .glm_expert_gemv import _t_cap
 import os
 from functools import lru_cache
 
@@ -252,14 +251,16 @@ def _kernel():
     return _expert_gemv_silu, _expert_gemv_silu_native
 
 
-def expert_gemv_silu(x, weights, scales, indices, storage="e4m3fn"):
+def expert_gemv_silu(x, weights, scales, indices, storage="e4m3fn", t_cap=None):
     """Return BF16 ``act[T,K,IA] = silu(gate) * up`` for BF16 x[T,I] or
-    x[T,K,I], T <= _t_cap(), where ``gate``/``up`` are the two halves of
-    the stacked GEMV output over ``weights[E, 2*IA, I]``.
+    x[T,K,I], T <= t_cap (default 2 — floe passes its
+    ``moe_decode_max_tokens`` knob), where ``gate``/``up`` are the two halves
+    of the stacked GEMV output over ``weights[E, 2*IA, I]``.
 
     Bit-identical (same device) to::
 
-        gu = glm_expert_gemv.expert_gemv(x, weights, scales, indices, storage)
+        gu = glm_expert_gemv.expert_gemv(x, weights, scales, indices, storage,
+                                         t_cap=t_cap)
         act = elementwise.silu_mul(gu[..., :IA], gu[..., IA:])
 
     but writes only [T,K,IA] and launches one kernel instead of two.
@@ -273,7 +274,7 @@ def expert_gemv_silu(x, weights, scales, indices, storage="e4m3fn"):
         raise OpNotEligible(f"unknown weight storage {storage!r}")
     fnuz = storage == "e4m3fnuz"
     want = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
-    cap = _t_cap()
+    cap = max(2, int(t_cap)) if t_cap is not None else 2
     if weights.ndim != 3 or indices.ndim != 2:
         raise OpNotEligible("expected weights [E,O,I] and indices [T,K]")
     e, o, i = weights.shape
@@ -354,7 +355,7 @@ def expert_gemv_silu(x, weights, scales, indices, storage="e4m3fn"):
     return out
 
 
-def expert_gemv_silu_reference(x, weights, scales, indices):
+def expert_gemv_silu_reference(x, weights, scales, indices, t_cap=None):
     """Unfused oracle: ``expert_gemv_reference`` + the eager silu chain.
 
     Delegates the FP8 gather-dequant dot to
@@ -369,7 +370,7 @@ def expert_gemv_silu_reference(x, weights, scales, indices):
 
     from .glm_expert_gemv import expert_gemv_reference
 
-    gu = expert_gemv_reference(x, weights, scales, indices)
+    gu = expert_gemv_reference(x, weights, scales, indices, t_cap=t_cap)
     ia = weights.shape[1] // 2
     return (F.silu(gu[..., :ia].float()) * gu[..., ia:].float()).to(
         torch.bfloat16

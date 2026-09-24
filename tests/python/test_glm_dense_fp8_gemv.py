@@ -68,22 +68,22 @@ def make_inputs(torch, o=256, i=256, seed=7):
 
 @pytest.mark.parametrize("m", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize("shape", [(128, 128), (256, 512), (4096, 1536), (512, 4096)])
-def test_gpu_parity_vs_oracle(monkeypatch, m, shape):
+def test_gpu_parity_vs_oracle(m, shape):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("requires GPU")
     pytest.importorskip("triton")
-    # m > 2 is the DFlash2 verify regime — widen the cap the same way
-    # floe's moe_decode_max_tokens=8 bridge does
-    monkeypatch.setenv("GLM53_MOE_DECODE_MAX_TOKENS", str(max(2, m)))
+    # m > 2 is the DFlash2 verify regime; floe passes its
+    # moe_decode_max_tokens knob as m_cap.
     from vkernels.torch_ops.glm_dense_fp8_gemv import (
         dense_gemv_fp8, dense_gemv_fp8_reference)
 
     o, i = shape
     w8, scales = make_inputs(torch, o=o, i=i)
     x = (torch.randn(m, i) * 0.1).to(torch.bfloat16)
+    cap = max(2, m)
     ref = dense_gemv_fp8_reference(x, w8, scales)
-    out = dense_gemv_fp8(x.cuda(), w8.cuda(), scales.cuda()).cpu()
+    out = dense_gemv_fp8(x.cuda(), w8.cuda(), scales.cuda(), m_cap=cap).cpu()
     assert out.shape == ref.shape
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
