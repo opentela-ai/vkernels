@@ -62,5 +62,46 @@ void dsa_topk_transform(int32_t batch_size,
                         const int32_t* row_starts,
                         const int32_t* seq_lens);
 
+// FUSED top-k chain (fusion lane dsa-topk-tailfold): the scalar
+// dsa_topk_logits GEMV (the AUTO dispatcher's scalar arms -- fp32-Q, else
+// fp8-Q; the MFMA fast paths live in dsa.hip) AND dsa_topk_transform on the
+// complete logits rows, in ONE launch when VK_DSA_TOPK_FUSED=1: a
+// cooperative grid of (batch, split_kv) 1024-thread blocks, phase 1 =
+// logits (lane = KV token), grid sync, phase 2 (split block) = the verbatim
+// transform row. With the gate OFF (the default) this entry IS the proven
+// two-launch chain, so callers may wire it unconditionally.
+//
+// Fallback contract: any condition the fused path cannot honour (gate off,
+// invalid transform parameters, unsupported group_topk, no scalar logits
+// variant under the device cap, no cooperative-launch support, occupancy 0,
+// grid beyond the co-residency capacity -- split_kv is CLAMPED to it, it is
+// perf-only/grouping-independent) silently runs the proven chain instead.
+// `logits` doubles as the transform's `score` buffer: pass score_stride ==
+// max_seq_len and zero/canary-fill up front -- cells with t >= seq_len[b]
+// are never written and the transform only reads [row_start, row_start +
+// lengths[row]) per row, exactly the caller contract of the two-launch
+// chain. All pointers are device pointers; default stream.
+//
+// `q_variant`: 0 = auto (fp32-Q, else fp8-Q), 1 = fp32-Q, 2 = fp8-Q; both
+// scalar variants produce BIT-IDENTICAL logits (gfx942 caps: H=32 -> fp32-Q,
+// H=64 -> fp8-Q; GB10: both fp32-Q). Explicit variant lets a caller pin the
+// proven one for bit-exact A/B against the fused path.
+void dsa_topk_logits_transform_fused(int batch_size, int num_heads, int head_dim,
+                                     int block, int max_table_len, int max_seq_len,
+                                     int split_kv, const void* q_fp8,
+                                     const void* kvcache_u8, const void* weight,
+                                     const void* seq_lens, const void* page_table,
+                                     void* logits, int q_variant,
+                                     const int32_t* t_lengths,
+                                     int32_t* dst_token_indices,
+                                     int64_t score_stride, int32_t pool_size,
+                                     int32_t token_topk, int32_t out_cols,
+                                     const int32_t* t_page_table,
+                                     int64_t t_page_table_stride,
+                                     const int32_t* page_table_row_index,
+                                     const int32_t* topk_indices_offset,
+                                     const int32_t* row_starts,
+                                     const int32_t* t_seq_lens);
+
 } // namespace vkernels::kernels::hip
 #endif // VKERNELS_HAS_HIP

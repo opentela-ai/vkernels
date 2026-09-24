@@ -80,6 +80,21 @@ endif()
 vkernels_add_test(NAME kda_chunked_fused_gpu
                   SOURCES kernels/attn/test_kda_chunked_fused_gpu.cpp)
 
+# DSA top-k fused-chain GPU test (fusion lane dsa-topk-tailfold): the device
+# path lives in dsa_topk.hip, shim-compiled under VKERNELS_HAS_HIP in the
+# CUDA build. Same pattern as moe_aux_fused (register the test first, then
+# the shim properties; the test TU dequants through the SHARED
+# device_numeric.cuh, so the CPU oracle sees bit-exact fp32 inputs).
+# Host-only builds self-report a skip.
+vkernels_add_test(NAME dsa_topk_fused_gpu
+                  SOURCES kernels/attn/test_dsa_topk_fused_gpu.cpp)
+if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+  set_source_files_properties(kernels/attn/test_dsa_topk_fused_gpu.cpp
+    PROPERTIES COMPILE_DEFINITIONS "VKERNELS_HAS_HIP=1;VKERNELS_DSA_TOPK_CUDA_SHIM=1")
+  set_property(TARGET vkernels_test_dsa_topk_fused_gpu APPEND PROPERTY
+    INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+endif()
+
 # The `extern "C"` ABI is CUDA-only (the entry points take a raw
 # cudaStream_t); its runtime test is a .cu compiled when a toolkit is
 # present. It links the shared `vkernels_c` boundary plus the CUDA runtime

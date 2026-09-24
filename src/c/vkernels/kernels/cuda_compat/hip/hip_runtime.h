@@ -78,6 +78,17 @@
 #define hipGetErrorString cudaGetErrorString
 #define hipGetLastError cudaGetLastError
 
+// ---- cooperative launch / occupancy / function attributes ------------------
+// dsa_topk.hip's fused chain (VK_DSA_TOPK_FUSED): one cooperative grid runs
+// the scalar logits GEMV + the radix transform row; requires the occupancy
+// query, the cooperative-launch check and the dynamic-smem opt-in.
+#define hipOccupancyMaxActiveBlocksPerMultiprocessor \
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor
+#define hipLaunchCooperativeKernel cudaLaunchCooperativeKernel
+#define hipFuncSetAttribute cudaFuncSetAttribute
+#define hipFuncAttributeMaxDynamicSharedMemorySize \
+  cudaFuncAttributeMaxDynamicSharedMemorySize
+
 // ---- events ---------------------------------------------------------------
 #define hipEventCreate cudaEventCreate
 #define hipEventRecord cudaEventRecord
@@ -86,6 +97,15 @@
 #define hipEventElapsedTime cudaEventElapsedTime
 
 // ---- device properties / enumeration --------------------------------------
+#define hipGetDevice cudaGetDevice
+#define hipDeviceGetAttribute cudaDeviceGetAttribute
+#define hipDeviceAttributeMultiprocessorCount cudaDevAttrMultiProcessorCount
+#define hipDeviceAttributeCooperativeLaunch cudaDevAttrCooperativeLaunch
+// Real HIP has no dynamic-LDS opt-in (gfx942's 64 KB cap IS the ceiling);
+// this enum name is only referenced from dsa_topk.hip's shim-build-only
+// query of the CUDA opt-in ceiling (VKERNELS_DSA_TOPK_CUDA_SHIM).
+#define hipDeviceAttributeMaxSharedMemoryPerBlockOptin \
+  cudaDevAttrMaxSharedMemoryPerBlockOptin
 #define hipGetDeviceProperties cudaGetDeviceProperties
 #define hipGetDeviceCount cudaGetDeviceCount
 // cudaDeviceProp has no gcnArchName; map it to name so AMD device-detection
