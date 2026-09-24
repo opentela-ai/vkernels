@@ -3,3 +3,11 @@ what kernels are we missing and might be interesting to copy from: https://githu
 ---
 
 Can you spawn a subagent for each of them?
+
+---
+
+continue, and can you benchmark those kernels on bristen (ssh bristen)
+
+---
+
+no can you ssh bristen and probe, it is an A100 cluster
