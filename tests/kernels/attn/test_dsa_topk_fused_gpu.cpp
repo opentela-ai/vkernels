@@ -408,8 +408,14 @@ TEST(DsaTopkFused, FallbackOnUnsupportedGroupTopk) {
 // TEMP shape-matrix probe (delete before commit)
 TEST(DsaTopkFused, LaunchOverheadProbe) {
   constexpr int H = 32, D = 128, B = 64, mt = 64;  // block=64, 64 pages -> 4096 tokens
-  constexpr int max_seq_len = mt * B, token_topk = 2048, group_topk = 128;
-  constexpr int out_cols = token_topk / group_topk;  // 16
+  constexpr int max_seq_len = mt * B, group_topk = 512;
+  // Valid transform spec per the entry contract: token_topk = group_topk *
+  // pool_size and out_cols == token_topk. (An earlier draft passed
+  // pool_size=1 / out_cols=token_topk/group_topk, which fails the
+  // transform-validity predicate -- the transform silently no-ops on BOTH
+  // arms and the memcmp then compares uninitialized hipMalloc garbage.)
+  constexpr int pool_size = 4, token_topk = group_topk * pool_size;
+  constexpr int out_cols = token_topk;
   constexpr int split_kv = (max_seq_len + 1023) / 1024;
   constexpr int bs = 2;
 
@@ -453,8 +459,8 @@ TEST(DsaTopkFused, LaunchOverheadProbe) {
     vkernels::kernels::hip::dsa_topk_logits_transform_fused(
         bs, H, D, B, mt, max_seq_len, split_kv, dq, dkv, dw, dsl, dpt, lg,
         /*q_variant=*/0, reinterpret_cast<const int32_t*>(dlen),
-        reinterpret_cast<int32_t*>(dst), max_seq_len, 1, token_topk, out_cols,
-        nullptr, 0, nullptr, reinterpret_cast<const int32_t*>(doff),
+        reinterpret_cast<int32_t*>(dst), max_seq_len, pool_size, token_topk,
+        out_cols, nullptr, 0, nullptr, reinterpret_cast<const int32_t*>(doff),
         reinterpret_cast<const int32_t*>(drs), nullptr);
   };
 
@@ -463,6 +469,31 @@ TEST(DsaTopkFused, LaunchOverheadProbe) {
   run(dlg0, ddst0);
   setenv("VK_DSA_TOPK_FUSED", "1", 1);
   run(dlg1, ddst1);
+  // CHAIN-vs-CHAIN determinism check at this geometry (diagnostic):
+  {
+    std::vector<int32_t> dstc(dst0.size(), 0), lgc(lg0.size(), 0.0f);
+    void* ddstc = nullptr; void* dlgc = nullptr;
+    CK(hipMalloc(&ddstc, dstc.size() * 4), "alloc dstc");
+    CK(hipMalloc(&dlgc, lgc.size() * 4), "alloc lgc");
+    CK(hipMemset(ddstc, 0, dstc.size() * 4), "zero dstc");
+    setenv("VK_DSA_TOPK_FUSED", "0", 1);
+    run(dlgc, ddstc);
+    CK(hipDeviceSynchronize(), "sync c");
+    CK(hipMemcpy(dstc.data(), ddstc, dstc.size() * 4, hipMemcpyDeviceToHost), "cpy dstc");
+    CK(hipMemcpy(lgc.data(), dlgc, lgc.size() * 4, hipMemcpyDeviceToHost), "cpy lgc");
+    int nd = 0; double mx = 0.0;
+    for (size_t di = 0; di < lg0.size(); ++di) {
+      if (std::memcmp(&lg0[di], &lgc[di], 4) != 0) {
+        ++nd;
+        double d = std::fabs(static_cast<double>(lg0[di]) - static_cast<double>(lgc[di]));
+        if (!(d <= mx)) mx = d;  // NaN-safe max
+      }
+    }
+    std::printf("  probe chain-vs-chain: dst equal=%d logits ndiff=%d maxdiff=%g\n",
+                std::memcmp(dst0.data(), dstc.data(), dst0.size() * 4) == 0 ? 1 : 0,
+                nd, mx);
+    (void)hipFree(ddstc); (void)hipFree(dlgc);
+  }
   CK(hipDeviceSynchronize(), "warmup");
   CK(hipMemcpy(lg0.data(), dlg0, lg0.size() * 4, hipMemcpyDeviceToHost), "cpy");
   CK(hipMemcpy(lg1.data(), dlg1, lg1.size() * 4, hipMemcpyDeviceToHost), "cpy");
@@ -470,8 +501,34 @@ TEST(DsaTopkFused, LaunchOverheadProbe) {
   CK(hipMemcpy(dst1.data(), ddst1, dst1.size() * 4, hipMemcpyDeviceToHost), "cpy");
   VK_EXPECT_MSG(std::memcmp(lg0.data(), lg1.data(), lg0.size() * 4) == 0,
                 "probe: gate-off/on logits differ");
+  for (size_t di = 0; di < dst0.size(); ++di) {
+    if (dst0[di] != dst1[di]) {
+      std::printf("  probe dst diff at [%zu]: gate-off=%d gate-on=%d\n",
+                  di, dst0[di], dst1[di]);
+      break;
+    }
+  }
+  { auto a = dst0, b = dst1;
+    std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
+    int nz1 = 0, nz0 = 0;
+    for (size_t di = 0; di < dst1.size(); ++di) {
+      if (dst1[di]) ++nz1;
+      if (dst0[di]) ++nz0;
+    }
+    std::printf("  probe dst sorted-equal: %d nonzero gate-off=%d gate-on=%d\n",
+                a == b ? 1 : 0, nz0, nz1); }
+  // The radix transform's WITHIN-ROW ORDER is atomic-scheduling-dependent
+  // (indices are appended via atomicAdd); the contract is the same SET per
+  // row (the BitExact test sorts rows before comparing for the same
+  // reason). Compare sorted.
+  for (int b = 0; b < bs; ++b) {
+    std::sort(dst0.begin() + (size_t)b * out_cols,
+              dst0.begin() + (size_t)(b + 1) * out_cols);
+    std::sort(dst1.begin() + (size_t)b * out_cols,
+              dst1.begin() + (size_t)(b + 1) * out_cols);
+  }
   VK_EXPECT_MSG(std::memcmp(dst0.data(), dst1.data(), dst0.size() * 4) == 0,
-                "probe: gate-off/on dst differ");
+                "probe: gate-off/on dst sets differ");
 
   const int iters = 200;
   auto t0 = std::chrono::steady_clock::now();
