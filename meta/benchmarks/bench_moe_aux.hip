@@ -239,8 +239,8 @@ int main() {
     // VK_MOE_AUX_FUSED_QUANT toggled to cover both gate positions.
     CK(hipMemset(dPackedS, 0x55, (size_t)EM * hidden / 2), "zPackedS");
     CK(hipMemset(dScalesS, 0x55, (size_t)EM * n_groups), "zScalesS");
-    mxfp4_moe_sorted_quant(dA, dSids, dPackedS, dScalesS, M, hidden, gs,
-                           top_k, EM);
+    vkernels::kernels::hip::mxfp4_moe_sorted_quant(dA, dSids, dPackedS, dScalesS,
+                                                   M, hidden, gs, top_k, EM);
     {
       std::vector<uint8_t> gpk((size_t)EM * hidden / 2),
           gsc((size_t)EM * n_groups);

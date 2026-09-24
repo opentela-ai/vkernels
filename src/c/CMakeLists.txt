@@ -186,11 +186,6 @@ if(VKERNELS_HAS_HIP)
   # -> …/rocm-X.Y/include) with the canonical /opt/rocm/include symlink
   # as the fallback hint.
   set(VKERNELS_HIP_RUNTIME_INCLUDE_DIRS "${CMAKE_HIP_TOOLKIT_INCLUDE_DIRECTORIES}")
-  # Export to the tests/ directory scope too (test TUs that include
-  # <hip/hip_runtime.h> directly -- moe_aux_fused, dsa_topk_fused_gpu --
-  # need the toolkit include dirs, which the vkernels target keeps PRIVATE).
-  set(VKERNELS_HIP_RUNTIME_INCLUDE_DIRS "${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS}"
-      CACHE INTERNAL "HIP runtime include dirs for test targets")
   if(NOT VKERNELS_HIP_RUNTIME_INCLUDE_DIRS)
     get_filename_component(_vk_hip_root "${CMAKE_HIP_COMPILER}" DIRECTORY)
     get_filename_component(_vk_hip_root "${_vk_hip_root}/../../.." ABSOLUTE)
@@ -202,6 +197,12 @@ if(VKERNELS_HAS_HIP)
     endif()
     unset(_vk_hip_root)
   endif()
+  # Export to the tests/ directory scope too (test TUs that include
+  # <hip/hip_runtime.h> directly -- moe_aux_fused, dsa_topk_fused_gpu --
+  # need the toolkit include dirs, which the vkernels target keeps PRIVATE).
+  # Exported AFTER the fallback resolution above so the value is final.
+  set(VKERNELS_HIP_RUNTIME_INCLUDE_DIRS "${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS}"
+      CACHE INTERNAL "HIP runtime include dirs for test targets")
   target_include_directories(vkernels SYSTEM PRIVATE
     ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
   target_sources(vkernels
