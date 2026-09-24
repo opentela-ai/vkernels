@@ -1,0 +1,99 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "01M3A6S4YWNFNXDZK6YTAVNEG5",
+  "session_id": "01a0d451-66e3-73e3-bb1d-142df7ccbe0d",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-24T17:18:01.083271772Z",
+  "branch": "main",
+  "checkpoints_count": 4,
+  "save_step_count": 4,
+  "files_touched": [
+    "src/python/vkernels/torch_ops/glm_dense_fp8_gemv.py",
+    "src/python/vkernels/torch_ops/glm_expert_gemv.py",
+    "src/python/vkernels/torch_ops/glm_expert_gemv_fused.py",
+    "tests/python/test_glm_dense_fp8_gemv.py",
+    "tests/python/test_glm_expert_gemv.py",
+    "tests/python/test_glm_expert_gemv_fused.py",
+    "tests/python/test_glm_fp8_blockwise_gemm.py"
+  ],
+  "agent": "Pi",
+  "model": "zai-org/GLM-5.3-Flash",
+  "turn_id": "184be649c41b",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 455055,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 7985,
+    "api_call_count": 21
+  },
+  "session_metrics": {
+    "turn_count": 4
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-24T17:18:01.063631326Z",
+    "agent_lines": 0,
+    "agent_removed": 11,
+    "human_added": 0,
+    "human_modified": 17,
+    "human_removed": 44,
+    "total_committed": 12,
+    "total_lines_changed": 82,
+    "agent_percentage": 13.414634146341465,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 1291,
+      "user_lines_removed": 61,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        "docs/candidates/dsv41-fp4-gemv-pairs.md": 68,
+        "docs/candidates/dsv41-fused-quant-epilogues.md": 185,
+        "docs/candidates/dsv41-group-split-routing.md": 167,
+        "docs/candidates/dsv41-p2p-ep-dispatch.md": 361,
+        "docs/candidates/dsv41-push-allreduce.md": 219,
+        "docs/candidates/dsv41-tc-gemm-family.md": 256,
+        "src/python/vkernels/torch_ops/glm_dense_fp8_gemv.py": 8,
+        "src/python/vkernels/torch_ops/glm_expert_gemv.py": 12,
+        "src/python/vkernels/torch_ops/glm_expert_gemv_fused.py": 5,
+        "tests/python/test_glm_dense_fp8_gemv.py": 4,
+        "tests/python/test_glm_expert_gemv.py": 1,
+        "tests/python/test_glm_expert_gemv_fused.py": 1,
+        "tests/python/test_glm_fp8_blockwise_gemm.py": 4
+      },
+      "user_removed_per_file": {
+        "src/python/vkernels/torch_ops/glm_dense_fp8_gemv.py": 18,
+        "src/python/vkernels/torch_ops/glm_expert_gemv.py": 18,
+        "src/python/vkernels/torch_ops/glm_expert_gemv_fused.py": 5,
+        "tests/python/test_glm_dense_fp8_gemv.py": 4,
+        "tests/python/test_glm_expert_gemv.py": 6,
+        "tests/python/test_glm_expert_gemv_fused.py": 4,
+        "tests/python/test_glm_fp8_blockwise_gemm.py": 6
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1291,
+      "agent_lines_removed": 61
+    }
+  ]
+}
