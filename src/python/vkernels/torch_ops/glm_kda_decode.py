@@ -19,7 +19,7 @@ thin-adapter model extended to the whole GLM-5 Triton set).
 Torch and Triton load lazily. Inference-only, no autograd backward.
 """
 
-from ._dispatch import OpNotEligible
+from ._dispatch import OpNotEligible, same_gpu_contiguous
 from functools import lru_cache
 
 
@@ -108,9 +108,7 @@ def kda_decode(query, key, value, gate, beta, initial_state, *, out_fp32=False):
         raise OpNotEligible("vectors must be FP32, BF16 or FP16")
     if initial_state.dtype != torch.float32:
         raise OpNotEligible("the recurrent state must be FP32")
-    for x in (*vectors, initial_state):
-        if not x.is_cuda or x.device != query.device or not x.is_contiguous():
-            raise OpNotEligible("inputs must be contiguous on the same GPU")
+    same_gpu_contiguous(query, key, value, gate, beta, initial_state)
     if out_fp32:
         out = torch.empty(query.shape, dtype=torch.float32, device=query.device)
     else:
@@ -190,41 +188,46 @@ def _conv_decode_kernel():
     return _conv_decode
 
 
-def kda_conv_decode(state, x, weight, kernel_size):
+def kda_conv_decode(state, x, weight):
     """Single-token causal depthwise conv + SiLU in one launch (GLM KDA).
 
     Replaces the eager four-kernel decode step
     ``silu((cat([state, x], -1) * weight).sum(-1))``:
     ``state`` ``[B, C, K-1]``, ``x`` ``[B, C, 1]``, ``weight`` ``[C, 1, K]``
-    (``nn.Conv1d`` layout), output ``[B, C]`` in the input dtype. Bit-identical
-    rounding contract vs the eager chain: bf16 product rounding per tap, FP32
-    tail accumulation, one round on the conv store, SiLU in FP32 on the stored
-    value with one round (see the kernel comment).
+    (``nn.Conv1d`` layout — the weight carries the kernel size K), output
+    ``[B, C]`` in the input dtype. Bit-identical rounding contract vs the
+    eager chain: bf16 product rounding per tap, FP32 tail accumulation, one
+    round on the conv store, SiLU in FP32 on the stored value with one round
+    (see the kernel comment).
 
-    Eligibility: CUDA bf16/fp16 inputs of one dtype on one device, contiguous,
-    ``K == kernel_size`` in (2, 3, 4, 8); raises :class:`OpNotEligible`
-    otherwise (fp32 eager callers keep the torch path — the decode site only
-    ever runs the serving dtype).
+    Eligibility: CUDA bf16/fp16 inputs of one dtype on one device,
+    contiguous, ``K = weight.shape[-1]`` in (2, 3, 4, 8); raises
+    :class:`OpNotEligible` otherwise (fp32 eager callers keep the torch
+    path — the decode site only ever runs the serving dtype).
     """
     import torch
 
-    if kernel_size not in (2, 3, 4, 8):
-        raise OpNotEligible("unsupported conv kernel size")
-    if state.dim() != 3 or state.shape[-1] != kernel_size - 1:
-        raise OpNotEligible("state must be [B, C, K-1]")
+    if (
+        weight.dim() != 3
+        or weight.shape[1] != 1
+        or weight.shape[2] not in (2, 3, 4, 8)
+    ):
+        raise OpNotEligible(
+            "weight must be the nn.Conv1d [C, 1, K] layout with K in (2, 3, 4, 8)"
+        )
+    if state.dim() != 3 or state.shape[-1] != weight.shape[2] - 1:
+        raise OpNotEligible("state must be [B, C, K-1] with K = weight.shape[-1]")
     if x.dim() != 3 or x.shape[-1] != 1 or x.shape[:2] != state.shape[:2]:
         raise OpNotEligible("x must be [B, C, 1] matching the state batch/channels")
-    if weight.shape != (state.shape[1], 1, kernel_size):
-        raise OpNotEligible("weight must be the nn.Conv1d [C, 1, K] layout")
+    if weight.shape[0] != state.shape[1]:
+        raise OpNotEligible("weight must have one filter per state channel")
     if (
         state.dtype not in (torch.bfloat16, torch.float16)
         or x.dtype != state.dtype
         or weight.dtype != state.dtype
     ):
         raise OpNotEligible("state/x/weight must be BF16 or FP16 of one dtype")
-    for t in (state, x, weight):
-        if not t.is_cuda or t.device != state.device or not t.is_contiguous():
-            raise OpNotEligible("inputs must be contiguous on the same GPU")
+    same_gpu_contiguous(state, x, weight)
     batch, channels = state.shape[0], state.shape[1]
     out = torch.empty((batch, channels), device=state.device, dtype=state.dtype)
     if batch * channels:
@@ -237,7 +240,7 @@ def kda_conv_decode(state, x, weight, kernel_size):
                 weight,
                 out,
                 channels,
-                kernel_size,
+                weight.shape[2],
                 1024,
                 num_warps=4,
                 enable_fp_fusion=False,
@@ -245,7 +248,7 @@ def kda_conv_decode(state, x, weight, kernel_size):
     return out
 
 
-def kda_conv_decode_reference(state, x, weight, kernel_size):
+def kda_conv_decode_reference(state, x, weight):
     """Eager oracle for :func:`kda_conv_decode` — the exact torch chain."""
     import torch
     import torch.nn.functional as F

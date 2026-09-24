@@ -21,7 +21,7 @@ kernels it describes (the deepseek_v41 arch already calls its ops exactly
 this way).
 """
 
-__all__ = ["OpNotEligible", "require"]
+__all__ = ["OpNotEligible", "require", "same_gpu_contiguous"]
 
 
 class OpNotEligible(ValueError, TypeError):
@@ -41,3 +41,20 @@ def require(condition: bool, message: str) -> None:
     """Raise :class:`OpNotEligible` with ``message`` unless ``condition``."""
     if not condition:
         raise OpNotEligible(message)
+
+
+def same_gpu_contiguous(*tensors) -> None:
+    """Shared eligibility floor: CUDA-resident, one device, contiguous.
+
+    The most common per-op validation prefix — reuse it instead of
+    hand-rolling the loop in each launcher.
+    """
+    require(
+        tensors[0].is_cuda,
+        "inputs must be CUDA-resident on the same GPU "
+        "(CPU callers take the *_reference/eager path)",
+    )
+    require(all(t.device == tensors[0].device for t in tensors),
+            "inputs must share one GPU device")
+    require(all(t.is_contiguous() for t in tensors),
+            "inputs must be contiguous on the same GPU")

@@ -22,9 +22,33 @@ dtype, shape agreement — the ``torch_ops`` dispatch convention) and raises
 callers fall back to the eager path instead of pre-gating on hardware.
 """
 
+import math
 from functools import lru_cache
+from typing import TYPE_CHECKING, NamedTuple
 
 from ._dispatch import require
+
+if TYPE_CHECKING:
+    import triton  # type-only: the module itself stays triton-free at runtime
+
+
+class _KernelSet(NamedTuple):
+    """The lazily-built Triton kernels, by name.
+
+    Consumers must use named access (``_kernels().norm_uw``). The field
+    order is an implementation detail: positional unpacks rebind silently
+    when the set grows or shuffles (the clariden job 3499983 incident),
+    and named access is immune to both.
+    """
+
+    norm: "triton.runtime.jit.JITFunction"
+    qk_norm: "triton.runtime.jit.JITFunction"
+    rope: "triton.runtime.jit.JITFunction"
+    store_kv: "triton.runtime.jit.JITFunction"
+    qk_norm_rope: "triton.runtime.jit.JITFunction"
+    norm_uw: "triton.runtime.jit.JITFunction"
+    norm_gated: "triton.runtime.jit.JITFunction"
+    swiglu_limit: "triton.runtime.jit.JITFunction"
 
 
 def _same_gpu(*tensors):
@@ -132,23 +156,6 @@ def _kernels():
             tl.store(OK + (row * HK + h) * D + col, a + b, col < D)
 
     @triton.jit
-    def _silu_mul(
-        G,
-        U,
-        Y,
-        D: tl.constexpr,
-        GS: tl.constexpr,
-        US: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        row = tl.program_id(0)
-        col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-        g = tl.load(G + row * GS + col, col < D, 0).to(tl.float32)
-        u = tl.load(U + row * US + col, col < D, 0).to(tl.float32)
-        act = (g / (1.0 + tl.exp(-g))).to(G.dtype.element_ty).to(tl.float32)
-        tl.store(Y + row * D + col, act * u, col < D)
-
-    @triton.jit
     def _swiglu_limit(
         G,
         U,
@@ -167,11 +174,18 @@ def _kernels():
         # The eager chain CLAMPS IN FP32 (TensorIterator opmath) and STORES
         # bf16 between every step, so each intermediate is rounded to the
         # storage dtype before the next op reads it — round the clamped
-        # values (and the silu result) exactly there.
-        g = tl.minimum(g, LIMIT).to(G.dtype.element_ty).to(tl.float32)
-        u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT).to(G.dtype.element_ty).to(
-            tl.float32
-        )
+        # values (and the silu result) exactly there. propagate_nan=ALL
+        # matches torch.clamp (NaN stays NaN; minnum semantics would return
+        # LIMIT instead) — and makes LIMIT=+inf an exact identity, which is
+        # how silu_mul shares this kernel (see silu_mul's docstring).
+        g = tl.minimum(g, LIMIT, propagate_nan=tl.PropagateNan.ALL).to(
+            G.dtype.element_ty
+        ).to(tl.float32)
+        u = tl.minimum(
+            tl.maximum(u, -LIMIT, propagate_nan=tl.PropagateNan.ALL),
+            LIMIT,
+            propagate_nan=tl.PropagateNan.ALL,
+        ).to(G.dtype.element_ty).to(tl.float32)
         act = (g / (1.0 + tl.exp(-g))).to(G.dtype.element_ty).to(tl.float32)
         tl.store(Y + row * D + col, act * u, col < D)
 
@@ -297,7 +311,16 @@ def _kernels():
         # left-to-right multiply order as the eager reference
         tl.store(Y + row * D + col, (((x * inv) * w) * tl.sigmoid(gate)).to(Y.dtype.element_ty), mask)
 
-    return _norm, _qk_norm, _rope, _silu_mul, _store_kv, _qk_norm_rope, _norm_uw, _norm_gated, _swiglu_limit
+    return _KernelSet(
+        norm=_norm,
+        qk_norm=_qk_norm,
+        rope=_rope,
+        store_kv=_store_kv,
+        qk_norm_rope=_qk_norm_rope,
+        norm_uw=_norm_uw,
+        norm_gated=_norm_gated,
+        swiglu_limit=_swiglu_limit,
+    )
 
 
 def rms_norm(x, module, residual=None):
@@ -327,7 +350,7 @@ def rms_norm(x, module, residual=None):
     summed = x if residual is None else torch.empty_like(x)
     r = x if residual is None else residual.contiguous()
     d = x.shape[-1]
-    norm = _kernels()[0]
+    norm = _kernels().norm
     norm[(x.numel() // d,)](
         x,
         module.weight,
@@ -366,7 +389,7 @@ def qk_norm(q, k, q_norm, k_norm):
     q3, k3 = q.reshape(-1, hq, d), k.reshape(-1, hk, d)
     oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     ok = torch.empty(k.shape, device=k.device, dtype=k.dtype)
-    qk_n = _kernels()[1]
+    qk_n = _kernels().qk_norm
     qk_n[(q3.shape[0], hq + hk)](
         q3,
         k3,
@@ -415,7 +438,7 @@ def rotary(q, k, cos, sin):
     q3, k3 = q.reshape(-1, hq, d), k.reshape(-1, hk, d)
     oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     ok = torch.empty(k.shape, device=k.device, dtype=k.dtype)
-    rope = _kernels()[2]
+    rope = _kernels().rope
     rope[(q3.shape[0], hq + hk)](
         q3,
         k3,
@@ -469,7 +492,7 @@ def qk_norm_rope(q, k, q_norm, k_norm, cos, sin):
     q3, k3 = q.reshape(-1, hq, d), k.reshape(-1, hk, d)
     oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     ok = torch.empty(k.shape, device=k.device, dtype=k.dtype)
-    qk_rope = _kernels()[5]
+    qk_rope = _kernels().qk_norm_rope
     qk_rope[(q3.shape[0], hq + hk)](
         q3,
         k3,
@@ -495,44 +518,31 @@ def qk_norm_rope(q, k, q_norm, k_norm, cos, sin):
 def silu_mul(gate, up):
     """SiLU(gate) * up in one launch (SiLU rounds before the product).
 
-    Eligibility: CUDA bf16/fp16 ``gate``/``up`` of the same shape and dtype
-    on one device; raises :class:`OpNotEligible` otherwise.
+    The unclamped member of the GLM swiglu family: the same kernel and
+    rounding contract as :func:`swiglu_limit` with ``limit=+inf``. For
+    values already resident in the storage dtype the clamps are exact
+    identities (NaN included, via ``propagate_nan``), so this is
+    bit-identical to the historical dedicated ``_silu_mul`` kernel.
+
+    Eligibility: CUDA bf16/fp16/fp32 ``gate``/``up`` of the same shape and
+    dtype on one device; raises :class:`OpNotEligible` otherwise.
     """
-    import torch
-    import triton  # lazy: launches need triton only
-
-    _same_gpu(gate, up)
-    require(gate.dtype in (torch.float32, torch.bfloat16, torch.float16)
-            and up.dtype == gate.dtype,
-            f"silu_mul runs fp32/bf16/fp16 with matching dtypes, got {gate.dtype}/{up.dtype}")
-    require(up.shape == gate.shape, "gate and up must share a shape")
-
-    d = gate.shape[-1]
-    g, u = gate.reshape(-1, d), up.reshape(-1, d)
-    out = torch.empty(gate.shape, device=gate.device, dtype=gate.dtype)
-    sm = _kernels()[3]
-    sm[(g.shape[0], triton.cdiv(d, 256))](
-        g,
-        u,
-        out,
-        d,
-        g.stride(0),
-        u.stride(0),
-        256,
-        enable_fp_fusion=False,
-    )
-    return out
+    return swiglu_limit(gate, up, math.inf)
 
 
 def swiglu_limit(gate, up, limit):
     """GLM swiglu in one launch: ``silu(clamp(gate, max=limit)) * clamp(up, ±limit)``.
 
-    Bit-identical to the eager four-kernel chain (clamp, clamp, F.silu, mul):
-    every intermediate rounds at exactly the storage-dtype boundary the eager
-    TensorIterator ops round at (clamp in fp32 opmath -> bf16 store; silu in
-    fp32 -> bf16 store; product in fp32 -> bf16 store). The silu core mirrors
-    the landed :func:`silu_mul` kernel (which carries the same rounding
-    contract vs ``F.silu``).
+    The family kernel of this module's activation lane — :func:`silu_mul`
+    is the ``limit=+inf`` member (clamps become exact identities). This is
+    bit-identical to the eager four-kernel chain (clamp, clamp, F.silu,
+    mul): every intermediate rounds at exactly the storage-dtype boundary
+    the eager TensorIterator ops round at (clamp in fp32 opmath -> bf16
+    store; silu in fp32 -> bf16 store; product in fp32 -> bf16 store), NaN
+    propagating like ``torch.clamp``. bf16/fp16 are bit-equal to the eager
+    chain; fp32 follows the same rounding points but triton's ``exp`` can
+    differ from torch's by ULPs (the long-standing ``silu_mul`` fp32
+    behavior).
 
     Eligibility: CUDA bf16/fp16/fp32 ``gate``/``up`` of the same shape and
     dtype on one device; raises :class:`OpNotEligible` otherwise.
@@ -551,8 +561,8 @@ def swiglu_limit(gate, up, limit):
     d = gate.shape[-1]
     g, u = gate.reshape(-1, d), up.reshape(-1, d)
     out = torch.empty(gate.shape, device=gate.device, dtype=gate.dtype)
-    sm = _kernels()[8]
-    sm[(g.shape[0], triton.cdiv(d, 256))](
+    kern = _kernels().swiglu_limit
+    kern[(g.shape[0], triton.cdiv(d, 256))](
         g,
         u,
         out,
@@ -568,7 +578,6 @@ def swiglu_limit(gate, up, limit):
 
 def swiglu_limit_reference(gate, up, limit):
     """Eager oracle for :func:`swiglu_limit` — the exact torch chain."""
-    import torch
     import torch.nn.functional as F
 
     gate = gate.clamp(max=limit)
@@ -607,7 +616,7 @@ def store_kv(k, v, kc, vc, block_table, seqlens, scratch_slot):
     k3, v3 = k.reshape(-1, h, d), v.reshape(-1, h, d)
     # Token count is runtime data, not a JIT specialization: captured decode
     # initializes the same kernel used for arbitrary-length fresh prefills.
-    sk = _kernels()[4]
+    sk = _kernels().store_kv
     sk[(b, n, h)](
         k3,
         v3,
@@ -643,9 +652,7 @@ def rms_norm_unweighted(x, module):
     x = x.contiguous()
     out = torch.empty_like(x)
     d = x.shape[-1]
-    # Index-based access: the _kernels() tuple grew (_swiglu_limit appended);
-    # tail unpacks ("*_ , unw, gated = ...") silently rebind on any append.
-    unw, _gated = _kernels()[6], _kernels()[7]
+    unw = _kernels().norm_uw
     unw[(x.numel() // d,)](
         x,
         out,
@@ -680,8 +687,7 @@ def rms_norm_gated(x, gate, module):
     gate = gate.contiguous()
     out = torch.empty_like(x)
     d = x.shape[-1]
-    # Index-based access — see the note in rms_norm_unweighted above.
-    _unw, gated = _kernels()[6], _kernels()[7]
+    gated = _kernels().norm_gated
     gated[(x.numel() // d,)](
         x,
         module.weight,
