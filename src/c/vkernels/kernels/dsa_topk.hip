@@ -28,18 +28,17 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 // Grid sync for the fused cooperative kernel. nvcc (the CUDA shim build)
-// takes CUDA's <cooperative_groups.h> with the cg:: namespace; real HIP
-// (ROCm 6.x, verified on beverin) ships the hipCG compat header
-// <hip/hip_cooperative_groups.h> whose grid_group/this_grid() live in the
-// GLOBAL namespace -- hence the VK_GRID_SYNC indirection below.
+// takes CUDA's <cooperative_groups.h>; real HIP (ROCm 6.3, beverin) ships
+// the hipCG compat header <hip/hip_cooperative_groups.h> -- which also
+// exposes this_grid() in namespace cooperative_groups -- so ONE cg:: alias
+// and ONE call site serve both backends.
 #if defined(__CUDACC__)
 #include <cooperative_groups.h>
-namespace cg = cooperative_groups;
-#define VK_GRID_SYNC() cg::this_grid().sync()
 #else
 #include <hip/hip_cooperative_groups.h>
-#define VK_GRID_SYNC() ::this_grid().sync()
 #endif
+namespace cg = cooperative_groups;
+#define VK_GRID_SYNC() cg::this_grid().sync()
 
 #include <cstddef>
 #include <cstdint>
