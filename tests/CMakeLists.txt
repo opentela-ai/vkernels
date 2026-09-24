@@ -27,6 +27,7 @@ vkernels_add_test(NAME kda_k3_chunked SOURCES kernels/attn/test_kda_k3_chunked.c
 vkernels_add_test(NAME kda_cp SOURCES kernels/attn/test_kda_cp.cpp)
 vkernels_add_test(NAME moe         SOURCES kernels/moe/test_moe.cpp)
 vkernels_add_test(NAME moe_fused   SOURCES kernels/moe/test_moe_fused.cpp)
+vkernels_add_test(NAME moe_align_oracle SOURCES kernels/moe/test_moe_align_oracle.cpp)
 vkernels_add_test(NAME moe_aux     SOURCES kernels/moe/test_moe_aux.cpp)
 vkernels_add_test(NAME glm_moe     SOURCES kernels/moe/test_glm_moe.cpp)
 vkernels_add_test(NAME dist_moe    SOURCES kernels/moe/test_dist_moe.cpp)

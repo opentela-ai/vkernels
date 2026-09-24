@@ -514,11 +514,18 @@ def resolve_align_fn(lib):
 # topk_ids.cpu() host round-trip was 97-100% of PP0's per-call
 # moe:vkernel_apply and the ~3x breakable regression floor on PP1/PP2).
 # Set VKERNELS_GPU_ALIGN=0 to force the legacy CPU align path (e.g. to A/B
-# the host round-trip in a profile). The GPU path requires the on-device
-# align symbol (PR #47) AND M*top_k <= 1024 (single-block shared memory,
-# the decode regime that dominates PP0); larger N (prefill) and
-# symbol-absent builds fall back to CPU automatically.
+# the host round-trip in a profile).
+#
+# VK_MOE_ALIGN_DEVICE=0 is a second, independent kill-switch for the same
+# gate (fusion-candidate moe-align-device lane, matching the
+# VK_DSA_DECODE_SPLIT / VK_MHC_PRE_STRICT precedents): either switch set
+# to 0/false forces the CPU path at this binding layer; both default ON.
+# The GPU path requires the on-device align symbol (PR #47) AND
+# M*top_k <= 1024 (single-block shared memory, the decode regime that
+# dominates PP0); larger N (prefill) and symbol-absent builds fall back to
+# CPU automatically.
 _GPU_ALIGN = os.environ.get("VKERNELS_GPU_ALIGN", "1") not in ("0", "false")
+_MOE_ALIGN_DEVICE = os.environ.get("VK_MOE_ALIGN_DEVICE", "1") not in ("0", "false")
 
 
 def _align_em_bound(M: int, top_k: int, local_n: int, block_size: int) -> int:
@@ -922,7 +929,8 @@ def _build_vllm_experts():
             # and read topk_ids/expert_map on-device — removing the ~4 ms
             # topk_ids.cpu() host sync (97-100% of PP0's per-call
             # moe:vkernel_apply, and the same gate that regressed PP1/PP2
-            # ~3x under breakable). VKERNELS_GPU_ALIGN=0 forces the CPU
+            # ~3x under breakable). VK_MOE_ALIGN_DEVICE=0 or
+            # VKERNELS_GPU_ALIGN=0 forces the CPU
             # path (A/B profiling). Larger N (prefill) falls back to the
             # CPU path automatically. The GEMM is launched with
             # max_EM/block_size blocks (a constant for the batch shape;
@@ -931,6 +939,7 @@ def _build_vllm_experts():
             align_fn = resolve_align_fn(lib)
             use_gpu = (
                 _GPU_ALIGN
+                and _MOE_ALIGN_DEVICE
                 and align_fn is not None
                 and (M * top_k) <= 1024
             )
