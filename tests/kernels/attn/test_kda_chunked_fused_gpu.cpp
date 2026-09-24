@@ -27,6 +27,7 @@
 
 #if VKERNELS_HAS_HIP
 
+#include <hip/hip_runtime.h>
 #include <cstdlib>
 
 using namespace vkernels::kernels;
@@ -120,22 +121,64 @@ TEST(KdaChunkedFused, BitIdentityAndOracleParity) {
     normalize_keys(k, B * H * S, D);
 
     const size_t sf = hip::kda_chunked_scratch_floats(B, H, S, D);
-    std::vector<float> scratch(sf);
     const size_t ns = (size_t)B * H * D * D;
+
+    // The hip:: launchers take DEVICE pointers. The GB10 shim + unified
+    // memory tolerated raw host vectors; gfx942 correctly faults on them
+    // (MI300A malloc'd host pages are not GPU-addressable), so stage
+    // explicit device buffers here.
+#define KDA_CK(call)                                                          \
+    do {                                                                      \
+      hipError_t e_ = (call);                                                 \
+      if (e_ != hipSuccess) {                                                 \
+        std::printf("  HIP error %s at %s:%d\n", hipGetErrorString(e_),       \
+                    __FILE__, __LINE__);                                      \
+        return;                                                               \
+      }                                                                       \
+    } while (0)
+    float *dq, *dk, *dv, *dg, *dbeta, *dscratch, *dstate, *dout;
+    KDA_CK(hipMalloc(&dq, m * sizeof(float)));
+    KDA_CK(hipMalloc(&dk, m * sizeof(float)));
+    KDA_CK(hipMalloc(&dv, m * sizeof(float)));
+    KDA_CK(hipMalloc(&dg, m * sizeof(float)));
+    KDA_CK(hipMalloc(&dbeta, n * sizeof(float)));
+    KDA_CK(hipMalloc(&dscratch, sf * sizeof(float)));
+    KDA_CK(hipMalloc(&dstate, ns * sizeof(float)));
+    KDA_CK(hipMalloc(&dout, m * sizeof(float)));
+    KDA_CK(hipMemcpy(dq, q.data(), m * sizeof(float), hipMemcpyHostToDevice));
+    KDA_CK(hipMemcpy(dk, k.data(), m * sizeof(float), hipMemcpyHostToDevice));
+    KDA_CK(hipMemcpy(dv, v.data(), m * sizeof(float), hipMemcpyHostToDevice));
+    KDA_CK(hipMemcpy(dg, g.data(), m * sizeof(float), hipMemcpyHostToDevice));
+    KDA_CK(hipMemcpy(dbeta, beta.data(), n * sizeof(float),
+                     hipMemcpyHostToDevice));
 
     // --- proven chain (gate off; the default) ---
     std::vector<float> state0(ns, 0.0f), out0(m, 0.0f);
-    hip::kda_delta_rule_fwd_chunked_with_scratch(
-        q.data(), k.data(), v.data(), g.data(), beta.data(), state0.data(),
-        out0.data(), scratch.data(), B, H, S, D, kCs, nullptr);
-
     // --- fused chain (gate on; per-call env read, so setenv works) ---
-    setenv("VK_KDA_CHUNKED_FUSED", "1", 1);
     std::vector<float> state1(ns, 0.0f), out1(m, 0.0f);
-    hip::kda_delta_rule_fwd_chunked_with_scratch(
-        q.data(), k.data(), v.data(), g.data(), beta.data(), state1.data(),
-        out1.data(), scratch.data(), B, H, S, D, kCs, nullptr);
+    for (int arm = 0; arm < 2; ++arm) {
+      // Fresh zeroed scratch + zero initial state per run (the launchers
+      // read parts of scratch they did not write: M/N strict-upper cells
+      // and the state kernel's dgG staging).
+      KDA_CK(hipMemset(dscratch, 0, sf * sizeof(float)));
+      KDA_CK(hipMemset(dstate, 0, ns * sizeof(float)));
+      KDA_CK(hipMemset(dout, 0, m * sizeof(float)));
+      setenv("VK_KDA_CHUNKED_FUSED", arm ? "1" : "0", 1);
+      hip::kda_delta_rule_fwd_chunked_with_scratch(
+          dq, dk, dv, dg, dbeta, dstate, dout, dscratch, B, H, S, D, kCs,
+          nullptr);  // nullptr stream: the launcher syncs internally
+      auto& st = arm ? state1 : state0;
+      auto& ot = arm ? out1 : out0;
+      KDA_CK(hipMemcpy(st.data(), dstate, ns * sizeof(float),
+                       hipMemcpyDeviceToHost));
+      KDA_CK(hipMemcpy(ot.data(), dout, m * sizeof(float),
+                       hipMemcpyDeviceToHost));
+    }
     setenv("VK_KDA_CHUNKED_FUSED", "0", 1);
+    (void)hipFree(dq); (void)hipFree(dk); (void)hipFree(dv);
+    (void)hipFree(dg); (void)hipFree(dbeta); (void)hipFree(dscratch);
+    (void)hipFree(dstate); (void)hipFree(dout);
+#undef KDA_CK
 
     // Gate 1: bit identity (out AND final state).
     const bool out_bit =

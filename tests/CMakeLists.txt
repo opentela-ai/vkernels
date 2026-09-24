@@ -90,6 +90,17 @@ endif()
 # adding tests here (additive; last-writer-wins is fine).
 vkernels_add_test(NAME kda_chunked_fused_gpu
                   SOURCES kernels/attn/test_kda_chunked_fused_gpu.cpp)
+if(VKERNELS_HAS_HIP)
+  # Real HIP: the TU stages device buffers (hipMalloc/hipMemcpy), so give it
+  # the toolkit include dirs (PRIVATE to the vkernels target) and the
+  # platform macro hipcc would inject. SYSTEM: ROCm headers are not
+  # -Wpedantic-clean. The CUDA-shim branch must NOT get the define (the
+  # cuda_compat shim #errors when __HIP_PLATFORM_AMD__ is set).
+  target_include_directories(vkernels_test_kda_chunked_fused_gpu SYSTEM PRIVATE
+    ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
+  set_property(TARGET vkernels_test_kda_chunked_fused_gpu APPEND PROPERTY
+    COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__=1)
+endif()
 
 # DSA top-k fused-chain GPU test (fusion lane dsa-topk-tailfold): the device
 # path lives in dsa_topk.hip, shim-compiled under VKERNELS_HAS_HIP in the
