@@ -147,3 +147,55 @@ Acceptance: per-step MoE on PP0 drops from ~130 ms toward the
 between them today), with **no per-request latency regression** and the
 CPU-oracle equality preserved (`vk_moe_align_block_size` parity tests in
 `tests/` + `meta/benchmarks/test_capi_moe.hip`).
+
+---
+
+## Implementation notes — on-device align landed (fusion-candidate `moe-align-device`)
+
+The Future-work section above is **implemented** on `main` (issues #46 and
+#78; the PR #44/#47 C ABI + capture-safe scratch series):
+
+- `vk_hip_moe_align_block_size` (`src/c/vkernels/capi/hip_capi.cpp`) +
+  `hip::moe_align_block_size_hip` (`src/c/vkernels/kernels/moe_fused.hip`):
+  single-block histogram + serial ascending-expert prefix/scatter, outputs
+  bit-identical to the CPU/Python oracle (padding sentinels included);
+  `M*top_k <= 1024` (decode regime), no allocation, no D2H, no sync —
+  graph-capturable.
+- `VkernelFusedExperts.apply` runs the align **on-device by default**
+  (`VKERNELS_GPU_ALIGN=0` was the original A/B switch). The GEMM grid is
+  sized at the host-constant `_align_em_bound` high-water bound, so no
+  host read of the data-dependent `EM` is needed — the whole MoE region
+  is now stream-ordered exactly as sketched above.
+- Fusion-candidate `moe-align-device` additions: a second, independent
+  kill-switch **`VK_MOE_ALIGN_DEVICE=0`** at the binding layer (same
+  gate as `VKERNELS_GPU_ALIGN=0`; both default ON) and the host oracle
+  suite `tests/kernels/moe/test_moe_align_oracle.cpp` (padding sentinels,
+  garbage-id skipping, prefill `block_size=64`, E=256, and the
+  `_align_em_bound` ≥ oracle-EM property). Kernel-doc section:
+  [kernels/moe_fused.md → "On-device alignment"](../../kernels/moe_fused.md).
+  Worklog: `NOTES-fusion-moe-align-device.md` (repo root).
+
+**MI300A A/B plan for the switch** (not yet run — this box has no HIP
+toolchain; the kernel itself is already validated by
+`meta/benchmarks/test_capi_moe_align.hip` on gfx942):
+
+```bash
+cmake --preset hip && cmake --build --preset hip -j
+srun --partition=mi300 --gpu=1 \
+  ./build/hip/meta/benchmarks/test_capi_moe_align          # parity gate
+srun --partition=mi300 --gpu=1 \
+  VK_MOE_ALIGN_DEVICE=0  python <pp-serving-job>            # A: CPU align
+srun --partition=mi300 --gpu=1 \
+  VK_MOE_ALIGN_DEVICE=1  python <pp-serving-job>            # B: device align
+python3 meta/benchmarks/moe_profile.py --label A <A-traces> --label B <B-traces> --head-to-head
+```
+
+Expected (from the tables above): PP0 `moe:apply.cpu_copy` (~3.8-4.2 ms
+of the 3.95-4.2 ms `vk_apply`) disappears; PP0 MoE/step drops from
+~130 ms toward the ~7-9 ms of pure `launch` GPU work, and the captured
+non-MoE graph is no longer hidden under PP0's sync wait. Gate: the
+`moe:apply.gpu_align` region replaces `cpu_copy`/`cpu_align`, per-call
+`vk_apply` on PP0 falls to O(PP1/PP2) + launch, and
+`test_capi_moe_align` stays green with `VK_MOE_ALIGN_DEVICE` at both
+settings. The PP1/PP2 ~3x breakable regression (finding 4) remains the
+next floor and is explicitly out of this candidate's scope.

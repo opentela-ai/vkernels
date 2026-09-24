@@ -24,6 +24,31 @@ def test_import_is_lazy():
     )
 
 
+def test_kernels_surface_is_named():
+    """_kernels() returns a NamedTuple — consumers must use named access.
+
+    Positional unpacks of the kernel set rebind silently when it grows or
+    shuffles (the clariden job 3499983 incident); the named surface is the
+    contract. Runs wherever triton imports (defining the kernels needs no
+    GPU — only launching does).
+    """
+    pytest.importorskip("triton")
+    from vkernels.torch_ops.elementwise import _kernels
+
+    kernels = _kernels()
+    for name in (
+        "norm",
+        "qk_norm",
+        "rope",
+        "store_kv",
+        "qk_norm_rope",
+        "norm_uw",
+        "norm_gated",
+        "swiglu_limit",
+    ):
+        assert callable(getattr(kernels, name)), name
+
+
 @pytest.fixture
 def torch():
     return pytest.importorskip("torch")
@@ -64,6 +89,21 @@ def test_silu_mul_reference_matches_hf_eager(torch):
     act = (gate.float() / (1.0 + torch.exp(-gate.float()))).to(torch.bfloat16)
     expected = (act.float() * up.float()).to(torch.bfloat16)
     torch.testing.assert_close(silu_mul_reference(gate, up), expected)
+
+
+def test_swiglu_limit_reference_matches_eager_chain(torch):
+    from vkernels.torch_ops.elementwise import swiglu_limit_reference
+
+    torch.manual_seed(23)
+    gate = torch.randn(7, 16, dtype=torch.bfloat16) * 12
+    up = torch.randn(7, 16, dtype=torch.bfloat16) * 12
+    limit = 6.0
+    # the clamps must bind, or this test proves nothing about them
+    assert bool((gate > limit).any()) and bool((up.abs() > limit).any())
+    expected = torch.nn.functional.silu(gate.clamp(max=limit)) * up.clamp(
+        min=-limit, max=limit
+    )
+    torch.testing.assert_close(swiglu_limit_reference(gate, up, limit), expected)
 
 
 def test_store_kv_reference_skips_scratch(torch):
@@ -112,6 +152,8 @@ def test_gpu_parity(torch):
         silu_mul_reference,
         store_kv,
         store_kv_reference,
+        swiglu_limit,
+        swiglu_limit_reference,
     )
 
     torch.manual_seed(23)
@@ -151,9 +193,23 @@ def test_gpu_parity(torch):
     torch.testing.assert_close(fq, rq)
     torch.testing.assert_close(fk, rk)
 
-    gate = torch.randn(4, 5, 16, device=dev, dtype=dt)
-    up = torch.randn(4, 5, 16, device=dev, dtype=dt)
+    gate = torch.randn(4, 5, 16, device=dev, dtype=dt) * 12
+    up = torch.randn(4, 5, 16, device=dev, dtype=dt) * 12
+    limit = 6.0
     torch.testing.assert_close(silu_mul(gate, up), silu_mul_reference(gate, up))
+    # GLM swiglu is bit-identical to the eager chain (verified on sm_121);
+    # silu_mul is the same kernel with the clamps disabled (limit=+inf).
+    assert torch.equal(
+        swiglu_limit(gate, up, limit), swiglu_limit_reference(gate, up, limit)
+    )
+    # NaN must propagate like torch.clamp (propagate_nan=ALL, not minnum —
+    # minnum semantics would return LIMIT for a NaN gate).
+    g_nan = torch.tensor([[float("nan"), 3.0]], device=dev, dtype=dt)
+    u_nan = torch.ones_like(g_nan)
+    assert torch.equal(
+        swiglu_limit(g_nan, u_nan, limit).isnan(),
+        swiglu_limit_reference(g_nan, u_nan, limit).isnan(),
+    )
 
     b, n, h, d, max_total = 2, 3, 2, 32, 12
     kk = torch.randn(b, n, h, d, device=dev, dtype=dt)

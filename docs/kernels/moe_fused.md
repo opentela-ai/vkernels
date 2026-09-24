@@ -332,6 +332,58 @@ EM_padded  = 48
 
 ---
 
+## On-device alignment: `moe_align_block_size_hip` (HIP, issue #46 follow-up)
+
+The CPU-only align forces the serving runtime to do `topk_ids.cpu()` —
+a stream-synchronizing host round-trip that measured **97–100% of PP0's
+per-call `moe:vkernel_apply`** (see
+[performance/moe-fused/gfx942-pp-pipeline.md](../performance/moe-fused/gfx942-pp-pipeline.md)).
+The HIP counterpart removes it:
+
+- **Device entry**: `vkernels::kernels::hip::moe_align_block_size_hip`
+  (`moe_fused.hip`) — single block, threads = `max(N, local_n)` rounded to
+  a wavefront. Phase A histograms the routing in parallel (one atomicAdd
+  per flat index into shared counts, after the `expert_map` global→local
+  remap); Phase B (thread 0) computes the padded counts, the exclusive
+  prefix, and `EM` in ascending-expert order; Phase C (thread 0) scatters
+  `sorted_ids` in ascending `(local_expert, flat_index)` order and writes
+  `expert_ids`. The serial tail matches the CPU/Python reference order
+  exactly, so the outputs are **bit-identical** to the oracle, including
+  the padding encoding (`sorted_ids` pads with `N = M*top_k`,
+  `expert_ids` pads with `-1`, minimum one block when the routing is
+  empty).
+- **C ABI**: `vk_hip_moe_align_block_size` (`capi/hip_capi.cpp`) —
+  host-side validation only; enqueues on the caller's stream and returns
+  immediately (no sync, no allocation → graph-capturable). Returns
+  `VK_ERROR_UNSUPPORTED` for `M*top_k > 1024` (single-block shared-memory
+  limit; the caller falls back to the CPU path — prefill stays on the
+  proven host align).
+- **Outputs**: `sorted_ids [max_EM]`, `expert_ids [max_EM/block_size]`,
+  and `out_em [1]` — the real padded EM is written **on device** and the
+  capture-safe fast path does NOT read it back; the downstream GEMM grid
+  is sized at the host-computed high-water bound `max_EM`
+  (`vllm_experts._align_em_bound`, a constant per batch shape) and the
+  kernels early-out padding blocks/rows (`flat < N` / `expert_ids[b] < 0`).
+- **Workspace**: caller-owned persistent buffers (`CaptureSafeScratch`),
+  sized once outside capture — the launcher performs no `hipMalloc` and
+  no D2H copy (issue #41/#45 convention).
+- **Kill-switches** (binding layer, both default ON — either `0`/`false`
+  forces the legacy CPU align path for A/B profiling):
+  `VK_MOE_ALIGN_DEVICE=0` and `VKERNELS_GPU_ALIGN=0`
+  (`src/python/vkernels/vllm_experts.py`).
+- **Parity test**: `meta/benchmarks/test_capi_moe_align.hip` — the device
+  output is compared bit-for-bit against the with-map CPU reference over
+  no-map / 1:1-map / TP-shard-with-skips / padding-heavy / empty-routing
+  cases, plus an end-to-end check that GPU-aligned routing feeds
+  `vk_hip_fused_moe_mxfp4` identically to CPU-aligned routing.
+- **Oracle tests (host)**: `tests/kernels/moe/test_moe_fused.cpp`
+  (`MoeAlign.*`) and `tests/kernels/moe/test_moe_align_oracle.cpp`
+  (padding sentinels, garbage-id skipping, `block_size=64`, E=256, and
+  the `_align_em_bound` ≥ oracle-EM property that makes the max-grid
+  fast path safe).
+
+---
+
 ## CPU reference
 
 `fused_moe_mxfp4_cpu` mirrors the HIP kernel block by block (M-blocks ×
