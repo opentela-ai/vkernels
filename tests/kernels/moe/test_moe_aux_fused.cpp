@@ -339,17 +339,6 @@ TEST(MoeAuxFused, RejectsBadArgs) {
 //
 // The hip:: launchers are self-declared in moe_aux.hip; re-declare the two
 // entry points used here so this host TU links them.
-#if defined(VKERNELS_HAS_HIP) && !defined(__CUDACC__) && !defined(__HIP__)
-#  ifndef __HIP_PLATFORM_AMD__
-#    ifndef __HIP_PLATFORM_NVIDIA__
-       // HIP headers require exactly one platform macro; the host compiler
-       // does not get hipcc's automatic define (same preamble as
-       // core/tuning.cpp; the CUDA-shim build takes its compat header
-       // instead).
-#      define __HIP_PLATFORM_AMD__ 1
-#    endif
-#  endif
-#endif
 #include <hip/hip_runtime.h>
 
 namespace vkernels::kernels::hip {

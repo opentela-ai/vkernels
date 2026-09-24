@@ -41,9 +41,13 @@ if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
 elseif(VKERNELS_HAS_HIP)
   # Real HIP: the device section includes <hip/hip_runtime.h> directly; the
   # toolkit include dirs are PRIVATE to the vkernels target, so give the
-  # test target the exported VKERNELS_HIP_RUNTIME_INCLUDE_DIRS.
+  # test target the exported VKERNELS_HIP_RUNTIME_INCLUDE_DIRS. Host-compiled
+  # TUs also need the platform macro hipcc would inject (the shim branch
+  # must NOT get it: the cuda_compat shim #errors when it is set).
   set_property(TARGET vkernels_test_moe_aux_fused APPEND PROPERTY
     INCLUDE_DIRECTORIES ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
+  set_property(TARGET vkernels_test_moe_aux_fused APPEND PROPERTY
+    COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__=1)
 endif()
 vkernels_add_test(NAME glm_moe     SOURCES kernels/moe/test_glm_moe.cpp)
 vkernels_add_test(NAME dist_moe    SOURCES kernels/moe/test_dist_moe.cpp)
@@ -103,6 +107,8 @@ elseif(VKERNELS_HAS_HIP)
   # Real HIP: direct <hip/hip_runtime.h> include, see moe_aux_fused above.
   set_property(TARGET vkernels_test_dsa_topk_fused_gpu APPEND PROPERTY
     INCLUDE_DIRECTORIES ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
+  set_property(TARGET vkernels_test_dsa_topk_fused_gpu APPEND PROPERTY
+    COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__=1)
 endif()
 
 # The `extern "C"` ABI is CUDA-only (the entry points take a raw
