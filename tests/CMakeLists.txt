@@ -44,8 +44,9 @@ elseif(VKERNELS_HAS_HIP)
   # test target the exported VKERNELS_HIP_RUNTIME_INCLUDE_DIRS. Host-compiled
   # TUs also need the platform macro hipcc would inject (the shim branch
   # must NOT get it: the cuda_compat shim #errors when it is set).
-  set_property(TARGET vkernels_test_moe_aux_fused APPEND PROPERTY
-    INCLUDE_DIRECTORIES ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
+  # SYSTEM: ROCm's own headers are not -Wpedantic-clean.
+  target_include_directories(vkernels_test_moe_aux_fused SYSTEM PRIVATE
+    ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
   set_property(TARGET vkernels_test_moe_aux_fused APPEND PROPERTY
     COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__=1)
 endif()
@@ -105,8 +106,9 @@ if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
     INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
 elseif(VKERNELS_HAS_HIP)
   # Real HIP: direct <hip/hip_runtime.h> include, see moe_aux_fused above.
-  set_property(TARGET vkernels_test_dsa_topk_fused_gpu APPEND PROPERTY
-    INCLUDE_DIRECTORIES ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
+  # SYSTEM: ROCm's own headers are not -Wpedantic-clean.
+  target_include_directories(vkernels_test_dsa_topk_fused_gpu SYSTEM PRIVATE
+    ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
   set_property(TARGET vkernels_test_dsa_topk_fused_gpu APPEND PROPERTY
     COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__=1)
 endif()
