@@ -1,0 +1,5 @@
+what kernels are we missing and might be interesting to copy from: https://github.com/shi3z/deepseekv4.1-A100-custom
+
+---
+
+Can you spawn a subagent for each of them?
