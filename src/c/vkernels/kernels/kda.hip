@@ -38,6 +38,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 #include "vkernels/kernels/kda.hpp"
 
@@ -525,6 +526,92 @@ __global__ void kda_k3_gram_kernel(
   }
 }
 
+// ---- (2a-FUSED) cumsum + gate-weighted grams in ONE launch --------------
+// VK_KDA_CHUNKED_FUSED=1 variant of kda_k3_gram_kernel: the per-chunk
+// per-key log-cumsum (kda_k3_cumsum_kernel's exact statements) runs as a
+// prologue in the same block that computes the grams, so the chunked chain
+// needs 3 launches instead of 4. Bit-identity with the proven chain holds
+// BY CONSTRUCTION: the prologue is one thread per key column accumulating
+// in the SAME ascending token order with the SAME log(0) clamp expression,
+// so every L value (and therefore every downstream float) is identical;
+// the L gmem scratch is still written because the (2b) local kernel reads
+// it. The only saving is the launch + the gram kernel's L gmem re-read
+// (sL is staged straight from the computed registers).
+template <int D>
+__global__ void kda_k3_gram_cumsum_kernel(
+    const float* __restrict__ g,
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ beta, float* __restrict__ L,
+    float* __restrict__ M, float* __restrict__ N,
+    int nc, int S) {
+  static_assert(D % 16 == 0, "D must be a multiple of 16");
+  const int bh = blockIdx.x, c = blockIdx.y, tid = threadIdx.x;
+  const int t0 = c * kCs;
+  const size_t tok = (size_t)bh * S + t0;
+  const size_t lb  = ((size_t)bh * nc + c) * kCs * D;
+  const size_t lbq = ((size_t)bh * nc + c) * kCs * kCs;
+
+  __shared__ float sk[kCs * D];
+  __shared__ float sL[kCs * D];
+
+  // prologue: per-key within-chunk inclusive log-cumsum (kda_k3_cumsum_kernel
+  // verbatim, one key column per thread) -> gmem L + LDS sL.
+  for (int e = tid; e < D; e += kThL) {
+    float acc = 0.0f;
+    for (int t = 0; t < kCs; ++t) {
+      const float gg = g[(tok + (size_t)t) * D + e];
+      acc += (gg <= 0.0f) ? -1.0e9f : logf(gg);   // log(0) clamp (kda.cpp)
+      L[lb + (size_t)t * D + e] = acc;
+      sL[(size_t)t * D + e] = acc;
+    }
+  }
+  for (int i = tid; i < kCs * D; i += kThL) {
+    const int t = i / D, e = i % D;
+    sk[i] = k[(tok + t) * D + e];
+  }
+  __syncthreads();
+
+  const int warp = tid / 32, lane = tid % 32;
+  const int n_pairs = kCs * (kCs + 1) / 2;
+  for (int pr = warp; pr < n_pairs; pr += kThL / 32) {
+    int t = 0, rem = pr;
+    while (rem > t) { rem -= t + 1; ++t; }
+    const int j = rem;
+    const float4* kj4 = (const float4*)(sk + (size_t)j * D);
+    const float4* kt4 = (const float4*)(sk + (size_t)t * D);
+    const float4* Lj4 = (const float4*)(sL + (size_t)j * D);
+    const float4* Lt4 = (const float4*)(sL + (size_t)t * D);
+    const float4* qt4 = (const float4*)(q + (tok + t) * D);
+    float mk = 0.0f, nk = 0.0f;
+    for (int e4 = lane; e4 < D / 4; e4 += 32) {
+      const float4 a = kj4[e4], b = kt4[e4], lj = Lj4[e4], lt = Lt4[e4];
+      const float4 cc = qt4[e4];                    // streamed (gmem/L2)
+      const float4 gw = {expf(lt.x - lj.x), expf(lt.y - lj.y),
+                         expf(lt.z - lj.z), expf(lt.w - lj.w)};
+      mk += gw.x * a.x * b.x + gw.y * a.y * b.y + gw.z * a.z * b.z +
+            gw.w * a.w * b.w;
+      nk += gw.x * a.x * cc.x + gw.y * a.y * cc.y + gw.z * a.z * cc.z +
+            gw.w * a.w * cc.w;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      mk += __shfl_xor(mk, off);
+      nk += __shfl_xor(nk, off);
+    }
+    if (lane == 0) {
+      const float bj = beta[tok + j];
+      N[lbq + (size_t)t * kCs + j] = bj * nk;
+      if (j < t) M[lbq + (size_t)t * kCs + j] = bj * mk;
+    }
+  }
+  // zero the strict-upper cells (disjoint from the pair writes; K2b reads
+  // full rows and must not see stale scratch)
+  for (int i = tid; i < kCs * kCs; i += kThL) {
+    const int t = i / kCs, j = i % kCs;
+    if (j > t) { M[lbq + i] = 0.0f; N[lbq + i] = 0.0f; }
+  }
+}
+
 // ---- (2b) chunk-local artifacts (Ainv + U_v/W/T/Opar) ------------------
 template <int D>
 __global__ void kda_k3_local_kernel(
@@ -791,7 +878,7 @@ template <int D>
 void launch_chunked(const float* q, const float* k, const float* v,
                     const float* g, const float* beta, float* state,
                     float* out, float* scratch, int B, int H, int S,
-                    hipStream_t stream) {
+                    hipStream_t stream, bool fused_cumsum) {
   const int nc = S / kCs;
   const size_t ncsd = (size_t)B * H * S * D;      // per-array float count
   float* L    = scratch;
@@ -803,8 +890,15 @@ void launch_chunked(const float* q, const float* k, const float* v,
   float* M    = Opar + ncsd;
   float* N    = M + (size_t)B * H * nc * kCs * kCs;
   const dim3 gchunk(B * H, nc);
-  kda_k3_cumsum_kernel<<<gchunk, kTh, 0, stream>>>(g, L, nc, S, D);
-  kda_k3_gram_kernel<D><<<gchunk, kThL, 0, stream>>>(q, k, beta, L, M, N, nc, S);
+  if (fused_cumsum) {
+    // VK_KDA_CHUNKED_FUSED=1: cumsum folded into the gram prologue —
+    // bit-identical L (same statements/order), one launch fewer.
+    kda_k3_gram_cumsum_kernel<D><<<gchunk, kThL, 0, stream>>>(
+        g, q, k, beta, L, M, N, nc, S);
+  } else {
+    kda_k3_cumsum_kernel<<<gchunk, kTh, 0, stream>>>(g, L, nc, S, D);
+    kda_k3_gram_kernel<D><<<gchunk, kThL, 0, stream>>>(q, k, beta, L, M, N, nc, S);
+  }
   kda_k3_local_kernel<D><<<gchunk, kThL, 0, stream>>>(
       q, k, v, beta, L, M, N, Kgw, Qgw, Kgb, dgG, U_v, W, T, Opar, nc, S,
       nullptr);
@@ -828,11 +922,34 @@ void kda_delta_rule_fwd_chunked_with_scratch(
                  chunk_size, S, D);
     return;
   }
+  // VK_KDA_CHUNKED_FUSED=1 folds the per-key cumsum launch into the gram
+  // kernel prologue (3 launches instead of 4, bit-identical L). DEFAULT is
+  // the proven 4-launch chain; flip the default only after the gfx942 A/B
+  // (NOTES-fusion-dsa-kda-launches.md).
+  bool fused = false;
+  if (const char* e = std::getenv("VK_KDA_CHUNKED_FUSED"))
+    fused = e[0] == '1';
   const hipStream_t st = static_cast<hipStream_t>(stream);
-  if (D <= 16)      launch_chunked<16>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
-  else if (D <= 32) launch_chunked<32>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
-  else if (D <= 64) launch_chunked<64>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
-  else              launch_chunked<128>(q, k, v, g, beta, state, out, scratch, B, H, S, st);
+#ifdef VKERNELS_KDA_CUDA_SHIM
+  // HIP-on-NVIDIA shim build: NVIDIA caps STATIC shared at 48 KB/block; the
+  // D=128 gram kernels stage 64 KB (fine in gfx942's static budget). The
+  // shim path therefore serves the D <= 64 templates only.
+  if (D > 64) {
+    std::fprintf(stderr,
+                 "kda_delta_rule_fwd_chunked_with_scratch: CUDA-shim build "
+                 "supports D <= 64 (got D=%d); use the HIP build for D=128\n",
+                 D);
+    return;
+  }
+  if (D <= 16)      launch_chunked<16>(q, k, v, g, beta, state, out, scratch, B, H, S, st, fused);
+  else if (D <= 32) launch_chunked<32>(q, k, v, g, beta, state, out, scratch, B, H, S, st, fused);
+  else              launch_chunked<64>(q, k, v, g, beta, state, out, scratch, B, H, S, st, fused);
+#else
+  if (D <= 16)      launch_chunked<16>(q, k, v, g, beta, state, out, scratch, B, H, S, st, fused);
+  else if (D <= 32) launch_chunked<32>(q, k, v, g, beta, state, out, scratch, B, H, S, st, fused);
+  else if (D <= 64) launch_chunked<64>(q, k, v, g, beta, state, out, scratch, B, H, S, st, fused);
+  else              launch_chunked<128>(q, k, v, g, beta, state, out, scratch, B, H, S, st, fused);
+#endif
 }
 
 void kda_delta_rule_fwd_chunked(const float* q, const float* k,
@@ -912,11 +1029,13 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
       kda_k3_gram_kernel<64><<<gchunk, kThL>>>(q, k, beta, L, M, N, nc, S);
       hipDeviceSynchronize();
     });
+#ifndef VKERNELS_KDA_CUDA_SHIM
   else
     out_us[1] = time_launch([&] {
       kda_k3_gram_kernel<128><<<gchunk, kThL>>>(q, k, beta, L, M, N, nc, S);
       hipDeviceSynchronize();
     });
+#endif
   if (D <= 16) {
     out_us[2] = time_launch([&] {
       kda_k3_local_kernel<16><<<gchunk, kThL>>>(q, k, v, beta, L, M, N,

@@ -56,6 +56,21 @@ vkernels_add_test(
   INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
   NO_VKERNELS_LIB)
 
+# KDA chunked-WY fused-launch GPU test: the device path lives in kda.hip,
+# compiled under VKERNELS_HAS_HIP (real HIP on gfx942, or the HIP-on-NVIDIA
+# shim in the CUDA build). On CUDA builds the TU is compiled with
+# VKERNELS_HAS_HIP=1 (like cuda_capi_kpool.cpp) so it links the shim-compiled
+# hip:: symbols from libvkernels; on host-only builds it self-reports a skip.
+if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+  set_source_files_properties(kernels/attn/test_kda_chunked_fused_gpu.cpp
+    PROPERTIES COMPILE_DEFINITIONS "VKERNELS_HAS_HIP=1;VKERNELS_KDA_CUDA_SHIM=1")
+endif()
+# NOTE (fusion lane dsa-kda-launches): the set_source_files_properties above
+# + this test line are a likely merge-conflict point with sibling lanes
+# adding tests here (additive; last-writer-wins is fine).
+vkernels_add_test(NAME kda_chunked_fused_gpu
+                  SOURCES kernels/attn/test_kda_chunked_fused_gpu.cpp)
+
 # The `extern "C"` ABI is CUDA-only (the entry points take a raw
 # cudaStream_t); its runtime test is a .cu compiled when a toolkit is
 # present. It links the shared `vkernels_c` boundary plus the CUDA runtime

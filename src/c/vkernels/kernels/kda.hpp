@@ -336,6 +336,13 @@ void kda_delta_rule_fwd_with_scratch(const float* q, const float* k,
 // state : same in/out contract as kda_delta_rule_fwd_with_scratch.
 // scratch: caller-owned kda_chunked_scratch_floats(B,H,S,D) floats
 //          (allocate once and reuse across calls; contents are clobbered).
+//
+// Launch-chain gate (fusion lane): env VK_KDA_CHUNKED_FUSED=1 folds the
+// per-key cumsum launch into the gram-kernel prologue (3 launches instead
+// of 4). The L values are computed by the SAME statements in the SAME
+// order, so every output bit is identical to the proven 4-launch chain
+// (validated by tests/kernels/attn/test_kda_chunked_fused_gpu.cpp).
+// DEFAULT remains the proven chain; flip only after the gfx942 A/B.
 void kda_delta_rule_fwd_chunked_with_scratch(
     const float* q, const float* k, const float* v, const float* g,
     const float* beta, float* state, float* out, float* scratch,

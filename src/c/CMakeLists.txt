@@ -88,9 +88,15 @@ if(VKERNELS_HAS_CUDA)
   # already owns these sources.
   if(NOT VKERNELS_HAS_HIP)
     set(VKERNELS_CUDA_HIP_SOURCES vkernels/kernels/dsa_kpool.hip
-                                  vkernels/kernels/moe_aux.hip)
+                                  vkernels/kernels/moe_aux.hip
+                                  vkernels/kernels/kda.hip)
     set_source_files_properties(${VKERNELS_CUDA_HIP_SOURCES} PROPERTIES
       LANGUAGE CUDA COMPILE_DEFINITIONS VKERNELS_HAS_HIP=1)
+    # kda.hip: the D=128 gram kernels stage 2 x 64 x 128 x 4 B = 64 KB of
+    # STATIC shared (within gfx942's budget), which exceeds NVIDIA's 48 KB
+    # static limit — the shim build serves D <= 64 only (VKERNELS_KDA_CUDA_SHIM).
+    set_source_files_properties(vkernels/kernels/kda.hip PROPERTIES
+      COMPILE_DEFINITIONS "VKERNELS_HAS_HIP=1;VKERNELS_KDA_CUDA_SHIM=1")
     target_sources(vkernels PRIVATE ${VKERNELS_CUDA_HIP_SOURCES})
     target_include_directories(vkernels PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/vkernels/kernels/cuda_compat)

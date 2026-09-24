@@ -222,6 +222,36 @@ Correctness on the same job: `test_kda_chunked` **12/12 PASS** — chunked vs
 scratch) contract vs the cooperative kernel (out + final state,
 max_rel ≤ 5e-6).
 
+### Fused cumsum launch (`VK_KDA_CHUNKED_FUSED=1`, fusion lane)
+
+The chain's first launch, `kda_k3_cumsum_kernel` (per-key within-chunk
+log-cumsum, 23–36 us of the 748–2922 us phase decomposition above), only
+feeds the gram/local kernels **this chunk's** `L` — there is no cross-chunk
+dependency. `kda.hip` therefore also ships `kda_k3_gram_cumsum_kernel`, the
+gram kernel with the cumsum statements as a prologue (one thread per key
+column, same ascending order, same log(0) clamp): the chain runs **3
+launches instead of 4** and the gram kernel stages `sL` from the computed
+registers instead of re-reading `L` from gmem (the `L` gmem scratch is still
+written — the (2b) local kernel reads it).
+
+Bit-identity with the proven chain holds by construction (same statements,
+same order → same `L` → same every float downstream) and is enforced by
+`tests/kernels/attn/test_kda_chunked_fused_gpu.cpp`: fused-vs-proven out AND
+final state must compare `memcmp`-equal, plus oracle parity of both chains
+against `kda_delta_rule_fwd_state_cpu`.
+
+- **Gate**: env `VK_KDA_CHUNKED_FUSED=1` enables the fused chain; DEFAULT
+  (unset/0) is the proven 4-launch chain. Flip the default only after the
+  MI300A A/B (`meta/scripts/ab_kda_chunked_mi300.sh` extension, worklog
+  NOTES-fusion-dsa-kda-launches.md).
+- **GB10 shim validation** (HIP-on-NVIDIA, D≤64 templates — NVIDIA's 48 KB
+  static-shared cap excludes the 64 KB D=128 gram staging; D=128 stays
+  HIP-only): bit-identical at {1,1,64,16}, {1,2,128,64}, {2,1,128,32};
+  oracle max_rel ≤ 4.4e-7. Wall A/B (sync-per-call, 200 iters):
+  32% faster at H=16 S=64 (launch-bound decode shape), ~5% at H=16 S=512,
+  ~1% at H=32 S=512 — GB10 is launch-overhead-dominated; the MI300A numbers
+  are the ones that matter for serving.
+
 ### Supporting kernels
 
 | kernel | shape | us(med) | GB/s |

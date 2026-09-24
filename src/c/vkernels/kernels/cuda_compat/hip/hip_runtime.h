@@ -59,6 +59,11 @@
 #define hipFree cudaFree
 #define hipMemcpy cudaMemcpy
 #define hipMemset cudaMemset
+#define hipMemsetAsync cudaMemsetAsync
+// kda.hip uses the 2-arg 32-lane butterfly __shfl_xor(var, mask); CUDA 13
+// removed the unsynced intrinsic, so map to the synced form (full-warp mask
+// — every call site in kda.hip has all lanes of a 32-lane warp active).
+#define __shfl_xor(var, mask) __shfl_xor_sync(0xFFFFFFFFu, (var), (mask))
 #define hipMemcpyHostToDevice cudaMemcpyHostToDevice
 #define hipMemcpyDeviceToHost cudaMemcpyDeviceToHost
 #define hipDeviceSynchronize cudaDeviceSynchronize
