@@ -17,7 +17,9 @@ folds the mix GEMV into the same launch: a pre site drops from 5 kernels
 (norm → GEMV → ``_mix`` gates → ``_collapse`` → post-collapse ``_norm``,
 ~12-13 us of launch-bound single-CTA work at bs=1) to 2
 (``mhc_pre_gemv`` + ``mhc_pre_big_fuse``) under floe's ``mhc_big_fuse``
-knob. Grid ``(tokens, mix)``: each program computes one output row,
+knob. Rows ≤ 8 (the decode-graph ladder: buckets 1/2/4, envelope to 8)
+so the B=4 bucket rides the fused launch too. Grid ``(tokens, mix)``:
+each program computes one output row,
 re-deriving the (tiny) row statistic — the fn stack (the only real
 traffic, ~786 KB at the deployed [24, 16384] shape) is read exactly once
 across the row programs, in parallel.
@@ -96,12 +98,17 @@ def mhc_pre_gemv(streams_flat, fn, hc=4, hidden_size=4096, eps=1e-6):
     if streams_flat.dtype not in (torch.bfloat16, torch.float16):
         raise OpNotEligible("streams must be bf16/fp16")
     rows = streams_flat.numel() // k
-    if rows > 2:
-        # Decode-sized rows only (the mhc_projection envelope): at prefill
-        # row counts the per-row GEMV grid wastes the machine AND the
-        # reduction-order drift surface grows with the row count, so
-        # prefill keeps the BLAS GEMM (bit-identical to the eager chain).
-        raise OpNotEligible("decode-sized rows only (<= 2)")
+    if rows > 8:
+        # Decode-sized rows only (the decode-graph ladder tops out at the
+        # 8-token bucket; floe's B<=4 serving runs rows<=4). The grid is
+        # (tokens, mix) — one program per output row — so extra rows are
+        # trivially M-safe (no per-program state beyond the row index);
+        # at prefill row counts the per-row GEMV grid still wastes the
+        # machine, so prefill keeps the BLAS GEMM (bit-identical to the
+        # eager chain). The per-row rounding contract is row-local: the
+        # fp32 statistic and fp32-accum GEMV never mix rows, so lifting
+        # the cap changes no rounding, only which shapes take the launch.
+        raise OpNotEligible("decode-sized rows only (<= 8)")
     if fn.dtype != streams_flat.dtype:
         raise OpNotEligible("fn must share the streams' dtype")
     for x in (streams_flat, fn):

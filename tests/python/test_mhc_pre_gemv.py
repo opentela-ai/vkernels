@@ -35,10 +35,11 @@ def torch():
 
 
 # Rig-realistic envelope: hc=4, hidden 4096 (fn [24, 16384]); decode graph
-# buckets are 1/2/4 tokens. A non-pow2 K (hc=2, hidden 96) and an odd
-# hidden exercise the masked tail path.
+# buckets are 1/2/4 tokens and the op's envelope is the 8-token ladder top
+# (rows <= 8). A non-pow2 K (hc=2, hidden 96) and an odd hidden exercise
+# the masked tail path.
 HC_D = ((4, 4096), (2, 96), (2, 1536))
-TOKENS = (1, 2)  # the op's decode envelope (rows <= 2; mhc_projection's line)
+TOKENS = (1, 2, 4, 8)  # the op's decode envelope (rows <= 8)
 
 
 def _inputs(torch, hc, hidden, tokens, seed=13, dtype=None):
@@ -72,7 +73,7 @@ def test_contract(torch):
     with pytest.raises(ValueError, match="contiguous"):
         mhc_pre_gemv(x.t().contiguous().t(), fn, hc=4, hidden_size=4096)
     with pytest.raises(ValueError, match="decode-sized"):
-        mhc_pre_gemv(x.repeat(2, 1), fn, hc=4, hidden_size=4096)  # 4 rows
+        mhc_pre_gemv(x.repeat(8, 1), fn, hc=4, hidden_size=4096)  # 16 rows
     cpu = _inputs(torch, 4, 4096, 2)
     with pytest.raises(ValueError, match="GPU"):
         mhc_pre_gemv(cpu[0].cpu(), cpu[1].cpu(), hc=4, hidden_size=4096)
@@ -101,11 +102,11 @@ def test_gpu_tokens_shape_roundtrip(torch):
     from vkernels.torch_ops.mhc_pre_gemv import mhc_pre_gemv
 
     hc, hidden = 4, 4096
-    x, fn = _inputs(torch, hc, hidden, 2)
-    x3 = x.view(2, 1, -1)
+    x, fn = _inputs(torch, hc, hidden, 8)
+    x3 = x.view(8, 1, -1)
     got = mhc_pre_gemv(x3, fn, hc=hc, hidden_size=hidden)
-    assert got.shape == (2, 1, hc * (hc + 2))
-    want = _ref(torch, x, fn, hc, hidden).view(2, 1, -1)
+    assert got.shape == (8, 1, hc * (hc + 2))
+    want = _ref(torch, x, fn, hc, hidden).view(8, 1, -1)
     diff = (got.float() - want.float()).abs().max().item()
     scale = want.float().abs().max().item()
     assert diff <= max(2e-2, scale * 2e-2), diff
