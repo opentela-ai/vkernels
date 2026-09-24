@@ -320,9 +320,13 @@ TEST(DsaTopkFused, BitIdentitySetIdentityOracleParity) {
     VK_EXPECT_MSG(std::memcmp(h_dst0.data(), h_dst1.data(), ndst * sizeof(int32_t)) == 0,
                   "clamped-split transform set differs");
 
-    hipFree(dq); hipFree(dkv); hipFree(dw); hipFree(lg0); hipFree(lg1);
-    hipFree(dsl); hipFree(dpt); hipFree(dlen); hipFree(drs); hipFree(doff);
-    hipFree(dptp); hipFree(dtsl); hipFree(dst0); hipFree(dst1);
+    // ROCm marks hipFree nodiscard; the shim build does not. Teardown
+    // failures are not observable here, so discard explicitly.
+    (void)hipFree(dq); (void)hipFree(dkv); (void)hipFree(dw);
+    (void)hipFree(lg0); (void)hipFree(lg1); (void)hipFree(dsl);
+    (void)hipFree(dpt); (void)hipFree(dlen); (void)hipFree(drs);
+    (void)hipFree(doff); (void)hipFree(dptp); (void)hipFree(dtsl);
+    (void)hipFree(dst0); (void)hipFree(dst1);
   }
 }
 
@@ -390,8 +394,10 @@ TEST(DsaTopkFused, FallbackOnUnsupportedGroupTopk) {
   VK_EXPECT_MSG(std::memcmp(h_dst0.data(), h_dst1.data(), h_dst0.size() * 4) == 0,
                 "fallback transform differs");
 
-  hipFree(dq); hipFree(dkv); hipFree(dw); hipFree(lg0); hipFree(lg1);
-  hipFree(dsl); hipFree(dpt); hipFree(dlen); hipFree(doff); hipFree(dst0); hipFree(dst1);
+  (void)hipFree(dq); (void)hipFree(dkv); (void)hipFree(dw);
+  (void)hipFree(lg0); (void)hipFree(lg1); (void)hipFree(dsl);
+  (void)hipFree(dpt); (void)hipFree(dlen); (void)hipFree(doff);
+  (void)hipFree(dst0); (void)hipFree(dst1);
 }
 
 // Launch-overhead probe (print-only, no assertion): the fusion collapses the
@@ -482,9 +488,10 @@ TEST(DsaTopkFused, LaunchOverheadProbe) {
               "gate-off chain %lld us vs fused %lld us per iteration\n",
               bs, H, D, B, mt, max_seq_len, chain_us, fused_us);
 
-  hipFree(dq); hipFree(dkv); hipFree(dw); hipFree(dsl); hipFree(dpt);
-  hipFree(dlg0); hipFree(dlg1); hipFree(dlen); hipFree(doff); hipFree(drs);
-  hipFree(ddst0); hipFree(ddst1);
+  (void)hipFree(dq); (void)hipFree(dkv); (void)hipFree(dw);
+  (void)hipFree(dsl); (void)hipFree(dpt); (void)hipFree(dlg0);
+  (void)hipFree(dlg1); (void)hipFree(dlen); (void)hipFree(doff);
+  (void)hipFree(drs); (void)hipFree(ddst0); (void)hipFree(ddst1);
 }
 
 #else  // !VKERNELS_HAS_HIP
