@@ -720,6 +720,52 @@ def mxfp4_moe_sort_scales(scales, sorted_ids, *, top_k: int):
     return out.reshape(EM, n_groups)
 
 
+def mxfp4_moe_sorted_quant(A, sorted_ids, *, group_size: int = 32, top_k: int):
+    """Fused gather + MXFP4 quantize (single op, no ``A_sorted`` materialization).
+
+    Produces exactly ``mxfp4_moe_quant(mxfp4_moe_sort(A, sorted_ids, ...))``
+    — the expert-grouped ``[EM, hidden/2]`` packed E2M1 and ``[EM,
+    n_groups]`` ue8m0 scales consumed by :func:`fused_moe_mxfp4` — in one
+    step. Padding rows quantize like real zero activations (``0xFF`` scale,
+    zero nibbles), matching the ``sort -> quant`` route. On the compiled
+    backend the fused op is bit-identical to the two-op composition by
+    construction (shared quantize code, gated by ``VK_MOE_AUX_FUSED_QUANT``).
+
+    Args:
+        A: uint16 bf16 array of shape ``(M, hidden)``.
+        sorted_ids: int32 array of shape ``(EM,)`` from
+            :func:`moe_align_block_size`.
+        group_size: ue8m0 scale group length (default 32).
+        top_k: experts selected per token (decodes ``token = flat / top_k``).
+
+    Returns:
+        ``(packed, scales)`` — uint8 ``[EM, hidden/2]`` E2M1 and uint8
+        ``[EM, hidden/group_size]`` ue8m0, in sorted row order.
+    """
+    A_arr = np.ascontiguousarray(A, dtype=np.uint16)
+    if A_arr.ndim != 2:
+        raise ValueError("A must be 2-D [M, hidden]")
+    M, hidden = A_arr.shape
+    ids = np.ascontiguousarray(sorted_ids, dtype=np.int32)
+    if ids.ndim != 1:
+        raise ValueError("sorted_ids must be 1-D [EM]")
+    EM = ids.size
+    if int(group_size) <= 0:
+        raise ValueError("group_size must be positive")
+    if hidden % int(group_size) != 0 or hidden % 2 != 0:
+        raise ValueError(
+            f"hidden ({hidden}) must be a multiple of group_size "
+            f"({int(group_size)}) and even"
+        )
+    packed, scales = _impl.mxfp4_moe_sorted_quant(
+        A_arr, ids, int(M), int(hidden), int(group_size), int(top_k), int(EM)
+    )
+    return (
+        packed.reshape(EM, hidden // 2),
+        scales.reshape(EM, hidden // int(group_size)),
+    )
+
+
 def mxfp4_moe_scatter_reduce(
     partial, topk_w, sorted_ids, *, M: int, width: int, top_k: int
 ):

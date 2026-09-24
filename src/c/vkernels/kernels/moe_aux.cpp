@@ -88,6 +88,58 @@ int ceil_log2(float v) {
 
 }  // namespace
 
+namespace {
+
+// Quantize one full row of `hidden` bf16 activations (already converted to
+// the caller's row pointer) into (hidden/2) packed E2M1 bytes + (hidden /
+// group_size) ue8m0 scales. Shared by `mxfp4_moe_quant` (token-order rows)
+// and `mxfp4_moe_sorted_quant` (sorted rows), so the fused op is bit-identical
+// to the sort→quant composition BY CONSTRUCTION (same code, same expression
+// order, not merely the same spec).
+void quant_row(const uint16_t* row, uint8_t* pk, uint8_t* sc, int hidden,
+               int group_size) {
+  const int n_groups = hidden / group_size;
+  for (int g = 0; g < n_groups; ++g) {
+    float amax = 0.0f;
+    const int base = g * group_size;
+    for (int i = 0; i < group_size; ++i) {
+      float a = bf16_to_float(row[base + i]);
+      float aa = std::fabs(a);
+      if (aa > amax) amax = aa;
+    }
+    uint8_t sb;
+    float scale;
+    // Exactly mirrors the CPU reference: a zero or non-finite amax produces
+    // the 0xFF (zero) scale and zero nibbles for the whole group. For a
+    // real amax the scale byte is clamped to [1, 254] (never 0) so the
+    // emitted scale is a normal power of two that decodes identically via
+    // the simple `s << 23` ue8m0 path on host and device.
+    if (!(amax > 0.0f) || !std::isfinite(amax)) {
+      sb = 0xFF;
+      scale = 0.0f;
+    } else {
+      int e = ceil_log2(amax / kMxFp4Max);
+      int s = e + 127;
+      if (s < 1) s = 1;
+      if (s > 254) s = 254;
+      sb = static_cast<uint8_t>(s);
+      scale = ue8m0_to_float(sb);
+    }
+    sc[g] = sb;
+    if (sb == 0xFF) {
+      for (int kp = 0; kp < group_size / 2; ++kp) pk[base / 2 + kp] = 0;
+      continue;
+    }
+    for (int i = 0; i < group_size; i += 2) {
+      uint8_t lo = float_to_fp4_nib(bf16_to_float(row[base + i]) / scale);
+      uint8_t hi = float_to_fp4_nib(bf16_to_float(row[base + i + 1]) / scale);
+      pk[base / 2 + i / 2] = (hi << 4) | (lo & 0x0F);
+    }
+  }
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // #16 — mxfp4_moe_quant
 // ---------------------------------------------------------------------------
@@ -102,47 +154,51 @@ void mxfp4_moe_quant(const uint16_t* A, uint8_t* packed, uint8_t* scales,
              "hidden must be a multiple of group_size");
   VK_EXPECTS(hidden % 2 == 0, "hidden must be even (two nibbles per byte)");
 
-  const int n_groups = hidden / group_size;
   for (int m = 0; m < M; ++m) {
-    const uint16_t* row = A + static_cast<std::size_t>(m) * hidden;
-    uint8_t* pk = packed + static_cast<std::size_t>(m) * (hidden / 2);
-    uint8_t* sc = scales + static_cast<std::size_t>(m) * n_groups;
-    for (int g = 0; g < n_groups; ++g) {
-      float amax = 0.0f;
-      const int base = g * group_size;
-      for (int i = 0; i < group_size; ++i) {
-        float a = bf16_to_float(row[base + i]);
-        float aa = std::fabs(a);
-        if (aa > amax) amax = aa;
-      }
-      uint8_t sb;
-      float scale;
-      // Exactly mirrors the CPU reference: a zero or non-finite amax produces
-      // the 0xFF (zero) scale and zero nibbles for the whole group. For a
-      // real amax the scale byte is clamped to [1, 254] (never 0) so the
-      // emitted scale is a normal power of two that decodes identically via
-      // the simple `s << 23` ue8m0 path on host and device.
-      if (!(amax > 0.0f) || !std::isfinite(amax)) {
-        sb = 0xFF;
-        scale = 0.0f;
-      } else {
-        int e = ceil_log2(amax / kMxFp4Max);
-        int s = e + 127;
-        if (s < 1) s = 1;
-        if (s > 254) s = 254;
-        sb = static_cast<uint8_t>(s);
-        scale = ue8m0_to_float(sb);
-      }
-      sc[g] = sb;
-      if (sb == 0xFF) {
-        for (int kp = 0; kp < group_size / 2; ++kp) pk[base / 2 + kp] = 0;
-        continue;
-      }
-      for (int i = 0; i < group_size; i += 2) {
-        uint8_t lo = float_to_fp4_nib(bf16_to_float(row[base + i]) / scale);
-        uint8_t hi = float_to_fp4_nib(bf16_to_float(row[base + i + 1]) / scale);
-        pk[base / 2 + i / 2] = (hi << 4) | (lo & 0x0F);
-      }
+    quant_row(A + static_cast<std::size_t>(m) * hidden,
+              packed + static_cast<std::size_t>(m) * (hidden / 2),
+              scales + static_cast<std::size_t>(m) * (hidden / group_size),
+              hidden, group_size);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fusion — mxfp4_moe_sorted_quant (gather + quantize in one pass)
+// ---------------------------------------------------------------------------
+void mxfp4_moe_sorted_quant(const uint16_t* A, const int32_t* sorted_ids,
+                            uint8_t* packed, uint8_t* scales,
+                            int M, int hidden, int group_size, int top_k,
+                            int EM) {
+  VK_EXPECTS(A != nullptr, "A must not be null");
+  VK_EXPECTS(sorted_ids != nullptr, "sorted_ids must not be null");
+  VK_EXPECTS(packed != nullptr, "packed must not be null");
+  VK_EXPECTS(scales != nullptr, "scales must not be null");
+  VK_EXPECTS(M >= 0 && hidden >= 0, "M and hidden must be non-negative");
+  VK_EXPECTS(top_k > 0, "top_k must be positive");
+  VK_EXPECTS(EM >= 0, "EM must be non-negative");
+  VK_EXPECTS(group_size > 0, "group_size must be positive");
+  VK_EXPECTS(hidden % group_size == 0,
+             "hidden must be a multiple of group_size");
+  VK_EXPECTS(hidden % 2 == 0, "hidden must be even (two nibbles per byte)");
+
+  const int n_groups = hidden / group_size;
+  const int N = M * top_k;
+  for (int r = 0; r < EM; ++r) {
+    uint8_t* pk = packed + static_cast<std::size_t>(r) * (hidden / 2);
+    uint8_t* sc = scales + static_cast<std::size_t>(r) * n_groups;
+    const int flat = sorted_ids[r];
+    if (flat >= 0 && flat < N) {
+      // Real row: quantize A[flat / top_k] directly. `quant_row` is the
+      // SAME code `mxfp4_moe_quant` runs on the sort output, so packed and
+      // scales are bit-identical to the sort→quant composition.
+      quant_row(A + static_cast<std::size_t>(flat / top_k) * hidden, pk, sc,
+                hidden, group_size);
+    } else {
+      // Padding row (flat outside [0, M*top_k)): mxfp4_moe_sort would zero
+      // the row and mxfp4_moe_quant would then produce scale 0xFF with
+      // all-zero nibbles for every group (amax == 0). Emit that directly.
+      std::memset(pk, 0, static_cast<std::size_t>(hidden) / 2);
+      std::memset(sc, 0xFF, static_cast<std::size_t>(n_groups));
     }
   }
 }

@@ -15,6 +15,7 @@ GEMM itself — that is [`fused_moe_mxfp4`](moe_fused.md).
 - **Source (HIP)**: `src/c/vkernels/kernels/moe_aux.hip`
 - **Header**: `src/c/vkernels/kernels/moe_aux.hpp`
 - **Tests**: `tests/kernels/moe/test_moe_aux.cpp` (host),
+  `tests/kernels/moe/test_moe_aux_fused.cpp` (fused sorted-quant, host),
   `tests/python/test_kernels.py::MoeAuxTest` (compiled vs fallback, K3 pipeline)
 
 ---
@@ -29,6 +30,8 @@ GEMM itself — that is [`fused_moe_mxfp4`](moe_fused.md).
             mxfp4_moe_sort          gather A          [M, hidden] → [EM, hidden]
             mxfp4_moe_sort_scales   gather scales     [M, n_groups] → [EM, n_groups]
             mxfp4_moe_quant         per-token / block E2M1 + ue8m0
+            │   (fused alternative: mxfp4_moe_sorted_quant does
+            │    gather + quantize in one launch, no A_sorted round-trip)
             │
             ▼
             fused_moe_mxfp4 (see moe_fused.md)
@@ -151,6 +154,41 @@ exactly the scales that `mxfp4_moe_quant(A_sorted)` would produce — both
 express the per-group scale of token `sorted_ids[r] // top_k` at sorted
 row `r`.
 
+### `mxfp4_moe_sorted_quant`
+
+```cpp
+void mxfp4_moe_sorted_quant(const uint16_t* A, const int32_t* sorted_ids,
+                            uint8_t* packed, uint8_t* scales, int M,
+                            int hidden, int group_size, int top_k, int EM);
+```
+
+The fused gather+quantize: produces `mxfp4_moe_quant(mxfp4_moe_sort(A,
+sorted_ids, ...))` in a single launch — `packed`/`scales` are the
+expert-grouped `[EM, hidden / 2]` / `[EM, n_groups]` quantized activation
+consumed directly by the grouped GEMM, with **no `A_sorted` materialization**.
+This removes the largest intermediate write+read of the pre-GEMM chain
+(`EM x hidden` bf16 out and in, ~58 MB round-trip at K3).
+
+Bit-exact composition contract (checked by
+test_moe_aux_fused.cpp and the bench parity gate):
+
+```
+mxfp4_moe_sorted_quant(A, sorted_ids)[r] == mxfp4_moe_quant(mxfp4_moe_sort(A, sorted_ids))[r]
+```
+
+for every sorted row `r`, real or padding. Padding rows quantize exactly
+like real zero activations (`scale = 0xFF`, zero nibbles), matching the
+`sort -> quant` route. Note the standalone `quant -> sort_scales` route
+instead writes literal `0` scale bytes for padding rows — a pre-existing
+asymmetry between the two standalone routes (harmless: the grouped GEMM
+never reads padding rows); the fused op follows `sort -> quant`, the route
+it replaces.
+
+On the device path the launcher dispatches to the fused kernel by default;
+`VK_MOE_AUX_FUSED_QUANT=0` falls back to `sort -> quant` (the proven
+two-launch path), so the fusion is an env-gated behavioral change with a
+bit-identical fallback.
+
 ### `mxfp4_moe_scatter_reduce`
 
 ```cpp
@@ -202,6 +240,13 @@ algorithms:
 - **`mxfp4_moe_sort`** / **`mxfp4_moe_sort_scales`**: one block per sorted
   row, a generic gather over `elem = sizeof(element)` bytes (bf16 → 2,
   ue8m0 → 1), strided across the row.
+- **`mxfp4_moe_sorted_quant`**: (#157) same grid/block shape as the quant
+  kernel (`EM * n_groups` blocks of `group_size` threads) but each block
+  gathers its group's `group_size` bf16 elements directly from `A` via
+  `sorted_ids` (row `sorted_ids[r] / top_k`, zero for padding rows) instead
+  of reading the materialized `A_sorted`. The amax tree reduction, E2M1
+  rounding and ue8m0 packing are the quant kernel's code, so the fused op
+  is bit-identical to `sort -> quant` on device by construction.
 - **`mxfp4_moe_scatter_reduce`** / **`mxfp4_moe_scatter_reduce_q`**:
   (#145) **token-major gather** — an inverse permutation `inv[sorted_ids[r]] = r`
   (micro-kernel + cached device scratch, or prebuilt via
@@ -241,6 +286,8 @@ scale/sort outputs) or allclose (`mxfp4_moe_scatter_reduce[_q]`) by
 packed, scales = vk.mxfp4_moe_quant(A, group_size=32)          # A: bf16 uint16
 A_sorted        = vk.mxfp4_moe_sort(A, sorted_ids, top_k=top_k)
 scales_sorted   = vk.mxfp4_moe_sort_scales(scales, sorted_ids, top_k=top_k)
+packed_s, scales_s = vk.mxfp4_moe_sorted_quant(A, sorted_ids, group_size=32,
+                                               top_k=top_k)   # fused gather+quant
 out             = vk.mxfp4_moe_scatter_reduce(partial, topk_w, sorted_ids,
                                               M=M, width=hidden, top_k=top_k)
 out             = vk.mxfp4_moe_scatter_reduce_q(partial_q, partial_s, topk_w,
@@ -357,3 +404,41 @@ cmake --build build/hip --target moe_aux_bench
 srun --partition=mi300 --ntasks=1 --cpus-per-task=16 \
      ./build/hip/meta/benchmarks/moe_aux_bench
 ```
+
+---
+
+## Fusion candidate — `mxfp4_moe_sorted_quant` (GB10 bring-up, gfx942 pending)
+
+The chain `sort → quant → sort_scales` materializes the `[EM, hidden]` bf16
+`A_sorted` (written by sort, read by quant) and re-derives sorted scales
+that the quant of sorted rows already produced. The fused op eliminates
+both. Validated so far on the GB10 via the CUDA-on-NVIDIA shim path (the
+`.hip` compiles under nvcc 13 with `cuda_compat/hip/hip_runtime.h`):
+
+- **Parity**: bit-exact vs the CPU `sort → quant` composition on 11 shape
+  classes up to full K3 (`M=112, hidden=7168, top_k=16, EM=2048` →
+  7.3 MB packed + 448 KiB scales, 0 mismatched bytes), with
+  `VK_MOE_AUX_FUSED_QUANT` in **both** positions. One shape (`gs=4` with a
+  mixed finite+NaN group) diverges from the *oracle* identically in both
+  gate positions — a pre-existing device-vs-oracle NaN-propagation
+difference in the shared amax tree (`(a > b) ? a : b` keeps a NaN that the
+  oracle's `if (aa > amax)` drops); the fused kernel is bit-identical to
+  the proven device quant kernel by construction.
+- **Latency (informative, GB10 — not gfx942)**: K3 shape, 100-iter best-of
+  CUDA events: `sort+quant+sort_scales` chain 652 µs → fused 496 µs
+  (**−24%**), consistent with dropping the `EM·hidden` bf16 round-trip and
+  the extra launch. gfx942 numbers to be recorded with the srun run below.
+
+```sh
+# gfx942 A/B (build on login node, run on compute node)
+cmake --preset hip -DVKERNELS_BUILD_BENCHMARKS=ON
+cmake --build build/hip --target moe_aux_bench test_moe_aux_correct
+srun --partition=mi300 --ntasks=1 --gpus=1 ./build/hip/meta/benchmarks/test_moe_aux_correct
+srun --partition=mi300 --ntasks=1 --gpus=1 ./build/hip/meta/benchmarks/moe_aux_bench   # fused (default)
+srun --partition=mi300 --ntasks=1 --gpus=1 VK_MOE_AUX_FUSED_QUANT=0 \
+     ./build/hip/meta/benchmarks/moe_aux_bench                                          # gate-off A/B
+```
+
+The bench prints a `parity OK` gate line per shape and refuses to time if
+the fused output differs from the `sort → quant` composition by even one
+byte, in either gate position.

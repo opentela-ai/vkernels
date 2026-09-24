@@ -77,6 +77,7 @@ backend when FlashInfer is unavailable.
 | `glm_router.fused_router` | sigmoid + bias + group mask + triple `topk` + weight gather + `norm_topk_prob` + scaling in one launch over fp32 `[T, E]` logits (shipped `n_group == 1` config; other configs raise `OpNotEligible` so the grouped eager path runs) |
 | `glm_kda_decode` | single-token FP32 per-dimension-gated KDA step; bf16/fp16 ABI with in-kernel widening (bit-identical to eager widening, minus 5 cast kernels per layer per step) |
 | `glm_expert_gemv`, `glm_expert_gather_dequant`, `glm_fp8_blockwise_gemm` (+ `_glm_fp8_sm90_gemm`) | FP8 block-scaled MoE GEMV/GEMM path (issue #65) |
+| `glm_expert_gemv_fused.expert_gemv_silu` | **fused-epilogue** variant of `glm_expert_gemv`: applies `silu(gate)*up` in-kernel and writes only `act[T,K,IA]`, bit-identical to the `expert_gemv` + `silu_mul` chain (the gate/up dots are rounded to bf16 in registers exactly where the chain stores/reloads); one launch instead of two, no `[T,K,2*IA]` gate/up round trip. Opt-in via `GLM53_MOE_SILU_FUSED=1` (default off); GB10 A/B showed the win is launch-boundary-sized (~0.6–2.2%), as the roofline predicts — see [glm53-decode-kernels.md](glm53-decode-kernels.md) and `NOTES-fusion-glm-decode-fused.md` |
 | `glm_mhc_mix`, `mhc_projection` | mHC residual-stream mixing / projection GEMV |
 | `mhc_compose.mhc_collapse` / `mhc_compose` | mHC stream collapse (`Σ pre·streams`) and compose (`combᵀ·streams + post⊙out`) with an exact-fp32 matmul oracle |
 | `qkv_projection` (+ `qkv_tuned_blas`) | chunked q/k/v projection GEMV, dispatch-tuned |

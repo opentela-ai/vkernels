@@ -29,6 +29,27 @@ vkernels_add_test(NAME moe         SOURCES kernels/moe/test_moe.cpp)
 vkernels_add_test(NAME moe_fused   SOURCES kernels/moe/test_moe_fused.cpp)
 vkernels_add_test(NAME moe_align_oracle SOURCES kernels/moe/test_moe_align_oracle.cpp)
 vkernels_add_test(NAME moe_aux     SOURCES kernels/moe/test_moe_aux.cpp)
+vkernels_add_test(NAME moe_aux_fused SOURCES kernels/moe/test_moe_aux_fused.cpp)
+# The NaN-parity device section of moe_aux_fused needs the shim's hip/
+# runtime mapping on CUDA builds (real HIP builds define VKERNELS_HAS_HIP
+# globally). Host-only builds compile the section out and skip these flags.
+if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+  set_source_files_properties(kernels/moe/test_moe_aux_fused.cpp
+    PROPERTIES COMPILE_DEFINITIONS "VKERNELS_HAS_HIP=1")
+  set_property(TARGET vkernels_test_moe_aux_fused APPEND PROPERTY
+    INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+elseif(VKERNELS_HAS_HIP)
+  # Real HIP: the device section includes <hip/hip_runtime.h> directly; the
+  # toolkit include dirs are PRIVATE to the vkernels target, so give the
+  # test target the exported VKERNELS_HIP_RUNTIME_INCLUDE_DIRS. Host-compiled
+  # TUs also need the platform macro hipcc would inject (the shim branch
+  # must NOT get it: the cuda_compat shim #errors when it is set).
+  # SYSTEM: ROCm's own headers are not -Wpedantic-clean.
+  target_include_directories(vkernels_test_moe_aux_fused SYSTEM PRIVATE
+    ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
+  set_property(TARGET vkernels_test_moe_aux_fused APPEND PROPERTY
+    COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__=1)
+endif()
 vkernels_add_test(NAME glm_moe     SOURCES kernels/moe/test_glm_moe.cpp)
 vkernels_add_test(NAME dist_moe    SOURCES kernels/moe/test_dist_moe.cpp)
 vkernels_add_test(NAME topology    SOURCES comm/test_topology.cpp)
@@ -54,6 +75,54 @@ vkernels_add_test(
           ${CMAKE_SOURCE_DIR}/src/c/vkernels/capi/serving_c.cpp
   INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
   NO_VKERNELS_LIB)
+
+# KDA chunked-WY fused-launch GPU test: the device path lives in kda.hip,
+# compiled under VKERNELS_HAS_HIP (real HIP on gfx942, or the HIP-on-NVIDIA
+# shim in the CUDA build). On CUDA builds the TU is compiled with
+# VKERNELS_HAS_HIP=1 (like cuda_capi_kpool.cpp) so it links the shim-compiled
+# hip:: symbols from libvkernels; on host-only builds it self-reports a skip.
+if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+  set_source_files_properties(kernels/attn/test_kda_chunked_fused_gpu.cpp
+    PROPERTIES COMPILE_DEFINITIONS "VKERNELS_HAS_HIP=1;VKERNELS_KDA_CUDA_SHIM=1")
+endif()
+# NOTE (fusion lane dsa-kda-launches): the set_source_files_properties above
+# + this test line are a likely merge-conflict point with sibling lanes
+# adding tests here (additive; last-writer-wins is fine).
+vkernels_add_test(NAME kda_chunked_fused_gpu
+                  SOURCES kernels/attn/test_kda_chunked_fused_gpu.cpp)
+if(VKERNELS_HAS_HIP)
+  # Real HIP: the TU stages device buffers (hipMalloc/hipMemcpy), so give it
+  # the toolkit include dirs (PRIVATE to the vkernels target) and the
+  # platform macro hipcc would inject. SYSTEM: ROCm headers are not
+  # -Wpedantic-clean. The CUDA-shim branch must NOT get the define (the
+  # cuda_compat shim #errors when __HIP_PLATFORM_AMD__ is set).
+  target_include_directories(vkernels_test_kda_chunked_fused_gpu SYSTEM PRIVATE
+    ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
+  set_property(TARGET vkernels_test_kda_chunked_fused_gpu APPEND PROPERTY
+    COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__=1)
+endif()
+
+# DSA top-k fused-chain GPU test (fusion lane dsa-topk-tailfold): the device
+# path lives in dsa_topk.hip, shim-compiled under VKERNELS_HAS_HIP in the
+# CUDA build. Same pattern as moe_aux_fused (register the test first, then
+# the shim properties; the test TU dequants through the SHARED
+# device_numeric.cuh, so the CPU oracle sees bit-exact fp32 inputs).
+# Host-only builds self-report a skip.
+vkernels_add_test(NAME dsa_topk_fused_gpu
+                  SOURCES kernels/attn/test_dsa_topk_fused_gpu.cpp)
+if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+  set_source_files_properties(kernels/attn/test_dsa_topk_fused_gpu.cpp
+    PROPERTIES COMPILE_DEFINITIONS "VKERNELS_HAS_HIP=1;VKERNELS_DSA_TOPK_CUDA_SHIM=1")
+  set_property(TARGET vkernels_test_dsa_topk_fused_gpu APPEND PROPERTY
+    INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+elseif(VKERNELS_HAS_HIP)
+  # Real HIP: direct <hip/hip_runtime.h> include, see moe_aux_fused above.
+  # SYSTEM: ROCm's own headers are not -Wpedantic-clean.
+  target_include_directories(vkernels_test_dsa_topk_fused_gpu SYSTEM PRIVATE
+    ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
+  set_property(TARGET vkernels_test_dsa_topk_fused_gpu APPEND PROPERTY
+    COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__=1)
+endif()
 
 # The `extern "C"` ABI is CUDA-only (the entry points take a raw
 # cudaStream_t); its runtime test is a .cu compiled when a toolkit is

@@ -219,7 +219,7 @@ class TestGpuKernelParity:
     at the real GLM MoE shapes (E=288 collapsed to active experts, N=4096,
     K=4096 gate_up / N=4096 K=2048 down)."""
 
-    def _native_cast_gemv_parity(self, e, o, i, t, kk):
+    def _native_cast_gemv_parity(self, e, o, i, t, kk, t_cap=None):
         from vkernels.torch_ops.glm_expert_gemv import (
             expert_gemv,
             expert_gemv_reference,
@@ -235,27 +235,26 @@ class TestGpuKernelParity:
             [torch.randperm(e, generator=gen, device="cuda")[:kk] for _ in range(t)]
         ).to(torch.int64)
         idx = idx.cpu().to(torch.int64).cuda()
-        got = expert_gemv(x, w, s, idx)
-        ref = expert_gemv_reference(x, w, s, idx)
+        got = expert_gemv(x, w, s, idx, t_cap=t_cap)
+        ref = expert_gemv_reference(x, w, s, idx, t_cap=t_cap)
         rel = (
             got.float() - ref.float()
         ).abs().max() / ref.float().abs().max().clamp_min(1e-6)
         assert rel < 0.02, f"native-cast GEMV parity rel={rel:.4f}"
 
-    def test_native_cast_gemv_matches_reference(self, monkeypatch):
+    def test_native_cast_gemv_matches_reference(self):
         """T=8 is the DFlash2 verify/replay block, which the wrapper only
-        admits when the env-widened cap matches (``_t_cap``) — without this
-        the test silently needs an undocumented environment variable.
+        admits when the caller widens the cap — passed here explicitly via
+        ``t_cap``.
 
         Small shapes, so this parity check runs on every GPU: it still crosses
         block-scale boundaries (2x2 scale blocks) and the fp8 -> bf16 dequant.
         The plugin shapes are a separate, memory-gated acceptance case below.
         """
         t = 8
-        monkeypatch.setenv("GLM53_MOE_DECODE_MAX_TOKENS", str(t))
-        self._native_cast_gemv_parity(24, 256, 256, t, 4)
+        self._native_cast_gemv_parity(24, 256, 256, t, 4, t_cap=t)
 
-    def test_native_cast_gemv_matches_reference_at_plugin_shapes(self, monkeypatch):
+    def test_native_cast_gemv_matches_reference_at_plugin_shapes(self):
         """The same parity at the real MoE shapes (E=288, N=K=4096).
 
         This one needs a large-memory card to itself: the oracle builds fp32
@@ -273,7 +272,6 @@ class TestGpuKernelParity:
         large-memory GPU is the precondition it cannot verify itself.
         """
         e, o, i, t, kk = 288, 4096, 4096, 8, 8
-        monkeypatch.setenv("GLM53_MOE_DECODE_MAX_TOKENS", str(t))
         fp32_bytes = e * o * i * 4
         torch.cuda.empty_cache()
         total = torch.cuda.get_device_properties(0).total_memory
@@ -291,7 +289,7 @@ class TestGpuKernelParity:
                 f"{total / 2**30:.1f} GiB"
             )
         try:
-            self._native_cast_gemv_parity(e, o, i, t, kk)
+            self._native_cast_gemv_parity(e, o, i, t, kk, t_cap=t)
         except torch.OutOfMemoryError as exc:
             torch.cuda.empty_cache()
             pytest.skip(f"plugin-shape parity needs a solo large-memory GPU: {exc}")

@@ -59,6 +59,38 @@ instruction-issue-bound, not bandwidth-bound; further gains need a
 different design (hardware fp8→fp16 converts, MFMA, or fusing the
 top-k gather), not tuning.
 
+### Fused-epilogue GEMV+silu (torch_ops companion, `glm_expert_gemv_fused`)
+
+The first "different design" rung, delivered additively:
+`vkernels.torch_ops.glm_expert_gemv_fused.expert_gemv_silu` runs the same
+block-FP8 GEMV with the SwiGLU applied in-kernel, writing only
+`act[T,K,IA]` instead of the `[T,K,2*IA]` gate/up halves plus a
+`silu_mul` launch. The numerics contract is **bit-exact equality with the
+two-launch chain on the same device** (the gate/up dots are rounded to
+bf16 in registers exactly where the chain stores/reloads; the silu
+expression is verbatim `elementwise._swiglu_limit`), asserted by
+`tests/python/test_glm_expert_gemv_fused.py` on both storages (e4m3fn and
+issue-#71 fnuz) and under CUDA-graph capture. Old path stays default
+(`GLM53_MOE_SILU_FUSED=1` opts in).
+
+**Honest roofline (GB10 indicative, MI300A pending):** the fusion saves
+`k·(4·O + 2·IA)` activation bytes per call against `k·O·I` weight bytes —
+0.10% at the GLM serving shape (IA=2048, I=4096, top-8). Measured on GB10
+(4×1000-launch event pairs, median): 559.7 → 555.0 µs/call at t=1 (0.8%)
+and 1.1–2.2% at the half shape, with BOTH arms already at ~240–298 GB/s
+model bandwidth ≈ GB10's LPDDR roof — i.e. where the op is
+bandwidth-bound, the fused epilogue wins ≈ its byte saving, nothing more.
+On MI300A (instruction-issue-bound at 500–800 GB/s) the expected win is
+the removed kernel boundary (~2–5 µs/call of dispatch floor + silu
+launch) against ~324 µs/token — a low-single-digit percent, worth having
+at M≤2 decode under CUDA graphs, not a bandwidth story. The bandwidth
+argument for going further (fusing silu into the down-GEMV read, or a
+single persistent kernel) is **near zero for the same reason: weights
+dominate** (~16 MiB per expert GEMV vs KB-scale activations); the real
+remaining levers are launch count and the router-gather plumbing — see
+`NOTES-fusion-glm-decode-fused.md` for the full stage-0→stage-1 design
+analysis and the MI300A A/B plan.
+
 ## #66/#68 — `vkernels.torch_ops.glm_projection`: batch-one small-output projection
 
 Triton operator generalising the proven mHC/QKV methodology to arbitrary

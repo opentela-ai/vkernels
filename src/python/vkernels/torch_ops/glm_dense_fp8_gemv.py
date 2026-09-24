@@ -27,7 +27,7 @@ gather. The e4m3fn bytes are loaded as uint8 and bitcast to
 semantics on NVIDIA), the same ~8x-faster-than-bit-twiddle trick as
 ``glm_expert_gemv._expert_gemv_native``. M is a masked constexpr power of
 two (decode buckets 1/2/4 and DFlash2 verify blocks up to
-``GLM53_MOE_DECODE_MAX_TOKENS``); the weight tile is read ONCE per
+the caller's ``m_cap``); the weight tile is read ONCE per
 program for all M rows, so the kernel stays bandwidth-bound up to the cap.
 
 Torch and Triton load lazily. Inputs are read-only; inference-only.
@@ -37,18 +37,6 @@ happens in the eager warmup passes that precede every capture.
 
 from ._dispatch import OpNotEligible
 from functools import lru_cache
-
-
-def _m_cap() -> int:
-    """Row cap: mirrors glm_expert_gemv's ``GLM53_MOE_DECODE_MAX_TOKENS``
-    bridge (floe's ``_sync_vkernels_env`` exports the moe_decode_max_tokens
-    knob here), so decode and verify blocks route consistently."""
-    import os
-
-    try:
-        return max(2, int(os.environ.get("GLM53_MOE_DECODE_MAX_TOKENS", "2")))
-    except ValueError:
-        return 2
 
 
 @lru_cache(maxsize=1)
@@ -143,13 +131,15 @@ def _tiles(o: int) -> tuple[int, int]:
     return (4 if o % 4 == 0 else 1), 4
 
 
-def dense_gemv_fp8(x, w8, scales):
+def dense_gemv_fp8(x, w8, scales, m_cap=None):
     """Return bf16 [M, O] for bf16 x [M, I] (or [I]), fp8-e4m3fn w8 [O, I]
     and fp32 block scales [O//128, I//128].
 
-    M <= the ``GLM53_MOE_DECODE_MAX_TOKENS`` cap (the padded constexpr is
-    the next power of two). Anything outside the contract raises
-    ``OpNotEligible`` so the caller can fall back to its BLAS/dequant path.
+    M <= ``m_cap`` (default 2, the decode-validated limit; floe passes its
+    ``moe_decode_max_tokens`` knob so decode and DFlash2 verify blocks
+    route consistently). The padded constexpr is the next power of two.
+    Anything outside the contract raises ``OpNotEligible`` so the caller
+    can fall back to its BLAS/dequant path.
     """
     import torch
 
@@ -159,7 +149,7 @@ def dense_gemv_fp8(x, w8, scales):
     o, i = w8.shape
     if x.shape[-1] != i:
         raise OpNotEligible(f"shape mismatch x{tuple(x.shape)} w8{w8.shape}")
-    cap = _m_cap()
+    cap = max(2, int(m_cap)) if m_cap is not None else 2
     if m < 1 or m > cap:
         raise OpNotEligible(f"M={m} outside the 1..{cap} decode-GEMV cap")
     if i % 128 or o % 128 or i <= 0 or o <= 0:

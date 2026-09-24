@@ -384,6 +384,28 @@ PYBIND11_MODULE(_core, m) {
       "[EM, n_groups] by sorted_ids (padding rows zeroed).");
 
   kernels.def(
+      "mxfp4_moe_sorted_quant",
+      [](U16Array A, I32Array sorted_ids, int M, int hidden, int group_size,
+         int top_k, int EM) {
+        if (hidden % 2 != 0)
+          throw py::value_error("hidden must be even (two nibbles per byte)");
+        if (hidden % group_size != 0)
+          throw py::value_error("hidden must be a multiple of group_size");
+        py::array_t<std::uint8_t> packed((std::size_t)EM * (hidden / 2));
+        py::array_t<std::uint8_t> scales((std::size_t)EM * (hidden / group_size));
+        kernels::mxfp4_moe_sorted_quant(A.data(), sorted_ids.data(),
+                                        packed.mutable_data(),
+                                        scales.mutable_data(), M, hidden,
+                                        group_size, top_k, EM);
+        return py::make_tuple(packed, scales);
+      },
+      py::arg("A"), py::arg("sorted_ids"), py::arg("M"), py::arg("hidden"),
+      py::arg("group_size") = 32, py::arg("top_k"), py::arg("EM"),
+      "Fused gather + MXFP4 quant: A [M, hidden] + sorted_ids [EM] -> "
+      "(packed [EM, hidden/2] uint8 E2M1, scales [EM, hidden/group] uint8 "
+      "ue8m0) in sorted row order, bit-identical to sort then quant.");
+
+  kernels.def(
       "mxfp4_moe_scatter_reduce",
       [](FloatArray partial, FloatArray topk_w, I32Array sorted_ids, int M,
          int width, int top_k, int EM) {

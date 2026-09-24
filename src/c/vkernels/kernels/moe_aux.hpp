@@ -92,6 +92,45 @@ void mxfp4_moe_sort_scales(const uint8_t* scales, const int32_t* sorted_ids,
                            int top_k, int EM);
 
 // ---------------------------------------------------------------------------
+// Fusion — mxfp4_moe_sorted_quant: gather + MXFP4 quantize in one pass
+// ---------------------------------------------------------------------------
+//
+//   A          [M, hidden]      uint16 bf16 activations (token order)
+//   sorted_ids [EM]             int32  flat topk indices (as mxfp4_moe_sort;
+//                                    an entry outside [0, M*top_k) marks a
+//                                    padding row)
+//   packed     [EM, hidden / 2] uint8  two E2M1 nibbles per byte, SORTED row
+//                                    order (low nibble = even K index)
+//   scales     [EM, n_groups]   uint8  ue8m0 per-group scales, SORTED row order
+//
+// Per sorted row r this computes exactly
+//   row_r = A[sorted_ids[r] / top_k]  (real row)  or the all-zero row (padding)
+//   (packed[r, :], scales[r, :]) = mxfp4_moe_quant(row_r)
+// in one pass, without materializing the [EM, hidden] bf16 A_sorted
+// intermediate. The composition contracts it must satisfy (and which the
+// tests check bit-exactly) are:
+//
+//   mxfp4_moe_sorted_quant(A, ids, pk, sc)
+//     == mxfp4_moe_quant(mxfp4_moe_sort(A, ids))          (packed AND scales)
+//   for REAL rows r (0 <= sorted_ids[r] < M*top_k) also:
+//     scales[r, :] == mxfp4_moe_sort_scales(mxfp4_moe_quant(A).scales, ids)[r]
+//
+// Padding rows quantize exactly like a real all-zero activation (scale
+// 0xFF + all-zero nibbles), matching the sort→quant composition. The
+// standalone quant→sort_scales route instead writes literal 0 scale bytes
+// for padding rows — a pre-existing asymmetry between the two standalone
+// routes (the grouped GEMM never reads padding rows); this op follows
+// sort→quant, the route it replaces. The composition contracts above are
+// checked bit-exactly by tests/kernels/moe/test_moe_aux_fused.cpp. This
+// removes one write + one read of EM*hidden*2 bytes (the A_sorted
+// round-trip) and makes the separate sort_scales launch unnecessary.
+// The three standalone ops stay fully intact; this op is additive.
+void mxfp4_moe_sorted_quant(const uint16_t* A, const int32_t* sorted_ids,
+                            uint8_t* packed, uint8_t* scales,
+                            int M, int hidden, int group_size, int top_k,
+                            int EM);
+
+// ---------------------------------------------------------------------------
 // #19 — mxfp4_moe_scatter_reduce: routed output combine (float32 partials)
 // ---------------------------------------------------------------------------
 //
