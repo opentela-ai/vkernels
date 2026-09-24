@@ -38,6 +38,12 @@ if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
     PROPERTIES COMPILE_DEFINITIONS "VKERNELS_HAS_HIP=1")
   set_property(TARGET vkernels_test_moe_aux_fused APPEND PROPERTY
     INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+elseif(VKERNELS_HAS_HIP)
+  # Real HIP: the device section includes <hip/hip_runtime.h> directly; the
+  # toolkit include dirs are PRIVATE to the vkernels target, so give the
+  # test target the exported VKERNELS_HIP_RUNTIME_INCLUDE_DIRS.
+  set_property(TARGET vkernels_test_moe_aux_fused APPEND PROPERTY
+    INCLUDE_DIRECTORIES ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
 endif()
 vkernels_add_test(NAME glm_moe     SOURCES kernels/moe/test_glm_moe.cpp)
 vkernels_add_test(NAME dist_moe    SOURCES kernels/moe/test_dist_moe.cpp)
@@ -93,6 +99,10 @@ if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
     PROPERTIES COMPILE_DEFINITIONS "VKERNELS_HAS_HIP=1;VKERNELS_DSA_TOPK_CUDA_SHIM=1")
   set_property(TARGET vkernels_test_dsa_topk_fused_gpu APPEND PROPERTY
     INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+elseif(VKERNELS_HAS_HIP)
+  # Real HIP: direct <hip/hip_runtime.h> include, see moe_aux_fused above.
+  set_property(TARGET vkernels_test_dsa_topk_fused_gpu APPEND PROPERTY
+    INCLUDE_DIRECTORIES ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
 endif()
 
 # The `extern "C"` ABI is CUDA-only (the entry points take a raw
