@@ -207,6 +207,66 @@ too):
   two silently writes only the first `BN` columns for single-M-tile
   shapes (every K3 serving shape).
 
+### Split-K: two-kernel path vs fused single-launch path
+
+`hip::gemm_bf16` routes `M <= 64 && K >= 4*BK` to split-K with
+`S = min(8, K/64)`. The proven (default) sequence is TWO launches:
+
+1. `gemm_bf16_splitk_wide_kernel<BM,BN>` (grid `(m-tiles, n-tiles, S)`):
+   each block computes its split's K-range into fp32 accumulators and stores
+   the RAW partials (no alpha/beta) to workspace plane `P[s][M][N]`.
+   Splits past the last K-tile store their zero accumulators, so the combine
+   can fold all `S` planes unconditionally.
+2. `gemm_bf16_splitk_combine_kernel`: one thread per output element, folds
+   the `S` planes in **fixed ascending-s order** (deterministic fp32 partial
+   sum, the mla_fwd #82 contract), applies `alpha` / `beta*C` once, single
+   RNE bf16 store.
+
+The workspace round-trip is ~`2*S*M*N*4` bytes (<= ~26 MB at the largest
+serving shape, ~5 us at roof) against the split-K latency win. The separate
+combine launch also serializes behind the ENTIRE split grid (tail effect).
+
+**Fused variant (A/B candidate, default OFF).**
+`hip::gemm_bf16_splitk_fused_with_config` folds the combine into the split
+kernel to save the second launch and the drain-to-combine serialization,
+WITHOUT touching the numerics:
+
+- After storing its partial plane, each block executes a device-scope
+  `__threadfence()` and atomically increments the arrival counter of its
+  `(m, n)` output tile (the canonical threadFenceReduction pattern, so the
+  last arriver observes every other split's plane stores complete).
+- The **last-arriving** block for a tile performs the combine for that
+  tile: it sums all `S` planes in the SAME fixed ascending-s order as the
+  combine kernel (`sum += P[s][row][col]`, per element), then applies
+  `alpha` / `beta*C` and the single RNE store. Identical fp32 addition
+  order over identical plane values => **bit-exact with the two-kernel
+  path** (not just within oracle tolerance).
+- The combining block resets its tile's counter to 0 (`atomicExch`), so
+  consecutive same-stream launches need no per-launch memset; the counter
+  buffer lives in the same grow-only workspace as the partial planes and is
+  zeroed at (re)allocation.
+- Requires the WIDE staging alignment (`N % 8 == 0 && K % 8 == 0`); other
+  shapes fall back to the two-kernel dispatcher.
+
+Routing and kill-switch:
+
+- `VK_GEMM_SPLITK_FUSED=1` routes `gemm_bf16_splitk_with_config` (and hence
+  the public serving path) to the fused entry for aligned shapes.
+- **Default 0 = the proven two-kernel path** until the MI300A A/B lands
+  (same-job A/B in the `probe_issue156_batched` style, plus the
+  `test_gemm_bf16_correct` fused section, must pass first).
+- The explicit fused entry is always callable for A/B probes regardless of
+  the env flag.
+
+Known trade-off (to be measured, not yet measured on gfx942): the fused
+combine reads the planes with the MFMA fragment access pattern (16-lane /
+64-byte contiguous segments per read instruction, the same pattern as the
+partial-plane stores) instead of the combine kernel's fully coalesced
+256-column sweeps, so the combine READ is less coalesced -- but it overlaps
+the remaining split blocks' compute instead of running after a full grid
+drain, and one launch is saved. Net win/loss is exactly what the MI300A A/B
+measures.
+
 ### Two entry points
 
 - `vkernels::kernels::hip::gemm_bf16(M, N, K, α, A, B, β, C)` — the public

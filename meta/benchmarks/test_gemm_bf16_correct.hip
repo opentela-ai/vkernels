@@ -52,6 +52,13 @@ void gemm_bf16_splitk_with_config(std::size_t M, std::size_t N, std::size_t K,
                                   float alpha, const uint16_t* A,
                                   const uint16_t* B, float beta, uint16_t* C,
                                   int bm, int bn, int S);
+// Fused single-launch split-K (per-tile arrival counters; same pattern).
+// Contract: BIT-EXACT with gemm_bf16_splitk_with_config (same fp32 partial
+// planes, same fixed ascending-s combine order).
+void gemm_bf16_splitk_fused_with_config(
+    std::size_t M, std::size_t N, std::size_t K, float alpha,
+    const uint16_t* A, const uint16_t* B, float beta, uint16_t* C,
+    int bm, int bn, int S);
 // Block-FP8 split-K dispatcher (issue #156; same pattern). Contract in
 // gemm_bf16.hpp: W8 E4M3FNUZ [K, N], fp32 scales [ceil(K/128), ceil(N/8)].
 void gemm_fp8_block_splitk_with_config(
@@ -386,6 +393,91 @@ int main() {
       std::printf("  M=%-3d N=%-4d K=%-4d S=%d beta=%.1f  max_abs=%.4f "
                   "max_rel=%.6f  %s  (%s)\n",
                   c.M, c.N, c.K, c.S, c.beta, st.max_abs, st.max_rel,
+                  ok ? "PASS" : "FAIL", c.what);
+      if (!ok) ++fails;
+    }
+  }
+
+  // --- (4b) FUSED split-K (single launch, per-tile arrival counters) -----
+  // Same case matrix as section (4). Two gates per case:
+  //   a. BIT-EXACT vs the two-kernel path: the fused kernel stores the same
+  //      fp32 partial planes and folds them in the SAME fixed ascending-s
+  //      order as gemm_bf16_splitk_combine_kernel, so the bf16 outputs must
+  //      be identical bit patterns. Each case runs the fused path TWICE
+  //      back-to-back to prove the per-tile counters self-reset between
+  //      launches (the combining block resets its tile's counter).
+  //   b. CPU-oracle tolerance (max_rel < 2e-2), same convention as above.
+  {
+    struct Case { int M, N, K, S; float beta; const char* what; };
+    const Case cases[] = {
+        {8,   128,  128, 2, 0.0f, "K=128 minimum split (1 K-tile/split)"},
+        {8,   128,  256, 3, 0.0f, "odd S=3, K=256 (whole-tile split)"},
+        {16,  100,  192, 3, 0.5f, "unaligned N=100 -> two-kernel fallback"},
+        {64,  6288, 7168, 8, 0.5f, "QKV shape, S=8, beta!=0"},
+        {8,   128,  128, 9, 0.0f, "S=9 clamped to ceil(K/BK)=2"},
+        {8,   128,   64, 8, 0.0f, "S=8 clamped to ceil(K/BK)=1 (unsplit)"},
+        {8,  3072,  512, 8, 0.0f, "S=8, kts=1: odd kt0 splits (ring parity)"},
+        {8,  7168, 1536, 8, 0.0f, "S=8, kts=3: odd kt0 splits (ring parity)"},
+        {5,  3584, 7168, 16, 0.0f, "S=16, kts=7: odd kt0 splits (ring parity)"},
+        {5,  6288, 7168, 16, 0.0f, "QKV shape, S=16, kts=7 (ring parity)"},
+    };
+    std::printf("\n--- FUSED split-K (gemm_bf16_splitk_fused_with_config)"
+                " ---\n");
+    for (const auto& c : cases) {
+      std::vector<uint16_t> A((size_t)c.M * c.K), B((size_t)c.K * c.N),
+          C((size_t)c.M * c.N, 0);
+      fill_AB(A, B, c.M, c.N, c.K, 13);
+      for (size_t i = 0; i < C.size(); ++i) C[i] = f2bf(rnd(5, (int)i) * 0.3f);
+      // CPU oracle.
+      std::vector<uint16_t> rC(C);
+      vkernels::kernels::gemm_bf16_cpu((size_t)c.M, (size_t)c.N, (size_t)c.K,
+                                       1.0f, A.data(), B.data(), c.beta,
+                                       rC.data());
+      // Two-kernel reference output.
+      CK(hipMemcpy(dA, A.data(), (size_t)c.M * c.K * 2, hipMemcpyHostToDevice),
+         "cpyA");
+      CK(hipMemcpy(dB, B.data(), (size_t)c.K * c.N * 2, hipMemcpyHostToDevice),
+         "cpyB");
+      CK(hipMemcpy(dC, C.data(), (size_t)c.M * c.N * 2,
+                   hipMemcpyHostToDevice), "cpyC");
+      vkernels::kernels::hip::gemm_bf16_splitk_with_config(
+          (size_t)c.M, (size_t)c.N, (size_t)c.K, 1.0f, dA, dB, c.beta, dC,
+          16, 16, c.S);
+      CK(hipDeviceSynchronize(), "sync");
+      std::vector<uint16_t> h2k((size_t)c.M * c.N);
+      CK(hipMemcpy(h2k.data(), dC, (size_t)c.M * c.N * 2,
+                   hipMemcpyDeviceToHost), "rdC2k");
+      // Fused path, run TWICE (counter self-reset check on the 2nd run).
+      std::vector<uint16_t> hFu[2];
+      bool bit_exact = true;
+      double ma = 0, mr = 0;
+      for (int rep = 0; rep < 2; ++rep) {
+        CK(hipMemcpy(dC, C.data(), (size_t)c.M * c.N * 2,
+                     hipMemcpyHostToDevice), "cpyC2");
+        vkernels::kernels::hip::gemm_bf16_splitk_fused_with_config(
+            (size_t)c.M, (size_t)c.N, (size_t)c.K, 1.0f, dA, dB, c.beta, dC,
+            16, 16, c.S);
+        CK(hipDeviceSynchronize(), "sync");
+        hFu[rep].resize((size_t)c.M * c.N);
+        CK(hipMemcpy(hFu[rep].data(), dC, (size_t)c.M * c.N * 2,
+                     hipMemcpyDeviceToHost), "rdCfu");
+        for (size_t i = 0; i < hFu[rep].size(); ++i)
+          if (hFu[rep][i] != h2k[i]) bit_exact = false;
+        // Oracle tolerance on the fused output.
+        for (int i = 0; i < c.M * c.N; ++i) {
+          float hf, rf;
+          uint32_t hu = (uint32_t)hFu[rep][i] << 16, ru = (uint32_t)rC[i] << 16;
+          std::memcpy(&hf, &hu, 4); std::memcpy(&rf, &ru, 4);
+          double e = std::fabs((double)hf - rf);
+          if (e > ma) ma = e;
+          double d = std::fmax(std::fabs((double)rf), 1.0);
+          if (e / d > mr) mr = e / d;
+        }
+      }
+      bool ok = bit_exact && mr < THRESH;
+      std::printf("  M=%-3d N=%-4d K=%-4d S=%-2d beta=%.1f  bit_exact=%d "
+                  "max_abs=%.4f max_rel=%.6f  %s  (%s)\n",
+                  c.M, c.N, c.K, c.S, c.beta, (int)bit_exact, ma, mr,
                   ok ? "PASS" : "FAIL", c.what);
       if (!ok) ++fails;
     }

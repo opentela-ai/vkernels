@@ -97,6 +97,24 @@ void gemm_fp8_block_splitk_with_config(
     const uint16_t* A, const uint8_t* W8, const float* scales,
     float beta, uint16_t* C, int bm, int bn, int S);
 
+// Fused split-K entry (single launch; A/B candidate, default OFF): same
+// grid / WIDE staging / fp32 partial planes as gemm_bf16_splitk_with_config,
+// but the fixed-order combine is folded into the kernel via per-output-tile
+// arrival counters -- each block publishes its split partial, bumps the
+// counter of its (m, n) tile, and the LAST-arriving block for the tile sums
+// all S planes in the SAME fixed ascending-s order as the separate combine
+// kernel (alpha / beta*C applied once, single RNE bf16 store), which makes
+// the result BIT-EXACT with the two-kernel path. Saves the combine launch
+// and its tail latency (docs/kernels-reference.md 3.1: the remaining
+// serving gap at 56% of HBM). Gated behind VK_GEMM_SPLITK_FUSED (default 0
+// = the proven two-kernel path) until the MI300A A/B lands. Requires the
+// WIDE staging alignment (N % 8 == 0 && K % 8 == 0); unaligned shapes fall
+// back to the two-kernel path.
+void gemm_bf16_splitk_fused_with_config(
+    std::size_t M, std::size_t N, std::size_t K, float alpha,
+    const uint16_t* A, const uint16_t* B, float beta, uint16_t* C,
+    int bm, int bn, int S);
+
 // Decode-GEMV split-K entries (issue #156): tiny-M (M <= 8) kernel with NO
 // weight LDS staging and NO per-tile barriers -- each thread owns `tb`
 // consecutive N columns (8 or 4; one uint4/uint2 of B per K row), walks the

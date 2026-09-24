@@ -55,6 +55,7 @@
 #include <cstdint>
 
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 #include "vkernels/kernels/gemm_bf16.hpp"
@@ -346,12 +347,15 @@ __global__ void gemm_bf16_splitk_kernel(const uint16_t* __restrict__ A,
 //   * The epilogue is unchanged (raw fp32 partials to P[s][M][N]);
 //     splits past the last K-tile still store their zero accumulators
 //     so the combine can fold all S planes unconditionally.
-template <int BM, int BN>
+template <int BM, int BN, bool Fused = false>
 __global__ void gemm_bf16_splitk_wide_kernel(const uint16_t* __restrict__ A,
                                              const uint16_t* __restrict__ B,
                                              float* __restrict__ P,
                                              int M, int N, int K,
-                                             int kts_per_split) {
+                                             int kts_per_split,
+                                             int* __restrict__ counters,
+                                             int S,
+                                             float alpha, float beta) {
   static_assert(BM % 16 == 0 && BN % 16 == 0, "tile must be a multiple of 16");
 
   constexpr int kNF    = BN / 16;
@@ -464,6 +468,51 @@ __global__ void gemm_bf16_splitk_wide_kernel(const uint16_t* __restrict__ A,
       const int grow = m_tile * BM + row_base + row_off + i;
       if (grow >= M) break;
       plane[(size_t)grow * N + gcol] = acc[nf][i];
+    }
+  }
+
+  // ---- Fused fixed-order combine (split-K combine fold-in) -------------
+  // (Fused = false is the proven two-kernel path: the separate
+  // gemm_bf16_splitk_combine_kernel launched after the grid drains.) With
+  // Fused = true, the LAST-arriving block for each (m, n) output tile folds
+  // all S planes for that tile here, in the SAME fixed ascending-s order as
+  // the combine kernel (same per-element fp32 partial order, same alpha /
+  // beta*C / single RNE store) => bit-exact with the two-kernel path.
+  //
+  // Ordering: each block's plane stores are made device-visible with
+  // __threadfence() BEFORE the atomic counter bump (the canonical
+  // threadFenceReduction pattern); the last arriver therefore observes all
+  // S-1 other planes complete. The combining block resets its tile's
+  // counter to 0 (atomicExch, after all S arrivals), so consecutive
+  // same-stream launches need no per-launch memset.
+  if (Fused) {
+    __threadfence();
+    __shared__ int s_last;
+    if (tid == 0) {
+      const int tile = m_tile * gridDim.y + n_tile;
+      const int arrived = atomicAdd(&counters[tile], 1) + 1;
+      s_last = (arrived == S) ? 1 : 0;
+      if (s_last) atomicExch(&counters[tile], 0);  // self-reset
+    }
+    __syncthreads();
+    if (s_last) {
+      const size_t plane_elems = (size_t)M * N;
+      for (int nf = 0; nf < kNF; ++nf) {
+        const int gcol = n_tile * BN + nf * 16 + col;
+        if (gcol >= N) break;
+        for (int i = 0; i < 4; ++i) {
+          const int grow = m_tile * BM + row_base + row_off + i;
+          if (grow >= M) break;
+          float sum = 0.0f;
+          const float* p0 = P + (size_t)grow * N + gcol;
+          // FIXED ascending-s order -- the bit-exactness contract.
+          for (int sf = 0; sf < S; ++sf) sum += p0[(size_t)sf * plane_elems];
+          float v = alpha * sum;
+          if (beta != 0.0f)
+            v += beta * bf16_to_f32(C[(size_t)grow * N + gcol]);
+          C[(size_t)grow * N + gcol] = f2bf(v);
+        }
+      }
     }
   }
 }
@@ -659,6 +708,12 @@ struct SplitKWorkspace {
   std::mutex mu;
   float* partials = nullptr;
   size_t cap = 0;  // elements
+  // Fused-path per-(m, n)-tile arrival counters (split-K combine fold-in):
+  // one int per output tile, zeroed at allocation and self-reset to 0 by
+  // the combining block at the end of every launch (same-stream launches
+  // serialise, so no per-launch memset is needed).
+  int* counters = nullptr;
+  size_t counter_cap = 0;  // ints
 };
 SplitKWorkspace& splitk_ws() {
   static SplitKWorkspace w;
@@ -1066,12 +1121,16 @@ __global__ void gemm_bf16_kernel_reuse(const uint16_t* __restrict__ A,
 namespace {
 
 // Split-K launch: sizes the grow-only workspace, then enqueues the split
-// kernel (grid (m-tiles, n-tiles, S)) + fixed-order combine on the default
-// stream. S is the caller-chosen split count (whole K-tiles per split are
-// guaranteed by the caller: S <= ceil(K/BK)); (bm, bn) must be a compiled
-// tile. Returns false when the workspace cannot be sized; the public entry
-// then falls back to the unsplit two-phase kernel.
-template <int BM, int BN, bool Wide>
+// kernel (grid (m-tiles, n-tiles, S)). Fused = true folds the combine into
+// the split kernel (last-arriving block per tile; ONE launch total, no
+// combine kernel) and requires `counters` (zeroed per-tile arrival
+// counters from the workspace). The non-fused path enqueues the fixed-order
+// combine kernel after the split grid as before. S is the caller-chosen
+// split count (whole K-tiles per split are guaranteed by the caller:
+// S <= ceil(K/BK)); (bm, bn) must be a compiled tile. Returns false when
+// the workspace cannot be sized; the public entry then falls back to the
+// unsplit two-phase kernel.
+template <int BM, int BN, bool Wide, bool Fused = false>
 bool launch_splitk(const uint16_t* A, const uint16_t* B, uint16_t* C,
                    int M, int N, int K, float alpha, float beta, int S) {
   const size_t n = (size_t)S * M * N;
@@ -1087,6 +1146,28 @@ bool launch_splitk(const uint16_t* A, const uint16_t* B, uint16_t* C,
   }
   if (w.cap < n) return false;
 
+  int* counters = nullptr;
+  if (Fused) {
+    const size_t tiles =
+        (size_t)((M + BM - 1) / BM) * (size_t)((N + BN - 1) / BN);
+    if (w.counter_cap < tiles) {
+      int* p = nullptr;
+      if (hipMalloc(&p, tiles * sizeof(int)) == hipSuccess) {
+        if (w.counters) hipFree(w.counters);
+        w.counters = p;
+        w.counter_cap = tiles;
+        // First-use zeroing only (see SplitKWorkspace::counters).
+        if (hipMemset(p, 0, tiles * sizeof(int)) != hipSuccess) {
+          hipFree(w.counters);
+          w.counters = nullptr;
+          w.counter_cap = 0;
+        }
+      }
+    }
+    if (w.counter_cap < tiles) return false;
+    counters = w.counters;
+  }
+
   const int n_ktiles = (K + BK - 1) / BK;
   const int kts = (n_ktiles + S - 1) / S;  // whole tiles per split
 
@@ -1094,16 +1175,18 @@ bool launch_splitk(const uint16_t* A, const uint16_t* B, uint16_t* C,
   dim3 block(kTh);
   dim3 gridS((M + BM - 1) / BM, (N + BN - 1) / BN, S);
   if (Wide) {
-    gemm_bf16_splitk_wide_kernel<BM, BN><<<gridS, block, 0, 0>>>(
-        A, B, w.partials, M, N, K, kts);
+    gemm_bf16_splitk_wide_kernel<BM, BN, Fused><<<gridS, block, 0, 0>>>(
+        A, B, w.partials, M, N, K, kts, counters, S, alpha, beta);
   } else {
     gemm_bf16_splitk_kernel<BM, BN><<<gridS, block, 0, 0>>>(
         A, B, w.partials, M, N, K, kts);
   }
-  const int cols = 256;
-  dim3 gridC(M, (N + cols - 1) / cols);
-  gemm_bf16_splitk_combine_kernel<<<gridC, cols, 0, 0>>>(
-      w.partials, C, C, M, N, S, alpha, beta);
+  if (!Fused) {
+    const int cols = 256;
+    dim3 gridC(M, (N + cols - 1) / cols);
+    gemm_bf16_splitk_combine_kernel<<<gridC, cols, 0, 0>>>(
+        w.partials, C, C, M, N, S, alpha, beta);
+  }
   return true;
 }
 
@@ -1137,6 +1220,13 @@ void gemm_bf16_with_config(std::size_t M, std::size_t N, std::size_t K,
                            const uint16_t* B, float beta, uint16_t* C,
                            int bm, int bn, int bk, int threads);
 
+// Defined below (fused single-launch split-K); used by the split-K
+// dispatcher when VK_GEMM_SPLITK_FUSED=1.
+void gemm_bf16_splitk_fused_with_config(
+    std::size_t M, std::size_t N, std::size_t K, float alpha,
+    const uint16_t* A, const uint16_t* B, float beta, uint16_t* C,
+    int bm, int bn, int S);
+
 // Explicit split-K entry point (issue #146, wide variant issue #156):
 // (bm, bn) is a compiled tile, S the split count (clamped to
 // [1, ceil(K/BK)]). When the shape is 16B-staging aligned (N % 8 == 0 &&
@@ -1158,6 +1248,21 @@ void gemm_bf16_splitk_with_config(std::size_t M, std::size_t N, std::size_t K,
   if (s < 1) s = 1;
   if (s > max_s) s = max_s;
 
+  // Fusion candidate (split-K combine fold-in): VK_GEMM_SPLITK_FUSED=1
+  // routes WIDE-eligible shapes through the single-launch fused kernel
+  // (per-tile arrival counters, bit-exact with the two-kernel sequence
+  // below). Default 0 = the proven two-kernel path; the flag stays OFF
+  // until the MI300A A/B (probe_issue156_batched-style, same job) lands.
+  static const int fused_mode = [] {
+    const char* e = std::getenv("VK_GEMM_SPLITK_FUSED");
+    return e ? std::atoi(e) : 0;
+  }();
+  if (fused_mode != 0 && (Ni % 8 == 0) && (Ki % 8 == 0)) {
+    gemm_bf16_splitk_fused_with_config(M, N, K, alpha, A, B, beta, C, bm, bn,
+                                       s);
+    return;
+  }
+
   const bool wide = (Ni % 8 == 0) && (Ki % 8 == 0);
   bool ok;
   if (bm == 16 && bn == 16)
@@ -1172,6 +1277,54 @@ void gemm_bf16_splitk_with_config(std::size_t M, std::size_t N, std::size_t K,
   else if (bm == 64 && bn == 64)
     ok = wide ? launch_splitk<64, 64, true>(A, B, C, Mi, Ni, Ki, alpha, beta, s)
               : launch_splitk<64, 64, false>(A, B, C, Mi, Ni, Ki, alpha, beta, s);
+  else {
+    // Uncompiled tile: unsplit fallback on the selected tile.
+    gemm_bf16_with_config(M, N, K, alpha, A, B, beta, C, bm, bn, 64, (bm / 16) * 64);
+    return;
+  }
+  if (!ok) gemm_bf16_with_config(M, N, K, alpha, A, B, beta, C, bm, bn, 64, (bm / 16) * 64);
+}
+
+// Fused split-K entry (single launch): same split grid / WIDE staging / fp32
+// partial planes as gemm_bf16_splitk_with_config, but the fixed-order
+// combine is folded into the kernel -- after publishing its partial plane
+// (device-scope fence) each block atomically increments the arrival counter
+// of its (m, n) output tile, and the LAST-arriving block for the tile folds
+// all S planes in the SAME fixed ascending-s order as
+// gemm_bf16_splitk_combine_kernel (alpha / beta*C applied once, single RNE
+// store), which is BIT-EXACT with the two-kernel path. The combining block
+// also resets the tile's counter, so no per-launch memset is needed.
+// Requires the WIDE staging alignment (N % 8 == 0 && K % 8 == 0); other
+// shapes fall back to the two-kernel dispatcher. Routed from
+// gemm_bf16_splitk_with_config only when VK_GEMM_SPLITK_FUSED=1 (default
+// 0 = two-kernel path until the MI300A A/B lands).
+void gemm_bf16_splitk_fused_with_config(
+    std::size_t M, std::size_t N, std::size_t K, float alpha,
+    const uint16_t* A, const uint16_t* B, float beta, uint16_t* C,
+    int bm, int bn, int S) {
+  const int Mi = static_cast<int>(M);
+  const int Ni = static_cast<int>(N);
+  const int Ki = static_cast<int>(K);
+  int s = S;
+  const int max_s = (Ki + BK - 1) / BK;
+  if (s < 1) s = 1;
+  if (s > max_s) s = max_s;
+
+  if ((Ni % 8) != 0 || (Ki % 8) != 0) {
+    // The fused kernel is the WIDE kernel only; unaligned shapes keep the
+    // proven two-kernel dispatch (which selects #146 for unaligned).
+    gemm_bf16_splitk_with_config(M, N, K, alpha, A, B, beta, C, bm, bn, s);
+    return;
+  }
+  bool ok;
+  if (bm == 16 && bn == 16)
+    ok = launch_splitk<16, 16, true, true>(A, B, C, Mi, Ni, Ki, alpha, beta, s);
+  else if (bm == 16 && bn == 64)
+    ok = launch_splitk<16, 64, true, true>(A, B, C, Mi, Ni, Ki, alpha, beta, s);
+  else if (bm == 32 && bn == 64)
+    ok = launch_splitk<32, 64, true, true>(A, B, C, Mi, Ni, Ki, alpha, beta, s);
+  else if (bm == 64 && bn == 64)
+    ok = launch_splitk<64, 64, true, true>(A, B, C, Mi, Ni, Ki, alpha, beta, s);
   else {
     // Uncompiled tile: unsplit fallback on the selected tile.
     gemm_bf16_with_config(M, N, K, alpha, A, B, beta, C, bm, bn, 64, (bm / 16) * 64);
