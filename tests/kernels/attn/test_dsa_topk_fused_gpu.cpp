@@ -40,6 +40,15 @@
 
 #if VKERNELS_HAS_HIP
 
+#  ifndef __HIP_PLATFORM_AMD__
+#    ifndef __HIP_PLATFORM_NVIDIA__
+       // HIP headers require exactly one platform macro; the host compiler
+       // does not get hipcc's automatic define (same preamble as
+       // core/tuning.cpp; the CUDA-shim build takes its compat header
+       // instead).
+#      define __HIP_PLATFORM_AMD__ 1
+#    endif
+#  endif
 #include <hip/hip_runtime.h>
 
 #include "vkernels/kernels/device_numeric.cuh"  // fp8e4m3fnuz_to_f32 (SHARED)
