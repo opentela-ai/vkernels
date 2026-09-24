@@ -124,7 +124,14 @@ def mhc_pre_gemv(streams_flat, fn, hc=4, hidden_size=4096, eps=1e-6):
     out = torch.empty(*lead, width, device=streams_flat.device, dtype=streams_flat.dtype)
     if tokens:
         kernel = _kernels()
-        block = min(2048, triton.next_power_of_2(k))
+        # One chunk over the whole row (BLOCK >= K, masked tail) with the
+        # warp count scaled to the chunk: measured on H100 (sgs-gpu07,
+        # graph-replayed) as the flat-in-M optimum at the deployed shapes —
+        # k=16384: 4.3 us/site (vs 8.9 for the old 2048/4 pin and ~6.1 for
+        # the two-launch chain it replaces); k=3072: 3.2; k=192: 2.7.
+        block = min(16384, max(256, triton.next_power_of_2(k)))
+        warps = 2 if block <= 512 else 4 if block <= 2048 else (
+            8 if block <= 4096 else 16)
         with torch.cuda.device(streams_flat.device):
             kernel[(tokens, width)](
                 x2,
@@ -134,7 +141,7 @@ def mhc_pre_gemv(streams_flat, fn, hc=4, hidden_size=4096, eps=1e-6):
                 width,
                 eps,
                 block,
-                num_warps=4,
+                num_warps=warps,
                 enable_fp_fusion=False,
             )
     return out.view(*lead, width)
