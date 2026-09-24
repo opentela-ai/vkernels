@@ -30,6 +30,15 @@ vkernels_add_test(NAME moe_fused   SOURCES kernels/moe/test_moe_fused.cpp)
 vkernels_add_test(NAME moe_align_oracle SOURCES kernels/moe/test_moe_align_oracle.cpp)
 vkernels_add_test(NAME moe_aux     SOURCES kernels/moe/test_moe_aux.cpp)
 vkernels_add_test(NAME moe_aux_fused SOURCES kernels/moe/test_moe_aux_fused.cpp)
+# The NaN-parity device section of moe_aux_fused needs the shim's hip/
+# runtime mapping on CUDA builds (real HIP builds define VKERNELS_HAS_HIP
+# globally). Host-only builds compile the section out and skip these flags.
+if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+  set_source_files_properties(kernels/moe/test_moe_aux_fused.cpp
+    PROPERTIES COMPILE_DEFINITIONS "VKERNELS_HAS_HIP=1")
+  set_property(TARGET vkernels_test_moe_aux_fused APPEND PROPERTY
+    INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+endif()
 vkernels_add_test(NAME glm_moe     SOURCES kernels/moe/test_glm_moe.cpp)
 vkernels_add_test(NAME dist_moe    SOURCES kernels/moe/test_dist_moe.cpp)
 vkernels_add_test(NAME topology    SOURCES comm/test_topology.cpp)

@@ -322,3 +322,161 @@ TEST(MoeAuxFused, RejectsBadArgs) {
                                       M, hidden, gs, top_k, -1),
                std::invalid_argument);  // negative EM
 }
+
+#if VKERNELS_HAS_HIP
+// --- Device-vs-oracle NaN parity (NOTES-157 follow-up, fixed) --------------
+//
+// The device amax reduction used the (a > b) ? a : b ternary, which RETURNS
+// the NaN operand when the NaN sits in the right slot (NaN > x is false), so
+// a group mixing finite values with one NaN emitted the 0xFF (zero) scale
+// while the CPU reference's `if (aa > amax)` ignores the NaN and quantizes
+// with the finite amax. The kernels now reduce with fmaxf (NaN-ignoring in
+// both operand positions, like the oracle). These tests run the REAL device
+// kernels (gfx942 HIP build, or the HIP-on-NVIDIA shim) against the CPU
+// oracle and pin the exact recorded repro: gs=4 group {-2.64062, -6.875,
+// 2.14062, NaN} must give scale byte 129 (amax 6.875, e = ceil(log2(6.875/3))
+// = 2), not 0xFF.
+//
+// The hip:: launchers are self-declared in moe_aux.hip; re-declare the two
+// entry points used here so this host TU links them.
+#include <hip/hip_runtime.h>
+
+namespace vkernels::kernels::hip {
+void mxfp4_moe_quant(const uint16_t* A, uint8_t* packed, uint8_t* scales,
+                     int M, int hidden, int group_size);
+void mxfp4_moe_sorted_quant(const uint16_t* A, const int32_t* sorted_ids,
+                            uint8_t* packed, uint8_t* scales, int M,
+                            int hidden, int group_size, int top_k, int EM);
+}  // namespace vkernels::kernels::hip
+
+#define VK_HIP_CHECK(call)                                            \
+  do {                                                                \
+    hipError_t e_ = (call);                                           \
+    if (e_ != hipSuccess) {                                           \
+      std::fprintf(stderr, "HIP call failed: %s at %s:%d\n", #call,    \
+                   __FILE__, __LINE__);                               \
+      EXPECT_TRUE(false);                                            \
+      return;                                                        \
+    }                                                                 \
+  } while (0)
+
+namespace {
+}  // namespace
+
+TEST(MoeAuxFused, DeviceMatchesOracleOnMixedNaNGroups) {
+  struct Case {
+    int M, hidden, gs, top_k, E;
+  };
+  const Case cases[] = {
+      {4, 32, 4, 2, 4},      // the NOTES-157 repro geometry
+      {8, 128, 32, 4, 6},    // padding-heavy, NaN at group ends + one inf
+      {16, 256, 32, 8, 8},   // wider routing
+  };
+  const uint16_t kNaN = f2bf(std::numeric_limits<float>::quiet_NaN());
+  const uint16_t kInf = f2bf(std::numeric_limits<float>::infinity());
+
+  for (const Case& c : cases) {
+    char ctx[96];
+    std::snprintf(ctx, sizeof(ctx), "M=%d hidden=%d gs=%d top_k=%d", c.M,
+                  c.hidden, c.gs, c.top_k);
+    const int n_groups = c.hidden / c.gs;
+
+    std::vector<int32_t> topk_ids(static_cast<size_t>(c.M) * c.top_k);
+    for (int i = 0; i < static_cast<int>(topk_ids.size()); ++i)
+      topk_ids[i] = (i * 5 + i / c.top_k) % c.E;
+    std::vector<int32_t> sorted_ids(4096), expert_ids(4096 / 16);
+    int EM = moe_align_block_size(topk_ids.data(), c.M, c.top_k, 16, c.E,
+                                  sorted_ids.data(), expert_ids.data());
+    sorted_ids.resize(EM);
+
+    std::vector<uint16_t> A(static_cast<size_t>(c.M) * c.hidden);
+    fill_bf16(A, c.M * 31 + c.hidden, /*specials=*/false);
+    // Deterministic NaN/inf injection: NaN at the LAST element of every 3rd
+    // group (the propagation position for the old ternary tree), an inf in
+    // group 1 of token 0, and the exact recorded repro group at token 0
+    // group 0 (gs=4 case).
+    for (int m = 0; m < c.M; ++m)
+      for (int g = 0; g < n_groups; g += 3)
+        A[(size_t)m * c.hidden + (size_t)g * c.gs + (c.gs - 1)] = kNaN;
+    if (n_groups > 1) A[(size_t)c.gs + (c.gs - 1)] = kInf;  // token 0, group 1
+    if (c.gs == 4) {
+      A[0] = f2bf(-2.64062f);
+      A[1] = f2bf(-6.875f);
+      A[2] = f2bf(2.14062f);
+      A[3] = kNaN;
+    }
+
+    // Host oracle references.
+    std::vector<uint8_t> pk_ref, sc_ref;
+    ref_composition(A, sorted_ids, c.M, c.hidden, c.gs, c.top_k, EM, &pk_ref,
+                    &sc_ref);
+    const size_t pk_bytes = pk_ref.size(), sc_bytes = sc_ref.size();
+    std::vector<uint8_t> pk_tok_ref(static_cast<size_t>(c.M) * (c.hidden / 2)),
+        sc_tok_ref(static_cast<size_t>(c.M) * n_groups);
+    mxfp4_moe_quant(A.data(), pk_tok_ref.data(), sc_tok_ref.data(), c.M,
+                    c.hidden, c.gs);
+
+    // Device fused op (sorted order) vs the sort -> quant oracle.
+    std::vector<uint8_t> pk_dev(pk_bytes, 0x55), sc_dev(sc_bytes, 0x55);
+    {
+      void *a_dev = nullptr, *ids_dev = nullptr, *pk_d = nullptr, *sc_d = nullptr;
+      VK_HIP_CHECK(hipMalloc(&a_dev, (size_t)c.M * c.hidden * 2));
+      VK_HIP_CHECK(hipMalloc(&ids_dev, (size_t)EM * 4));
+      VK_HIP_CHECK(hipMalloc(&pk_d, pk_bytes));
+      VK_HIP_CHECK(hipMalloc(&sc_d, sc_bytes));
+      VK_HIP_CHECK(hipMemcpy(a_dev, A.data(), (size_t)c.M * c.hidden * 2,
+                             hipMemcpyHostToDevice));
+      VK_HIP_CHECK(hipMemcpy(ids_dev, sorted_ids.data(), (size_t)EM * 4,
+                             hipMemcpyHostToDevice));
+      hip::mxfp4_moe_sorted_quant(
+          static_cast<const uint16_t*>(a_dev),
+          static_cast<const int32_t*>(ids_dev),
+          static_cast<uint8_t*>(pk_d), static_cast<uint8_t*>(sc_d), c.M,
+          c.hidden, c.gs, c.top_k, EM);
+      VK_HIP_CHECK(hipDeviceSynchronize());
+      VK_HIP_CHECK(hipMemcpy(pk_dev.data(), pk_d, pk_bytes,
+                             hipMemcpyDeviceToHost));
+      VK_HIP_CHECK(hipMemcpy(sc_dev.data(), sc_d, sc_bytes,
+                             hipMemcpyDeviceToHost));
+      VK_HIP_CHECK(hipFree(a_dev));
+      VK_HIP_CHECK(hipFree(ids_dev));
+      VK_HIP_CHECK(hipFree(pk_d));
+      VK_HIP_CHECK(hipFree(sc_d));
+    }
+    expect_buf_eq(pk_dev, pk_ref, "device packed", ctx);
+    expect_buf_eq(sc_dev, sc_ref, "device scales", ctx);
+
+    // Device token-order quant vs the host quant oracle.
+    std::vector<uint8_t> pk_tok_dev(pk_tok_ref.size(), 0x55),
+        sc_tok_dev(sc_tok_ref.size(), 0x55);
+    {
+      void *a_dev = nullptr, *pk_d = nullptr, *sc_d = nullptr;
+      VK_HIP_CHECK(hipMalloc(&a_dev, (size_t)c.M * c.hidden * 2));
+      VK_HIP_CHECK(hipMalloc(&pk_d, pk_tok_ref.size()));
+      VK_HIP_CHECK(hipMalloc(&sc_d, sc_tok_ref.size()));
+      VK_HIP_CHECK(hipMemcpy(a_dev, A.data(), (size_t)c.M * c.hidden * 2,
+                             hipMemcpyHostToDevice));
+      hip::mxfp4_moe_quant(static_cast<const uint16_t*>(a_dev),
+                           static_cast<uint8_t*>(pk_d),
+                           static_cast<uint8_t*>(sc_d), c.M, c.hidden, c.gs);
+      VK_HIP_CHECK(hipDeviceSynchronize());
+      VK_HIP_CHECK(hipMemcpy(pk_tok_dev.data(), pk_d, pk_tok_ref.size(),
+                             hipMemcpyDeviceToHost));
+      VK_HIP_CHECK(hipMemcpy(sc_tok_dev.data(), sc_d, sc_tok_ref.size(),
+                             hipMemcpyDeviceToHost));
+      VK_HIP_CHECK(hipFree(a_dev));
+      VK_HIP_CHECK(hipFree(pk_d));
+      VK_HIP_CHECK(hipFree(sc_d));
+    }
+    expect_buf_eq(pk_tok_dev, pk_tok_ref, "device packed (token)", ctx);
+    expect_buf_eq(sc_tok_dev, sc_tok_ref, "device scales (token)", ctx);
+
+    // Pin the recorded repro semantics: token 0 group 0 (gs=4 case) must be
+    // the finite-amax scale byte 129 on BOTH sides, not 0xFF.
+    if (c.gs == 4) {
+      EXPECT_EQ(unsigned(sc_tok_ref[0]), 129u);
+      EXPECT_EQ(unsigned(sc_tok_dev[0]), 129u);
+    }
+  }
+}
+#endif  // VKERNELS_HAS_HIP

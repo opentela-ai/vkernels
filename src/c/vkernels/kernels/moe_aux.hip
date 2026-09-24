@@ -97,11 +97,14 @@ __global__ void mxfp4_moe_quant_kernel(
 
   float a = (t < group_size) ? __builtin_fabsf(bf16_to_f32(A[(size_t)m * hidden + base + t])) : 0.0f;
   // Block-wide amax reduction (group_size ≤ 256 → single __syncthreads tree).
+  // fmaxf (not the (a>b)?a:b ternary) so a NaN operand is ignored exactly
+  // like the CPU reference's `if (aa > amax)` — the ternary returns the NaN
+  // when it sits in the right slot and would wrongly emit the 0xFF scale.
   __shared__ float s_red[256];
   s_red[t] = a;
   __syncthreads();
   for (int s = group_size / 2; s > 0; s >>= 1) {
-    if (t < s) s_red[t] = (s_red[t] > s_red[t + s]) ? s_red[t] : s_red[t + s];
+    if (t < s) s_red[t] = fmaxf(s_red[t], s_red[t + s]);
     __syncthreads();
   }
   if (t == 0) s_amax = s_red[0];
@@ -202,12 +205,13 @@ __global__ void mxfp4_moe_sorted_quant_kernel(
                       bf16_to_f32(real ? src[base + t] : (uint16_t)0))
                 : 0.0f;
   // Block-wide amax reduction (group_size ≤ 256 → single __syncthreads tree).
-  // Same statement order as mxfp4_moe_quant_kernel.
+  // Same statement order as mxfp4_moe_quant_kernel; fmaxf so a NaN operand
+  // is ignored exactly like the CPU reference's `if (aa > amax)`.
   __shared__ float s_red[256];
   s_red[t] = a;
   __syncthreads();
   for (int s = group_size / 2; s > 0; s >>= 1) {
-    if (t < s) s_red[t] = (s_red[t] > s_red[t + s]) ? s_red[t] : s_red[t + s];
+    if (t < s) s_red[t] = fmaxf(s_red[t], s_red[t + s]);
     __syncthreads();
   }
   float amax = s_red[0];

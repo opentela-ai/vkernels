@@ -40,11 +40,19 @@
 
 // Host-only translation units that transitively pull in device helpers need
 // the CUDA keywords neutralized; nvcc TUs define __CUDACC__ and handle them
-// natively.
+// natively. CUDA >= 13's crt/host_defines.h defines __host__/__device__ in
+// host TUs too (via cuda_runtime.h included above), so guard each define to
+// avoid a -Werror redefinition there.
 #ifndef __CUDACC__
+#ifndef __host__
 #define __host__
+#endif
+#ifndef __device__
 #define __device__
+#endif
+#ifndef __forceinline__
 #define __forceinline__ inline
+#endif
 #endif
 
 // ---- error codes / types --------------------------------------------------

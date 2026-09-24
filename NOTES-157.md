@@ -118,6 +118,16 @@ The pre-GEMM MoE aux chain for the W4A4 grouped GEMM (docs/kernels/moe_aux.md):
   `mxfp4_moe_sorted_quant_kernel` amax reductions. Left untouched here:
   changing the proven quant kernel's numerics is outside this lane's
   additive scope.
+  **[RESOLVED in the follow-up change]** Both amax trees now reduce with
+  `fmaxf` (NaN-ignoring in both operand positions, matching the oracle);
+  the shim header gained `#ifndef` guards on the `__host__`/`__device__`
+  neutralizers (CUDA 13's `crt/host_defines.h` defines them in host TUs
+  too). New committed GPU test
+  `MoeAuxFused.DeviceMatchesOracleOnMixedNaNGroups`
+  (tests/kernels/moe/test_moe_aux_fused.cpp) runs BOTH device kernels on
+  GB10 vs the CPU oracle with NaN/inf-mixed groups and pins the recorded
+  repro (scale byte 129, not 0xFF). Negative control verified: reverting
+  to the ternary makes the test fail. cuda ctest 56/56, host 46/46.
 - First parity run showed a gs=4 "failure" that turned out to be the NaN
   item above; a second debug harness quantized token-order A with EM rows
   (out-of-bounds garbage) before the real cause was isolated — both
