@@ -142,11 +142,38 @@ _TILES = {
 }
 
 
-def _tiles(o: int, i: int) -> tuple[int, int, int]:
+# M > 1 pins from the dense-m8 tile sweep (m8_sweep_results.json, 6484
+# rows; corroborated wrapper-level by m8_confirm_results.json, 260 rows —
+# both archived under scratch/dense-m8/), keyed (O, I, M) ->
+# (ROWS, BLOCK_I, num_warps). Only wrapper-confirm-corroborated cells are
+# listed (gate: best-pin median < 0.98 x cuBLAS median, the same rule that
+# rejected 3 M=1 sweep winners). The corroborated M > 1 GEMV territory is
+# exactly: (512, 4096) at every swept M (2/4/8) and the four remaining fp8
+# shapes at M=2 only — at M >= 4 cuBLAS (dequant-on-use mm) wins every
+# other cell, so those stay ABSENT here and the caller's routing (floe
+# _fp8_dense_gemm's M-threshold dispatch) keeps them on F.linear; if they
+# are routed here anyway they still run correctly on the M=1 pin /
+# heuristic. Confirm medians, pin vs cuBLAS:
+#   (512, 4096)   m=2 (4,4096,8)  3.33 us 635 GB/s | m=4 (2,4096,4)  4.00 us 534 GB/s | m=8 (4,4096,8)  5.36 us 405 GB/s  (cuBLAS ~6.4 us flat)
+#   (1536, 4096)  m=2 (4,4096,4)  5.52 us 1144 GB/s (cuBLAS 7.21)
+#   (3072, 4096)  m=2 (4,2048,2)  8.71 us 1448 GB/s (cuBLAS 10.54)
+#   (4096, 512)   m=2 (4,512,2)   3.34 us 633 GB/s  (cuBLAS 3.45)
+_TILES_M = {
+    (512, 4096, 2): (4, 4096, 8),
+    (512, 4096, 4): (2, 4096, 4),
+    (512, 4096, 8): (4, 4096, 8),
+    (1536, 4096, 2): (4, 4096, 4),
+    (3072, 4096, 2): (4, 2048, 2),
+    (4096, 512, 2): (4, 512, 2),
+}
+
+
+def _tiles(o: int, i: int, m: int = 1) -> tuple[int, int, int]:
     """(ROWS, BLOCK_I, num_warps). Precedence: the live single-shape tuning
     knob ``VK_FP8_DENSE_GEMV_TILES='ROWS,warps'`` (BLOCK_I keeps the
     next-pow-2(min(I, 4096)) default, the VK_FP8GEMM_TILES convention) >
-    the H100 per-shape pin table > the heuristic default."""
+    the H100 per-(O, I, M) pin > the per-(O, I) M=1 pin table > the
+    heuristic default."""
     import os
 
     cfg = os.environ.get("VK_FP8_DENSE_GEMV_TILES", "")
@@ -154,7 +181,7 @@ def _tiles(o: int, i: int) -> tuple[int, int, int]:
         parts = [int(x) for x in cfg.split(",")]
         if len(parts) == 2:
             return parts[0], _next_pow2(min(i, 4096)), parts[1]
-    pin = _TILES.get((o, i))
+    pin = _TILES_M.get((o, i, m)) or _TILES.get((o, i))
     if pin is not None:
         return pin
     return (4 if o % 4 == 0 else 1), _next_pow2(min(i, 4096)), 4
@@ -193,7 +220,7 @@ def dense_gemv_fp8(x, w8, scales, m_cap=None):
     if not (x.is_contiguous() and w8.is_contiguous() and scales.is_contiguous()):
         raise OpNotEligible("inputs must be contiguous")
     tl, triton, kern = _kernel()
-    rows, block_i, warps = _tiles(o, i)
+    rows, block_i, warps = _tiles(o, i, m)
     mp = triton.next_power_of_2(m)
     y = torch.empty(m, o, device=x.device, dtype=torch.bfloat16)
     with torch.cuda.device(x.device):
