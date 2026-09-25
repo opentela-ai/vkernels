@@ -1,0 +1,61 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "01M3C6KQYNJWYN0GTZ1Z9TTG6S",
+  "session_id": "01a0d41e-215e-74d5-96c3-51db82007df4",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-25T11:53:32.705507676Z",
+  "branch": "fusion/mhc-pre-gemv",
+  "checkpoints_count": 1,
+  "save_step_count": 2,
+  "files_touched": [
+    "docs/candidates/dsv41-a100-bench-results.json",
+    "docs/candidates/dsv41-fp4-gemv-pairs.md",
+    "docs/candidates/dsv41-fused-quant-epilogues.md",
+    "docs/candidates/dsv41-group-split-routing.md",
+    "docs/candidates/dsv41-p2p-ep-dispatch.md",
+    "docs/candidates/dsv41-push-allreduce.md",
+    "docs/candidates/dsv41-tc-gemm-family.md"
+  ],
+  "agent": "Pi",
+  "model": "zai-org/GLM-5.3-Flash",
+  "turn_id": "054eb43e756e",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 6216808,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 60781,
+    "api_call_count": 102
+  },
+  "session_metrics": {
+    "turn_count": 6
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-25T11:53:32.657687294Z",
+    "agent_lines": 1618,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1618,
+    "total_lines_changed": 1618,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1256,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1618,
+      "agent_lines_removed": 0
+    }
+  ]
+}
