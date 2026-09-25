@@ -1,5 +1,9 @@
 # Porting candidate: push-style one-shot all-reduce for small decode vectors
 
+> Provenance: reference repo (shi3z/deepseekv4.1-A100-custom) carries **no license file** as of
+> this writing — analysis only; don't copy code verbatim without resolving licensing.
+
+
 Source: `dsv41/cuda/allreduce.cu` (+ its P2P substrate `dsv41/cuda/p2p.cu`),
 a single-process, no-NCCL all-reduce over P2P-connected GPUs.
 

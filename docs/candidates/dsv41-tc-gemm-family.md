@@ -15,6 +15,15 @@ Files studied:
 | `w8.py` | `W8` container, `PERM_K` byte permutation, `linear_w` dispatch ladder, `oproj_a` (block-diagonal) |
 | `cukern.py` | Host launchers: split-factor heuristics, fused-epilogue counter buffer, `permute_x`, EP shard args |
 
+Not in scope, deliberately: `cuda/fp8_gemv.cu` (the hand M=1 GEMV). On our A100 sweep
+(`dsv41-a100-bench-results.json`) it measures 25–33 µs / 83–472 GB/s at M=1 — its grid is
+`ceil(N/32)` blocks with no split-K, so it is launch-latency-bound — and its own TC path
+beats it 3–5×. Not a port candidate.
+
+> Provenance: the reference repo (shi3z/deepseekv4.1-A100-custom) carries **no license
+> file** as of this writing. Treat everything here as analysis; obtain permission or
+> re-derive from the described techniques before copying code verbatim.
+
 Our side: `src/c/vkernels/kernels/gemm_bf16.hpp` (two-implementation model, HIP MFMA +
 CUDA wmma + fp8-block split-K + fused split-K combine), `moe_fused.hpp/.hip` (MXFP4 fused
 MoE with inline E2M1+ue8m0 dequant), `src/python/vkernels/torch_ops/v41_fp8_gemm.py` /
@@ -36,13 +45,14 @@ lo = ((t0 >> 4) & 0x07F007F0) | (t0 & 0x80008000);   // s eeee mmm -> bf16 s 000
 ```
 
 Exactness argument (why this is not an approximation): byte `[s eeee mmm]` becomes the bf16
-`s 0000eeee mmm0000`. Normals decode to `2^(e-7)(1+m/8)` — the e4m3 value. The bf16 value
-is subnormal for `e == 0`, and there bf16 arithmetic yields `m * 2^-9`, which is exactly the
-e4m3 subnormal. NaN (0x7F/0xFF) is payload-dependent and clamped upstream. The **E8M0
-block scale is folded into the same multiply**: the per-32-k scale byte `S` builds
-`f2 = bf16x2(2^(S-7))` via `(S + 120) << 7` as the exponent field (S=0 → f2=0, zeroing the
-block — a free E8M0 zero handling), and one `fma.rn.bf16x2` with addend 0 applies it
-(sm_80 has no `mul.bf16x2`; `fma` with 0 is exact). Products fed to
+`s 0000eeee mmm0000`. Normals decode to `2^(e-7)(1+m/8)` — the e4m3 value. The placed bf16
+is subnormal for `e == 0` (value `m·2⁻¹²⁹`), and multiplying by the 2^120 fold (which the
+bf16 multiply applies to subnormal and normal operands alike) lands exactly on the e4m3
+subnormal `m·2⁻⁹` (`fp8_tc.cu:5-7`). NaN (0x7F/0xFF) is payload-dependent and clamped
+upstream. The **E8M0 block scale is folded into the same multiply**: the per-32-k scale
+byte `S` builds `f2 = bf16x2(2^(S-7))` via `(S + 120) << 7` as the exponent field, and one
+`fma.rn.bf16x2` with addend 0 applies it (sm_80 has no `mul.bf16x2`; `fma` with 0 is
+exact). Products fed to
 `mma.m16n8k16.row.col.f32.bf16.bf16.f32` are therefore the **exactly dequantized weights**,
 accumulation is fp32 — bit-identical to the bf16 cuBLAS path it replaces at half the bytes.
 
@@ -52,11 +62,18 @@ decode is exact including the E2M1 subnormal (`64m·2^-133 → m/2`). 8 nibbles 
 words in the order (0,4),(2,6),(1,5),(3,7) — which is why **x must be pre-permuted**
 (`cukern.permute_x`, 8-k order `0,4,2,6,1,5,3,7`): a dot product is order-invariant, so the
 nibble extraction order defines the required x layout, and no x gather is ever needed.
+**Scale-range contract:** the `2^(S-1)` fold is built as `(S+126) << 7` in bf16, so it
+overflows the bf16 exponent at **S ≥ 129** (→ inf → NaN products). Valid inputs must
+satisfy S ≤ 128, i.e. per-block scale ≤ 1 — real checkpoints (per-block amax ≤ 6 for fp4,
+≤ 448 for fp8) always do, but a port accepting arbitrary E8M0 bytes must assert the bound
+or document the silent-NaN failure mode (our A100 sweep hit exactly this with synthetic
+S ∈ [110,135) before clamping to [112,128)).
 
 **Port value on AMD:** `v_perm_b32` is the exact gfx942 analog of `prmt`; the placed-bits
-masks are plain VALU; gfx942 has packed bf16 `v_pk_fma_f32` (CDNA3) for the scale multiply
-— with an fp32-decode fallback if the packed path underperforms. Every step has a
-1:1 AMD equivalent; nothing here is sm_80-only.
+masks are plain VALU; gfx942/CDNA3 has packed-bf16 `v_pk_fma_bf16` for the scale multiply
+(note: `v_pk_fma_f32` is packed *fp32* — not what this needs) — with an fp32-decode fallback
+if the packed path underperforms. Every step has a 1:1 AMD equivalent; nothing here is
+sm_80-only.
 
 ### 1.2 PERM_K — the weight byte layout that makes (ld)matrix fragments free
 
@@ -116,6 +133,13 @@ compatible, otherwise it falls back to the einsum.
 
 * `w8.py` docstring: 1.1–1.2 TB/s effective on A100 vs 1.4 TB/s bf16 cuBLAS ⇒ **~1.6× per
   decode GEMV at half the weight bytes, exactly equal numbers** (exact dequant, fp32 acc).
+  Our independent A100 sweep (`dsv41-a100-bench-results.json`, nid002280/332, CUDA 12.6)
+  corroborates the memory-bound window: fp8_gemm_tc measures **402–1257 GB/s for M ≤ 8**
+  (peak ~1.2 TB/s at M=4–8, 1.2–2.0× over bf16 cuBLAS; the M=1 small-N rows are
+  launch-latency-floor, not bandwidth), **wins 1.2–2.0× for M ≤ 32**, and **loses to dense
+  bf16 cuBLAS at M ≥ 64** (compute-bound: the decode path uses the same bf16 mma, so there
+  is no FLOP advantage to offset the decode overhead). The crossover is ~M=32–64 on this
+  part; a port should carry the same shape gate.
 * `fp4_tc.cu` header: same numbers as the FP4 GEMV, "a quarter of the instructions per
   weight", and all tokens routed to an expert share one weight read (the grouped-GEMM win
   the `glm_expert_gemv` family cannot get at M > 1).
@@ -176,10 +200,16 @@ port as the baseline and correctness cross-check.
 
 * `gemm_w8.cpp`: exact e4m3fn decode from bits (table or arithmetic — mirroring
   `_e4m3_to_f32` in `v41_fp8_gemm.py`: normals `2^(e-7)(1+m/8)`, subnormals `m·2^-9`,
-  0x7F/0xFF NaN), E8M0 scale = `2^(S-127)` with `S == 0 ⇒ block contributes 0`, fp32
-  accumulation, **one** RNE bf16 round on store; split-K combine sums in fixed
-  ascending-split order so host and fused device agree to the bit (same contract as
-  `gemm_bf16_cpu`).
+  0x7F/0xFF NaN), E8M0 scale = `2^(S-127)`, fp32 accumulation, **one** RNE bf16 round on
+  store; split-K combine sums in fixed ascending-split order so host and fused device
+  agree to the bit (same contract as `gemm_bf16_cpu`).
+  **S == 0 semantics — decide explicitly.** The dsv41 sources are inconsistent here:
+  only `fp4_gemv.cu:60` zeroes the block (`sb==0 → 0`); the TC kernels do **not** —
+  the guard at `fp8_tc.cu:105` (`sc+120 > 0`) is dead code (`sc ≥ 0` always), so S=0
+  contributes a `2^-127` scale, and the fp4 TC kernels have no zero case at all.
+  Whatever we pick for the CPU oracle must be implemented identically in the kernel;
+  do not copy the docstring-level "S=0 zeroes" claim into a contract without picking
+  a side (zeroing is the safer, more useful semantics).
 * `moe_grouped_w4.cpp`: gather-dequant + fp32 dot oracle (mirror of
   `mxfp4_expert_gemv_reference` / `FP4_VALUES`), including the `pair_tok` mapping,
   EP shard skipping (`zero_out`), and the min/max token-count partition contract so the
@@ -199,7 +229,10 @@ port as the baseline and correctness cross-check.
   `permute_k`/`unpermute_k` (the `PERM_K`/`PERM_K_GFX942` reorders) and, for the fp4
   grouped path, `permute_x` (8-k order `0,4,2,6,1,5,3,7`).
 * Launcher policy (port from `cukern.fp8_gemm_tc`): shape gate on M
-  (≤ 16 per-lane-load kernel → ≤ 64 weights-as-A → tiled beyond), split-factor heuristic
+  (≤ 16 per-lane-load kernel → ≤ 64 weights-as-A → tiled beyond; note the source's exact
+  ladder: Mo 17–64 **without** N%64 alignment goes through 16-row passes of the ≤ 16
+  kernel, not the weights-as-A one, and ≥ `MAX_TC_ROWS = 512` rows (`w8.py:18`) falls
+  back to dequant + cuBLAS entirely), split-factor heuristic
   "≥ ~1024 warps stream the weights, partials ≤ half the weight bytes", and the
   fused-epilogue-only-when-bf16-output rule (`out_dtype` float ⇒ caller reduces).
 

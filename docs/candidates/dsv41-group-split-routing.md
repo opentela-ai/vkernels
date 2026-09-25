@@ -1,5 +1,9 @@
 # Candidate: DSV41 group-split expert routing (fp4_tc / fp4_tcw) for `moe_fused`
 
+> Provenance: reference repo (shi3z/deepseekv4.1-A100-custom) carries **no license file** as of
+> this writing — analysis only; don't copy code verbatim without resolving licensing.
+
+
 **Status**: analysis + port plan (no code yet)
 **Reference**: `/tmp/dsv41/dsv41/cuda/fp4_tc.cu` (small groups, ≤ 8/16 tokens,
 weights-as-B), `/tmp/dsv41/dsv41/cuda/fp4_tcw.cu` (operand-flipped, ≤ 64 tokens,
@@ -61,12 +65,15 @@ amplification is 1.000 either way. Concretely (DeepSeek-V3-like dims,
 hidden 7168 / ispp 2048 → 22.3 MiB per expert per layer), at M = 64 the
 per-GPU weight traffic is ~1.24 GiB/layer in *both* schemes; the flipped
 layout buys zero bytes. The decode step is weight-bandwidth-bound, so this
-is the metric that matters; the extra compute the 16-row padding wastes
-(~11 % real rows per M-tile at M = 64) is hidden under the weight stream.
+is the metric that matters; the extra compute the 16-row padding wastes is hidden under
+the weight stream (at M = 64 tokens: 512 pairs over ~282 hit experts → ~1.8 pairs per
+expert → **~11 % real rows per 16-row tile**, measured 11.3 % by Monte-Carlo).
 
 **Crossover.** cap-64 starts paying off only when groups overflow 16 rows:
-aggregate amp(cap16) ≈ 1.001 at M = 300, 1.011 at M = 400, 1.075 at M = 500,
-1.26 at M = 600, 2.0 at M = 800, 2.66 at M = 1000 (top_k = 8). I.e. the
+aggregate amp(cap16) ≈ 1.000 at M = 300, 1.005 at M = 400, 1.037 at M = 500,
+1.13 at M = 600, 1.50 at M = 800, 1.84 at M = 1000 (top_k = 8; exact Poisson,
+λ = M·top_k/E per expert, verified by simulation — an earlier draft of this
+doc carried an inflated series). I.e. the
 adaptive split is a **large-batch / prefill / chunked-prefill** feature, not a
 decode feature. Our prefill regime (block_size = 64, 64×64 tiles) *already*
 has cap-64 semantics, so the reference's `tcw` value-add over what vkernels

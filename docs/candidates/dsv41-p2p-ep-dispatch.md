@@ -1,5 +1,9 @@
 # Candidate 5 — device-side EP token dispatch (indexed row scatter + flag wait)
 
+> Provenance: reference repo (shi3z/deepseekv4.1-A100-custom) carries **no license file** as of
+> this writing — analysis only; don't copy code verbatim without resolving licensing.
+
+
 Porting plan for the expert-parallel decode scheme of the dsv41 reference
 (`/tmp/dsv41/dsv41/ep.py` + `/tmp/dsv41/dsv41/cuda/p2p.cu`) onto the
 `src/c/vkernels/comm/` abstractions. The reference runs **one CUDA graph per

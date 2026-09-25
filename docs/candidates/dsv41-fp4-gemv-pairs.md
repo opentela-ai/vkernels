@@ -1,5 +1,9 @@
 # Candidate analysis: `fp4_gemv_pairs` (CUDA → HIP port) for V4.1 MXFP4 MoE decode
 
+> Provenance: reference repo (shi3z/deepseekv4.1-A100-custom) carries **no license file** as of
+> this writing — analysis only; don't copy code verbatim without resolving licensing.
+
+
 Reference: `/tmp/dsv41/dsv41/cuda/fp4_gemv.cu` + wrapper `cukern.py::fp4_gemv_pairs`.
 Current op: `src/python/vkernels/torch_ops/v41_mxfp4_gemv.py` (Triton per-row GEMV).
 Tuning-store precedent: `tuner.py` `Tunable("glm_fp8_gemv_pick_sk", toolkit="hip", bench="glm_fp8_gemv_bench")` + `bench_glm_fp8_gemv --persist`.
@@ -15,7 +19,7 @@ W packed E2M1 (two codes/byte, low nibble = even k), one E8M0 scale per (n, 32 k
 | Block | `(256, 1, 1)` = 8 warps (`WARPS=8`) |
 | Rows per block | `WARPS * ROWS_PER_WARP = 8 * 4 = 32` output rows `n`; each warp owns 4 consecutive `n` (`n0 = (blockIdx.x*8 + warp)*4`) |
 | Shared memory (static) | `float xs[32 * MAX_CHUNKS]` = `32 * 160 * 4` = **20,480 B**, plus `float lut[16]` = 64 B → **20,544 B ≈ 20.1 KB** (`MAX_CHUNKS = 5120/32 = 160`) |
-| Loads | 16-byte `uint4` per warp instruction = 32 contiguous bytes = 64 codes (32 per nibble-half... 512 contiguous weight bytes per warp instruction row stream); lane `l` owns k-chunks `c = l, l+32, …` |
+| Loads | 16-byte `uint4` per lane per instruction = **16 B = 32 fp4 codes** (a 32-lane row streams 512 contiguous weight bytes per instruction); lane `l` owns k-chunks `c = l, l+32, …` |
 | Reduction | fp32 accumulation; full-warp `__shfl_xor` butterfly (16→1); `lane==0` writes `wt[pair] * acc` — **no atomics, one writer per (pair, n)** |
 | Smem activation staging | Transposed: `xs[j*chunks + c] = x[32c + j]`; after decode, lanes read `xs[j*chunks + c]` for fixed `j`, `c = lane` → consecutive addresses, conflict-free |
 | E2M1 decode | 16-entry shared fp32 LUT built once per block (`mags = {0,.5,1,1.5,2,3,4,6}`, sign from bit 3) |
@@ -35,7 +39,8 @@ W packed E2M1 (two codes/byte, low nibble = even k), one E8M0 scale per (n, 32 k
 
 ## 3. Cost / risks for a HIP port
 
-- **No atomics, no wmma, no callbacks** — the kernel is pure LDS + FMA + shuffle, i.e. squarely in the "portable" class; `__shfl_xor_sync` maps to full-wavefront shuffle on CDNA. 20.5 KB static LDS is trivial vs 64 KB.
+- **No atomics, no wmma, no callbacks** — the kernel is pure LDS + FMA + shuffle, i.e. squarely in the "portable" class. Wave64 caveat: `__shfl_xor_sync` offsets 16..1 happen to stay within 32-lane halves of a 64-lane CDNA wavefront, but the kernel's `warp = tid>>5` / `lane = tid&31` decomposition assumes 32-lane waves throughout — on CDNA either compile for wave32 or keep the per-32-lane decomposition explicit; do not blindly widen the butterfly. 20.5 KB static LDS is trivial vs 64 KB.
+- **Grid-y bound**: `gridDim.y = n_pairs` ≤ 65535 (CUDA limit). Fine for decode (pairs = tokens·top-k ≤ a few thousand); assert in the wrapper so a prefill-shaped call fails loudly instead of silently truncating.
 - **`K ≤ 5120` static bound.** Our V4.1 MoE FFN has three matrices per expert; confirm hidden/intermediate dims fit, or bump `MAX_K` (smem grows linearly: K=7168 → 224 chunks → 28.7 KB, still fine). Make `MAX_K` a template/compile-time knob, not a runtime assert surprise.
 - **16-byte loads need 16-byte alignment** of each weight row (`stride_wn` must preserve it); assert in the wrapper.
 - **Pair-array format**: we must produce int32 `row_in`, `expert` and fp32 `wt` (router weight). Our router currently emits int64 `indices [T, K]` and applies weights after the GEMV — fusing `wt` changes where the multiply happens (need parity test against the post-hoc path; fp32-vs-bf16 weight ordering differs).
@@ -51,7 +56,25 @@ W packed E2M1 (two codes/byte, low nibble = even k), one E8M0 scale per (n, 32 k
 
 ## 5. Verdict
 
-**Worth porting.** For decode (pairs ≈ tokens × top-k, M=1 per pair) the current Triton kernel's per-program x reloads, scalar nibble unpacking, global LUT, and `t*k × cdiv(O,4)` program count are all eliminated by this schedule. The kernel is atomics-free, tensor-core-free, LDS-light, and shuffle-based — the lowest-risk HIP port class — and it fuses the router weight, removing a downstream pass. Main engineering tasks: pair-triplet emission from the router, `MAX_K` knob, and tolerance-based parity tests.
+**Worth porting — with the TC grouped kernel on the table as the alternative decode vehicle.**
+For decode (pairs ≈ tokens × top-k, M=1 per pair) the current Triton kernel's per-program x
+reloads, scalar nibble unpacking, global LUT, and `t*k × cdiv(O,4)` program count are all
+eliminated by this schedule. The kernel is atomics-free, tensor-core-free, LDS-light, and
+shuffle-based — the lowest-risk HIP port class — and it fuses the router weight, removing a
+downstream pass. Main engineering tasks: pair-triplet emission from the router, `MAX_K`
+knob, and tolerance-based parity tests.
+
+**Cross-check against the TC grouped path (read this before committing).** The same repo's
+`fp4_tc.cu`/`fp4_tcw.cu` (see `dsv41-group-split-routing.md` / `dsv41-tc-gemm-family.md`)
+solves the same problem with weights shared across a group's tokens. Our A100 sweep
+(`dsv41-a100-bench-results.json`) is not a same-shape head-to-head (pairs at K=5120 vs TC
+at K=7168, and no TC datapoint below M=16), so no dominance claim is warranted — but the
+measured trends are: the pair GEMV streams 617–775 GB/s (weights re-read per pair), while
+the TC grouped path is sublinear in tokens per group (1.1 TB/s at M=16, 48–75 TFLOP/s at
+M=128–256) and beats the pair kernel ~2× at M=16-equivalent work. The pair kernel keeps
+three real advantages: no tensor cores (portable + lower risk), bit-stable atomics-free
+reduction, and per-pair `wt` fusion at M=1-shaped decode. If the TC path is ported first
+(candidate 1), treat this as the fallback/simple vehicle, not the primary decode schedule.
 
 ---
 ### 10-line summary

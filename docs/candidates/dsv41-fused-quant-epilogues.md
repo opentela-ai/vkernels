@@ -1,5 +1,9 @@
 # Candidate 6 — fused SwiGLU/RMSNorm + FP8-quant epilogues (dsv41 port)
 
+> Provenance: reference repo (shi3z/deepseekv4.1-A100-custom) carries **no license file** as of
+> this writing — analysis only; don't copy code verbatim without resolving licensing.
+
+
 Reference: `/tmp/dsv41/dsv41/fused.py` (`swiglu_quant`, `_round_e4m3`,
 `_ceil_log2`, `_pow2`, `_fq8`-equivalent per-32 fake quant) and
 `/tmp/dsv41/dsv41/fused2.py` (`norm_quant`, `hc_pre_norm_quant2`,
