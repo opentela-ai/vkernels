@@ -1,0 +1,406 @@
+{
+ "meta": {
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "compute_capability": "8.0",
+  "torch": "2.6.0+cu124",
+  "cuda": "12.4",
+  "driver": "590.48.01",
+  "host": "nid002329",
+  "date": "2026-09-25T14:10+0200",
+  "methodology": "CUDA-graph capture of 50 iterations, 5 timed replays; eager-loop fallback tagged per row as timing='eager'. Parity gate: relative err < 1e-2 vs exact-decode fp32 reference (structural-bug gate, not 1-ulp).",
+  "reference_repo": "https://github.com/shi3z/deepseekv4.1-A100-custom (no license file as of this date)"
+ },
+ "results": [
+  {
+   "kernel": "fp8_gemv",
+   "shape": [
+    1,
+    512,
+    5120
+   ],
+   "us": 32.829396426677704,
+   "GBps": 82.7200099784113,
+   "timing": "graph"
+  },
+  {
+   "kernel": "bf16_cublas",
+   "shape": [
+    1,
+    512,
+    5120
+   ],
+   "us": 7.925755809992552,
+   "GBps": 673.3853689096959,
+   "timing": "graph"
+  },
+  {
+   "kernel": "fp8_gemv",
+   "shape": [
+    1,
+    1280,
+    5120
+   ],
+   "us": 33.21606433019042,
+   "GBps": 203.93024088176696,
+   "timing": "graph"
+  },
+  {
+   "kernel": "bf16_cublas",
+   "shape": [
+    1,
+    1280,
+    5120
+   ],
+   "us": 12.005035765469074,
+   "GBps": 1110.1474631449596,
+   "timing": "graph"
+  },
+  {
+   "kernel": "fp8_gemv",
+   "shape": [
+    1,
+    5120,
+    2304
+   ],
+   "us": 25.704948231577873,
+   "GBps": 474.23585101893497,
+   "timing": "graph"
+  },
+  {
+   "kernel": "bf16_cublas",
+   "shape": [
+    1,
+    5120,
+    2304
+   ],
+   "us": 13.355528004467487,
+   "GBps": 1796.0119578931167,
+   "timing": "graph"
+  },
+  {
+   "kernel": "fp8_gemm_tc",
+   "shape": [
+    1,
+    512,
+    5120,
+    0
+   ],
+   "us": 6.836371961981058,
+   "GBps": 397.2352609106796,
+   "timing": "graph",
+   "TFLOPs": 0.7669097043222773
+  },
+  {
+   "kernel": "bf16_cublas",
+   "shape": [
+    1,
+    512,
+    5120,
+    0
+   ],
+   "us": 8.366648107767105,
+   "GBps": 637.9003791309641,
+   "timing": "graph",
+   "TFLOPs": 0.6266404338354827
+  },
+  {
+   "kernel": "fp8_gemm_tc",
+   "shape": [
+    1,
+    5120,
+    2304,
+    0
+   ],
+   "us": 11.802923865616322,
+   "GBps": 1032.8125588873697,
+   "timing": "graph",
+   "TFLOPs": 1.998908089946239
+  },
+  {
+   "kernel": "bf16_cublas",
+   "shape": [
+    1,
+    5120,
+    2304,
+    0
+   ],
+   "us": 13.36025632917881,
+   "GBps": 1795.3763317858695,
+   "timing": "graph",
+   "TFLOPs": 1.7659062385257502
+  },
+  {
+   "kernel": "fp8_gemm_tc",
+   "shape": [
+    4,
+    5120,
+    8192,
+    0
+   ],
+   "us": 34.81712006032467,
+   "GBps": 1246.548132780724,
+   "timing": "graph",
+   "TFLOPs": 9.637337017496877
+  },
+  {
+   "kernel": "bf16_cublas",
+   "shape": [
+    4,
+    5120,
+    8192,
+    0
+   ],
+   "us": 58.610695879906416,
+   "GBps": 1456.1208448176553,
+   "timing": "graph",
+   "TFLOPs": 5.724967345337988
+  },
+  {
+   "kernel": "fp8_gemm_tc",
+   "shape": [
+    16,
+    4608,
+    5120,
+    0
+   ],
+   "us": 28.30589609220624,
+   "GBps": 875.7536563848764,
+   "timing": "graph",
+   "TFLOPs": 26.671995033850035
+  },
+  {
+   "kernel": "bf16_cublas",
+   "shape": [
+    16,
+    4608,
+    5120,
+    0
+   ],
+   "us": 33.476084005087614,
+   "GBps": 1445.2691656720372,
+   "timing": "graph",
+   "TFLOPs": 22.552659381702497
+  },
+  {
+   "kernel": "fp8_gemm_tc",
+   "shape": [
+    32,
+    5120,
+    7168,
+    0
+   ],
+   "us": 46.93056829273701,
+   "GBps": 830.187091640858,
+   "timing": "graph",
+   "TFLOPs": 50.04862130262128
+  },
+  {
+   "kernel": "bf16_cublas",
+   "shape": [
+    32,
+    5120,
+    7168,
+    0
+   ],
+   "us": 55.88222434744239,
+   "GBps": 1353.9423829943314,
+   "timing": "graph",
+   "TFLOPs": 42.031437857528665
+  },
+  {
+   "kernel": "fp8_gemm_tc",
+   "shape": [
+    64,
+    4608,
+    5120,
+    0
+   ],
+   "us": 57.71003616973758,
+   "GBps": 453.39164097978386,
+   "timing": "graph",
+   "TFLOPs": 52.32883360387837
+  },
+  {
+   "kernel": "bf16_cublas",
+   "shape": [
+    64,
+    4608,
+    5120,
+    0
+   ],
+   "us": 35.27868818491697,
+   "GBps": 1410.432489416474,
+   "timing": "graph",
+   "TFLOPs": 85.60122372382105
+  },
+  {
+   "kernel": "fp8_gemm_tc",
+   "shape": [
+    8,
+    8192,
+    4096,
+    1024
+   ],
+   "us": 28.412864077836275,
+   "GBps": 1229.3969345824596,
+   "timing": "graph",
+   "TFLOPs": 2.361918313344163
+  },
+  {
+   "kernel": "bf16_cublas",
+   "shape": [
+    8,
+    8192,
+    4096,
+    1024
+   ],
+   "us": 52.65334388241172,
+   "GBps": 1300.6794051474612,
+   "timing": "graph",
+   "TFLOPs": 1.2745413501157898
+  },
+  {
+   "kernel": "fp8_gemm_tc",
+   "shape": [
+    128,
+    7168,
+    2048,
+    0
+   ],
+   "us": 67.93194403871894,
+   "GBps": 284.5954178638074,
+   "timing": "graph",
+   "TFLOPs": 55.321490311803984
+  },
+  {
+   "kernel": "bf16_cublas",
+   "shape": [
+    128,
+    7168,
+    2048,
+    0
+   ],
+   "us": 32.62319974601269,
+   "GBps": 1042.6072324238276,
+   "timing": "graph",
+   "TFLOPs": 115.19705035859724
+  },
+  {
+   "kernel": "fp4_gemv_pairs",
+   "shape": [
+    1,
+    8,
+    4096,
+    5120
+   ],
+   "us": 142.72511191666126,
+   "GBps": 625.0538451291684,
+   "timing": "graph",
+   "TFLOPs": 2.350983057528993
+  },
+  {
+   "kernel": "fp4_gemv_pairs",
+   "shape": [
+    4,
+    8,
+    4096,
+    5120
+   ],
+   "us": 486.63502000272274,
+   "GBps": 733.287793381585,
+   "timing": "graph",
+   "TFLOPs": 2.758077871157917
+  },
+  {
+   "kernel": "fp4_gemv_pairs",
+   "shape": [
+    16,
+    8,
+    4096,
+    5120
+   ],
+   "us": 1849.7769758105278,
+   "GBps": 771.6465815423825,
+   "timing": "graph",
+   "TFLOPs": 2.9023548190978863
+  },
+  {
+   "kernel": "fp4_gemv_pairs",
+   "shape": [
+    64,
+    8,
+    4096,
+    5120
+   ],
+   "us": 7361.6633038036525,
+   "GBps": 775.5715093693562,
+   "timing": "graph",
+   "TFLOPs": 2.9171174493818945
+  },
+  {
+   "kernel": "fp4_gemm_tc",
+   "shape": [
+    16,
+    8,
+    4096,
+    7168
+   ],
+   "us": 907.6439877972007,
+   "GBps": 1099.8192743199688,
+   "timing": "graph",
+   "TFLOPs": 8.28099218311506
+  },
+  {
+   "kernel": "fp4_gemm_tc",
+   "shape": [
+    32,
+    8,
+    4096,
+    7168
+   ],
+   "us": 1067.2150482423604,
+   "GBps": 935.3731974113829,
+   "timing": "graph",
+   "TFLOPs": 14.085619913959649
+  },
+  {
+   "kernel": "fp4_gemm_tc",
+   "shape": [
+    64,
+    8,
+    4096,
+    7168
+   ],
+   "us": 1145.4018959775567,
+   "GBps": 871.5232229889374,
+   "timing": "graph",
+   "TFLOPs": 26.248228833549177
+  },
+  {
+   "kernel": "fp4_gemm_tc",
+   "shape": [
+    128,
+    8,
+    4096,
+    7168
+   ],
+   "us": 1237.2902883216739,
+   "GBps": 806.798825968376,
+   "timing": "graph",
+   "TFLOPs": 48.59776457597748
+  },
+  {
+   "kernel": "fp4_gemm_tc",
+   "shape": [
+    256,
+    8,
+    4096,
+    7168
+   ],
+   "us": 1609.4179241918027,
+   "GBps": 620.2517922753258,
+   "timing": "graph",
+   "TFLOPs": 74.72209826940396
+  }
+ ]
+}
