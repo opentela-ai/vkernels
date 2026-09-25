@@ -1,17 +1,1 @@
-what kernels are we missing and might be interesting to copy from: https://github.com/shi3z/deepseekv4.1-A100-custom
-
----
-
-Can you spawn a subagent for each of them?
-
----
-
-continue, and can you benchmark those kernels on bristen (ssh bristen)
-
----
-
-no can you ssh bristen and probe, it is an A100 cluster
-
----
-
-check progress
+ok push to remote
