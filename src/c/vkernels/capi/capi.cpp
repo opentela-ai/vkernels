@@ -160,7 +160,18 @@ int32_t vk_stream_submit(vk_stream* s, void (*fn)(void*), void* ctx) {
   VK_CAPI_CATCH_RETURN_CODE()
 }
 
-void vk_stream_wait(vk_stream* s) { reinterpret_cast<vk_stream_impl*>(s)->s.wait(); }
+void vk_stream_wait(vk_stream* s) {
+  // Keep the legacy void ABI; callback failures are available through the
+  // thread-local error accessors and must never unwind across extern "C".
+  auto wait = [s]() -> int32_t {
+    VK_CAPI_TRY
+    reinterpret_cast<vk_stream_impl*>(s)->s.wait();
+    vkernels::capi::set_last_error(VK_OK, "");
+    return VK_OK;
+    VK_CAPI_CATCH_RETURN_CODE()
+  };
+  (void)wait();
+}
 
 size_t vk_stream_submitted(const vk_stream* s) { return reinterpret_cast<const vk_stream_impl*>(s)->s.submitted(); }
 

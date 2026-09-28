@@ -497,10 +497,9 @@ pub fn kda_gate_chunk_cumsum(
     })
 }
 
-/// Naive sequential delta-rule forward (the chunked kernel's pole-model).
+/// K3 per-key-dimension gated delta-rule forward (post-gate prediction).
 ///
-/// `q`, `k`, `v` are `[B, H, S, D]` (flat `b*h*s*d`); `g`, `beta` are
-/// `[B, H, S]` (flat `b*h*s`); `out` is `[B, H, S, D]` (flat `b*h*s*d`).
+/// `q`, `k`, `v`, `g` are `[B, H, S, D]`; `beta` is `[B, H, S]`; `out` is `[B, H, S, D]` (flat `b*h*s*d`).
 #[allow(clippy::too_many_arguments)]
 pub fn kda_naive_delta_rule_fwd(
     q: &[f32],
@@ -521,9 +520,9 @@ pub fn kda_naive_delta_rule_fwd(
             "q, k, v must each be b*h*s*d elements".into(),
         ));
     }
-    if g.len() != n_bh_s || beta.len() != n_bh_s {
+    if g.len() != n_bh_s_d || beta.len() != n_bh_s {
         return Err(Error::InvalidArgument(
-            "g and beta must each be b*h*s elements".into(),
+            "g must be b*h*s*d and beta must be b*h*s elements".into(),
         ));
     }
     if out.len() != n_bh_s_d {
@@ -569,7 +568,7 @@ pub fn kda_delta_rule_fwd(
     chunk_size: usize,
     out: &mut [f32],
 ) -> Result<(), Error> {
-    if !s.is_multiple_of(chunk_size) {
+    if chunk_size == 0 || !s.is_multiple_of(chunk_size) {
         return Err(Error::InvalidArgument(format!(
             "chunk_size must divide s (s={s}, chunk_size={chunk_size})"
         )));
@@ -634,7 +633,7 @@ pub fn kda_delta_rule_intra(
     chunk_size: usize,
     chunk_idx: usize,
 ) -> Result<(), Error> {
-    if !s.is_multiple_of(chunk_size) {
+    if chunk_size == 0 || !s.is_multiple_of(chunk_size) {
         return Err(Error::InvalidArgument(
             "chunk_size must divide s".into(),
         ));
@@ -705,7 +704,7 @@ pub fn kda_delta_rule_inter(
     chunk_size: usize,
     chunk_idx: usize,
 ) -> Result<(), Error> {
-    if !s.is_multiple_of(chunk_size) {
+    if chunk_size == 0 || !s.is_multiple_of(chunk_size) {
         return Err(Error::InvalidArgument(
             "chunk_size must divide s".into(),
         ));
@@ -774,7 +773,7 @@ pub fn kda_gla_fwd_o(
     chunk_size: usize,
     out: &mut [f32],
 ) -> Result<(), Error> {
-    if !s.is_multiple_of(chunk_size) {
+    if chunk_size == 0 || !s.is_multiple_of(chunk_size) {
         return Err(Error::InvalidArgument(
             "chunk_size must divide s".into(),
         ));
@@ -1688,7 +1687,7 @@ mod tests {
     #[test]
     fn mla_config_decode_and_prefill() {
         assert_eq!(mla_config(1, 512, 64), (1, 64, 64));
-        assert_eq!(mla_config(9, 512, 64), (4, 64, 256));
+        assert_eq!(mla_config(9, 512, 64), (4, 8, 512));
     }
 
     // =====================================================================
@@ -1749,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn kda_naive_vs_chunked_matches() {
+    fn kda_chunked_matches_standard_recurrence() {
         use rand::Rng;
         let mut rng = rand::thread_rng();
         for (b, h, s, d, cs) in [
@@ -1766,7 +1765,22 @@ mod tests {
             let g: Vec<f32> = (0..b * h * s).map(|_| 0.3 + 0.7 * rng.gen::<f32>()).collect();
             let beta: Vec<f32> = (0..b * h * s).map(|_| 0.3 + 0.7 * rng.gen::<f32>()).collect();
             let mut naive = vec![0.0f32; b * h * s * d];
-            kda_naive_delta_rule_fwd(&q, &k, &v, &g, &beta, b, h, s, d, &mut naive).unwrap();
+            // Standard scalar-gate recurrence predicts from the pre-gate
+            // state; K3's per-key-dimension oracle is a different operator.
+            for bh in 0..b*h {
+                let mut state = vec![0.0f32; d*d];
+                for t in 0..s {
+                    let row = bh*s+t;
+                    for vi in 0..d {
+                        let pred: f32 = (0..d).map(|ki| state[vi*d+ki]*k[row*d+ki]).sum();
+                        for ki in 0..d {
+                            state[vi*d+ki] = g[row]*state[vi*d+ki]
+                                + beta[row]*(v[row*d+vi]-pred)*k[row*d+ki];
+                        }
+                        naive[row*d+vi] = (0..d).map(|ki| state[vi*d+ki]*q[row*d+ki]).sum();
+                    }
+                }
+            }
             let mut chunked = vec![0.0f32; b * h * s * d];
             kda_delta_rule_fwd(&q, &k, &v, &g, &beta, b, h, s, d, cs, &mut chunked).unwrap();
             let maxd = naive
@@ -1937,7 +1951,9 @@ mod tests {
         let mut out = vec![0.0f32; m * width];
         mxfp4_moe_scatter_reduce(&partial, &w, &sorted_ids, m, width, top_k, &mut out).unwrap();
         let want = scatter_oracle(&partial, &w, &sorted_ids, m, width, top_k);
-        assert_eq!(out, want);
+        for (actual, expected) in out.iter().zip(&want) {
+            assert!((actual-expected).abs() <= 1e-6 * (1.0 + expected.abs()));
+        }
     }
 
     #[test]

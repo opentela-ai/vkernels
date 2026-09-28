@@ -37,6 +37,8 @@ class Stream {
   void submit(std::function<void()> task);
 
   // Block the calling thread until every task submitted so far has run.
+  // Captures are destroyed before completion. Rethrow the first callback
+  // failure since the previous wait, after draining all queued tasks.
   void wait();
 
   // Number of tasks submitted (completed + queued). Test observable.

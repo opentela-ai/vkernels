@@ -56,12 +56,12 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <mutex>
 
 #include "vkernels/kernels/gemm_bf16.hpp"
 
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
+#include "vkernels/kernels/execution_workspace.hpp"
 #  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 
 namespace vkernels::kernels::hip {
@@ -700,28 +700,6 @@ __global__ void gemm_fp8_block_splitk_kernel(
   }
 }
 
-// Device workspace for the split-K fp32 partial planes (issue #146):
-// grow-only, shared across consecutive gemm_bf16 launches -- the same
-// pattern as the mla_fwd split workspace (issue #82). Both kernels of one
-// launch are enqueued under the lock that (re)sizes the buffer, so a later
-// resize's hipFree (which synchronises the device) can never race a
-// not-yet-launched kernel against a freed buffer.
-struct SplitKWorkspace {
-  std::mutex mu;
-  float* partials = nullptr;
-  size_t cap = 0;  // elements
-  // Fused-path per-(m, n)-tile arrival counters (split-K combine fold-in):
-  // one int per output tile, zeroed at allocation and self-reset to 0 by
-  // the combining block at the end of every launch (same-stream launches
-  // serialise, so no per-launch memset is needed).
-  int* counters = nullptr;
-  size_t counter_cap = 0;  // ints
-};
-SplitKWorkspace& splitk_ws() {
-  static SplitKWorkspace w;
-  return w;
-}
-
 // ======================================================================
 //  Decode-GEMV split-K kernels (issue #156) -- tiny-M latency killers
 // ======================================================================
@@ -921,17 +899,7 @@ bool gemv_decode_dispatch(
   if (s < 1) s = 1;
   if (s > Ki) s = Ki;
   const size_t need = (size_t)s * M * N;
-  auto& w = splitk_ws();
-  std::lock_guard<std::mutex> lock(w.mu);
-  if (w.cap < need) {
-    float* p = nullptr;
-    if (hipMalloc(&p, need * sizeof(float)) == hipSuccess) {
-      if (w.partials) hipFree(w.partials);
-      w.partials = p;
-      w.cap = need;
-    }
-  }
-  if (w.cap < need) return false;
+  Scratch<float> partials(need);
 
   const int kts_e = (Ki + s - 1) / s;
   const dim3 block(threads);
@@ -942,10 +910,10 @@ bool gemv_decode_dispatch(
   do {                                                                        \
     if (fp8)                                                                  \
       gemv_decode_fp8_splitk_kernel<MV, TB><<<grid, block, smem>>>(           \
-          A, (const uint8_t*)Bw, scales, w.partials, Ni, Ki, kts_e);          \
+          A, (const uint8_t*)Bw, scales, partials.ptr, Ni, Ki, kts_e);          \
     else                                                                      \
       gemv_decode_bf16_splitk_kernel<MV, TB><<<grid, block, smem>>>(          \
-          A, (const uint16_t*)Bw, w.partials, Ni, Ki, kts_e);                 \
+          A, (const uint16_t*)Bw, partials.ptr, Ni, Ki, kts_e);                 \
   } while (0)
   switch (Mi) {
     case 1: VK_GEMV_M_CASE(1); break;
@@ -960,7 +928,7 @@ bool gemv_decode_dispatch(
   const int cols = 256;
   dim3 gridC(Mi, (Ni + cols - 1) / cols);
   gemm_bf16_splitk_combine_kernel<<<gridC, cols, 0, 0>>>(
-      w.partials, C, C, Mi, Ni, s, alpha, beta);
+      partials.ptr, C, C, Mi, Ni, s, alpha, beta);
   return true;
 }
 
@@ -1122,7 +1090,7 @@ __global__ void gemm_bf16_kernel_reuse(const uint16_t* __restrict__ A,
 
 namespace {
 
-// Split-K launch: sizes the grow-only workspace, then enqueues the split
+// Split-K launch: acquires invocation-owned partials, then enqueues the split
 // kernel (grid (m-tiles, n-tiles, S)). Fused = true folds the combine into
 // the split kernel (last-arriving block per tile; ONE launch total, no
 // combine kernel) and requires `counters` (zeroed per-tile arrival
@@ -1136,39 +1104,14 @@ template <int BM, int BN, bool Wide, bool Fused = false>
 bool launch_splitk(const uint16_t* A, const uint16_t* B, uint16_t* C,
                    int M, int N, int K, float alpha, float beta, int S) {
   const size_t n = (size_t)S * M * N;
-  auto& w = splitk_ws();
-  std::lock_guard<std::mutex> lock(w.mu);
-  if (w.cap < n) {
-    float* p = nullptr;
-    if (hipMalloc(&p, n * sizeof(float)) == hipSuccess) {
-      if (w.partials) hipFree(w.partials);
-      w.partials = p;
-      w.cap = n;
-    }
-  }
-  if (w.cap < n) return false;
+  Scratch<float> partials(n);
 
-  int* counters = nullptr;
-  if (Fused) {
-    const size_t tiles =
-        (size_t)((M + BM - 1) / BM) * (size_t)((N + BN - 1) / BN);
-    if (w.counter_cap < tiles) {
-      int* p = nullptr;
-      if (hipMalloc(&p, tiles * sizeof(int)) == hipSuccess) {
-        if (w.counters) hipFree(w.counters);
-        w.counters = p;
-        w.counter_cap = tiles;
-        // First-use zeroing only (see SplitKWorkspace::counters).
-        if (hipMemset(p, 0, tiles * sizeof(int)) != hipSuccess) {
-          hipFree(w.counters);
-          w.counters = nullptr;
-          w.counter_cap = 0;
-        }
-      }
-    }
-    if (w.counter_cap < tiles) return false;
-    counters = w.counters;
-  }
+  const size_t tiles = (size_t)((M + BM - 1) / BM) * ((N + BN - 1) / BN);
+  Scratch<int> counter_storage(Fused ? tiles : 0);
+  int* counters = counter_storage.ptr;
+  if (Fused)
+    VK_ENSURES(hipMemsetAsync(counters, 0, tiles * sizeof(int), nullptr) == hipSuccess,
+               "GEMM counter initialization failed");
 
   const int n_ktiles = (K + BK - 1) / BK;
   const int kts = (n_ktiles + S - 1) / S;  // whole tiles per split
@@ -1178,16 +1121,16 @@ bool launch_splitk(const uint16_t* A, const uint16_t* B, uint16_t* C,
   dim3 gridS((M + BM - 1) / BM, (N + BN - 1) / BN, S);
   if (Wide) {
     gemm_bf16_splitk_wide_kernel<BM, BN, Fused><<<gridS, block, 0, 0>>>(
-        A, B, w.partials, C, C, M, N, K, kts, counters, S, alpha, beta);
+        A, B, partials.ptr, C, C, M, N, K, kts, counters, S, alpha, beta);
   } else {
     gemm_bf16_splitk_kernel<BM, BN><<<gridS, block, 0, 0>>>(
-        A, B, w.partials, M, N, K, kts);
+        A, B, partials.ptr, M, N, K, kts);
   }
   if (!Fused) {
     const int cols = 256;
     dim3 gridC(M, (N + cols - 1) / cols);
     gemm_bf16_splitk_combine_kernel<<<gridC, cols, 0, 0>>>(
-        w.partials, C, C, M, N, S, alpha, beta);
+        partials.ptr, C, C, M, N, S, alpha, beta);
   }
   return true;
 }
@@ -1423,17 +1366,7 @@ void gemm_fp8_block_splitk_with_config(
   if (s > max_s) s = max_s;
 
   const size_t n = (size_t)s * M * N;
-  auto& w = splitk_ws();
-  std::lock_guard<std::mutex> lock(w.mu);
-  if (w.cap < n) {
-    float* p = nullptr;
-    if (hipMalloc(&p, n * sizeof(float)) == hipSuccess) {
-      if (w.partials) hipFree(w.partials);
-      w.partials = p;
-      w.cap = n;
-    }
-  }
-  if (w.cap < n) return;
+  Scratch<float> partials(n);
 
   const int n_ktiles = (Ki + BK - 1) / BK;
   const int kts = (n_ktiles + s - 1) / s;
@@ -1443,21 +1376,21 @@ void gemm_fp8_block_splitk_with_config(
   dim3 gridS((Mi + bm - 1) / bm, (Ni + bn - 1) / bn, s);
   if (bm == 16 && bn == 16) {
     gemm_fp8_block_splitk_kernel<16, 16><<<gridS, block, 0, 0>>>(
-        A, W8, scales, w.partials, Mi, Ni, Ki, kts);
+        A, W8, scales, partials.ptr, Mi, Ni, Ki, kts);
   } else if (bm == 16 && bn == 64) {
     gemm_fp8_block_splitk_kernel<16, 64><<<gridS, block, 0, 0>>>(
-        A, W8, scales, w.partials, Mi, Ni, Ki, kts);
+        A, W8, scales, partials.ptr, Mi, Ni, Ki, kts);
   } else if (bm == 32 && bn == 64) {
     gemm_fp8_block_splitk_kernel<32, 64><<<gridS, block, 0, 0>>>(
-        A, W8, scales, w.partials, Mi, Ni, Ki, kts);
+        A, W8, scales, partials.ptr, Mi, Ni, Ki, kts);
   } else {
     gemm_fp8_block_splitk_kernel<64, 64><<<gridS, block, 0, 0>>>(
-        A, W8, scales, w.partials, Mi, Ni, Ki, kts);
+        A, W8, scales, partials.ptr, Mi, Ni, Ki, kts);
   }
   const int cols = 256;
   dim3 gridC(Mi, (Ni + cols - 1) / cols);
   gemm_bf16_splitk_combine_kernel<<<gridC, cols, 0, 0>>>(
-      w.partials, C, C, Mi, Ni, s, alpha, beta);
+      partials.ptr, C, C, Mi, Ni, s, alpha, beta);
 }
 
 // Cross-tile B-reuse entry point (offline autotuner, issue #77). (bm, bn)

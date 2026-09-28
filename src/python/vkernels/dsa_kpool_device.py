@@ -37,7 +37,13 @@ device ABI's dtype/layout contract with cheap on-device casts:
   as int64/bool; those are cast — each cast is one tiny kernel launch).
 * ``round_scale`` — a host bool is materialized as a cached device int32
   (the kernel reads ``*it > 0`` on-device; NULL selects raw absmax/448), so
-  the call stays graph-capturable.
+  the call stays graph-capturable after warming it on the capture stream.
+
+All inputs must be ready on the caller's current stream. An explicit stream
+(Torch Stream or raw handle on the tensor device) waits for that stream;
+casts and the native launch both execute on the selected stream. Tensor
+storage is retained through queued work by the Torch allocator. Callers
+consuming results on another stream must wait for the launch stream.
 
 The kernels write ONLY the slots addressed by ``loc`` / the pool-complete
 rows — untouched cache slots keep their content, so the caller must not
@@ -48,9 +54,7 @@ leg fp8+scale layout usable as a drop-in for the Triton store path).
 from __future__ import annotations
 
 import ctypes
-import glob
-import os
-from pathlib import Path
+from .device_contract import launch_context as _launch_context
 
 __all__ = [
     "find_libvkernels",
@@ -67,62 +71,10 @@ _LIB_NAMES = ("libvkernels_c.so", "libvkernels_hip.so")
 _lib_cache: dict = {}
 
 
-def _repo_root() -> Path | None:
-    """Repository root (a directory containing ``src/c/vkernels``), or None."""
-    here = Path(__file__).resolve()
-    for cand in (here, *here.parents):
-        if (cand / "src" / "c" / "vkernels").is_dir():
-            return cand
-    return None
-
-
 def find_libvkernels() -> str | None:
-    """Locate a shared library exporting the ``vk_hip_dsa_kpool_*`` C ABI.
-
-    Resolution order (mirrors ``vllm_experts.find_libvkernels_hip``):
-
-    1. ``$VKERNELS_LIB`` — explicit path (highest precedence).
-    2. ``$K3/home/pylib/libvkernels_hip.so`` — the per-model image layout.
-    3. ``$VKERNELS_DIR`` / the repo root — newest ``build/**/libvkernels_
-       {c,hip}.so`` (dev checkout).
-    4. ``$LD_LIBRARY_PATH`` via :func:`ctypes.util.find_library`.
-    5. ``None``.
-    """
-    env_path = os.environ.get("VKERNELS_LIB")
-    if env_path and os.path.exists(env_path):
-        return env_path
-
-    k3 = os.environ.get("K3", "")
-    if k3:
-        for name in _LIB_NAMES:
-            p = os.path.join(k3, "home/pylib", name)
-            if os.path.exists(p):
-                return p
-
-    vdir = os.environ.get("VKERNELS_DIR") or ""
-    if not vdir:
-        root = _repo_root()
-        vdir = str(root) if root else ""
-    if vdir:
-        cands: list[str] = []
-        for name in _LIB_NAMES:
-            cands += glob.glob(
-                os.path.join(vdir, "build", "**", name), recursive=True
-            )
-        if cands:
-            return max(cands, key=os.path.getmtime)
-
-    try:
-        from ctypes.util import find_library
-
-        for soname in ("vkernels_c", "vkernels_hip"):
-            found = find_library(soname)
-            if found:
-                return found
-    except Exception:  # noqa: S110, BLE001 - no library finder; fall through
-        pass
-
-    return None
+    """Resolve the installed library or explicit VKERNELS_LIB/VKERNELS_BUILD_DIR."""
+    from .native_runtime import find_library
+    return find_library(_LIB_NAMES)
 
 
 def _set_kpool_prototypes(lib: ctypes.CDLL) -> None:
@@ -216,22 +168,38 @@ def _torch():
     return torch
 
 
-def _as_device_stream_arg(tensors, stream):
-    """Resolve the launch stream: an explicit handle wins (a raw int handle
-    or a torch Stream object); otherwise the CALLER'S current torch stream
-    on the tensors' device (the sglang DSA indexer launches the compress
-    path on an alternate stream — the NULL default stream would order the
-    writes against the wrong stream)."""
-    import torch
 
-    if stream is not None:
-        if isinstance(stream, torch.cuda.Stream):
-            return stream.cuda_stream
-        return stream
-    for t in tensors:
-        if isinstance(t, torch.Tensor) and t.is_cuda:
-            return torch.cuda.current_stream(t.device).cuda_stream
-    return None
+def _validate_shapes(data, scores, tail, tail_scores, ape, rows, vectors, block_tables=None):
+    """Validate buffer capacities from shape metadata before extracting pointers."""
+    if data.ndim != 2 or data.shape[1] != 128 or scores.shape != data.shape:
+        raise ValueError("keys/scores must have matching [rows, 128] shapes")
+    if tail.ndim != 3 or tail.shape[2] != 128 or tail_scores.shape != tail.shape or tail.shape[1] <= 0:
+        raise ValueError("tail keys/scores must have matching [requests, tail_size, 128] shapes")
+    if ape.ndim != 2 or ape.shape[1] != 128 or ape.shape[0] <= 0:
+        raise ValueError("ape must have shape [pool_size, 128]")
+    for value in vectors:
+        if value is not None and value.shape != (rows,):
+            raise ValueError(f"index and mask vectors must have shape [{rows}]")
+    if block_tables is not None and (block_tables.ndim != 2 or block_tables.shape[0] != rows
+                                     or block_tables.shape[1] <= 0):
+        raise ValueError("block_tables must have shape [batch, positive column count]")
+
+
+def _slots_per_page(out, head_dim, *, fp8=False):
+    torch = _torch()
+    dtype = torch.uint8 if fp8 else torch.bfloat16
+    if out.dtype != dtype or not out.is_contiguous():
+        raise ValueError(f"kpool output must be contiguous {dtype}")
+    width = head_dim + 4 if fp8 else head_dim
+    if not fp8 and out.ndim == 3 and out.shape[2] == head_dim:
+        slots = out.shape[1]
+    elif out.ndim == 2 and out.shape[1] % width == 0:
+        slots = out.shape[1] // width
+    else:
+        raise ValueError("invalid kpool output page shape")
+    if slots <= 0:
+        raise ValueError("kpool output must have positive slots per page")
+    return int(slots)
 
 
 def _ptr(t):
@@ -273,9 +241,13 @@ def _round_scale_ptr(round_scale: bool, device):
 
     if not round_scale:
         return None
-    key = str(device)
+    # A flag first initialized on stream A cannot be read by stream B until
+    # that initialization completes. Keep independent flags per launch stream.
+    key = (str(device), torch.cuda.current_stream(device).cuda_stream)
     buf = _round_scale_buf.get(key)
     if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("warm round_scale=True on this stream before capture")
         buf = torch.ones(1, dtype=torch.int32, device=device)
         _round_scale_buf[key] = buf
     return buf
@@ -315,27 +287,32 @@ def dsa_kpool_assemble_fp8(
     n_pools = int(req_pool_idx.shape[0])
     if n_pools == 0:
         return
-    ck = _prep(chunk_k, torch.bfloat16, "chunk_k")
-    cs = _prep(chunk_score, torch.bfloat16, "chunk_score")
-    tk = _prep(tail_k, torch.bfloat16, "tail_k")
-    ts = _prep(tail_score, torch.bfloat16, "tail_score")
-    ap = _prep(ape, torch.float32, "ape")
-    rp = _i32(req_pool_idx, "req_pool_idx")
-    nf = _i32(n_from_tail, "n_from_tail")
-    csrc = _i32(chunk_src_start, "chunk_src_start")
-    tlb = _i32(tail_logical_base, "tail_logical_base")
-    lc = _i32(loc, "loc")
-    wm = None if write_mask is None else _i32(write_mask, "write_mask")
-    rs = _round_scale_ptr(round_scale, cache_u8.device)
-    s = _as_device_stream_arg([ck, cache_u8], stream)
-    load_libvkernels().vk_hip_dsa_kpool_assemble_fp8(
-        n_pools, int(ap.shape[0]), int(ck.shape[1]), int(tk.shape[1]),
-        int(cache_u8.shape[1] // (ck.shape[1] + 4)), int(cache_u8.shape[0]),
-        int(ck.shape[0]), int(tk.shape[0]),
-        _ptr(ck), _ptr(cs), _ptr(tk), _ptr(ts), _ptr(ap), _ptr(rp),
-        _ptr(nf), _ptr(csrc), _ptr(tlb), _ptr(lc), _ptr(wm),
-        _ptr(cache_u8), _ptr(rs), ctypes.c_void_p(s),
-    )
+    with _launch_context((
+        cache_u8, chunk_k, chunk_score, tail_k, tail_score, ape,
+        req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base, loc, write_mask,
+    ), stream) as s:
+        _validate_shapes(chunk_k, chunk_score, tail_k, tail_score, ape, n_pools,
+                         (req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base, loc, write_mask))
+        ck = _prep(chunk_k, torch.bfloat16, "chunk_k")
+        cs = _prep(chunk_score, torch.bfloat16, "chunk_score")
+        tk = _prep(tail_k, torch.bfloat16, "tail_k")
+        ts = _prep(tail_score, torch.bfloat16, "tail_score")
+        ap = _prep(ape, torch.float32, "ape")
+        rp = _i32(req_pool_idx, "req_pool_idx")
+        nf = _i32(n_from_tail, "n_from_tail")
+        csrc = _i32(chunk_src_start, "chunk_src_start")
+        tlb = _i32(tail_logical_base, "tail_logical_base")
+        lc = _i32(loc, "loc")
+        wm = None if write_mask is None else _i32(write_mask, "write_mask")
+        rs = _round_scale_ptr(round_scale, cache_u8.device)
+        load_libvkernels().vk_hip_dsa_kpool_assemble_fp8(
+            n_pools, int(ap.shape[0]), int(ck.shape[1]), int(tk.shape[1]),
+            _slots_per_page(cache_u8, int(ck.shape[1]), fp8=True), int(cache_u8.shape[0]),
+            int(ck.shape[0]), int(tk.shape[0]),
+            _ptr(ck), _ptr(cs), _ptr(tk), _ptr(ts), _ptr(ap), _ptr(rp),
+            _ptr(nf), _ptr(csrc), _ptr(tlb), _ptr(lc), _ptr(wm),
+            _ptr(cache_u8), _ptr(rs), ctypes.c_void_p(s),
+        )
 
 
 def dsa_kpool_decode_update_fp8(
@@ -367,26 +344,31 @@ def dsa_kpool_decode_update_fp8(
     batch = int(key.shape[0])
     if batch == 0:
         return
-    k = _prep(key, torch.bfloat16, "key")
-    ss = _prep(slot_score, torch.bfloat16, "slot_score")
-    tk = _prep(tail_k, torch.bfloat16, "tail_k", in_place_ok=True)
-    ts = _prep(tail_score, torch.bfloat16, "tail_score", in_place_ok=True)
-    ap = _prep(ape, torch.float32, "ape")
-    bt = _i32(block_tables, "block_tables")
-    rp = _i32(req_pool_indices, "req_pool_indices")
-    pos = _i32(positions, "positions")
-    sl = _i32(seq_lens, "seq_lens")
-    ocl = _i32(out_cache_loc, "out_cache_loc")
-    rs = _round_scale_ptr(round_scale, cache_u8.device)
-    s = _as_device_stream_arg([k, cache_u8], stream)
-    load_libvkernels().vk_hip_dsa_kpool_decode_update_fp8(
-        batch, int(ap.shape[0]), int(k.shape[1]), int(tk.shape[1]),
-        int(cache_u8.shape[1] // (k.shape[1] + 4)), int(bt.shape[1]),
-        int(tk.shape[0]), int(cache_u8.shape[0]),
-        _ptr(k), _ptr(ss), _ptr(tk), _ptr(ts), _ptr(ap), _ptr(bt), _ptr(rp),
-        _ptr(pos), _ptr(sl), _ptr(ocl),
-        _ptr(cache_u8), _ptr(rs), ctypes.c_void_p(s),
-    )
+    with _launch_context((
+        cache_u8, key, slot_score, tail_k, tail_score, ape,
+        block_tables, req_pool_indices, positions, seq_lens, out_cache_loc,
+    ), stream) as s:
+        _validate_shapes(key, slot_score, tail_k, tail_score, ape, batch,
+                         (req_pool_indices, positions, seq_lens, out_cache_loc), block_tables)
+        k = _prep(key, torch.bfloat16, "key")
+        ss = _prep(slot_score, torch.bfloat16, "slot_score")
+        tk = _prep(tail_k, torch.bfloat16, "tail_k", in_place_ok=True)
+        ts = _prep(tail_score, torch.bfloat16, "tail_score", in_place_ok=True)
+        ap = _prep(ape, torch.float32, "ape")
+        bt = _i32(block_tables, "block_tables")
+        rp = _i32(req_pool_indices, "req_pool_indices")
+        pos = _i32(positions, "positions")
+        sl = _i32(seq_lens, "seq_lens")
+        ocl = _i32(out_cache_loc, "out_cache_loc")
+        rs = _round_scale_ptr(round_scale, cache_u8.device)
+        load_libvkernels().vk_hip_dsa_kpool_decode_update_fp8(
+            batch, int(ap.shape[0]), int(k.shape[1]), int(tk.shape[1]),
+            _slots_per_page(cache_u8, int(k.shape[1]), fp8=True), int(bt.shape[1]),
+            int(tk.shape[0]), int(cache_u8.shape[0]),
+            _ptr(k), _ptr(ss), _ptr(tk), _ptr(ts), _ptr(ap), _ptr(bt), _ptr(rp),
+            _ptr(pos), _ptr(sl), _ptr(ocl),
+            _ptr(cache_u8), _ptr(rs), ctypes.c_void_p(s),
+        )
 
 
 def dsa_kpool_assemble(
@@ -415,26 +397,31 @@ def dsa_kpool_assemble(
     n_pools = int(req_pool_idx.shape[0])
     if n_pools == 0:
         return
-    ck = _prep(chunk_k, torch.bfloat16, "chunk_k")
-    cs = _prep(chunk_score, torch.bfloat16, "chunk_score")
-    tk = _prep(tail_k, torch.bfloat16, "tail_k")
-    ts = _prep(tail_score, torch.bfloat16, "tail_score")
-    ap = _prep(ape, torch.float32, "ape")
-    rp = _i32(req_pool_idx, "req_pool_idx")
-    nf = _i32(n_from_tail, "n_from_tail")
-    csrc = _i32(chunk_src_start, "chunk_src_start")
-    tlb = _i32(tail_logical_base, "tail_logical_base")
-    lc = _i32(loc, "loc")
-    wm = None if write_mask is None else _i32(write_mask, "write_mask")
-    s = _as_device_stream_arg([ck, out_bf16], stream)
-    load_libvkernels().vk_hip_dsa_kpool_assemble(
-        n_pools, int(ap.shape[0]), int(ck.shape[1]), int(tk.shape[1]),
-        int(out_bf16.shape[1] // ck.shape[1]), int(out_bf16.shape[0]),
-        int(ck.shape[0]), int(tk.shape[0]),
-        _ptr(ck), _ptr(cs), _ptr(tk), _ptr(ts), _ptr(ap), _ptr(rp),
-        _ptr(nf), _ptr(csrc), _ptr(tlb), _ptr(lc), _ptr(wm),
-        _ptr(out_bf16), ctypes.c_void_p(s),
-    )
+    with _launch_context((
+        out_bf16, chunk_k, chunk_score, tail_k, tail_score, ape,
+        req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base, loc, write_mask,
+    ), stream) as s:
+        _validate_shapes(chunk_k, chunk_score, tail_k, tail_score, ape, n_pools,
+                         (req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base, loc, write_mask))
+        ck = _prep(chunk_k, torch.bfloat16, "chunk_k")
+        cs = _prep(chunk_score, torch.bfloat16, "chunk_score")
+        tk = _prep(tail_k, torch.bfloat16, "tail_k")
+        ts = _prep(tail_score, torch.bfloat16, "tail_score")
+        ap = _prep(ape, torch.float32, "ape")
+        rp = _i32(req_pool_idx, "req_pool_idx")
+        nf = _i32(n_from_tail, "n_from_tail")
+        csrc = _i32(chunk_src_start, "chunk_src_start")
+        tlb = _i32(tail_logical_base, "tail_logical_base")
+        lc = _i32(loc, "loc")
+        wm = None if write_mask is None else _i32(write_mask, "write_mask")
+        load_libvkernels().vk_hip_dsa_kpool_assemble(
+            n_pools, int(ap.shape[0]), int(ck.shape[1]), int(tk.shape[1]),
+            _slots_per_page(out_bf16, int(ck.shape[1]), fp8=False), int(out_bf16.shape[0]),
+            int(ck.shape[0]), int(tk.shape[0]),
+            _ptr(ck), _ptr(cs), _ptr(tk), _ptr(ts), _ptr(ap), _ptr(rp),
+            _ptr(nf), _ptr(csrc), _ptr(tlb), _ptr(lc), _ptr(wm),
+            _ptr(out_bf16), ctypes.c_void_p(s),
+        )
 
 
 def dsa_kpool_decode_update(
@@ -460,22 +447,27 @@ def dsa_kpool_decode_update(
     batch = int(key.shape[0])
     if batch == 0:
         return
-    k = _prep(key, torch.bfloat16, "key")
-    ss = _prep(slot_score, torch.bfloat16, "slot_score")
-    tk = _prep(tail_k, torch.bfloat16, "tail_k", in_place_ok=True)
-    ts = _prep(tail_score, torch.bfloat16, "tail_score", in_place_ok=True)
-    ap = _prep(ape, torch.float32, "ape")
-    bt = _i32(block_tables, "block_tables")
-    rp = _i32(req_pool_indices, "req_pool_indices")
-    pos = _i32(positions, "positions")
-    sl = _i32(seq_lens, "seq_lens")
-    ocl = _i32(out_cache_loc, "out_cache_loc")
-    s = _as_device_stream_arg([k, out_bf16], stream)
-    load_libvkernels().vk_hip_dsa_kpool_decode_update(
-        batch, int(ap.shape[0]), int(k.shape[1]), int(tk.shape[1]),
-        int(out_bf16.shape[1] // k.shape[1]), int(bt.shape[1]),
-        int(tk.shape[0]), int(out_bf16.shape[0]),
-        _ptr(k), _ptr(ss), _ptr(tk), _ptr(ts), _ptr(ap), _ptr(bt), _ptr(rp),
-        _ptr(pos), _ptr(sl), _ptr(ocl),
-        _ptr(out_bf16), ctypes.c_void_p(s),
-    )
+    with _launch_context((
+        out_bf16, key, slot_score, tail_k, tail_score, ape,
+        block_tables, req_pool_indices, positions, seq_lens, out_cache_loc,
+    ), stream) as s:
+        _validate_shapes(key, slot_score, tail_k, tail_score, ape, batch,
+                         (req_pool_indices, positions, seq_lens, out_cache_loc), block_tables)
+        k = _prep(key, torch.bfloat16, "key")
+        ss = _prep(slot_score, torch.bfloat16, "slot_score")
+        tk = _prep(tail_k, torch.bfloat16, "tail_k", in_place_ok=True)
+        ts = _prep(tail_score, torch.bfloat16, "tail_score", in_place_ok=True)
+        ap = _prep(ape, torch.float32, "ape")
+        bt = _i32(block_tables, "block_tables")
+        rp = _i32(req_pool_indices, "req_pool_indices")
+        pos = _i32(positions, "positions")
+        sl = _i32(seq_lens, "seq_lens")
+        ocl = _i32(out_cache_loc, "out_cache_loc")
+        load_libvkernels().vk_hip_dsa_kpool_decode_update(
+            batch, int(ap.shape[0]), int(k.shape[1]), int(tk.shape[1]),
+            _slots_per_page(out_bf16, int(k.shape[1]), fp8=False), int(bt.shape[1]),
+            int(tk.shape[0]), int(out_bf16.shape[0]),
+            _ptr(k), _ptr(ss), _ptr(tk), _ptr(ts), _ptr(ap), _ptr(bt), _ptr(rp),
+            _ptr(pos), _ptr(sl), _ptr(ocl),
+            _ptr(out_bf16), ctypes.c_void_p(s),
+        )

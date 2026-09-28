@@ -64,6 +64,8 @@
 
 // ---- memory / sync --------------------------------------------------------
 #define hipMalloc cudaMalloc
+#define hipMallocAsync cudaMallocAsync
+#define hipFreeAsync cudaFreeAsync
 #define hipFree cudaFree
 #define hipMemcpy cudaMemcpy
 #define hipMemset cudaMemset
@@ -98,6 +100,7 @@
 
 // ---- device properties / enumeration --------------------------------------
 #define hipGetDevice cudaGetDevice
+#define hipSetDevice cudaSetDevice
 #define hipDeviceGetAttribute cudaDeviceGetAttribute
 #define hipDeviceAttributeMultiprocessorCount cudaDevAttrMultiProcessorCount
 #define hipDeviceAttributeCooperativeLaunch cudaDevAttrCooperativeLaunch

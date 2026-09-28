@@ -8,10 +8,10 @@
 // one box by a measured sweep replays everywhere the store ships,
 // instead of being copy-pasted into source comments.
 //
-// File format (`vk-native-tuning/1`) — one `<kernel>.<arch>.tune` per
+// File format (`vk-native-tuning/2`) — one `<kernel>.<arch>.tune` per
 // kernel per device arch, line-based so the C++ side needs no JSON:
 //
-//   # vk-native-tuning/1
+//   # vk-native-tuning/2
 //   # arch=gfx942 cu_count=228 written_by=bench_dsa_topk_logits
 //   key=1,4096,64
 //   split=64
@@ -57,8 +57,7 @@ bool enabled();
 // `VKERNELS_TUNING_ARCH` overrides the query — the test seam (host-only
 // CI exercises the full store round trip) and the inspection seam (read
 // another arch's artifact on this box). The override is honored whenever
-// set (re-read per call, so tests can toggle it); the device query itself
-// runs once, on the first override-free call, and is cached from then on.
+// set (re-read per call, so tests can toggle it); the device query follows the current execution device.
 std::string device_arch();
 
 // Parse one `.tune` body (loader + unit tests).

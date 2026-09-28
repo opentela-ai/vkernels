@@ -87,6 +87,12 @@ tests under `tests/python/`:
 | `glm_expert_gather_dequant` | gather + explicit E4M3FN block-dequant |
 | `glm_fp8_blockwise_gemm` (+ `_glm_fp8_sm90_gemm`) | blockwise-scaled FP8 GEMM / MoE grouped GEMM (Triton + CuTe DSL sm90) |
 | `glm_mhc_mix` | mHC gate + Sinkhorn fusion |
+| `glm_moe_grouped` | two-launch grouped MoE decode over stacked fp8 experts (gate/up GEMV + clamped swiglu, down GEMV + weighted combine) |
+| `sgl_moe` (+ `configs/`) | vendored SGLang Triton fused-MoE (fp8_w8a8, block [128,128]) + per-token-group quant + tuned tile sidecars |
+| `moe_combine` | weighted top-k MoE combine (one launch; SGLang `_moe_sum_reduce` design) |
+| `silu_mul_clamp` | grouped-MoE activation: clamp+clamp+silu+mul in one launch (`swiglu_fn` seam callable) |
+| `mhc_chain` | mHC chain-fuse: previous site's compose tail + pre head in ONE launch (decode rows) |
+| `glm_kda_conv_update` | KDA decode conv + SiLU + in-place state roll (SGLang `causal_conv1d_update` design) |
 | `glm_kda_decode` | single-token per-dimension-gated KDA decode |
 | `glm_projection`, `mhc_projection`, `qkv_projection`, `qkv_tuned_blas` | fused projection GEMVs |
 | `gdn_commit` | deferred GDN SSM commit (DFlash2 spec decoding) |
@@ -214,7 +220,8 @@ See [`docs/python-bindings.md`](docs/python-bindings.md) for the full API.
 
 See [`docs/README.md`](docs/README.md) for the full kernel and communication
 catalogue, and [`docs/ORIENTATION.md`](docs/ORIENTATION.md) for the design,
-build, and testing conventions.
+build, and testing conventions. See [runtime and compiler contracts](docs/code-quality-remediation.md)
+for workspace ownership, backend selection, tuning migration, and device execution.
 
 ## Rust bindings (opt-in)
 

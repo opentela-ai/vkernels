@@ -45,21 +45,14 @@ from .lowerings import (
     lower_graph,
 )
 from .memory import kv_cache_bytes, plan_memory
-from .model_gpt2 import GPT2Config, GPT2Weights, KVCache, SymbolicModelArgs, build_forward, random_weights
+from .model_gpt2 import GPT2Config, GPT2Weights, KVCache
 from .model_qwen3 import (
     Qwen3Config,
-    Qwen3ModelArgs,
-    build_qwen3_forward,
-    random_qwen3_weights,
 )
-from .model_qwen35 import Qwen35ModelArgs, build_qwen35_forward
-from .model_deepseek_v4 import DeepseekV4ModelArgs, build_deepseek_v4_forward
-from .qwen35_arch import Qwen35Config, random_qwen35_weights
-from .deepseek_v4_arch import DeepseekV4Config, random_deepseek_weights
 from .operator_ir import I32, OperatorGraph
 from .reference_exec import ExecutionTrace, ReferenceExecutor
 from .runtime.launch import LaunchManifest, choose_worker_count, query_device_sms
-from .runtime.synchronization import CapabilityError, require_grid_sync_backend
+from .runtime.synchronization import CapabilityError
 from .schedule_phase import PhaseSchedule
 
 __all__ = [
@@ -144,6 +137,24 @@ class CompiledExecutable:
             capability_notes=list(report.capability_notes),
         )
 
+    def prepare_device(self, *, device="cuda", dtype=None, k_cache=None, v_cache=None):
+        """Prepare the Qwen3 Triton backend from this exact schedule and workspace.
+
+        Return the runner to pass as ``cache`` to ``run(mode="device")``.
+        ``runner.run_device`` accepts prepared GPU inputs without host staging.
+        Other model adapters remain reference-only until they have a backend.
+        """
+        if not isinstance(self.config, Qwen3Config):
+            raise DeviceUnavailable("this model adapter has no validated device backend")
+        import torch
+        from .device_triton import TritonMegakernel
+        self._device_runner = TritonMegakernel(
+            self.config, self.weights, capacity=self.config.cache_capacity,
+            workers=self.workers, dtype=dtype or torch.float32, device=device,
+            batch=self.config.batch, k_cache=k_cache, v_cache=v_cache, executable=self,
+        )
+        return self._device_runner
+
     # -- workspace -----------------------------------------------------------
 
     def allocate_workspace(self, dtype=np.float64) -> np.ndarray:
@@ -182,8 +193,13 @@ class CompiledExecutable:
         canary: bool = True,
     ) -> tuple[np.ndarray, ExecutionTrace]:
         if mode == "device":
-            require_grid_sync_backend()  # raises until Milestone 0 passes (§8.4)
-            raise DeviceUnavailable("CuTe DSL device backend is not available on this stack; run with mode='reference' for schedule validation (§15.1)")
+            runner = getattr(self, "_device_runner", None)
+            if runner is None:
+                raise DeviceUnavailable("call prepare_device() and pass its runner as cache before device execution")
+            if cache is not runner or workspace is not None or workers not in (None, runner.workers):
+                raise ValueError("device execution requires the prepared runner and its owned workspace/worker count")
+            logits = runner.run(ids, position)
+            return logits, ExecutionTrace(kernel_launches=1, grid_barriers=runner.num_barriers)
         if mode != "reference":
             raise ValueError(f"unknown execution mode {mode!r}")
 
@@ -293,51 +309,23 @@ def compile_model(
     """
     if schedule != "phase":
         raise ValueError(f"schedule={schedule!r}: only the phase-synchronous target is implemented; static/dynamic fine-grained schedules are Milestone 5 (§10, §11)")
-    if target not in ("cute_persistent", "reference"):
+    if target not in ("cute_persistent", "triton_persistent", "reference"):
         raise ValueError(f"unknown target {target!r}")
 
     if model_config is None:
         model_config = GPT2Config()
     config = model_config
-    is_qwen3 = isinstance(config, Qwen3Config)
-    is_qwen35 = isinstance(config, Qwen35Config)
-    is_deepseek = isinstance(config, DeepseekV4Config)
+    from .model_adapters import model_adapter
+    adapter = model_adapter(config)
     config.validate()
-    if model_body is None:
-        if is_deepseek:
-            model_body = build_deepseek_v4_forward
-        elif is_qwen35:
-            model_body = build_qwen35_forward
-        else:
-            model_body = build_qwen3_forward if is_qwen3 else build_forward
-    if weights is None:
-        if is_deepseek:
-            weights = random_deepseek_weights(config, seed=seed)
-        elif is_qwen35:
-            weights = random_qwen35_weights(config, seed=seed)
-        elif is_qwen3:
-            weights = random_qwen3_weights(config, seed=seed)
-        else:
-            weights = random_weights(config, seed=seed)
-
-    # ---- capture (§4, M1) ----------------------------------------------
+    model_body = model_body or adapter.body
+    weights = weights if weights is not None else adapter.weights(config, seed=seed)
     recorder = RecordingBackend()
-    if is_qwen35 or is_deepseek:
-        # #93: the decode step is ragged-row native — per-row positions.
-        position = recorder.define_row_positions(
-            "row_positions", config.batch, config.cache_capacity, storage_id=10**6 + 5
-        )
-    else:
-        position = recorder.define_position(config.cache_capacity)
+    position = (recorder.define_row_positions("row_positions", config.batch, config.cache_capacity,
+                                             storage_id=10**6 + 5)
+                if adapter.row_positions else recorder.define_position(config.cache_capacity))
     ids = recorder.external_tensor("ids", (config.batch,), I32, storage_id=10**6)
-    if is_deepseek:
-        args = DeepseekV4ModelArgs(recorder, config)
-    elif is_qwen35:
-        args = Qwen35ModelArgs(recorder, config)
-    elif is_qwen3:
-        args = Qwen3ModelArgs(recorder, config)
-    else:
-        args = SymbolicModelArgs(recorder, config, weights)
+    args = adapter.arguments(recorder, config, weights)
     graph, recorder = capture_model(model_body, args, ids, position, config, backend=recorder)
 
     # ---- legality (§3.3) --------------------------------------------------

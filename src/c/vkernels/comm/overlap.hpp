@@ -24,6 +24,7 @@ class OverlapExecutor {
 
   // Run `iters` iterations. `compute(i)` produces a value; `comm(i, value)`
   // consumes it. Compute runs on stream A, comm on stream B.
+  // Submission/callback failures are rethrown only after both streams drain.
   Result run(std::size_t iters, std::function<int(std::size_t)> compute,
              std::function<void(std::size_t, int)> comm);
 

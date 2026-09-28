@@ -45,6 +45,17 @@ if(VKERNELS_BUILD_PYTHON)
     OUTPUT_NAME "_core"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python/vkernels")
 
+  install(TARGETS vkernels_python_core LIBRARY DESTINATION vkernels COMPONENT python)
+  foreach(_lib vkernels_c vkernels_hip vkernels_hostc)
+    if(TARGET ${_lib})
+      install(TARGETS ${_lib} LIBRARY DESTINATION vkernels COMPONENT python)
+    endif()
+  endforeach()
+  file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/python/vkernels/build_info.json"
+    CONTENT "{\"abi_version\":1,\"cuda\":$<IF:$<BOOL:${VKERNELS_HAS_CUDA}>,true,false>,\"hip\":$<IF:$<BOOL:${VKERNELS_HAS_HIP}>,true,false>}")
+  install(FILES "${CMAKE_BINARY_DIR}/python/vkernels/build_info.json"
+    DESTINATION vkernels COMPONENT python)
+
   # Python test suite (discovery + bindings), under tests/python/. The
   # interpreter can be overridden, e.g. when the extension was built against
   # the system Python but the tests should run in a venv that has numpy:
@@ -59,11 +70,11 @@ if(VKERNELS_BUILD_PYTHON)
 
   if(VKERNELS_BUILD_TESTS)
     add_test(NAME python_bindings
-      COMMAND ${_vk_py_test_exe} -m unittest discover -s tests/python -v)
+      COMMAND ${_vk_py_test_exe} -m pytest tests/python -v)
     set_tests_properties(python_bindings PROPERTIES
       WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
       ENVIRONMENT
-        "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_BINARY_DIR}/python;\
+        "VKERNELS_EXTENSION=$<TARGET_FILE:vkernels_python_core>;VKERNELS_BACKEND=compiled;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_BINARY_DIR}/python;\
 OPENBLAS_NUM_THREADS=1;OMP_NUM_THREADS=1;MKL_NUM_THREADS=1")
   endif()
 endif()
