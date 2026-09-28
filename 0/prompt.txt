@@ -1,0 +1,258 @@
+Task: You are implementing one lane of a kernel-borrow round (GLM-5.3-Flash serving perf). Work in /local/home/xiayao/Documents/code/vkernels (branch integration/sgl-fuse).
+
+CONTEXT
+- vkernels repo: /local/home/xiayao/Documents/code/vkernels. WARNING: the working tree contains unrelated uncommitted WIP (megakernel compiler refactor, NOTES deletions, C++/Rust edits). NEVER touch, revert, or commit anything outside your assigned files. Do not run git add/commit/stash/checkout/restore.
+- floe repo: /local/home/xiayao/Documents/code/floe (clean, branch main) — READ-ONLY for you; it is the consumer of your kernels.
+- Python: /local/home/xiayao/Documents/code/vkernels/.venv/bin/python (torch 2.14.0+cu130, triton 3.8). Local GPU is a GB10, capability (12,1) = sm_121: use it for CORRECTNESS only; donor perf numbers are H100-class and stay unvalidated until the sgs-gpu07 rig run.
+- House conventions — read these exemplars FIRST and copy their structure: src/python/vkernels/torch_ops/moe_combine.py, src/python/vkernels/torch_ops/glm_kda_conv_update.py, tests/python/test_moe_combine.py, tests/python/test_glm_kda_conv_update.py. Required style: module docstring with provenance + what-it-replaces; lazy torch/triton imports; eligibility validation that raises OpNotEligible (from ._dispatch) instead of pre-gating; a *_reference implementation for tests; parametrized dtype/shape tests including eligibility-contract and CPU-rejects tests.
+- New modules are imported directly as vkernels.torch_ops.<name>; do NOT edit torch_ops/__init__.py, README.md, pyproject.toml, or anything under compiler/, src/c/, src/rust/.
+- floe wiring is OUT OF SCOPE: after all lanes finish, the parent integrates via floe/engine/runner/kernels/vkl_ops.py (read that file to see the adapter pattern and match its expectations for public signatures).
+
+VALIDATION (from /local/home/xiayao/Documents/code/vkernels)
+- /local/home/xiayao/Documents/code/vkernels/.venv/bin/python -m pytest tests/python/<your test files> -q — all green.
+- .venv/bin/python -m ruff check <your files> — clean under the repo gate (select F).
+- Do NOT run the full test suite; the tree has unrelated WIP.
+
+REPORT
+Write /local/home/xiayao/Documents/code/floe/.agents/runs/borrow-round9/<your-key>.md containing: files created/modified; exact public API signatures with dtypes/layouts (the parent wires floe from this); eligibility/fallback contract; parity results with tolerances; open questions. Return a concise summary plus the report path.
+
+STOP/ASK
+If a numerics contract cannot be honored, a dependency is missing, or you would need to edit a file outside your boundary, STOP and use contact_supervisor instead of improvising.
+
+
+LANE borrow9-merged-proj — three merged-projection GEMV ops for the GLM-5.3 decode step (node-cuts steps C, E, F).
+Full spec with code-site line refs and node arithmetic: /local/home/xiayao/Documents/code/floe/.agents/runs/gap-levers/node-cuts.md — read it first; its line refs may have drifted, anchor by function names instead. Your edit boundary: NEW files src/python/vkernels/torch_ops/kda_small_gemv.py and src/python/vkernels/torch_ops/dsa_qkva_stacked.py + their tests, PLUS the existing src/python/vkernels/torch_ops/qkv_projection.py and its test file (find it under tests/python/) which are exclusively yours this lane.
+
+1. qkv_projection envelope fix (step C): _validate in qkv_projection.py hardcodes the unsharded (8192, 4096) weight triple, so the op declines the TP4 per-rank [2048, 4096] triples and the deployed recipe cannot set the knob. Relax to any equal-(O, 4096) triple: the grid already loops 3 projections; make the store offsets 3*O and keep the autotune key per (O, tokens). The existing 8192 path must remain behavior-identical. Extend the tests with the TP4 shape, other equal-(O, K) shapes, and decline cases (mismatched O, non-contiguous).
+
+2. New op kda_small_gemv (step E) in torch_ops/kda_small_gemv.py: ONE launch over the row-concatenated [16+128+128, 4096] bf16 weight stack (b_proj beta | f_a | g_a) sharing a single x read, writing: beta (sigmoid folded AFTER the bf16 round of the dot — the eager contract rounds the dot to bf16 THEN applies sigmoid; pin this in tests), h (f_a output, consumed downstream by the forget-gate op), and g_a. Support general (O_beta, O_fa, O_ga) shapes with the GLM-5.3-TP4 stack as the tuned case. Consumer contracts to read (floe is read-only): the beta / forget-gate / g_a sites in floe/engine/runner/models/glm53flash/forward.py (search for the KDA projection sites; node-cuts.md lists them), and src/python/vkernels/torch_ops/glm_forget_gate.py (f_a is currently a dense_gemv call inside it — your op replaces that launch plus the b and g_a GEMVs). Provide kda_small_gemv_reference.
+
+3. New op for step F in torch_ops/dsa_qkva_stacked.py: stacked fp8 GEMV over a [1536+512=2048, 4096] fp8e4m3 weight with its [16, 32] block-scale grid for DSA layers (q_a 1536 rows | kv_a 512 rows; both projections replicate under TP; 1536 and 512 are 128-multiples so the block-scale concatenation is exact). The caller slices the [1536 | 512] output. Contract: BIT-identical to running the two per-matrix fp8 GEMVs separately (same rows, same reduction order, concatenated storage only). Study the incumbent dense fp8 GEMV (src/python/vkernels/torch_ops/glm_dense_fp8_gemv.py or wherever dense_gemv_fp8 lives) and reuse its reduction order. Eligibility: contiguity, fp8 dtype, scale shapes.
+
+Numerics classes per the spec — tests must pin exactly these: C is the adopted perf-only class (fp32-accum GEMV, one bf16 round, different reduction order than the per-matrix GEMVs); E has per-slice dots identical to dense_gemv plus the sigmoid-rounding pin; F is bit-identical.
+
+---
+
+Task: You are implementing one lane of a kernel-borrow round (GLM-5.3-Flash serving perf). Work in /local/home/xiayao/Documents/code/vkernels (branch integration/sgl-fuse).
+
+CONTEXT
+- vkernels repo: /local/home/xiayao/Documents/code/vkernels. WARNING: the working tree contains unrelated uncommitted WIP (megakernel compiler refactor, NOTES deletions, C++/Rust edits). NEVER touch, revert, or commit anything outside your assigned files. Do not run git add/commit/stash/checkout/restore.
+- floe repo: /local/home/xiayao/Documents/code/floe (clean, branch main) — READ-ONLY for you; it is the consumer of your kernels.
+- Python: /local/home/xiayao/Documents/code/vkernels/.venv/bin/python (torch 2.14.0+cu130, triton 3.8). Local GPU is a GB10, capability (12,1) = sm_121: use it for CORRECTNESS only; donor perf numbers are H100-class and stay unvalidated until the sgs-gpu07 rig run.
+- House conventions — read these exemplars FIRST and copy their structure: src/python/vkernels/torch_ops/moe_combine.py, src/python/vkernels/torch_ops/glm_kda_conv_update.py, tests/python/test_moe_combine.py, tests/python/test_glm_kda_conv_update.py. Required style: module docstring with provenance + what-it-replaces; lazy torch/triton imports; eligibility validation that raises OpNotEligible (from ._dispatch) instead of pre-gating; a *_reference implementation for tests; parametrized dtype/shape tests including eligibility-contract and CPU-rejects tests.
+- New modules are imported directly as vkernels.torch_ops.<name>; do NOT edit torch_ops/__init__.py, README.md, pyproject.toml, or anything under compiler/, src/c/, src/rust/.
+- floe wiring is OUT OF SCOPE: after all lanes finish, the parent integrates via floe/engine/runner/kernels/vkl_ops.py (read that file to see the adapter pattern and match its expectations for public signatures).
+
+VALIDATION (from /local/home/xiayao/Documents/code/vkernels)
+- /local/home/xiayao/Documents/code/vkernels/.venv/bin/python -m pytest tests/python/<your test files> -q — all green.
+- .venv/bin/python -m ruff check <your files> — clean under the repo gate (select F).
+- Do NOT run the full test suite; the tree has unrelated WIP.
+
+REPORT
+Write /local/home/xiayao/Documents/code/floe/.agents/runs/borrow-round9/<your-key>.md containing: files created/modified; exact public API signatures with dtypes/layouts (the parent wires floe from this); eligibility/fallback contract; parity results with tolerances; open questions. Return a concise summary plus the report path.
+
+STOP/ASK
+If a numerics contract cannot be honored, a dependency is missing, or you would need to edit a file outside your boundary, STOP and use contact_supervisor instead of improvising.
+
+
+LANE borrow9-kpool — vendor SGLang v0.5.20 pool-aware DSA (sparse attention) kpool metadata Triton kernels into vkernels, adapted to floe indexer/pool contracts.
+
+Donor sources (local): /tmp/sgl_pkg/sgl/sglang/kernels/ops/attention/dsa_kpool_metadata/ — __init__.py, decode.py (fused DSA decode metadata kernel: seq_lens, req_pool_indices, req_to_token, cache_seqlens, cu_seqlens_k, page_table, dsa_cache_seqlens, dsa_cu_seqlens_k, real_page_table; do_not_specialize on strides/lengths), scan.py (bounded_scan_num_splits), verify.py, draft_extend.py. Resolve their import closure (they may pull sglang.srt.utils, index_buf_accessor, fused_metadata_copy) and vendor only what the kernels need — strip engine machinery exactly the way src/python/vkernels/torch_ops/vllm_sparse_mla.py did (read its CUT LIST header for the house pattern).
+
+Existing vkernels kpool surface to align names/contracts with (read first): src/python/vkernels/dsa_kpool_device.py, src/c/vkernels/kernels/dsa.hip (HIP twins: dsa_topk_logits, dsa_topk_transform, dsa_kpool ops), tests/python/test_dsa_kpool_device.py.
+
+floe consumer contracts (read-only): floe/engine/runner/models/glm53flash/forward.py — Glm53Indexer emits int32 [B, S_q, W] top-k token ids with -1 masking; pools carry req_to_token / page_table / cu_seqlens / cache_seqlens (search the DSA/indexer region; anchor by the Glm53Indexer class and the sparse-attention sites).
+
+DELIVERABLES
+1. New torch_ops module (suggest src/python/vkernels/torch_ops/dsa_kpool_metadata.py, or a small set): the fused decode metadata kernel + bounded scan; include verify.py only if it stands alone without MTP machinery; SKIP draft_extend if it needs MTP machinery — document every skip.
+2. Adapter layer: public wrapper(s) taking floe-shaped tensors directly; document any re-stride/re-dtype the caller must know about (keep it minimal — the parent wires floe from your report).
+3. Optional, network permitting: fetch vLLM kpool_compress.py (raw.githubusercontent.com, vllm-project/vllm main branch, path vllm/models/glm5next/amd/ops/kpool_compress.py from PR #53906) and vendor it as a reference-semantics module (Apache-2.0 header preserved). If no network, note it as a follow-up in your report and continue with the SGLang set.
+4. Tests: parity vs an eager torch metadata computation over small randomized pools (compare cu_seqlens_k, num_splits, real_page_table, dsa_cache_seqlens, dsa_cu_seqlens_k), eligibility contracts, capture safety (the do_not_specialize stride/length handling must survive CUDA graph capture with static shapes, no host syncs).
+
+---
+
+Task: You are implementing one lane of a kernel-borrow round (GLM-5.3-Flash serving perf). Work in /local/home/xiayao/Documents/code/vkernels (branch integration/sgl-fuse).
+
+CONTEXT
+- vkernels repo: /local/home/xiayao/Documents/code/vkernels. WARNING: the working tree contains unrelated uncommitted WIP (megakernel compiler refactor, NOTES deletions, C++/Rust edits). NEVER touch, revert, or commit anything outside your assigned files. Do not run git add/commit/stash/checkout/restore.
+- floe repo: /local/home/xiayao/Documents/code/floe (clean, branch main) — READ-ONLY for you; it is the consumer of your kernels.
+- Python: /local/home/xiayao/Documents/code/vkernels/.venv/bin/python (torch 2.14.0+cu130, triton 3.8). Local GPU is a GB10, capability (12,1) = sm_121: use it for CORRECTNESS only; donor perf numbers are H100-class and stay unvalidated until the sgs-gpu07 rig run.
+- House conventions — read these exemplars FIRST and copy their structure: src/python/vkernels/torch_ops/moe_combine.py, src/python/vkernels/torch_ops/glm_kda_conv_update.py, tests/python/test_moe_combine.py, tests/python/test_glm_kda_conv_update.py. Required style: module docstring with provenance + what-it-replaces; lazy torch/triton imports; eligibility validation that raises OpNotEligible (from ._dispatch) instead of pre-gating; a *_reference implementation for tests; parametrized dtype/shape tests including eligibility-contract and CPU-rejects tests.
+- New modules are imported directly as vkernels.torch_ops.<name>; do NOT edit torch_ops/__init__.py, README.md, pyproject.toml, or anything under compiler/, src/c/, src/rust/.
+- floe wiring is OUT OF SCOPE: after all lanes finish, the parent integrates via floe/engine/runner/kernels/vkl_ops.py (read that file to see the adapter pattern and match its expectations for public signatures).
+
+VALIDATION (from /local/home/xiayao/Documents/code/vkernels)
+- /local/home/xiayao/Documents/code/vkernels/.venv/bin/python -m pytest tests/python/<your test files> -q — all green.
+- .venv/bin/python -m ruff check <your files> — clean under the repo gate (select F).
+- Do NOT run the full test suite; the tree has unrelated WIP.
+
+REPORT
+Write /local/home/xiayao/Documents/code/floe/.agents/runs/borrow-round9/<your-key>.md containing: files created/modified; exact public API signatures with dtypes/layouts (the parent wires floe from this); eligibility/fallback contract; parity results with tolerances; open questions. Return a concise summary plus the report path.
+
+STOP/ASK
+If a numerics contract cannot be honored, a dependency is missing, or you would need to edit a file outside your boundary, STOP and use contact_supervisor instead of improvising.
+
+
+LANE borrow9-kda-cuda — vendor the two Kimi-K3 KDA decode CUDA kernels from the SGLang v0.5.20 wheel into vkernels as new torch_ops modules, with GLM-5.3-Flash TP4 support.
+
+Donor sources (all local; read every one first):
+- /tmp/sgl_pkg/sgl/sglang/kernels/ops/attention/kda_packed_decode.py and /tmp/sgl_pkg/sgl/sglang/kernels/jit/csrc/attention/kda_packed_decode.cuh — row-streaming CUDA port of the triton fused_recurrent packed decode; keeps a [BV, K] fp32 state tile out of registers and streams the state one 512B row at a time, reaching the in-place state read+write bandwidth of the part (~9.6 TB/s on H100 vs ~5 TB/s for the register-tile Triton class). Outputs match the Triton kernel to ULPs (warp-shuffle reduction order), NOT bits. covered() gates unsupported inputs with fallback to Triton.
+- /tmp/sgl_pkg/sgl/sglang/kernels/ops/attention/kda_fused_decode.py and /tmp/sgl_pkg/sgl/sglang/kernels/jit/csrc/attention/kda_fused_decode.cuh — fully fused KDA decode step: ONE kernel replaces causal_conv1d_update -> kda_packed_decode -> rms_norm_gated; reads the raw pre-conv qkv slice straight from the fused projection GEMM output; conv state shifted in place in the pool; delta-rule recurrence (l2-normed q/k, softplus forget gate, sigmoid beta); sigmoid-gated output RMSNorm; PDL-capable (is_arch_support_pdl). Specialized for K = V = 128, conv width 4, T = 1 per request, head counts H in {12, 6, 3} (K3 TP8/TP16/TP32).
+- JIT mechanics: /tmp/sgl_pkg/sgl/sglang/kernels/jit/utils/ (load_jit, make_cpp_args, cache_once, is_arch_support_pdl) — replicate a minimal equivalent inside your module; do NOT import sglang.
+
+GLM-5.3-Flash deltas vs K3 (what you must add): per-rank TP4 KDA heads H = 16 (q/k/v are each [2048, 4096] per rank, head dim 128); conv width 4; K = V = 128; T = 1 decode.
+
+DELIVERABLES
+1. src/python/vkernels/torch_ops/glm_kda_packed_decode.py — the vendored CUDA packed-decode with an H=16 instantiation added (keep {3,6,12} instantiations if cheap); eligibility check raising OpNotEligible; documented fallback: the incumbent Triton kernel in src/python/vkernels/torch_ops/glm_kda_decode.py (read it — your CUDA kernel must accept the same q/k/v/gate/beta/state ABI so floe can swap it in at one site).
+2. src/python/vkernels/torch_ops/glm_kda_fused_decode.py — the vendored fused conv+delta+norm kernel, H=16. The K3 conv-state pool is transposed [slots, 3, 3*H*128]; the floe/vkernels pool layout is defined by src/python/vkernels/torch_ops/glm_kda_conv_update.py — provide an explicit adapter (layout-transform helper or kernel-side stride handling), do NOT invent a new pool format. The K3 model hands the output-norm gate off as an onorm_g argument; for GLM-5.3 wire the g_a gate analogously as an argument and document the mapping.
+3. CUDA JIT mechanics: nvcc is at /usr/local/cuda-13.0/bin/nvcc (NOT on PATH — add it in your build helper). Local GPU is GB10 sm_121: kernels are sm90-tuned but must compile and be CORRECT locally; H100 perf claims stay unvalidated. Compile lazily on first call and cache the built module under a stable cache dir OUTSIDE the repo tree (e.g. under the user cache dir), mirroring sglang load_jit caching. If local compilation fails, still deliver module + tests with pytest.skip(reason=exact nvcc error).
+4. Provenance docstrings: Apache-2.0, SGLang v0.5.20 wheel, vendored from the NVIDIA x Moonshot Kimi K3 optimization package; preserve the upstream header comments listing integration patches.
+
+PARITY TESTS (tests/python/):
+- packed decode: vs the incumbent Triton glm_kda_decode AND an fp32 torch reference; the donor promises ULP-level (not bit) equality — assert a tight tolerance and document the reduction-order class.
+- fused decode: vs the incumbent 3-kernel chain (glm_kda_conv_update -> glm_kda_decode -> the rms_norm_gated op — find it in vkernels) as a composition, and vs the torch reference; the conv-state and ssm-state pool contents after the call must match the chain exactly (in-place state-roll semantics).
+- eligibility-contract tests, capture-safety tests (static per-bucket shapes, plain current-stream launches, no host syncs, JIT compiled during eager warmup before capture).
+
+---
+
+Task: You are reviving a previous subagent conversation.
+
+Original run: b0134e70-8975-4fa0-b5aa-98bf432352b5
+Original agent: worker
+Original session file: /local/home/xiayao/.pi/agent/sessions/--local-home-xiayao-Documents-code-floe--/2026-09-28T07-16-26-131Z_01a0e6df-4193-74f4-80c8-c67f86ab798d/33d8dbee-43d2-49c4-9b1c-2c665b9110e3/run-0/session.jsonl
+
+Use the stored session context as background. Answer the orchestrator's follow-up below. Do not assume the original child session is still running.
+
+Follow-up:
+You are implementing one lane of a kernel-borrow round (GLM-5.3-Flash serving perf). Work in /local/home/xiayao/Documents/code/vkernels (branch integration/sgl-fuse).
+
+CONTEXT
+- vkernels repo: /local/home/xiayao/Documents/code/vkernels. WARNING: the working tree contains unrelated uncommitted WIP (megakernel compiler refactor, NOTES deletions, C++/Rust edits). NEVER touch, revert, or commit anything outside your assigned files. Do not run git add/commit/stash/checkout/restore.
+- floe repo: /local/home/xiayao/Documents/code/floe (clean, branch main) — READ-ONLY for you; it is the consumer of your kernels.
+- Python: /local/home/xiayao/Documents/code/vkernels/.venv/bin/python (torch 2.14.0+cu130, triton 3.8). Local GPU is a GB10, capability (12,1) = sm_121: use it for CORRECTNESS only; donor perf numbers are H100-class and stay unvalidated until the sgs-gpu07 rig run.
+- House conventions — read these exemplars FIRST and copy their structure: src/python/vkernels/torch_ops/moe_combine.py, src/python/vkernels/torch_ops/glm_kda_conv_update.py, tests/python/test_moe_combine.py, tests/python/test_glm_kda_conv_update.py. Required style: module docstring with provenance + what-it-replaces; lazy torch/triton imports; eligibility validation that raises OpNotEligible (from ._dispatch) instead of pre-gating; a *_reference implementation for tests; parametrized dtype/shape tests including eligibility-contract and CPU-rejects tests.
+- New modules are imported directly as vkernels.torch_ops.<name>; do NOT edit torch_ops/__init__.py, README.md, pyproject.toml, or anything under compiler/, src/c/, src/rust/.
+- floe wiring is OUT OF SCOPE: after all lanes finish, the parent integrates via floe/engine/runner/kernels/vkl_ops.py (read that file to see the adapter pattern and match its expectations for public signatures).
+
+VALIDATION (from /local/home/xiayao/Documents/code/vkernels)
+- /local/home/xiayao/Documents/code/vkernels/.venv/bin/python -m pytest tests/python/<your test files> -q — all green.
+- .venv/bin/python -m ruff check <your files> — clean under the repo gate (select F).
+- Do NOT run the full test suite; the tree has unrelated WIP.
+
+REPORT
+Write /local/home/xiayao/Documents/code/floe/.agents/runs/borrow-round9/<your-key>.md containing: files created/modified; exact public API signatures with dtypes/layouts (the parent wires floe from this); eligibility/fallback contract; parity results with tolerances; open questions. Return a concise summary plus the report path.
+
+STOP/ASK
+If a numerics contract cannot be honored, a dependency is missing, or you would need to edit a file outside your boundary, STOP and use contact_supervisor instead of improvising.
+
+
+LANE borrow9-merged-proj — three merged-projection GEMV ops for the GLM-5.3 decode step (node-cuts steps C, E, F).
+Full spec with code-site line refs and node arithmetic: /local/home/xiayao/Documents/code/floe/.agents/runs/gap-levers/node-cuts.md — read it first; its line refs may have drifted, anchor by function names instead. Your edit boundary: NEW files src/python/vkernels/torch_ops/kda_small_gemv.py and src/python/vkernels/torch_ops/dsa_qkva_stacked.py + their tests, PLUS the existing src/python/vkernels/torch_ops/qkv_projection.py and its test file (find it under tests/python/) which are exclusively yours this lane.
+
+1. qkv_projection envelope fix (step C): _validate in qkv_projection.py hardcodes the unsharded (8192, 4096) weight triple, so the op declines the TP4 per-rank [2048, 4096] triples and the deployed recipe cannot set the knob. Relax to any equal-(O, 4096) triple: the grid already loops 3 projections; make the store offsets 3*O and keep the autotune key per (O, tokens). The existing 8192 path must remain behavior-identical. Extend the tests with the TP4 shape, other equal-(O, K) shapes, and decline cases (mismatched O, non-contiguous).
+
+2. New op kda_small_gemv (step E) in torch_ops/kda_small_gemv.py: ONE launch over the row-concatenated [16+128+128, 4096] bf16 weight stack (b_proj beta | f_a | g_a) sharing a single x read, writing: beta (sigmoid folded AFTER the bf16 round of the dot — the eager contract rounds the dot to bf16 THEN applies sigmoid; pin this in tests), h (f_a output, consumed downstream by the forget-gate op), and g_a. Support general (O_beta, O_fa, O_ga) shapes with the GLM-5.3-TP4 stack as the tuned case. Consumer contracts to read (floe is read-only): the beta / forget-gate / g_a sites in floe/engine/runner/models/glm53flash/forward.py (search for the KDA projection sites; node-cuts.md lists them), and src/python/vkernels/torch_ops/glm_forget_gate.py (f_a is currently a dense_gemv call inside it — your op replaces that launch plus the b and g_a GEMVs). Provide kda_small_gemv_reference.
+
+3. New op for step F in torch_ops/dsa_qkva_stacked.py: stacked fp8 GEMV over a [1536+512=2048, 4096] fp8e4m3 weight with its [16, 32] block-scale grid for DSA layers (q_a 1536 rows | kv_a 512 rows; both projections replicate under TP; 1536 and 512 are 128-multiples so the block-scale concatenation is exact). The caller slices the [1536 | 512] output. Contract: BIT-identical to running the two per-matrix fp8 GEMVs separately (same rows, same reduction order, concatenated storage only). Study the incumbent dense fp8 GEMV (src/python/vkernels/torch_ops/glm_dense_fp8_gemv.py or wherever dense_gemv_fp8 lives) and reuse its reduction order. Eligibility: contiguity, fp8 dtype, scale shapes.
+
+Numerics classes per the spec — tests must pin exactly these: C is the adopted perf-only class (fp32-accum GEMV, one bf16 round, different reduction order than the per-matrix GEMVs); E has per-slice dots identical to dense_gemv plus the sigmoid-rounding pin; F is bit-identical.
+
+---
+
+Task: You are reviving a previous subagent conversation.
+
+Original run: 86e4b73f-852c-4661-b831-cdeeb55aef9e
+Original agent: worker
+Original session file: /local/home/xiayao/.pi/agent/sessions/--local-home-xiayao-Documents-code-floe--/2026-09-28T07-16-26-131Z_01a0e6df-4193-74f4-80c8-c67f86ab798d/034fd0ac-a0d4-4fdd-bdb2-4359c1271184/run-0/session.jsonl
+
+Use the stored session context as background. Answer the orchestrator's follow-up below. Do not assume the original child session is still running.
+
+Follow-up:
+You are implementing one lane of a kernel-borrow round (GLM-5.3-Flash serving perf). Work in /local/home/xiayao/Documents/code/vkernels (branch integration/sgl-fuse).
+
+CONTEXT
+- vkernels repo: /local/home/xiayao/Documents/code/vkernels. WARNING: the working tree contains unrelated uncommitted WIP (megakernel compiler refactor, NOTES deletions, C++/Rust edits). NEVER touch, revert, or commit anything outside your assigned files. Do not run git add/commit/stash/checkout/restore.
+- floe repo: /local/home/xiayao/Documents/code/floe (clean, branch main) — READ-ONLY for you; it is the consumer of your kernels.
+- Python: /local/home/xiayao/Documents/code/vkernels/.venv/bin/python (torch 2.14.0+cu130, triton 3.8). Local GPU is a GB10, capability (12,1) = sm_121: use it for CORRECTNESS only; donor perf numbers are H100-class and stay unvalidated until the sgs-gpu07 rig run.
+- House conventions — read these exemplars FIRST and copy their structure: src/python/vkernels/torch_ops/moe_combine.py, src/python/vkernels/torch_ops/glm_kda_conv_update.py, tests/python/test_moe_combine.py, tests/python/test_glm_kda_conv_update.py. Required style: module docstring with provenance + what-it-replaces; lazy torch/triton imports; eligibility validation that raises OpNotEligible (from ._dispatch) instead of pre-gating; a *_reference implementation for tests; parametrized dtype/shape tests including eligibility-contract and CPU-rejects tests.
+- New modules are imported directly as vkernels.torch_ops.<name>; do NOT edit torch_ops/__init__.py, README.md, pyproject.toml, or anything under compiler/, src/c/, src/rust/.
+- floe wiring is OUT OF SCOPE: after all lanes finish, the parent integrates via floe/engine/runner/kernels/vkl_ops.py (read that file to see the adapter pattern and match its expectations for public signatures).
+
+VALIDATION (from /local/home/xiayao/Documents/code/vkernels)
+- /local/home/xiayao/Documents/code/vkernels/.venv/bin/python -m pytest tests/python/<your test files> -q — all green.
+- .venv/bin/python -m ruff check <your files> — clean under the repo gate (select F).
+- Do NOT run the full test suite; the tree has unrelated WIP.
+
+REPORT
+Write /local/home/xiayao/Documents/code/floe/.agents/runs/borrow-round9/<your-key>.md containing: files created/modified; exact public API signatures with dtypes/layouts (the parent wires floe from this); eligibility/fallback contract; parity results with tolerances; open questions. Return a concise summary plus the report path.
+
+STOP/ASK
+If a numerics contract cannot be honored, a dependency is missing, or you would need to edit a file outside your boundary, STOP and use contact_supervisor instead of improvising.
+
+
+LANE borrow9-kda-cuda — vendor the two Kimi-K3 KDA decode CUDA kernels from the SGLang v0.5.20 wheel into vkernels as new torch_ops modules, with GLM-5.3-Flash TP4 support.
+
+Donor sources (all local; read every one first):
+- /tmp/sgl_pkg/sgl/sglang/kernels/ops/attention/kda_packed_decode.py and /tmp/sgl_pkg/sgl/sglang/kernels/jit/csrc/attention/kda_packed_decode.cuh — row-streaming CUDA port of the triton fused_recurrent packed decode; keeps a [BV, K] fp32 state tile out of registers and streams the state one 512B row at a time, reaching the in-place state read+write bandwidth of the part (~9.6 TB/s on H100 vs ~5 TB/s for the register-tile Triton class). Outputs match the Triton kernel to ULPs (warp-shuffle reduction order), NOT bits. covered() gates unsupported inputs with fallback to Triton.
+- /tmp/sgl_pkg/sgl/sglang/kernels/ops/attention/kda_fused_decode.py and /tmp/sgl_pkg/sgl/sglang/kernels/jit/csrc/attention/kda_fused_decode.cuh — fully fused KDA decode step: ONE kernel replaces causal_conv1d_update -> kda_packed_decode -> rms_norm_gated; reads the raw pre-conv qkv slice straight from the fused projection GEMM output; conv state shifted in place in the pool; delta-rule recurrence (l2-normed q/k, softplus forget gate, sigmoid beta); sigmoid-gated output RMSNorm; PDL-capable (is_arch_support_pdl). Specialized for K = V = 128, conv width 4, T = 1 per request, head counts H in {12, 6, 3} (K3 TP8/TP16/TP32).
+- JIT mechanics: /tmp/sgl_pkg/sgl/sglang/kernels/jit/utils/ (load_jit, make_cpp_args, cache_once, is_arch_support_pdl) — replicate a minimal equivalent inside your module; do NOT import sglang.
+
+GLM-5.3-Flash deltas vs K3 (what you must add): per-rank TP4 KDA heads H = 16 (q/k/v are each [2048, 4096] per rank, head dim 128); conv width 4; K = V = 128; T = 1 decode.
+
+DELIVERABLES
+1. src/python/vkernels/torch_ops/glm_kda_packed_decode.py — the vendored CUDA packed-decode with an H=16 instantiation added (keep {3,6,12} instantiations if cheap); eligibility check raising OpNotEligible; documented fallback: the incumbent Triton kernel in src/python/vkernels/torch_ops/glm_kda_decode.py (read it — your CUDA kernel must accept the same q/k/v/gate/beta/state ABI so floe can swap it in at one site).
+2. src/python/vkernels/torch_ops/glm_kda_fused_decode.py — the vendored fused conv+delta+norm kernel, H=16. The K3 conv-state pool is transposed [slots, 3, 3*H*128]; the floe/vkernels pool layout is defined by src/python/vkernels/torch_ops/glm_kda_conv_update.py — provide an explicit adapter (layout-transform helper or kernel-side stride handling), do NOT invent a new pool format. The K3 model hands the output-norm gate off as an onorm_g argument; for GLM-5.3 wire the g_a gate analogously as an argument and document the mapping.
+3. CUDA JIT mechanics: nvcc is at /usr/local/cuda-13.0/bin/nvcc (NOT on PATH — add it in your build helper). Local GPU is GB10 sm_121: kernels are sm90-tuned but must compile and be CORRECT locally; H100 perf claims stay unvalidated. Compile lazily on first call and cache the built module under a stable cache dir OUTSIDE the repo tree (e.g. under the user cache dir), mirroring sglang load_jit caching. If local compilation fails, still deliver module + tests with pytest.skip(reason=exact nvcc error).
+4. Provenance docstrings: Apache-2.0, SGLang v0.5.20 wheel, vendored from the NVIDIA x Moonshot Kimi K3 optimization package; preserve the upstream header comments listing integration patches.
+
+PARITY TESTS (tests/python/):
+- packed decode: vs the incumbent Triton glm_kda_decode AND an fp32 torch reference; the donor promises ULP-level (not bit) equality — assert a tight tolerance and document the reduction-order class.
+- fused decode: vs the incumbent 3-kernel chain (glm_kda_conv_update -> glm_kda_decode -> the rms_norm_gated op — find it in vkernels) as a composition, and vs the torch reference; the conv-state and ssm-state pool contents after the call must match the chain exactly (in-place state-roll semantics).
+- eligibility-contract tests, capture-safety tests (static per-bucket shapes, plain current-stream launches, no host syncs, JIT compiled during eager warmup before capture).
+
+---
+
+Task: You are reviving a previous subagent conversation.
+
+Original run: fd723d9b-b639-4c99-ab9e-850892e0a7a6
+Original agent: worker
+Original session file: /local/home/xiayao/.pi/agent/sessions/--local-home-xiayao-Documents-code-floe--/2026-09-28T07-16-26-131Z_01a0e6df-4193-74f4-80c8-c67f86ab798d/15354355-eb66-459a-8f9b-622d84d08ffb/run-0/session.jsonl
+
+Use the stored session context as background. Answer the orchestrator's follow-up below. Do not assume the original child session is still running.
+
+Follow-up:
+You are implementing one lane of a kernel-borrow round (GLM-5.3-Flash serving perf). Work in /local/home/xiayao/Documents/code/vkernels (branch integration/sgl-fuse).
+
+CONTEXT
+- vkernels repo: /local/home/xiayao/Documents/code/vkernels. WARNING: the working tree contains unrelated uncommitted WIP (megakernel compiler refactor, NOTES deletions, C++/Rust edits). NEVER touch, revert, or commit anything outside your assigned files. Do not run git add/commit/stash/checkout/restore.
+- floe repo: /local/home/xiayao/Documents/code/floe (clean, branch main) — READ-ONLY for you; it is the consumer of your kernels.
+- Python: /local/home/xiayao/Documents/code/vkernels/.venv/bin/python (torch 2.14.0+cu130, triton 3.8). Local GPU is a GB10, capability (12,1) = sm_121: use it for CORRECTNESS only; donor perf numbers are H100-class and stay unvalidated until the sgs-gpu07 rig run.
+- House conventions — read these exemplars FIRST and copy their structure: src/python/vkernels/torch_ops/moe_combine.py, src/python/vkernels/torch_ops/glm_kda_conv_update.py, tests/python/test_moe_combine.py, tests/python/test_glm_kda_conv_update.py. Required style: module docstring with provenance + what-it-replaces; lazy torch/triton imports; eligibility validation that raises OpNotEligible (from ._dispatch) instead of pre-gating; a *_reference implementation for tests; parametrized dtype/shape tests including eligibility-contract and CPU-rejects tests.
+- New modules are imported directly as vkernels.torch_ops.<name>; do NOT edit torch_ops/__init__.py, README.md, pyproject.toml, or anything under compiler/, src/c/, src/rust/.
+- floe wiring is OUT OF SCOPE: after all lanes finish, the parent integrates via floe/engine/runner/kernels/vkl_ops.py (read that file to see the adapter pattern and match its expectations for public signatures).
+
+VALIDATION (from /local/home/xiayao/Documents/code/vkernels)
+- /local/home/xiayao/Documents/code/vkernels/.venv/bin/python -m pytest tests/python/<your test files> -q — all green.
+- .venv/bin/python -m ruff check <your files> — clean under the repo gate (select F).
+- Do NOT run the full test suite; the tree has unrelated WIP.
+
+REPORT
+Write /local/home/xiayao/Documents/code/floe/.agents/runs/borrow-round9/<your-key>.md containing: files created/modified; exact public API signatures with dtypes/layouts (the parent wires floe from this); eligibility/fallback contract; parity results with tolerances; open questions. Return a concise summary plus the report path.
+
+STOP/ASK
+If a numerics contract cannot be honored, a dependency is missing, or you would need to edit a file outside your boundary, STOP and use contact_supervisor instead of improvising.
+
+
+LANE borrow9-kpool — vendor SGLang v0.5.20 pool-aware DSA (sparse attention) kpool metadata Triton kernels into vkernels, adapted to floe indexer/pool contracts.
+
+Donor sources (local): /tmp/sgl_pkg/sgl/sglang/kernels/ops/attention/dsa_kpool_metadata/ — __init__.py, decode.py (fused DSA decode metadata kernel: seq_lens, req_pool_indices, req_to_token, cache_seqlens, cu_seqlens_k, page_table, dsa_cache_seqlens, dsa_cu_seqlens_k, real_page_table; do_not_specialize on strides/lengths), scan.py (bounded_scan_num_splits), verify.py, draft_extend.py. Resolve their import closure (they may pull sglang.srt.utils, index_buf_accessor, fused_metadata_copy) and vendor only what the kernels need — strip engine machinery exactly the way src/python/vkernels/torch_ops/vllm_sparse_mla.py did (read its CUT LIST header for the house pattern).
+
+Existing vkernels kpool surface to align names/contracts with (read first): src/python/vkernels/dsa_kpool_device.py, src/c/vkernels/kernels/dsa.hip (HIP twins: dsa_topk_logits, dsa_topk_transform, dsa_kpool ops), tests/python/test_dsa_kpool_device.py.
+
+floe consumer contracts (read-only): floe/engine/runner/models/glm53flash/forward.py — Glm53Indexer emits int32 [B, S_q, W] top-k token ids with -1 masking; pools carry req_to_token / page_table / cu_seqlens / cache_seqlens (search the DSA/indexer region; anchor by the Glm53Indexer class and the sparse-attention sites).
+
+DELIVERABLES
+1. New torch_ops module (suggest src/python/vkernels/torch_ops/dsa_kpool_metadata.py, or a small set): the fused decode metadata kernel + bounded scan; include verify.py only if it stands alone without MTP machinery; SKIP draft_extend if it needs MTP machinery — document every skip.
+2. Adapter layer: public wrapper(s) taking floe-shaped tensors directly; document any re-stride/re-dtype the caller must know about (keep it minimal — the parent wires floe from your report).
+3. Optional, network permitting: fetch vLLM kpool_compress.py (raw.githubusercontent.com, vllm-project/vllm main branch, path vllm/models/glm5next/amd/ops/kpool_compress.py from PR #53906) and vendor it as a reference-semantics module (Apache-2.0 header preserved). If no network, note it as a follow-up in your report and continue with the SGLang set.
+4. Tests: parity vs an eager torch metadata computation over small randomized pools (compare cu_seqlens_k, num_splits, real_page_table, dsa_cache_seqlens, dsa_cu_seqlens_k), eligibility contracts, capture safety (the do_not_specialize stride/length handling must survive CUDA graph capture with static shapes, no host syncs).
