@@ -533,39 +533,9 @@ OP_MLA_VALUES = "mla_values"
 # rope -> conjugate_rope round-trips to identity.
 OP_CONJUGATE_ROPE = "conjugate_rope"
 
-ARITHMETIC_OP_KINDS = (
-    OP_EMBEDDING,
-    OP_LAYER_NORM,
-    OP_RMS_NORM,
-    OP_RMS_NORM_GATED,
-    OP_ROPE,
-    OP_LINEAR,
-    OP_LINEAR_FP8,
-    OP_INDEXER_SCORES,
-    OP_INDEX_TOPK,
-    OP_GELU,
-    OP_SWIGLU,
-    OP_ADD,
-    OP_CACHE_APPEND,
-    OP_GDN_CONV,
-    OP_GDN_DELTA,
-    OP_KDA_DELTA,
-    OP_COMPRESSOR_APPEND,
-    OP_CACHE_APPEND_PAGED,
-    OP_MHC_PRE,
-    OP_MHC_POST,
-    OP_ATTENTION_SCORES,
-    OP_ATTENTION_SCORES_PAGED,
-    OP_SOFTMAX,
-    OP_ATTENTION_VALUES,
-    OP_ATTENTION_VALUES_PAGED,
-    OP_MOE_ROUTE,
-    OP_MOE_EXPERT,
-    OP_MOE_COMBINE,
-    OP_MLA_SCORES,
-    OP_MLA_VALUES,
-    OP_CONJUGATE_ROPE,
-)
+from .contracts import CONTRACTS
+
+ARITHMETIC_OP_KINDS = tuple(CONTRACTS)
 
 
 @dataclass(frozen=True)

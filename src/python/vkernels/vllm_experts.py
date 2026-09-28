@@ -59,10 +59,8 @@ __all__ = [
 ]
 
 import ctypes
-import glob
 import importlib
 import os
-from pathlib import Path
 
 import numpy as np
 
@@ -382,57 +380,9 @@ _lib_cache: dict = {}
 
 
 def find_libvkernels_hip():
-    """Locate ``libvkernels_hip.so`` (the gfx942 HIP C ABI library).
-
-    Resolution order:
-
-    1. ``$VKERNELS_LIB`` — explicit path (highest precedence).
-    2. ``$K3/home/pylib/libvkernels_hip.so`` — the per-model image layout.
-    3. ``$VKERNELS_DIR/build/.../libvkernels_hip.so`` — a dev checkout;
-       defaults to this repository's root (so a freshly built
-       ``build/<preset>/.../libvkernels_hip.so`` is found automatically).
-    4. ``$LD_LIBRARY_PATH`` via :func:`ctypes.util.find_library` — a
-       system-installed copy.
-    5. ``None`` — :func:`load_libvkernels_hip` raises with guidance.
-    """
-    env_path = os.environ.get("VKERNELS_LIB")
-    if env_path and os.path.exists(env_path):
-        return env_path
-
-    k3 = os.environ.get("K3", "")
-    if k3:
-        k3_path = os.path.join(k3, "home/pylib/libvkernels_hip.so")
-        if os.path.exists(k3_path):
-            return k3_path
-
-    vdir = os.environ.get("VKERNELS_DIR")
-    if not vdir:
-        # Default to this repository's root so a dev build is found without
-        # an env var (matches src/python/vkernels/_backend.py).
-        here = Path(__file__).resolve()
-        for cand in (here, *here.parents):
-            if (cand / "src" / "c" / "vkernels").is_dir():
-                vdir = str(cand)
-                break
-    if vdir:
-        cands = sorted(
-            glob.glob(os.path.join(vdir, "build", "**", "libvkernels_hip.so"),
-                      recursive=True)
-        )
-        if cands:
-            # Newest build wins.
-            return max(cands, key=lambda p: os.path.getmtime(p))
-
-    try:
-        from ctypes.util import find_library
-
-        found = find_library("vkernels_hip")
-        if found:
-            return found
-    except Exception:  # noqa: S110, BLE001 - find_library unavailable; fall through
-        pass
-
-    return None
+    """Resolve an installed library or an explicit development build."""
+    from .native_runtime import find_library
+    return find_library(("libvkernels_hip.so",))
 
 
 def load_libvkernels_hip():

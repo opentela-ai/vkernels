@@ -40,7 +40,7 @@ def test_contract(torch):
         qkv_projection(x, w, w, w)
     with pytest.raises(TypeError, match="BF16"):
         qkv_projection_reference(x.float(), w, w, w)
-    with pytest.raises(ValueError, match="one or two"):
+    with pytest.raises(ValueError, match="one to 8"):
         qkv_projection_reference(x.expand(3, -1), w, w, w)
     with pytest.raises(ValueError, match="contiguous"):
         qkv_projection_reference(x, w, w.T.contiguous().T, w)
@@ -121,3 +121,64 @@ def test_gpu_device_guard(torch):
         assert torch.cuda.current_device() == 0
         torch.testing.assert_close(result, torch.ones_like(result), rtol=0, atol=0)
     assert torch.cuda.current_device() == original
+
+
+# ---------------------------------------------------------------------------
+# envelope generalization: any equal-(O, I) triple (node-cuts step C)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("o,i", [(2048, 4096), (1024, 2048), (24, 8192), (8192, 4096)])
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8])
+def test_gpu_envelope_shapes(torch, o, i, tokens):
+    """TP4 per-rank triples and beyond: same op, wider token policy."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires GPU")
+    pytest.importorskip("triton")
+    from vkernels.torch_ops.qkv_projection import qkv_projection, qkv_projection_reference
+
+    torch.manual_seed(o + i + tokens)
+    x = torch.randn((tokens, i), device="cuda", dtype=torch.bfloat16)
+    weights = [torch.randn((o, i), device="cuda", dtype=torch.bfloat16) / 64 for _ in range(3)]
+    out = qkv_projection(x, *weights)
+    assert out.shape == (tokens, 3 * o)
+    ref = qkv_projection_reference(x, *weights)
+    torch.testing.assert_close(out, ref, rtol=0.008, atol=0.008)
+    # projection order: scale each weight, recompute, check the third moves
+    weights[2] *= 2
+    out2 = qkv_projection(x, *weights)
+    assert torch.equal(out2[:, : 2 * o], out[:, : 2 * o])
+    assert not torch.equal(out2[:, 2 * o :], out[:, 2 * o :])
+
+
+def test_envelope_contract_rejects(torch):
+    from vkernels.torch_ops.qkv_projection import qkv_projection_reference
+
+    x = torch.ones((1, 4096), dtype=torch.bfloat16)
+    w = torch.ones((2048, 4096), dtype=torch.bfloat16)
+    # unequal shapes among the three
+    with pytest.raises(ValueError, match="equal-shape"):
+        qkv_projection_reference(x, w, w, w[:1024])
+    # weight width != x width (three equal weights, wrong width)
+    wn = torch.ones((2048, 2048), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="matching weights"):
+        qkv_projection_reference(x, wn, wn, wn)
+    # non-power-of-two width (tl.arange constraint)
+    wn = torch.ones((2048, 4095), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="power-of-two"):
+        qkv_projection_reference(torch.ones((1, 4095), dtype=torch.bfloat16), wn, wn, wn)
+    # beyond the m<=8 token policy
+    with pytest.raises(ValueError, match="one to 8"):
+        qkv_projection_reference(torch.ones((16, 4096), dtype=torch.bfloat16), w, w, w)
+
+
+def test_gpu_tune_sweeps_both_envelopes(torch):
+    if not torch.cuda.is_available():
+        pytest.skip("requires GPU")
+    pytest.importorskip("triton")
+    from vkernels.torch_ops.qkv_projection import qkv_projection_tune
+
+    swept = qkv_projection_tune(device="cuda")
+    assert (torch.cuda.current_device(), 1, 2048) in swept
+    assert (torch.cuda.current_device(), 8, 8192) in swept
+    assert len(swept) == 8  # 4 token counts x 2 envelopes

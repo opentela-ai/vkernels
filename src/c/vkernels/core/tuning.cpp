@@ -37,6 +37,9 @@
 // must compile on pre-C++17-filesystem host toolchains (SLES gcc 7 on CSCS
 // beverin/clariden). Only the three operations below are needed.
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -156,7 +159,7 @@ std::string render_body(const std::string& arch, int cu_count,
                         const std::string& written_by,
                         const std::vector<Entry>& entries) {
   std::ostringstream out;
-  out << "# vk-native-tuning/1\n";
+  out << "# vk-native-tuning/2\n";
   out << "# arch=" << arch;
   if (cu_count > 0) out << " cu_count=" << cu_count;
   if (!written_by.empty()) out << " written_by=" << written_by;
@@ -182,12 +185,14 @@ void warm_locked(const std::string& dir) {
   while (const dirent* de = readdir(d)) {
     const std::string name = de->d_name;
     const auto dot = name.find('.');
-    if (dot == std::string::npos || name.rfind(".tune") == std::string::npos)
+    if (dot == std::string::npos || name.size() < 5 ||
+        name.compare(name.size() - 5, 5, ".tune") != 0)
       continue;
     std::ifstream in(dir + "/" + name);
     if (!in) continue;
     std::ostringstream body;
     body << in.rdbuf();
+    if (body.str().rfind("# vk-native-tuning/2", 0) != 0) continue;
     g_stores[name.substr(0, dot)][file_arch(name, body.str())] =
         [&] {  // LCOV_EXCL_LINE (gcov cannot attribute the lambda-entry counter)
           std::vector<std::shared_ptr<const Entry>> owned;
@@ -217,12 +222,10 @@ bool enabled() {
 std::string device_arch() {
   // Test/inspection seam: pin the arch token without a GPU. The pin wins
   // whenever it is set (re-read per call, so tests can toggle it); the
-  // device query runs once, on the first override-free call, and is
-  // cached from then on.
+  // device query follows the calling thread's current execution device.
   const char* env = std::getenv("VKERNELS_TUNING_ARCH");
   if (env != nullptr && *env != '\0') return env;
-  static const std::string queried = query_arch();
-  return queried;
+  return query_arch();
 }
 
 std::vector<Entry> parse_body(const std::string& text) {
@@ -284,11 +287,7 @@ std::shared_ptr<const Entry> find(const std::string& kernel,
   const auto& arches = kernel_it->second;
   const std::string& arch = device_arch();
   auto arch_it = arches.find(arch);
-  if (arch_it == arches.end()) {
-    // Single-machine convenience: one file, no arch match -> use it.
-    if (arches.size() != 1) return nullptr;
-    arch_it = arches.begin();
-  }
+  if (arch_it == arches.end()) return nullptr;
   for (const auto& entry : arch_it->second)
     if (entry->key == key) return entry;
   return nullptr;
@@ -301,15 +300,21 @@ void persist(const std::string& kernel, const std::vector<long long>& key,
   const std::string dir = store_dir();
   mkdir_p(dir);
 
-  // Read-modify-write: keep every record the file already carries.
+  std::lock_guard<std::mutex> lock(g_mutex);
+  // Lock the complete disk transaction across processes as well as threads.
   std::vector<Entry> entries;
   const std::string path = dir + "/" + kernel + "." + device_arch() + ".tune";
+  struct FileLock {
+    int fd;
+    ~FileLock() { if (fd >= 0) { flock(fd, LOCK_UN); close(fd); } }
+  } file_lock{open((path + ".lock").c_str(), O_CREAT | O_RDWR, 0600)};
+  if (file_lock.fd < 0 || flock(file_lock.fd, LOCK_EX) != 0) return;
   {
     std::ifstream in(path);
     if (in) {
       std::ostringstream body;
       body << in.rdbuf();
-      entries = parse_body(body.str());
+      if (body.str().rfind("# vk-native-tuning/2", 0) == 0) entries = parse_body(body.str());
     }
   }
   const auto same_key = [&](const Entry& e) { return e.key == key; };
@@ -319,7 +324,10 @@ void persist(const std::string& kernel, const std::vector<long long>& key,
 
   // Write via tmp + rename so a concurrent process's lazy warm() never
   // sees a torn file (the doc's atomicity claim, now actually true).
-  const std::string tmp = path + ".tmp";
+  std::string tmp = path + ".XXXXXX";
+  const int fd = mkstemp(tmp.data());
+  if (fd < 0) return;
+  close(fd);
   {
     std::ofstream out(tmp, std::ios::trunc);
     out << render_body(device_arch(), query_cu_count(), written_by, entries);
@@ -329,12 +337,14 @@ void persist(const std::string& kernel, const std::vector<long long>& key,
       return;
     }
   }
-  std::rename(tmp.c_str(), path.c_str());
+  if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    std::remove(tmp.c_str());
+    return;
+  }
 
   // Refresh this process's view (a bench that tunes then re-queries the
   // selector in the same process must see its own winner, and a find()
   // before the first persist must not have cached an empty store).
-  std::lock_guard<std::mutex> lock(g_mutex);
   warm_locked(store_dir());
 }
 

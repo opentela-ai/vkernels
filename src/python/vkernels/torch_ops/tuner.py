@@ -37,7 +37,7 @@ from pathlib import Path
 
 from .tuning_cache import TuningCacheError, default_store_dir, device_fingerprint
 
-NATIVE_SCHEMA = "vk-native-tuning/1"
+NATIVE_SCHEMA = "vk-native-tuning/2"
 
 
 def native_arch() -> str:
@@ -131,8 +131,8 @@ class NativeStore:
     """Read/write one native kernel's ``.tune`` sidecars.
 
     Same file contract as ``core/tuning.hpp``: the arch-matching file is
-    authoritative; a single foreign-arch file is honored (one-machine
-    rule); multiple foreign files are ambiguous and read as empty.
+    authoritative; foreign architectures and older configuration versions
+    are cache misses.
     Writes are atomic (temp file + ``os.replace``) and keep every record
     the file already carries.
     """
@@ -159,10 +159,12 @@ class NativeStore:
         """The authoritative sidecar for this arch (see the class docstring)."""
         archs = {}
         for name, path in self._files().items():
-            archs[parse_tune_arch(path.read_text(errors="replace"), name)] = path
+            text = path.read_text(errors="replace")
+            if text.startswith(f"# {NATIVE_SCHEMA}\n"):
+                archs[parse_tune_arch(text, name)] = path
         if self.arch and self.arch in archs:
             return archs[self.arch]
-        return next(iter(archs.values())) if len(archs) == 1 else None
+        return None
 
     # -- records -------------------------------------------------------------
 
@@ -180,31 +182,34 @@ class NativeStore:
                 "(set VKERNELS_TUNING_ARCH or run on a GPU host)")
         self.store_dir.mkdir(parents=True, exist_ok=True)
         path = self.store_dir / f"{self.kernel_name}.{_safe_arch(self.arch)}.tune"
-        records = parse_tune_body(path.read_text(errors="replace")) if path.exists() else {}
-        records[tuple(int(k) for k in key)] = {str(n): int(v) for n, v in params.items()}
+        from .store_lock import store_lock
+        with store_lock(path):
+            text = path.read_text(errors="replace") if path.exists() else ""
+            records = parse_tune_body(text) if text.startswith(f"# {NATIVE_SCHEMA}\n") else {}
+            records[tuple(int(k) for k in key)] = {str(n): int(v) for n, v in params.items()}
 
-        try:
-            cu_count = device_fingerprint()["cu_count"]
-        except Exception:
-            cu_count = 0
-        header = f"# {NATIVE_SCHEMA}\n# arch={self.arch}"
-        if cu_count > 0:
-            header += f" cu_count={cu_count}"
-        header += f" written_by={written_by}\n"
-        body = [header]
-        for key_tuple, params_map in records.items():
-            body.append("key=" + ",".join(str(v) for v in key_tuple))
-            body.extend(f"{name}={value}" for name, value in params_map.items())
+            try:
+                cu_count = device_fingerprint()["cu_count"]
+            except Exception:
+                cu_count = 0
+            header = f"# {NATIVE_SCHEMA}\n# arch={self.arch}"
+            if cu_count > 0:
+                header += f" cu_count={cu_count}"
+            header += f" written_by={written_by}\n"
+            body = [header]
+            for key_tuple, params_map in records.items():
+                body.append("key=" + ",".join(str(v) for v in key_tuple))
+                body.extend(f"{name}={value}" for name, value in params_map.items())
 
-        fd, tmp = tempfile.mkstemp(dir=self.store_dir, prefix=path.name, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as out:
-                out.write("\n".join(body) + "\n")
-            os.replace(tmp, path)
-        except BaseException:
-            os.unlink(tmp)
-            raise
-        return dict(records[tuple(int(k) for k in key)])
+            fd, tmp = tempfile.mkstemp(dir=self.store_dir, prefix=path.name, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as out:
+                    out.write("\n".join(body) + "\n")
+                os.replace(tmp, path)
+            except BaseException:
+                os.unlink(tmp)
+                raise
+            return dict(records[tuple(int(k) for k in key)])
 
     def clear(self) -> bool:
         """Remove every sidecar of this kernel. True when one was removed."""
@@ -323,13 +328,12 @@ def repo_root() -> Path:
 
 
 def find_bench_binary(name: str) -> Path | None:
-    """A built bench executable under ``build/*/meta/benchmarks/``, newest first."""
-    candidates = [
-        p
-        for p in (repo_root() / "build").glob(f"*/meta/benchmarks/{name}")
-        if p.is_file() and os.access(p, os.X_OK)
-    ]
-    return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
+    """Resolve a benchmark in the explicitly selected build directory."""
+    build = os.environ.get("VKERNELS_BUILD_DIR")
+    if not build:
+        return None
+    path = Path(build) / "meta" / "benchmarks" / name
+    return path if path.is_file() and os.access(path, os.X_OK) else None
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +355,8 @@ def _toolkit_mismatch(toolkit: str) -> str | None:
     try:
         import torch
 
+        if not torch.cuda.is_available():
+            return f"{toolkit} device unavailable"
         is_hip = bool(torch.version.hip)
     except Exception:
         return f"{toolkit} toolkit unavailable (no torch)"

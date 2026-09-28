@@ -299,8 +299,8 @@ class FindLibTest(unittest.TestCase):
             # Falls through to K3 / VKERNELS_DIR / LD_LIBRARY_PATH; on CI
             # none of those have it, so the result is None (or a real
             # build if present — accept both, just not the bogus path).
-            got = find_libvkernels_hip()
-            self.assertNotEqual(got, os.environ["VKERNELS_LIB"])
+            with self.assertRaises(FileNotFoundError):
+                find_libvkernels_hip()
         finally:
             if old is None:
                 os.environ.pop("VKERNELS_LIB", None)

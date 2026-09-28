@@ -14,7 +14,6 @@ __global__ void gemm_kernel(const float* A, const float* B, float* C, int M,
                             int N, int K, float alpha, float beta) {
   int row = blockIdx.y * blockDim.y + threadIdx.y;
   int col = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= M || col >= N) return;
 
   __shared__ float sA[kTile][kTile];
   __shared__ float sB[kTile][kTile];
@@ -30,7 +29,8 @@ __global__ void gemm_kernel(const float* A, const float* B, float* C, int M,
     for (int k = 0; k < kTile; ++k) acc += sA[threadIdx.y][k] * sB[k][threadIdx.x];
     __syncthreads();
   }
-  C[row * N + col] = alpha * acc + beta * C[row * N + col];
+  if (row < M && col < N)
+    C[row * N + col] = alpha * acc + (beta == 0.0f ? 0.0f : beta * C[row * N + col]);
 }
 
 // The CUDA launcher lives in `cuda::` (like elementwise.cu) so the host
@@ -44,6 +44,7 @@ void gemm(std::size_t M, std::size_t N, std::size_t K, float alpha,
   VK_EXPECTS(B.size() == K * N, "B must be K*N");
   VK_EXPECTS(C.size() == M * N, "C must be M*N");
 
+  if (M == 0 || N == 0) return;
   dim3 block(kTile, kTile);
   dim3 grid(static_cast<int>((N + kTile - 1) / kTile), static_cast<int>((M + kTile - 1) / kTile));
   gemm_kernel<<<grid, block>>>(A.data(), B.data(), C.data(),

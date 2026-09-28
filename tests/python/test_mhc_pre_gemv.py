@@ -31,7 +31,10 @@ def test_import_is_lazy():
 
 @pytest.fixture
 def torch():
-    return pytest.importorskip("torch")
+    module = pytest.importorskip("torch")
+    if not module.cuda.is_available():
+        pytest.skip("requires a GPU")
+    return module
 
 
 # Rig-realistic envelope: hc=4, hidden 4096 (fn [24, 16384]); decode graph

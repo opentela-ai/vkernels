@@ -469,7 +469,7 @@ def test_strict_mode_refuses_device_execution(compiled_default):
     assert GRID_SYNC_BACKEND_VERIFIED is False
     with pytest.raises(CapabilityError) as ei:
         compiled_default.run(np.array([0]), KVCache(GPT2Config()), 0, mode="device")
-    assert "Milestone 0" in str(ei.value) or "Milestone-0" in str(ei.value)
+    assert "prepare_device" in str(ei.value)
 
 
 def test_compilation_report_contents(compiled_default):

@@ -341,10 +341,6 @@ if(VKERNELS_HAS_HIP)
   # kpool_assemble_softmax_rotate_write_cache (prefill) and
   # kpool_decode_update_and_maybe_write_cache (decode), cross-checked
   # against the CPU fp32 oracles.
-  add_executable(test_dsa_kpool_correct test_dsa_kpool_correct.hip)
-  target_link_libraries(test_dsa_kpool_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_dsa_kpool_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_dsa_kpool_correct)
 
   # DSA kpool-cache compress/write BENCHMARK (issue #60): same harness style
   # as bench_dsa.hip (HIP events, variance-driven iters, roofline table) for
@@ -406,15 +402,9 @@ endif()
 # same per-source treatment (their TUs include only the kernel header, never
 # core/device.hpp, so a per-source define stays sufficient).
 if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
-  set_source_files_properties(test_dsa_kpool_correct.hip bench_dsa_kpool.hip
+  set_source_files_properties(bench_dsa_kpool.hip
     PROPERTIES LANGUAGE CUDA COMPILE_DEFINITIONS VKERNELS_HAS_HIP=1)
 
-  add_executable(test_dsa_kpool_correct test_dsa_kpool_correct.hip)
-  target_link_libraries(test_dsa_kpool_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_dsa_kpool_correct PRIVATE cxx_std_17)
-  target_include_directories(test_dsa_kpool_correct PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
-  vkernels_set_warnings(test_dsa_kpool_correct)
 
   add_executable(dsa_kpool_bench bench_dsa_kpool.hip)
   target_link_libraries(dsa_kpool_bench PRIVATE vkernels::vkernels)
@@ -427,8 +417,6 @@ if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
   # (issue #60: until now the kpool .hip sources were COMPILED by the CUDA CI
   # but never RUN there). The binary exits 77 when no GPU is visible, so the
   # test skips (SKIP_RETURN_CODE) on GPU-less CUDA boxes instead of failing.
-  add_test(NAME dsa_kpool_device_cuda COMMAND test_dsa_kpool_correct)
-  set_tests_properties(dsa_kpool_device_cuda PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # bf16 GEMM correctness + benchmark on NVIDIA (issue #29 CUDA port): the

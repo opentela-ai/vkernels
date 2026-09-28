@@ -3,6 +3,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
+#include <stdexcept>
 #include <thread>
 
 #include "vkernels/core/stream.hpp"
@@ -68,4 +70,42 @@ TEST(Stream, MoveSemantics) {
   assigned.wait();
 
   EXPECT_EQ(ran.load(), 3);
+}
+
+TEST(Stream, FailureDrainsQueueAndIsConsumedByWait) {
+  Stream stream;
+  int completed = 0;
+  stream.submit([] { throw std::runtime_error("callback failed"); });
+  stream.submit([&] { ++completed; });
+  EXPECT_THROW(stream.wait(), std::runtime_error);
+  EXPECT_EQ(completed, 1);
+  stream.wait();
+  stream.submit([&] { ++completed; });
+  stream.wait();
+  EXPECT_EQ(completed, 2);
+}
+
+TEST(Stream, WaitReleasesCallbackCaptures) {
+  Stream stream;
+  auto capture = std::make_shared<int>(1);
+  std::weak_ptr<int> weak = capture;
+  stream.submit([capture = std::move(capture)] {});
+  stream.wait();
+  EXPECT_TRUE(weak.expired());
+}
+
+TEST(Stream, SubmittedCanBeReadDuringSubmission) {
+  Stream stream;
+  std::thread producer([&] {
+    for (int i = 0; i < 1000; ++i) stream.submit([] {});
+  });
+  std::size_t previous = 0;
+  for (int i = 0; i < 1000; ++i) {
+    const auto current = stream.submitted();
+    EXPECT_GE(current, previous);
+    previous = current;
+  }
+  producer.join();
+  stream.wait();
+  EXPECT_EQ(stream.submitted(), 1000u);
 }

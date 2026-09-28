@@ -20,28 +20,7 @@ if(NOT VKERNELS_HAS_OFI)
   return()
 endif()
 
-enable_language(C)
-
-add_library(rccl-net-ofi SHARED rccl_net_ofi.c)
-add_library(vkernels::rccl-net-ofi ALIAS rccl-net-ofi)
-
-# The export attribute is applied directly on `nccl_ofi_net` in the source;
-# -fvisibility=hidden (or -exported_symbol on macOS) hides every other symbol
-# so the RCCL loader only resolves `nccl_ofi_net`.
-if(APPLE)
-  set_property(TARGET rccl-net-ofi APPEND PROPERTY
-    LINK_FLAGS "-Wl,-exported_symbol,_nccl_ofi_net")
-else()
-  target_compile_options(rccl-net-ofi PRIVATE -fvisibility=hidden)
-endif()
-
-target_include_directories(rccl-net-ofi PRIVATE ${VKERNELS_OFI_INCLUDE_DIRS})
-target_link_libraries(rccl-net-ofi PRIVATE ${VKERNELS_OFI_LIBRARIES})
-set_target_properties(rccl-net-ofi PROPERTIES
-  OUTPUT_NAME "rccl-net-ofi"
-  LINKER_LANGUAGE C
-  POSITION_INDEPENDENT_CODE ON)
-
-# Install the .so next to the RCCL loader's search path on a Slingshot node.
-include(GNUInstallDirs)
-install(TARGETS rccl-net-ofi LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+# The transport callbacks are placeholders. Never install a discoverable
+# RCCL plugin until send/receive contract tests pass on a fabric runner.
+message(STATUS "vkernels/net-ofi: disabled (transport not implemented)")
+return()
