@@ -1,0 +1,15 @@
+$thermo-nuclear-code-quality-review Review the entire codebase, and suggest how to improve the usability, performance and maintainability of this repo. Review the whole codebase, rather than the recent commits only
+
+---
+
+continue
+
+---
+
+Fix the above
+
+---
+
+<send_user_message_question_reply>
+[{"answer":"Fix all findings from both reviews","question":"I’m fixing the three lifetime defects from the follow-up review first. Should this change also cover all findings from the original 12-point audit?","questionItemId":"[\"request_user_input_async\",\"call_wNsZNqECVsdPw31sDSS24tzx\",0]"}]
+</send_user_message_question_reply>
