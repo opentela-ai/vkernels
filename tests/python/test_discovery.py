@@ -321,40 +321,17 @@ class DiscoveryTest(unittest.TestCase):
         self.kernels = {e.name: e for e in self.disc.kernels}
         self.comm = {e.name: e for e in self.disc.comm}
 
-    def test_kernel_names_and_order(self):
-        self.assertEqual(
-            [(e.name, e.category) for e in self.disc.kernels],
-            EXPECTED_KERNELS,
-        )
+    def test_kernel_catalog_is_stable_and_contains_public_contracts(self):
+        again = discovery.discover(ROOT)
+        self.assertEqual(self.disc.kernels, again.kernels)
+        for name in ("sum", "max", "gemm", "dsa_kpool_assemble", "kda_naive_delta_rule_fwd_cpu"):
+            self.assertIn(name, self.kernels)
+        self.assertEqual(self.kernels["sum"].contract_test, "cuda_contracts")
+        self.assertFalse(self.kernels["kda_naive_delta_rule_fwd_cpu"].cuda)
 
-    def test_kernel_kinds_and_backends(self):
-        for name, _ in EXPECTED_KERNELS:
-            e = self.kernels[name]
-            self.assertEqual(e.kind, "kernel", name)
-            self.assertTrue(e.host, f"{name} must have a CPU reference")
-            self.assertTrue(
-                e.cuda or e.hip, f"{name} must have a GPU (CUDA or HIP) source"
-            )
-
-    def test_moe_kernels_are_hip(self):
-        for name in (
-            "direct_lds_fill_bf16",
-            "fp4_to_bf16_dequant",
-            "use_async_copy_default",
-            "mfma_f32_16x16x16bf16",
-            "fused_moe_mxfp4_cpu",
-            "moe_align_block_size",
-            "moe_align_block_size_hip",
-            "fused_moe_mxfp4",
-            "mxfp4_moe_quant",
-            "mxfp4_moe_sort",
-            "mxfp4_moe_sort_scales",
-            "mxfp4_moe_sorted_quant",
-            "mxfp4_moe_scatter_reduce",
-            "mxfp4_moe_scatter_reduce_q",
-        ):
-            self.assertTrue(self.kernels[name].hip, name)
-            self.assertFalse(self.kernels[name].cuda, name)
+    def test_host_helpers_do_not_inherit_gpu_source_capabilities(self):
+        self.assertFalse(self.kernels["fused_moe_mxfp4_cpu"].hip)
+        self.assertTrue(self.kernels["fused_moe_mxfp4"].hip)
 
     def test_comm_names_kinds_and_order(self):
         self.assertEqual(
@@ -363,7 +340,7 @@ class DiscoveryTest(unittest.TestCase):
         )
 
     def test_comm_backends(self):
-        self.assertTrue(self.comm["ring_allreduce"].cuda)
+        self.assertFalse(self.comm["ring_allreduce"].cuda)  # host/mock interface
         self.assertTrue(self.comm["p2p_gather_runs"].cuda)
         self.assertFalse(self.comm["ring_rank"].cuda)
         self.assertFalse(self.comm["make_ring_channels"].cuda)

@@ -532,27 +532,11 @@ def test_two_layer_model_compiler_regression():
 def _floe_import():
     """Locate the floe sibling checkout and stub its kvaas_runtime native
     import (same protocol as the #90 suite)."""
-    import os
-    import types
-    if "floe" not in sys.modules:
-        for cand in (os.environ.get("FLOE_ROOT"),
-                     "/home/xiayao/Documents/projects/opentela-ai/serving-stack/floe"):
-            if cand and (Path(cand) / "floe" / "engine").is_dir():
-                if cand not in sys.path:
-                    sys.path.insert(0, cand)
-                break
-    if "kvaas_runtime" not in sys.modules:
-        kv = types.ModuleType("kvaas_runtime")
-        for name in ("CudaVmm", "ElasticControlSession", "ManagedResidencyAdmissionDeferred",
-                     "ManagedResidencySession", "allocate_device_pool"):
-            setattr(kv, name, object)
-        sub = types.ModuleType("kvaas_runtime.kv_pool_import")
-        sub.tensor_from_cuda_pointer = object
-        kv.kv_pool_import = sub
-        sys.modules["kvaas_runtime"] = kv
-        sys.modules["kvaas_runtime.kv_pool_import"] = sub
+    from tests.python.external_dependencies import require_floe
+    require_floe()
 
 
+@pytest.mark.integration
 def test_floe_deepseek_hc_parity():
     """ATTESTED-NOT-VERIFIED (needs torch + floe; skipped on the bare env):
     the recorded/executed mhc_pre/mhc_post chain vs the real floe
@@ -610,6 +594,7 @@ def test_floe_deepseek_hc_parity():
         torch.from_numpy(got_streams), streams_ref.squeeze(1).to(torch.float32), rtol=1e-3, atol=1e-4)
 
 
+@pytest.mark.integration
 def test_floe_glm_hc_parity():
     """ATTESTED-NOT-VERIFIED (needs torch + floe): the same op family via
     ``Glm53HyperConnection`` — one implementation, family attributes."""

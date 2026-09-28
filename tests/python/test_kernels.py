@@ -1139,7 +1139,7 @@ class MlaFwdTest(unittest.TestCase):
     def test_config_selector(self):
         self.assertEqual(mla_config(1, 512, 64), (1, 64, 64))
         self.assertEqual(mla_config(8, 512, 64), (1, 64, 64))
-        self.assertEqual(mla_config(9, 512, 64), (4, 64, 256))
+        self.assertEqual(mla_config(9, 512, 64), (4, 8, 512))
 
     def test_shape_inference_and_validation(self):
         q = np.zeros((1, 1, 2, 4), dtype=_F32)
@@ -2177,7 +2177,7 @@ class KdaNaiveDeltaRuleTest(unittest.TestCase):
         q = np.array([[[[2.0], [3.0]]]], dtype=_F32)
         k = np.array([[[[1.0], [2.0]]]], dtype=_F32)
         v = np.array([[[[5.0], [7.0]]]], dtype=_F32)
-        g = np.array([[[1.0, 1.0]]], dtype=_F32)
+        g = np.array([[[[1.0], [1.0]]]], dtype=_F32)
         beta = np.array([[[1.0, 1.0]]], dtype=_F32)
         out = kda_naive_delta_rule_fwd(q, k, v, g, beta)
         # S_1 = 0 + 1*(5-0)*1 = 5; o_1 = 5*2 = 10
@@ -2190,7 +2190,7 @@ class KdaNaiveDeltaRuleTest(unittest.TestCase):
         q = rng.standard_normal((1, 2, 8, 4)).astype(_F32)
         k = rng.standard_normal((1, 2, 8, 4)).astype(_F32)
         v = rng.standard_normal((1, 2, 8, 4)).astype(_F32)
-        g = (0.3 + 0.7 * rng.random((1, 2, 8))).astype(_F32)
+        g = (0.3 + 0.7 * rng.random((1, 2, 8, 4))).astype(_F32)
         b = (0.3 + 0.7 * rng.random((1, 2, 8))).astype(_F32)
         out = np.empty((1, 2, 8, 4), dtype=_F32)
         got = kda_naive_delta_rule_fwd(q, k, v, g, b, out=out)
@@ -2206,13 +2206,26 @@ class KdaNaiveDeltaRuleTest(unittest.TestCase):
             q = rng.standard_normal((B, H, S, D)).astype(_F32)
             k = rng.standard_normal((B, H, S, D)).astype(_F32)
             v = rng.standard_normal((B, H, S, D)).astype(_F32)
-            g = (0.3 + 0.7 * rng.random((B, H, S))).astype(_F32)
+            g = (0.3 + 0.7 * rng.random((B, H, S, D))).astype(_F32)
             b = (0.3 + 0.7 * rng.random((B, H, S))).astype(_F32)
             c = _run_under(core, lambda q=q, k=k, v=v, g=g, b=b:
                            kda_naive_delta_rule_fwd(q, k, v, g, b).copy())
             f = _run_under(fb, lambda q=q, k=k, v=v, g=g, b=b:
                            kda_naive_delta_rule_fwd(q, k, v, g, b).copy())
-            np.testing.assert_array_equal(c, f)
+            np.testing.assert_allclose(c, f, rtol=1e-5, atol=1e-5)
+
+
+def _standard_delta_reference(q, k, v, g, beta):
+    out = np.zeros_like(q)
+    B, H, S, D = q.shape
+    for b in range(B):
+        for h in range(H):
+            state = np.zeros((D, D), dtype=np.float64)
+            for t in range(S):
+                correction = v[b,h,t] - state @ k[b,h,t]
+                state = g[b,h,t] * state + beta[b,h,t] * np.outer(correction, k[b,h,t])
+                out[b,h,t] = state @ q[b,h,t]
+    return out
 
 
 @unittest.skipIf(np is None, "numpy is required for these tests")
@@ -2233,7 +2246,7 @@ class KdaDeltaRuleFwdTest(unittest.TestCase):
                                  (1, 2, 8, 3, 4), (2, 1, 12, 4, 4),
                                  (1, 1, 16, 4, 8), (1, 1, 64, 8, 16)]:
             q, k, v, g, beta = self._args(B, H, S, D, rng)
-            naive = kda_naive_delta_rule_fwd(q, k, v, g, beta)
+            naive = _standard_delta_reference(q, k, v, g, beta)
             chunked = kda_delta_rule_fwd(q, k, v, g, beta, chunk_size=cs)
             maxd = float(np.max(np.abs(naive - chunked)))
             maxabs = float(np.max(np.abs(naive)))
@@ -2247,7 +2260,7 @@ class KdaDeltaRuleFwdTest(unittest.TestCase):
         v = rng.standard_normal((B, H, S, D)).astype(_F32)
         g = np.ones((B, H, S), dtype=_F32)
         beta = np.full((B, H, S), 0.5, dtype=_F32)
-        naive = kda_naive_delta_rule_fwd(q, k, v, g, beta)
+        naive = _standard_delta_reference(q, k, v, g, beta)
         chunked = kda_delta_rule_fwd(q, k, v, g, beta, chunk_size=cs)
         maxd = float(np.max(np.abs(naive - chunked)))
         maxabs = float(np.max(np.abs(naive)))

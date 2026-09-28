@@ -20,7 +20,6 @@ Validation chain (mirrors the issue's Validation section):
 from __future__ import annotations
 
 import sys
-import types
 from pathlib import Path
 
 import numpy as np
@@ -49,25 +48,8 @@ from vkernels.compiler.schedule_phase import PhaseSchedule  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def _floe_gdn():
-    if "floe" not in sys.modules:
-        # floe is a sibling repo on this stack, not a venv dependency; probe
-        # FLOE_ROOT then the standard serving-stack checkout location.
-        import os
-        from pathlib import Path
-        for cand in (os.environ.get("FLOE_ROOT"), "/home/xiayao/Documents/projects/opentela-ai/serving-stack/floe", "/local/home/xiayao/Documents/code/floe"):
-            if cand and (Path(cand) / "floe" / "engine").is_dir():
-                if cand not in sys.path:
-                    sys.path.insert(0, cand)
-                break
-    if "kvaas_runtime" not in sys.modules:
-        kv = types.ModuleType("kvaas_runtime")
-        for name in ("CudaVmm", "ElasticControlSession", "ManagedResidencyAdmissionDeferred", "ManagedResidencySession", "allocate_device_pool"):
-            setattr(kv, name, object)
-        sub = types.ModuleType("kvaas_runtime.kv_pool_import")
-        sub.tensor_from_cuda_pointer = object
-        kv.kv_pool_import = sub
-        sys.modules["kvaas_runtime"] = kv
-        sys.modules["kvaas_runtime.kv_pool_import"] = sub
+    from tests.python.external_dependencies import require_floe
+    require_floe()
     try:
         # floe refactored the qwen35 modules: qwen35_config -> qwen35.config,
         # qwen35_gdn -> qwen35.gdn. Try the historical paths first, then the
@@ -206,6 +188,7 @@ def test_gdn_conv_two_layer_hazards_are_state_ordered():
 # Lowering (task decomposition)
 # ===========================================================================
 
+@pytest.mark.integration
 def test_lowering_gdn_conv_task_decomposition():
     gdn, _cfg = _floe_gdn()
     executor, handles = _build_executor(np.zeros((B, K - 1, CONV_DIM), dtype=np.float32), workers=1)
@@ -227,6 +210,7 @@ def test_lowering_gdn_conv_task_decomposition():
 # ===========================================================================
 
 @pytest.mark.parametrize("workers", [1, 3])
+@pytest.mark.integration
 def test_reference_gdn_conv_walk_matches_floe_oracle(workers):
     gdn, _cfg = _floe_gdn()
     rng = np.random.default_rng(41 + workers)
@@ -277,6 +261,7 @@ def test_reference_gdn_conv_state_shift_semantics():
     np.testing.assert_array_equal(pool[:, K - 2, :], x_np)
 
 
+@pytest.mark.integration
 def test_reference_gdn_conv_silu_is_elementwise_fir():
     """Out must be silu of the FIR accumulation: compare against an
     independent fp64 recomputation from the same storages."""

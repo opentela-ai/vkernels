@@ -50,8 +50,9 @@ def _drive_gdn_heads(q_ptr, k_ptr, v_ptr, z_ptr, a_ptr, b_ptr, alog_ptr, dtb_ptr
 
 gpu = pytest.mark.skipif(not (torch.cuda.is_available() and triton_available()), reason="requires CUDA + triton")
 
-TARGET = "/local/home/xiayao/minisgl-ds5/models/Qwen3.8-27B-FP8"
-has_27b = pytest.mark.skipif(not glob.glob(os.path.join(TARGET, "layers-*.safetensors")), reason=f"requires {TARGET}")
+TARGET = os.environ.get("VKERNELS_TEST_CHECKPOINT", "")
+pytestmark = pytest.mark.checkpoint
+has_27b = pytest.mark.skipif(not TARGET or not glob.glob(os.path.join(TARGET, "layers-*.safetensors")), reason=f"requires {TARGET}")
 
 
 def _layer0():
