@@ -329,12 +329,18 @@ def sparse_attn_prefill_ragged(
     indptr: torch.Tensor,
     scale: float,
     attn_sink: torch.Tensor | None = None,
+    *,
+    block_k: int | None = None,
+    num_warps: int | None = None,
 ) -> torch.Tensor:
     """Ragged prefill over selected kv rows.
 
     ``q`` [sq, h, d] (bf16), ``kv`` [skv, d] flat bf16 rows, ``indices``
     [nnz] int32 + ``indptr`` [sq+1] int32 ragged selection (``-1`` masked),
     ``scale`` natural-exp units. Returns bf16 [sq, h, d].
+
+    ``block_k`` / ``num_warps`` override the in-tree launch pins when
+    given (the op-config cache seam; ``None`` = the historical pins).
     """
     assert q.ndim == 3, f"expected q=[sq,h,d], got {q.shape}"
     assert kv.ndim == 2, f"expected kv=[skv,d], got {kv.shape}"
@@ -358,8 +364,10 @@ def sparse_attn_prefill_ragged(
 
     block_h = 16
     block_d = triton.next_power_of_2(head_dim)
-    block_k = 16 if head_dim >= 256 else 32
-    num_warps = 4
+    if block_k is None:
+        block_k = 16 if head_dim >= 256 else 32
+    if num_warps is None:
+        num_warps = 4
     out = torch.empty_like(q, dtype=torch.bfloat16)
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
@@ -396,10 +404,17 @@ def sparse_attn_prefill(
     scale: float,
     attn_sink: torch.Tensor | None = None,
     topk_length: torch.Tensor | None = None,
+    *,
+    block_k: int | None = None,
+    num_warps: int | None = None,
 ) -> torch.Tensor:
     """Dense-indices prefill: ``q`` [sq, h, d], ``kv`` [skv, d], ``indices``
     [sq, w] int32 with ``-1`` masked (``topk_length`` [sq] overrides the
-    per-row valid count when given). Returns bf16 [sq, h, d]."""
+    per-row valid count when given). Returns bf16 [sq, h, d].
+
+    ``block_k`` / ``num_warps`` override the launch pins (the op-config
+    cache path pins them per head-dim class; ``None`` keeps the in-tree
+    defaults)."""
     ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
         indices,
         topk_length
@@ -414,6 +429,8 @@ def sparse_attn_prefill(
         indptr=ragged_indptr,
         scale=scale,
         attn_sink=attn_sink,
+        block_k=block_k,
+        num_warps=num_warps,
     )
 
 
@@ -728,6 +745,11 @@ def sparse_attn_decode(
     attn_sink: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     block_k: int = 32,
+    *,
+    topk_length: torch.Tensor | None = None,
+    num_splits: int | None = None,
+    num_stages: int | None = None,
+    num_warps: int | None = None,
 ) -> torch.Tensor:
     """Split-K sparse decode over selected kv rows.
 
@@ -736,6 +758,11 @@ def sparse_attn_decode(
     ``indices`` [t, w] int32 dense with ``-1`` masked (or a prebuilt
     ``(ragged_indices, ragged_indptr)`` tuple). ``scale`` natural-exp units.
     Returns bf16 [t, h, d].
+
+    Launch-config overrides (the op-config cache seam — ``None`` keeps the
+    in-tree heuristic pins): ``topk_length`` [t] per-row valid counts,
+    ``num_splits`` the split-K count (skips the fill heuristic),
+    ``num_stages`` / ``num_warps`` the partial-kernel launch pins.
     """
     assert q.ndim == 3, f"expected q=[t,h,d], got {q.shape}"
     assert kv_cache.ndim == 2, f"expected kv_cache=[rows,d], got {kv_cache.shape}"
@@ -752,7 +779,9 @@ def sparse_attn_decode(
     else:
         ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
             indices,
-            (indices >= 0).sum(dim=-1, dtype=torch.int32),
+            topk_length
+            if topk_length is not None
+            else (indices >= 0).sum(dim=-1, dtype=torch.int32),
             num_rows=kv_cache.shape[0],
         )
     ragged_indices = _as_int32_contiguous_1d(ragged_indices)
@@ -778,9 +807,14 @@ def sparse_attn_decode(
 
     # Average per-query segment length, read sync-free from the ragged index
     # size, lets the split heuristic avoid over-splitting (as in the source).
-    inv_q = 1.0 / max(1, num_queries)
-    avg_len = ragged_indices.numel() * inv_q
-    num_splits = _decode_num_splits(num_queries, heads_blocks, avg_len, block_k)
+    if num_splits is None:
+        inv_q = 1.0 / max(1, num_queries)
+        avg_len = ragged_indices.numel() * inv_q
+        num_splits = _decode_num_splits(num_queries, heads_blocks, avg_len, block_k)
+    if num_stages is None:
+        num_stages = 1
+    if num_warps is None:
+        num_warps = 4
 
     part_m = torch.empty(
         (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
@@ -815,8 +849,8 @@ def sparse_attn_decode(
         BLOCK_H=block_h,
         BLOCK_K=block_k,
         NUM_SPLITS=num_splits,
-        NUM_STAGES=1,
-        num_warps=4,
+        NUM_STAGES=num_stages,
+        num_warps=num_warps,
     )
 
     _sparse_attn_decode_reduce_kernel[(num_queries, num_heads)](
