@@ -449,3 +449,37 @@ V-triplet (V0 ctrl / V1 +T1T2T4 / V2 +mhc_compose_pre, all node-pinned nid002706
 sequential): expected signatures — transitions capture directly after the first drain
 cycle (no 2.3 s eager forwards), desync ARs gone, agg ≥ 27.5 target on V1, B=1 p50
 ~unchanged (its transitions are pre-timing).
+
+## T5 soup fusions landed (bit-exact; vkernels `9ce9bcf` + floe `546cecc`)
+
+Per L2's attribution, three in-graph glue kills, all bit-exact by construction:
+
+1. **Hoisted slot arange** — 85 launches/step → 0 (per-bsz bucket, soup-constant contract).
+2. **V-major state writeback** — one `index_put_` through permuted pool strides replaces
+   transpose-copy + K-major scatter: 108 → 34 index_put/step, whole-pool `torch.equal`.
+   (Mirror GET is NOT a win — permuted-view gather still pays `.contiguous()`; writeback
+   direction only.)
+3. **Sigmoid o_norm** — `rms_norm_gated` sigmoid variant validated (kernel was already
+   shipped): 8-kernel eager fallback × 34 KDA layers → 1 kernel.
+4. **Shared-slot pinned rows** (knob `shared_slot_pinned`, requires `fused_router`) —
+   warmup-pinned `[rows,K+1]` routing rows, shared column prefilled; fused_router stores
+   routed columns directly (new `out_indices`/`out_weights` args); 84 cat/fill/step → 0
+   (fused) / 84 (eager). Capture-safe: populate at warmup, never allocate/evict under
+   capture; bounded 64-entry pin set.
+
+Expected ≈1–1.5 ms/step — below B=1 run-noise, so the T5 legs must be judged on
+**kineto launch counts** (arange=0, index_put≈34, cat≈0, no sigmoid fallback), not p50.
+Leg design when the node frees: T5a = ctrl + `kda_packed_decode+fused_norms` (T5 tree),
+T5b = T5a + `shared_slot_pinned` — T5b−T5a isolates pinned-slot/direct-store;
+T5a−V0 isolates the kpd/fn enablement + hoist/writeback on matched node.
+
+**HAZARD (pre-existing, ledgered): `fused_conv_update` × paged cache silently loses the
+conv state roll** — the kernel rolls a gathered COPY (`_PagedGlmCache.get_conv_state`
+returns advanced-index copy; dense `Glm53Cache` is fine). Do NOT enable
+`fused_conv_update` for paged serving (e.g. the `stack-moe-conv` arm) until the kernel
+takes slot ids or the wiring scatters the rolled window back. No current arm is exposed.
+
+Deferred (deliberate): F2 V-major rec-pool migration (kills gather+writeback entirely,
+~3 kernels/layer/step) — blocked on checkpoint layout + TP state_dict ripple; its own
+lane. A K-major buffer read as V-major is stride-identical for square heads, so
+eligibility checks cannot catch a wrong-layout pool — migration must be atomic.
