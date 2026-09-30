@@ -585,3 +585,16 @@ variance sample.
   bail auto-clear added to sbatch legs after 657019's empty phase-2 traces.
 - Armed-optimization scoreboard: rows+soup **+19.7% B=1 (deployed)** · mhc_compose_pre **+4.5–11.8% E agg (proven)** ·
   T5 negative (attributed, not deployed) · T1v2 parked (root-caused).
+
+## T1v3 deferral guard — parked follow-up landed (post-close-out increment)
+- Crash evidence re-read from 657018 log: all 4 aborts are faulthandler stacks at kvaas graph.py:42 `capture`
+  (CUDA-graph capture deadlock) -> SIGABRT, during phase-E onset. The shape-warm direct capture skips the eager warm
+  that pre-stages a fresh live-set; under 4-way peers the bt width can settle AFTER the width check, and capturing
+  unstaged while peers mutate the shared block table deadlocks the capture.
+- Guard (0003 patch + live edit in run-t1t2t4-clone/repo, bit-identical port verified, compiles on 3.11):
+  shape-warm direct capture additionally requires `len(reqs) == 1` — a QUIET window with no peer mutator (the regime
+  every clean leg captured in). Multi-request steps take canonical eager->capture (ctrl semantics, 0-crash proven).
+- Cost: phase-E fresh live-sets lose the direct-capture seam win (eager warm ~2.3s instead); single-stream live-sets
+  (phases 1/2) keep it. T1v2's 0.9-1.9s/capture-event win retained where it was measured.
+- Validation leg 657078 = 657018's exact crashing config (ARM=stack-moe-ctrl, barrier=0, shape_warm=1) on the guarded
+  tree. Pass = 0 capture aborts + natural completion; then the seam-latency delta vs 657019/657032 (shape_warm=0).
