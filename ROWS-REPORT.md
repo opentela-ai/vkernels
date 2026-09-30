@@ -616,3 +616,9 @@ variance sample.
 - Infra fixed en route: sbatch now auto-clears stale `repo-prof` (657019/657078 had served kineto-unpatched on it).
 - Scoreboard update: rows+soup +19.7% B=1 (deployed) · mhc_compose_pre +4.5–11.8% E agg (proven) · T5 negative ·
   **T1v2/v3 not deployable (crash root-caused to HIP capture-vs-residency interaction; default off)**.
+
+## L7 (subagent): conc-sweep delivery bug root-caused + fixed; b8 closing leg speced
+- The conc[8] row was never dropped by the loop: **sbatch `--export` is comma-delimited**, so `--export=...,BENCH_CONC_SWEEP=4,8` truncated the value to `4` (+ orphan `8` token, silently dropped). Differential proof: 656882 (value via export list → conc[4] only) vs 656567 (value `8` via export → conc[8] emitted) vs 656523 (value set **in-script** → both emitted). Supersedes L3's "loop gates on MAXR" hypothesis.
+- Fix deployed to glm5-tp4-bench.sbatch (beverin live + campaign mirror, `bash -n` clean, .pre-l7.bak kept): normalize `;`→`,` after arm selection + per-leg delivery echo `[tp4-bench] conc-sweep delivery: …` — tripwire for 657010-class delivery bugs. **Submit spelling from now on: `BENCH_CONC_SWEEP=4;8`.**
+- Closing leg spec (queued, runs after L4/L5/L6 legs): `ARM=stack-moe-rows-soup MAXR=8 SNAP=run-rows-clone --nodelist=nid002706 BENCH_CONC_SWEEP=4;8` — NOT the stack-moe-b8 arm (its EXTRA lacks rows/soup knobs). Net-positive gate: same-leg `conc[8].agg ≥ conc[4].agg`, conc[4] ≥ ~24 (on-band), conc[8] above the 14.35–14.48 collapse floor, all_paris=True, row_min ≥ 0.5×agg/8, B=1 p50 held, 8-way duplicate samples within 15%.
+- Report: lane-reports/L7-bench-sweep-b8.md
