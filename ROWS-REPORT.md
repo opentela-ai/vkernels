@@ -364,5 +364,46 @@ AR wait itself. Traced phase-2 agg (28.28) is single-window noise — phase-1 nu
 the record.
 
 **Standing best**: single-stream **14.73 tok/s p50 (15.06 best)**; concurrency 26.42 (ctrl
-27.58 still leads 4-way). Next: same-day ctrl control leg to pin the agg band; AR-volume
-lane unchanged as the structural lever.
+27.58 still leads 4-way).
+
+## Straggler forensics correction (lane L1, 656775+656705 traces) — O1 as stated is DEAD
+
+There is **no steady-state AR pathology**. The 156 straggler ARs / 3.71 s decompose 100%
+into transition overhead, reproduced within ~10% by the rows-only leg (soup exonerated):
+
+1. **Eager-fallback forwards** at uncaptured widths: any decode forward whose runtime
+   batch width lacks a captured graph runs the whole ~53-block forward eagerly; each
+   block's MoE-down AR absorbs ~40 ms of slowest-peer host-dispatch skew → **~2.1–2.3 s
+   per forward**. w2 shows the drain ladder hitting exactly this: step14 bs=2 (2.33 s),
+   step15 bs=1 (2.29 s), step16 bs=4-on-refill (2.32 s) + step17 re-capture desync (1.81 s).
+   **~10.5 s of a 26 s window is eager fallbacks.**
+2. **Capture-boundary desync**: rank 0 starts replaying while a peer is still capturing →
+   first AR waits 0.9–1.9 s (host hipStreamSynchronize mirrors it). ~3.7 s/window.
+
+Steady state is clean at every width: bs=1 replay **34.5 ms/step**, bs=4 **59 ms/step**,
+ARs at the 35.7 µs wire floor, straggler mass ≤1 ms/step. w1 is the **bs=1 window**
+(29 clean replays), not 4-way as previously assumed. The observed concurrency wall is
+**transition tax**, not per-step cost (steady 4-way is only 1.7× bs=1 GPU time).
+
+New oddity to chase: step16 (bs=4 on refill) ran eager despite the bs=4 graph serving
+steps 2–13 — the graph-cache key misses on something beyond width (composition/pages).
+
+**Fix ladder (ranked)**: (a) precapture graphs for drain widths {1,2} — kills 2.3 s/step;
+(b) `dist.barrier()` after capture before first replay — trivial, kills desync ARs;
+(c) kill the periodic `aten::item` DtoH reads (125–166 ms every ~205 ms during eager;
+3/step + ~11 ms stream-sync during replay — a major B=1 host item);
+(d) worker-rank trace leg (4-rank capture spec in lane report) to attribute the 40 ms/block
+host cost. Full report: `floe-bev-main/.local/campaign/beverin/glm5-smoke/lane-reports/`.
+
+## Soup attribution (lane L2) — 11.6 ms/step of eager glue, fusions costed
+
+Post-stack soup = **11.6 ms/step** (13% of replay GPU busy), ~96% inside the captured
+graph (must be cut at capture time): mHC casts/mul/add glue + Σx², KDA state
+arange/index/index_put_/conv-cat, RMSNormGated sigmoid fallback, `_append_shared_slot`.
+Top fusions: **mhc_pre_big_fuse + mhc_compose_pre knobs exist in-repo but are OFF here**
+(~3.0–3.5 ms/step; not auto-bit-exact — needs parity leg); KDA decode state glue
+(~1.3–1.6 ms/step, bit-exact by construction); sigmoid-RMSNorm fused variant +
+shared-slot cat elimination (~0.7 ms/step, bit-exact).
+
+**B=1 budget**: replay GPU 34.5 ms vs bench 67.9 ms/tok → ~33 ms is host-side. Soup
+(11.6) + item/sync (~11) is a credible path to **~20 tok/s B=1**.
