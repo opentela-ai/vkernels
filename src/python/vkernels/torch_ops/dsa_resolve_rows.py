@@ -457,39 +457,67 @@ def resolve_rows_reference(resident, backing, generations, lengths, hot_slots,
     ``ages``/``clock`` state — all bit-exact against the production kernel
     by transliteration (scalar walk over K in selection order).
     """
-    # Device/dtype/shape normalization. Everything is pulled to CPU int64
-    # up front (GPU parity callers pass CUDA tensors), and `lengths`/`clock`
-    # are flattened to 1-D: a per-layer caller can hand the reference a
-    # scalar (0-dim) clock/lengths, and `clock[b]` on a 0-dim tensor raises
-    # "invalid index of a 0-dim tensor" in torch 2.9 — jobs 656671/656672/
-    # 656673 died here before the walk even started. A scalar is broadcast
-    # across the batch; the advanced clock is reshaped back to the input's
-    # shape on return so shape-sensitive compares stay intact.
-    resident = resident.long().cpu()
-    backing = backing.long().cpu()
-    generations = generations.long().cpu()
-    lengths = torch.atleast_1d(lengths.long().cpu()).reshape(-1)
-    hot_slots = hot_slots.long().cpu()
-    selected = selected.long().cpu()
-    tags = tags.long().cpu().clone()
-    tag_generations = tag_generations.long().cpu().clone()
-    ages = ages.long().cpu().clone()
-    clock = clock.long().cpu()
-    clock_shape = clock.shape
-    clock = torch.atleast_1d(clock).reshape(-1)
+    # ---- entry: device/dtype + RANK normalization (comprehensive shim) ----
+    # Contract ranks: resident/backing/generations/hot_slots/selected and
+    # tags/tag_generations/ages are [batch, ...]; lengths/clock are [batch];
+    # the fence pair is [gpu_pages] (per-page — never batch-broadcast).
+    # Callers in the GPU parity tests hand the oracle KERNEL-RANKED state:
+    # [1, batch, ...] with a singleton layer dim, or scalars for the 1-D
+    # per-request contracts. torch 2.9 raises "invalid index of a 0-dim
+    # tensor" on X[b] for any such input (jobs 656671/656672/656673 died at
+    # three different sites: lengths/clock, then t_b[slot]) — so EVERY input
+    # goes through one shim: squeeze a singleton leading dim, broadcast a
+    # scalar across the batch, fail LOUD on anything else. The four mutated
+    # in-outs are restored to their input rank at return.
+    def _norm(x, rank, name, batch=None):
+        x = x.long().cpu()
+        shape0 = tuple(x.shape)
+        if x.dim() == rank + 1 and x.shape[0] == 1:
+            x = x[0]  # singleton layer dim (kernel-ranked state)
+        if x.dim() == rank:
+            if batch is not None and x.shape[0] != batch:
+                raise ValueError(
+                    f"resolve_rows_reference: {name} has shape {shape0}; "
+                    f"leading dim {x.shape[0]} != batch {batch}")
+            return x.clone(), shape0
+        if x.dim() == rank - 1:
+            if rank == 1:
+                if x.numel() == 1 and batch is not None and batch > 1:
+                    x = x.reshape(1).expand(batch)  # scalar -> per-request
+                else:
+                    x = x.reshape(1)
+                return x.contiguous().clone(), shape0
+            if batch == 1:  # [row] -> [1, row] for a single-request batch
+                return x.reshape(1, -1).clone(), shape0
+        raise ValueError(
+            f"resolve_rows_reference: {name} has shape {shape0}; expected "
+            f"rank {rank} ([batch, ...]) or kernel-ranked [1, batch, ...]")
+
+    def _restore(x, shape0):
+        # input-rank-consistent outputs for the mutated in-outs; a scalar
+        # broadcast across batch>1 cannot be collapsed back (per-request
+        # clocks diverge in the walk), so it stays [batch].
+        return x.reshape(shape0) if x.numel() == torch.Size(shape0).numel() else x
+
+    resident, _ = _norm(resident, 2, "resident")
+    batch = resident.shape[0]
+    backing, _ = _norm(backing, 2, "backing", batch)
+    generations, _ = _norm(generations, 2, "generations", batch)
+    lengths, _ = _norm(lengths, 1, "lengths", batch)
+    hot_slots, _ = _norm(hot_slots, 2, "hot_slots", batch)
+    selected, _ = _norm(selected, 2, "selected", batch)
+    tags, tags_shape = _norm(tags, 2, "tags", batch)
+    tag_generations, tgs_shape = _norm(tag_generations, 2, "tag_generations", batch)
+    ages, ages_shape = _norm(ages, 2, "ages", batch)
+    clock, clock_shape = _norm(clock, 1, "clock", batch)
     has_fence = fence_values is not None
     if has_fence:
-        fence_values = fence_values.long().cpu()
-        fence_expected = fence_expected.long().cpu()
-    batch = resident.shape[0]
+        fence_values = torch.atleast_1d(fence_values.long().cpu())
+        fence_expected = torch.atleast_1d(fence_expected.long().cpu())
     pages = resident.shape[1]
     hot_rows = tags.shape[-1]
     k = selected.shape[-1]
     page = page_tokens
-    if lengths.numel() == 1 and batch > 1:
-        lengths = lengths.expand(batch)
-    if clock.numel() == 1 and batch > 1:
-        clock = clock.expand(batch).clone()  # materialize: clock[b] is written back
     output = torch.full((batch, k), -1, dtype=torch.int64)
     counters = torch.zeros((batch, 3), dtype=torch.int64)
     errors = torch.zeros((batch,), dtype=torch.int64)
@@ -575,8 +603,9 @@ def resolve_rows_reference(resident, backing, generations, lengths, hot_slots,
         errors[b] = err_n
     return {
         "output": output, "counters": counters, "errors": errors,
-        "fills": fills, "tags": tags, "tag_generations": tag_generations,
-        "ages": ages,
-        "clock": (clock.reshape(clock_shape)
-                  if clock.numel() == clock_shape.numel() else clock),
+        "fills": fills,
+        "tags": _restore(tags, tags_shape),
+        "tag_generations": _restore(tag_generations, tgs_shape),
+        "ages": _restore(ages, ages_shape),
+        "clock": _restore(clock, clock_shape),
     }
