@@ -333,3 +333,36 @@ not per-layer compute.
 
 **Next lever (unchanged, sharpened)**: reduce the 11 fp32 ARs per step (segment-fused AR,
 AR+commit coalescing on the control stream) — AR is 55-62% of the served step span.
+
+## 8. INTERACTION LEG: rows+soup stack (job 656775, 2026-09-30) — YES, they stack
+
+**Arm** `stack-moe-rows-soup` (node nid002670): ctrl recipe + `dsa_resolve_rows_fast=true`
++ `cache_gate_fp32=true` + `cache_shared_slot=true` + batched-telemetry marker (soup delta
+ported from run-soup-clone2: 2 knob fields, fp32soup caches in forward.py with graph-bank-
+safe per-key pinning, memoized marker knob in knobs.py, batched fleet telemetry in
+sparse_runtime; served PYTHONPATH/scratch discipline unchanged). Engagement: vectorized
+latched on all ranks, **zero fallbacks**, `all_paris=True`, bench rc 0/0.
+
+**Single-stream (B=1) ladder** (phase-1 untraced):
+
+| arm | decode p50 | best run | ms/tok | Δ vs ctrl |
+|---|---|---|---|---|
+| ctrl | 12.31 | 12.69 | 81.2 | — |
+| rows | 13.89 / 13.72 | 14.16 | 72.0 | −9.2 ms (≈ resolver −8.1) |
+| soup | 14.40 | 14.41 | 69.4 | −11.8 ms |
+| **rows+soup** | **14.73** | **15.06** | **67.9** | **−13.3 ms (+19.7%)** |
+
+**Agg (4-way)**: ctrl 27.58 > **rows+soup 26.42** > rows 26.30/25.61 > soup 24.81. Soup's
+agg regression is mostly RELEASED by the rows lane (24.81 → 26.42) — removing the 9.1 ms
+resolve_rows launches takes the pressure off the path that made the soup caches hurt at
+concurrency — but −1.2 vs ctrl persists.
+
+**Additivity check**: independent savings would predict −21 ms/tok; measured −13.3. The two
+levers overlap ~8 ms — both drain the same rank-skew/AR-wait pool, consistent with the
+absorption model. The pooled pool is now ~2/3 drained; what remains at B=1 is mostly the
+AR wait itself. Traced phase-2 agg (28.28) is single-window noise — phase-1 numbers are
+the record.
+
+**Standing best**: single-stream **14.73 tok/s p50 (15.06 best)**; concurrency 26.42 (ctrl
+27.58 still leads 4-way). Next: same-day ctrl control leg to pin the agg band; AR-volume
+lane unchanged as the structural lever.
