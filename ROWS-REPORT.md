@@ -307,22 +307,29 @@ on all 4 ranks; **zero** FALLBACK warnings across both legs; correctness gate `a
 
 | metric | ctrl (656553) | rows 656701 | rows 656705 |
 |---|---|---|---|
-| decode tok/s p50 (B=1) | 13.4–13.9 | 13.89 | 13.72 |
+| decode tok/s p50 (B=1) | **12.31** (10.73/12.31/12.69) | **13.89** (13.23/13.89/14.01) | **13.72** (11.42/13.72/14.16) |
 | concurrency agg (tok/s) | 27.58 | 26.30 | 25.61 |
+| (phase-2 traced, 656705 only) | — | — | 12.68 p50 / 23.17 agg |
+
+**CORRECTION (was misread as "flat")**: ctrl's B=1 decode was **12.31**, not 13.9. The rows
+arm is a **real single-stream win: +12.8% (81.2 → 72.0 ms/tok = −9.2 ms/tok)** — matching the
+kineto-measured 8.1 ms/step resolve saving almost exactly. At B=1 the saving is **fully
+exposed**; only the 4-way concurrency phase re-absorbs it (multi-stream AR wait + bandwidth
+contention), where agg is a wash-to-slightly-negative within the leg band.
 
 **Kineto** (656705 decode windows, per rank): `resolve_rows` **829 µs → 82 µs mean
 (12×)**; per-step 0.91 ms (w1, ~33 steps) / 1.14 ms (w2, ~35 steps) vs kvaas 9.1 ms —
 **~8.1 ms/step of pure compute removed**. `ncclDevKernel` = 55% (w1) / 62% (w2) of the
 window span (3646/4413 ms total kernel time = 83% in w1).
 
-**Verdict**: the kernel win is real and bit-exact, but under the served TP4 stack with
-`tp_control_stream` the step is **AR-wait-bound**: the saved 8.1 ms/step lands inside the
-all-reduce/skew slack, so decode p50 and agg are **flat-to-slightly-negative (within the
-~±1.5 tok/s leg band; soup leg 26.46 for reference)**. The E9-era "resolve_rows = 21% of
-step" attribution no longer holds on the stacked recipe — it was only true while the sync
-wire absorbed rank skew ON the critical path. Keep the lane landed (parity oracle intact,
-fallback verbatim) but **do not credit it as an end-to-end lever**; the remaining lever is
-AR volume itself, not per-layer compute.
+**Verdict**: the kernel win is real and bit-exact, and at **B=1 it converts to wall-clock:
+13.9 tok/s p50 (best run 14.16) vs ctrl 12.31 — the ~8.1 ms/step saving is fully exposed**.
+At 4-way concurrency the same saving is re-absorbed by multi-stream AR wait/bandwidth
+contention (agg wash-to-slightly-negative, 25.6–26.3 vs 27.58). Net: **keep the lane landed**
+— it is the new single-stream best and the parity oracle stays intact (fallback verbatim).
+The remaining B=1 headroom: 72 ms/tok now decomposes ~45% compute / ~55% AR wait;
+wire-only AR would put the step at ~35–40 ms → ~25–28 tok/s. The lever is AR volume/skew,
+not per-layer compute.
 
 **Next lever (unchanged, sharpened)**: reduce the 11 fp32 ARs per step (segment-fused AR,
 AR+commit coalescing on the control stream) — AR is 55-62% of the served step span.
