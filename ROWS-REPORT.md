@@ -734,3 +734,15 @@ variance sample.
 - **657175 (first Tier-1 WARM_DECODED leg) RUNNING** — arm echo green ("t1r: warm_decoded + key_trace markers on").
   Gates on completion: window-gone KEYTRACE population shrinks vs 657121's 140; shadow gate 0.0000 on new capture
   steps; all_paris=True; ZERO capture crashes (crash = fresh-admission hypothesis survives, Tier-1 falsified).
+
+## Queue execution 5 — T1R falsified at width-4 (657175 SIGABRT); wall confounder resolved (657179); host-staging validated leg-long (657180); Tier-2 probe authored
+
+- **657175 (Tier-1 WARM_DECODED) FAILED rc=1, SIGABRT — falsified in v1 form**:
+  - Phase-1 (B=1) completed 3 runs, **p50 13.46 = best of session** (runs 11.14/13.46/13.5), then the 4-way phase crashed.
+  - Crash chain (faulthandler, staged kvaas-src): `run_forward:109 result=forward()` → `graph.py:42 with torch.cuda.graph(...)` → **abort INSIDE the captured width-4 step forward**. Crashing step KEYTRACE: `width=4 n_live=3 reason=key-mismatch force_eager=False` — with shape_warm requiring len==1, the only route to mode=capture there is the warm_decoded branch ⇒ **Tier-1 DID fire and crashed**.
+  - Window-gone census 44×width-1 + 4×width-4 (vs 140 total in 657121) — width-1 events still eager (Tier-1 needs ever_captured; fresh width-1 buckets convert only after first capture).
+  - Root-cause class per kvaas issue #43 comment: opaque HIP capture-state error → NCCL watchdog SIGABRT, uncatchable by the retire guard.
+  - **Tier-2 discriminator probe authored** (`FLOE_KVAAS_CAPTURE_PROBE=1` in kvaas execution.py run_forward: for capture-path width>1 steps, pre-run the exact captured callable eagerly + sync BEFORE the capture window): prerun-ok+capture-completes ⇒ cold-path class (fix = bucket warmup); prerun-ok+still-aborts ⇒ capture-unsafe op inside (roctracer needed); prerun-fail ⇒ forward itself fails. Knob-off dead code; sbatch t1r arm exports the env. **Leg 657196 queued** (same arm, nid002706).
+- **657179 (same-session ctrl twin on run-l5-clone) COMPLETED**: p50 11.3/12.25, agg 21.85/23.06, all_paris=True. vs L5b 657173's 7.21/9.65 and l5-debug 657180's 9.02/12.02 — **the three same-session arms overlap; wall reads cannot resolve L5's effect on this rig (same-arm spread 5.01–14.05 documented)**. Trace gates remain the arbiter: blocking item tax −99.7% stands as the L5 verdict.
+- **657180 (l5-debug) COMPLETED rc=0, all_paris=True, 17 min**: knobs batch_tel/host_tables/host_dbg all 1 (marker files verified in repo AND repo-prof). host_tables DEBUG semantics = read device tensors anyway and RAISE on disagreement with host ints ⇒ **a full leg with zero disagreement = host-int staging path validated bit-exact across every step** (not the item enumeration hoped; the remaining 48.6 items/step are 1.4 µs non-blocking, ~0.07 ms/step — near-zero value; syncs are documented load-bearing per L5 report).
+- **Net session state**: deployed knobs bit-exact with proven in-trace mechanism (L5 blocking elimination); L4 fusions live but sub-resolution; Tier-1 v1 falsified (width-4 direct capture crashes; root cause narrowed to inside-window op via probe); best session p50 14.05 (ctrl) / 13.46 (T1R pre-crash).
