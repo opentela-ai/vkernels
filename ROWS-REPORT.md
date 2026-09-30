@@ -566,3 +566,22 @@ cross-job (documented 2× same-arm swings). Trace-level mechanism proof pending:
 leg's phase-2 kineto came up EMPTY (stale repo-prof bail, same failure class as the
 old ctrl legs) — repo-prof cleared, V2 re-run queued (657032) for traces + a second
 variance sample.
+
+## V2 mhc_compose_pre — final attribution (657019 + 657032, same-day matched-node)
+- **E agg: 28.72 / 26.85 (mean ~27.8) vs ctrl 656984 25.69 → +4.5% / +11.8%.** row p50 7.18/6.71 vs 6.42.
+- **Mechanism PROVEN at trace level** (kin-657032 vs kin-656984): B=1 decode window — fused `_compose_pre` 2759 launches,
+  incumbent `_compose`+`_pre_gemv` collapsed to 31+31 (−98.8% two-launch chain in the rows≤2 domain). 4-way window:
+  178 compose_pre fires from small-batch steps in the mix; incumbent chain dominant at rows>2 — eligibility cap exact.
+- Parity: all_paris=True, says_bern=True, natural finish on both legs; correctness latency 74.9s ≈ ctrl.
+- Verdict: real, modest, batch-structure-dependent win. Deployable as `stack-moe-mhc` arm (clean, reproducible).
+  Single-stream medians unchanged (step is AR-wait-bound at B=1 — compute-side fusion can't move it; consistent with rows lane finding).
+
+## Session ledger (t1t2t4 campaign close-out)
+- T1v2+T2: **T2 exonerated** (657019 crashed 0× with barrier=0-only tree); T1v2 shape-warm capture-onset is the
+  phase-E abort source → mitigation = knobs default-off (stable config on beverin snapshot). T1v2's seam-latency win
+  (0.9–1.9s/capture event, rare) parked as follow-up behind a deferral-guard fix + fresh validation legs.
+- V1 target crash: fixed — decode median 13.87 vs 8.67 on the broken tree (same day, matched node).
+- Infra: marker-file knob delivery (EDF env-scrub workaround) landed 3976606; ctrl trace baseline restored; repo-prof
+  bail auto-clear added to sbatch legs after 657019's empty phase-2 traces.
+- Armed-optimization scoreboard: rows+soup **+19.7% B=1 (deployed)** · mhc_compose_pre **+4.5–11.8% E agg (proven)** ·
+  T5 negative (attributed, not deployed) · T1v2 parked (root-caused).
