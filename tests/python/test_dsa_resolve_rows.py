@@ -265,14 +265,16 @@ def _gpu_parity_case(torch, dev, *, seed, k, batch=2, fence=False,
         page_tokens=page, allow_padding=allow_padding,
         fence=(fv, fe) if fence else None,
     )
-    # BIT-EXACT: outputs, counters, errors, fills-prefix, AND the advanced
+    # BIT-EXACT: outputs, counters, errors, fills (FULL tensor — the tail
+    # [m_b, K) is zeroed by the kernel epilogue and by the reference's
+    # torch.zeros, so it is defined; the job-656573 failure was
+    # garbage-vs-garbage in those rows when batch requests had different
+    # miss counts and the old max-slice compare), AND the advanced
     # LRU state (tags/tag_generations/ages/clock) — no tolerance anywhere.
     assert torch.equal(out, ref["output"].to(dev))
     assert torch.equal(counters, ref["counters"].to(dev))
     assert torch.equal(errors, ref["errors"].to(dev))
-    m = int(ref["counters"][:, 2].max())
-    if m:
-        assert torch.equal(fills[:, :m], ref["fills"][:, :m].to(dev))
+    assert torch.equal(fills, ref["fills"].to(dev))
     assert torch.equal(tags.cpu(), ref["tags"])
     assert torch.equal(tgs.cpu(), ref["tag_generations"])
     assert torch.equal(ages.cpu(), ref["ages"])

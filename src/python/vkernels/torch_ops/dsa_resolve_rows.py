@@ -223,11 +223,18 @@ def _kernel():
         tl.store(ERRORS + state, err_count)
 
         # ---- 5. copy pass: drain the fill list in tiles (verbatim) ----
-        for j in range(0, miss_count, FILL_CHUNK):
+        # the tail [miss_count, K) is outside the contract (consumers read
+        # only [0, miss_count)) but must be DETERMINISTIC for bit-exact
+        # parity: zero it in the same loop (scratch buffers are reused
+        # across calls within a decode step — job-656573 lesson).
+        for j in range(0, K, FILL_CHUNK):
             jv = j + tl.arange(0, FILL_CHUNK)
             live = jv < miss_count
             src = tl.load(FILL + (state * K + jv) * 2, live, 0)
             dst = tl.load(FILL + (state * K + jv) * 2 + 1, live, 0)
+            tl.store(FILL + (state * K + jv) * 2, 0, mask=jv >= miss_count)
+            tl.store(FILL + (state * K + jv) * 2 + 1, 0,
+                     mask=jv >= miss_count)
             tile = live[:, None] & (d < WIDTH)[None, :]
             values = tl.load(
                 HOST + layer * HOST_ROWS * WIDTH + src[:, None] * WIDTH + d[None, :],
@@ -458,7 +465,7 @@ def resolve_rows_reference(resident, backing, generations, lengths, hot_slots,
     output = torch.full((batch, k), -1, dtype=torch.int64)
     counters = torch.zeros((batch, 3), dtype=torch.int64)
     errors = torch.zeros((batch,), dtype=torch.int64)
-    fills = torch.empty((batch, k, 2), dtype=torch.int64)
+    fills = torch.zeros((batch, k, 2), dtype=torch.int64)
     for b in range(batch):
         length = int(lengths[b])
         protected = torch.zeros(hot_rows, dtype=torch.bool)

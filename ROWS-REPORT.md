@@ -92,9 +92,25 @@ FIXED: pools are now sized so exhaustion is impossible by construction (gpu_slot
 batch·pages + batch·hot_pages + 2; resident rolls capped at gpu_slots−1−batch·hot_pages so the
 hot capacity is always reserved; host capacity batch·pages+1 covers every non-resident page),
 validated over 800 parameter/seed combos off-device; the no-seeded-tag corner of the miss/fill
-test gained a seed-retry guard. No kernel or reference change was needed. Awaiting the re-ship
-+ re-run (stage: glm5-smoke/rows-resolver-src) for the N/N confirmation; CPU semantic cases
-run anywhere, GPU legs skip without CUDA.
+test gained a seed-retry guard. No kernel or reference change was needed for that one.
+
+On-cluster round 2 (job 656573, fixed tree): 4/5 — `test_gpu_parity_bit_exact` failed on a
+REAL comparison mismatch, root-caused to UNDEFINED fills-TAIL bytes, not walk divergence:
+the test compared `fills[:, :m]` with `m = max over batch of miss counts`, but each request
+only defines `fills[b, :m_b]` (`m_b = counters[b,2]`); `fills` was `torch.empty` on BOTH
+sides (kernel launcher, batched wrapper, reference), so rows `[m_b, m)` were garbage-vs-
+garbage whenever batch requests had different miss counts — exactly matching the symptom
+(fills matched through entry m_0, diverged right after, while out/counters/errors — fully
+overwritten every call — were bit-exact). Aggravator: the single-op launcher caches the
+fills buffer in `scratch` across calls within a decode step, so tails could hold STALE
+fills from a previous call. FIX (commit 11cb5c2 follow-up): (1) kernel epilogue zeroes the
+fills tail `[miss_count, K)` in the same copy-pass loop (per state; makes the buffer
+deterministic across scratch reuse; cost ~K/FILL_CHUNK extra masked stores); (2) reference
+switched to `torch.zeros`; (3) test upgraded to FULL-tensor `torch.equal(fills, ref)` —
+stronger than the old max-slice (tails now defined on both sides). The walk itself
+(output/counters/errors/tags/ages all bit-exact in 4/5 passing legs) needed NO change.
+Awaiting the re-ship + re-run for the N/N confirmation; CPU semantic cases run anywhere,
+GPU legs skip without CUDA.
 
 ## 4. floe-side patch TEXT (apply with the deployment's `patch -p4` flat layout; author paths shown repo-relative)
 
