@@ -168,6 +168,32 @@ shape on return so shape-sensitive compares (kernel-shaped [1,batch] vs referenc
 stay intact. Semantics of the walk untouched. py_compile + ast clean on the final tree.
 Awaiting re-ship + re-run.
 
+On-cluster round 6 (job 656677, tree 9a417b2): SAME error class, THIRD site —
+`t_b[slot] = token` inside the walk; t_b was [1, hot_rows] because the GPU tests pass
+KERNEL-RANKED state (tags/tag_generations/ages arrive [layers, batch, hot_rows] after
+.repeat(layers,1,1)) while the oracle contract is 2-D. Per instruction, replaced the
+one-index-at-a-time fixes with a COMPREHENSIVE rank audit + shim. Contract ranks
+enumerated: resident/backing/generations/hot_slots/selected and tags/tag_generations/
+ages = [batch, ...] (rank 2); lengths/clock = [batch] (rank 1); fence pair = [gpu_pages]
+(rank 1, per-page — never batch-broadcast). EVERY input now goes through one `_norm`
+shim at entry: .long().cpu(); squeeze a SINGLETON leading dim (kernel-ranked
+[1, batch, ...]); broadcast a scalar across the batch for the rank-1 per-request
+contracts; validate leading-dim == batch for every non-resident input (batch is derived
+from resident); FAIL LOUD (ValueError naming the tensor) on anything else — no more
+silent misindexing. `_restore` gives input-rank-consistent outputs for the four mutated
+in-outs (tags/tag_generations/ages/clock) — a scalar clock broadcast across batch>1
+stays [batch] (per-request clocks diverge in the walk). Outputs output/counters/errors/
+fills are freshly allocated at contract rank. Walk semantics untouched.
+REGRESSION HARNESS (torch-free, catches this entire class locally):
+tests/python/test_dsa_resolve_rows_rank_shim.py — pure-python mirror of _norm/_restore
+(KEEP-IN-SYNC note) fuzzed over the same state-generator family: 20k trials (env
+RANKSHIM_TRIALS) asserting contract-rank walk == kernel-rank walk == scalar-clock walk
+bit-for-bit + mutated-in-out rank round-trip + negative cases (batch-mismatched,
+mis-ranked inputs raise); plus a torch-guarded end-to-end test (runs on-cluster)
+exercising the REAL reference with kernel-ranked CPU tensors, scalar clock, restored
+ranks, and the loud-failure path. 20k trials pass locally in ~1.6s; py_compile + ast
+clean on the final tree. Awaiting re-ship + re-run.
+
 ## 4. floe-side patch TEXT (apply with the deployment's `patch -p4` flat layout; author paths shown repo-relative)
 
 ```patch
