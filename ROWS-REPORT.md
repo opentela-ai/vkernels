@@ -680,3 +680,19 @@ variance sample.
   rows_changed=[] epoch_changed=[3]` + `decoded_in_bucket=[True,True,False,False]` (survivors True, admissions False).
   Zero spurious mismatches (reject-condition (a) did not fire); L6 closes CORRECT-miss; Tier-1 precapture
   (FLOE_SPARSE_WARM_DECODED) spec graduates with a working freshness predicate.
+
+## Queue execution 2 — 657124/657145/657146 done; 657145 VOID (repo-prof marker staleness) root-caused + fixed; L4a fusion PROVEN live
+
+- **657124 (rows+soup b8) COMPLETED**: B=1 p50 12.7 (in-band); conc[4] agg 23.27, **conc[8] agg 13.43 / row_p50 1.68**
+  (the missing 8-way datapoint: 8-way trades agg for per-row latency as predicted; ctrl-twin 657078 held agg 31.99 at conc4).
+- **657146 (L4a conv 4→1) — fusion PROVEN live in the traced window**: `_conv_decode` fused kernel 1054×
+  (=31 steps × 34 KDA layers) vs ZERO conv-named kernels in the ctrl trace (eager 4-op chain); all_paris=True,
+  p50 13.19 in-band. Gate green.
+- **657145 (L5b) VOID as A/B**: trace counts byte-identical to its ctrl twin (item=3601 sync=124 DtoH=102 both) —
+  root cause: arm-block marker writes land in `$SNAP/repo/env-markers` AFTER the repo→repo-prof copy, and the
+  **kineto phase serves from repo-prof** → traced process read stale 0s (phase-1 serve from repo/ was correctly ON).
+  Fix: sbatch now mirrors the final marker set into repo-prof before serve launch (line ~362, bash -n clean).
+  The "shadow gate passed" lines are the pre-existing soup SHADOWTRACE, not L5's debug — knobs never engaged.
+- **L5b resubmitted as 657173** (queued behind 657147 l4b, running). Mirror synced + committed.
+- Note: ctrl same-config spread this session remains wide (B=1 12.72–14.05, agg 21.98–31.99); same-clone A/B pairs
+  (657119 vs 657173; 657078 vs 657124) are the only decision-grade reads.
