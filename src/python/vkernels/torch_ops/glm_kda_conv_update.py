@@ -44,6 +44,8 @@ happens under capture).
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 from ._dispatch import OpNotEligible
@@ -82,6 +84,7 @@ def kda_conv_update_eligible(
     )
 
 
+@functools.lru_cache(maxsize=1)
 def _kernel():
     """JIT-scoped kernel definition (import triton lazily, moe_combine style)."""
     import triton

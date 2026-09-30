@@ -61,6 +61,8 @@ warmup's eager pass compiles both kernels per shape before capture.
 
 from __future__ import annotations
 
+import functools
+
 import os
 
 import torch
@@ -148,6 +150,7 @@ def moe_grouped_decode_eligible(
     )
 
 
+@functools.lru_cache(maxsize=1)
 def _kernels():
     import triton
     import triton.language as tl
