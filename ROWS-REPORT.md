@@ -130,6 +130,26 @@ set from the selected-token bitmap). Added to the oracle; without it, a pre-prot
 evicted early by the oracle would turn a later guaranteed hit into a miss — a counts/fills
 divergence waiting to fire in the random sweep. Awaiting re-ship + re-run.
 
+On-cluster round 4 (job 656668, tree babca79 + harness randrange fix): tags fix VERIFIED
+(tags/tag_generations/ages/clock bit-exact — the flattened predicated-carry form works);
+next peel failed at fills AGAIN. NOT the walk and NOT the new reference pre-pass: a 30k-
+state pure-Python fuzz of the committed reference vs the committed kernel algorithm found
+ZERO divergence (out/counters/errors/fills/tags/tgs/ages/clock all equal, dup tokens,
+invalid tokens, boundary lengths, no-victim states included). Root cause was in MY 5e1e45d
+epilogue: the §5 fills TAIL-ZEROING stores were masked only by `jv >= miss_count` — the
+`jv < K` upper bound was MISSING. The last FILL_CHUNK tile runs to ceil(K/32)*32-1
+(29 lanes past K for k=2051, 31 for k=257 — EVERY GPU case), so state s's epilogue wrote
+garbage zeros into state s+1's first fill rows (cross-CTA race vs that state's in-walk
+fill stores — hence flaky, and why 656618's fills passed on timing luck), and for the last
+state ~464B of zeros landed PAST the fills tensor (allocator-layout-dependent corruption).
+This exactly matches the failure shape: only fills diverge, everything the kernel fully
+overwrites within bounds stays bit-exact, ref shows more fill pairs. The randrange fix
+(3d07037) merely reshuffled which random state exposed the race — the OOB write fired on
+every run of every GPU case since 5e1e45d. FIX: zeroing store masks are now
+`(jv >= miss_count) & (jv < K)`; audited every other vector store in the kernel for the
+same class of bug (bitmap clear, classify pass, walk stores, KV copy — all correctly
+bounded). Awaiting re-ship + re-run.
+
 ## 4. floe-side patch TEXT (apply with the deployment's `patch -p4` flat layout; author paths shown repo-relative)
 
 ```patch
