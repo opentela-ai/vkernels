@@ -38,30 +38,37 @@ def torch():
 # ---------------------------------------------------------------------------
 
 def _build_state(torch, rng, *, batch=2, pages=8, page=64, hot_pages=3,
-                 k=12, host_pages=16, width=8, layers=1, hot_rows=None,
+                 k=12, width=8, layers=1, hot_rows=None,
                  gen=3, dup=True, pad=True):
     """Randomized but VALID tables: hot slots unique + disjoint from resident,
     active nonresident pages host-backed, lengths within pages*page."""
     import torch
 
     hot_rows = hot_rows or hot_pages * page
-    kv = torch.randn(layers, hot_pages * page + 2 * page, width)
-    host = torch.randn(layers, host_pages * page, width)
+    # Pool sizing invariant (the job-656560 StopIteration fix): leaseable slots
+    # must cover the WORST case by construction — resident rolls capped so the
+    # batch's hot pages always fit, host capacity covers every non-resident
+    # active page. next() selectors below can then never run dry.
+    gpu_slots = batch * pages + batch * hot_pages + 2  # +2: scratch slot 0 + margin
+    max_resident = gpu_slots - 1 - batch * hot_pages   # reserve the hot capacity
+    host_pages_default = batch * pages + 1
+    kv = torch.randn(layers, gpu_slots * page, width)
+    host = torch.randn(layers, host_pages_default * page, width)
     resident = torch.full((batch, pages), -1, dtype=torch.int64)
     backing = torch.full((batch, pages), -1, dtype=torch.int64)
     generations = torch.randint(0, gen, (batch, pages), dtype=torch.int64)
     lengths = torch.randint(1, pages * page + 1, (batch,), dtype=torch.int64)
     hot_slots = torch.full((batch, hot_pages), -1, dtype=torch.int64)
     used_res, used_hot = set(), set()
-    free_host = list(range(host_pages))
+    free_host = list(range(host_pages_default))
     for b in range(batch):
         L = int(lengths[b])
         for pg in range((L + page - 1) // page):
             roll = rng.random()
-            if roll < 0.55 and len(used_res) < kv.shape[1] // page:
+            if roll < 0.55 and len(used_res) < max_resident:
                 # resident page (slot 0 stays the shared scratch — never lease it)
                 slot = next(
-                    s for s in range(1, kv.shape[1] // page) if s not in used_res
+                    s for s in range(1, gpu_slots) if s not in used_res
                 )
                 used_res.add(slot)
                 resident[b, pg] = slot
@@ -69,9 +76,10 @@ def _build_state(torch, rng, *, batch=2, pages=8, page=64, hot_pages=3,
                 assert free_host, "host capacity exhausted"
                 backing[b, pg] = free_host.pop(rng.randrange(len(free_host)))
         # hot slots: unique across live rows, disjoint from resident slots
+        # (always satisfiable: max_resident reserves batch*hot_pages slots)
         for hp in range(hot_pages):
             slot = next(
-                s for s in range(1, kv.shape[1] // page)
+                s for s in range(1, gpu_slots)
                 if s not in used_res and s not in used_hot
             )
             used_hot.add(slot)
@@ -175,6 +183,14 @@ def test_reference_miss_fill_and_duplicate_hits_reserved_slot(torch):
 
     rng = __import__("random").Random(13)
     st = _build_state(torch, rng, batch=1, k=6, dup=False, pad=False)
+    # the walk needs a seeded hot-tier hit; ~1% of draws leave every active
+    # page resident (no tags) — retry seeds until one exists
+    for seed in range(13, 40):
+        if (st["tags"][0] >= 0).any():
+            break
+        rng = __import__("random").Random(seed + 1)
+        st = _build_state(torch, rng, batch=1, k=6, dup=False, pad=False)
+    assert (st["tags"][0] >= 0).any(), "no seeded hot hit across seed sweep"
     # one hot-tagged token (guaranteed hit), then a MISS for the same page
     # family, then a duplicate of the first: it must hit the SAME slot
     tagged = (st["tags"][0] >= 0).nonzero(as_tuple=True)[0][0]
@@ -220,7 +236,7 @@ def _gpu_parity_case(torch, dev, *, seed, k, batch=2, fence=False,
     rng = random.Random(seed)
     st = _build_state(
         torch, rng, batch=batch, k=k, width=width, page=page,
-        hot_pages=4, host_pages=16, gen=4,
+        hot_pages=4, gen=4,
     )
     layers = 1
     kv = st["kv"].to(dev).to(torch.bfloat16).contiguous()
