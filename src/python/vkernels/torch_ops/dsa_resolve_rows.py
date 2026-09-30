@@ -245,9 +245,10 @@ def _kernel():
             live = jv < miss_count
             src = tl.load(FILL + (state * K + jv) * 2, live, 0)
             dst = tl.load(FILL + (state * K + jv) * 2 + 1, live, 0)
-            tl.store(FILL + (state * K + jv) * 2, 0, mask=jv >= miss_count)
+            tl.store(FILL + (state * K + jv) * 2, 0,
+                     mask=(jv >= miss_count) & (jv < K))
             tl.store(FILL + (state * K + jv) * 2 + 1, 0,
-                     mask=jv >= miss_count)
+                     mask=(jv >= miss_count) & (jv < K))
             tile = live[:, None] & (d < WIDTH)[None, :]
             values = tl.load(
                 HOST + layer * HOST_ROWS * WIDTH + src[:, None] * WIDTH + d[None, :],
