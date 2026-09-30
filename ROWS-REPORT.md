@@ -82,8 +82,19 @@ advanced tags/tag_generations/ages/clock state; cases: randomized sweep (dup tok
 mix, invalid tokens, ALLOW_PADDING), victim ties, fence mismatch (masked miss + nonzero errors,
 no fill), boundary pages (`length = pages*PAGE`), zero-length rows, non-pow2 topk (2051),
 topk=2048 production geometry, multi-layer `dsa_resolve_rows_batched` state indexing, and
-OpNotEligible contract-miss fallback. Status: **written + py_compile/ast clean; awaiting the
-on-cluster run** (no GPU locally, per lane rules).
+OpNotEligible contract-miss fallback. Status: **py_compile/ast clean locally; on-cluster
+run (job 656560, MI300A): 1 FAILED — StopIteration in `test_reference_resident_rows_and_counts`
+was a HARNESS capacity bug in `_build_state` (the leaseable slot pool, `hot_pages+2` slots,
+could be exhausted by the resident roll before the hot-slot `next()` selector ran — the
+failure fired during state construction, BEFORE any reference-vs-kernel comparison, so it
+carries no kernel signal; the harness has no reference/kernel generator pairing to desync).
+FIXED: pools are now sized so exhaustion is impossible by construction (gpu_slots =
+batch·pages + batch·hot_pages + 2; resident rolls capped at gpu_slots−1−batch·hot_pages so the
+hot capacity is always reserved; host capacity batch·pages+1 covers every non-resident page),
+validated over 800 parameter/seed combos off-device; the no-seeded-tag corner of the miss/fill
+test gained a seed-retry guard. No kernel or reference change was needed. Awaiting the re-ship
++ re-run (stage: glm5-smoke/rows-resolver-src) for the N/N confirmation; CPU semantic cases
+run anywhere, GPU legs skip without CUDA.
 
 ## 4. floe-side patch TEXT (apply with the deployment's `patch -p4` flat layout; author paths shown repo-relative)
 
