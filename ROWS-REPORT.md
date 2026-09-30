@@ -622,3 +622,47 @@ variance sample.
 - Fix deployed to glm5-tp4-bench.sbatch (beverin live + campaign mirror, `bash -n` clean, .pre-l7.bak kept): normalize `;`→`,` after arm selection + per-leg delivery echo `[tp4-bench] conc-sweep delivery: …` — tripwire for 657010-class delivery bugs. **Submit spelling from now on: `BENCH_CONC_SWEEP=4;8`.**
 - Closing leg spec (queued, runs after L4/L5/L6 legs): `ARM=stack-moe-rows-soup MAXR=8 SNAP=run-rows-clone --nodelist=nid002706 BENCH_CONC_SWEEP=4;8` — NOT the stack-moe-b8 arm (its EXTRA lacks rows/soup knobs). Net-positive gate: same-leg `conc[8].agg ≥ conc[4].agg`, conc[4] ≥ ~24 (on-band), conc[8] above the 14.35–14.48 collapse floor, all_paris=True, row_min ≥ 0.5×agg/8, B=1 p50 held, 8-way duplicate samples within 15%.
 - Report: lane-reports/L7-bench-sweep-b8.md
+
+## L4/L5/L6 lane harvest (run d2bbf267) — patches deployed, 6-leg queue live (657119–657124, nid002706 serial)
+
+### L4 bit-exact soup fusions — lane SHRUNK by tree audit (report: lane-reports/L4-bit-exact-soup-fusions.md)
+- 85 arange/step mis-attributed (slot arange only under kda_packed_decode, OFF in stack); sigmoid-o_norm likely
+  already banked (rms_norm_gated wired + decode_fuse=true); KDA packed kernel is ULP-class ("matches to ULPs, NOT
+  bits", 1/32 greedy flips) → T5a lever out of bit-exact lane. Honest residual: ~1.0 ms/step (not 2.0–2.3).
+- t5b root-cause candidate: T5's `_pinned_shared_slot_buffers` guarded the LOOKUP with is_current_stream_capturing
+  → every captured graph recorded the donor cat chain (cat=209 with knob echoed on). Port moves guard to ALLOCATION
+  (warmup populates → capture reuses). Engagement echo (latched line + cat −84/step) decides.
+- Deliverables: vkernels fused_router out-buffer direct-store (stride kwargs, verbatim T5 9ce9bcf), dispatch +
+  forward shared_slot_pinned (capture-guard fix + latched echo), 2 new GPU parity tests, arms stack-moe-l4a
+  (fused_conv_decode=true, ~0.5 ms) / stack-moe-l4b (pinned slot, ~0.5 ms).
+
+### L5 item/sync elimination — 46 blocking DtoH + 3 syncs/step enumerated, patch deployed (report: L5-step-path-item-syncs.md)
+- 11 ms replay sync = SparseStep.finish → drain() → sparse-runtime stream synchronize — LOAD-BEARING (StepTableBank
+  pinned-staging reuse guard); double-buffering is a separate lane, not touched.
+- begin_step does 2 blocking tolist()s on tensors the engine just staged from the same host ints (glm53's
+  decode_step declared seq_lens_host/rows_host and dropped them); _check_errors(11) + _counters(33) per-resolver
+  item reads = soup telemetry patch (62ed36c) never ported into run-t1t2t4.
+- Patch: dispatch-only, 4 files, FLOE_SPARSE_BATCH_TELEMETRY (memoized marker, three-way port) +
+  FLOE_SPARSE_HOST_STEP_TABLES (+_DEBUG cross-check). Gate: aten::item 44→≤3/step, DtoH 46→≤2, syncs 3→1,
+  replay GPU ±5%.
+
+### L6 graph-key miss — verdict: the step16 miss is CORRECT, not a bug (report: L6-graph-key-miss.md)
+- Key = (rows tuple, admission epochs tuple) (sparse_runtime.py:1515); refill gives fresh epochs → miss is the
+  minimal sufficient statistic firing. Relaxation provably unsound (armed SparseExecution holds native lease
+  tickets + hot-slot claims + fence snapshot; kvaas forbids lease rebinding under capture; release-before-free-list).
+  Drain steps 14/15 structurally eager regardless (window dropped synchronously at release()).
+- Deliverables: FLOE_SPARSE_KEY_TRACE diagnostic (default OFF; one leg attributes every eager step to its key
+  component) + Tier-1 precapture spec "decoded live-set direct capture" (FLOE_SPARSE_WARM_DECODED, spec-only,
+  exploits fresh-vs-survivor asymmetry of the HIP first-touch crash); Tier-2 (refill) blocked on HIP-trace pin.
+- Open item flagged: req.commit_event recorded (sparse_runtime.py:1050) but no consumer found — latent hazard.
+
+### Deployment + queue
+- Clones: run-l5-clone / run-l6-clone / run-l4-clone (cp -a of run-t1t2t4-clone; CAPTURE_BARRIER=1, SHAPE_WARM=0
+  sanitized; INDEXER_DELTA_POOLS=1 + COMMIT_DEFER=1 preserved = legs-of-record state). Patches applied via
+  patch -p1 (hunk headers recomputed — lane markdown had wrong @@ counts and md-stripped blank lines in new-file
+  hunks); all touched files py_compile OK; L4 fuzz ≤2 spot-checked by grep (insertion sites + class indent correct).
+- sbatch: ctrl-family condition + l4a/l4b/l5/l5-debug arm blocks + default-0 marker printfs (KEY_TRACE,
+  BATCH_TELEMETRY, HOST_STEP_TABLES, HOST_STEP_TABLES_DEBUG) + extended marker echo. bash -n OK, mirror identical.
+- Queue (nid002706, serial): 657119 L5a ctrl-identity → 657120 L5b → 657121 L6 KEYTRACE diag → 657122 L4-1 l4a →
+  657123 L4-2 l4b → 657124 L7-b8 rows-soup MAXR=8 BENCH_CONC_SWEEP=4;8 (semicolon inside quoted export per the
+  L7 comma-truncation doctrine).
