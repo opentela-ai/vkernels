@@ -40,6 +40,8 @@ def _kernel():
         WGT,
         E,
         SCALING,
+        IDX_STRIDE,
+        WGT_STRIDE,
         K: tl.constexpr,
         NORM: tl.constexpr,
         BLOCK_E: tl.constexpr,
@@ -66,17 +68,33 @@ def _kernel():
             value = tl.sum(tl.where(e == first, scores, 0.0), axis=0)
             weights = tl.where(ks == i, value, weights)
             total += value
-            tl.store(IDX + row * K + i, first)
+            # IDX_STRIDE/WGT_STRIDE are the OUTPUT row pitches: callers may
+            # land the routed columns inside a wider pinned buffer (floe's
+            # shared-slot [T, K+1] index/weight rows — the appended shared
+            # column is prefilled once at warmup). Same values, same store
+            # order, one extra stride multiply per store.
+            tl.store(IDX + row * IDX_STRIDE + i, first)
         if NORM:
             weights = weights / (total + 1.0e-20)
-        tl.store(WGT + row * K + ks, weights * SCALING, mask=kmask)
+        tl.store(WGT + row * WGT_STRIDE + ks, weights * SCALING, mask=kmask)
 
     return _router
 
 
 def fused_router(logits, bias, top_k, scaling, norm_topk_prob=True,
-                 *, num_group=1, topk_group=1):
+                 *, num_group=1, topk_group=1,
+                 out_indices=None, out_weights=None):
     """Return ``(indices [T, K] int32, weights [T, K] fp32)``.
+
+    ``out_indices``/``out_weights`` (optional) preallocate the outputs: any
+    ``[T, >= K]`` CUDA tensors with unit column stride (int for indices,
+    floating for weights — ``int64`` is exact: the stored selection values
+    are small ints). The kernel writes the routed columns through the
+    tensors' own row stride, so a caller can target the first ``K`` columns
+    of a wider pinned ``[T, K+1]`` row (floe's shared-slot buffer: the
+    ``K+1``-th column is prefilled once at warmup and the per-call
+    ``torch.cat`` append disappears). Values and store order are identical
+    to the allocated-output run — pure store addressing.
 
     ``logits`` is the fp32 router GEMM output ``[T, E]``, ``bias`` the fp32
     ``e_score_correction_bias`` ``[E]``. Mirrors ``Glm53TopkRouter.forward``
@@ -110,8 +128,30 @@ def fused_router(logits, bias, top_k, scaling, norm_topk_prob=True,
         raise OpNotEligible("bias must be a float dtype")
     if not logits.is_cuda or logits.device != bias.device or not logits.is_contiguous() or not bias.is_contiguous():
         raise OpNotEligible("inputs must be contiguous tensors on the same GPU")
-    indices = torch.empty(tokens, top_k, device=logits.device, dtype=torch.int32)
-    weights = torch.empty(tokens, top_k, device=logits.device, dtype=torch.float32)
+
+    def _out(value, kind, name):
+        if value is None:
+            return None
+        if not value.is_cuda or value.device != logits.device:
+            raise OpNotEligible(f"{name} must be a CUDA tensor on the logits' device")
+        if value.shape[0] != tokens or value.shape[1] < top_k:
+            raise OpNotEligible(f"{name} must be [tokens, >= top_k], got {tuple(value.shape)}")
+        if value.stride(1) != 1:
+            raise OpNotEligible(f"{name} must be unit-stride along columns")
+        if kind == "int":
+            if value.dtype not in (torch.int32, torch.int64):
+                raise OpNotEligible(f"{name} must be int32/int64, got {value.dtype}")
+            return value
+        if kind == "float" and value.dtype.is_floating_point:
+            return value
+        raise OpNotEligible(f"{name} has the wrong dtype: {value.dtype}")
+
+    indices = _out(out_indices, "int", "out_indices")
+    if indices is None:
+        indices = torch.empty(tokens, top_k, device=logits.device, dtype=torch.int32)
+    weights = _out(out_weights, "float", "out_weights")
+    if weights is None:
+        weights = torch.empty(tokens, top_k, device=logits.device, dtype=torch.float32)
     if tokens:
         import triton
 
@@ -122,6 +162,8 @@ def fused_router(logits, bias, top_k, scaling, norm_topk_prob=True,
             weights,
             experts,
             float(scaling),
+            indices.stride(0),
+            weights.stride(0),
             top_k,
             bool(norm_topk_prob),
             triton.next_power_of_2(experts),

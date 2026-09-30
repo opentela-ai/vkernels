@@ -226,3 +226,83 @@ def test_gpu_edge_envelopes(torch):
     assert not wide.is_contiguous()
     with pytest.raises(OpNotEligible, match="contiguous"):
         fused_router(wide, torch.randn(288, device="cuda"), 8, 2.5)
+
+
+# ---------------------------------------------------------------------------
+# preallocated out-buffers (T5 shared-slot direct-store; floe pinned [T,K+1])
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_out_buffers_bit_identical(torch):
+    """Kernel stores into caller buffers are bit-identical to the
+    allocated-output run — same values, same store order, only the row
+    stride of the store address moves."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires GPU")
+    pytest.importorskip("triton")
+    from vkernels.torch_ops.glm_router import fused_router
+
+    torch.manual_seed(31)
+    for tokens, experts, k in [(1, 288, 8), (33, 288, 8), (7, 64, 2)]:
+        logits = torch.randn(tokens, experts, device="cuda")
+        bias = torch.randn(experts, device="cuda")
+        ref_idx, ref_w = fused_router(logits, bias, k, 2.5)
+
+        # exact-shape buffers
+        idx = torch.empty(tokens, k, device="cuda", dtype=torch.int32)
+        w = torch.empty(tokens, k, device="cuda", dtype=torch.float32)
+        fused_router(logits, bias, k, 2.5, out_indices=idx, out_weights=w)
+        assert torch.equal(idx, ref_idx) and torch.equal(w, ref_w)
+
+        # floe's shared-slot pinned row: [T, K+1] with the appended shared
+        # column prefilled (index = num_experts, weight = 1.0). The kernel
+        # must touch ONLY the first K columns.
+        shared_idx = torch.full((tokens, k + 1), experts, device="cuda", dtype=torch.int64)
+        shared_w = torch.ones(tokens, k + 1, device="cuda", dtype=torch.float32)
+        fused_router(
+            logits, bias, k, 2.5,
+            out_indices=shared_idx[:, :k], out_weights=shared_w[:, :k],
+        )
+        assert torch.equal(shared_idx[:, :k], ref_idx.to(torch.int64))
+        assert torch.equal(shared_w[:, :k], ref_w)
+        # shared column untouched (prefill survived the kernel store)
+        assert torch.equal(shared_idx[:, k], torch.full((tokens,), experts, device="cuda", dtype=torch.int64))
+        assert torch.equal(shared_w[:, k], torch.ones(tokens, device="cuda"))
+
+        # int64 out: int32 selection values stored exactly (no reinterpret)
+        idx64 = torch.empty(tokens, k, device="cuda", dtype=torch.int64)
+        fused_router(logits, bias, k, 2.5, out_indices=idx64)
+        assert torch.equal(idx64, ref_idx.to(torch.int64))
+
+
+def test_gpu_out_buffer_contract(torch):
+    """Out-buffer eligibility: wrong shape/dtype/device/stride rejected
+    BEFORE any launch (the caller falls back to the cat path)."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires GPU")
+    pytest.importorskip("triton")
+    from vkernels.torch_ops._dispatch import OpNotEligible
+    from vkernels.torch_ops.glm_router import fused_router
+
+    logits = torch.randn(3, 288, device="cuda")
+    bias = torch.randn(288, device="cuda")
+    good_i = torch.empty(3, 8, device="cuda", dtype=torch.int32)
+    good_w = torch.empty(3, 8, device="cuda", dtype=torch.float32)
+
+    with pytest.raises(OpNotEligible, match="out_indices"):
+        fused_router(logits, bias, 8, 2.5, out_indices=torch.empty(3, 8, dtype=torch.int32))  # CPU
+    with pytest.raises(OpNotEligible, match="out_indices"):
+        fused_router(logits, bias, 8, 2.5, out_indices=torch.empty(3, 4, device="cuda", dtype=torch.int32))
+    with pytest.raises(OpNotEligible, match="out_indices"):
+        fused_router(logits, bias, 8, 2.5, out_indices=torch.empty(3, 8, device="cuda", dtype=torch.float32))
+    with pytest.raises(OpNotEligible, match="out_weights"):
+        fused_router(logits, bias, 8, 2.5, out_weights=torch.empty(3, 8, device="cuda", dtype=torch.int32))
+    # non-unit column stride (column-major backing) rejected
+    colmajor = torch.empty(8, 3, device="cuda", dtype=torch.int32).t()
+    assert colmajor.shape == (3, 8) and colmajor.stride(1) != 1
+    with pytest.raises(OpNotEligible, match="unit-stride"):
+        fused_router(logits, bias, 8, 2.5, out_indices=colmajor)
+
+    # sanity: with valid buffers the call succeeds and fills them
+    fused_router(logits, bias, 8, 2.5, out_indices=good_i, out_weights=good_w)
+    assert bool((good_i >= 0).all()) and bool((good_i < 288).all())
