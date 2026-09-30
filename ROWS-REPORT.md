@@ -282,3 +282,47 @@ so the knob line below is the arm delta to append):
   `dsa_resolve_rows_batched` → attention pass); the kernel already supports it.
 - Fold the per-`swap_in` staging triple (`copy_`/`sub_`/`masked_fill_`) into the kernel's
   phase 1 (accept the padded int32 selection + pads tensor directly) — removes 33 launches/step.
+
+## 7. DEPLOYED + BENCHED (2026-09-30, beverin) — kernel 12× proven, end-to-end wash
+
+**Deployment** (all gates green before the first leg):
+- Parity on-cluster: **7/7 PASS** (job 656697, `tests/python/test_dsa_resolve_rows.py`, GPU),
+  after fixing the test's own bugs (multi-layer `[L]` slice on 2-D shared state, kernel-ranked
+  vs ref-ranked shape normalization in the comparisons, sbatch log truncation hiding tracebacks).
+- Import/knob probe in the REAL serve env (job 656699, 43 s): `dsa_resolve_rows` imports from
+  the repo vkernels (shadows staged), knob registered in `GLM53_KNOBS`, SparseStep methods present.
+- Patch applied on a fresh clone `run-rows-clone` (base run-wZTCex7s + ctrl-branch delta
+  (serve.py TP-knob bridge, knobs.py commit-defer marker, dispatch/forward tp_control_stream)
+  + the rows patch): `SparseStep.swap_in` routes via `_rows_lane_init()`/`_resolve_rows_fast()`
+  with **resolver-owned scratch** (captured-graph lifetime safety: buffers must outlive the
+  step like kvaas's own output/counters/fills), geometry-tuple re-key guard, shared prefetcher
+  tail, one-shot engagement/fallback logging; OQ-6 structural-warm probe calls the fast path
+  per layer pre-capture (JIT warm before any capture). First submission 656700 failed on the
+  missing ctrl-branch knob bridge (unknown --model-opt); 656701 ran clean.
+
+**Engagement (unambiguous)**: serve log `rows-lane: dsa_resolve_rows_fast latched -> vectorized`
+on all 4 ranks; **zero** FALLBACK warnings across both legs; correctness gate `all_paris=True`.
+
+**Results** (jobs 656701, 656705; arm `stack-moe-rows` = ctrl recipe + `dsa_resolve_rows_fast=true`):
+
+| metric | ctrl (656553) | rows 656701 | rows 656705 |
+|---|---|---|---|
+| decode tok/s p50 (B=1) | 13.4–13.9 | 13.89 | 13.72 |
+| concurrency agg (tok/s) | 27.58 | 26.30 | 25.61 |
+
+**Kineto** (656705 decode windows, per rank): `resolve_rows` **829 µs → 82 µs mean
+(12×)**; per-step 0.91 ms (w1, ~33 steps) / 1.14 ms (w2, ~35 steps) vs kvaas 9.1 ms —
+**~8.1 ms/step of pure compute removed**. `ncclDevKernel` = 55% (w1) / 62% (w2) of the
+window span (3646/4413 ms total kernel time = 83% in w1).
+
+**Verdict**: the kernel win is real and bit-exact, but under the served TP4 stack with
+`tp_control_stream` the step is **AR-wait-bound**: the saved 8.1 ms/step lands inside the
+all-reduce/skew slack, so decode p50 and agg are **flat-to-slightly-negative (within the
+~±1.5 tok/s leg band; soup leg 26.46 for reference)**. The E9-era "resolve_rows = 21% of
+step" attribution no longer holds on the stacked recipe — it was only true while the sync
+wire absorbed rank skew ON the critical path. Keep the lane landed (parity oracle intact,
+fallback verbatim) but **do not credit it as an end-to-end lever**; the remaining lever is
+AR volume itself, not per-layer compute.
+
+**Next lever (unchanged, sharpened)**: reduce the 11 fp32 ARs per step (segment-fused AR,
+AR+commit coalescing on the control stream) — AR is 55-62% of the served step span.
