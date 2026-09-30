@@ -715,3 +715,22 @@ variance sample.
   shrinks vs 657121's 140 (drain eager→capture conversion); shadow gate 0.0000 on new capture steps; all_paris=True;
   no capture crashes (a crash falsifies the fresh-admission-specific hypothesis).
   Patch scripts: patches/T1R/{apply_t1r.py,add_t1r_arm.py}.
+
+## Queue execution 4 — L5b (657173) mechanism PROVEN: blocking item tax −99.7%; call-count + sync gates partial; T1R leg live (657175)
+
+- **Delivery fix VERIFIED in-vivo**: "env-markers mirrored into repo-prof: 8 files" + repo-prof BATCH_TELEMETRY=1 —
+  the traced serve saw the knobs (unlike VOID 657145).
+- **657173 (L5b knobs ON) vs ctrl twin 657119, same kineto window (45 steps both, rccl 3034/3035)**:
+  - **aten::item blocking duration 1087.0 ms → 3.1 ms/window (−99.7%)** — the per-step DtoH-blocking item tax is
+    ELIMINATED (80.7→48.6 item calls/step, but the survivors are 1.4 µs non-blocking, not 300 µs syncs).
+  - DtoH memcpys 102→73/window; **syncs 124→123 (gate 3→1 NOT met)**; non-AR GPU compute identical (995/992 ms ✓
+    host-path-only confirmed); all_paris=True (bit-exact).
+  - **Verdict: mechanism proven, host-path win real in-trace; call-count gate (≤3/step) partially met (48.6/step
+    remain — other call sites than begin_step tolists), sync gate unmet.** Next iteration needs the l5-debug leg
+    (host_dbg=1) to enumerate the remaining sites.
+- **Wall: p50 7.21 (phase-1) / 9.65 (kineto-phase) vs twin 12.99 — DEGRADED on paper, but matches the L3
+  depressed-node pattern (leg A: 5.50/16.17) and AR busy was 167 ms (no skew this run). Confounded — queued
+  657179 (same-session ctrl twin on run-l5-clone) behind 657175 to separate node depression from patch cost.**
+- **657175 (first Tier-1 WARM_DECODED leg) RUNNING** — arm echo green ("t1r: warm_decoded + key_trace markers on").
+  Gates on completion: window-gone KEYTRACE population shrinks vs 657121's 140; shadow gate 0.0000 on new capture
+  steps; all_paris=True; ZERO capture crashes (crash = fresh-admission hypothesis survives, Tier-1 falsified).
