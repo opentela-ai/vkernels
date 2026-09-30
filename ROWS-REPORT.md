@@ -696,3 +696,22 @@ variance sample.
 - **L5b resubmitted as 657173** (queued behind 657147 l4b, running). Mirror synced + committed.
 - Note: ctrl same-config spread this session remains wide (B=1 12.72–14.05, agg 21.98–31.99); same-clone A/B pairs
   (657119 vs 657173; 657078 vs 657124) are the only decision-grade reads.
+
+## Queue execution 3 — L4 verdict honest (kernel-time win NOT proven); Tier-1 patch authored + queued (657175)
+
+- **657147 (L4b pinned slot) COMPLETED**: all_paris=True, p50 12.5 in-band. Trace: kernel-busy 2329 ms vs ctrl 3065 —
+  but the ENTIRE delta is rcclGenericKernel (allreduce wait/skew) −726 ms; non-AR compute identical (986 vs 996 ms).
+- **Three-way decode-w1 kernel-busy**: ctrl 657119 = 3065 (AR 2069) | l4a 657146 = 3861 (AR 2868) | l4b 657147 = 2329
+  (AR 1343). **AR busy swings ±0.8 s between same-family legs; non-AR compute is constant ±0.5%.**
+- **L4 verdict (honest): fusions ENGAGE (l4a `_conv_decode` 1054×, 5 ms/window total; l4b cat chain ~nil) and are
+  bit-exact with zero p50 regression, but the ~1.0 ms/step projection does NOT survive measurement — AR-skew variance
+  swamps a ~15 ms/window effect. Same pattern as T5 NOT-PROVEN.** The dominant cost is AR wait (2–3× compute),
+  confirming L1/L5/Tier-1 targets (host path + eager-warm seconds) over GPU compute.
+- **Tier-1 precapture (FLOE_SPARSE_WARM_DECODED) authored per L6 §4 spec**: knobs.py `sparse_warm_decoded()` +
+  sparse_runtime.py disjoint survivor-set direct-capture branch (all rows decoded-in-bucket at already-captured
+  shape; v3 fresh-set gate untouched; knob-off = one _env_flag read/step, byte-identical). Applied to run-l6-clone/repo
+  (compile OK), sbatch arm `stack-moe-t1r` added (whitelist + markers WARM_DECODED=1 KEYTRACE=1 + repo-prof mirror).
+  **Leg 657175 queued** behind 657173 (L5b retry with the marker-mirror fix). Gates: window-gone KEYTRACE population
+  shrinks vs 657121's 140 (drain eager→capture conversion); shadow gate 0.0000 on new capture steps; all_paris=True;
+  no capture crashes (a crash falsifies the fresh-admission-specific hypothesis).
+  Patch scripts: patches/T1R/{apply_t1r.py,add_t1r_arm.py}.
