@@ -598,3 +598,21 @@ variance sample.
   (phases 1/2) keep it. T1v2's 0.9-1.9s/capture-event win retained where it was measured.
 - Validation leg 657078 = 657018's exact crashing config (ARM=stack-moe-ctrl, barrier=0, shape_warm=1) on the guarded
   tree. Pass = 0 capture aborts + natural completion; then the seam-latency delta vs 657019/657032 (shape_warm=0).
+
+## T1v3 falsified; shape_warm default flipped OFF (post-close-out increment, legs 657078/657084)
+- **657078** (v3 guard, node 2676): COMPLETED clean, 0 aborts, E agg 31.99 / decode med 13.87 — but node-confounded
+  (2676 decodes ~30% faster in solo runs), and...
+- **657084** (v3 guard, node 2706, matched vs baselines): **FAILED — same 4x hipErrorStreamCaptureUnsupported at
+  section E.** The guard is falsified: section E's 4 requests are 4 separate live-sets, each window len(reqs)==1 —
+  the quiet-window condition never gated the crashing captures.
+- **Root cause corrected** (earlier "deadlock" read was wrong): the aborts are `HIP error: operation not permitted
+  when stream is capturing` — direct capture makes a fresh live-set's FIRST decode step the capture step, and that
+  step still carries first-touch host-tier residency work (prompt-commit D2H + miss-copy); some op in it is illegal
+  on a capturing HIP stream. Fatal via C++ terminate — kvaas's python-side retire guard can't intercept it.
+  Canonical eager→capture (shape_warm=0) never crashes (all legs, any node).
+- **Deployed posture**: `FLOE_SPARSE_SHAPE_WARM` default OFF in knobs.py (evidence docstring) + sbatch marker
+  (0004 patch). Direct capture = debug-legs-only behind explicit env. T1's seam win (0.9–1.9s/event, rare) stays
+  parked behind a HIP-trace debug cycle to pin the exact in-capture op.
+- Infra fixed en route: sbatch now auto-clears stale `repo-prof` (657019/657078 had served kineto-unpatched on it).
+- Scoreboard update: rows+soup +19.7% B=1 (deployed) · mhc_compose_pre +4.5–11.8% E agg (proven) · T5 negative ·
+  **T1v2/v3 not deployable (crash root-caused to HIP capture-vs-residency interaction; default off)**.
