@@ -109,8 +109,26 @@ deterministic across scratch reuse; cost ~K/FILL_CHUNK extra masked stores); (2)
 switched to `torch.zeros`; (3) test upgraded to FULL-tensor `torch.equal(fills, ref)` —
 stronger than the old max-slice (tails now defined on both sides). The walk itself
 (output/counters/errors/tags/ages all bit-exact in 4/5 passing legs) needed NO change.
-Awaiting the re-ship + re-run for the N/N confirmation; CPU semantic cases run anywhere,
-GPU legs skip without CUDA.
+
+On-cluster round 3 (job 656618): fills fix VERIFIED (fills/out/counters/errors bit-exact);
+next peel failed at the advanced-LRU compare — kernel `tags` had FEWER writes than the
+oracle (regressed to pre-loop values except where the input already matched). Root cause:
+**Triton lost the loop-carried tensor yields for `tags`/`tag_generations`, which were
+mutated THREE scf levels deep** (`if slot<H` → `if fenced` → `else` of `if is_hit`) inside
+the dynamic-trip-count walk. Proof by elimination: fills/out/counters bit-exact ⇒ same
+evict slots ⇒ the tag-write (slot→token) pairs were identical; `protected`/`ages` (mutated
+at depth 2) demonstrably persisted (fills equality REQUIRES their in-loop evolution);
+scalars at depth 3 (`hit_count`) persisted; only the depth-3 tensor mutations vanished.
+FIX: flattened ALL carried-tensor mutations to loop-body top level as predicated
+`tl.where`s (`is_evict & (h == slot)` etc. — all-false when unclaimed, so safe no-ops);
+claim/fence resolved as scalar predicates with masked scalar loads; only side-effect
+stores (fills) remain in a scalar `if`. Semantics transliteration unchanged. ALSO fixed a
+LATENT oracle divergence found while bisecting: the reference was missing the production
+PROTECT PRE-PASS (kvaas kernels.py:356-363 — lanes tagged with a valid-selected token at
+current page generation are immune to eviction before walked; the kernel builds the same
+set from the selected-token bitmap). Added to the oracle; without it, a pre-protected lane
+evicted early by the oracle would turn a later guaranteed hit into a miss — a counts/fills
+divergence waiting to fire in the random sweep. Awaiting re-ship + re-run.
 
 ## 4. floe-side patch TEXT (apply with the deployment's `patch -p4` flat layout; author paths shown repo-relative)
 
