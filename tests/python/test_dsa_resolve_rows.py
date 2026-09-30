@@ -240,7 +240,7 @@ def _gpu_parity_case(torch, dev, *, seed, k, batch=2, fence=False,
     )
     layers = 1
     kv = st["kv"].to(dev).to(torch.bfloat16).contiguous()
-    host = st["host"].to(dev).to(torch.bfloat16).pin_memory().contiguous()
+    host = st["host"].to(torch.bfloat16).pin_memory().contiguous()  # host tier stays host-side (pinned for H2D)
     t = lambda x: x.to(dev)  # noqa: E731
     tags = st["tags"].to(dev)
     tgs = st["tag_generations"].to(dev)
