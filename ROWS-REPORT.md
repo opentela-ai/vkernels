@@ -666,3 +666,17 @@ variance sample.
 - Queue (nid002706, serial): 657119 L5a ctrl-identity → 657120 L5b → 657121 L6 KEYTRACE diag → 657122 L4-1 l4a →
   657123 L4-2 l4b → 657124 L7-b8 rows-soup MAXR=8 BENCH_CONC_SWEEP=4;8 (semicolon inside quoted export per the
   L7 comma-truncation doctrine).
+
+## Queue execution 1 — whitelist miss fixed; L5a identity green; L6 attribution PROVEN in-vivo (657121)
+
+- **sbatch ARM whitelist miss**: the validation elif (~line 186) didn't know l4a/l4b/l5/l5-debug → 657120/657122/657123
+  died in ~24 s ("unknown ARM", exit 2). Fixed + error message extended; mirror synced. Resubmitted as 657145 (L5b) /
+  657146 (L4-1) / 657147 (L4-2), queued behind 657124 (L7-b8, running).
+- **657119 L5a ctrl-identity (run-l5-clone, knobs OFF): COMPLETED 16 m, rc1=0 rc2=0.** B=1 p50 12.99 tok/s (ctrl band
+  12.31–12.69, inside spread), 4-way agg 25.47, all_paris=True — knob-off identity gate GREEN (patched tree behaves).
+- **657121 L6 KEYTRACE diagnostic: COMPLETED 16 m, all gates green — the step16-class misses are CORRECT, proven in-vivo:**
+  180 KEYTRACE lines (4/rank); reasons: 140 window-gone (release closes window before key check) + 40 key-mismatch.
+  Refill signature EXACTLY as predicted: `old(rows=[0,1,2],ep=[8,9,10]) new(rows=[0,1,2,3],ep=[8,9,10,11])
+  rows_changed=[] epoch_changed=[3]` + `decoded_in_bucket=[True,True,False,False]` (survivors True, admissions False).
+  Zero spurious mismatches (reject-condition (a) did not fire); L6 closes CORRECT-miss; Tier-1 precapture
+  (FLOE_SPARSE_WARM_DECODED) spec graduates with a working freshness predicate.
