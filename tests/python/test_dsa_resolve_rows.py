@@ -44,6 +44,10 @@ def _build_state(torch, rng, *, batch=2, pages=8, page=64, hot_pages=3,
     active nonresident pages host-backed, lengths within pages*page."""
     import torch
 
+    # torch's GLOBAL RNG feeds kv/host/generations — unseeded, tests flake.
+    # Derive it from the python rng so each call is fully deterministic.
+    torch.manual_seed(rng.getrandbits(31))
+
     hot_rows = hot_rows or hot_pages * page
     # Pool sizing invariant (the job-656560 StopIteration fix): leaseable slots
     # must cover the WORST case by construction — resident rolls capped so the
@@ -335,7 +339,7 @@ def test_gpu_parity_multi_layer_state_indexing(torch):
     st = _build_state(torch, rng, batch=2, k=65, layers=1)
     layers = 3
     kv = st["kv"].repeat(layers, 1, 1).to(dev).to(torch.bfloat16).contiguous()
-    host = st["host"].repeat(layers, 1, 1).to(dev).to(torch.bfloat16).pin_memory().contiguous()
+    host = st["host"].repeat(layers, 1, 1).to(torch.bfloat16).pin_memory().contiguous()  # host tier stays host-side (pinned for H2D)
     t = lambda x: x.to(dev)  # noqa: E731
     tags = st["tags"].repeat(layers, 1, 1).to(dev)
     tgs = st["tag_generations"].repeat(layers, 1, 1).to(dev)
