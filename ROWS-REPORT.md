@@ -418,6 +418,15 @@ matched-node or it is noise; legs node-pinned via --nodelist from here on.** The
 references (ctrl 12.31/27.58, rows+soup 14.73/26.42) were single-node snapshots, not
 portable bands.
 
+**V0 follow-up (656892): matched-node is still not enough.** Same ctrl arm, same snapshot,
+same node (nid002706): 656849 = 13.54 p50 / 26.25 agg vs 656892 = 8.67 p50 / 31.52 agg
+~1.5 h later, with 656892's within-leg runs spreading 6.12→8.67→12.14 (656849's were
+tight: 13.45/13.54/13.6). Solo decode is host-latency-sensitive and gets crushed by
+interference that 4-way agg partially overlaps. **Primary evaluators from here on:
+kineto trace signatures (eager-forward presence, capture desyncs, launch counts, per-step
+replay ms — deterministic and leg-stable) and within-leg run spread; tok/s only as coarse
+corroboration, never as the decision metric.**
+
 **b8 (MAXR=8) first look** (656882, nid002926): decode p50 12.43 — better than the
 same-day default-MAXR rows+soup leg (8.24, node-confounded) — but agg fell to 23.96
 (22.73 at the conc[4] sweep point) vs ~26 at 4-way. Direction: **b8 helps single-stream
