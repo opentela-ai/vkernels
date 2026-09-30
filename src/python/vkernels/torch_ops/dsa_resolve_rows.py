@@ -185,30 +185,43 @@ def _kernel():
                 slot = tl.min(
                     tl.where(hm & ~protected & (ages == oldest), h, BLOCK_H), 0)
                 # H >= K guarantees a victim after protecting selected hits.
-            row_id = tl.full((), -1, tl.int64)
-            if slot < H:
-                hot_page = tl.load(HOT_SLOTS + request * HOT_PAGES + slot // PAGE)
-                fenced = True
-                if HAS_FENCE:
-                    fenced = tl.load(FENCE + hot_page) == tl.load(EXPECTED + hot_page)
-                if fenced:
-                    if is_hit:
-                        hit_count += 1
-                    else:
-                        host_page = tl.load(BACKING + request * PAGES + page)
-                        dst = hot_page * PAGE + slot % PAGE
-                        tl.store(FILL + (state * K + miss_count) * 2,
-                                 host_page * PAGE + offset)
-                        tl.store(FILL + (state * K + miss_count) * 2 + 1, dst)
-                        miss_count += 1
-                        tags = tl.where(h == slot, token, tags)
-                        tag_generations = tl.where(h == slot, generation,
-                                                   tag_generations)
-                    row_id = hot_page * PAGE + slot % PAGE
-                    protected = protected | (h == slot)
-                    ages = tl.where(h == slot, clock, ages)
-                else:
-                    err_count += 1
+            # claim/fence resolved as scalar predicates, NOT nested mutation:
+            # job-656618 — loop-carried TENSOR updates mutated three scf
+            # levels deep (if slot<H → if fenced → else of if is_hit) lost
+            # their yields on this Triton (tags/tag_generations regressed to
+            # pre-loop values at the epilogue store) while scalars at the
+            # same depth and tensors at depth 2 (protected/ages) survived.
+            # All carried-tensor mutations now happen at loop-body top level
+            # gated by predicates; only side-effect stores stay in the if.
+            claim = slot < H
+            hot_page = tl.load(HOT_SLOTS + request * HOT_PAGES + slot // PAGE,
+                               mask=claim, other=0)
+            if HAS_FENCE:
+                fenced = tl.load(FENCE + hot_page, mask=claim, other=0) == \
+                    tl.load(EXPECTED + hot_page, mask=claim, other=-1)
+            else:
+                fenced = claim
+            ok = claim & fenced
+            is_evict = ok & ~is_hit
+            row_id = tl.where(ok, hot_page * PAGE + slot % PAGE,
+                              -1).to(tl.int64)
+            hit_count += (ok & is_hit).to(tl.int64)
+            err_count += (claim & ~fenced).to(tl.int64)
+            if is_evict:
+                host_page = tl.load(BACKING + request * PAGES + page)
+                tl.store(FILL + (state * K + miss_count) * 2,
+                         host_page * PAGE + offset)
+                tl.store(FILL + (state * K + miss_count) * 2 + 1,
+                         hot_page * PAGE + slot % PAGE)
+                miss_count += 1
+            # carried-tensor updates, flattened (upd is all-false when
+            # slot == BLOCK_H, so unclaimed items are safe no-ops)
+            upd = h == slot
+            tags = tl.where(is_evict & upd, token, tags)
+            tag_generations = tl.where(is_evict & upd, generation,
+                                       tag_generations)
+            ages = tl.where(ok & upd, clock, ages)
+            protected = protected | (ok & upd)
             tl.store(OUTPUT + state * K + mi, row_id)
         tl.debug_barrier()
 
@@ -473,6 +486,20 @@ def resolve_rows_reference(resident, backing, generations, lengths, hot_slots,
         g_b = tag_generations[b].clone()
         a_b = ages[b].clone()
         clock_b = int(clock[b]) + 1
+        # production protect pre-pass: a hot lane whose tag is a VALID
+        # SELECTED token at that page's current generation is immune to
+        # eviction until the walk reaches it (kvaas does this as the
+        # O(K·H) compare pre-pass; the kernel builds the identical set
+        # from the selected-token bitmap — job-656618 follow-up: the
+        # oracle was missing it, a latent kernel↔oracle divergence).
+        sel_valid = selected[b][(selected[b] >= 0) & (selected[b] < length)]
+        tagged = (t_b >= 0).nonzero(as_tuple=True)[0]
+        if tagged.numel():
+            tt = t_b[tagged]
+            protected[tagged] = (
+                (generations[b, tt // page] == g_b[tagged])
+                & torch.isin(tt, sel_valid)
+            )
         res_n = hit_n = miss_n = err_n = 0
         for i in range(k):
             token = int(selected[b, i])
