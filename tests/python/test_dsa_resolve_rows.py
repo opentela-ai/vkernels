@@ -147,9 +147,17 @@ def test_reference_resident_rows_and_counts(torch):
     # resident pages
     res_pages = (st["resident"][0] >= 0).nonzero(as_tuple=True)[0]
     assert res_pages.numel()
+    length = int(st["lengths"][0])
+    page0 = int(st["page"])
+    # only pages that contain valid tokens (token < length); -1 is the
+    # correct answer for out-of-length tokens and this test pins hits
+    valid = res_pages[res_pages * page0 < length]
+    if valid.numel() == 0:
+        st["resident"][0, 0] = 0  # force page 0 resident; it always has valid tokens
+        valid = torch.tensor([0], dtype=res_pages.dtype)
     for j in range(st["selected"].shape[1]):
-        pg = int(res_pages[j % res_pages.numel()])
-        st["selected"][0, j] = pg * st["page"] + j % st["page"]
+        pg = int(valid[j % valid.numel()])
+        st["selected"][0, j] = pg * page0 + j % page0
     out = _run_reference(torch, st)
     page = st["page"]
     for j in range(st["selected"].shape[1]):
