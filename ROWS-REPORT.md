@@ -407,3 +407,45 @@ shared-slot cat elimination (~0.7 ms/step, bit-exact).
 
 **B=1 budget**: replay GPU 34.5 ms vs bench 67.9 ms/tok → ~33 ms is host-side. Soup
 (11.6) + item/sync (~11) is a credible path to **~20 tok/s B=1**.
+
+## Same-day band + node doctrine (lane L3, jobs 656849–656882)
+
+**Node-to-node variance dominates arm deltas today.** Same ctrl arm: 13.54 p50 / 26.25 agg
+on nid002706 vs **5.50 p50 / 16.17 agg on nid002666 minutes later** (runs 5.01/5.5/10.3 —
+node in a bad state). rows+soup re-run on the same bad node: 8.24 p1 → 13.17 p2 / agg 26.06
+(node half-recovered; agg on-band vs 26.42 ref). **Doctrine: every cross-arm comparison is
+matched-node or it is noise; legs node-pinned via --nodelist from here on.** The historical
+references (ctrl 12.31/27.58, rows+soup 14.73/26.42) were single-node snapshots, not
+portable bands.
+
+**b8 (MAXR=8) first look** (656882, nid002926): decode p50 12.43 — better than the
+same-day default-MAXR rows+soup leg (8.24, node-confounded) — but agg fell to 23.96
+(22.73 at the conc[4] sweep point) vs ~26 at 4-way. Direction: **b8 helps single-stream
+decode, costs aggregate**. Sweep gap: BENCH_CONC_SWEEP=4,8 emitted only conc[4] — no
+conc[8] row; needs a bench-script look before the 8-way aggregate question closes.
+
+## T1T2T4 validation stack (patches applied, V-triplet launched)
+
+Root cause of the transition tax (lane T1T2T4): the sparse runtime's captured window is
+keyed to the exact **live-set** `(rows tuple, admission epochs)` (sparse_runtime.py:1347) —
+any drain/refill mints a new key → full eager warm (~2.3 s) + re-capture desync (~1.8 s)
+per transition, even at a width whose graph replayed minutes earlier (the step16 anomaly).
+Dense bank exonerated (pre-captures all widths, never re-captures).
+
+- **T1** (`17b4eb0`, kill-switch `FLOE_SPARSE_SHAPE_WARM=0`): shape-level warm gate —
+  `bucket.ever_captured` lets a fresh live-set at an already-captured width capture on its
+  first step (the eager warm existed only to keep Triton JIT out of capture; guarantee is
+  shape-level: bucket-fixed B, 256-grain t_pad, OQ-6 pre-capture probe re-warms resolvers).
+- **T2** (`FLOE_SPARSE_CAPTURE_BARRIER=0` to disable): TP barrier after capture_forward,
+  before first replay — kills the 0.9–1.9 s first-replay AR desync. Known edge: an
+  asymmetric capture failure would block peers at the barrier (NCCL watchdog aborts;
+  zero capture failures in any leg so far).
+- **T4**: `stack-moe-mhc` arm added to the sbatch = ctrl config verbatim +
+  `--model-opt mhc_compose_pre=true` (the real new flip; `mhc_pre_big_fuse` is implied by
+  the recipe's `mhc_big_fuse`). Parity gate: phase_correctness ok + all_paris=True +
+  fallback-count comparison vs ctrl + greedy-hash spot check.
+
+V-triplet (V0 ctrl / V1 +T1T2T4 / V2 +mhc_compose_pre, all node-pinned nid002706,
+sequential): expected signatures — transitions capture directly after the first drain
+cycle (no 2.3 s eager forwards), desync ARs gone, agg ≥ 27.5 target on V1, B=1 p50
+~unchanged (its transitions are pre-timing).
