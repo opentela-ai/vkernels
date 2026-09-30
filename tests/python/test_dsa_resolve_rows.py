@@ -287,10 +287,45 @@ def _gpu_parity_case(torch, dev, *, seed, k, batch=2, fence=False,
     assert torch.equal(counters, ref["counters"].to(dev))
     assert torch.equal(errors, ref["errors"].to(dev))
     assert torch.equal(fills, ref["fills"].to(dev))
-    assert torch.equal(tags.cpu(), ref["tags"])
-    assert torch.equal(tgs.cpu(), ref["tag_generations"])
-    assert torch.equal(ages.cpu(), ref["ages"])
-    assert torch.equal(clock.cpu(), ref["clock"])
+    _kt = tags.cpu().reshape(ref["tags"].shape)
+    if not torch.equal(_kt, ref["tags"]):
+        d = (_kt != ref["tags"])
+        idx = d.nonzero()[:12]
+        print(f"[tag-diff seed={seed} k={k} batch={batch} fence={fence} "
+              f"pad={allow_padding}] ndiff={int(d.sum())} of {d.numel()}")
+        for ix in idx:
+            i = tuple(ix.tolist())
+            print(f"  tags{i}: kernel={_kt[i].item()} "
+                  f"ref={ref['tags'][i].item()}")
+        # correlate with per-request residency: which requests had misses?
+        print(f"  counters={counters.cpu().tolist()}")
+        raise AssertionError("tags diverge (see [tag-diff] dump above)")
+    assert torch.equal(tags.cpu().reshape(ref["tags"].shape), ref["tags"])
+    _kt = tgs.cpu().reshape(ref["tag_generations"].shape)
+    if not torch.equal(_kt, ref["tag_generations"]):
+        d = (_kt != ref["tag_generations"])
+        idx = d.nonzero()[:12]
+        print(f"[tgs-diff seed={seed} k={k} batch={batch} fence={fence} "
+              f"pad={allow_padding}] ndiff={int(d.sum())}")
+        for ix in idx:
+            i = tuple(ix.tolist())
+            print(f"  tgs{i}: kernel={_kt[i].item()} "
+                  f"ref={ref['tag_generations'][i].item()}")
+        raise AssertionError("tag_generations diverge (see [tgs-diff] dump)")
+    assert torch.equal(tgs.cpu().reshape(ref["tag_generations"].shape), ref["tag_generations"])
+    _kt = ages.cpu().reshape(ref["ages"].shape)
+    if not torch.equal(_kt, ref["ages"]):
+        d = (_kt != ref["ages"])
+        idx = d.nonzero()[:12]
+        print(f"[ages-diff seed={seed} k={k} batch={batch} fence={fence} "
+              f"pad={allow_padding}] ndiff={int(d.sum())}")
+        for ix in idx:
+            i = tuple(ix.tolist())
+            print(f"  ages{i}: kernel={_kt[i].item()} "
+                  f"ref={ref['ages'][i].item()}")
+        raise AssertionError("ages diverge (see [ages-diff] dump)")
+    assert torch.equal(ages.cpu().reshape(ref["ages"].shape), ref["ages"])
+    assert torch.equal(clock.cpu().reshape(ref["clock"].shape), ref["clock"])
     # resolved resident rows must point at the resident-page latents
     page = st["page"]
     for j in range(k):
@@ -352,10 +387,12 @@ def test_gpu_parity_multi_layer_state_indexing(torch):
         page_tokens=st["page"],
     )
     for L in range(layers):
+        # _build_state yields the shared single-layer (2-D) initial state;
+        # each layer starts from it and must evolve independently.
         ref = resolve_rows_reference(
             st["resident"], st["backing"], st["generations"], st["lengths"],
-            st["hot_slots"], st["selected"], st["tags"][L], st["tag_generations"][L],
-            st["ages"][L], st["clock"][L], page_tokens=st["page"],
+            st["hot_slots"], st["selected"], st["tags"], st["tag_generations"],
+            st["ages"], st["clock"], page_tokens=st["page"],
         )
         assert torch.equal(out[L].cpu(), ref["output"])
         assert torch.equal(counters[L].cpu(), ref["counters"])
