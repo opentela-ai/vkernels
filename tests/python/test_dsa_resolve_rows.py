@@ -242,10 +242,10 @@ def _gpu_parity_case(torch, dev, *, seed, k, batch=2, fence=False,
     kv = st["kv"].to(dev).to(torch.bfloat16).contiguous()
     host = st["host"].to(torch.bfloat16).pin_memory().contiguous()  # host tier stays host-side (pinned for H2D)
     t = lambda x: x.to(dev)  # noqa: E731
-    tags = st["tags"].to(dev)
-    tgs = st["tag_generations"].to(dev)
-    ages = st["ages"].to(dev)
-    clock = st["clock"].to(dev)
+    tags = st["tags"].repeat(layers, 1, 1).to(dev)  # kernel contract: [layers, batch, hot_rows]
+    tgs = st["tag_generations"].repeat(layers, 1, 1).to(dev)
+    ages = st["ages"].repeat(layers, 1, 1).to(dev)
+    clock = st["clock"].repeat(layers, 1).to(dev)  # [layers, batch]
     selected = st["selected"].to(dev)
     fv = fe = None
     if fence:
