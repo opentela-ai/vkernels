@@ -227,3 +227,67 @@ def test_gpu_parity(torch):
     )
     torch.testing.assert_close(kc, exp_kc)
     torch.testing.assert_close(vc, exp_vc)
+
+
+def test_rms_norm_gated_reference_matches_floe_eager(torch):
+    """The oracle restates floe's ``Glm53RMSNormGated`` eager chain exactly:
+    fp32 stats -> rsqrt -> x*inv -> *w -> *sigmoid(gate) -> one bf16 cast."""
+    import torch
+
+    from vkernels.torch_ops.elementwise import rms_norm_gated_reference
+
+    torch.manual_seed(5)
+    x = torch.randn(4, 16, dtype=torch.bfloat16)
+    gate = torch.randn(4, 16, dtype=torch.bfloat16) * 8
+    module = _Norm(torch, 16, seed=7)
+
+    dtype = x.dtype
+    x32 = x.float()
+    x32 = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + module.variance_epsilon)
+    x32 = module.weight.float() * x32
+    expected = (x32 * torch.sigmoid(gate.float())).to(dtype)
+    torch.testing.assert_close(rms_norm_gated_reference(x, gate, module), expected)
+
+
+def test_gpu_rms_norm_gated_parity(torch):
+    """``rms_norm_gated`` (sigmoid, GLM o_norm) — one launch, strict fp32,
+    the eager left-to-right multiply order. This is the T5 target-2a
+    variant: the kernel family already covers the sigmoid activation, so
+    the parity bar is the eager chain itself, not a sibling kernel."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires GPU")
+    pytest.importorskip("triton")
+    import torch
+
+    from vkernels.torch_ops.elementwise import rms_norm_gated, rms_norm_gated_reference
+
+    torch.manual_seed(19)
+    for rows, d in [(6, 128), (1, 128), (17, 64), (3, 96)]:
+        x = torch.randn(rows, d, device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn(rows, d, device="cuda", dtype=torch.bfloat16) * 12
+        module = _Norm(torch, d, seed=3)
+        module.weight = module.weight.to("cuda")
+        out = rms_norm_gated(x, gate, module)
+        ref = rms_norm_gated_reference(x, gate, module)
+        torch.testing.assert_close(out, ref)
+        # bf16 store contract: out rounds exactly where the reference does
+        assert out.dtype == torch.bfloat16
+
+    # fp64 oracle cross-check (stats-dominated eps region)
+    x = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)
+    module = _Norm(torch, 128, seed=9)
+    module.weight = module.weight.to("cuda")
+    out = rms_norm_gated(x, gate, module).float()
+    x64 = x.double()
+    inv = torch.rsqrt((x64 * x64).mean(-1, keepdim=True) + module.variance_epsilon)
+    oracle = (((x64 * inv) * module.weight.double()) * torch.sigmoid(gate.double())).float()
+    torch.testing.assert_close(out, oracle, atol=2e-2, rtol=2e-2)
+
+    # gate -> -inf saturates fp32 sigmoid to exactly 0: the product is an
+    # exact bf16 zero; a NaN gate propagates like the eager chain
+    gate_inf = torch.full((2, 128), float("-inf"), device="cuda", dtype=torch.bfloat16)
+    assert torch.equal(rms_norm_gated(x[:2], gate_inf, module), torch.zeros(2, 128, device="cuda", dtype=torch.bfloat16))
+    g_nan = gate.clone()
+    g_nan[0, 0] = float("nan")
+    assert torch.isnan(rms_norm_gated(x, g_nan, module)[0, 0])
