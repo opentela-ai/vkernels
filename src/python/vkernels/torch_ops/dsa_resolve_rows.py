@@ -457,16 +457,26 @@ def resolve_rows_reference(resident, backing, generations, lengths, hot_slots,
     ``ages``/``clock`` state — all bit-exact against the production kernel
     by transliteration (scalar walk over K in selection order).
     """
+    # Device/dtype/shape normalization. Everything is pulled to CPU int64
+    # up front (GPU parity callers pass CUDA tensors), and `lengths`/`clock`
+    # are flattened to 1-D: a per-layer caller can hand the reference a
+    # scalar (0-dim) clock/lengths, and `clock[b]` on a 0-dim tensor raises
+    # "invalid index of a 0-dim tensor" in torch 2.9 — jobs 656671/656672/
+    # 656673 died here before the walk even started. A scalar is broadcast
+    # across the batch; the advanced clock is reshaped back to the input's
+    # shape on return so shape-sensitive compares stay intact.
     resident = resident.long().cpu()
     backing = backing.long().cpu()
     generations = generations.long().cpu()
-    lengths = lengths.long().cpu()
+    lengths = torch.atleast_1d(lengths.long().cpu()).reshape(-1)
     hot_slots = hot_slots.long().cpu()
     selected = selected.long().cpu()
     tags = tags.long().cpu().clone()
     tag_generations = tag_generations.long().cpu().clone()
     ages = ages.long().cpu().clone()
-    clock = clock.long().cpu().clone()
+    clock = clock.long().cpu()
+    clock_shape = clock.shape
+    clock = torch.atleast_1d(clock).reshape(-1)
     has_fence = fence_values is not None
     if has_fence:
         fence_values = fence_values.long().cpu()
@@ -476,6 +486,10 @@ def resolve_rows_reference(resident, backing, generations, lengths, hot_slots,
     hot_rows = tags.shape[-1]
     k = selected.shape[-1]
     page = page_tokens
+    if lengths.numel() == 1 and batch > 1:
+        lengths = lengths.expand(batch)
+    if clock.numel() == 1 and batch > 1:
+        clock = clock.expand(batch).clone()  # materialize: clock[b] is written back
     output = torch.full((batch, k), -1, dtype=torch.int64)
     counters = torch.zeros((batch, 3), dtype=torch.int64)
     errors = torch.zeros((batch,), dtype=torch.int64)
@@ -562,5 +576,7 @@ def resolve_rows_reference(resident, backing, generations, lengths, hot_slots,
     return {
         "output": output, "counters": counters, "errors": errors,
         "fills": fills, "tags": tags, "tag_generations": tag_generations,
-        "ages": ages, "clock": clock,
+        "ages": ages,
+        "clock": (clock.reshape(clock_shape)
+                  if clock.numel() == clock_shape.numel() else clock),
     }

@@ -150,6 +150,24 @@ every run of every GPU case since 5e1e45d. FIX: zeroing store masks are now
 same class of bug (bitmap clear, classify pass, walk stores, KV copy — all correctly
 bounded). Awaiting re-ship + re-run.
 
+On-cluster round 5 (jobs 656671/656672/656673, tree bdddd14 = 80ef6d4 + harness fixes:
+unseeded torch global RNG in _build_state pinned via torch.manual_seed — real flake,
+generations/kv fed by unseeded RNG — plus multi-layer host-pin fix and full-failure-list
+sbatch): 5/7 — BOTH remaining failures are the GPU tests, BOTH dying INSIDE the reference
+before the walk: `IndexError: invalid index of a 0-dim tensor` at the
+`clock_b = int(clock[b]) + 1` line. NOT a semantics bug (CPU suite green; the 30k-state
+fuzz already cleared the walk transliteration) — a SHAPE bug in the reference's entry
+handling: the head-of-function `.long().cpu()` conversions cover device/dtype but not
+rank, and a per-layer caller can hand the reference a 0-dim (scalar) `clock`/`lengths`
+(e.g. `state["clock"][L]` on a 1-D per-request tensor); `clock[b]` on a 0-dim tensor is
+exactly torch 2.9's "invalid index of a 0-dim tensor". FIX: entry normalization now does
+`torch.atleast_1d(...).reshape(-1)` for lengths and clock (scalar inputs are broadcast
+across the batch — clock's expanded view is materialized with .clone() since the walk
+writes `clock[b] = clock_b` back), and the advanced clock is reshaped to the INPUT's
+shape on return so shape-sensitive compares (kernel-shaped [1,batch] vs reference)
+stay intact. Semantics of the walk untouched. py_compile + ast clean on the final tree.
+Awaiting re-ship + re-run.
+
 ## 4. floe-side patch TEXT (apply with the deployment's `patch -p4` flat layout; author paths shown repo-relative)
 
 ```patch
