@@ -93,8 +93,8 @@ def _build_state(torch, rng, *, batch=2, pages=8, page=64, hot_pages=3,
         nonres = [pg for pg in range((L + page - 1) // page) if resident[b, pg] < 0]
         for hp in range(min(hot_pages, len(nonres))):
             pg = nonres[hp]
-            tok = pg * page + int(rng.randint(0, page))
-            slot = hp * page + int(rng.randint(0, page))
+            tok = pg * page + int(rng.randrange(page))
+            slot = hp * page + int(rng.randrange(page))
             tags[b, slot] = tok
             tag_generations[b, slot] = generations[b, pg]
     ages = torch.randint(0, 100, (batch, hot_rows), dtype=torch.int64)
@@ -106,7 +106,7 @@ def _build_state(torch, rng, *, batch=2, pages=8, page=64, hot_pages=3,
         # the slot the earlier miss reserved)
         for b in range(batch):
             L = int(lengths[b])
-            src = int(rng.randint(0, k))
+            src = int(rng.randrange(k))  # randint(0,k) is INCLUSIVE — index-k blowup
             selected[b, k - 1] = selected[b, src]
             hot_tok = int(tags[b][tags[b] >= 0][0]) if (tags[b] >= 0).any() else 0
             if hot_tok < L:
