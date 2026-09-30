@@ -523,3 +523,25 @@ increased capture frequency (close-during-capture overlap). Isolation leg 657010
 gated on it — a phase-E abort kills its phase 2. If barrier=0 passes section B AND
 phase E, the barrier-off tree is the V2 baseline; else the implicated patch needs a
 symmetry/teardown fix before V2 fires.
+
+## DELIVERY BUG: ISO leg 657010 was VOID (knob never delivered) — fix landed
+
+The barrier-off isolation leg 657010 crashed identically to 656937 — but a serve_env
+audit showed `FLOE_SPARSE_CAPTURE_BARRIER=0` never reached the serve process: the
+glm5-smoke EDF scrubs `os.environ` during heavy imports, so step-time knob reads
+(`knobs._env_flag`) miss plain `--export` env. The codebase already knew this
+(knobs.py commit-defer accessor: "Env delivery is unreliable on the glm5-smoke EDF";
+soup/delta-pool knobs use marker files) — the new T1/T2 knobs predated the lesson.
+**T2 is therefore NOT exonerated; the phase-E attribution (T2 barrier vs T1v2
+capture-onset) is re-opened.**
+
+Fix (vkernels-floe t1t2t4 `12498f6` + sbatch): `_env_flag` gains the standard
+marker-file fallback (`<repo-root>/env-markers/<NAME>`, env wins, 6-assertion host
+test green); the sbatch materializes `FLOE_SPARSE_CAPTURE_BARRIER` /
+`FLOE_SPARSE_SHAPE_WARM` markers EVERY leg from the job env with an engagement echo
+(per-leg delivery proof in the serve log). In flight, serialized on nid002706:
+- **657018** ISO redo: barrier=0 only → if phase E passes, T2 implicated; else T1v2.
+- **657019** V2 (stack-moe-mhc): `mhc_compose_pre=true` (argv — scrub-immune) on the
+  maximally-V0-like capture path (shape_warm=0 + barrier=0 = V0 capture semantics +
+  v2 bugfixes), ctrl baseline = kin-656984 traces. Parity gate: correctness ok +
+  all_paris + greedy-hash spot check vs ctrl arm.
