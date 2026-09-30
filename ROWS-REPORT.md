@@ -545,3 +545,24 @@ test green); the sbatch materializes `FLOE_SPARSE_CAPTURE_BARRIER` /
   maximally-V0-like capture path (shape_warm=0 + barrier=0 = V0 capture semantics +
   v2 bugfixes), ctrl baseline = kin-656984 traces. Parity gate: correctness ok +
   all_paris + greedy-hash spot check vs ctrl arm.
+
+## Phase-E attribution CONCLUSIVE (657018/657019) + V2 first number
+
+With delivery now proven (per-leg sbatch echo + on-disk markers):
+- **657018** (shape_warm=ON + barrier=0): phase E CRASHES (4× `~CUDAGraph` HIP abort) —
+  with T2 disabled the crash persists.
+- **657019** (shape_warm=0 + barrier=0): phase E PASSES, job completes clean.
+Delta = **T1v2's shape-warm capture-onset gate is the phase-E culprit; T2 is fully
+exonerated** (the barrier neither causes nor masks it). Mechanism: immediate
+capture-on-settle destroys/retires graph state while the stream is still capturing,
+under phase E's live-set churn. T1v2 stays default-OFF (marker shape_warm=0) until a
+deferral guard lands; its seam-latency win (~0.9–1.9 s/capture) is the prize for the
+fix lane.
+
+**V2 (mhc_compose_pre) first leg (657019): E agg 28.72 vs ctrl 25.69 (+11.8%), row p50
+7.18 vs 6.42 (+11.8%), correctness ok, finish=stop.** Capture semantics matched (both
+arms on V0-like warm-then-capture). Single-stream decode medians not comparable
+cross-job (documented 2× same-arm swings). Trace-level mechanism proof pending: the
+leg's phase-2 kineto came up EMPTY (stale repo-prof bail, same failure class as the
+old ctrl legs) — repo-prof cleared, V2 re-run queued (657032) for traces + a second
+variance sample.
