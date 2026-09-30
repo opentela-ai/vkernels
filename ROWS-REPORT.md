@@ -492,3 +492,34 @@ Deferred (deliberate): F2 V-major rec-pool migration (kills gather+writeback ent
 ~3 kernels/layer/step) — blocked on checkpoint layout + TP state_dict ripple; its own
 lane. A K-major buffer read as V-major is stride-identical for square heads, so
 eligibility checks cannot catch a wrong-layout pool — migration must be atomic.
+
+## T5 verdict on beverin: NOT PROVEN (CTRLKIN, jobs 656939/656970/656984)
+
+Both T5 legs ran clean (0 fallbacks, 0 tracebacks, kda/fused knobs engaged on 4/4 ranks,
+`_gemv_bf16` +102/step proves the packed-decode path is live) — but the kineto launch-count
+gate **failed**: inside `step[DECODE]`, arange ≈89–94/step, cat ≈209/step, sigmoid exactly
+68/step in **all** arms (t5a, t5b, and the freshly captured ctrl baseline); index_put is
+1–6/step *higher* in t5 (282 vs 250). The local dev claims (arange 85→0, index_put 108→34,
+slot-cat 84→0) do **not** transfer to the serving path — the fused kernels run *alongside*
+the targeted eager ops, not instead of them. Throughput deltas are within noise on the
+pinned node (t5b vs t5a p50 +2.3%/−1.5%). Attribution: **no kineto-supported win**; T5
+fusions stay default-off on the serving path until the wiring gap (which call site still
+emits the eager chain) is root-caused.
+
+Root cause of every empty ctrl `kin-*` dir (656553→656892, days of trace-less runs): stale
+`run-ctrl-clone/repo-prof` made `apply_kineto_patch_bev.py` bail "already exists" → serve
+ran unpatched with kineto disabled. Cleared; ctrl baseline trace now exists (kin-656984,
+1.35 GB, decode p50 12.63) — the evaluator for all future arms.
+
+## V1 (T1T2T4) outcome: target crash FIXED, new phase-E abort under attribution
+
+Job 656937 (v2 patch, nid002706): the exact section-B phase that 500'd in 656923 now
+passes 3/3 with zero capture failures; decode p50 13.87 vs V0 8.67 (no regression).
+New unrelated failure: phase E (first 4-way session) aborts all 4 ranks with
+`HIP error: operation not permitted when stream is capturing` from `~CUDAGraph()` →
+SIGABRT. Suspects: T2 capture-barrier rank symmetry under ragged rosters, or T1v2's
+increased capture frequency (close-during-capture overlap). Isolation leg 657010
+(`FLOE_SPARSE_CAPTURE_BARRIER=0`, same tree/node) in flight; V2 (`stack-moe-mhc`) stays
+gated on it — a phase-E abort kills its phase 2. If barrier=0 passes section B AND
+phase E, the barrier-off tree is the V2 baseline; else the implicated patch needs a
+symmetry/teardown fix before V2 fires.
