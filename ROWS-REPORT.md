@@ -1032,3 +1032,26 @@ Priority queue (device-side, width-1, 37ms budget):
 2. aten glue ~9ms -> the remaining unfused elementwise/reduce soup.
 3. resolve_rows 5.0ms + MoE 5.5ms (lever 2/3 kernel work).
 4. RCCL 3.7ms (small; TP restructuring later).
+
+## T2R-6 follow-up: the Cijk block IDENTIFIED (658387 + trace re-analysis)
+
+The gemv-decline diagnostic leg: ZERO decode-M declines (only prefill
+M=21-23 chunks) -- the fp8 dense GEMV fleet ENGAGES at decode all
+along. The 658286 trace recount: _gemv_fp8 = 63.7 calls/step at only
+361us/step TOTAL (~5.7us/call; _pre_gemv another 13ms/trace-window).
+The "fleet never engages" read was a name-grep artifact.
+
+The Cijk block (~147 calls, 5.4-10.7ms/step) = the gated-delta-rule
+ATTENTION CONTRACTIONS (forward.py ~2836-2849: attn @ v_beta, attn @
+(k_beta * g.exp()), the per-layer state updates + core_attn_out
+assembly) -- ~3 tiny batched GEMMs x 45 layers, each ~40-70us of
+rocBLAS small-tile time for trivial FLOPs. Not projection weights:
+attention math outside every fleet.
+
+Fix class: extend the vkernels fused attention family (_big_fuse /
+_compose / the aiter_mhc path, currently OFF) to absorb these
+contractions -- real kernel work (the lever-2/3 class), not config.
+
+Revised width-1 device budget (37ms): delta-rule matmuls 5.4-10.7 |
+aten glue ~9.2 | resolve 5.0 | MoE 5.5 | GEMV fleet 0.36 | RCCL 3.7 |
+attention/misc remainder.
