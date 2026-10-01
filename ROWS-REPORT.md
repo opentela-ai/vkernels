@@ -1141,3 +1141,23 @@ SESSION OPTIMIZATION LEDGER (width-1 device-ms, same-node gates):
 conc 30.4s -> 16.6s (SGFUSE+KDAFUSE recipe, RGEMV pending calm-window
 verification). Remaining blocks all kernel-surgery class: MoE decode
 chain (5.1), resolve (4.9), glue (4.6), residual Cijk, RCCL (2.1-2.9).
+
+## T2R-11 moe_bf16_decode — implemented, MEMORY-BLOCKED on this config (658522/658530)
+
+The 658521 bound: a bf16-resident read of the same weight values runs
+3672 GB/s (L2-assisted) vs the tuned fp8 chain's 760 GB/s — 2.4x
+despite 2x bytes; the decode chain is instruction-bound. Implemented
+end-to-end (vkernels _kernels16 bit-exact by construction + the floe
+OPT-IN moe_bf16_decode with lazy twins; 7715f32/20208f3/2e3f374):
+
+- 658522: OOM — the full-stack _dq fp32 transient (~5GB at E=289).
+- 658530 (chunked, ~270MB transient): STILL oom_killed — the
+  PERSISTENT twins (+3.6GB/rank, +14.4GB node-wide) exceed the config's
+  headroom (the fp8 stacks exist FOR memory; kvaasd's pool shares the
+  node). The lazy-at-first-decode timing lands after the KV/daemon
+  pools take their share.
+
+Disposition: OPT-IN stays off; the code is correct and ready. The 2.4x
+lands where the memory math works: EP-sharded experts (1/4 the twin
+cost/rank), smaller-IA variants, or evictable/hot-set twins (a
+top-working-set bf16 cache with the fp8 path as the miss handler).
