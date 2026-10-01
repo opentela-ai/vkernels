@@ -853,3 +853,31 @@ launch-bound 4809/step).
 Next-arc menu (unchanged): (a) standalone width-4 re-capture repro -> the
 deep capture fix; (b) eager-path batched gemv for bs<=4 (rocBLAS ensemble
 24% of width-4 compute); (c) HIP 209 root cause.
+
+## T2R-2 GEMV4 arc — engaged, conc-NEUTRAL (657788)
+
+Mechanism found from the code: the deployed dispatch has NO
+fp8_dense_gemv_max_m -> default cap 2 -> at width-4 (M=4) every fp8
+dense projection with shape != (512,4096) takes the dequant-on-use
+fallback (materialize bf16 = 2x transient bytes + cuBLAS/rocBLAS GEMM)
+= the 142-call/step rocBLAS ensemble in the 657570 trace. The b4-2026-
+09-28 census already validated routing M=4 back onto the GEMV fleet
+(weight-read-once); the flag just was not deployed.
+
+Fix (opt-in, GEMV4=1 in --export -> --model-opt fp8_dense_gemv_max_m=4;
+sbatch block before the env PYTHONPATH command — an insertion INSIDE
+the env continuation kills the env prefix and the serve silently falls
+to the STALE EDF PYTHONPATH (glm5-smoke/repo + kvaas-fix ->
+ManagedResidencySessionLost ImportError, 657775)).
+
+657788: flag engaged (dispatch knobs show 4), width-1 p50=12.91
+[11.53,12.91,13.28] healthy, conc wall=254.6s agg=2.01 vs 251.7s
+baseline — NEUTRAL. The eager width-4 step is LAUNCH-bound (4809
+launches/step, zero graph replays): GPU-compute savings (~4-6ms of
+~24% compute share) are masked by the CPU launch time. The GEMV4
+routing stays future-relevant for any captured width-4 path (avoids
+the dequant materialization); opt-in only, zero deployed delta.
+
+Conclusion: the conc lever = the captured width-4 path only — i.e.
+arc (a), the standalone re-capture repro -> the C++-level
+"operation not permitted when stream is capturing" fix.
