@@ -32,21 +32,31 @@ def _kernel():
     import triton
     import triton.language as tl
 
-    @triton.jit
-    def _dsa_scores(Q, K, W, Y, S: tl.constexpr, H: tl.constexpr, D: tl.constexpr, T: tl.constexpr, BT: tl.constexpr):
+    @triton.jit(do_not_specialize=["t_len"])
+    def _dsa_scores(Q, K, W, Y, S: tl.constexpr, H: tl.constexpr, D: tl.constexpr, t_len, BT: tl.constexpr):
+        # ``t_len`` is a RUNTIME argument (the candidate count, i.e. the
+        # ctx-derived dim): it feeds only the grid, the lane mask and the
+        # output stride, never a tile shape, so ONE compiled kernel serves
+        # every context. This used to be ``T: tl.constexpr`` — the full
+        # prefix length, +1 per decode step — which put the context into
+        # the Triton compile key and recompiled per step (the sgs-gpu07
+        # 8K JIT cliff; see ctx_buckets.py). Tile shapes (BT) and every
+        # load/store mask are unchanged from the constexpr version, so the
+        # kernel is bit-identical per launch; the mask lanes beyond
+        # ``t_len`` were already dead (masked load, masked store).
         bs = tl.program_id(0)
         b = bs // S
         t = tl.program_id(1) * BT + tl.arange(0, BT)
         d = tl.arange(0, D)
         h = tl.arange(0, H)
-        tmask = t < T
+        tmask = t < t_len
         q = tl.load(Q + bs * (H * D) + h[:, None] * D + d[None, :]).to(tl.float32)  # [H,D]
         w = tl.load(W + bs * H + h).to(tl.float32)  # [H]
-        k = tl.load(K + b * (T * D) + t[:, None] * D + d[None, :], tmask[:, None], 0.0).to(tl.float32)  # [BT,D]
+        k = tl.load(K + b * (t_len * D) + t[:, None] * D + d[None, :], tmask[:, None], 0.0).to(tl.float32)  # [BT,D]
         sc = tl.dot(q, tl.trans(k), input_precision="ieee")  # [H,BT]=q[H,D]@k.T[D,BT], full fp32
         sc = tl.maximum(sc, 0.0) * w[:, None]
         y = tl.sum(sc, axis=0)  # [BT]
-        tl.store(Y + bs * T + t, y, tmask)
+        tl.store(Y + bs * t_len + t, y, tmask)
 
     return _dsa_scores
 
@@ -95,5 +105,10 @@ def indexer_scores(q, index_k, weights):
 
     BT = 64
     with torch.cuda.device(q.device):
+        # t (the ctx-derived candidate count) is a runtime launch argument,
+        # NOT a constexpr: no per-step recompile as the prefix grows. The
+        # kernel does not read or write beyond ``t`` (grid covers exactly
+        # cdiv(t, BT) tiles; lanes past t are masked), so no padding and no
+        # masking-visible numeric change vs the constexpr version.
         _kernel()[(b * s, triton.cdiv(t, BT))](qf, kf, wf, out, s, h, d, t, BT)
     return out.reshape(b, s, t)
