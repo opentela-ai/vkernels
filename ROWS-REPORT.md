@@ -917,3 +917,15 @@ Deployed knob state: FLOE_SPARSE_GRAIN_GATE=1 (safe re-capture timing;
 avoids wasted attempts near grain flips), graph.py carries thread_local
 error mode + the deterministic teardown; GEMV4 off (conc-neutral,
 future-relevant for captured width-4); HLB=0 default.
+
+657940 (confirmation leg): COMPLETED, conc wall=20.869s agg=24.53
+tok/s all_paris=True, zero aborts — the ~12x holds across legs.
+Width-1 p50=12.33 (the established fast band 12.3-14.5).
+
+Follow-up menu from this state: (a) upstream T2R-4 into the real
+kvaas/floe repos (the fix currently lives in the beverin campaign
+tree + local mirror); (b) HIP 209 one-shot load failure (still open,
+kineto-phase class); (c) the width-1 p50 variance (12.3 vs 14.5 legs,
+census-identical — environmental); (d) re-trace the CAPTURED width-4
+step (the 657570 trace showed eager; a captured trace would rank the
+new bottleneck, if any).
