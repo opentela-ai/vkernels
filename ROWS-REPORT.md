@@ -1001,3 +1001,34 @@ that matter are all device-side:
 - lever 3 (resolve_rows): ~9ms incl. its in-kernel fill path;
 - the remaining ~18ms: attention/MoE kernels + collectives -- a kineto
   trace of the CAPTURED step (not the eager fallback) would split it.
+
+## T2R-6 SGFUSE A/B (658285/658286, same node 2346, GST=1 both)
+
+- The "node confound" is DEAD: OFF@2346 captured step = 36-37ms device =
+  OFF@2706. The earlier 36-vs-46ms delta was PURELY the lever-1 prefetch
+  regression (node-independent).
+- SGFUSE (skinny_gemv + fused_norms, both engaged per dispatch knobs):
+  width-1 captured step UNCHANGED (36.8-37.5ms, composition identical in
+  the kineto re-harvest: Cijk 5.4ms/84 calls, resolve 5.0ms, glue ~9ms,
+  MoE 5.5ms, RCCL 3.7ms).
+  BUT conc wall 30.4s -> 17.4s (agg 16.9 -> 29.4, all_paris) — the best
+  conc ever (fused_norms at width-4).
+- WHY width-1 is unmoved: the trace has ZERO GEMV-fleet kernels — the
+  dense fp8 GEMV fleet never engages in-serve. The aten::linear
+  neighborhoods show the t/transpose/as_strided decomposition; the
+  microbench (contiguous textbook w8 [O,I]) accepted all shapes, so the
+  prime suspect = the serve's loader produces non-contiguous/transposed
+  weight storage -> dense_gemv_fp8's contiguity check declines ->
+  dequant-on-use F.linear = the Cijk block. NEXT: inspect the staged-fp8
+  loader's weight layout vs the op's eligibility contract; fix = store
+  [O,I] contiguous or accept strided reads in the kernel (Triton strides
+  are free).
+- p50 today on 2346 = environmentally cold (6.8/8.56 with 36ms captured
+  steps; runs improve within-leg). The captured-step device-ms is the
+  stable gating metric; client p50 only for same-hour comparisons.
+
+Priority queue (device-side, width-1, 37ms budget):
+1. the Cijk block 5.4-10.7ms -> GEMV fleet engagement (loader layout).
+2. aten glue ~9ms -> the remaining unfused elementwise/reduce soup.
+3. resolve_rows 5.0ms + MoE 5.5ms (lever 2/3 kernel work).
+4. RCCL 3.7ms (small; TP restructuring later).
