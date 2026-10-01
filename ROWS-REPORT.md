@@ -1078,3 +1078,22 @@ Remaining width-1 budget at 32.7ms: glue ~9 | resolve 5.0 | MoE 5.5 |
 RCCL 3.7 | reduced Cijk remainder | misc. Next biggest block = the
 elementwise/reduce glue (~1200 calls) — kernel work beyond
 fused_norms; then resolve/MoE.
+
+## T2R-8 MHCFUSE — REGRESSION, dropped (658446)
+
+fused_mhc_compose (the Triton mHC stream kernels): 33.6-34.2ms
+(+1.1 vs KDAFUSE-only) AND conc 27.0s (vs 16.6) — worse on both.
+Dropped. The persistent Cijk_MT128x32x32 block (~80 calls, ~5ms) is
+NOT the mHC compose (or the fusion's own cost exceeds the eager
+matmuls at these shapes).
+
+FINAL RECIPE (zero code, dispatch flags): SGFUSE + KDAFUSE
+= skinny_gemv + fused_norms + fused_kda:
+- width-1 captured step 37.0 -> 32.7ms (-12%)
+- conc 30.4 -> 16.6s (agg 16.9 -> 30.8, +83%), all_paris green
+
+Staircase summary (node 2346, sequential, device-ms gate):
+OFF 37.0 | +SGFUSE 36.8 | +KDAFUSE 32.7* | +FCU 33.5x | +MHCFUSE 33.8x
+
+Remaining width-1 blocks at 32.7ms: glue ~5.2 | resolve 4.9 | MoE 5.3 |
+Cijk-persistent ~5.0 | rccl 2.9 | gemv 0.36. All kernel-work class.
