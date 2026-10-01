@@ -830,3 +830,26 @@ Next arc if pursued: standalone repro of width-4 capture#1->close->warm->
 re-capture (the /tmp/repro209.sh pattern) to pin the illegal op; or skip
 to the eager-path width-4 optimizations (rocBLAS GEMM ensemble 24%,
 launch-bound 4809/step).
+
+## T2R follow-ups (657667/657679) + width-1 variance census
+
+- 657667 (gate OFF, restore leg): p50=13.29 [13.23,13.29,13.38], conc
+  251.7s eager, all_paris — the capture-once status quo intact.
+- 657679 (diagnostic: gate ON + CUDA_LAUNCH_BLOCKING=1): SIGABRT again;
+  the AcceleratorError ("operation not permitted when stream is
+  capturing") NEVER reaches python (zero "capture failed at ladder"
+  warnings, zero Tracebacks) — it escapes at C++ level (terminate
+  called) from a thread async to the decode loop. Serve-level evidence
+  exhausted: pinning the illegal op needs a standalone width-4
+  capture#1->close->warm->re-capture harness (single GPU, no serve).
+- Width-1 p50 variance (7.05 vs 14.48 legs, identical code): the KEYTRACE
+  census is IDENTICAL (44x window-gone, zero capture-not-ok, in 657606/
+  657633/657667) — the capture/re-capture structure is byte-identical;
+  the variance is NOT the sparse path. 657606 warmed within itself
+  (6.2 -> 7.05 -> 11.94): an environmental warm-up artifact (pool/hot-
+  tier cold start suspected; no telemetry in serve logs to confirm).
+  Fast legs 13.2-14.5 = the true capability.
+
+Next-arc menu (unchanged): (a) standalone width-4 re-capture repro -> the
+deep capture fix; (b) eager-path batched gemv for bs<=4 (rocBLAS ensemble
+24% of width-4 compute); (c) HIP 209 root cause.
