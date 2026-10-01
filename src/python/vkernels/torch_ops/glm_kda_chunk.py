@@ -52,36 +52,10 @@ caller's fallback keeps today's behavior until the AMD twin
 """
 
 from ._dispatch import OpNotEligible
+from ._fp32 import pin_fp32_matmul
 
 _HEAD_DIMS = (64, 128, 256)  # fwd_h splits K into 64-wide register blocks
 _CHUNK_SIZES = (16, 32, 64)  # solve_tril / kkt block structure supports these
-
-
-def _pin_fp32_matmul():
-    """Force torch matmuls to true fp32 (ieee); returns a restore callable.
-
-    The fp32 contract of the KDA core is meaningless if the *reference*
-    computes in tf32: NGC/NVIDIA containers set the torch matmul default to
-    tf32 (``fp32_precision='tf32'``, ``allow_tf32=True``) — stock torch
-    defaults to ieee — which silently degrades every fp32-by-contract torch
-    reference run inside them (round-7 lane C's 7.3e-4 "kernel drift" was
-    exactly this, on the oracle side). The fused Triton pipeline pins its
-    own dots to ieee (``vllm_kda.NV_DOT_PRECISION``); this pins the oracle.
-    """
-    import torch
-
-    matmul = torch.backends.cuda.matmul
-    prev = (matmul.allow_tf32, getattr(matmul, "fp32_precision", None))
-    matmul.allow_tf32 = False
-    if prev[1] is not None:
-        matmul.fp32_precision = "ieee"
-
-    def _restore():
-        matmul.allow_tf32 = prev[0]
-        if prev[1] is not None:
-            matmul.fp32_precision = prev[1]
-
-    return _restore
 
 
 def kda_chunk(
@@ -143,7 +117,8 @@ def kda_chunk(
                 "inputs must be contiguous CUDA tensors (caller owns "
                 ".contiguous())"
             )
-    if len({t.device for t in tensors} | {beta.device}) != 1:
+    devices = {t.device for t in (*tensors, beta, initial_state) if t is not None}
+    if len(devices) != 1:
         raise OpNotEligible("inputs must live on one GPU")
     if torch.version.hip is not None:
         raise OpNotEligible(
@@ -179,8 +154,9 @@ def kda_chunk(
     )
     if pad:
         # the padded tail rows must not leak: the reference slices its output
-        # to seq_len after padding, and so does the contract (o is [B, S, H, V]).
-        out = out[:, :seq_len]
+        # to seq_len after padding, and so does the contract (o is [B, S, H,
+        # V]). .contiguous() matches the reference's returned layout.
+        out = out[:, :seq_len].contiguous()
     return out, final_state
 
 
@@ -201,10 +177,10 @@ def kda_chunk_reference(
     self-contained — floe's copy is the upstream original).
 
     Matmuls run under a true-fp32 (ieee) pin for the duration of the call
-    (see :func:`_pin_fp32_matmul`): an fp32 oracle computed with the
-    container's tf32 matmul default is not an fp32 oracle.
+    (see :mod:`._fp32`): an fp32 oracle computed with the container's tf32
+    matmul default is not an fp32 oracle.
     """
-    restore = _pin_fp32_matmul()
+    restore = pin_fp32_matmul()
     try:
         return _kda_chunk_reference_impl(
             query, key, value, g, beta, chunk_size, initial_state, output_final_state

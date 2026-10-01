@@ -18,10 +18,6 @@ attested-not-verified when the gate skips.
 
 from __future__ import annotations
 
-import os
-import sys
-import types
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -569,23 +565,8 @@ def test_reference_full_kda_layer_matches_numpy_mirror():
 # ===========================================================================
 
 def _floe_kda():
-    if "floe" not in sys.modules:
-        for cand in (os.environ.get("FLOE_ROOT"),
-                     "/home/xiayao/Documents/projects/opentela-ai/serving-stack/floe"):
-            if cand and (Path(cand) / "floe" / "engine").is_dir():
-                if cand not in sys.path:
-                    sys.path.insert(0, cand)
-                break
-    if "kvaas_runtime" not in sys.modules:
-        kv = types.ModuleType("kvaas_runtime")
-        for name in ("CudaVmm", "ElasticControlSession", "ManagedResidencyAdmissionDeferred",
-                     "ManagedResidencySession", "allocate_device_pool"):
-            setattr(kv, name, object)
-        sub = types.ModuleType("kvaas_runtime.kv_pool_import")
-        sub.tensor_from_cuda_pointer = object
-        kv.kv_pool_import = sub
-        sys.modules["kvaas_runtime"] = kv
-        sys.modules["kvaas_runtime.kv_pool_import"] = sub
+    from tests.python.external_dependencies import require_floe
+    require_floe()
     try:
         torch = pytest.importorskip("torch")
         from floe.engine.runner.models.glm5.glm5_config import Glm53Config
@@ -599,6 +580,7 @@ def _floe_kda():
     return torch, la, cfg, glm5_arch
 
 
+@pytest.mark.integration
 def test_reference_kda_full_layer_matches_floe_oracle():
     """Attested (torch+floe gated): the in-graph layer walk vs the real
     floe Glm53LinearAttention seq==1 forward branch, weights loaded from

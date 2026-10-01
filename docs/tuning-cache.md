@@ -40,9 +40,8 @@ their own (Triton kernels on first launch of each key shape, native
 config selectors on every launch).
 
 Measured stores captured in-tree: `meta/tuning-stores/` carries the
-sidecars recorded on real hardware (MI300A, A100, GB10). Copy the file
-for your arch into your store directory to start from measured configs
-instead of the compiled-in formulas:
+sidecars recorded on real hardware (MI300A, A100, GB10). Only version-2 sidecars for your current architecture are accepted; re-run
+the sweep for older snapshots. Copy a compatible file into your store directory:
 
 ```bash
 mkdir -p ~/.cache/vkernels/tuning
@@ -51,14 +50,13 @@ cp meta/tuning-stores/<kernel>.<arch>.tune ~/.cache/vkernels/tuning/
 
 (In-repo, `vkl` is `make vkl ARGS='tune status'` or
 `python3 -m vkernels.cli tune status`; the console script comes from
-`pip install -e ./src`.)
+`pip install -e .`.)
 
-**When to re-tune:** the records self-invalidate. A different device
-arch, a torch/triton/HIP upgrade, or changed producer sources turns the
-record into a **miss** — the next launch re-sweeps that key and
-re-persists. It never errors and never picks a config tuned for other
-hardware; delete the store (`vkl tune clear --all`) only to force a full
-clean sweep sooner.
+**When to re-tune:** Triton records invalidate on device/software or producer
+fingerprint changes and re-sweep on a miss. Native records require the current
+architecture and configuration version; misses use compiled-in formulas until
+you run `vkl tune` again. Version 2 intentionally rejects older native records.
+Delete the store (`vkl tune clear --all`) to force a clean sweep.
 
 ## Commands
 
@@ -71,8 +69,7 @@ vkl tune clear <name>|--all   # delete stored configs (both tiers)
 `status` output on a tuned GB10 (plain formatter; with
 [rich](https://rich.readthedocs.io/) installed the same report renders
 as aligned tables — the CLI uses rich when importable and falls back to
-the stdlib formatter otherwise, mirroring `_backend.py`'s fallback
-pattern):
+the stdlib formatter otherwise):
 
 ```
 store: ~/.cache/vkernels/tuning  arch: sm121  enabled
@@ -106,6 +103,7 @@ clean.
 | `VKERNELS_TUNING_CACHE=<dir>` | store root. Default `~/.cache/vkernels/tuning`. |
 | `VKERNELS_TUNING_CACHE=off` | disable reads *and* writes — pure in-process autotune / compiled-in formulas (historical behavior). |
 | `VKERNELS_TUNING_ARCH=<token>` | pin the arch token used in file names (tests, cross-arch artifact inspection). Otherwise: HIP `gcnArchName` (feature flags stripped), CUDA `sm<major><minor>`. |
+| `VKERNELS_BUILD_DIR=<dir>` | Explicit build tree containing native benchmark binaries; no modification-time discovery. |
 | `TRITON_CACHE_DIR` | orthogonal: Triton's **binary** (cubin) cache. This module persists *choices*, Triton persists *cubins* — pin both for fully warm boots. |
 | `CCACHE_DIR` / `VKERNELS_USE_CCACHE` | the build cache (see [Build cache](#build-cache)). |
 
@@ -120,20 +118,22 @@ One artifact per (kernel, device arch), two formats in one directory:
 ```
 $VKERNELS_TUNING_CACHE/
   mhc_projection.sm121.json                  # triton tier (schema vk-tuning-store/1)
-  dsa_topk_logits_split_for.sm121.tune       # native tier (vk-native-tuning/1)
+  dsa_topk_logits_split_for.sm121.tune       # native tier (vk-native-tuning/2)
 ```
 
 The native sidecar is line-based (the C++ reader takes no dependencies):
 
 ```
-# vk-native-tuning/1
+# vk-native-tuning/2
 # arch=sm121 cu_count=48 written_by=bench_dsa_topk_logits
 key=1,512,64
 split=32
 ```
 
-Writes are atomic (temp + rename) in both tiers; concurrent sweeps
-last-writer-wins per key, benign for benchmark winners. The JSON tier
+Writes lock the complete read/merge/replace transaction in both tiers and
+use unique temporary files plus atomic rename. Concurrent writers preserve
+distinct keys; the last writer wins for the same key. Persistent `.lock`
+files coordinate processes and are not tuning records. The JSON tier
 also stores the measured time, the full device/software block, and
 sha256 producer fingerprints — see [The decorator](#the-decorator) and
 [Lenient by design](#lenient-by-design).
@@ -205,7 +205,7 @@ compiled kernels. Reading:
 
 | Piece | What it does |
 | --- | --- |
-| `tuning::find(kernel, key)` | the persisted record as an owned snapshot (`std::shared_ptr<const Entry>`), or null on any miss. A single foreign-arch file is honored (one-machine rule), two are ambiguous and miss. |
+| `tuning::find(kernel, key)` | the persisted record as an owned snapshot (`std::shared_ptr<const Entry>`), or null on any miss. Only records for the current execution-device architecture and configuration version are accepted. |
 | `tuning::persist(kernel, key, params, written_by)` | merge-write the winner (atomic whole-file rewrite, unknown records kept). |
 | `VKERNELS_TUNING_CACHE=off` | disables reads *and* writes — pure compiled-in formulas. |
 

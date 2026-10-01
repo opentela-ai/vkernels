@@ -3,8 +3,9 @@
 One launch per mHC pre site, replacing the post-GEMM epilogue chain of
 ``Glm53HyperConnection.forward`` + the decoder layer's RMSNorm:
 
-* gates + Sinkhorn combiner from the mix logits (exactly the
-  ``glm_mhc_mix._mix`` math and normalization order),
+* gates + Sinkhorn combiner from the mix logits (the canonical
+  ``glm_mhc_mix`` jit helper, shared verbatim — identical math by
+  construction, not just by test),
 * stream collapse ``sum_k pre[k] * streams[k, :]`` in fp32 with a single
   round on store (exactly the ``mhc_compose._collapse`` reduction),
 * weighted RMSNorm of the collapsed streams (exactly ``Glm53RMSNorm``'s
@@ -41,9 +42,16 @@ from functools import lru_cache
 
 @lru_cache(maxsize=1)
 def _kernel():
-    global tl
+    global tl, _gates_sinkhorn
     import triton
     import triton.language as tl
+
+    # the parity-critical gates + Sinkhorn block is the canonical
+    # glm_mhc_mix jit helper — bound into this module's globals so Triton
+    # can resolve it inside _big_fuse (the same trick as ``tl``).
+    from .glm_mhc_mix import _jit_helpers
+
+    _gates_sinkhorn = _jit_helpers()
 
     @triton.jit
     def _big_fuse(
@@ -64,27 +72,7 @@ def _kernel():
     ):
         token = tl.program_id(0)
         k = tl.arange(0, HC)
-        width: tl.constexpr = HC * (HC + 2)
-        s0 = tl.load(S)
-        s1 = tl.load(S + 1)
-        s2 = tl.load(S + 2)
-        # -- gates + Sinkhorn combiner (glm_mhc_mix._mix order) ------------
-        pre = tl.load(L + token * width + k).to(tl.float32) * s0 + tl.load(B + k)
-        post = tl.load(L + token * width + HC + k).to(tl.float32) * s1 + tl.load(
-            B + HC + k
-        )
-        pre_gated = tl.sigmoid(pre) + EPS
-        tl.store(POST + token * HC + k, 2.0 * tl.sigmoid(post))
-        offset = k[:, None] * HC + k[None, :]
-        logits = tl.load(L + token * width + 2 * HC + offset).to(tl.float32) * s2 + tl.load(
-            B + 2 * HC + offset
-        )
-        value = tl.exp(logits - tl.max(logits, 1)[:, None])
-        value = tl.div_rn(value, tl.sum(value, 1)[:, None]) + EPS
-        value = tl.div_rn(value, tl.sum(value, 0)[None, :] + EPS)
-        for _ in range(ITERS - 1):
-            value = tl.div_rn(value, tl.sum(value, 1)[:, None] + EPS)
-            value = tl.div_rn(value, tl.sum(value, 0)[None, :] + EPS)
+        pre_gated, value, offset = _gates_sinkhorn(L, B, S, POST, token, HC, EPS, ITERS)
         tl.store(COMB + token * HC * HC + offset, value)
         # -- collapse: sum_k pre[k] * streams[k, :] (fp32, one round) ------
         # The gate vector is re-read per k through the where-select so the
@@ -155,7 +143,7 @@ def mhc_pre_big_fuse(
         raise OpNotEligible("mHC control tensors must be FP32")
     if streams.dtype not in (torch.bfloat16, torch.float16):
         raise OpNotEligible("streams must be bf16/fp16")
-    if d != _pow2(d) or d < 512 or d > 8192:
+    if d < 512 or d > 8192 or d & (d - 1):
         raise OpNotEligible("d must be a power of two in [512, 8192]")
     for x in (logits, base, scale, streams, norm_weight):
         if not x.is_cuda or not x.is_contiguous():
@@ -195,10 +183,6 @@ def mhc_pre_big_fuse(
     return post, comb, out
 
 
-def _pow2(d):
-    return 1 << (d.bit_length() - 1)
-
-
 def mhc_pre_big_fuse_reference(
     logits,
     base,
@@ -211,17 +195,18 @@ def mhc_pre_big_fuse_reference(
     norm_eps=1e-6,
 ):
     """Eager oracle: the exact chain the kernel replaces, composed from the
-    landed reference pieces (``mhc_mix_reference`` + eager collapse +
-    eager ``Glm53RMSNorm``), so parity here is parity with the whole
-    epilogue chain, not a second hand-rolled kernel oracle."""
+    landed reference pieces (``mhc_mix_reference`` + ``mhc_collapse_reference``
+    + the eager ``Glm53RMSNorm`` rounding chain), so parity here is parity
+    with the whole epilogue chain, not a second hand-rolled kernel oracle."""
     import torch
 
     from .glm_mhc_mix import mhc_mix_reference
+    from .mhc_compose import mhc_collapse_reference
 
     pre, post, comb = mhc_mix_reference(
         logits.float(), base, scale, hc=hc, eps=eps, sinkhorn_iters=sinkhorn_iters
     )
-    collapsed = (pre.unsqueeze(-1) * streams).sum(dim=-2).to(streams.dtype)
+    collapsed = mhc_collapse_reference(pre, streams, hc=hc)
     x = collapsed.float()
     var = x.pow(2).mean(-1, keepdim=True)
     normalized = (x * torch.rsqrt(var + norm_eps)).to(streams.dtype)

@@ -26,8 +26,6 @@ cast) runs only where torch + floe are importable.
 
 from __future__ import annotations
 
-import os
-import sys
 
 import numpy as np
 import pytest
@@ -475,14 +473,8 @@ def test_nan_canaries_and_worker_stride_coverage(workers):
 # ---------------------------------------------------------------------------
 
 def _floe_glm_o_norm():
-    if "floe" not in sys.modules:
-        from pathlib import Path
-
-        for cand in (os.environ.get("FLOE_ROOT"), "/home/xiayao/Documents/projects/opentela-ai/serving-stack/floe"):
-            if cand and (Path(cand) / "floe" / "engine").is_dir():
-                if cand not in sys.path:
-                    sys.path.insert(0, cand)
-                break
+    from tests.python.external_dependencies import require_floe
+    require_floe()
     try:
         from floe.engine.runner.models.glm5.glm5_arch import Glm53RMSNormGated
     except ModuleNotFoundError as exc:  # floe not on this stack
@@ -493,6 +485,7 @@ def _floe_glm_o_norm():
     return norm, torch
 
 
+@pytest.mark.integration
 def test_eager_glm53_rms_norm_gated_parity_bf16_fp32_stats():
     """Eager floe ``Glm53RMSNormGated`` parity incl. the fp32-stat cast at
     bf16 input: bf16 x/gate -> fp32 math -> bf16 out. The compiler slice

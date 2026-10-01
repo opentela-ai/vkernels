@@ -42,3 +42,31 @@ TEST(Overlap, ZeroIterations) {
   EXPECT_EQ(result.comm_count, 0u);
   EXPECT_FALSE(comm_called);
 }
+
+TEST(Overlap, ComputeFailureDrainsAndExecutorCanBeReused) {
+  OverlapExecutor ex;
+  int computed = 0;
+  int communicated = 0;
+  EXPECT_THROW(ex.run(8, [&](std::size_t i) {
+    ++computed;
+    if (i == 2) throw std::runtime_error("compute failed");
+    return static_cast<int>(i);
+  }, [&](std::size_t, int) { ++communicated; }), std::runtime_error);
+  EXPECT_EQ(computed, 8);
+  EXPECT_EQ(communicated, 7);
+  auto result = ex.run(1, [](std::size_t) { return 7; },
+                       [&](std::size_t, int) { ++communicated; });
+  EXPECT_EQ(result.comm_count, 1u);
+  EXPECT_EQ(communicated, 8);
+}
+
+TEST(Overlap, CommFailureDrainsRemainingCallbacks) {
+  OverlapExecutor ex;
+  int communicated = 0;
+  EXPECT_THROW(ex.run(8, [](std::size_t i) { return static_cast<int>(i); },
+                     [&](std::size_t i, int) {
+                       ++communicated;
+                       if (i == 2) throw std::runtime_error("comm failed");
+                     }), std::runtime_error);
+  EXPECT_EQ(communicated, 8);
+}

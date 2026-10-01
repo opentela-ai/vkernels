@@ -2150,24 +2150,19 @@ def kda_gate_chunk_cumsum(g):
 
 
 def kda_naive_delta_rule_fwd(q, k, v, g, beta, *, out=None):
-    """Per-token delta-rule oracle (O(S*D^2) per head).
+    """K3 recurrence: decay each key dimension, predict, then apply delta.
 
-    Implements the recurrence ``S_t = g_t S_{t-1} + beta_t (v_t -
-    S_{t-1} k_t) k_t^T`` then ``o_t = S_t q_t`` per token, per head. This is
-    the slow but obviously-correct reference the chunked forward (and the
-    HIP kernel) are checked against.
-
-    Args:
-        q, k, v: float32 ``(B, H, S, D)``.
-        g, beta: float32 ``(B, H, S)``.
-        out: optional writable float32 ``(B, H, S, D)`` buffer; a new
-            ``(B, H, S, D)`` array is allocated when omitted.
-
-    Returns:
-        The output array (``out`` if given, otherwise a new
-        ``(B, H, S, D)`` float32 array).
+    q/k/v/g are float32 [B,H,S,D]; beta is [B,H,S]. This differs from the
+    scalar-gate, pre-decay prediction used by the standard chunked operator.
     """
-    B, H, S, D = _kda_dims(q, g)
+    if np.asarray(q).ndim != 4:
+        raise ValueError("q must be [B,H,S,D]")
+    B, H, S, D = np.asarray(q).shape
+    for name, value in (("k", k), ("v", v), ("g", g)):
+        if np.asarray(value).shape != (B, H, S, D):
+            raise ValueError(f"{name} must have shape {(B,H,S,D)}")
+    if np.asarray(beta).shape != (B, H, S):
+        raise ValueError("beta must be [B,H,S]")
     q_arr = _as_input(q, "q")
     k_arr = _as_input(k, "k")
     v_arr = _as_input(v, "v")
@@ -2189,7 +2184,7 @@ def kda_delta_rule_fwd(q, k, v, g, beta, *, chunk_size, out=None):
     Orchestrates the gate log-cumsum (L2), the within-chunk delta-corrected
     value solve (L4), the cross-chunk state propagation (L5) and the final
     intra+inter output combine (L6). ``chunk_size`` must divide ``S``. The
-    result matches :func:`kda_naive_delta_rule_fwd` within fp32 round-off
+    result follows the scalar-gate standard delta recurrence
     scaled by the sequence length.
 
     Args:

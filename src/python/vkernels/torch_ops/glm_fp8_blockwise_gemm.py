@@ -807,6 +807,7 @@ def glm_moe_grouped_gemm_native(
     topk_index,
     topk_weights,
     swiglu_limit=7.0,
+    swiglu_fn=None,
 ):
     """Routed expert MLP via TWO single-launch grouped fp8 GEMMs.
 
@@ -818,6 +819,12 @@ def glm_moe_grouped_gemm_native(
     once by :func:`e4m3fn_to_fnuz`, scales doubled) and ``e4m3fn`` (NVIDIA
     tensor cores: checkpoint bytes and scales as they are, no conversion and no
     second resident weight copy).
+
+    ``swiglu_fn`` (optional callable ``fn(gate_up, limit) -> act``) replaces
+    the between-stages activation: floe injects its vendored one-launch
+    silu+clamp kernel here (fused_silu_clamp, the SGLang
+    silu_and_mul_with_thresh design). The callable owns its eligibility
+    and never raises; ``None`` (default) keeps the eager chain below.
 
     Host work per call: one sort, a handful of tiny torch ops for the
     tile map, two grouped launches, one swiglu + per-row quantize — no
@@ -894,9 +901,18 @@ def glm_moe_grouped_gemm_native(
         two_i,
         h,
     )
-    gate = gu[:, :i].float().clamp(max=swiglu_limit)
-    up = gu[:, i:].float().clamp(min=-swiglu_limit, max=swiglu_limit)
-    act = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+    if swiglu_fn is not None:
+        # floe's vendored one-launch activation (fused_silu_clamp — the
+        # SGLang sgl-kernel silu_and_mul_with_thresh design) replaces the
+        # eager chain below: same fp32 rounding sequence, one bf16 round
+        # at the store, one launch instead of five-to-seven. The callable
+        # owns its eligibility and never raises (internal fallback to the
+        # exact eager expression); None keeps the eager oracle.
+        act = swiglu_fn(gu, swiglu_limit)
+    else:
+        gate = gu[:, :i].float().clamp(max=swiglu_limit)
+        up = gu[:, i:].float().clamp(min=-swiglu_limit, max=swiglu_limit)
+        act = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
 
     # act rows are per-SLOT in sorted order (K expert assignments per
     # token) — the down GEMM indexes A directly, no gather.

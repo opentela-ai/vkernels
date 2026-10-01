@@ -1,0 +1,93 @@
+{
+  "device": {
+    "name": "NVIDIA_GB10",
+    "capability": [
+      12,
+      1
+    ]
+  },
+  "gate_reason": "DeepGEMM dispatches only on arch major 9/10; this device is capability (12, 1) \u2014 sm_121 supports neither wgmma fp8 (sm90) nor tcgen05 (sm100) MMA, so the JIT cannot emit any DeepGEMM kernel here (ptxas-rejected; lane-31 evidence)",
+  "shapes": {
+    "E": 288,
+    "H": 4096,
+    "I_tp": 512,
+    "topk": 8
+  },
+  "iters": 150,
+  "rows": [
+    {
+      "T": 1,
+      "expert_gemv": 1.0421,
+      "sgl_fused_moe": 1.0791,
+      "deepgemm_moe": null
+    },
+    {
+      "T": 2,
+      "expert_gemv": 1.3914,
+      "sgl_fused_moe": 1.4327,
+      "deepgemm_moe": null
+    },
+    {
+      "T": 4,
+      "expert_gemv": 1.7898,
+      "sgl_fused_moe": 1.7207,
+      "deepgemm_moe": null
+    },
+    {
+      "T": 8,
+      "expert_gemv": 2.9553,
+      "sgl_fused_moe": 2.8393,
+      "deepgemm_moe": null
+    }
+  ],
+  "parity": {
+    "T1/expert_gemv": {
+      "max_abs": 0.03711,
+      "max_abs_over_rms": 0.1605,
+      "median_rel": "4.32e-02",
+      "p999_abs_over_rms": "1.35e-01"
+    },
+    "T1/sgl_fused_moe": {
+      "max_abs": 0.01794,
+      "max_abs_over_rms": 0.0776,
+      "median_rel": "2.15e-02",
+      "p999_abs_over_rms": "7.18e-02"
+    },
+    "T2/expert_gemv": {
+      "max_abs": 0.04297,
+      "max_abs_over_rms": 0.1591,
+      "median_rel": "4.26e-02",
+      "p999_abs_over_rms": "1.37e-01"
+    },
+    "T2/sgl_fused_moe": {
+      "max_abs": 0.02148,
+      "max_abs_over_rms": 0.0795,
+      "median_rel": "1.43e-02",
+      "p999_abs_over_rms": "6.15e-02"
+    },
+    "T4/expert_gemv": {
+      "max_abs": 0.05078,
+      "max_abs_over_rms": 0.254,
+      "median_rel": "4.69e-02",
+      "p999_abs_over_rms": "1.76e-01"
+    },
+    "T4/sgl_fused_moe": {
+      "max_abs": 0.01465,
+      "max_abs_over_rms": 0.0733,
+      "median_rel": "1.79e-02",
+      "p999_abs_over_rms": "6.18e-02"
+    },
+    "T8/expert_gemv": {
+      "max_abs": 0.06055,
+      "max_abs_over_rms": 0.2559,
+      "median_rel": "4.47e-02",
+      "p999_abs_over_rms": "1.90e-01"
+    },
+    "T8/sgl_fused_moe": {
+      "max_abs": 0.03516,
+      "max_abs_over_rms": 0.1486,
+      "median_rel": "1.68e-02",
+      "p999_abs_over_rms": "1.16e-01"
+    }
+  }
+}

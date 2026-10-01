@@ -33,12 +33,12 @@
 //               Cross-checked against the oracle by test_mla_correct.hip.
 #include <cstdint>
 #include <climits>
-#include <mutex>
 
 #include "vkernels/kernels/mla.hpp"
 
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
+#include "vkernels/kernels/execution_workspace.hpp"
 
 namespace vkernels::kernels::hip {
 
@@ -599,36 +599,7 @@ void launch(const float* q, const float* k_c, const float* k_pe,
       scale);
 }
 
-// Device workspace for the split-K partials (issue #82): grow-only, shared
-// across consecutive mla_fwd launches. Both kernels of one launch are
-// enqueued under the same lock that (re)sizes the buffers, so a later
-// resize's hipFree — which synchronises the device — can never race a
-// not-yet-launched kernel against a freed buffer. The resize path runs only
-// on first use / shape growth; steady-state decode just enqueues.
-struct SplitWorkspace {
-  std::mutex mu;
-  float* partial_out = nullptr;
-  float* partial_lse = nullptr;
-  size_t cap_out = 0;
-  size_t cap_lse = 0;
-};
-SplitWorkspace& split_ws() {
-  static SplitWorkspace w;
-  return w;
-}
-
-// Split-K decode launch: allocates (grow-only) the per-split partial buffers
-// and enqueues the split kernel + fixed-order combine kernel on the caller
-// stream (`st`; nullptr = legacy default stream 0). Returns false when the
-// buffers cannot be sized; the caller then falls back to the plain
-// single-block path.
-//
-// Capture safety (issue #45): the resize path hipFree()s, which
-// device-synchronises — illegal mid-capture. While `st` is capturing we
-// therefore never touch the workspace: if it is already sized (caller warmed
-// the shape up before capture, the steady-state serving pattern) the split
-// path enqueues on `st` exactly as eagerly; otherwise we return false and the
-// caller falls back to the capture-safe non-split kernel.
+// Each invocation owns its split partials through stream completion.
 bool launch_split(const float* q, const float* k_c, const float* k_pe,
                   const float* v_c, float* out, int B, int H, int S_q,
                   int S_kv, int q_start, int kv_start, int lr, int rhd,
@@ -639,31 +610,8 @@ bool launch_split(const float* q, const float* k_c, const float* k_pe,
   const size_t n_out = rows * split * lr;
   const size_t n_lse = rows * split;
 
-  auto& w = split_ws();
-  std::lock_guard<std::mutex> lock(w.mu);
-  hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
-  const bool capturing =
-      st != nullptr && hipStreamIsCapturing(st, &cap_status) == hipSuccess &&
-      cap_status == hipStreamCaptureStatusActive;
-  if (!capturing) {
-    if (w.cap_out < n_out) {
-      float* p = nullptr;
-      if (hipMalloc(&p, n_out * sizeof(float)) == hipSuccess) {
-        if (w.partial_out) hipFree(w.partial_out);
-        w.partial_out = p;
-        w.cap_out = n_out;
-      }
-    }
-    if (w.cap_lse < n_lse) {
-      float* p = nullptr;
-      if (hipMalloc(&p, n_lse * sizeof(float)) == hipSuccess) {
-        if (w.partial_lse) hipFree(w.partial_lse);
-        w.partial_lse = p;
-        w.cap_lse = n_lse;
-      }
-    }
-  }
-  if (w.cap_out < n_out || w.cap_lse < n_lse) return false;
+  Scratch<float> partial_out(n_out, st);
+  Scratch<float> partial_lse(n_lse, st);
 
   // Decode (S_q <= 8): one row per block, BQ=1 (issue #82, unchanged).
   // Chunked / short prefill (S_q > 8): BQ=4 rows per block (issue #151) —
@@ -673,14 +621,14 @@ bool launch_split(const float* q, const float* k_c, const float* k_pe,
   const dim3 gridS((S_q + bq - 1) / bq, H, B * split);
   if (bq == 4) {
     mla_fwd_split_kernel<4><<<gridS, block, 4 * Dq * sizeof(float), st>>>(
-        q, k_c, k_pe, v_c, w.partial_out, w.partial_lse, H, S_q, S_kv,
+        q, k_c, k_pe, v_c, partial_out.ptr, partial_lse.ptr, H, S_q, S_kv,
         q_start, kv_start, lr, rhd, scale, split, kvs);
   } else {
     mla_fwd_split_kernel<1><<<gridS, block, Dq * sizeof(float), st>>>(
-        q, k_c, k_pe, v_c, w.partial_out, w.partial_lse, H, S_q, S_kv,
+        q, k_c, k_pe, v_c, partial_out.ptr, partial_lse.ptr, H, S_q, S_kv,
         q_start, kv_start, lr, rhd, scale, split, kvs);
   }
-  // A failed split-kernel launch would leave the grow-only workspace with
+  // A failed split-kernel launch would leave the partial workspace with
   // stale contents that the combine below would fold into `out` -- the
   // wrong-but-plausible failure mode. Report failure so the caller falls
   // back to the plain (unsplit) path instead.
@@ -689,7 +637,7 @@ bool launch_split(const float* q, const float* k_c, const float* k_pe,
   // The combine kernel assumes 64 threads (its strided slices and the sLse
   // staging loop are hard-wired to 64); keep it at 64 regardless of BQ.
   mla_fwd_split_combine_kernel<<<gridC, 64, split * sizeof(float), st>>>(
-      w.partial_out, w.partial_lse, out, S_q, split, lr);
+      partial_out.ptr, partial_lse.ptr, out, S_q, split, lr);
   return true;
 }
 

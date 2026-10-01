@@ -113,7 +113,10 @@ class Stream:
         self._impl.submit(task)
 
     def wait(self) -> None:
-        """Block the calling thread until every submitted task has run."""
+        """Drain callbacks and their captures, then raise the first failure.
+
+        A reported failure is consumed; a subsequent wait can succeed.
+        """
         self._impl.wait()
 
     def submitted(self) -> int:

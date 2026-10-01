@@ -19,8 +19,6 @@ Validation chain (mirrors the issue's Validation section):
 
 from __future__ import annotations
 
-import sys
-import types
 
 import numpy as np
 import pytest
@@ -43,23 +41,8 @@ from vkernels.compiler.schedule_phase import PhaseSchedule  # noqa: E402
 def _floe_partial_rope():
     # floe is a sibling repo on this stack, not a venv dependency; probe
     # FLOE_ROOT then known checkout locations.
-    if "floe" not in sys.modules:
-        import os
-        from pathlib import Path
-        for cand in (os.environ.get("FLOE_ROOT"), "/local/home/xiayao/Documents/code/floe"):
-            if cand and (Path(cand) / "floe" / "engine").is_dir():
-                if cand not in sys.path:
-                    sys.path.insert(0, cand)
-                break
-    if "kvaas_runtime" not in sys.modules:
-        kv = types.ModuleType("kvaas_runtime")
-        for name in ("CudaVmm", "ElasticControlSession", "ManagedResidencyAdmissionDeferred", "ManagedResidencySession", "allocate_device_pool"):
-            setattr(kv, name, object)
-        sub = types.ModuleType("kvaas_runtime.kv_pool_import")
-        sub.tensor_from_cuda_pointer = object
-        kv.kv_pool_import = sub
-        sys.modules["kvaas_runtime"] = kv
-        sys.modules["kvaas_runtime.kv_pool_import"] = sub
+    from tests.python.external_dependencies import require_floe
+    require_floe()
     try:
         # floe moved the qwen35 model modules (qwen35_arch -> forward/…); try
         # the historical path first, then the current layout.
@@ -182,6 +165,7 @@ def test_capture_rope_neox_rejects_wrong_table_width():
 
 @pytest.mark.parametrize("position", [0, 1, 3, 17, 31])
 @pytest.mark.parametrize("workers", [1, 3])
+@pytest.mark.integration
 def test_reference_rope_neox_matches_floe_oracle(position, workers):
     PartialRotaryEmbedding = _floe_partial_rope()
     rng = np.random.default_rng(position * 7 + workers)
@@ -234,6 +218,7 @@ gpu = pytest.mark.skipif(
 
 
 @gpu
+@pytest.mark.integration
 def test_device_t_rope_partial_matches_floe_oracle():
     pytest.importorskip("triton")
     from tests.python._megakernel_launch import launch_task_body

@@ -48,6 +48,10 @@ import torch
 import triton
 import triton.language as tl
 
+from .triton_dense import _t_embed as _t_embed, _t_rms2d as _t_rms2d, _t_rms_heads as _t_rms_heads, _t_rms2d_gated as _t_rms2d_gated, _t_rms_heads_gated as _t_rms_heads_gated, _t_gemv as _t_gemv, _t_gemv_transposed as _t_gemv_transposed, _t_swiglu as _t_swiglu, _t_add as _t_add, _t_linear_grouped as _t_linear_grouped, _t_gemv_fp8 as _t_gemv_fp8, _t_moe_expert as _t_moe_expert, _t_moe_combine as _t_moe_combine, _t_moe_route as _t_moe_route
+from .triton_attention import _t_rope as _t_rope, _t_append as _t_append, _t_scores as _t_scores, _t_softmax as _t_softmax, _t_values as _t_values, _t_values_gated as _t_values_gated, _t_rope_interleaved as _t_rope_interleaved, _t_mla_scores as _t_mla_scores, _t_mla_values as _t_mla_values, _t_indexer_scores as _t_indexer_scores, _t_index_topk as _t_index_topk, _t_compressor_append as _t_compressor_append
+from .triton_recurrent import _t_gdn_conv as _t_gdn_conv, _t_gdn_conv_tiled as _t_gdn_conv_tiled, _t_gdn_heads as _t_gdn_heads, _t_mhc_pre as _t_mhc_pre, _t_mhc_post as _t_mhc_post, _t_gdn_heads_batched as _t_gdn_heads_batched, _t_kda_heads_batched as _t_kda_heads_batched
+
 __all__ = [
     "grid_barrier",
     "qwen3_megakernel",
@@ -124,478 +128,34 @@ def milestone0_barrier_test(out_ptr, bar_ptr, P, ROUNDS, base: tl.int64, IDLE: t
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
-def _t_embed(worker: tl.int32, P: tl.int32, ids_ptr, tok_ptr, out_ptr, B: tl.constexpr, C: tl.constexpr, BC: tl.constexpr):
-    """hidden[b, :] = tok[ids[b], :] — one task per batch row."""
-    task = worker
-    while task < B:
-        offs = tl.arange(0, BC)
-        m = offs < C
-        tok_id = tl.load(ids_ptr + task).to(tl.int64)
-        row = tl.load(tok_ptr + tok_id * C + offs, mask=m, other=0.0)
-        tl.store(out_ptr + task * C + offs, row.to(tl.float32), mask=m)
-        task += P
 
 
-@triton.jit
-def _t_rms2d(worker: tl.int32, P: tl.int32, x_ptr, g_ptr, y_ptr, B: tl.constexpr, C: tl.constexpr, BC: tl.constexpr, eps: tl.constexpr):
-    """RMSNorm over one hidden row: one task per batch row."""
-    task = worker
-    while task < B:
-        offs = tl.arange(0, BC)
-        m = offs < C
-        x = tl.load(x_ptr + task * C + offs, mask=m, other=0.0, cache_modifier=".cg").to(tl.float32)
-        var = tl.sum(x * x, axis=0) / C
-        g = tl.load(g_ptr + offs, mask=m, other=0.0).to(tl.float32)
-        tl.store(y_ptr + task * C + offs, x * (1.0 / tl.sqrt(var + eps)) * g, mask=m)
-        task += P
 
 
-@triton.jit
-def _t_rms_heads(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    g_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    NHEAD: tl.constexpr,
-    D: tl.constexpr,
-    ROWSTRIDE: tl.constexpr,
-    eps: tl.constexpr,
-):
-    """Per-head RMSNorm (Qwen3 q_norm/k_norm): one task per (batch, head).
-
-    ``ROWSTRIDE`` is the source row stride: the q/k slices live interleaved
-    inside each batch row's packed QKV projection, while the output is a
-    packed [B, NHEAD, D] buffer.
-    """
-    task = worker
-    while task < B * NHEAD:
-        b = task // NHEAD
-        h = task % NHEAD
-        offs = tl.arange(0, D)
-        x = tl.load(x_ptr + b * ROWSTRIDE + h * D + offs, cache_modifier=".cg").to(tl.float32)
-        var = tl.sum(x * x, axis=0) / D
-        g = tl.load(g_ptr + offs).to(tl.float32)
-        tl.store(y_ptr + (b * NHEAD + h) * D + offs, x * (1.0 / tl.sqrt(var + eps)) * g)
-        task += P
 
 
-@triton.jit
-def _t_rms2d_gated(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    gate_ptr,
-    g_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    C: tl.constexpr,
-    BC: tl.constexpr,
-    eps: tl.constexpr,
-):
-    """Sigmoid-gated RMSNorm over one hidden row (issue #100, GLM o_norm):
-    one task per batch row. Strict-fp32 math (floe Glm53RMSNormGated):
-
-        y = x * rsqrt(mean(x^2) + eps) * g * sigmoid(gate)
-
-    Same task decomposition as ``_t_rms2d`` with a second elementwise
-    input stream; the gate multiply folds after the weight multiply so a
-    saturated gate (sigmoid fp32 -> 0) zeroes the row exactly.
-    """
-    task = worker
-    while task < B:
-        offs = tl.arange(0, BC)
-        m = offs < C
-        x = tl.load(x_ptr + task * C + offs, mask=m, other=0.0, cache_modifier=".cg").to(tl.float32)
-        var = tl.sum(x * x, axis=0) / C
-        g = tl.load(g_ptr + offs, mask=m, other=0.0).to(tl.float32)
-        gate = tl.load(gate_ptr + task * C + offs, mask=m, other=0.0, cache_modifier=".cg").to(tl.float32)
-        sig = 1.0 / (1.0 + tl.exp(-gate))
-        tl.store(y_ptr + task * C + offs, x * (1.0 / tl.sqrt(var + eps)) * g * sig, mask=m)
-        task += P
 
 
-@triton.jit
-def _t_rms_heads_gated(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    gate_ptr,
-    g_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    NHEAD: tl.constexpr,
-    D: tl.constexpr,
-    ROWSTRIDE: tl.constexpr,
-    eps: tl.constexpr,
-):
-    """Per-head sigmoid-gated RMSNorm (issue #100): the linear-attention
-    output norm folded before ``o_proj`` — one task per (batch, head), the
-    ``_t_rms_heads`` decomposition with a second per-head gate stream.
-    """
-    task = worker
-    while task < B * NHEAD:
-        b = task // NHEAD
-        h = task % NHEAD
-        offs = tl.arange(0, D)
-        x = tl.load(x_ptr + b * ROWSTRIDE + h * D + offs, cache_modifier=".cg").to(tl.float32)
-        var = tl.sum(x * x, axis=0) / D
-        g = tl.load(g_ptr + offs).to(tl.float32)
-        gate = tl.load(gate_ptr + (b * NHEAD + h) * D + offs, cache_modifier=".cg").to(tl.float32)
-        sig = 1.0 / (1.0 + tl.exp(-gate))
-        tl.store(y_ptr + (b * NHEAD + h) * D + offs, x * (1.0 / tl.sqrt(var + eps)) * g * sig)
-        task += P
 
 
-@triton.jit
-def _t_rope(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    cos_ptr,
-    sin_ptr,
-    pos_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    NHEAD: tl.constexpr,
-    D: tl.constexpr,
-    ROT: tl.constexpr,
-    TSTRIDE: tl.constexpr,
-):
-    """RoPE at row b's runtime position: one task per (b, head).
-
-    Ported from the 27B-validated ``_h_rope_append`` (device_triton_hybrid):
-    fp32 loads from the (bf16) workspace, NeoX split-half over the first
-    ``ROT`` dims — ``x1' = x1*c - x2*s ; x2' = x2*c + x1*s`` with
-    ``half = ROT // 2`` — and dims ``[ROT, D)`` pass through unchanged.
-
-    ``TSTRIDE`` is the cos/sin table row stride (fp32 tables indexed at the
-    per-row runtime position). The Qwen3 call passes ``ROT=D, TSTRIDE=D``:
-    with the full-width cat([f, f]) tables this reduces exactly to the
-    full-width rotate-half form.
-    """
-    task = worker
-    while task < B * NHEAD:
-        b = task // NHEAD
-        h = task % NHEAD
-        half: tl.constexpr = ROT // 2
-        d = tl.arange(0, half)
-        p = tl.load(pos_ptr + b).to(tl.int64)
-        base = (b * NHEAD + h) * D
-        x1 = tl.load(x_ptr + base + d, cache_modifier=".cg").to(tl.float32)
-        x2 = tl.load(x_ptr + base + half + d, cache_modifier=".cg").to(tl.float32)
-        c = tl.load(cos_ptr + p * TSTRIDE + d).to(tl.float32)
-        s = tl.load(sin_ptr + p * TSTRIDE + d).to(tl.float32)
-        tl.store(y_ptr + base + d, x1 * c - x2 * s)
-        tl.store(y_ptr + base + half + d, x2 * c + x1 * s)
-        if ROT < D:  # pass-through tail (empty for the full-width Qwen3 form)
-            offs_d = tl.arange(0, D)
-            mt = offs_d >= ROT
-            tail = tl.load(x_ptr + base + offs_d, mask=mt, other=0.0, cache_modifier=".cg").to(tl.float32)
-            tl.store(y_ptr + base + offs_d, tail, mask=mt)
-        task += P
 
 
-@triton.jit
-def _t_append(
-    worker: tl.int32,
-    P: tl.int32,
-    k_ptr,
-    v_ptr,
-    table_ptr,
-    pos_ptr,
-    k_new_ptr,
-    v_new_ptr,
-    B: tl.constexpr,
-    KVH: tl.constexpr,
-    D: tl.constexpr,
-    QKVW: tl.constexpr,
-    SCAP: tl.constexpr,
-):
-    """K/V append into slot table[b, pos[b]]: one task per (b, kv-head).
-
-    The new k rows come from the packed roped-k buffer [B, KVH, D]; the v
-    rows are read from the packed QKV projection (v at row offset
-    HD + KVH*D). The cache destination is token-slot-major
-    ``slot * KVH * D + kvh * D``.
-    """
-    task = worker
-    while task < B * KVH:
-        b = task // KVH
-        kvh = task % KVH
-        offs = tl.arange(0, D)
-        p = tl.load(pos_ptr + b).to(tl.int64)
-        slot = tl.load(table_ptr + b * SCAP + p)
-        dst = slot * KVH * D + kvh * D
-        kn = tl.load(k_new_ptr + (b * KVH + kvh) * D + offs, cache_modifier=".cg").to(tl.float32)
-        vn = tl.load(v_new_ptr + b * QKVW + kvh * D + offs, cache_modifier=".cg").to(tl.float32)
-        tl.store(k_ptr + dst + offs, kn.to(k_ptr.dtype.element_ty))
-        tl.store(v_ptr + dst + offs, vn.to(v_ptr.dtype.element_ty))
-        task += P
 
 
-@triton.jit
-def _t_scores(
-    worker: tl.int32,
-    P: tl.int32,
-    q_ptr,
-    k_ptr,
-    table_ptr,
-    pos_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    KVH: tl.constexpr,
-    D: tl.constexpr,
-    SCAP: tl.constexpr,
-    BT: tl.constexpr,
-    scale: tl.constexpr,
-):
-    """scores[b, h, t] = scale * <q_bh, K[table[b, t]]>, t in [0, pos[b]]."""
-    task = worker
-    GROUP: tl.constexpr = H // KVH
-    while task < B * H:
-        b = task // H
-        h = task % H
-        kvh = h // GROUP
-        offs_d = tl.arange(0, D)
-        q = tl.load(q_ptr + (b * H + h) * D + offs_d, cache_modifier=".cg").to(tl.float32)
-        p1 = tl.load(pos_ptr + b).to(tl.int64) + 1
-        kbase = k_ptr + kvh * D  # head offset inside each token row
-        trow = table_ptr + b * SCAP
-        yrow = y_ptr + (b * H + h) * SCAP
-        t0 = tl.zeros((), tl.int64)
-        while t0 < p1:
-            offs_t = t0 + tl.arange(0, BT)
-            m = offs_t < p1
-            slots = tl.load(trow + offs_t, mask=m, other=0)
-            kt = tl.load(kbase + slots[:, None] * (KVH * D) + offs_d[None, :], mask=m[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
-            s = tl.sum(kt * q[None, :], axis=1) * scale
-            tl.store(yrow + offs_t, s, mask=m)
-            t0 += BT
-        task += P
 
 
-@triton.jit
-def _t_softmax(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    pos_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    SCAP: tl.constexpr,
-    BTR: tl.constexpr,
-):
-    """Row softmax over the valid prefix (per-row length); tail written 0.
-
-    Loop-free on purpose: a scalar carried out of a runtime-bound loop and
-    reused in later loops miscompiles inside the task loop on this
-    Triton/GB10 target (verified with a minimal repro), so the whole row is
-    processed as one masked block. BTR = next_pow2(SCAP) <= 1024.
-    """
-    task = worker
-    while task < B * H:
-        b = task // H
-        h = task % H
-        row = (b * H + h) * SCAP
-        offs_t = tl.arange(0, BTR)
-        m = offs_t < (tl.load(pos_ptr + b).to(tl.int64) + 1)
-        s = tl.load(x_ptr + row + offs_t, mask=m, other=-float("inf"), cache_modifier=".cg")
-        m_run = tl.max(s, axis=0)
-        e = tl.exp(s - m_run)  # masked lanes: exp(-inf) = 0
-        inv = 1.0 / tl.sum(e, axis=0)
-        tl.store(y_ptr + row + offs_t, tl.where(m, e * inv, 0.0), mask=offs_t < SCAP)
-        task += P
 
 
-@triton.jit
-def _t_values(
-    worker: tl.int32,
-    P: tl.int32,
-    probs_ptr,
-    v_ptr,
-    table_ptr,
-    pos_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    KVH: tl.constexpr,
-    D: tl.constexpr,
-    SCAP: tl.constexpr,
-    BT: tl.constexpr,
-):
-    """ctx[b, h, :] = sum_{t<=pos[b]} probs * V[table[b, t]] (masked)."""
-    task = worker
-    GROUP: tl.constexpr = H // KVH
-    while task < B * H:
-        b = task // H
-        h = task % H
-        kvh = h // GROUP
-        offs_d = tl.arange(0, D)
-        acc = tl.zeros([D], tl.float32)
-        p1 = tl.load(pos_ptr + b).to(tl.int64) + 1
-        vbase = v_ptr + kvh * D
-        trow = table_ptr + b * SCAP
-        prow = probs_ptr + (b * H + h) * SCAP
-        t0 = tl.zeros((), tl.int64)
-        while t0 < p1:
-            offs_t = t0 + tl.arange(0, BT)
-            m = offs_t < p1
-            slots = tl.load(trow + offs_t, mask=m, other=0)
-            pv = tl.load(prow + offs_t, mask=m, other=0.0, cache_modifier=".cg")
-            vv = tl.load(vbase + slots[:, None] * (KVH * D) + offs_d[None, :], mask=m[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
-            acc += tl.sum(pv[:, None] * vv, axis=0)
-            t0 += BT
-        tl.store(y_ptr + (b * H + h) * D + offs_d, acc)
-        task += P
 
 
-@triton.jit
-def _t_values_gated(
-    worker: tl.int32,
-    P: tl.int32,
-    probs_ptr,
-    v_ptr,
-    gate_ptr,
-    table_ptr,
-    pos_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    KVH: tl.constexpr,
-    D: tl.constexpr,
-    SCAP: tl.constexpr,
-    BT: tl.constexpr,
-):
-    """Issue #92: _t_values + per-head sigmoid output gate fused —
-
-    ``y[b,h,:] = (sum_{t<=pos[b]} probs * V[table[b,t]]) * sigmoid(gate[b,h,:])``
-
-    Gate epilogue is the validated ``_h_values_gate`` one
-    (device_triton_hybrid.py, 27B): gate loaded once per head, sigmoid and
-    multiply in f32, single bf16 store — no extra grid barrier per FA layer.
-    """
-    task = worker
-    GROUP: tl.constexpr = H // KVH
-    while task < B * H:
-        b = task // H
-        h = task % H
-        kvh = h // GROUP
-        offs_d = tl.arange(0, D)
-        acc = tl.zeros([D], tl.float32)
-        p1 = tl.load(pos_ptr + b).to(tl.int64) + 1
-        vbase = v_ptr + kvh * D
-        trow = table_ptr + b * SCAP
-        prow = probs_ptr + (b * H + h) * SCAP
-        t0 = tl.zeros((), tl.int64)
-        while t0 < p1:
-            offs_t = t0 + tl.arange(0, BT)
-            m = offs_t < p1
-            slots = tl.load(trow + offs_t, mask=m, other=0)
-            pv = tl.load(prow + offs_t, mask=m, other=0.0, cache_modifier=".cg")
-            vv = tl.load(vbase + slots[:, None] * (KVH * D) + offs_d[None, :], mask=m[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
-            acc += tl.sum(pv[:, None] * vv, axis=0)
-            t0 += BT
-        gate = tl.load(gate_ptr + (b * H + h) * D + offs_d, cache_modifier=".cg").to(tl.float32)
-        tl.store(y_ptr + (b * H + h) * D + offs_d, acc * (1.0 / (1.0 + tl.exp(-gate))))
-        task += P
 
 
-@triton.jit
-def _t_gemv(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    w_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    K: tl.constexpr,
-    N: tl.constexpr,
-    TILE: tl.constexpr,
-    BK: tl.constexpr,
-):
-    """y[b, n] = sum_k x[b, k] * w[k, n] — 16-column tiles, full-K (§6.2).
-
-    One task per output tile; the task computes all B rows (weight tile
-    loaded once per k-chunk is re-read per row from L2; B == 1 compiles to
-    the original single-row path).
-    """
-    NTASK: tl.constexpr = N // TILE
-    task = worker
-    while task < NTASK:
-        offs_n = task * TILE + tl.arange(0, TILE)
-        for b in tl.static_range(B):
-            acc = tl.zeros([TILE], tl.float32)
-            for k0 in range(0, K, BK):
-                offs_k = k0 + tl.arange(0, BK)
-                xv = tl.load(x_ptr + b * K + offs_k, mask=offs_k < K, other=0.0, cache_modifier=".cg").to(tl.float32)
-                wt = tl.load(w_ptr + offs_k[:, None] * N + offs_n[None, :], mask=offs_k[:, None] < K, other=0.0).to(tl.float32)
-                acc += tl.sum(wt * xv[:, None], axis=0)
-            tl.store(y_ptr + b * N + offs_n, acc)
-        task += P
 
 
-@triton.jit
-def _t_gemv_transposed(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    tok_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    K: tl.constexpr,
-    N: tl.constexpr,
-    TILE: tl.constexpr,
-    BK: tl.constexpr,
-):
-    """Tied head: logits[b, n] = sum_c x[b, c] * tok[n, c]."""
-    NTASK: tl.constexpr = N // TILE
-    task = worker
-    while task < NTASK:
-        offs_n = task * TILE + tl.arange(0, TILE)
-        for b in tl.static_range(B):
-            acc = tl.zeros([TILE], tl.float32)
-            for k0 in range(0, K, BK):
-                offs_k = k0 + tl.arange(0, BK)
-                xv = tl.load(x_ptr + b * K + offs_k, mask=offs_k < K, other=0.0, cache_modifier=".cg").to(tl.float32)
-                wt = tl.load(tok_ptr + offs_n[:, None].to(tl.int64) * K + offs_k[None, :], mask=offs_k[None, :] < K, other=0.0).to(tl.float32)
-                acc += tl.sum(wt * xv[None, :], axis=1)
-            tl.store(y_ptr + b * N + offs_n, acc)
-        task += P
 
 
-@triton.jit
-def _t_swiglu(worker: tl.int32, P: tl.int32, gu_ptr, y_ptr, B: tl.constexpr, F: tl.constexpr, F2: tl.constexpr, ELEM: tl.constexpr):
-    """act = silu(gate) * up over [B, F]; gate/up interleaved per row in the
-    fused [B, 2F] gate_up output (ELEM divides F, so tiles stay in-row)."""
-    NTASK: tl.constexpr = (B * F) // ELEM
-    task = worker
-    while task < NTASK:
-        lo = task * ELEM
-        b = lo // F
-        c = (lo % F) + tl.arange(0, ELEM)
-        row = b * F2
-        g = tl.load(gu_ptr + row + c, cache_modifier=".cg").to(tl.float32)
-        u = tl.load(gu_ptr + row + F + c, cache_modifier=".cg").to(tl.float32)
-        tl.store(y_ptr + b * F + c, g / (1.0 + tl.exp(-g)) * u)
-        task += P
 
 
-@triton.jit
-def _t_add(worker: tl.int32, P: tl.int32, a_ptr, b_ptr, y_ptr, BC: tl.constexpr, ELEM: tl.constexpr):
-    """y = a + b over [B, C] (flat)."""
-    NTASK: tl.constexpr = BC // ELEM
-    task = worker
-    while task < NTASK:
-        offs = task * ELEM + tl.arange(0, ELEM)
-        a = tl.load(a_ptr + offs, cache_modifier=".cg")
-        b = tl.load(b_ptr + offs, cache_modifier=".cg")
-        tl.store(y_ptr + offs, a + b)
-        task += P
 
 
 # ---------------------------------------------------------------------------
@@ -625,7 +185,7 @@ def qwen3_megakernel(
     ws_ptr,
     logits_ptr,
     bar_ptr,
-    bar_base: tl.int64,
+    bar_base_ptr,
     L,
     WQKV_L,
     WOP_L,
@@ -645,24 +205,10 @@ def qwen3_megakernel(
     QKVW: tl.constexpr,
     HD: tl.constexpr,
     F2: tl.constexpr,
-    WS_LAYER: tl.constexpr,
-    O_HIDDEN_A: tl.constexpr,
-    O_HIDDEN_B: tl.constexpr,
+    layout_ptr,
+    O_EMBED: tl.constexpr,
+    O_FINAL_INPUT: tl.constexpr,
     O_FINAL: tl.constexpr,
-    O_RMS1: tl.constexpr,
-    O_QKV: tl.constexpr,
-    O_QN: tl.constexpr,
-    O_KN: tl.constexpr,
-    O_RQ: tl.constexpr,
-    O_RK: tl.constexpr,
-    O_SCORES: tl.constexpr,
-    O_PROBS: tl.constexpr,
-    O_CTX: tl.constexpr,
-    O_ATTN: tl.constexpr,
-    O_RMS2: tl.constexpr,
-    O_GU: tl.constexpr,
-    O_ACT: tl.constexpr,
-    O_DOWN: tl.constexpr,
     EPS: tl.constexpr,
     SCALE: tl.constexpr,
     TILE: tl.constexpr,
@@ -671,296 +217,98 @@ def qwen3_megakernel(
     BTR: tl.constexpr,
     ELEM: tl.constexpr,
 ):
+    bar_base = tl.load(bar_base_ptr)
     worker = tl.program_id(0)
     P = tl.num_programs(0)
     BC: tl.constexpr = B * C
 
     # ---- phase 0: embedding -------------------------------------------
-    _t_embed(worker, P, ids_ptr, tok_ptr, ws_ptr + O_HIDDEN_A, B, C, C)
+    _t_embed(worker, P, ids_ptr, tok_ptr, ws_ptr + O_EMBED, B, C, C)
     grid_barrier(bar_ptr, bar_base + P)
 
     for l in range(L):
         li = l.to(tl.int64)
-        base = ws_ptr + li * WS_LAYER
+        base = ws_ptr
+        o_hidden_a = tl.load(layout_ptr + li * 17 + 0)
+        o_rms1 = tl.load(layout_ptr + li * 17 + 1)
+        o_qkv = tl.load(layout_ptr + li * 17 + 2)
+        o_qn = tl.load(layout_ptr + li * 17 + 3)
+        o_kn = tl.load(layout_ptr + li * 17 + 4)
+        o_rq = tl.load(layout_ptr + li * 17 + 5)
+        o_rk = tl.load(layout_ptr + li * 17 + 6)
+        o_scores = tl.load(layout_ptr + li * 17 + 7)
+        o_probs = tl.load(layout_ptr + li * 17 + 8)
+        o_ctx = tl.load(layout_ptr + li * 17 + 9)
+        o_attn = tl.load(layout_ptr + li * 17 + 10)
+        o_hidden_b = tl.load(layout_ptr + li * 17 + 11)
+        o_rms2 = tl.load(layout_ptr + li * 17 + 12)
+        o_gu = tl.load(layout_ptr + li * 17 + 13)
+        o_act = tl.load(layout_ptr + li * 17 + 14)
+        o_down = tl.load(layout_ptr + li * 17 + 15)
+        o_hidden_out = tl.load(layout_ptr + li * 17 + 16)
         # phase 1: rms1
-        _t_rms2d(worker, P, ws_ptr + O_HIDDEN_A, ln1_ptr + li * LNLN_L, base + O_RMS1, B, C, C, EPS)
+        _t_rms2d(worker, P, ws_ptr + o_hidden_a, ln1_ptr + li * LNLN_L, base + o_rms1, B, C, C, EPS)
         grid_barrier(bar_ptr, bar_base + (2 + 17 * l) * P)
         # phase 2: qkv projection [C -> QKVW]
-        _t_gemv(worker, P, base + O_RMS1, qkv_w_ptr + li * WQKV_L, base + O_QKV, B, C, QKVW, TILE, BK)
+        _t_gemv(worker, P, base + o_rms1, qkv_w_ptr + li * WQKV_L, base + o_qkv, B, C, QKVW, TILE, BK)
         grid_barrier(bar_ptr, bar_base + (3 + 17 * l) * P)
         # phases 3-4: q/k RMSNorm per head (v needs no processing); the q/k
         # slices are interleaved inside each row's packed QKV projection.
-        _t_rms_heads(worker, P, base + O_QKV, qn_ptr + li * D, base + O_QN, B, H, D, QKVW, EPS)
+        _t_rms_heads(worker, P, base + o_qkv, qn_ptr + li * D, base + o_qn, B, H, D, QKVW, EPS)
         grid_barrier(bar_ptr, bar_base + (4 + 17 * l) * P)
-        _t_rms_heads(worker, P, base + O_QKV + HD, kn_ptr + li * D, base + O_KN, B, KVH, D, QKVW, EPS)
+        _t_rms_heads(worker, P, base + o_qkv + HD, kn_ptr + li * D, base + o_kn, B, KVH, D, QKVW, EPS)
         grid_barrier(bar_ptr, bar_base + (5 + 17 * l) * P)
         # phases 5-6: rope q/k at each row's runtime position
         # (ROT=D, TSTRIDE=D: full-width rotate_half via the partial template)
-        _t_rope(worker, P, base + O_QN, cos_ptr, sin_ptr, pos_ptr, base + O_RQ, B, H, D, D, D)
+        _t_rope(worker, P, base + o_qn, cos_ptr, sin_ptr, pos_ptr, base + o_rq, B, H, D, D, D)
         grid_barrier(bar_ptr, bar_base + (6 + 17 * l) * P)
-        _t_rope(worker, P, base + O_KN, cos_ptr, sin_ptr, pos_ptr, base + O_RK, B, KVH, D, D, D)
+        _t_rope(worker, P, base + o_kn, cos_ptr, sin_ptr, pos_ptr, base + o_rk, B, KVH, D, D, D)
         grid_barrier(bar_ptr, bar_base + (7 + 17 * l) * P)
         # phase 7: cache append (k roped; v straight from the qkv buffer)
         kcl = k_cache_ptr + li * KCBASE_L
         vcl = v_cache_ptr + li * KCBASE_L
-        _t_append(worker, P, kcl, vcl, table_ptr, pos_ptr, base + O_RK, base + O_QKV + HD + KVH * D, B, KVH, D, QKVW, SCAP)
+        _t_append(worker, P, kcl, vcl, table_ptr, pos_ptr, base + o_rk, base + o_qkv + HD + KVH * D, B, KVH, D, QKVW, SCAP)
         grid_barrier(bar_ptr, bar_base + (8 + 17 * l) * P)
         # phases 8-10: attention (GQA, per-row valid lengths)
-        _t_scores(worker, P, base + O_RQ, kcl, table_ptr, pos_ptr, base + O_SCORES, B, H, KVH, D, SCAP, BT, SCALE)
+        _t_scores(worker, P, base + o_rq, kcl, table_ptr, pos_ptr, base + o_scores, B, H, KVH, D, SCAP, BT, SCALE)
         grid_barrier(bar_ptr, bar_base + (9 + 17 * l) * P)
-        _t_softmax(worker, P, base + O_SCORES, pos_ptr, base + O_PROBS, B, H, SCAP, BTR)
+        _t_softmax(worker, P, base + o_scores, pos_ptr, base + o_probs, B, H, SCAP, BTR)
         grid_barrier(bar_ptr, bar_base + (10 + 17 * l) * P)
-        _t_values(worker, P, base + O_PROBS, vcl, table_ptr, pos_ptr, base + O_CTX, B, H, KVH, D, SCAP, BT)
+        _t_values(worker, P, base + o_probs, vcl, table_ptr, pos_ptr, base + o_ctx, B, H, KVH, D, SCAP, BT)
         grid_barrier(bar_ptr, bar_base + (11 + 17 * l) * P)
         # phase 11: o_proj [H*D -> C], phase 12: residual add
-        _t_gemv(worker, P, base + O_CTX, op_ptr + li * WOP_L, base + O_ATTN, B, HD, C, TILE, BK)
+        _t_gemv(worker, P, base + o_ctx, op_ptr + li * WOP_L, base + o_attn, B, HD, C, TILE, BK)
         grid_barrier(bar_ptr, bar_base + (12 + 17 * l) * P)
-        _t_add(worker, P, ws_ptr + O_HIDDEN_A, base + O_ATTN, ws_ptr + O_HIDDEN_B, BC, ELEM)
+        _t_add(worker, P, ws_ptr + o_hidden_a, base + o_attn, ws_ptr + o_hidden_b, BC, ELEM)
         grid_barrier(bar_ptr, bar_base + (13 + 17 * l) * P)
         # phase 13: rms2, phase 14: gate_up [C -> 2F]
-        _t_rms2d(worker, P, ws_ptr + O_HIDDEN_B, ln2_ptr + li * LNLN_L, base + O_RMS2, B, C, C, EPS)
+        _t_rms2d(worker, P, ws_ptr + o_hidden_b, ln2_ptr + li * LNLN_L, base + o_rms2, B, C, C, EPS)
         grid_barrier(bar_ptr, bar_base + (14 + 17 * l) * P)
-        _t_gemv(worker, P, base + O_RMS2, gu_ptr + li * WGU_L, base + O_GU, B, C, F2, TILE, BK)
+        _t_gemv(worker, P, base + o_rms2, gu_ptr + li * WGU_L, base + o_gu, B, C, F2, TILE, BK)
         grid_barrier(bar_ptr, bar_base + (15 + 17 * l) * P)
         # phase 15: swiglu, phase 16: down [F -> C], phase 17: residual add
-        _t_swiglu(worker, P, base + O_GU, base + O_ACT, B, F, F2, ELEM)
+        _t_swiglu(worker, P, base + o_gu, base + o_act, B, F, F2, ELEM)
         grid_barrier(bar_ptr, bar_base + (16 + 17 * l) * P)
-        _t_gemv(worker, P, base + O_ACT, down_ptr + li * WDOWN_L, base + O_DOWN, B, F, C, TILE, BK)
+        _t_gemv(worker, P, base + o_act, down_ptr + li * WDOWN_L, base + o_down, B, F, C, TILE, BK)
         grid_barrier(bar_ptr, bar_base + (17 + 17 * l) * P)
-        _t_add(worker, P, ws_ptr + O_HIDDEN_B, base + O_DOWN, ws_ptr + O_HIDDEN_A, BC, ELEM)
+        _t_add(worker, P, ws_ptr + o_hidden_b, base + o_down, ws_ptr + o_hidden_out, BC, ELEM)
         grid_barrier(bar_ptr, bar_base + (18 + 17 * l) * P)
 
     # ---- final phases: norm + tied head (no barrier after the last) ------
-    _t_rms2d(worker, P, ws_ptr + O_HIDDEN_A, final_g_ptr, ws_ptr + O_FINAL, B, C, C, EPS)
+    _t_rms2d(worker, P, ws_ptr + O_FINAL_INPUT, final_g_ptr, ws_ptr + O_FINAL, B, C, C, EPS)
     grid_barrier(bar_ptr, bar_base + (17 * L + 2) * P)
     _t_gemv_transposed(worker, P, ws_ptr + O_FINAL, tok_ptr, logits_ptr, B, C, V, TILE, BK)
+    if worker == 0:
+        tl.store(bar_base_ptr, bar_base + (17 * L + 2) * P)
 
 
 
-@triton.jit
-def _t_rope_interleaved(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    cos_ptr,
-    sin_ptr,
-    pos_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    NHEAD: tl.constexpr,
-    D: tl.constexpr,
-    ROT: tl.constexpr,
-    TSTRIDE: tl.constexpr,
-    NEGATE_SIN: tl.constexpr,
-):
-    """Interleaved (GPT-J style) rope — issue #95, DeepSeek-V4 q/latent-k.
-
-    One task per (b, head); pairs ``(2i, 2i+1)`` over the first ``ROT``
-    dims, cos/sin indexed by PAIR index at the row's runtime position::
-
-        x[2i]'   = x[2i]*c_i - x[2i+1]*s_i
-        x[2i+1]' = x[2i+1]*c_i + x[2i]*s_i
-
-    dims ``[ROT, D)`` pass through. ``NEGATE_SIN=True`` turns this into the
-    CONJUGATE rotation (output-side, negative angle) — the exact inverse of
-    the q/k rotation at the same position; implemented as one template so
-    the round-trip property is structurally guaranteed on device.
-    UNVERIFIED in this environment: CUDA-gated (same flagged gap as PRs
-    #88/#113/#114/#115/#117).
-    """
-    task = worker
-    while task < B * NHEAD:
-        b = task // NHEAD
-        h = task % NHEAD
-        half: tl.constexpr = ROT // 2
-        i = tl.arange(0, half)
-        p = tl.load(pos_ptr + b).to(tl.int64)
-        base = (b * NHEAD + h) * D
-        x_even = tl.load(x_ptr + base + 2 * i, cache_modifier=".cg").to(tl.float32)
-        x_odd = tl.load(x_ptr + base + 2 * i + 1, cache_modifier=".cg").to(tl.float32)
-        c = tl.load(cos_ptr + p * TSTRIDE + i).to(tl.float32)
-        s = tl.load(sin_ptr + p * TSTRIDE + i).to(tl.float32)
-        if NEGATE_SIN:
-            s = -s
-        tl.store(y_ptr + base + 2 * i, x_even * c - x_odd * s)
-        tl.store(y_ptr + base + 2 * i + 1, x_odd * c + x_even * s)
-        if ROT < D:
-            offs_d = tl.arange(0, D)
-            mt = offs_d >= ROT
-            tail = tl.load(x_ptr + base + offs_d, mask=mt, other=0.0, cache_modifier=".cg").to(tl.float32)
-            tl.store(y_ptr + base + offs_d, tail, mask=mt)
-        task += P
 
 
-@triton.jit
-def _t_mla_scores(
-    worker: tl.int32,
-    P: tl.int32,
-    q_ptr,
-    latent_ptr,
-    wtable_ptr,
-    comp_ptr,
-    compidx_ptr,
-    sink_ptr,
-    bias_ptr,
-    pos_ptr,
-    probs_ptr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    W: tl.constexpr,
-    K: tl.constexpr,
-    SPOOL: tl.constexpr,
-    MPOOL: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    scale: tl.constexpr,
-):
-    """MLA fused scores + softmax + sink (issue #95). One task per (b, head).
-
-    Candidate layout per (b, h): [W window | K compressed | 1 sink (last)].
-    Window slot i -> logical cache position t = p - W + 1 + i, gathered from
-    the per-row latent pool via the slot table (masked to [0, p]);
-    compressed slot j -> comp_idx[b, j] (masked to >= 0; logits + bias when
-    HAS_BIAS); sink logit per head, always valid. fp32 two-pass softmax over
-    valid candidates; invalid slots exact 0.0. UNVERIFIED: CUDA-gated.
-    """
-    task = worker
-    WIDTH: tl.constexpr = W + K + 1
-    while task < B * H:
-        b = task // H
-        h = task % H
-        offs_w = tl.arange(0, W)
-        offs_k = tl.arange(0, K)
-        offs_d = tl.arange(0, D)
-        p = tl.load(pos_ptr + b).to(tl.int64)
-        qb = tl.load(q_ptr + (b * H + h) * D + offs_d, cache_modifier=".cg").to(tl.float32)
-        # window logits: logical t = p - W + 1 + i
-        t = p - W + 1 + offs_w.to(tl.int64)
-        m_w = (t >= 0) & (t <= p)
-        slots_w = tl.load(wtable_ptr + b * SPOOL + t, mask=m_w, other=0).to(tl.int64)
-        lat = tl.load(latent_ptr + b * SPOOL * D + slots_w[:, None] * D + offs_d[None, :],
-                      mask=m_w[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
-        lw = tl.sum(lat * qb[None, :], axis=1) * scale
-        # compressed logits
-        e = tl.load(compidx_ptr + b * K + offs_k).to(tl.int64)
-        m_k = e >= 0
-        comp = tl.load(comp_ptr + b * MPOOL * D + e[:, None] * D + offs_d[None, :],
-                       mask=m_k[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
-        lc = tl.sum(comp * qb[None, :], axis=1) * scale
-        if HAS_BIAS:
-            lc += tl.load(bias_ptr + b * K + offs_k, mask=m_k, other=0.0).to(tl.float32)
-        # sink (per-head, always valid, LAST slot)
-        lsink = tl.load(sink_ptr + h).to(tl.float32)
-        # fused two-pass softmax over valid candidates ∪ sink. The union
-        # axis (W+K+1) is not a power of two, so it is never materialized:
-        # the window [W], compressed [K] and sink pieces are reduced
-        # separately and share the global max / denominator (identical
-        # result to a single fused pass — max and Σexp are order-free).
-        mx = tl.maximum(tl.max(tl.where(m_w, lw, -float("inf"))),
-                        tl.max(tl.where(m_k, lc, -float("inf"))))
-        mx = tl.maximum(mx, lsink)
-        ex_w = tl.where(m_w, tl.exp(lw - mx), 0.0)
-        ex_k = tl.where(m_k, tl.exp(lc - mx), 0.0)
-        ex_sink = tl.exp(lsink - mx)
-        denom = tl.sum(ex_w) + tl.sum(ex_k) + ex_sink
-        prow = probs_ptr + (b * H + h) * WIDTH
-        tl.store(prow + offs_w, ex_w / denom)
-        tl.store(prow + W + offs_k, ex_k / denom)
-        tl.store(prow + (W + K), ex_sink / denom)
-        task += P
 
 
-@triton.jit
-def _t_mla_values(
-    worker: tl.int32,
-    P: tl.int32,
-    probs_ptr,
-    latent_ptr,
-    wtable_ptr,
-    comp_ptr,
-    compidx_ptr,
-    pos_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    W: tl.constexpr,
-    K: tl.constexpr,
-    SPOOL: tl.constexpr,
-    MPOOL: tl.constexpr,
-):
-    """MLA context gather (issue #95): window + compressed pools; the sink
-    column (W+K) contributes NO value. fp32 accumulation, single store.
-    UNVERIFIED: CUDA-gated."""
-    task = worker
-    while task < B * H:
-        b = task // H
-        h = task % H
-        offs_w = tl.arange(0, W)
-        offs_k = tl.arange(0, K)
-        offs_d = tl.arange(0, D)
-        p = tl.load(pos_ptr + b).to(tl.int64)
-        prow = probs_ptr + (b * H + h) * (W + K + 1)
-        t = p - W + 1 + offs_w.to(tl.int64)
-        m_w = (t >= 0) & (t <= p)
-        slots_w = tl.load(wtable_ptr + b * SPOOL + t, mask=m_w, other=0).to(tl.int64)
-        pw = tl.load(prow + offs_w, mask=m_w, other=0.0, cache_modifier=".cg")
-        lat = tl.load(latent_ptr + b * SPOOL * D + slots_w[:, None] * D + offs_d[None, :],
-                      mask=m_w[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
-        acc = tl.sum(pw[:, None] * lat, axis=0)
-        e = tl.load(compidx_ptr + b * K + offs_k).to(tl.int64)
-        m_k = e >= 0
-        pc = tl.load(prow + W + offs_k, mask=m_k, other=0.0, cache_modifier=".cg")
-        comp = tl.load(comp_ptr + b * MPOOL * D + e[:, None] * D + offs_d[None, :],
-                       mask=m_k[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
-        acc += tl.sum(pc[:, None] * comp, axis=0)
-        tl.store(y_ptr + (b * H + h) * D + offs_d, acc)
-        task += P
 
 
-@triton.jit
-def _t_linear_grouped(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    w_ptr,
-    y_ptr,
-    M: tl.constexpr,
-    K: tl.constexpr,
-    N: tl.constexpr,
-    GH: tl.constexpr,
-    TILE_N: tl.constexpr,
-):
-    """Block-diagonal per-head GEMV (issue #95 GroupedLinear). One task per
-    (row, N tile): each output n reads only its owning head's diagonal
-    blocks — off-block weight storage is never touched. fp32 accumulation.
-    UNVERIFIED: CUDA-gated."""
-    task = worker
-    K_G: tl.constexpr = K // GH
-    N_G: tl.constexpr = N // GH
-    while task < M * (N // TILE_N):
-        m = task // (N // TILE_N)
-        nt = task % (N // TILE_N)
-        n0 = nt * TILE_N
-        offs_n = n0 + tl.arange(0, TILE_N)
-        acc = tl.zeros([TILE_N], tl.float32)
-        for h in range(GH):
-            lo = h * N_G
-            hi = (h + 1) * N_G
-            sel = (offs_n >= lo) & (offs_n < hi)
-            if tl.sum(sel.to(tl.int32)) > 0:
-                offs_k = h * K_G + tl.arange(0, K_G)
-                xv = tl.load(x_ptr + m * K + offs_k, cache_modifier=".cg").to(tl.float32)
-                nn = tl.where(sel, offs_n, 0) - h * N_G
-                # w is stored [Cin, Cout] = [K, N] (§3.1, same as the base
-                # linear): the head's diagonal block is
-                # w[h*K_G:(h+1)*K_G, h*N_G:(h+1)*N_G] — rows are the head's
-                # K slice, columns its N slice. y[n] = <w[:, n], x>.
-                wv = tl.load(w_ptr + offs_k[:, None] * N + (h * N_G + nn)[None, :],
-                             mask=sel[None, :], other=0.0, cache_modifier=".cg").to(tl.float32)
-                acc += tl.sum(xv[:, None] * wv, axis=0)
-        tl.store(y_ptr + m * N + offs_n, acc)
-        task += P
 
 
 # ---------------------------------------------------------------------------
@@ -970,69 +318,44 @@ def _t_linear_grouped(
 
 @dataclass
 class _Plan:
-    """Layer-uniform fp32 workspace layout (element offsets, batch-sized)."""
-
-    C: int
-    H: int
-    KVH: int
-    D: int
-    F: int
-    V: int
     SCAP: int
-    L: int
-    B: int
-    offsets: dict
-    ws_layer: int
     ws_total: int
-    num_phases: int  # 1 + 17L + 2
-    num_barriers: int  # one after every phase except the last
+    num_phases: int
+    num_barriers: int
+    embedding: int
+    final_input: int
+    final: int
+    logits: int
+    layer_offsets: list[list[int]]
 
 
-def _plan(config, capacity: int, batch: int) -> _Plan:
-    C, H, KVH, D, F, V, L = (
-        config.hidden,
-        config.heads,
-        config.kv_heads,
-        config.head_dim,
-        config.intermediate,
-        config.vocab,
-        config.layers,
-    )
-    HD, F2, QKVW = H * D, 2 * F, (H + 2 * KVH) * D
-    off: dict[str, int] = {}
-    o = 0
+def _plan(executable) -> _Plan:
+    """Adapt the canonical schedule and packed workspace to the Qwen3 template."""
+    graph, families = executable.graph, executable.families
+    offsets = {b.storage_id: b.offset for b in executable.workspace_plan.buffers}
 
-    def take(name, n):
-        nonlocal o
-        off[name] = o
-        o += n
+    def output(family):
+        value = graph.tensor(family.op.outputs[0])
+        return offsets[value.storage_id] + value.offset
 
-    take("hidden_a", batch * C)
-    take("hidden_b", batch * C)
-    take("final", batch * C)
-    o = (o + 63) // 64 * 64  # align the layer block
-    layer_base = o
-    for name, n in [
-        ("rms1", batch * C),
-        ("qkv", batch * QKVW),
-        ("qn", batch * HD),
-        ("kn", batch * KVH * D),
-        ("rq", batch * HD),
-        ("rk", batch * KVH * D),
-        ("scores", batch * H * capacity),
-        ("probs", batch * H * capacity),
-        ("ctx", batch * HD),
-        ("attn", batch * C),
-        ("rms2", batch * C),
-        ("gu", batch * F2),
-        ("act", batch * F),
-        ("down", batch * C),
-    ]:
-        take(name, n)
-    ws_layer = o - layer_base
-    ws_total = layer_base + ws_layer * L
-    num_phases = 1 + 17 * L + 2
-    return _Plan(C, H, KVH, D, F, V, capacity, L, batch, off, ws_layer, ws_total, num_phases, num_phases - 1)
+    expected = ("rms_norm", "linear", "rms_norm", "rms_norm", "rope", "rope",
+                "cache_append", "attention_scores", "softmax", "attention_values",
+                "linear", "add", "rms_norm", "linear", "swiglu", "linear", "add")
+    if len(families) != 3 + 17 * executable.config.layers:
+        raise ValueError("Qwen3 backend does not support this schedule")
+    layers = []
+    hidden = output(families[0])
+    embedding = hidden
+    for layer in range(executable.config.layers):
+        fs = families[1+17*layer:1+17*(layer+1)]
+        if tuple(f.op.kind for f in fs) != expected:
+            raise ValueError("Qwen3 backend phase contract mismatch")
+        values = [output(f) for i, f in enumerate(fs) if i != 6]
+        layers.append([hidden, *values])
+        hidden = values[-1]
+    return _Plan(executable.config.cache_capacity, executable.workspace_plan.total_elements,
+                 len(families), len(families)-1, embedding, hidden,
+                 output(families[-2]), output(families[-1]), layers)
 
 
 def _pow2(n: int) -> int:
@@ -1072,15 +395,24 @@ class TritonMegakernel:
         batch: int = 1,
         k_cache=None,
         v_cache=None,
+        executable=None,
     ):
         assert config.heads % config.kv_heads == 0
         assert 1 <= batch
         self.config = config
+        if workers < 1:
+            raise ValueError("workers must be positive")
         self.workers = workers
         self.device = device
         self.dtype = dtype
         self.batch = batch
-        self.plan = _plan(config, capacity, batch)
+        from dataclasses import replace
+        from .compile import compile_model
+        planned_config = replace(config, batch=batch, cache_capacity=capacity)
+        self.executable = executable or compile_model(model_config=planned_config, weights=weights, workers=workers)
+        if self.executable.config != planned_config:
+            raise ValueError("executable configuration does not match the runner")
+        self.plan = _plan(self.executable)
         p = self.plan
         self.elem = _elem_tile(config.hidden, config.intermediate)
         self.btcap = 64  # attention chunk; [64, D] fp32 tiles stay in registers
@@ -1105,6 +437,7 @@ class TritonMegakernel:
         self.gu_w = stack(lambda l: w.layers[l].gate_up_w)
         self.down_w = stack(lambda l: w.layers[l].down_w)
         self.ws = torch.zeros(p.ws_total, device=device, dtype=torch.float32)
+        self._layout = torch.tensor(p.layer_offsets, device=device, dtype=torch.int64)
         # KV cache: token-slot-major [layers, max_tokens, KVH, D] — the kvaas
         # pool granularity — either locally allocated or caller-provided
         # (daemon-owned, imported via CUDA IPC). Addressing always goes
@@ -1153,9 +486,15 @@ class TritonMegakernel:
         self._pos_host = torch.zeros(batch, dtype=torch.int32, pin_memory=True)
         self.ids = torch.zeros(batch, device=device, dtype=torch.int64)
         self.pos = torch.zeros(batch, device=device, dtype=torch.int32)
-        self.logits = torch.zeros(batch, config.vocab, device=device, dtype=torch.float32)
+        self.logits = self.ws[p.logits:p.logits + batch*config.vocab].view(batch, config.vocab)
         self.barrier_counter = torch.zeros(1, device=device, dtype=torch.int64)
-        self._bar_base = 0
+        self._bar_base_device = torch.zeros(1, device=device, dtype=torch.int64)
+
+        from .runtime.residency import validate_residency
+        self._stream = torch.cuda.current_stream(self.ids.device)
+        with torch.cuda.device(self.ids.device):
+            self._compiled = self._launch(self.ids, self.pos, warmup=True)
+            self.residency_bound = validate_residency(self._compiled, self.workers, self.ids.device)
 
     # -- kvaas integration --------------------------------------------------
 
@@ -1236,37 +575,18 @@ class TritonMegakernel:
 
     @property
     def barrier_base(self) -> int:
-        return self._bar_base
+        return int(self._bar_base_device[0])
 
     def task_counts(self) -> dict[str, int]:
-        """Per-phase task counts at this batch size (§6.4 tile contract)."""
-        cfg, B = self.config, self.batch
-        f2 = 2 * cfg.intermediate
-        layer = {
-            "rms1": B,
-            "qkv": ((cfg.heads + 2 * cfg.kv_heads) * cfg.head_dim) // 16,
-            "qnorm": B * cfg.heads,
-            "knorm": B * cfg.kv_heads,
-            "rope_q": B * cfg.heads,
-            "rope_k": B * cfg.kv_heads,
-            "append": B * cfg.kv_heads,
-            "scores": B * cfg.heads,
-            "softmax": B * cfg.heads,
-            "values": B * cfg.heads,
-            "o_proj": cfg.hidden // 16,
-            "add1": (B * cfg.hidden) // self.elem,
-            "rms2": B,
-            "gate_up": f2 // 16,
-            "swiglu": (B * cfg.intermediate) // self.elem,
-            "down": cfg.hidden // 16,
-            "add2": (B * cfg.hidden) // self.elem,
-        }
-        out = {"embedding": B}
-        for l in range(cfg.layers):
-            out.update({f"l{l}_{k}": v for k, v in layer.items()})
-        out["final_rms"] = B
-        out["logits"] = cfg.vocab // 16
-        return out
+        """Task counts from the canonical compiled schedule."""
+        aliases = {"embedding lookup": "embedding"}
+        for layer in range(self.config.layers):
+            for source, short in (("kv cache append", "append"), ("attention scores", "scores"),
+                                  ("softmax", "softmax"), ("attention values", "values"),
+                                  ("rope q", "rope_q"), ("rope k", "rope_k")):
+                aliases[f"layer {layer} {source}"] = f"l{layer}_{short}"
+        return {aliases.get(f.op.source_location, f.op.source_location): f.task_count
+                for f in self.executable.families}
 
     # -- launch -------------------------------------------------------------
 
@@ -1278,7 +598,7 @@ class TritonMegakernel:
         ``[B, V]`` logits. Two tiny H2D copies carry the step's tokens and
         positions (disclosed: one kernel launch + two ≤8·B-byte copies).
         """
-        cfg = self.config
+        self._check_stream()
         p = self.plan
         ids = self._as_row(token_ids, self.ids)
         pos = self._as_row(positions, self.pos)
@@ -1297,9 +617,22 @@ class TritonMegakernel:
         # per-step block drains a queue that decode steps sync anyway.
         self.ids.copy_(self._ids_host, non_blocking=False)
         self.pos.copy_(self._pos_host, non_blocking=False)
-        qwen3_megakernel[(self.workers,)](
-            self.ids,
-            self.pos,
+        self._launch(self.ids, self.pos)
+        if check_counter:
+            torch.cuda.synchronize()
+            got = int(self.barrier_counter[0])
+            expected = self.barrier_base
+            if got != expected:
+                raise RuntimeError(f"barrier counter {got} != expected {expected} (progress/protocol failure)")
+        return self.logits
+
+    def _launch(self, ids, pos, *, warmup=False):
+        cfg, p = self.config, self.plan
+        launch = qwen3_megakernel.warmup if warmup else qwen3_megakernel[(self.workers,)]
+        extra = {"grid": (self.workers,)} if warmup else {}
+        return launch(
+            ids,
+            pos,
             self.table,
             self.tok,
             self.final_g,
@@ -1318,7 +651,7 @@ class TritonMegakernel:
             self.ws,
             self.logits,
             self.barrier_counter,
-            self._bar_base,
+            self._bar_base_device,
             cfg.layers,
             cfg.hidden * ((cfg.heads + 2 * cfg.kv_heads) * cfg.head_dim),
             (cfg.heads * cfg.head_dim) * cfg.hidden,
@@ -1337,24 +670,10 @@ class TritonMegakernel:
             QKVW=(cfg.heads + 2 * cfg.kv_heads) * cfg.head_dim,
             HD=cfg.heads * cfg.head_dim,
             F2=2 * cfg.intermediate,
-            WS_LAYER=p.ws_layer,
-            O_HIDDEN_A=p.offsets["hidden_a"],
-            O_HIDDEN_B=p.offsets["hidden_b"],
-            O_FINAL=p.offsets["final"],
-            O_RMS1=p.offsets["rms1"],
-            O_QKV=p.offsets["qkv"],
-            O_QN=p.offsets["qn"],
-            O_KN=p.offsets["kn"],
-            O_RQ=p.offsets["rq"],
-            O_RK=p.offsets["rk"],
-            O_SCORES=p.offsets["scores"],
-            O_PROBS=p.offsets["probs"],
-            O_CTX=p.offsets["ctx"],
-            O_ATTN=p.offsets["attn"],
-            O_RMS2=p.offsets["rms2"],
-            O_GU=p.offsets["gu"],
-            O_ACT=p.offsets["act"],
-            O_DOWN=p.offsets["down"],
+            layout_ptr=self._layout,
+            O_EMBED=p.embedding,
+            O_FINAL_INPUT=p.final_input,
+            O_FINAL=p.final,
             EPS=cfg.rms_eps,
             SCALE=cfg.attention_scale,
             TILE=16,
@@ -1363,14 +682,28 @@ class TritonMegakernel:
             BTR=_pow2(p.SCAP),
             ELEM=self.elem,
             num_warps=8,  # §7.1: T = 256 threads per persistent worker
+            **extra,
         )
-        self._bar_base += self.num_barriers * self.workers
-        if check_counter:
-            torch.cuda.synchronize()
-            got = int(self.barrier_counter[0])
-            if got != self._bar_base:
-                raise RuntimeError(f"barrier counter {got} != expected {self._bar_base} (progress/protocol failure)")
+
+    def run_device(self, token_ids, positions) -> torch.Tensor:
+        """Prepared, device-resident decode. No host copies or scalar reads.
+
+        Caller guarantees token IDs are in vocabulary, positions address the
+        installed slot table, and all inputs are ready on the current stream.
+        Calls on one runner must use its preparation stream; outputs alias its
+        workspace and must be consumed before the next step.
+        """
+        for name, value, expected in (("token_ids", token_ids, self.ids), ("positions", positions, self.pos)):
+            if (value.device != self.ids.device or value.dtype != expected.dtype
+                    or value.shape != (self.batch,) or not value.is_contiguous()):
+                raise ValueError(f"{name} must be contiguous {expected.dtype} [{self.batch}] on {self.ids.device}")
+        self._check_stream()
+        self._launch(token_ids, positions)
         return self.logits
+
+    def _check_stream(self):
+        if torch.cuda.current_stream(self.ids.device) != self._stream:
+            raise ValueError("runner belongs to its preparation stream; create a separate runner for concurrency")
 
     def _as_row(self, val, like):
         t = torch.as_tensor(val)
@@ -1484,416 +817,18 @@ def attach_megakernel_pool(
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
-def _t_gemv_fp8(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    w_ptr,
-    scale_ptr,
-    y_ptr,
-    K: tl.constexpr,
-    N: tl.constexpr,
-    TILE: tl.constexpr,
-    BK: tl.constexpr,
-):
-    """y[n] = sum_k x[k] * dequant(w)[k, n] with 128x128 block FP8 scales.
-
-    ``BK`` must equal the quant block width (128) so every k-chunk of a
-    16-column tile falls in exactly one scale block. Weights are streamed
-    as e4m3 and dequantized in-register (scale * fp8 -> fp32 accumulate).
-    """
-    NTASK: tl.constexpr = N // TILE
-    KB: tl.constexpr = K // BK
-    task = worker
-    while task < NTASK:
-        offs_n = task * TILE + tl.arange(0, TILE)
-        sb_row = (task * TILE) // BK
-        acc = tl.zeros([TILE], tl.float32)
-        for kb in range(0, KB):
-            offs_k = kb * BK + tl.arange(0, BK)
-            s = tl.load(scale_ptr + sb_row * KB + kb).to(tl.float32)
-            xv = tl.load(x_ptr + offs_k).to(tl.float32)
-            # checkpoint layout is nn.Linear [out, in] row-major
-            wt = tl.load(w_ptr + offs_n[:, None] * K + offs_k[None, :]).to(tl.float32)
-            acc += tl.sum(wt * (s * xv[None, :]), axis=1)
-        tl.store(y_ptr + offs_n, acc)
-        task += P
 
 
-@triton.jit
-def _t_gdn_conv(
-    worker: tl.int32,
-    P: tl.int32,
-    state_ptr,
-    w_ptr,
-    x_ptr,
-    out_ptr,
-    C: tl.constexpr,
-    ELEM: tl.constexpr,
-    KTAPS: tl.constexpr,
-):
-    """GDN short-conv decode step over channel tiles.
-
-    ``state`` is the persistent [KTAPS-1, C] fp32 channel state (time-major);
-    ``x`` is this token's mixed qkv row [C]; ``w`` is the FIR [C, KTAPS]
-    (grouped conv weights, one tap vector per channel). Computes
-    ``out = silu(sum_j w[:, j] * in_j)`` and shifts the state. One task per
-    ELEM-channel tile.
-    """
-    NTASK: tl.constexpr = C // ELEM
-    task = worker
-    while task < NTASK:
-        offs = task * ELEM + tl.arange(0, ELEM)
-        acc = tl.zeros([ELEM], tl.float32)
-        for j in tl.static_range(KTAPS - 1):
-            wj = tl.load(w_ptr + offs * KTAPS + j).to(tl.float32)
-            sj = tl.load(state_ptr + j * C + offs, cache_modifier=".cg")
-            acc += wj * sj
-        wj = tl.load(w_ptr + offs * KTAPS + (KTAPS - 1)).to(tl.float32)
-        xn = tl.load(x_ptr + offs, cache_modifier=".cg").to(tl.float32)
-        acc += wj * xn
-        tl.store(out_ptr + offs, acc / (1.0 + tl.exp(-acc)))
-        # state shift: drop the oldest tap, append the new row
-        for j in tl.static_range(KTAPS - 2):
-            sj1 = tl.load(state_ptr + (j + 1) * C + offs, cache_modifier=".cg")
-            tl.store(state_ptr + j * C + offs, sj1)
-        tl.store(state_ptr + (KTAPS - 2) * C + offs, xn)
-        task += P
 
 
-@triton.jit
-def _t_gdn_conv_tiled(
-    worker: tl.int32,
-    P: tl.int32,
-    state_ptr,
-    w_ptr,
-    x_ptr,
-    out_ptr,
-    B: tl.constexpr,
-    C: tl.constexpr,
-    ELEM: tl.constexpr,
-    KTAPS: tl.constexpr,
-):
-    """Generic gdn_conv decode-step task body (issue #89): one task per
-    (batch, ELEM-channel tile) over the batched persistent state pool
-    [B, KTAPS-1, C] (fp32, time-major), the mixed qkv rows [B, C] and the
-    FIR weights [C, KTAPS]. Same arithmetic as the 27B-validated
-    ``_t_gdn_conv`` (which is a single flattened batch row of this
-    template), generalized to per-task (b, tile) addressing. Requires
-    C % ELEM == 0 (the lowering picks an exact tiling).
-    """
-    NTILE: tl.constexpr = C // ELEM
-    task = worker
-    while task < B * NTILE:
-        b = task // NTILE
-        t = task % NTILE
-        offs = t * ELEM + tl.arange(0, ELEM)
-        sbase = state_ptr + b.to(tl.int64) * ((KTAPS - 1) * C)
-        acc = tl.zeros([ELEM], tl.float32)
-        for j in tl.static_range(KTAPS - 1):
-            wj = tl.load(w_ptr + offs * KTAPS + j).to(tl.float32)
-            sj = tl.load(sbase + j * C + offs, cache_modifier=".cg")
-            acc += wj * sj
-        wj = tl.load(w_ptr + offs * KTAPS + (KTAPS - 1)).to(tl.float32)
-        xn = tl.load(x_ptr + b.to(tl.int64) * C + offs, cache_modifier=".cg").to(tl.float32)
-        acc += wj * xn
-        tl.store(out_ptr + b.to(tl.int64) * C + offs, acc / (1.0 + tl.exp(-acc)))
-        # state shift: drop the oldest tap, append the new row
-        for j in tl.static_range(KTAPS - 2):
-            sj1 = tl.load(sbase + (j + 1) * C + offs, cache_modifier=".cg")
-            tl.store(sbase + j * C + offs, sj1)
-        tl.store(sbase + (KTAPS - 2) * C + offs, xn)
-        task += P
 
 
-@triton.jit
-def _t_indexer_scores(
-    worker: tl.int32,
-    P: tl.int32,
-    q_ptr,
-    c_ptr,
-    w_ptr,
-    s_ptr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    M: tl.constexpr,
-    TILE: tl.constexpr,
-    scale: tl.constexpr,
-):
-    """Lightning-indexer fused scoring (issue #97), one task per
-    (batch, TILE-entry tile):
-
-        s[b, j] = sum_h relu(<q[b, h, :], c[b, j, :]>) * scale * mix_w[b, h]
-
-    with ``scale = head_dim**-0.5``. The head loop streams the row's full
-    query block [H, D] against the tile and accumulates the per-head mix in
-    registers (f32); q/entries may be stored bf16 (``.cg`` streamed). The
-    full capacity M is scored — masking by the per-row valid candidate
-    count happens in ``_t_index_topk``. Requires D and TILE to be powers of
-    two (tl.arange); the lowering picks exact tiles for ragged M via masks.
-    """
-    NT: tl.constexpr = (M + TILE - 1) // TILE
-    offs_d = tl.arange(0, D)
-    task = worker
-    while task < B * NT:
-        b = task // NT
-        t = task % NT
-        offs_m = t * TILE + tl.arange(0, TILE)
-        mm = offs_m < M
-        cbase = c_ptr + b.to(tl.int64) * (M * D)
-        acc = tl.zeros([TILE], tl.float32)
-        for h in range(0, H):
-            qh = tl.load(q_ptr + (b * H + h) * D + offs_d, cache_modifier=".cg").to(tl.float32)
-            cj = tl.load(
-                cbase + offs_m[:, None].to(tl.int64) * D + offs_d[None, :],
-                mask=mm[:, None],
-                other=0.0,
-                cache_modifier=".cg",
-            ).to(tl.float32)
-            sc = tl.maximum(tl.sum(cj * qh[None, :], axis=1), 0.0) * scale
-            wv = tl.load(w_ptr + b * H + h).to(tl.float32)
-            acc += sc * wv
-        tl.store(s_ptr + b * M + offs_m, acc, mask=mm)
-        task += P
 
 
-@triton.jit
-def _t_index_topk(
-    worker: tl.int32,
-    P: tl.int32,
-    s_ptr,
-    valid_ptr,
-    idx_ptr,
-    bias_ptr,
-    B: tl.constexpr,
-    M: tl.constexpr,
-    K: tl.constexpr,
-    KP: tl.constexpr,
-    TILE: tl.constexpr,
-):
-    """Fixed-count top-k selection (issue #97), one task per batch row.
-
-    Rank by comparison counting over the row's valid prefix:
-
-        rank(j) = #{valid i : s_i > s_j} + #{valid i < j : s_i == s_j}
-
-    so the rank *is* the output slot — descending score with deterministic
-    lowest-index tie-break, no sort and no scratch buffer. NaN scores inside
-    the valid prefix are excluded (``s == s`` fails); candidates at or
-    beyond the row's valid count are never observed (masked loads — the
-    uninitialized tail may hold NaN canaries). Slots beyond a row's valid
-    count keep the up-front -1 / 0.0 fill. ``bias = s_j / ||s_valid||_2``
-    in fp32. M <= ~1k candidates: the O(M^2/TILE) comparison sweep is a
-    few dozen register-block reductions. KP is the power-of-two pad of K
-    (tl.arange); TILE a power of two.
-    """
-    offs_k = tl.arange(0, KP)
-    km = offs_k < K
-    task = worker
-    while task < B:
-        b = task
-        vc = tl.load(valid_ptr + b)
-        vc = tl.minimum(tl.maximum(vc, 0), M)
-        # Deterministic fill first; selected slots are overwritten by the
-        # rank-addressed scatter below (same-thread program order).
-        tl.store(idx_ptr + b * K + offs_k, tl.full([KP], -1, tl.int32), mask=km)
-        tl.store(bias_ptr + b * K + offs_k, tl.zeros([KP], tl.float32), mask=km)
-        # Normalizer: ||s||_2 over the row's valid finite prefix.
-        nacc = tl.zeros([TILE], tl.float32)
-        t0 = 0
-        while t0 < M:
-            offs = t0 + tl.arange(0, TILE)
-            sm = (offs < M) & (offs < vc)
-            sv = tl.load(s_ptr + b * M + offs, mask=sm, other=0.0).to(tl.float32)
-            nacc += tl.where(sv == sv, sv * sv, 0.0)
-            t0 += TILE
-        norm = tl.sqrt(tl.sum(nacc, axis=0))
-        # Rank counting + rank-addressed scatter, chunk pair by chunk pair.
-        t0 = 0
-        while t0 < M:
-            offs_i = t0 + tl.arange(0, TILE)
-            mi = (offs_i < M) & (offs_i < vc)
-            si = tl.load(s_ptr + b * M + offs_i, mask=mi, other=0.0).to(tl.float32)
-            ci = mi & (si == si)
-            rank = tl.zeros([TILE], tl.int32)
-            t1 = 0
-            while t1 < M:
-                offs_j = t1 + tl.arange(0, TILE)
-                mj = (offs_j < M) & (offs_j < vc)
-                sj = tl.load(s_ptr + b * M + offs_j, mask=mj, other=0.0).to(tl.float32)
-                cj = mj & (sj == sj)
-                gt = (sj[None, :] > si[:, None]) & cj[None, :] & ci[:, None]
-                eq = (sj[None, :] == si[:, None]) & cj[None, :] & ci[:, None] & (offs_j[None, :] < offs_i[:, None])
-                rank += tl.sum((gt | eq).to(tl.int32), axis=1)
-                t1 += TILE
-            sel = ci & (rank < K)
-            tl.store(idx_ptr + b * K + rank, offs_i.to(tl.int32), mask=sel)
-            tl.store(bias_ptr + b * K + rank, si / norm, mask=sel)
-            t0 += TILE
-        task += P
 
 
-@triton.jit
-def _t_compressor_append(
-    worker: tl.int32,
-    P: tl.int32,
-    pool_ptr,
-    state_ptr,
-    win_ptr,
-    gates_ptr,
-    rmsw_ptr,
-    cos_ptr,
-    sin_ptr,
-    pos_ptr,
-    p_scalar,
-    B: tl.constexpr,
-    L: tl.constexpr,
-    M: tl.constexpr,
-    R: tl.constexpr,
-    D: tl.constexpr,
-    EPS: tl.constexpr,
-    POS_ROW: tl.constexpr,
-):
-    """Issue #96: DSA compressor entry emission — one task per (b, layer).
-
-    Rows at the m-token boundary (``p[b] % m == m-1``, per-row positions
-    from issue #93) fold their m-token window: fp32 softmax over the gates,
-    weighted latent fold, rms_norm, rotate_half rope at the emitting row's
-    own position (entries rotate ONCE at emission — decode rotates only the
-    query), stored bf16 into the row's active Ca/Cb series slot. Series
-    bookkeeping ping-pongs slot roles at ``cb_len == R``. Non-boundary rows
-    are exact no-ops (masked stores only).
-    """
-    task = worker
-    while task < B * L:
-        b = task // L
-        l = task % L
-        if POS_ROW:
-            p = tl.load(pos_ptr + b)
-        else:
-            p = p_scalar
-        boundary = (p % M) == (M - 1)
-        # --- gated softmax fold over the m-token window (fp32) ---
-        gmax = tl.zeros([1], tl.float32) - float("inf")
-        t = 0
-        while t < M:
-            gt = tl.load(gates_ptr + b * M + t, mask=boundary, other=0.0).to(tl.float32)
-            gmax = tl.maximum(gmax, gt)
-            t += 1
-        denom = tl.zeros([1], tl.float32)
-        t = 0
-        while t < M:
-            gt = tl.load(gates_ptr + b * M + t, mask=boundary, other=0.0).to(tl.float32)
-            denom += tl.exp(gt - gmax)
-            t += 1
-        acc = tl.zeros([D], tl.float32)
-        t = 0
-        while t < M:
-            gt = tl.load(gates_ptr + b * M + t, mask=boundary, other=0.0).to(tl.float32)
-            wt = tl.exp(gt - gmax) / denom
-            offs = tl.arange(0, D)
-            wv = tl.load(win_ptr + (b * M + t) * D + offs, mask=boundary, other=0.0, cache_modifier=".cg").to(tl.float32)
-            acc += wt * wv
-            t += 1
-        # --- rms_norm ---
-        ms = tl.sum(acc * acc, axis=0) / D
-        rmsw = tl.load(rmsw_ptr + tl.arange(0, D), cache_modifier=".cg").to(tl.float32)
-        e = acc * (1.0 / tl.sqrt(ms + EPS)) * rmsw
-        # --- rotate_half rope at the emitting row's position (once) ---
-        # out[i] = e[i]*cos[i mod D/2] + sign·e[partner(i)]·sin[i mod D/2],
-        # partner(i) = i+D/2 for the first half, i-D/2 for the second;
-        # partner gather via lane-compare reduction (D small: head_dim ≤ 128).
-        i = tl.arange(0, D)
-        pair = tl.where(i < D // 2, i + D // 2, i - D // 2)
-        cmp = tl.arange(0, D)[None, :] == pair[:, None]
-        pv = tl.sum(tl.where(cmp, e[None, :], 0.0), axis=1)
-        chf = tl.load(cos_ptr + b * (D // 2) + (i % (D // 2)), mask=boundary, other=0.0).to(tl.float32)
-        shf = tl.load(sin_ptr + b * (D // 2) + (i % (D // 2)), mask=boundary, other=0.0).to(tl.float32)
-        sign = tl.where(i < D // 2, -1.0, 1.0)
-        e_rot = e * chf + sign * pv * shf
-        # --- store entry + series bookkeeping (masked: boundary rows only) ---
-        slot = tl.load(state_ptr + (b * L + l) * 2 + 0, mask=boundary, other=0)
-        cb = tl.load(state_ptr + (b * L + l) * 2 + 1, mask=boundary, other=0)
-        dst = ((b * L + l) * 2 + slot) * R * D + cb * D + i
-        tl.store(pool_ptr + dst, e_rot.to(pool_ptr.dtype.element_ty), mask=boundary)
-        ncb = tl.where(cb + 1 == R, 0, cb + 1)
-        nslot = tl.where(cb + 1 == R, 1 - slot, slot)
-        tl.store(state_ptr + (b * L + l) * 2 + 0, nslot, mask=boundary)
-        tl.store(state_ptr + (b * L + l) * 2 + 1, ncb, mask=boundary)
-        task += P
 
 
-@triton.jit
-def _t_gdn_heads(
-    worker: tl.int32,
-    P: tl.int32,
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    z_ptr,
-    a_ptr,
-    b_ptr,
-    alog_ptr,
-    dtb_ptr,
-    normw_ptr,
-    state_ptr,
-    out_ptr,
-    NH: tl.constexpr,
-    NK: tl.constexpr,
-    HV: tl.constexpr,
-    HK: tl.constexpr,
-    eps: tl.constexpr,
-    scale: tl.constexpr,
-):
-    """Per-value-head gated delta rule (decode step), matching the repo's
-    ``_gdn_delta_rule_recurrent`` reference exactly:
-
-        s *= exp(g);  s += beta*(v - s.k) outer k;  o = s.q
-        o <- RMSNorm(o) * norm_w * (z * sigmoid(z))
-
-    with g = -exp(A_log)*softplus(a + dt_bias), beta = sigmoid(b), q/k
-    L2-normalized per *key* head (group-expanded), fp32 state [NH, HV, HK].
-    One task per value head; the [HV, HK] state slice stays in registers.
-    """
-    GROUP: tl.constexpr = NH // NK
-    offs_v = tl.arange(0, HV)
-    offs_k = tl.arange(0, HK)
-    task = worker
-    while task < NH:
-        h = task
-        kh = h // GROUP
-        q = tl.load(q_ptr + kh * HK + offs_k, cache_modifier=".cg").to(tl.float32)
-        k = tl.load(k_ptr + kh * HK + offs_k, cache_modifier=".cg").to(tl.float32)
-        v = tl.load(v_ptr + h * HV + offs_v, cache_modifier=".cg").to(tl.float32)
-        z = tl.load(z_ptr + h * HV + offs_v, cache_modifier=".cg").to(tl.float32)
-        # per-head scalars
-        a_ = tl.load(a_ptr + h).to(tl.float32)
-        b_ = tl.load(b_ptr + h).to(tl.float32)
-        A = tl.exp(tl.load(alog_ptr + h).to(tl.float32))
-        x_dt = a_ + tl.load(dtb_ptr + h).to(tl.float32)
-        sp = tl.where(x_dt <= 20.0, tl.log(1.0 + tl.exp(x_dt)), x_dt)
-        beta = 1.0 / (1.0 + tl.exp(-b_))
-        # per-key-head normalization (computed redundantly per value head)
-        qn = q * (1.0 / tl.sqrt(tl.sum(q * q, axis=0) + 1e-6)) * scale
-        kn = k * (1.0 / tl.sqrt(tl.sum(k * k, axis=0) + 1e-6))
-        # state update over this head's [HV, HK] slice
-        sbase = state_ptr + h * HV * HK
-        s = tl.load(sbase + offs_v[:, None] * HK + offs_k[None, :], cache_modifier=".cg")
-        s = s * tl.exp(-A * sp)
-        sk = tl.sum(s * kn[None, :], axis=1)
-        vd = beta * (v - sk)
-        s = s + vd[:, None] * kn[None, :]
-        o = tl.sum(s * qn[None, :], axis=1)
-        tl.store(sbase + offs_v[:, None] * HK + offs_k[None, :], s)
-        # per-head RMSNorm over hv + z gate
-        var = tl.sum(o * o, axis=0) / HV
-        nw = tl.load(normw_ptr + offs_v).to(tl.float32)
-        on = o * (1.0 / tl.sqrt(var + eps)) * nw
-        og = on * (z * (1.0 / (1.0 + tl.exp(-z))))
-        tl.store(out_ptr + h * HV + offs_v, og)
-        task += P
 
 
 
@@ -1928,447 +863,3 @@ def _t_gdn_heads(
 # K-reduction GEMV folded into the pre task, and the hc×hc Sinkhorn chain
 # is register-resident elementwise work.
 # ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _t_moe_expert(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    gate_up_ptr,
-    down_ptr,
-    ids_ptr,
-    partials_ptr,
-    B: tl.constexpr,
-    K: tl.constexpr,
-    H: tl.constexpr,
-    I: tl.constexpr,
-    LIMIT: tl.constexpr,  # 0.0 encodes "unclamped"
-):
-    """partials[b, s, :] = down[e] @ (silu(clamp(g, ≤L)) · clamp(u, ±L)),
-    (g, u) = gate_up[e] @ x[b, :], e = ids[b, s] loaded at run time.
-
-    gate_up is the Mixtral-layout stack [E, 2I, H] row-major: the gate rows
-    sit at e·2I·H + i·H + h, the up rows I slots later. down is [E, H, I]."""
-    offs_i = tl.arange(0, I)
-    offs_h = tl.arange(0, H)
-    ntask: tl.constexpr = B * K
-    task = worker
-    while task < ntask:
-        b = task // K
-        s = task % K
-        e = tl.load(ids_ptr + b * K + s).to(tl.int32)
-        xb = tl.load(x_ptr + b * H + offs_h, cache_modifier=".cg").to(tl.float32)
-        wbase = (e * 2 * I) * H
-        wg = tl.load(gate_up_ptr + wbase + offs_i[:, None] * H + offs_h[None, :], cache_modifier=".cg").to(tl.float32)
-        wu = tl.load(gate_up_ptr + wbase + (I + offs_i)[:, None] * H + offs_h[None, :], cache_modifier=".cg").to(tl.float32)
-        g = tl.sum(wg * xb[None, :], axis=1)
-        u = tl.sum(wu * xb[None, :], axis=1)
-        if LIMIT > 0.0:
-            g = tl.minimum(g, LIMIT)
-            u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
-        act = g / (1.0 + tl.exp(-g)) * u
-        wd = tl.load(down_ptr + (e * H) * I + offs_h[:, None] * I + offs_i[None, :], cache_modifier=".cg").to(tl.float32)
-        acc = tl.sum(wd * act[None, :], axis=1)
-        tl.store(partials_ptr + (b * K + s) * H + offs_h, acc)
-        task += P
-
-
-@triton.jit
-def _t_mhc_pre(
-    worker: tl.int32,
-    P: tl.int32,
-    streams_ptr,
-    fn_ptr,
-    base_ptr,
-    scale_ptr,
-    hin_ptr,
-    post_ptr,
-    comb_ptr,
-    B: tl.constexpr,
-    HC: tl.constexpr,
-    C: tl.constexpr,
-    MIX: tl.constexpr,  # (2 + HC) * HC
-    EPS: tl.constexpr,
-    RMS_EPS: tl.constexpr,
-    ITERS: tl.constexpr,
-    MIXP: tl.constexpr,  # pow2 pad of MIX
-    HCP: tl.constexpr,  # pow2 pad of HC
-    BLOCK_K: tl.constexpr,
-):
-    """mhc_pre task body (issue #99): one task per batch row over the
-    [B, HC, C] stream stack. fp32 throughout: unweighted RMSNorm over the
-    flattened hc·C row, the folded [MIX, hc·C] fn GEMV (one K-reduction
-    per mix row), sigmoid pre/post gates, softmax + Sinkhorn-Knopp
-    alternate row/col normalization (eps inside every denominator, floe
-    DeepseekV4HyperConnection.forward verbatim) and the pre-weighted
-    stream collapse."""
-    HCK: tl.constexpr = HC * C
-    offs_m = tl.arange(0, MIXP)
-    offs_h = tl.arange(0, HCP)
-    offs_k = tl.arange(0, HCP)
-    m_mask = offs_m < MIX
-    h_mask = offs_h < HC
-    kj_mask = (offs_k[:, None] < HC) & (offs_h[None, :] < HC)
-    task = worker
-    while task < B:
-        b = task.to(tl.int64)
-        # pass 1: sqrsum over the flattened [HC, C] row (unweighted RMSNorm)
-        ss = 0.0
-        for k0 in range(0, HCK, BLOCK_K):
-            offs = k0 + tl.arange(0, BLOCK_K)
-            v = tl.load(streams_ptr + b * HCK + offs, mask=offs < HCK, other=0.0).to(tl.float32)
-            ss += tl.sum(v * v, axis=0)
-        rstd = 1.0 / tl.sqrt(ss / HCK + RMS_EPS)
-        # pass 2: the folded fn projection — logits[m] = <fn[m, :], flat>
-        # with flat = streams * rstd. NO projection bias: floe's F.linear
-        # carries none; base enters only inside the gates below.
-        logits = tl.zeros([MIXP], dtype=tl.float32)
-        for k0 in range(0, HCK, BLOCK_K):
-            offs = k0 + tl.arange(0, BLOCK_K)
-            kmask = offs < HCK
-            flat = tl.load(streams_ptr + b * HCK + offs, mask=kmask, other=0.0).to(tl.float32) * rstd
-            frows = tl.load(fn_ptr + offs_m[:, None] * HCK + offs[None, :],
-                            mask=m_mask[:, None] & kmask[None, :], other=0.0).to(tl.float32)
-            logits += tl.sum(frows * flat[None, :], axis=1)
-        # split [MIX] -> pre_w [HC] | post_w [HC] | comb_w [HC, HC]
-        pre_w = tl.sum(tl.where((offs_m[:, None] == offs_h[None, :]) & h_mask[None, :],
-                                logits[:, None], 0.0), axis=0)
-        post_w = tl.sum(tl.where((offs_m[:, None] == HC + offs_h[None, :]) & h_mask[None, :],
-                                 logits[:, None], 0.0), axis=0)
-        comb_rows = 2 * HC + offs_k[:, None] * HC + offs_h[None, :]
-        comb_w = tl.sum(tl.where(offs_m[:, None, None] == comb_rows[None, :, :],
-                                 logits[:, None, None], 0.0), axis=0)
-        pre_s = tl.load(scale_ptr).to(tl.float32)
-        post_s = tl.load(scale_ptr + 1).to(tl.float32)
-        comb_s = tl.load(scale_ptr + 2).to(tl.float32)
-        pre = 1.0 / (1.0 + tl.exp(-(pre_w * pre_s + tl.load(base_ptr + offs_h, mask=h_mask, other=0.0).to(tl.float32)))) + EPS
-        post = 2.0 / (1.0 + tl.exp(-(post_w * post_s + tl.load(base_ptr + HC + offs_h, mask=h_mask, other=0.0).to(tl.float32))))
-        comb_b = tl.load(base_ptr + 2 * HC + offs_k[:, None] * HC + offs_h[None, :],
-                         mask=kj_mask, other=0.0).to(tl.float32)
-        # softmax over j (rows), masked to the valid hc×hc block
-        cl = comb_w * comb_s + comb_b
-        cl = tl.where(kj_mask, cl, float("-inf"))
-        cm = tl.max(cl, axis=1)
-        ce = tl.exp(cl - cm[:, None])
-        ce = tl.where(kj_mask, ce, 0.0)
-        # Padded rows (k or j >= HC) must stay EXACTLY 0 through the whole
-        # Sinkhorn recursion: an unmasked 0/0 here becomes NaN and the
-        # unmasked column sums below poison the entire valid block; even
-        # without the NaN, EPS-floored padding inflates the column
-        # denominators (~17-20% at hc=3, HCP=4). All denominators therefore
-        # sum only the valid hc×hc block, matching the reference recursion
-        # on the exact matrix.
-        row_den = tl.sum(ce, axis=1)[:, None]
-        comb = tl.where(kj_mask, ce / row_den + EPS, 0.0)
-        # Sinkhorn-Knopp: initial column normalization, then (ITERS−1)
-        # alternate row/col passes — eps inside every denominator (floe).
-        comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
-        for _ in tl.static_range(ITERS - 1):
-            comb = comb / (tl.sum(comb, axis=1)[:, None] + EPS)
-            comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
-        comb = tl.where(kj_mask, comb, 0.0)
-        tl.store(post_ptr + b * HC + offs_h, post, mask=h_mask)
-        tl.store(comb_ptr + b * HC * HC + offs_k[:, None] * HC + offs_h[None, :], comb, mask=kj_mask)
-        # stream collapse: h_in[c] = Σ_h pre[h] · streams[b, h, c]
-        for c0 in range(0, C, BLOCK_K):
-            offs_c = c0 + tl.arange(0, BLOCK_K)
-            cmask = offs_c < C
-            acc = tl.zeros([BLOCK_K], dtype=tl.float32)
-            for h in tl.static_range(HC):
-                ph = tl.sum(tl.where(offs_h == h, pre, 0.0), axis=0)
-                sv = tl.load(streams_ptr + b * HCK + h * C + offs_c, mask=cmask, other=0.0).to(tl.float32)
-                acc += ph * sv
-            tl.store(hin_ptr + b * C + offs_c, acc, mask=cmask)
-        task += P
-
-
-@triton.jit
-def _t_moe_combine(
-    worker: tl.int32,
-    P: tl.int32,
-    partials_ptr,
-    weights_ptr,
-    shared_ptr,
-    y_ptr,
-    B: tl.constexpr,
-    K: tl.constexpr,
-    H: tl.constexpr,
-    HAS_SHARED: tl.constexpr,
-):
-    """y[b, :] = Σ_k weights[b, k] · partials[b, k, :] (slot order, fp32
-    accumulate) + shared[b, :] when HAS_SHARED."""
-    offs_h = tl.arange(0, H)
-    task = worker
-    while task < B:
-        b = task
-        acc = tl.zeros([H], tl.float32)
-        for s in range(K):
-            w = tl.load(weights_ptr + b * K + s).to(tl.float32)
-            acc += w * tl.load(partials_ptr + (b * K + s) * H + offs_h, cache_modifier=".cg").to(tl.float32)
-        if HAS_SHARED:
-            acc += tl.load(shared_ptr + b * H + offs_h, cache_modifier=".cg").to(tl.float32)
-        tl.store(y_ptr + b * H + offs_h, acc)
-        task += P
-
-
-@triton.jit
-def _t_moe_route(
-    worker: tl.int32,
-    P: tl.int32,
-    x_ptr,
-    w_ptr,
-    bias_ptr,
-    tok_ptr,
-    t2e_ptr,
-    ids_ptr,
-    weights_ptr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    E: tl.constexpr,
-    EP: tl.constexpr,  # padded expert block, power of two, E <= EP
-    K: tl.constexpr,  # power of two (block width for the selection state)
-    MODE_HASH: tl.constexpr,
-    SQRTSP: tl.constexpr,  # sqrtsoftplus (DeepSeek-V4) vs sigmoid noaux_tc
-    NORM_TOPK: tl.constexpr,
-    RSF: tl.constexpr,
-):
-    """Router decode step — degenerate-group and hash device paths.
-
-    scores = sqrt(softplus(logits)) (SQRTSP) or sigmoid(logits) + bias
-    (noaux_tc, n_group == 1: the single group always wins — floe's own
-    degeneracy note). Selection = K masked-argmax rounds over the choice
-    scores; ``tl.argmax`` returns the first maximal index, which IS the
-    documented tie rule (ties resolve to the lower expert index). Weights
-    gather the UNBIASED scores, renorm w/(Σw+1e-20) iff NORM_TOPK, × RSF.
-    Hash mode replaces selection with the frozen tid2eid[token_id] gather
-    (renorm unconditional, floe semantics)."""
-    offs_e = tl.arange(0, EP)
-    offs_k = tl.arange(0, K)
-    emask = offs_e < E
-    neg_inf: tl.constexpr = -1.0e38
-    task = worker
-    while task < B:
-        b = task
-        se = tl.zeros([EP], tl.float32)
-        for h in range(H):
-            xv = tl.load(x_ptr + b * H + h, cache_modifier=".cg").to(tl.float32)
-            wv = tl.load(w_ptr + offs_e * H + h, mask=emask, other=0.0, cache_modifier=".cg").to(tl.float32)
-            se += wv * xv
-        if SQRTSP:
-            scores = tl.sqrt(tl.where(se > 20.0, se, tl.log(1.0 + tl.exp(se))))
-            choice = scores
-        else:
-            sig = 1.0 / (1.0 + tl.exp(-se))
-            bias = tl.load(bias_ptr + offs_e, mask=emask, other=0.0).to(tl.float32)
-            scores = sig  # weights gather the UNBIASED scores (floe semantics)
-            choice = sig + bias
-        if MODE_HASH:
-            tok = tl.load(tok_ptr + b).to(tl.int32)
-            sel = tl.load(t2e_ptr + tok * K + offs_k).to(tl.int32)
-            # gather scores at the selected experts: one [EP, K] masked sum
-            wsel = tl.sum(tl.where(offs_e[:, None] == sel[None, :], scores[:, None], 0.0), axis=0)
-            wsel = wsel / (tl.sum(wsel, axis=0) + 1e-20)
-        else:
-            choice = tl.where(emask, choice, neg_inf)
-            sel = tl.zeros([K], tl.int32)
-            wsel = tl.zeros([K], tl.float32)
-            for kk in range(K):
-                best = tl.argmax(choice, axis=0)  # first max index: ties -> lower expert
-                hit = offs_e == best
-                w_best = tl.sum(tl.where(hit, scores, 0.0), axis=0)
-                sel = tl.where(offs_k == kk, best + tl.zeros([K], tl.int32), sel)
-                wsel = tl.where(offs_k == kk, w_best + tl.zeros([K], tl.float32), wsel)
-                choice = tl.where(hit, neg_inf, choice)
-            if NORM_TOPK:
-                wsel = wsel / (tl.sum(wsel, axis=0) + 1e-20)
-        wsel = wsel * RSF
-        tl.store(ids_ptr + b * K + offs_k, sel)
-        tl.store(weights_ptr + b * K + offs_k, wsel)
-        task += P
-
-
-@triton.jit
-def _t_mhc_post(
-    worker: tl.int32,
-    P: tl.int32,
-    streams_ptr,
-    body_out_ptr,
-    post_ptr,
-    comb_ptr,
-    out_ptr,
-    B: tl.constexpr,
-    HC: tl.constexpr,
-    C: tl.constexpr,
-    HCP: tl.constexpr,  # pow2 pad of HC
-    BLOCK_C: tl.constexpr,
-):
-    """mhc_post task body (issue #99): one task per (batch, stream j);
-    streams'[j] = post[j]·body_out + Σ_k comb[k, j]·streams[k] (floe
-    _mhc_compose), fp32 compose arithmetic, one output stream row per task."""
-    offs_k = tl.arange(0, HCP)
-    k_mask = offs_k < HC
-    task = worker
-    while task < B * HC:
-        b = (task // HC).to(tl.int64)
-        j = task % HC
-        pj = tl.load(post_ptr + b * HC + j).to(tl.float32)
-        # comb column j: comb[k, j] weights source stream k
-        ck = tl.load(comb_ptr + b * HC * HC + offs_k * HC + j, mask=k_mask, other=0.0).to(tl.float32)
-        for c0 in range(0, C, BLOCK_C):
-            offs_c = c0 + tl.arange(0, BLOCK_C)
-            cmask = offs_c < C
-            acc = tl.zeros([BLOCK_C], dtype=tl.float32)
-            for k in tl.static_range(HC):
-                w = tl.sum(tl.where(offs_k == k, ck, 0.0), axis=0)
-                sv = tl.load(streams_ptr + b * HC * C + k * C + offs_c, mask=cmask, other=0.0).to(tl.float32)
-                acc += w * sv
-            bo = tl.load(body_out_ptr + b * C + offs_c, mask=cmask, other=0.0).to(tl.float32)
-            acc = pj * bo + acc
-            tl.store(out_ptr + b * HC * C + j * C + offs_c, acc, mask=cmask)
-        task += P
-
-
-@triton.jit
-def _t_gdn_heads_batched(
-    worker: tl.int32,
-    P: tl.int32,
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    z_ptr,
-    a_ptr,
-    b_ptr,
-    alog_ptr,
-    dtb_ptr,
-    normw_ptr,
-    state_ptr,
-    out_ptr,
-    B: tl.constexpr,
-    NH: tl.constexpr,
-    NK: tl.constexpr,
-    HV: tl.constexpr,
-    HK: tl.constexpr,
-    eps: tl.constexpr,
-    scale: tl.constexpr,
-):
-    """Batched gdn_delta decode-step task body (issue #90): one task per
-    (batch, value head) over the batched persistent state pool
-    [B, NH, HV, HK] (fp32, read-modify-write). Arithmetic identical to the
-    27B-validated ``_t_gdn_heads`` (which is the B=1, task==head flattening
-    of this template), generalized to per-task (b, head) addressing:
-    A_log/dt_bias/norm_w are per-layer params broadcast over the batch.
-    """
-    GROUP: tl.constexpr = NH // NK
-    offs_v = tl.arange(0, HV)
-    offs_k = tl.arange(0, HK)
-    task = worker
-    while task < B * NH:
-        bb = task // NH
-        h = task % NH
-        kh = h // GROUP
-        q = tl.load(q_ptr + bb.to(tl.int64) * (NK * HK) + kh * HK + offs_k, cache_modifier=".cg").to(tl.float32)
-        k = tl.load(k_ptr + bb.to(tl.int64) * (NK * HK) + kh * HK + offs_k, cache_modifier=".cg").to(tl.float32)
-        v = tl.load(v_ptr + bb.to(tl.int64) * (NH * HV) + h * HV + offs_v, cache_modifier=".cg").to(tl.float32)
-        z = tl.load(z_ptr + bb.to(tl.int64) * (NH * HV) + h * HV + offs_v, cache_modifier=".cg").to(tl.float32)
-        # per-head scalars
-        a_ = tl.load(a_ptr + bb.to(tl.int64) * NH + h).to(tl.float32)
-        b_ = tl.load(b_ptr + bb.to(tl.int64) * NH + h).to(tl.float32)
-        A = tl.exp(tl.load(alog_ptr + h).to(tl.float32))
-        x_dt = a_ + tl.load(dtb_ptr + h).to(tl.float32)
-        sp = tl.where(x_dt <= 20.0, tl.log(1.0 + tl.exp(x_dt)), x_dt)
-        beta = 1.0 / (1.0 + tl.exp(-b_))
-        # per-key-head normalization (computed redundantly per value head)
-        qn = q * (1.0 / tl.sqrt(tl.sum(q * q, axis=0) + 1e-6)) * scale
-        kn = k * (1.0 / tl.sqrt(tl.sum(k * k, axis=0) + 1e-6))
-        # state update over this head's [HV, HK] slice
-        sbase = state_ptr + bb.to(tl.int64) * (NH * HV * HK) + h * HV * HK
-        s = tl.load(sbase + offs_v[:, None] * HK + offs_k[None, :], cache_modifier=".cg")
-        s = s * tl.exp(-A * sp)
-        sk = tl.sum(s * kn[None, :], axis=1)
-        vd = beta * (v - sk)
-        s = s + vd[:, None] * kn[None, :]
-        o = tl.sum(s * qn[None, :], axis=1)
-        tl.store(sbase + offs_v[:, None] * HK + offs_k[None, :], s)
-        # per-head RMSNorm over hv + z gate
-        var = tl.sum(o * o, axis=0) / HV
-        nw = tl.load(normw_ptr + offs_v).to(tl.float32)
-        on = o * (1.0 / tl.sqrt(var + eps)) * nw
-        og = on * (z * (1.0 / (1.0 + tl.exp(-z))))
-        tl.store(out_ptr + bb.to(tl.int64) * (NH * HV) + h * HV + offs_v, og)
-        task += P
-
-
-@triton.jit
-def _t_kda_heads_batched(
-    worker: tl.int32,
-    P: tl.int32,
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    f_ptr,
-    b_ptr,
-    dtb_ptr,
-    alog_ptr,
-    state_ptr,
-    out_ptr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    scale: tl.constexpr,
-    lower_bound: tl.constexpr,  # float; NaN sentinel selects the softplus branch
-):
-    """Batched KDA gated delta-rule decode-step task body (issue #101):
-    one task per (batch, head) over the persistent fp32 state pool
-    [B, H, K, V] (read-modify-write). GLM-5.3 ``Glm53LinearAttention``
-    seq==1 arithmetic, ported from floe's eager ``Glm53ForgetGate`` +
-    ``_kda_recurrent`` (the fused kda_decode Triton path no longer ships in
-    floe — kernels live in vkernels):
-
-        g    = lower_bound * sigmoid(exp(A_log[h]) * (f + dt_bias))  # [K]
-           (lower_bound NaN sentinel -> g = -exp(A_log)*softplus(f + dt_bias))
-        s   *= exp(g)[:, None]                     # element-wise row decay
-        kv   = sum_k s * k_n
-        s   += k_n outer (sigmoid(b) * (v - kv))
-        o    = sum_k s * q_n
-
-    q/k L2-normalized per head (eps 1e-6 inside the sqrt); q carries the
-    1/sqrt(K) scale. Plain readout — the gated norm is the separate
-    rms_norm_gated op. Unlike _t_gdn_heads_batched the decay is
-    element-wise per k-row (broadcast over V), and there is no group
-    expansion (KDA: one q/k/v head each).
-    """
-    offs_k = tl.arange(0, K)
-    offs_v = tl.arange(0, V)
-    task = worker
-    while task < B * H:
-        bb = task // H
-        h = task % H
-        q = tl.load(q_ptr + bb.to(tl.int64) * (H * K) + h * K + offs_k, cache_modifier=".cg").to(tl.float32)
-        k = tl.load(k_ptr + bb.to(tl.int64) * (H * K) + h * K + offs_k, cache_modifier=".cg").to(tl.float32)
-        v = tl.load(v_ptr + bb.to(tl.int64) * (H * V) + h * V + offs_v, cache_modifier=".cg").to(tl.float32)
-        f = tl.load(f_ptr + bb.to(tl.int64) * (H * K) + h * K + offs_k, cache_modifier=".cg").to(tl.float32)
-        # gate conditioning: per-(head, k-dim) log gate, folded in-task
-        A = tl.exp(tl.load(alog_ptr + h).to(tl.float32))
-        x_dt = f + tl.load(dtb_ptr + h * K + offs_k).to(tl.float32)
-        if lower_bound == lower_bound:  # NaN sentinel: finite -> lower_bound branch
-            g = lower_bound * (1.0 / (1.0 + tl.exp(-A * x_dt)))
-        else:
-            sp = tl.where(x_dt <= 20.0, tl.log(1.0 + tl.exp(x_dt)), x_dt)
-            g = -A * sp
-        beta = 1.0 / (1.0 + tl.exp(-tl.load(b_ptr + bb.to(tl.int64) * H + h).to(tl.float32)))
-        # L2 conditioning (floe _l2norm)
-        qn = q * (1.0 / tl.sqrt(tl.sum(q * q, axis=0) + 1e-6)) * scale
-        kn = k * (1.0 / tl.sqrt(tl.sum(k * k, axis=0) + 1e-6))
-        # state update over this head's [K, V] slice — element-wise decay
-        sbase = state_ptr + bb.to(tl.int64) * (H * K * V) + h * K * V
-        s = tl.load(sbase + offs_k[:, None] * V + offs_v[None, :], cache_modifier=".cg")
-        s = s * tl.exp(g)[:, None]
-        kv = tl.sum(s * kn[:, None], axis=0)
-        s = s + kn[:, None] * (beta * (v - kv))[None, :]
-        tl.store(sbase + offs_k[:, None] * V + offs_v[None, :], s)
-        # plain readout (gated norm is the separate rms_norm_gated op)
-        o = tl.sum(s * qn[:, None], axis=0)
-        tl.store(out_ptr + bb.to(tl.int64) * (H * V) + h * V + offs_v, o)
-        task += P

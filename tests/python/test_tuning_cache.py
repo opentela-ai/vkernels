@@ -61,7 +61,7 @@ def cache(tmp_path, source_file):
 
 def test_record_lookup_roundtrip(cache, tmp_path):
     cache.record((7, 1), kwargs={"BLOCK": 64}, num_warps=2, num_stages=3, time_ms=0.5)
-    path = next((tmp_path / "store").iterdir())
+    path = next((tmp_path / "store").glob("*.json"))
     assert path.name.startswith("k.sm00")
     doc = json.loads(path.read_text())
     assert doc["schema"] == SCHEMA and doc["kernel"] == "k"
@@ -119,6 +119,7 @@ def test_off_switch_disables_persistence(cache, monkeypatch):
     assert cache.lookup((1,)) is None
 
 
+@gpu
 def test_device_fingerprint_shape():
     fp = device_fingerprint()
     assert fp["arch"] and fp["cu_count"] > 0
@@ -157,7 +158,7 @@ def test_first_run_tunes_and_persists(tmp_path):
     torch.testing.assert_close(y, x + 1)
     assert len(counts) == len(_CONFIGS)  # every config benchmarked exactly once
     assert len(add.cache) == 1
-    doc = json.loads(next(tmp_path.iterdir()).read_text())
+    doc = json.loads(next(tmp_path.glob("*.json")).read_text())
     assert doc["schema"] == SCHEMA and doc["records"]
 
 

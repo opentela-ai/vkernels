@@ -42,8 +42,18 @@ def _kernel():
     import triton
     import triton.language as tl
 
-    @triton.jit
-    def _sparse_attn(Q, KV, MASK, SINK, Out, H: tl.constexpr, S: tl.constexpr, N: tl.constexpr, D: tl.constexpr, SCALE: tl.constexpr, BT: tl.constexpr):
+    @triton.jit(do_not_specialize=["n_len"])
+    def _sparse_attn(Q, KV, MASK, SINK, Out, H: tl.constexpr, S: tl.constexpr, n_len, D: tl.constexpr, SCALE: tl.constexpr, BT: tl.constexpr):
+        # ``n_len`` (the per-row KV candidate count — ctx-derived, grew +1
+        # per decode step) is a RUNTIME argument: it feeds only the loop
+        # bound and the lane masks, never a tile shape, so ONE compiled
+        # kernel serves every context. Was ``N: tl.constexpr`` — the
+        # sgs-gpu07 per-step-JIT cliff (see ctx_buckets.py). The iteration
+        # sequence, tile shapes and every mask value are identical to the
+        # constexpr version (masked lanes contributed exactly zero before:
+        # the in-kernel -1.0e30 sentinel plus the sink correction zero the
+        # accumulator state of any all-masked prefix block), so this is
+        # bit-identical per launch.
         bh = tl.program_id(0)
         s = tl.program_id(1)
         b = bh // H
@@ -55,12 +65,12 @@ def _kernel():
         m = tl.full((), -1.0e30, tl.float32)
         l = tl.zeros((), tl.float32)
         acc = tl.zeros((D,), tl.float32)
-        for t0 in range(0, N, BT):
+        for t0 in range(0, n_len, BT):
             t = t0 + tl.arange(0, BT)
-            tmask = t < N
-            kv = tl.load(KV + (b * N + t[:, None]) * D + d[None, :], tmask[:, None], 0.0).to(tl.float32)  # [BT,D]
+            tmask = t < n_len
+            kv = tl.load(KV + (b * n_len + t[:, None]) * D + d[None, :], tmask[:, None], 0.0).to(tl.float32)  # [BT,D]
             sc = tl.sum(q[None, :] * kv, axis=1) * SCALE  # [BT]
-            keep = tl.load(MASK + (b * S + s) * N + t, tmask, 0.0) > 0
+            keep = tl.load(MASK + (b * S + s) * n_len + t, tmask, 0.0) > 0
             sc = tl.where(keep & tmask, sc, -1.0e30)
             m_new = tl.maximum(m, tl.max(sc, axis=0))
             p = tl.exp(sc - m_new)
@@ -110,5 +120,9 @@ def sparse_attention(q, kv, mask, sink, scale):
     out = torch.empty((b * h, s, d), device=q.device, dtype=torch.float32)
     BT = 32
     with torch.cuda.device(q.device):
+        # n (ctx-derived candidate count) is a runtime launch argument, NOT
+        # a constexpr: no per-step recompile as the window grows. Strides
+        # are computed from the same n, masks are unchanged -> bit-identical
+        # per launch vs the constexpr version.
         _kernel()[(b * h, s)](qf, kvf, mf, sf, out, h, s, n, d, float(scale), BT)
     return out.reshape(b, h, s, d)

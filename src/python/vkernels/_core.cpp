@@ -28,6 +28,7 @@
 #include <pybind11/stl.h>
 
 #include <cstddef>
+#include <memory>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -64,6 +65,14 @@ namespace py = pybind11;
 using namespace vkernels;
 
 namespace {
+
+struct StreamDeleter {
+  void operator()(Stream* stream) const {
+    // A worker may need the GIL to invoke or destroy a Python callback.
+    py::gil_scoped_release release;
+    delete stream;
+  }
+};
 
 // A numpy input array: anything convertible to a C-contiguous float32 array.
 // Already-float32 C-contiguous arrays are wrapped zero-copy; everything else
@@ -143,7 +152,7 @@ PYBIND11_MODULE(_core, m) {
       });
   core.def("default_device", &default_device, "The default Device.");
 
-  py::class_<Stream>(
+  py::class_<Stream, std::unique_ptr<Stream, StreamDeleter>>(
       core, "Stream",
       "An ordered, asynchronous queue of tasks (host worker-thread model of "
       "a CUDA stream). Tasks within a stream run in submission order; "
@@ -924,6 +933,11 @@ PYBIND11_MODULE(_core, m) {
       "kda_naive_delta_rule_fwd",
       [](FloatArray q, FloatArray k, FloatArray v, FloatArray g,
          FloatArray beta, int B, int H, int S, int D, FloatArray out) {
+        VK_EXPECTS(B >= 0 && H >= 0 && S >= 0 && D > 0, "invalid KDA dimensions");
+        const auto n = static_cast<py::ssize_t>(B) * H * S;
+        VK_EXPECTS(q.size() == n * D && k.size() == n * D && v.size() == n * D &&
+                   g.size() == n * D && beta.size() == n && out.size() == n * D,
+                   "K3 q/k/v/g/out must be B*H*S*D; beta must be B*H*S");
         require_writeable(out);
         kernels::kda_naive_delta_rule_fwd_cpu(
             q.data(), k.data(), v.data(), g.data(),

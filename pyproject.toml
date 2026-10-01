@@ -7,8 +7,8 @@
 # src/c/ is built separately with CMake (see CMakePresets.json / Makefile) and
 # is discovered at runtime by src/python/vkernels/_backend.py.
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10", "pybind11==3.1.0"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "vkernels-cli"
@@ -63,24 +63,16 @@ dev = [
     "safetensors>=0.4",
 ]
 
-# src-layout: the `vkernels` package lives under src/python/.
-# When building a platform wheel (meta/scripts/build_wheel.sh copies the
-# compiled _core*.so here before `python -m build`), setuptools includes
-# it automatically; the fallback backend is used when no .so is present.
-[tool.setuptools.packages.find]
-where = ["src/python"]
+[tool.scikit-build]
+wheel.packages = ["src/python/vkernels"]
+cmake.build-type = "Release"
+install.components = ["python"]
 
-# Include the compiled pybind11 extension in the wheel when it exists.
-# The build script (meta/scripts/build_wheel.sh) places the .so here
-# temporarily; pip-installing the resulting wheel places it alongside
-# the .py files so `import vkernels._core` works at runtime.
-[tool.setuptools.package-data]
-vkernels = ["_core*.so"]
-
-# setuptools needs this flag to actually include package-data files
-# that aren't tracked by a VCS (our temporary .so definitely isn't).
-[tool.setuptools]
-include-package-data = true
+[tool.scikit-build.cmake.define]
+VKERNELS_BUILD_PYTHON = "ON"
+VKERNELS_BUILD_TESTS = "OFF"
+VKERNELS_BUILD_CUDA = "OFF"
+VKERNELS_BUILD_HIP = "OFF"
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

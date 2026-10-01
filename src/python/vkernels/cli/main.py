@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="vkernels repository root (default: auto-detected)")
     sub = p.add_subparsers(dest="command", metavar="COMMAND")
 
+    sub.add_parser("doctor", help="show backend paths, build capabilities, and load failures")
+
     list_p = sub.add_parser(
         "list", help="list implemented kernels and communication primitives")
     group = list_p.add_mutually_exclusive_group()
@@ -304,6 +306,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command is None:
         build_parser().print_help()
+        return 0
+    if args.command == "doctor":
+        from vkernels.native_runtime import doctor
+        print(json.dumps(doctor(), indent=2))
         return 0
     try:
         root = discovery.resolve_root(args.root)

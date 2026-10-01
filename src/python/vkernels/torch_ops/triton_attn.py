@@ -483,7 +483,26 @@ def decode_attention_split(q, kc, vc, block_table, seq_lens, *, max_splits=_MAX_
     ``max_len_hint`` (host int) is an upper bound on the longest sequence
     (e.g. the block-table width); when given it avoids a ``sl.max().item()``
     device sync on the decode hot path. Split count adapts down from the
-    bound; stage-1 programs whose slice is empty write neutral partials."""
+    bound; stage-1 programs whose slice is empty write neutral partials.
+
+    Compile-key stability (the sgs-gpu07 8K JIT cliff — see
+    ``ctx_buckets.py``): when ``max_len_hint`` is ABSENT the bound comes
+    from ``sl.max()`` and grew +1 per decode step, so ``SPLITS`` (a
+    constexpr) and ``split_len`` (an int Triton auto-specializes) both
+    churned and the partial buffers ``[B, n_q, splits, D]`` changed shape
+    every step. In that branch the bound is now snapped UP to the nearest
+    ctx bucket (``VK_CTX_BUCKETS`` ladder, default
+    512..65536 x2): the (SPLITS, split_len, buffer-shape) key then takes
+    one value per ladder rung — bounded — and is step-stable within a
+    rung. Bit-compat: stage-1 slices past the true sequence length write
+    the neutral partial (masked loads, ``l = 0``, ``m = -inf``), the
+    stage-2 LSE merge of a neutral partial is the identity, and the
+    per-token online-softmax masking is unchanged — results for the
+    active window are exact. A different bucket rung re-partitions the
+    same tokens across splits (fp32 addition-order-only rounding change,
+    the same perf-only class as retuning ``block_n``); callers with a
+    static length keep the hint path, which is byte-for-byte unchanged
+    (the hint is used verbatim, no bucket snap)."""
     import math
 
     import torch
@@ -501,6 +520,16 @@ def decode_attention_split(q, kc, vc, block_table, seq_lens, *, max_splits=_MAX_
         sl = sl.contiguous()
     dev = q.device
     max_len = int(max_len_hint) if max_len_hint is not None else (int(sl.max().item()) if B else 1)
+    if max_len_hint is None:
+        # Growing (per-step) bound: snap UP to the ctx bucket ladder so the
+        # split geometry — and with it the Triton compile key and the
+        # partial-buffer shapes — is step-stable and bounded. Coverage is
+        # preserved (bucket >= true max_len; beyond the ladder's top rung
+        # the true length passes through and SPLITS has long saturated at
+        # max_splits).
+        from .ctx_buckets import bucket_for_coverage
+
+        max_len = bucket_for_coverage(max_len)
     splits = max(1, min(max_splits, (max_len + block_n - 1) // block_n))
     split_len = (max_len + splits - 1) // splits
     acc = torch.empty(B, n_q, splits, D, dtype=torch.float32, device=dev)

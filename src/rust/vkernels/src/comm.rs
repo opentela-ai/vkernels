@@ -367,15 +367,8 @@ impl OverlapExecutor {
                 &mut comm_count,
             )
         };
-        if code != sys::VK_OK {
-            // On failure the C++ worker threads may still hold references to
-            // the closures (in-flight tasks), so reclaiming the boxes would
-            // be unsound. They are deliberately leaked; the executor is in a
-            // broken state regardless.
-            return Err(crate::from_code(code));
-        }
-        // run() completed synchronously (both streams were waited on), so
-        // the closures are no longer referenced and can be freed.
+        // Native run() drains both streams on success AND failure, so the
+        // callbacks can always be reclaimed before returning to the caller.
         unsafe {
             drop(Box::from_raw(
                 compute_ctx as *mut Box<dyn Fn(usize) -> i32 + Send>,
@@ -384,6 +377,7 @@ impl OverlapExecutor {
                 comm_ctx as *mut Box<dyn Fn(usize, i32) + Send>,
             ));
         }
+        from_status(code)?;
         Ok(OverlapResult {
             compute_count,
             comm_count,
@@ -589,9 +583,10 @@ fn stream_raw(stream: Option<&Stream>) -> *mut sys::vk_stream {
 /// `num_runs == 0` list is a valid no-op (nothing is enqueued).
 ///
 /// # Safety
-/// With a `stream`, `dst` and every source must stay alive until
-/// `stream.wait()` completes the enqueued copy.
-pub fn p2p_gather_runs(
+/// Every source address must name readable memory for its full run. With a
+/// stream, sources must remain readable and the destination exclusively
+/// borrowed until `stream.wait()` completes, including after an error.
+pub unsafe fn p2p_gather_runs(
     dst: &mut [u8],
     src_ptrs: &[usize],
     dst_offsets: &[usize],
@@ -620,7 +615,11 @@ pub fn p2p_gather_runs(
 
 /// Copy every 2-D tile into `dst` in a single operation; same contract and
 /// validation as [`p2p_gather_runs`].
-pub fn p2p_gather_runs_2d(
+///
+/// # Safety
+/// All source tiles must be readable; source and exclusive destination
+/// lifetimes must extend through stream completion, including after an error.
+pub unsafe fn p2p_gather_runs_2d(
     dst: &mut [u8],
     runs: &[Gather2DRun],
     stream: Option<&Stream>,
@@ -641,7 +640,10 @@ pub fn p2p_gather_runs_2d(
 /// `stream.submitted()` grows by the run count instead of 1). Same contract
 /// as [`p2p_gather_runs`]; kept for benchmarking and for asserting the
 /// "no per-run API calls" property of the single-launch path.
-pub fn memcpy_peer_batch_async(
+///
+/// # Safety
+/// Same pointer validity and completion lifetime requirements as [`p2p_gather_runs`].
+pub unsafe fn memcpy_peer_batch_async(
     dst: &mut [u8],
     src_ptrs: &[usize],
     dst_offsets: &[usize],
@@ -666,6 +668,14 @@ pub fn memcpy_peer_batch_async(
             stream_raw(stream),
         )
     })
+}
+
+/// Copy borrowed sources synchronously. All borrows remain live through completion.
+pub fn gather(dst: &mut [u8], sources: &[&[u8]], offsets: &[usize]) -> Result<(), Error> {
+    let addresses: Vec<usize> = sources.iter().map(|s| s.as_ptr() as usize).collect();
+    let lengths: Vec<usize> = sources.iter().map(|s| s.len()).collect();
+    // Sources are valid slices and no asynchronous task escapes this call.
+    unsafe { p2p_gather_runs(dst, &addresses, offsets, &lengths, None) }
 }
 
 #[cfg(test)]
@@ -964,7 +974,7 @@ mod tests {
     fn p2p_gather_1d_basic() {
         let src: Vec<u8> = (0..6).collect();
         let mut dst = vec![0u8; 6];
-        p2p_gather_runs(&mut dst, &[src.as_ptr() as usize], &[2], &[4], None).unwrap();
+        unsafe { p2p_gather_runs(&mut dst, &[src.as_ptr() as usize], &[2], &[4], None) }.unwrap();
         assert_eq!(dst, vec![0, 0, 0, 1, 2, 3]);
     }
 
@@ -973,18 +983,20 @@ mod tests {
         let s1: Vec<u8> = vec![1, 2];
         let s2: Vec<u8> = vec![3, 4];
         let mut dst = vec![0u8; 5];
-        p2p_gather_runs(
-            &mut dst,
-            &[s1.as_ptr() as usize, s2.as_ptr() as usize],
-            &[0, 3],
-            &[2, 2],
-            None,
-        )
+        unsafe {
+            p2p_gather_runs(
+                &mut dst,
+                &[s1.as_ptr() as usize, s2.as_ptr() as usize],
+                &[0, 3],
+                &[2, 2],
+                None,
+            )
+        }
         .unwrap();
         assert_eq!(dst, vec![1, 2, 0, 3, 4]);
 
         let mut dst = vec![0u8; 4];
-        p2p_gather_runs(&mut dst, &[], &[], &[], None).unwrap();
+        unsafe { p2p_gather_runs(&mut dst, &[], &[], &[], None) }.unwrap();
         assert_eq!(dst, vec![0, 0, 0, 0]);
     }
 
@@ -994,24 +1006,24 @@ mod tests {
         let src_addr = src.as_ptr() as usize;
         let mut dst = vec![0u8; 4];
         assert!(matches!(
-            p2p_gather_runs(&mut dst, &[src_addr], &[3], &[4], None),
+            unsafe { p2p_gather_runs(&mut dst, &[src_addr], &[3], &[4], None) },
             Err(Error::InvalidArgument(_))
         )); // exceeds capacity
         assert!(matches!(
-            p2p_gather_runs(&mut dst, &[0], &[0], &[1], None),
+            unsafe { p2p_gather_runs(&mut dst, &[0], &[0], &[1], None) },
             Err(Error::InvalidArgument(_))
         )); // null source for non-empty run
         assert!(matches!(
-            p2p_gather_runs(&mut dst, &[src_addr, src_addr], &[0, 1], &[2, 2], None),
+            unsafe { p2p_gather_runs(&mut dst, &[src_addr, src_addr], &[0, 1], &[2, 2], None) },
             Err(Error::InvalidArgument(_))
         )); // overlapping output runs
         assert!(matches!(
-            p2p_gather_runs(&mut dst, &[src_addr], &[0], &[1, 2], None),
+            unsafe { p2p_gather_runs(&mut dst, &[src_addr], &[0], &[1, 2], None) },
             Err(Error::InvalidArgument(_))
         )); // ragged arrays
         let dst_addr = dst.as_ptr() as usize;
         assert!(matches!(
-            p2p_gather_runs(&mut dst, &[dst_addr], &[0], &[4], None),
+            unsafe { p2p_gather_runs(&mut dst, &[dst_addr], &[0], &[4], None) },
             Err(Error::InvalidArgument(_))
         )); // src/dst overlap
     }
@@ -1021,7 +1033,8 @@ mod tests {
         let src: Vec<u8> = (1..5).collect(); // [1, 2, 3, 4]
         let mut dst = vec![0u8; 4];
         let s = Stream::new();
-        p2p_gather_runs(&mut dst, &[src.as_ptr() as usize], &[1], &[3], Some(&s)).unwrap();
+        unsafe { p2p_gather_runs(&mut dst, &[src.as_ptr() as usize], &[1], &[3], Some(&s)) }
+            .unwrap();
         assert_eq!(s.submitted(), 1); // a single launch, not yet awaited
         s.wait();
         assert_eq!(dst, vec![0, 1, 2, 3]);
@@ -1040,7 +1053,7 @@ mod tests {
             width: 2,
             height: 2,
         };
-        p2p_gather_runs_2d(&mut dst, &[run], None).unwrap();
+        unsafe { p2p_gather_runs_2d(&mut dst, &[run], None) }.unwrap();
         assert_eq!(dst, vec![1, 2, 3, 4, 0, 0]);
     }
 
@@ -1057,7 +1070,7 @@ mod tests {
             height: 2,
         };
         assert!(matches!(
-            p2p_gather_runs_2d(&mut dst, &[bad_stride], None),
+            unsafe { p2p_gather_runs_2d(&mut dst, &[bad_stride], None) },
             Err(Error::InvalidArgument(_))
         )); // width exceeds src stride
         let beyond = Gather2DRun {
@@ -1069,7 +1082,7 @@ mod tests {
             height: 1,
         };
         assert!(matches!(
-            p2p_gather_runs_2d(&mut dst, &[beyond], None),
+            unsafe { p2p_gather_runs_2d(&mut dst, &[beyond], None) },
             Err(Error::InvalidArgument(_))
         )); // beyond capacity
     }
@@ -1080,28 +1093,35 @@ mod tests {
         let s2: Vec<u8> = vec![7];
         let mut d1 = vec![0u8; 4];
         let mut d2 = vec![0u8; 4];
-        p2p_gather_runs(
-            &mut d1,
-            &[s1.as_ptr() as usize, s2.as_ptr() as usize],
-            &[0, 2],
-            &[1, 2],
-            None,
-        )
+        unsafe {
+            p2p_gather_runs(
+                &mut d1,
+                &[s1.as_ptr() as usize, s2.as_ptr() as usize],
+                &[0, 2],
+                &[1, 2],
+                None,
+            )
+        }
         .unwrap();
-        memcpy_peer_batch_async(
-            &mut d2,
-            &[s1.as_ptr() as usize, s2.as_ptr() as usize],
-            &[0, 2],
-            &[1, 2],
-            None,
-        )
+        unsafe {
+            memcpy_peer_batch_async(
+                &mut d2,
+                &[s1.as_ptr() as usize, s2.as_ptr() as usize],
+                &[0, 2],
+                &[1, 2],
+                None,
+            )
+        }
         .unwrap();
         assert_eq!(d1, d2);
 
         let src: Vec<u8> = vec![1, 2, 3];
         let mut dst = vec![0u8; 3];
         let s = Stream::new();
-        memcpy_peer_batch_async(&mut dst, &[src.as_ptr() as usize], &[0], &[3], Some(&s)).unwrap();
+        unsafe {
+            memcpy_peer_batch_async(&mut dst, &[src.as_ptr() as usize], &[0], &[3], Some(&s))
+        }
+        .unwrap();
         assert_eq!(s.submitted(), 1); // one run -> one task
         s.wait();
         assert_eq!(dst, vec![1, 2, 3]);

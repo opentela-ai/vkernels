@@ -55,15 +55,10 @@ class FindLibTest(unittest.TestCase):
             os.environ["VKERNELS_LIB"] = f.name
             self.assertEqual(dev.find_libvkernels(), f.name)
 
-    def test_env_override_missing_path_is_ignored(self):
+    def test_invalid_explicit_library_is_an_error(self):
         os.environ["VKERNELS_LIB"] = "/nonexistent/vkernels.so"
-        found = dev.find_libvkernels()
-        if found is not None:
-            # A build tree on this machine satisfied a later step; the env
-            # path itself must not have been returned.
-            self.assertNotEqual(found, "/nonexistent/vkernels.so")
-        else:
-            self.assertIsNone(found)
+        with self.assertRaises(FileNotFoundError):
+            dev.find_libvkernels()
 
     def test_missing_library_returns_none(self):
         # Only valid when no dev build exists next to the repo; otherwise a

@@ -566,7 +566,9 @@ void vk_stream_delete(vk_stream* s);
  * callback runs on the stream's worker thread; it must not call back into
  * the stream. */
 int32_t vk_stream_submit(vk_stream* s, void (*fn)(void*), void* ctx);
-/* Block the calling thread until every submitted task has run. */
+/* Block until every submitted callback and its captures have completed.
+ * Reports failure via vk_last_error_code() / vk_last_error().
+ * A successful wait resets the thread-local error to VK_OK. */
 void vk_stream_wait(vk_stream* s);
 /* Number of tasks submitted so far (completed + queued). */
 size_t vk_stream_submitted(const vk_stream* s);

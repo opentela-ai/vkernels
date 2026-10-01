@@ -3,41 +3,52 @@
 
 #include <future>
 #include <memory>
-#include <vector>
+#include <utility>
 
 namespace vkernels::comm {
 
 OverlapExecutor::Result OverlapExecutor::run(std::size_t iters,
                                              std::function<int(std::size_t)> compute,
                                              std::function<void(std::size_t, int)> comm) {
-  std::vector<std::shared_future<int>> ready;
-  ready.resize(iters);
-
-  for (std::size_t i = 0; i < iters; ++i) {
-    auto promise = std::make_shared<std::promise<int>>();
-    ready[i] = promise->get_future().share();
-
-    // Submit compute(i) on the compute stream; it fulfils the promise.
-    // Note: `compute`/`comm` are captured BY REFERENCE. Copying a
-    // pybind11-wrapped std::function (func_handle) needs the GIL, and the
-    // caller may have released it while we block below; the reference is
-    // safe because run() waits for every task before returning.
-    compute_.submit([&compute, i, promise]() {
-      int v = compute(i);
-      promise->set_value(v);
-    });
-
-    // Submit comm(i) on the comm stream; it blocks on the future (honouring the
-    // data dependency) while the compute stream is free to start compute(i+1).
-    auto fut = ready[i];
-    comm_.submit([&comm, i, fut]() {
-      int v = fut.get();
-      comm(i, v);
-    });
+  struct Invocation {
+    std::function<int(std::size_t)> compute;
+    std::function<void(std::size_t, int)> comm;
+  };
+  // Move Python-wrapped functions once; copying them on a GIL-released
+  // caller is unsafe. Queued tasks own the invocation, never stack references.
+  auto invocation = std::make_shared<Invocation>(
+      Invocation{std::move(compute), std::move(comm)});
+  std::exception_ptr failure;
+  try {
+    for (std::size_t i = 0; i < iters; ++i) {
+      auto promise = std::make_shared<std::promise<int>>();
+      auto ready = promise->get_future().share();
+      compute_.submit([invocation, i, promise]() {
+        try {
+          promise->set_value(invocation->compute(i));
+        } catch (...) {
+          promise->set_exception(std::current_exception());
+          throw;
+        }
+      });
+      comm_.submit([invocation, i, ready]() {
+        invocation->comm(i, ready.get());
+      });
+    }
+  } catch (...) {
+    failure = std::current_exception();
   }
 
-  compute_.wait();
-  comm_.wait();
+  // Drain BOTH streams even when submission or a callback fails. This also
+  // releases every callback capture before returning across a language ABI.
+  for (Stream* stream : {&compute_, &comm_}) {
+    try {
+      stream->wait();
+    } catch (...) {
+      if (!failure) failure = std::current_exception();
+    }
+  }
+  if (failure) std::rethrow_exception(failure);
 
   return Result{iters, iters};
 }

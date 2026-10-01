@@ -34,3 +34,28 @@ for _name in [
     _file = getattr(sys.modules[_name], "__file__", None) or ""
     if str(_SRC) not in _file:
         del sys.modules[_name]
+
+
+def pytest_addoption(parser):
+    parser.addoption("--run-integration", action="store_true", help="run external serving-stack oracle tests")
+    parser.addoption("--run-checkpoint", action="store_true", help="run tests using VKERNELS_TEST_CHECKPOINT")
+
+
+def pytest_configure(config):
+    import os
+    for name, description in {
+        "integration": "requires explicitly installed external dependencies",
+        "checkpoint": "requires an explicitly selected model checkpoint",
+        "gpu": "requires a GPU runtime",
+    }.items():
+        config.addinivalue_line("markers", f"{name}: {description}")
+    if config.getoption("--run-integration"):
+        os.environ["VKERNELS_TEST_INTEGRATION"] = "1"
+
+
+def pytest_collection_modifyitems(config, items):
+    import pytest
+    for item in items:
+        for marker, option in (("integration", "--run-integration"), ("checkpoint", "--run-checkpoint")):
+            if item.get_closest_marker(marker) and not config.getoption(option):
+                item.add_marker(pytest.mark.skip(reason=f"requires {option}"))

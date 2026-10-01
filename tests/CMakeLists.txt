@@ -57,7 +57,7 @@ vkernels_add_test(NAME channel     SOURCES comm/test_channel.cpp)
 vkernels_add_test(NAME allreduce   SOURCES comm/test_allreduce.cpp)
 vkernels_add_test(NAME rccl        SOURCES comm/test_rccl.cpp)
 vkernels_add_test(NAME rccl_c      SOURCES comm/test_rccl_c.cpp)
-vkernels_add_test(NAME overlap     SOURCES comm/test_overlap.cpp)
+vkernels_add_test(NAME overlap     SOURCES comm/test_overlap.cpp comm/test_overlap_allocation.cpp)
 vkernels_add_test(NAME p2p_gather SOURCES comm/test_p2p_gather.cpp)
 vkernels_add_test(NAME p2p_kv_restore SOURCES comm/test_p2p_kv_restore.cpp)
 vkernels_add_test(NAME p2p_kv_donate SOURCES comm/test_p2p_kv_donate.cpp)
@@ -90,6 +90,10 @@ endif()
 # adding tests here (additive; last-writer-wins is fine).
 vkernels_add_test(NAME kda_chunked_fused_gpu
                   SOURCES kernels/attn/test_kda_chunked_fused_gpu.cpp)
+if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+  target_include_directories(vkernels_test_kda_chunked_fused_gpu PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+endif()
 if(VKERNELS_HAS_HIP)
   # Real HIP: the TU stages device buffers (hipMalloc/hipMemcpy), so give it
   # the toolkit include dirs (PRIVATE to the vkernels target) and the
@@ -158,4 +162,28 @@ if(VKERNELS_HAS_CUDA)
                     SOURCES comm/test_cross_node_kv_allgather_c.cu
                     INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
                     LIBS vkernels::vkernels_c NO_VKERNELS_LIB)
+endif()
+
+if(VKERNELS_HAS_CUDA)
+  vkernels_add_test(NAME cuda_contracts SOURCES kernels/test_cuda_contracts.cu
+    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+endif()
+# A host placeholder is a skipped device contract, never a passing GPU test.
+if(NOT VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+  set_tests_properties(kda_chunked_fused_gpu dsa_topk_fused_gpu
+    PROPERTIES DISABLED TRUE)
+endif()
+
+if(VKERNELS_HAS_CUDA OR VKERNELS_HAS_HIP)
+  add_executable(test_dsa_kpool_correct kernels/attn/test_dsa_kpool_correct.hip)
+  target_link_libraries(test_dsa_kpool_correct PRIVATE vkernels::vkernels)
+  target_compile_features(test_dsa_kpool_correct PRIVATE cxx_std_17)
+  if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
+    set_source_files_properties(kernels/attn/test_dsa_kpool_correct.hip
+      PROPERTIES LANGUAGE CUDA COMPILE_DEFINITIONS VKERNELS_HAS_HIP=1)
+    target_include_directories(test_dsa_kpool_correct PRIVATE
+      ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+  endif()
+  add_test(NAME dsa_kpool_device COMMAND test_dsa_kpool_correct)
+  set_tests_properties(dsa_kpool_device PROPERTIES SKIP_RETURN_CODE 77)
 endif()

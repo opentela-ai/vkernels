@@ -19,14 +19,21 @@ precision; the rest bisects whatever residual remains:
      pure torch;
   5. fwd_h autotune config sweep (BV x warps x stages).
 
+The instrumented oracle is pinned to the library's
+``glm_kda_chunk.kda_chunk_reference`` by a bit-identical lockstep guard at
+startup (a drifted bench copy would bisect the wrong target).
+
 Run: python3 kda_state_bisect.py  (GH200, floe-clariden container)
 """
 import math
+import os
 import sys
 
 import torch
 
-sys.path.insert(0, "/iopsstor/scratch/cscs/xyao/kvaas-clariden/vkernels-src")
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "python"))
+from vkernels.torch_ops._fp32 import pin_fp32_matmul  # noqa: E402
 from vkernels.torch_ops.vllm_kda import (  # noqa: E402
     RCP_LN2,
     chunk_gated_delta_rule_fwd_h,
@@ -62,11 +69,11 @@ def dmax(a, b):
 
 
 def set_matmul_precision(tf32):
-    """Pin the torch matmul fp32 path. The NGC container defaults to tf32
-    (fp32_precision='tf32') — lane C's oracle ran tf32-degraded there."""
-    torch.backends.cuda.matmul.allow_tf32 = tf32
-    if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
-        torch.backends.cuda.matmul.fp32_precision = "tf32" if tf32 else "ieee"
+    """Re-pin the torch matmul fp32 path for the oracle A/B. Deliberately
+    no restore — each leg of the harness re-pins explicitly. The canonical
+    (save/restore-capable, both-knobs) pin lives in
+    ``vkernels.torch_ops._fp32.pin_fp32_matmul``."""
+    pin_fp32_matmul("tf32" if tf32 else "ieee")
 
 
 # --------------------------------------------------------------------------
@@ -110,6 +117,29 @@ def ref_instrumented(q, k, v, g, beta, chunk_size, initial_state):
             + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
         cap["state_out"].append(state.clone())
     return cap, g
+
+
+def oracle_lockstep_guard(q, k, v, gate, beta, state0):
+    """``ref_instrumented`` below must compute the LIB oracle's math, not a
+    drifted copy: run both once (ieee-pinned) and require a bit-identical
+    final state, so the bisect always measures the real parity target
+    (``glm_kda_chunk.kda_chunk_reference``)."""
+    from vkernels.torch_ops.glm_kda_chunk import kda_chunk_reference
+
+    _, ref_state = kda_chunk_reference(
+        q, k, v, gate, beta, CHUNK, state0, output_final_state=True
+    )
+    restore = pin_fp32_matmul()
+    try:
+        cap, _ = ref_instrumented(q, k, v, gate, beta, CHUNK, state0)
+    finally:
+        restore()
+    assert torch.equal(cap["state_out"][-1], ref_state), (
+        "bench oracle drifted from glm_kda_chunk.kda_chunk_reference — "
+        "the bisect below would measure the wrong target"
+    )
+    print("oracle lockstep: ref_instrumented final state bit-identical "
+          "to kda_chunk_reference")
 
 
 def fused_pipeline(q, k, v, gate, beta, initial_state, chunk_size=CHUNK):
@@ -313,18 +343,20 @@ def ablations(b=1, h=8, s=512, d=128, seed=100):
         decay_mask = ex(g.unsqueeze(-2) - g.unsqueeze(-3))
         attn = -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask).sum(dim=-1).masked_fill(tri0, 0)
         if blockinv:
-            # fla order: 16x16 sequential inverse + block merges, in torch
+            # fla order: 16x16 sequential inverse + block merges, in torch.
+            # CONVENTION: the oracle's row recurrence on a strictly-lower M
+            # yields (I - M)^{-1} (attn = -A0 -> (I + A0)^{-1}); the merge
+            # below is that convention's block identity, X21 = A22 @ M21 @ A11
+            # — NOT the (I+M)^{-1} negated form.
             Ai = torch.zeros_like(attn)
-            o_i = torch.arange(16, device=q.device)
-            mA = (o_i[:, None] > o_i[None, :]).float()
-            mI = (o_i[:, None] == o_i[None, :]).float()
+            mI = torch.eye(16, dtype=attn.dtype, device=attn.device)
             for bi in range(4):
                 sl = slice(bi * 16, (bi + 1) * 16)
-                blk = -attn[..., sl, sl] * mA
-                for i in range(2, 16):
-                    b_a = -blk[..., i, :]
-                    b_a = b_a + (b_a.unsqueeze(-1) * blk).sum(-2)
-                    blk = torch.where((o_i == i).view(1, 1, 1, 16, 1), b_a, blk)
+                blk = attn[..., sl, sl].clone()
+                for i in range(1, 16):
+                    row = blk[..., i, :i].clone()
+                    sub = blk[..., :i, :i].clone()
+                    blk[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
                 Ai[..., sl, sl] = blk + mI
             for size in (32, 64):
                 for bi in range(64 // size):
@@ -333,7 +365,7 @@ def ablations(b=1, h=8, s=512, d=128, seed=100):
                     A11 = Ai[..., i1:i1 + m, i1:i1 + m]
                     A22 = Ai[..., i1 + m:i2, i1 + m:i2]
                     A21 = attn[..., i1 + m:i2, i1:i1 + m]
-                    Ai[..., i1 + m:i2, i1:i1 + m] = -(A22 @ A21) @ A11
+                    Ai[..., i1 + m:i2, i1:i1 + m] = A22 @ A21 @ A11
             attn_inv = Ai
         else:
             for i in range(1, CHUNK):
@@ -383,9 +415,16 @@ def fwd_h_config_sweep(q, k, v, gate, beta, state0, fu, cap):
         for cfg in full:
             tuner.configs = [cfg]
             tuner.cache = {}
-            _, _, final = chunk_gated_delta_rule_fwd_h(
-                k=kg, w=w, u=u, gk=g2, initial_state=h0, output_final_state=True,
-                chunk_size=CHUNK, use_exp2=True)
+            try:
+                _, _, final = chunk_gated_delta_rule_fwd_h(
+                    k=kg, w=w, u=u, gk=g2, initial_state=h0, output_final_state=True,
+                    chunk_size=CHUNK, use_exp2=True)
+            except Exception as err:  # noqa: BLE001 - diagnostic sweep: report & skip
+                # e.g. OutOfResources: a GH200-sized config (BV64/s3 shared
+                # memory) can exceed smaller devices' (GB10) limits.
+                print(f"  BV{cfg.kwargs.get('BV')}/w{cfg.num_warps}/s{cfg.num_stages}: "
+                      f"SKIPPED ({type(err).__name__}: {err})")
+                continue
             dd = dmax(final.transpose(-1, -2), ref_final)
             print(f"  BV{cfg.kwargs.get('BV')}/w{cfg.num_warps}/s{cfg.num_stages}: final Δ {dd:.3e}")
     finally:
@@ -420,6 +459,11 @@ def main():
     print(f"ieee-oracle vs tf32-oracle: final Δ "
           f"{dmax(cap_ie['state_out'][-1], cap32['state_out'][-1]):.3e}   "
           "<- if this carries the 7e-4, the drift was the container's tf32 oracle")
+
+    # the bisect below trusts ref_instrumented as the oracle — pin it to
+    # the library's kda_chunk_reference first (small shape; the big shape
+    # would double the eager pipeline's ~2.9 GB decay mask)
+    oracle_lockstep_guard(q, k, v, gate, beta, state0)
 
     q2, k2, v2, gate2, beta2, state02, fu, cap = bisect_shape(1, 8, 512, 128, 100, True)
     fwd_h_config_sweep(q2, k2, v2, gate2, beta2, state02, fu, cap)

@@ -32,7 +32,7 @@ def query_device_sms() -> int:
         import torch
 
         if torch.cuda.is_available():
-            return torch.cuda.get_device_properties(0).multi_processor_count
+            return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     except Exception:
         pass
     return _FALLBACK_SMS

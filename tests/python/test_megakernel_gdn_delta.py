@@ -22,7 +22,6 @@ Validation chain (mirrors the issue's Validation section):
 from __future__ import annotations
 
 import sys
-import types
 from pathlib import Path
 
 import numpy as np
@@ -51,24 +50,8 @@ from vkernels.compiler.schedule_phase import PhaseSchedule  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def _floe_gdn():
-    if "floe" not in sys.modules:
-        # floe is a sibling repo on this stack, not a venv dependency; probe
-        # FLOE_ROOT then the standard serving-stack checkout location.
-        import os
-        for cand in (os.environ.get("FLOE_ROOT"), "/home/xiayao/Documents/projects/opentela-ai/serving-stack/floe"):
-            if cand and (Path(cand) / "floe" / "engine").is_dir():
-                if cand not in sys.path:
-                    sys.path.insert(0, cand)
-                break
-    if "kvaas_runtime" not in sys.modules:
-        kv = types.ModuleType("kvaas_runtime")
-        for name in ("CudaVmm", "ElasticControlSession", "ManagedResidencyAdmissionDeferred", "ManagedResidencySession", "allocate_device_pool"):
-            setattr(kv, name, object)
-        sub = types.ModuleType("kvaas_runtime.kv_pool_import")
-        sub.tensor_from_cuda_pointer = object
-        kv.kv_pool_import = sub
-        sys.modules["kvaas_runtime"] = kv
-        sys.modules["kvaas_runtime.kv_pool_import"] = sub
+    from tests.python.external_dependencies import require_floe
+    require_floe()
     try:
         from floe.engine.runner.models.qwen35.qwen35_config import Qwen35Config
         from floe.engine.runner.models.qwen35 import qwen35_gdn
@@ -282,6 +265,7 @@ def test_lowering_gdn_delta_task_decomposition():
 # ===========================================================================
 
 @pytest.mark.parametrize("workers", [1, 3])
+@pytest.mark.integration
 def test_reference_gdn_delta_walk_matches_floe_oracle(workers):
     gdn, _cfg, qwen35_gdn = _floe_gdn()
     rng = np.random.default_rng(40 + workers)
@@ -333,6 +317,7 @@ def test_reference_gdn_delta_walk_matches_floe_oracle(workers):
     torch.testing.assert_close(torch.from_numpy(pool.copy()), oracle_states, rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.integration
 def test_reference_gdn_delta_issue_factored_form():
     """Independent recomputation in the issue's factored form
     ``s_new = diag(exp(g)) · s (I − β k kᵀ) + β k vᵀ`` — algebraically the
@@ -372,6 +357,7 @@ def test_reference_gdn_delta_issue_factored_form():
             np.testing.assert_allclose(got[bb, h], expected, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.integration
 def test_reference_gdn_delta_group_expansion():
     """Value heads in one group must read the SAME normalized key head: two
     decode chains identical except for a perturbation of key head 0 must
@@ -409,6 +395,7 @@ def test_reference_gdn_delta_group_expansion():
             np.testing.assert_array_equal(pools_a[step][bb, 2:], pools_b[step][bb, 2:])
 
 
+@pytest.mark.integration
 def test_reference_gdn_delta_in_place_state_rmw():
     """The pool must be updated in place from its pre-step contents (the
     task reads the OLD state, writes the NEW state to the same storage)."""
@@ -450,6 +437,7 @@ def _gdn_conv_available() -> bool:
 
 
 @pytest.mark.skipif(not _gdn_conv_available(), reason="requires the #89 gdn_conv op on this base")
+@pytest.mark.integration
 def test_reference_gdn_conv_then_delta_matches_full_floe_forward():
     """Full Qwen3.5 GDN decode step: linear qkv -> gdn_conv -> split ->
     gdn_delta (+ z/a/b/out projections) vs floe GatedDeltaNet.forward seq==1,
@@ -557,6 +545,7 @@ gpu = pytest.mark.skipif(
 
 
 @gpu
+@pytest.mark.integration
 def test_device_t_gdn_heads_batched_matches_floe_oracle():
     pytest.importorskip("triton")
     from tests.python._megakernel_launch import launch_task_body

@@ -34,7 +34,7 @@ def store(tmp_path, monkeypatch):
 
 def test_parse_body_comments_blanks_orphans(store):
     text = (
-        "# vk-native-tuning/1\n"
+        "# vk-native-tuning/2\n"
         "# arch=sm000 cu_count=48 written_by=bench\n"
         "key=1,4096,64\n"
         "split=64\n"
@@ -51,7 +51,7 @@ def test_parse_body_comments_blanks_orphans(store):
 
 
 def test_parse_arch_header_then_filename(store):
-    assert parse_tune_arch("# vk-native-tuning/1\n# arch=gfx942 cu_count=228\n",
+    assert parse_tune_arch("# vk-native-tuning/2\n# arch=gfx942 cu_count=228\n",
                            "k.gfx942.tune") == "gfx942"
     assert parse_tune_arch("key=1\nsplit=2\n", "k.sm121.tune") == "sm121"
 
@@ -68,7 +68,7 @@ def test_upsert_replaces_and_keeps_other_records(store):
     # The file is named <kernel>.<arch>.tune and carries the standard header.
     path = store / "k.sm000.tune"
     text = path.read_text()
-    assert text.startswith("# vk-native-tuning/1\n# arch=sm000")
+    assert text.startswith("# vk-native-tuning/2\n# arch=sm000")
     assert "written_by=test" in text
 
 
@@ -79,8 +79,8 @@ def test_arch_selection_rules(store):
 
     # Single foreign-arch file: honored (one-machine rule).
     (store / "two.gfx942.tune").write_text(
-        "# vk-native-tuning/1\n# arch=gfx942\nkey=1,2,3\nsplit=64\n")
-    assert NativeStore("two", store_dir=store).records()[(1, 2, 3)] == {"split": 64}
+        "# vk-native-tuning/2\n# arch=gfx942\nkey=1,2,3\nsplit=64\n")
+    assert NativeStore("two", store_dir=store).records() == {}
 
     # Two foreign files, none matching: ambiguous -> empty (lenient).
     # (A single foreign file would be honored by the one-machine rule.)
@@ -116,7 +116,9 @@ def test_tune_non_persisting_entry_is_a_clean_skip(store):
     assert "does not write the store" in report["detail"]
 
 
-def test_tune_all_skips_formula_only_but_exits_clean(store):
+def test_tune_all_skips_formula_only_but_exits_clean(store, monkeypatch):
+    from vkernels.torch_ops import tuner as tuner_mod
+    monkeypatch.setattr(tuner_mod, "_toolkit_mismatch", lambda toolkit: "no device in this unit test")
     # Batch runs tune what they can: the formula-only entry is a skip
     # (ok=True), not a failure that spoils --all's exit code.
     rows = tune(all=True, store_dir=store)
@@ -174,7 +176,7 @@ def test_clear_removes_both_tiers(store):
 
     (row,) = clear(["k"], store_dir=store)
     assert row == {"name": "k", "cleared": True, "tiers": ["triton", "native"]}
-    assert list(store.glob("k.*")) == []
+    assert not list(store.glob("k.*.json")) and not list(store.glob("k.*.tune"))
     assert (store / "unrelated.sm000.tune").exists()  # untouched
 
 

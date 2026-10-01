@@ -16,6 +16,7 @@ CPU ``*_reference`` is the always-tested oracle. Torch/Triton load lazily.
 Inference-only, no autograd backward.
 """
 
+import functools
 import threading
 
 
@@ -79,6 +80,7 @@ _FP8_GEMM_TRITON_MIN_N = 2048
 _BLOCKWISE_FALLBACK_WARNED = threading.Event()
 
 
+@functools.lru_cache(maxsize=1)
 def _kernel():
     global tl
     import triton

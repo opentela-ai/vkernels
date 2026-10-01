@@ -66,7 +66,7 @@ def default_store_dir() -> Path:
     return Path(env) if env else Path.home() / ".cache" / "vkernels" / "tuning"
 
 
-def device_fingerprint() -> dict:
+def device_fingerprint(device=None) -> dict:
     """JSON-safe identity of the current CUDA device (arch, CU count, software).
 
     Deliberately excludes the device *index*: the store is shared per host
@@ -77,7 +77,7 @@ def device_fingerprint() -> dict:
     import torch
     import triton
 
-    props = torch.cuda.get_device_properties(0)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device() if device is None else device)
     # The arch token must MATCH the native tier (core/tuning.cpp): HIP
     # gcnArchName (feature flags stripped), CUDA sm<major><minor>. Torch on
     # CUDA >= 13 exposes a gcnArchName attribute even on NVIDIA (value: the
@@ -211,19 +211,22 @@ class TuningCache:
         """Persist the winning config for ``key`` (atomic write)."""
         if not tuning_enabled():
             return {}
-        records = self._load()
-        doc_record = {
-            "config": {"kwargs": kwargs, "num_warps": num_warps, "num_stages": num_stages},
-            "time_ms": time_ms,
-            "device": self.device,
-            "producer": {"fingerprints": {
-                path: fingerprint_file(path) for path in self.source_files
-            }},
-            "measured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        }
-        records[_key_json(key)] = doc_record
-        self._write(records)
-        return doc_record
+        from .store_lock import store_lock
+        with store_lock(self._path()):
+            self._records = None  # merge the latest disk state under the lock
+            records = self._load()
+            doc_record = {
+                "config": {"kwargs": kwargs, "num_warps": num_warps, "num_stages": num_stages},
+                "time_ms": time_ms,
+                "device": self.device,
+                "producer": {"fingerprints": {
+                    path: fingerprint_file(path) for path in self.source_files
+                }},
+                "measured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            records[_key_json(key)] = doc_record
+            self._write(records)
+            return doc_record
 
     def _write(self, records) -> None:
         path = self._path()
@@ -248,8 +251,10 @@ class TuningCache:
 
     def clear(self) -> None:
         """Drop this kernel's store file and the in-memory records."""
-        self._records = {}
-        self._path().unlink(missing_ok=True)
+        from .store_lock import store_lock
+        with store_lock(self._path()):
+            self._records = {}
+            self._path().unlink(missing_ok=True)
 
 
 def _key_json(key) -> str:
@@ -297,6 +302,8 @@ class PersistentAutotuner:
             raise ValueError(f"autotune key(s) {missing} not in kernel args {arg_names}")
         self._cache = TuningCache(kernel_name, source_files,
                                   store_dir=store_dir, strict=strict)
+        self._stores = {}
+        self._memory_configs = {}
         self._bench = None  # injectable for tests
 
     @property
@@ -319,13 +326,14 @@ class PersistentAutotuner:
         bound.update(kwargs)
         return tuple(bound[k] for k in self.keys)
 
-    def _pick(self, key, grid, args, kwargs):
+    def _pick(self, key, grid, args, kwargs, store=None):
         """Store hit, else benchmark every config and persist the winner."""
-        record = self._cache.lookup(key)
+        store = store or self._cache
+        record = store.lookup(key)
         if record is not None:
             return self._config_from_record(record)
         best, best_ms = self._bench_all(grid, args, kwargs, self.configs)
-        self._cache.record(
+        store.record(
             key, kwargs=dict(best.kwargs), num_warps=best.num_warps,
             num_stages=best.num_stages, time_ms=best_ms)
         return best
@@ -382,14 +390,24 @@ class PersistentAutotuner:
         if warmup:
             # Compile-only: no launch, no benchmarking, no store write.
             return self.fn.run(*args, grid=grid, warmup=True, **kwargs)
+        device = next((v.device for v in (*args, *kwargs.values()) if getattr(v, "is_cuda", False)), None)
+        fingerprint = device_fingerprint(device)
+        identity = json.dumps(fingerprint, sort_keys=True)
+        if identity not in self._stores:
+            self._stores[identity] = TuningCache(
+                self._cache.kernel_name, self._cache.source_files,
+                store_dir=self._cache.store_dir, strict=self._cache.strict, device=fingerprint)
+        store = self._stores[identity]
+        memory = self._memory_configs.setdefault(identity, {})
+        self.cache = memory  # Triton-compatible introspection of this device
         key = self._key_of(args, kwargs)
-        config = self.cache.get(key)
+        config = memory.get(key)
         if config is None:
             if tuning_enabled():
-                config = self._pick(key, grid, args, kwargs)
-            else:  # off switch: time every config, keep nothing
+                config = self._pick(key, grid, args, kwargs, store)
+            else:
                 config, _ = self._bench_all(grid, args, kwargs, self.configs)
-            self.cache[key] = config
+            memory[key] = config
         launch = dict(config.kwargs)
         launch["num_warps"] = config.num_warps
         launch["num_stages"] = config.num_stages

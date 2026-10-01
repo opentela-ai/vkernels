@@ -96,7 +96,7 @@ std::string slurp(const std::string& path) {
 
 TEST(tuning, parse_body) {
   const std::string body =
-      "# vk-native-tuning/1\n"
+      "# vk-native-tuning/2\n"
       "# arch=gfx942 cu_count=228 written_by=bench\n"
       "key=1,4096,64\n"
       "split=64\n"
@@ -164,23 +164,21 @@ TEST(tuning, arch_selection) {
   EXPECT_TRUE(store.sole_tune_file("single")
               .rfind("/single.sm000.tune") != std::string::npos);
 
-  // Single-file fallback: one file, no arch match -> honored (the
-  // one-machine convenience rule).
+  // A mismatched architecture is a miss even when it is the only file.
   {
     std::ofstream out(store.dir + "/one.gfx942.tune");
-    out << "# vk-native-tuning/1\n# arch=gfx942\nkey=1,2,3\nsplit=64\n";
+    out << "# vk-native-tuning/2\n# arch=gfx942\nkey=1,2,3\nsplit=64\n";
   }
   tuning::reset_for_test();
   const auto fell_back = tuning::find("one", key);
-  ASSERT_TRUE(fell_back != nullptr);
-  EXPECT_EQ(*fell_back->find("split"), (long long)64);
+  EXPECT_TRUE(fell_back == nullptr);
 
   // Multi-arch, none matching this device: ambiguous -> miss (lenient).
   {
     std::ofstream out(store.dir + "/two.gfx942.tune");
-    out << "# vk-native-tuning/1\n# arch=gfx942\nkey=1,2,3\nsplit=64\n";
+    out << "# vk-native-tuning/2\n# arch=gfx942\nkey=1,2,3\nsplit=64\n";
     std::ofstream out2(store.dir + "/two.gfx90a.tune");
-    out2 << "# vk-native-tuning/1\n# arch=gfx90a\nkey=1,2,3\nsplit=32\n";
+    out2 << "# vk-native-tuning/2\n# arch=gfx90a\nkey=1,2,3\nsplit=32\n";
   }
   tuning::reset_for_test();
   EXPECT_TRUE(tuning::find("two", key) == nullptr);
@@ -289,7 +287,7 @@ TEST(tuning, warm_public_wrapper) {
   const std::vector<long long> key{4, 5, 6};
   {
     std::ofstream out(store.dir + "/w.sm000.tune");
-    out << "# vk-native-tuning/1\n# arch=sm000\nkey=4,5,6\nsplit=9\n";
+    out << "# vk-native-tuning/2\n# arch=sm000\nkey=4,5,6\nsplit=9\n";
   }
   tuning::warm(store.dir);
   const auto hit = tuning::find("w", key);
@@ -309,8 +307,7 @@ TEST(tuning, file_arch_from_filename) {
   }
   tuning::reset_for_test();
   const auto hit = tuning::find("hdrless", key);  // pinned sm000 != gfx942
-  ASSERT_TRUE(hit != nullptr);
-  EXPECT_EQ(*hit->find("split"), (long long)11);
+  EXPECT_TRUE(hit == nullptr);
 }
 
 TEST(tuning, persist_write_failure_is_lenient) {
@@ -345,4 +342,56 @@ TEST(tuning, persist_write_failure_is_lenient) {
     ::unsetenv("VKERNELS_TUNING_ARCH");
   tuning::reset_for_test();
   (void)::unlink(blocker.c_str());
+}
+
+TEST(tuning, current_version_can_take_arch_from_filename) {
+  const TempStore store("filename");
+  {
+    std::ofstream out(store.dir + "/named.sm000.tune");
+    out << "# vk-native-tuning/2\nkey=7,8\nsplit=11\n";
+  }
+  tuning::reset_for_test();
+  const auto hit = tuning::find("named", {7,8});
+  ASSERT_TRUE(hit != nullptr);
+  EXPECT_EQ(*hit->find("split"), 11LL);
+}
+
+#include <csignal>
+#include <sys/resource.h>
+TEST(tuning, failed_write_preserves_existing_records) {
+  const TempStore store("full");
+  tuning::persist("k", {1}, {{"split", 2}}, "test");
+  struct rlimit before{};
+  ASSERT_TRUE(getrlimit(RLIMIT_FSIZE, &before) == 0);
+  auto handler = std::signal(SIGXFSZ, SIG_IGN);
+  struct rlimit limited = before;
+  limited.rlim_cur = 0;
+  ASSERT_TRUE(setrlimit(RLIMIT_FSIZE, &limited) == 0);
+  tuning::persist("k", {2}, {{"split", 3}}, "test");
+  ASSERT_TRUE(setrlimit(RLIMIT_FSIZE, &before) == 0);
+  std::signal(SIGXFSZ, handler);
+  tuning::reset_for_test();
+  EXPECT_TRUE(tuning::find("k", {1}) != nullptr);
+  EXPECT_TRUE(tuning::find("k", {2}) == nullptr);
+}
+
+TEST(tuning, failed_rename_leaves_destination_untouched) {
+  const TempStore store("rename");
+  const auto path = store.dir + "/k.sm000.tune";
+  ASSERT_TRUE(::mkdir(path.c_str(), 0755) == 0);
+  tuning::persist("k", {1}, {{"split", 2}}, "test");
+  struct stat info{};
+  ASSERT_TRUE(::stat(path.c_str(), &info) == 0);
+  EXPECT_TRUE(S_ISDIR(info.st_mode));
+  ::rmdir(path.c_str());
+}
+
+TEST(tuning, ignores_incomplete_transaction_files) {
+  const TempStore store("partial");
+  {
+    std::ofstream out(store.dir + "/k.sm000.tune.abandoned");
+    out << "# vk-native-tuning/2\n# arch=sm000\nkey=1\nsplit=99\n";
+  }
+  tuning::reset_for_test();
+  EXPECT_TRUE(tuning::find("k", {1}) == nullptr);
 }

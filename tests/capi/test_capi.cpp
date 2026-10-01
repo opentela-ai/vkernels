@@ -245,6 +245,20 @@ TEST(Capi, DeviceLifecycle) {
   vk_device_delete(d);
 }
 
+TEST(Capi, StreamWaitContainsCallbackFailure) {
+  auto* stream = vk_stream_new();
+  ASSERT_NE(stream, nullptr);
+  EXPECT_EQ(vk_stream_submit(stream, [](void*) {
+    throw std::runtime_error("worker error");
+  }, nullptr), VK_OK);
+  vk_stream_wait(stream);
+  EXPECT_EQ(vk_last_error_code(), VK_ERROR_INTERNAL);
+  EXPECT_TRUE(std::string(vk_last_error()).find("worker error") != std::string::npos);
+  vk_stream_wait(stream);
+  EXPECT_EQ(vk_last_error_code(), VK_OK);
+  vk_stream_delete(stream);
+}
+
 TEST(Capi, StreamLifecycleAndSubmit) {
   vk_stream* s = vk_stream_new();
   ASSERT_NE(s, nullptr);

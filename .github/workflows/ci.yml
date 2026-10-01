@@ -49,6 +49,8 @@ jobs:
           --min 100
 
       - name: Python smoke tests (fallback backend)
+        env:
+          VKERNELS_BACKEND: fallback
         run: |
           uv run vkl list
           uv run vkl info gemm
@@ -93,7 +95,7 @@ jobs:
             set -e
             cmake -S . -B build/cuda -DVKERNELS_BUILD_BENCHMARKS=ON
             cmake --build build/cuda --target test_dsa_kpool_correct -j"$(nproc)"
-            ctest --test-dir build/cuda -R dsa_kpool_device_cuda --output-on-failure
+            ctest --test-dir build/cuda -R dsa_kpool_device --output-on-failure
             VKERNELS_LIB="$PWD/build/cuda/src/c/libvkernels_c.so" \
               python3 tests/python/test_dsa_kpool_device.py -v'
 
@@ -132,13 +134,8 @@ jobs:
             export TRITON_LIBCUDA_PATH="$(dirname "$libcuda")"
             python3 -m pip install --quiet numpy pytest torch triton || \
               python3 -m pip install --quiet --break-system-packages numpy pytest torch triton
-            python3 -m pytest -v \
-              tests/python/test_megakernel_rope_neox.py \
-              tests/python/test_megakernel_gdn_conv.py \
-              tests/python/test_megakernel_values_gate.py \
-              tests/python/test_megakernel_kda_delta.py \
-              tests/python/test_megakernel_indexer_topk.py \
-              tests/python/test_megakernel_mla_decode.py
+            export VKERNELS_LIB="$PWD/build/cuda/src/c/libvkernels_c.so"
+            python3 -m pytest tests/python -q
           '
 
       - name: Build wheel (CUDA)
@@ -149,3 +146,49 @@ jobs:
           name: wheels-cuda
           path: dist/*.whl
           if-no-files-found: ignore
+
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --manifest-path src/rust/Cargo.toml --workspace
+
+  installed-python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install . pytest
+      - name: Installed wheel outside the checkout (fallback forbidden)
+        env:
+          VKERNELS_BACKEND: compiled
+        run: |
+          cd /tmp
+          vkl doctor
+          vkl list
+          python -c 'from vkernels import kernels; assert kernels.sum([1., 2.]) == 3.'
+      - name: Compiled Python parity
+        env:
+          VKERNELS_BACKEND: compiled
+        run: |
+          export VKERNELS_EXTENSION="$(python -c 'from vkernels._backend import load_extension; print(load_extension().__file__)')"
+          python -m pytest tests/python -q
+
+  hip:
+    # Enable only where an actual ROCm runner is provisioned. A skipped job
+    # does not establish validated-on-device status in the capability report.
+    if: vars.VKERNELS_HIP_CI == 'true'
+    runs-on: [self-hosted, hip]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake --preset hip
+      - run: cmake --build --preset hip --parallel
+      - run: ctest --test-dir build/hip --output-on-failure
+      - name: Device Python contracts
+        env:
+          VKERNELS_BUILD_DIR: build/hip
+        run: python3 -m pytest tests/python/test_dsa_kpool_streams.py tests/python/test_dsa_kpool_device.py -q

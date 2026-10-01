@@ -3,8 +3,10 @@
 
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 namespace vkernels {
 
@@ -15,6 +17,7 @@ struct Stream::Impl {
   std::condition_variable done_cv;   // signalled when outstanding hits zero
   std::size_t outstanding = 0;
   std::size_t total = 0;
+  std::exception_ptr failure;
   bool stop = false;
   std::thread worker;
 
@@ -39,9 +42,15 @@ struct Stream::Impl {
         task = std::move(queue.front());
         queue.pop_front();
       }
-      {
+      try {
         task();  // may acquire/release the GIL via wrapped callables
-      }          // task destroyed here, BEFORE the completion signal
+      } catch (...) {
+        std::lock_guard<std::mutex> lk(m);
+        if (!failure) failure = std::current_exception();
+      }
+      // Destroy captures (including Python callables) before wait() can
+      // observe completion. An invocation block alone does not destroy task.
+      task = nullptr;
       {
         std::lock_guard<std::mutex> lk(m);
         if (--outstanding == 0) done_cv.notify_all();
@@ -76,8 +85,14 @@ void Stream::submit(std::function<void()> task) {
 void Stream::wait() {
   std::unique_lock<std::mutex> lk(impl_->m);
   impl_->done_cv.wait(lk, [this] { return impl_->outstanding == 0; });
+  auto failure = std::exchange(impl_->failure, nullptr);
+  lk.unlock();
+  if (failure) std::rethrow_exception(failure);
 }
 
-std::size_t Stream::submitted() const { return impl_->total; }
+std::size_t Stream::submitted() const {
+  std::lock_guard<std::mutex> lk(impl_->m);
+  return impl_->total;
+}
 
 }  // namespace vkernels

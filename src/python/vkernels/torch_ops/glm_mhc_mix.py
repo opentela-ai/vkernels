@@ -9,7 +9,10 @@ caller; all control math here uses FP32.
 
 Adopted from floe's ``engine/runner/kernels/glm5_mhc.py`` (vkernels owns
 the kernel; floe imports it back through a thin adapter — the #64/#65
-thin-adapter model extended to the whole GLM-5 Triton set).
+thin-adapter model extended to the whole GLM-5 Triton set). The gates +
+Sinkhorn jit block is the canonical one, shared with (and bit-identical
+by construction to) ``glm_mhc_big_fuse``'s fused kernel via
+:func:`_jit_helpers`.
 
 Torch and Triton load lazily. Inference-only, no autograd backward.
 """
@@ -20,10 +23,67 @@ from functools import lru_cache
 
 
 @lru_cache(maxsize=1)
+def _jit_helpers():
+    """Shared mHC @triton.jit building blocks, bound into module globals.
+
+    The gates + Sinkhorn combiner is the parity-critical mHC control math
+    (floe's Glm53HyperConnection ordering). ``glm_mhc_big_fuse`` embeds
+    the same block inside its fused kernel; sharing one jit function
+    keeps the two bit-identical by construction instead of only by test.
+    Triton resolves called jit functions through the caller's module
+    globals, so the helper is bound to a module-global name here — the
+    same ``global tl`` trick the kernels themselves use.
+    """
+    global _gates_sinkhorn
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _gates_sinkhorn(
+        L,
+        B,
+        S,
+        POST,
+        token,
+        HC: tl.constexpr,
+        EPS: tl.constexpr,
+        ITERS: tl.constexpr,
+    ):
+        # gates + Sinkhorn combiner, exactly Glm53HyperConnection's order:
+        # row softmax + eps, column normalization, then ITERS-1 row/column
+        # normalizations. Loads always upcast to fp32 — a no-op for this
+        # module's fp32 logits, the bf16/fp16 widening glm_mhc_big_fuse owes.
+        k = tl.arange(0, HC)
+        width: tl.constexpr = HC * (HC + 2)
+        pre = tl.load(L + token * width + k).to(tl.float32) * tl.load(S) + tl.load(B + k)
+        post = tl.load(L + token * width + HC + k).to(tl.float32) * tl.load(
+            S + 1
+        ) + tl.load(B + HC + k)
+        pre_gated = tl.sigmoid(pre) + EPS
+        tl.store(POST + token * HC + k, 2.0 * tl.sigmoid(post))
+        offset = k[:, None] * HC + k[None, :]
+        logits = tl.load(L + token * width + 2 * HC + offset).to(tl.float32) * tl.load(
+            S + 2
+        ) + tl.load(B + 2 * HC + offset)
+        value = tl.exp(logits - tl.max(logits, 1)[:, None])
+        value = tl.div_rn(value, tl.sum(value, 1)[:, None]) + EPS
+        value = tl.div_rn(value, tl.sum(value, 0)[None, :] + EPS)
+        for _ in range(ITERS - 1):
+            value = tl.div_rn(value, tl.sum(value, 1)[:, None] + EPS)
+            value = tl.div_rn(value, tl.sum(value, 0)[None, :] + EPS)
+        return pre_gated, value, offset
+
+    _gates_sinkhorn = _gates_sinkhorn
+    return _gates_sinkhorn
+
+
+@lru_cache(maxsize=1)
 def _kernel():
     global tl
     import triton
     import triton.language as tl
+
+    _jit_helpers()  # bind _gates_sinkhorn into module globals for _mix
 
     @triton.jit
     def _mix(
@@ -39,23 +99,8 @@ def _kernel():
     ):
         token = tl.program_id(0)
         k = tl.arange(0, HC)
-        width: tl.constexpr = HC * (HC + 2)
-        pre = tl.load(L + token * width + k) * tl.load(S) + tl.load(B + k)
-        post = tl.load(L + token * width + HC + k) * tl.load(S + 1) + tl.load(
-            B + HC + k
-        )
-        tl.store(PRE + token * HC + k, tl.sigmoid(pre) + EPS)
-        tl.store(POST + token * HC + k, 2.0 * tl.sigmoid(post))
-        offset = k[:, None] * HC + k[None, :]
-        logits = tl.load(L + token * width + 2 * HC + offset) * tl.load(
-            S + 2
-        ) + tl.load(B + 2 * HC + offset)
-        value = tl.exp(logits - tl.max(logits, 1)[:, None])
-        value = tl.div_rn(value, tl.sum(value, 1)[:, None]) + EPS
-        value = tl.div_rn(value, tl.sum(value, 0)[None, :] + EPS)
-        for _ in range(ITERS - 1):
-            value = tl.div_rn(value, tl.sum(value, 1)[:, None] + EPS)
-            value = tl.div_rn(value, tl.sum(value, 0)[None, :] + EPS)
+        pre_gated, value, offset = _gates_sinkhorn(L, B, S, POST, token, HC, EPS, ITERS)
+        tl.store(PRE + token * HC + k, pre_gated)
         tl.store(COMB + token * HC * HC + offset, value)
 
     return _mix

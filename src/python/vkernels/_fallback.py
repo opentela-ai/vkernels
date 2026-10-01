@@ -101,6 +101,7 @@ class Stream:
         self._cv = threading.Condition()
         self._outstanding = 0
         self._total = 0
+        self._failure = None
         self._stop = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -112,7 +113,14 @@ class Stream:
                 if self._stop and not self._queue:
                     return
                 task = self._queue.popleft()
-            task()
+            try:
+                task()
+            except BaseException as error:
+                with self._cv:
+                    if self._failure is None:
+                        self._failure = error.with_traceback(None)
+            finally:
+                task = None  # release captures before publishing completion
             with self._cv:
                 self._outstanding -= 1
                 if self._outstanding == 0:
@@ -128,6 +136,9 @@ class Stream:
     def wait(self) -> None:
         with self._cv:
             self._cv.wait_for(lambda: self._outstanding == 0)
+            failure, self._failure = self._failure, None
+        if failure is not None:
+            raise failure
 
     def submitted(self) -> int:
         with self._cv:
@@ -994,10 +1005,10 @@ def mla_fwd(B, H, S_q, S_kv, q_start, kv_start, kv_lora_rank,
 
 def mla_config(S_q, kv_lora_rank, qk_rope_head_dim):
     """Per-shape (bq, bn_kv, threads) tile selector (mirrors
-    ``mla_config_for``; decode S_q<=8 -> (1,64,64), prefill -> (4,64,256))."""
+    ``mla_config_for``; decode S_q<=8 -> (1,64,64), prefill -> (4,8,512))."""
     if S_q <= 8:
         return (1, 64, 64)
-    return (4, 64, 256)
+    return (4, 8, 512)
 
 
 # ---------------------------------------------------------------------------
@@ -1788,7 +1799,7 @@ def kda_gate_chunk_cumsum(g, B, H, n_chunks, chunk_size):
 
 def kda_naive_delta_rule_fwd(q, k, v, g, beta, B, H, S, D, out):
     """Per-token delta-rule oracle (mirrors ``kda_naive_delta_rule_fwd_cpu``,
-    O(S*D^2)). q,k,v [B,H,S,D], g,beta [B,H,S] -> out [B,H,S,D] fp32."""
+    O(S*D^2)). q,k,v,g [B,H,S,D], beta [B,H,S] -> out [B,H,S,D] fp32."""
     q = np.ascontiguousarray(q, dtype=np.float32).ravel()
     k = np.ascontiguousarray(k, dtype=np.float32).ravel()
     v = np.ascontiguousarray(v, dtype=np.float32).ravel()
@@ -1802,7 +1813,7 @@ def kda_naive_delta_rule_fwd(q, k, v, g, beta, B, H, S, D, out):
         ("k", k, B * H * S * D),
         ("v", v, B * H * S * D),
         ("out", out, B * H * S * D),
-        ("g", g, B * H * S),
+        ("g", g, B * H * S * D),
         ("beta", beta, B * H * S),
     ):
         if arr.size != exp:
@@ -1819,8 +1830,9 @@ def kda_naive_delta_rule_fwd(q, k, v, g, beta, B, H, S, D, out):
                 kt = k[(bh + t) * D : (bh + t + 1) * D]
                 vt = v[(bh + t) * D : (bh + t + 1) * D]
                 qt = q[(bh + t) * D : (bh + t + 1) * D]
-                gt = g[bh + t]
+                gt = g[(bh + t) * D : (bh + t + 1) * D]
                 bt = beta[bh + t]
+                state.reshape(D, D)[:] *= gt[None, :]
                 for d in range(D):
                     s = np.float32(0.0)
                     Srow = state[d * D : (d + 1) * D]
@@ -1831,7 +1843,7 @@ def kda_naive_delta_rule_fwd(q, k, v, g, beta, B, H, S, D, out):
                     ud = np.float32(vt[d] - a[d])
                     Srow = state[d * D : (d + 1) * D]
                     for e in range(D):
-                        Srow[e] = np.float32(gt * Srow[e] + bt * ud * kt[e])
+                        Srow[e] = np.float32(Srow[e] + bt * ud * kt[e])
                     s = np.float32(0.0)
                     for e in range(D):
                         s = np.float32(s + Srow[e] * qt[e])
@@ -2183,23 +2195,35 @@ class OverlapExecutor:
         return True
 
     def run(self, iters: int, compute, comm_fn) -> Result:
-        for i in range(iters):
-            event = threading.Event()
-            cell: dict = {}
+        from concurrent.futures import Future
 
-            def do_compute(i=i, event=event, cell=cell):
-                cell["value"] = compute(i)
-                event.set()
+        failure = None
+        try:
+            for i in range(iters):
+                ready = Future()
 
-            self._compute.submit(do_compute)
+                def do_compute(i=i, ready=ready):
+                    try:
+                        ready.set_result(compute(i))
+                    except BaseException as error:
+                        ready.set_exception(error)
+                        raise
 
-            def do_comm(i=i, event=event, cell=cell):
-                event.wait()
-                comm_fn(i, cell["value"])
+                def do_comm(i=i, ready=ready):
+                    comm_fn(i, ready.result())
 
-            self._comm.submit(do_comm)
-        self._compute.wait()
-        self._comm.wait()
+                self._compute.submit(do_compute)
+                self._comm.submit(do_comm)
+        except BaseException as error:
+            failure = error
+        for stream in (self._compute, self._comm):
+            try:
+                stream.wait()
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+        if failure is not None:
+            raise failure
         return Result(iters, iters)
 
 

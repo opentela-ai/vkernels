@@ -66,6 +66,7 @@
 #  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 #  include "vkernels/kernels/dsa_topk_device.cuh"  // shared scalar dsa_topk_logits kernels
 #  include <hip/hip_runtime.h>
+#include "vkernels/kernels/execution_workspace.hpp"
 
 namespace vkernels::kernels::hip {
 
@@ -756,41 +757,6 @@ void dsa_sparse_fwd_with_tile(int S_q, int S_kv, int H, int dim, int tail_dim,
 //  the degenerate split_kv == 1 delegation keep the plain serial behavior.
 //  VK_DSA_DECODE_SPLIT=0 restores the pre-#155 serial decode dispatch.
 
-// Internally managed partial scratch for the auto split: one fp32 partial-
-// output + one fp32 partial-lse buffer, grown on demand and never shrunk.
-// Retired generations are intentionally NOT hipFree'd (a pending kernel
-// could still reference an old buffer; the leak is bounded by the number of
-// grow steps and is tiny -- the same rationale as vec_combine_counters's
-// counter buffer above).
-namespace {
-struct DsaAutoSplitScratch {
-  float* part_out = nullptr;
-  float* part_lse = nullptr;
-  size_t cap_out = 0;  // floats
-  size_t cap_lse = 0;  // floats
-};
-bool dsa_auto_split_scratch(size_t n_out, size_t n_lse, float** p_out,
-                            float** p_lse) {
-  static DsaAutoSplitScratch s;
-  if (n_out > s.cap_out || n_lse > s.cap_lse) {
-    float* no = nullptr;
-    float* nl = nullptr;
-    if (hipMalloc(&no, n_out * sizeof(float)) != hipSuccess) return false;
-    if (hipMalloc(&nl, n_lse * sizeof(float)) != hipSuccess) {
-      hipFree(no);
-      return false;
-    }
-    s.part_out = no;  // previous generation intentionally abandoned
-    s.part_lse = nl;
-    s.cap_out = n_out;
-    s.cap_lse = n_lse;
-  }
-  *p_out = s.part_out;
-  *p_lse = s.part_lse;
-  return true;
-}
-}  // namespace
-
 // Shared split dispatch: the partial launch ladder + the combine launch --
 // factored out of dsa_sparse_fwd_split so the issue-#155 auto path runs the
 // EXACT same kernel selection (vec -> db -> serial partial, then combine).
@@ -858,7 +824,7 @@ void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
     return e ? std::atoi(e) : 1;
   }();
   if (auto_split_mode != 0 && S_q > 0 && H > 0 && topk > 0) {
-    static const int num_cu = [] {
+    const int num_cu = [] {
       int dev = 0, n = 0;
       if (hipGetDevice(&dev) != hipSuccess ||
           hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount,
@@ -871,14 +837,12 @@ void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
     if (split_kv > topk) split_kv = topk;  // defensive: every split >= 1 key
     if (split_kv > 1) {
       const int d_v = dim - tail_dim;
-      float* part_out = nullptr;
-      float* part_lse = nullptr;
-      if (dsa_auto_split_scratch((size_t)S_q * H * split_kv * d_v,
-                                 (size_t)S_q * H * split_kv, &part_out,
-                                 &part_lse)) {
+      Scratch<float> part_out((size_t)S_q * H * split_kv * d_v, (hipStream_t)stream);
+      Scratch<float> part_lse((size_t)S_q * H * split_kv, (hipStream_t)stream);
+      {
         dsa_sparse_fwd_split_run(S_q, S_kv, H, dim, tail_dim, topk, kv_group,
                                  sm_scale, return_lse, split_kv, q, kv, indices,
-                                 out, lse, part_out, part_lse, bq, stream);
+                                 out, lse, part_out.ptr, part_lse.ptr, bq, stream);
         return;
       }
     }
@@ -1553,7 +1517,7 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
   // thousands of tiny blocks, TLP already hides the serial chain and
   // staging is pure overhead. Engage the db kernel only in its win region;
   // VK_DSA_DB=2 bypasses this gate for diagnostics.
-  static const int num_cu = [] {
+  const int num_cu = [] {
     int dev = 0, n = 0;
     if (hipGetDevice(&dev) != hipSuccess ||
         hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount,
@@ -1578,34 +1542,6 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
       dbpipe);
   return true;
 }
-
-// Issue #137: arrival counters for the vec kernel's FUSED combine (lever
-// (b)): one int per (gi, h), memset to 0 on the launch stream before every
-// fused launch (so no cross-launch state and no correctness dependence on
-// the allocator's contents). Grown on demand and never shrunk; retired
-// generations are intentionally NOT hipFree'd (a pending kernel could still
-// reference an old buffer; the leak is bounded by the number of grow steps
-// and is tiny: S_q*H*4 B each).
-namespace {
-int* vec_combine_counters(size_t n, hipStream_t stream) {
-  static int* buf = nullptr;
-  static size_t cap = 0;
-  if (n == 0) return nullptr;
-  if (buf == nullptr || n > cap) {
-    int* nb = nullptr;
-    if (hipMalloc(&nb, n * sizeof(int)) != hipSuccess) return nullptr;
-    if (hipMemsetAsync(nb, 0, n * sizeof(int), stream) != hipSuccess) {
-      hipFree(nb);
-      return nullptr;
-    }
-    buf = nb;
-    cap = n;
-  } else {
-    hipMemsetAsync(buf, 0, n * sizeof(int), stream);
-  }
-  return buf;
-}
-}  // namespace
 
 // Issue #137: vectorized + register-batched serial partial (lever (a)),
 // with the optional FUSED combine (lever (b)). Returns:
@@ -1662,9 +1598,12 @@ int launch_partial_vec(const void* q, const void* kv, const void* indices,
                     : 1;
 
   int fuse = fuse_mode ? 1 : 0;
+  Scratch<int> counter_storage(fuse ? (size_t)S_q * H : 0, stream);
   int* counters = nullptr;
   if (fuse) {
-    counters = vec_combine_counters((size_t)S_q * H, stream);
+    counters = counter_storage.ptr;
+    VK_ENSURES(hipMemsetAsync(counters, 0, (size_t)S_q * H * sizeof(int), stream) == hipSuccess,
+               "DSA counter initialization failed");
     if (counters == nullptr) fuse = 0;  // alloc failure: plain partial path
   }
 
