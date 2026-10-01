@@ -947,3 +947,30 @@ new bottleneck, if any).
   the t1r patch scripts — they stay in the campaign dir
   (floe-bev-main/.local/campaign/beverin/glm5-smoke/) with local
   mirrors of the validated files.
+
+## T2R lever microbenches (658140/658148/658146/658149) + the parallel-legs race
+
+**GEMV in-graph (658148)** — the standalone event-timing floor (~60us,
+shape-independent) is the python/Triton DISPATCH, not kernel time; the
+true in-graph costs (capture 100 calls, replay):
+- gemv_fp8: 7-38us/call = 250-580 GB/s vs the measured 3485 GB/s D2D
+  wall -> 6-14x kernel headroom (to 1.5TB/s: 3-4x).
+- bf16 cuBLAS in-graph: wins the big-K shapes ((4096,4096): 26us at
+  1275 GB/s vs gemv_fp8's 37us/452) — the H100 crossover table does
+  NOT transfer to MI300; per-shape routing is worth revisiting.
+- dequant+mm (the deployed M>=4 fallback) always loses in-graph.
+
+**resolve_rows (658149)** — with the whole table hot (0 misses), the
+pure tag/selection logic costs 183us (K64/H128) / 256us (K128/H256) vs
+the serving 820us/call -> **the fill path is ~75% of the serving
+resolve cost** — lever 1 (graph prefetch) targets exactly that block.
+(658160 reruns with PAGES=256/len=8192 to measure the fill path
+directly.)
+
+**Parallel-legs race (658110 FAILED)**: every job start does
+`rm -rf $SNAP/repo-prof` + rebuild; concurrent legs sharing one $SNAP
+yank the tree out from under a running serve (a request-time lazy
+import hit the gap -> "No module named glm_kda_chunk" 500s -> engine
+loop death). NOT a lever-1 regression (the serve ran clean until the
+tree vanished). Fix: per-leg $SNAP copies (~30MB each; staged-fp8 is a
+stub) for any parallel submission.
