@@ -929,3 +929,21 @@ kineto-phase class); (c) the width-1 p50 variance (12.3 vs 14.5 legs,
 census-identical — environmental); (d) re-trace the CAPTURED width-4
 step (the 657570 trace showed eager; a captured trace would rank the
 new bottleneck, if any).
+
+## Consolidation to the real repos (post-657940)
+
+- floe `beverin/t2r-capture` @ 4f35e8b (from t1t2t4): the validated
+  sparse-capture stack — T1R warm_decoded + KEYTRACE + W2 delta pools
+  + T2R grain gate (+_min) + begin_step force_eager plumbing. 395
+  insertions across knobs.py + sparse_runtime.py; host tests green
+  (25 sparse_runtime + 13 knob bridges).
+- kvaas `main` @ 9b6d3ae: graph.py T2R-4 deterministic teardown +
+  thread_local error mode; capture_guard.py capture-once registry +
+  scoped refusal + the allowance API; execution.py the refusal raise +
+  the env-gated capture probe. Host tests green (18 capture_guard +
+  fault_inject). The repo's unrelated Rust WIP untouched.
+- Campaign-only tooling (not repo material): the kineto patch layer
+  (apply_kineto_patch_bev.py), the sbatch arms (GEMV4/HLB opt-ins),
+  the t1r patch scripts — they stay in the campaign dir
+  (floe-bev-main/.local/campaign/beverin/glm5-smoke/) with local
+  mirrors of the validated files.
