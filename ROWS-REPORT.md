@@ -797,3 +797,36 @@ variance sample.
 - 657570 still running at analysis time (the redundant W width-1 re-trace follows; rc2=1 expected — the post-W loop death).
 
 - **657570 COMPLETED (36:45, rc1=0, rc2=1)** — the W re-trace after E2-PREW did not fire (one window per serve lifetime effectively; the conc phase consumed it); the width-4 deliverable trace is the leg's product. **TIER-2 KINETO CAMPAIGN COMPLETE: both widths traced, analyzed, verdicts ledgered.** Open items for the next arcs: (a) the one-shot HIP 209 root cause (serve-state-dependent; full evidence chain in the 657541/657542/657545-49/657550 sections); (b) optimization targets: the width-4 rocBLAS ensemble (142 calls/step — why the batched reference path?), resolve_rows internals (0.82 ms/call batch-invariant), the aten glue (~40-80 unfused copies/reduces per step).
+
+## T2R grain-gate arc — FALSIFIED (657582/657606/657633)
+
+Hypothesis: the width>1 re-capture abort (issue #43, 657175) is the
+peer-mutation race (657018: a table flip inside the capture window), so a
+grain-stability gate (re-capture only when NO live request can flip the
+256-grain bt within G=4 steps — the bt width is a pure function of
+MAX(lens), `_grain_headroom`) would make width>1 re-captures safe and lift
+the conc phase off the permanent eager fallback (~2.8 tok/s/req).
+
+Delivery lesson (cost two legs): repo-prof is `rm -rf`'d and rebuilt from
+$SNAP/repo at every job start — engine patches must be baked into the
+persistent $SNAP/repo (like the t1r patch) or the arm chain; manual
+repo-prof edits die at sbatch. kvaas-src IS persistent (staged per job).
+657582/657606 ran pre-gate code (their only signal: p50 14.37 vs 7.05 =
+the eager/captured width-1 signatures; the spread is real).
+
+657633 (patch verified in-tree, marker on, zero grain-gates = headroom
+always sufficient, zero refusals = allowance worked):
+- width-1: p50=14.48, runs=[14.06,14.48,14.51] — tight, captured, healthy.
+- width-4 gated re-capture ATTEMPTED under a provably stable table ->
+  `HIP error: operation not permitted when stream is capturing` (async-
+  reported, hipErrorStreamCaptureUnsupported) x4 ranks -> c10::
+  AcceleratorError -> SIGABRT. Same class as 657175.
+
+Conclusion: the width>1 re-capture abort is NOT the grain race — a
+capture-unsafe op exists in the width>1 second-capture path itself
+(width-4 capture #1 succeeds; width-1 re-captures succeed 44/leg).
+Capture-once for width>1 stays (marker reverted; 657667 = restore leg).
+Next arc if pursued: standalone repro of width-4 capture#1->close->warm->
+re-capture (the /tmp/repro209.sh pattern) to pin the illegal op; or skip
+to the eager-path width-4 optimizations (rocBLAS GEMM ensemble 24%,
+launch-bound 4809/step).
