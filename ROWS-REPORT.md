@@ -1097,3 +1097,26 @@ OFF 37.0 | +SGFUSE 36.8 | +KDAFUSE 32.7* | +FCU 33.5x | +MHCFUSE 33.8x
 
 Remaining width-1 blocks at 32.7ms: glue ~5.2 | resolve 4.9 | MoE 5.3 |
 Cijk-persistent ~5.0 | rccl 2.9 | gemv 0.36. All kernel-work class.
+
+## T2R-9 router_gemv — the fp32 router scoring GEMM off BLAS (658473/477/479/480/482)
+
+The router logits GEMM [1,4096]x[288,4096] fp32 ran as rocBLAS small-
+tile Cijk (~2.7ms/step across 42 MoE layers). New vkernels op
+router_gemv (fp32 GEMV, the HF rounding class preserved: fp32
+accumulate, one round at the store):
+- v1 ROWS=16/BK=1024: 18 CTAs = 8% occupancy -> 52us/call, no win
+  (658473: engaged but step unchanged).
+- MI300A tiling sweep (658479): ROWS=1/BK=4096 = 3.06us/call (1.56
+  TB/s, 288 CTAs) vs cuBLAS fp32 18.77us = 6x.
+- v2 (658480): width-1 captured step 32.7 -> 31.95-32.36ms (-0.5, the
+  router block collapses) BUT conc 41.3s -- full-width BK at M=4
+  spilled registers (x tile [4,4096] fp32 per CTA).
+- v3 (658482, MP*BK<=8192 budget): width-1 32.25-32.86 (win holds),
+  conc 25.65s vs the 16.6 KDAFUSE baseline -- today's environment
+  swings (p50 6.7-13 within hours) make the conc gate unreliable;
+  worst case at M=4 = neutral after the fix. If a calm-window leg
+  still shows regression: route only M<=2 through the op.
+
+Branches: vkernels perf/router-gemv (worktree ../vkernels-routergemv,
+WIP in the main tree untouched) @ 6a8ffaa; floe perf/router-gemv @
+9b39e20 (OPT-IN router_gemv + vkl_ops wiring). Beverin: wired + legged.
