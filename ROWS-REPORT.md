@@ -1055,3 +1055,26 @@ contractions -- real kernel work (the lever-2/3 class), not config.
 Revised width-1 device budget (37ms): delta-rule matmuls 5.4-10.7 |
 aten glue ~9.2 | resolve 5.0 | MoE 5.5 | GEMV fleet 0.36 | RCCL 3.7 |
 attention/misc remainder.
+
+## T2R-7 KDAFUSE staircase (658395/658396, node 2346, sequential)
+
+The decode S==1 path already routes to the TRITON fused-recurrent
+kda_decode under the never-legged `fused_kda` opt-in knob (the CUDA
+packed/fused donors are nvcc-compiled = MI300-blocked; the Triton
+glm_kda_decode is ROCm-ready and audited bit-identical to the fp32
+reference with out_fp32=True).
+
+Staircase (captured-step device-ms, the stable metric):
+- OFF (658285):        37.0   conc 30.4s
+- +SGFUSE (658286):    36.8   conc 17.4s
+- +KDAFUSE (658395):   32.7   conc 16.6s/30.8 agg (best yet)
+- +FCU (658396):       33.5   -> DROP FCU (neutral-to-negative)
+
+Net: -4.3ms/step (37.0 -> 32.7), zero regressions, all_paris green
+throughout. The environmental p50 swings (12.98 and 6.7 on the same
+node within the hour) reconfirm: device-ms is the only gate.
+
+Remaining width-1 budget at 32.7ms: glue ~9 | resolve 5.0 | MoE 5.5 |
+RCCL 3.7 | reduced Cijk remainder | misc. Next biggest block = the
+elementwise/reduce glue (~1200 calls) — kernel work beyond
+fused_norms; then resolve/MoE.
