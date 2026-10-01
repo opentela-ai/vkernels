@@ -974,3 +974,30 @@ import hit the gap -> "No module named glm_kda_chunk" 500s -> engine
 loop death). NOT a lever-1 regression (the serve ran clean until the
 tree vanished). Fix: per-leg $SNAP copies (~30MB each; staged-fp8 is a
 stub) for any parallel submission.
+
+## T2R-5 lever-1 (graph prefetch) — FALSIFIED on device time; the captured-step baseline is 36ms device-bound
+
+Same-node A/B (nid002706, GLM5_GRAPH_STEP_TIMING=1 both sides):
+- OFF (658193): captured step wall 36-37ms, DEVICE 36ms, run-host 3-4.7ms; p50 12.95.
+- ON  (658225): captured step wall 47-48ms, DEVICE 46ms, run-host 3.5-5ms; p50 12.03.
+
+The prefetch ADDS ~10ms of device time. Mechanism: the host-side
+planner (plan_prefetch_pages) sees only the CPU tables -- not the
+device-resident tag state -- so it re-copies already-hot rows; and the
+fills execute as per-layer strided page-slice copies (94 layers x
+~1-2 pages) whose device cost (~10ms) duplicates rather than replaces
+the resolve's in-kernel fill path. Prediction accuracy cannot fix
+this: the planner is structurally tag-blind.
+
+Also resolved this turn: the node confound (2706 vs 2346/2350 legs
+differ by ~10ms/step -- ALL cross-node p50 comparisons are void; only
+same-node A/Bs count) and the parallel-legs $SNAP/repo-prof race
+(658110: a sibling job's rebuild yanked the tree mid-serve).
+
+THE REAL BASELINE: the captured width-1 decode step = 36ms, ~100%
+device-bound (host 3-5ms fully pipelined). The single-stream levers
+that matter are all device-side:
+- lever 2 (dense fleet): 8.6ms at 250-580 GB/s -> 3-6x kernel headroom;
+- lever 3 (resolve_rows): ~9ms incl. its in-kernel fill path;
+- the remaining ~18ms: attention/MoE kernels + collectives -- a kineto
+  trace of the CAPTURED step (not the eager fallback) would split it.
