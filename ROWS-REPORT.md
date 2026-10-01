@@ -1120,3 +1120,24 @@ accumulate, one round at the store):
 Branches: vkernels perf/router-gemv (worktree ../vkernels-routergemv,
 WIP in the main tree untouched) @ 6a8ffaa; floe perf/router-gemv @
 9b39e20 (OPT-IN router_gemv + vkl_ops wiring). Beverin: wired + legged.
+
+## T2R-10 MoE grouped config sweep (658491) + the session's arc close
+
+VK_MOE_GROUPED_CFG sweep at the serving shapes (E73/IA512/I4096/K8/T1,
+in-graph, all configs bit-identical): best r1=2/w1=8/r2=4 = 66.2us
+(760 GB/s) vs the default 75.0us -> default retuned (05460c8), ~-0.2ms/
+step, below leg noise; rides the next leg.
+
+The sweep ALSO bounds the MoE headroom honestly: the kernel tops out
+at ~760 GB/s vs the 3.4TB/s wall -- the fp8 decode chain (software
+e4m3fn + the parity-pinned double bf16 round trips) is instruction-
+bound. The remaining big MoE win requires decode-chain surgery with a
+parity decision (drop the intermediate bf16 rounds or a native-fp8 dot
+path) -- a heavier arc than this session's config wins.
+
+SESSION OPTIMIZATION LEDGER (width-1 device-ms, same-node gates):
+37.0 (baseline) -> 36.8 (SGFUSE) -> 32.7 (KDAFUSE) -> 32.3 (RGEMV)
+-> ~32.1 (MoE retune pending next leg) = -13% with zero regressions;
+conc 30.4s -> 16.6s (SGFUSE+KDAFUSE recipe, RGEMV pending calm-window
+verification). Remaining blocks all kernel-surgery class: MoE decode
+chain (5.1), resolve (4.9), glue (4.6), residual Cijk, RCCL (2.1-2.9).
