@@ -881,3 +881,39 @@ the dequant materialization); opt-in only, zero deployed delta.
 Conclusion: the conc lever = the captured width-4 path only — i.e.
 arc (a), the standalone re-capture repro -> the C++-level
 "operation not permitted when stream is capturing" fix.
+
+## T2R-4 — THE WIDTH>1 RE-CAPTURE ABORT ROOT-CAUSED AND FIXED (657861 -> 657909)
+
+Root cause (657861's C++ frame list, printed by the c10 exception
+context): the "operation not permitted when stream is capturing" was
+raised from `at::cuda::CUDAGraph::~CUDAGraph()` (libtorch_hip.so)
+during PYTHON DEALLOCATION — the OLD window's graph object is GC'd at
+an arbitrary later time, and that lands INSIDE the next capture's
+recording: hipGraph teardown mid-capture is illegal, the throw escapes
+the interpreter's dealloc path -> terminate -> SIGABRT, never a python
+traceback. Explains the full evidence matrix:
+- first capture safe (no prior graph object to destroy);
+- width-1 re-captures safe x44/leg (allocation churn between close and
+  re-capture collects the graph OUTSIDE captures);
+- width>1 re-capture dies (GC fires mid-recording);
+- grain-gate (657633), thread_local error mode (657861), and
+  HIP_LAUNCH_BLOCKING properly delivered in the env chain (657896,
+  p50 7.69 proves delivery) were all no-ops — the destructor's own
+  c10_hip_check throws regardless.
+
+Fix (kvaas-src sparse_attention/graph.py, persistent tree): drop the
+CUDAGraph reference deterministically in close() and the failed-attempt
+except path, right after reset() with the stream already synchronized
+— the destructor then runs outside any capture window.
+
+657909 (fix + grain gate ON + allowance): leg COMPLETED, zero aborts,
+zero refusals, zero grain-gates; width-1 p50=14.09 [13.84,14.09,14.57];
+**concurrency wall 251.7s -> 21.444s, agg 2.0 -> 23.88 tok/s (~11.7x),
+all_paris=True**; width-4 KEYTRACE census: 88 eager steps total
+(24 key-mismatch + 64 window-gone) vs 1088+ before — the rest are
+captured replays.
+
+Deployed knob state: FLOE_SPARSE_GRAIN_GATE=1 (safe re-capture timing;
+avoids wasted attempts near grain flips), graph.py carries thread_local
+error mode + the deterministic teardown; GEMV4 off (conc-neutral,
+future-relevant for captured width-4); HLB=0 default.
