@@ -83,6 +83,8 @@ autograd backward.
 
 from __future__ import annotations
 
+import functools
+
 import math
 import os
 
@@ -116,6 +118,7 @@ def _max_rows() -> int:
     return 2
 
 
+@functools.lru_cache(maxsize=1)
 def _kernel():
     """JIT-scoped kernel definition (import triton lazily, moe_combine style)."""
     import triton

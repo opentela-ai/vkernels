@@ -26,8 +26,17 @@ capture safe).
   ``expert_gemv`` bf16 store boundary and the ``moe_weighted_sum``
   fp32-accumulate contract reproduced in registers — storing ``[T,H]`` once.
 
+Storage flavour (mirrors ``glm_expert_gemv``'s ``storage`` kwarg, issue #71):
+``storage="e4m3fn"`` (default) reads the checkpoint e4m3fn stacks (fp8e4nv
+bitcast); ``storage="e4m3fnuz"`` reads the IN-PLACE converted stacks produced
+by ``e4m3fn_to_fnuz_inplace`` — fnuz bytes (bias 8, NaN only at 0x80) with
+the DOUBLED fp32 block scales, sharing the checkpoint's storage — decoded by
+the manual bit-decode on BOTH backends (CUDA has no fnuz dtype), so
+``value * scale`` reproduces the original e4m3fn weight bit-exactly.
+
 Numerics contract (bit-exactness with the ladder, on a given device):
-weight decode (fp8e4nv bitcast on CUDA), per-element ``value * scale``
+weight decode (fp8e4nv bitcast on CUDA / manual bit-decode for fnuz),
+per-element ``value * scale``
 rounded to bf16 then fp32, the fp32 ``tl.sum`` dot (order depends only on
 the reduction-axis length — inherited from ``glm_expert_gemv``/``glm_expert_gemv_fused``
 provenance), the bf16 rounding at every stage boundary, the
@@ -51,6 +60,8 @@ warmup's eager pass compiles both kernels per shape before capture.
 """
 
 from __future__ import annotations
+
+import functools
 
 import os
 
@@ -94,13 +105,22 @@ def moe_grouped_decode_eligible(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
     t_cap: int,
+    storage: str = "e4m3fn",
 ) -> bool:
     """Cheap (no device sync) contract check for :func:`moe_grouped_decode`.
 
-    Mirrors the ladder wrapper's envelope: bf16 activations, e4m3fn stacked
-    weights (fp32 block scales), int64 indices, fp32 routing weights,
-    block-128 dims, ``T <= t_cap``, all-CUDA contiguous same-device inputs.
+    Mirrors the ladder wrapper's envelope: bf16 activations, block-FP8
+    stacked weights in EITHER storage flavour (``storage="e4m3fn"`` — the
+    checkpoint bytes — or ``storage="e4m3fnuz"`` — the issue #71 in-place
+    rewrite views with their doubled scales; the flavour-agnostic gate
+    mirrors ``expert_gemv``, which decodes fnuz bytes on both backends,
+    so no CDNA/CUDA gating is needed here), fp32 block scales, int64
+    indices, fp32 routing weights, block-128 dims, ``T <= t_cap``,
+    all-CUDA contiguous same-device inputs.
     """
+    if storage not in ("e4m3fn", "e4m3fnuz"):
+        return False
+    want = torch.float8_e4m3fnuz if storage == "e4m3fnuz" else torch.float8_e4m3fn
     e, o, i = (gate_up_w.shape[0], gate_up_w.shape[1], gate_up_w.shape[2])
     ia = o // 2
     t, k = top_k_index.shape
@@ -109,8 +129,8 @@ def moe_grouped_decode_eligible(
         and x.dim() == 2
         and x.dtype == torch.bfloat16
         and x.shape == (t, i)
-        and gate_up_w.dtype == torch.float8_e4m3fn
-        and down_w.dtype == torch.float8_e4m3fn
+        and gate_up_w.dtype == want
+        and down_w.dtype == want
         and gate_up_s.dtype == torch.float32
         and down_s.dtype == torch.float32
         and top_k_index.dtype == torch.int64
@@ -130,9 +150,42 @@ def moe_grouped_decode_eligible(
     )
 
 
+@functools.lru_cache(maxsize=1)
 def _kernels():
     import triton
     import triton.language as tl
+
+    @triton.jit
+    def _decode_w8(raw, FNUZ: tl.constexpr):
+        """fp8 weight byte -> fp32 value, per storage flavour.
+
+        Mirrors ``glm_expert_gemv._expert_gemv`` verbatim. ``FNUZ=0``
+        (e4m3fn checkpoint bytes): the ``tl.float8e4nv`` bitcast decodes
+        bias-7/IEEE-NaN semantics on both backends (Triton's fp8 casts are
+        software — no hardware-fp8 shortcut is taken here, unlike
+        ``_expert_gemv_native``). ``FNUZ=1`` (issue #71 in-place fnuz
+        rewrite): manual bit-decode — bias 8, max finite 240, NaN ONLY at
+        0x80 (no -0), subnormals ``m * 2**-10`` — against the DOUBLED
+        scales from ``e4m3fn_to_fnuz_inplace``, so ``value * scale``
+        reproduces the original e4m3fn weight exactly (verified exhaustive
+        over all 256 bytes; the doubled-scale convention is part of the
+        in-place conversion contract).
+        """
+        if FNUZ:
+            ri = raw.to(tl.int32)
+            exponent, mantissa = (ri >> 3) & 15, ri & 7
+            bits = ((exponent + 119) << 23) | (mantissa << 20)
+            value = tl.where(
+                exponent == 0,
+                mantissa.to(tl.float32) * 0.0009765625,
+                bits.to(tl.float32, bitcast=True),
+            )
+            value = tl.where(ri == 128, float("nan"), value)
+            return (value.to(tl.int32, bitcast=True) | ((ri & 128) << 24)).to(
+                tl.float32, bitcast=True
+            )
+        else:
+            return raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
 
     @triton.jit
     def _moe_gate_up(
@@ -147,6 +200,7 @@ def _kernels():
         K: tl.constexpr,
         ROWS: tl.constexpr,
         COLS: tl.constexpr,
+        FNUZ: tl.constexpr,
     ):
         """Stage 1: act[t,k,row] = swiglu_limit(gate_dot, up_dot) per pair.
 
@@ -173,7 +227,7 @@ def _kernels():
             (row[:, None] < IA) & (scol[None, :] < I // 128),
             0,
         )
-        weight = (raw_gate.to(tl.float8e4nv, bitcast=True).to(tl.float32).reshape(ROWS, COLS // 128, 128) * scale[:, :, None]).reshape(ROWS, COLS).to(tl.bfloat16).to(tl.float32)
+        weight = (_decode_w8(raw_gate, FNUZ).reshape(ROWS, COLS // 128, 128) * scale[:, :, None]).reshape(ROWS, COLS).to(tl.bfloat16).to(tl.float32)
         gate = tl.sum(weight * x[None, :], axis=1)
 
         raw_up = tl.load(base + (row[:, None] + IA) * I + col[None, :], inbounds & (col[None, :] < I), 0)
@@ -182,7 +236,7 @@ def _kernels():
             (row[:, None] < IA) & (scol[None, :] < I // 128),
             0,
         )
-        weight = (raw_up.to(tl.float8e4nv, bitcast=True).to(tl.float32).reshape(ROWS, COLS // 128, 128) * scale[:, :, None]).reshape(ROWS, COLS).to(tl.bfloat16).to(tl.float32)
+        weight = (_decode_w8(raw_up, FNUZ).reshape(ROWS, COLS // 128, 128) * scale[:, :, None]).reshape(ROWS, COLS).to(tl.bfloat16).to(tl.float32)
         up = tl.sum(weight * x[None, :], axis=1)
 
         # Verbatim elementwise._swiglu_limit epilogue (clamp max=limit gate,
@@ -217,6 +271,7 @@ def _kernels():
         K: tl.constexpr,
         ROWS: tl.constexpr,
         COLS: tl.constexpr,
+        FNUZ: tl.constexpr,
     ):
         """Stage 2: y[t, row] = sum_k wts[t,k] * round_bf16(down dot).
 
@@ -243,7 +298,7 @@ def _kernels():
                 (row[:, None] < H) & (scol[None, :] < IA // 128),
                 0,
             )
-            weight = (raw.to(tl.float8e4nv, bitcast=True).to(tl.float32).reshape(ROWS, COLS // 128, 128) * scale[:, :, None]).reshape(ROWS, COLS).to(tl.bfloat16).to(tl.float32)
+            weight = (_decode_w8(raw, FNUZ).reshape(ROWS, COLS // 128, 128) * scale[:, :, None]).reshape(ROWS, COLS).to(tl.bfloat16).to(tl.float32)
             a = tl.load(ACT + token * K * IA + k * IA + col, col < IA, 0).to(tl.float32)
             dot = tl.sum(weight * a[None, :], axis=1)
             w = tl.load(WTS + token * K + k)
@@ -263,8 +318,16 @@ def moe_grouped_decode(
     top_k_weights: torch.Tensor,
     swiglu_limit: float,
     t_cap: int = 8,
+    storage: str = "e4m3fn",
 ) -> torch.Tensor:
     """Grouped decode MoE: return ``[T, H]`` bf16 for x ``[T, I]`` bf16.
+
+    ``storage`` selects the stack flavour, mirroring ``expert_gemv``:
+    ``"e4m3fn"`` (default) reads the checkpoint e4m3fn bytes;
+    ``"e4m3fnuz"`` reads the issue #71 in-place converted stacks (fnuz
+    bytes + DOUBLED fp32 block scales — pass the ``_fp8_stack_view``
+    fnuz-dtype reinterpret of the same storage). Both decode bit-exactly
+    to the same weights, so the ladder oracle is flavour-independent.
 
     Bit-exact (same device) with the four-launch ladder::
 
@@ -276,10 +339,11 @@ def moe_grouped_decode(
     Raises ``OpNotEligible`` when the inputs fall outside the contract (the
     caller falls through to the ladder). No host syncs; capture-safe.
     """
-    if not moe_grouped_decode_eligible(x, gate_up_w, gate_up_s, down_w, down_s, top_k_index, top_k_weights, t_cap):
+    if not moe_grouped_decode_eligible(x, gate_up_w, gate_up_s, down_w, down_s, top_k_index, top_k_weights, t_cap, storage):
         raise OpNotEligible(
-            f"moe_grouped_decode contract: bf16 x[T,I], e4m3fn [E,2IA,I]/[E,H,IA] "
-            f"stacks with fp32 block-128 scales, int64 [T,K] indices, fp32 [T,K] "
+            f"moe_grouped_decode contract: bf16 x[T,I], e4m3fn-or-e4m3fnuz "
+            f"[E,2IA,I]/[E,H,IA] stacks (storage={storage!r}) with fp32 "
+            f"block-128 scales, int64 [T,K] indices, fp32 [T,K] "
             f"weights, T<={t_cap} (got x{x.shape} {x.dtype}, w13{tuple(gate_up_w.shape)} "
             f"{gate_up_w.dtype}, w2{tuple(down_w.shape)} {down_w.dtype}, "
             f"idx{tuple(top_k_index.shape)} {top_k_index.dtype})"
@@ -293,6 +357,12 @@ def moe_grouped_decode(
     cfg = _cfg()
     rows1 = cfg["rows1"]
     rows2 = cfg["rows2"]
+    # Flavour rides the wrapper (expert_gemv precedent): fnuz STORAGE always
+    # takes the manual bit-decode (FNUZ=1) — CUDA has no fnuz dtype to
+    # bitcast to, and the doubled-scale convention is part of the in-place
+    # conversion contract (issue #71). e4m3fn bytes keep the float8e4nv
+    # bitcast on both backends (Triton's fp8 casts are software).
+    fnuz = storage == "e4m3fnuz"
     act = torch.empty((t, k, ia), device=x.device, dtype=torch.bfloat16)
     out = torch.empty((t, h), device=x.device, dtype=torch.bfloat16)
     _, gate_up, down = _kernels()
@@ -312,6 +382,7 @@ def moe_grouped_decode(
             k,
             rows1,
             triton.next_power_of_2(i),
+            fnuz,
             num_warps=cfg["warps1"],
             enable_fp_fusion=False,
         )
@@ -327,6 +398,7 @@ def moe_grouped_decode(
             k,
             rows2,
             triton.next_power_of_2(ia),
+            fnuz,
             # Default fp-fusion: the accumulate must contract to FMA exactly
             # like _weighted_moe_sum_reduce_kernel (enable_fp_fusion default
             # True) for the w[t,k]*dot term to round identically. The dot
