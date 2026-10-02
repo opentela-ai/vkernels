@@ -105,6 +105,8 @@ def _kernel():
         BROADCAST: tl.constexpr,
         ROWS: tl.constexpr,
         COLS: tl.constexpr,
+        ROUTE_W=None,
+        SKIP_ZERO: tl.constexpr = False,
     ):
         """CUDA variant: bitcast the raw e4m3FN bytes (uint8 load — direct
         fp8-pointer loads are rejected by this Triton) to tl.float8e4nv and
@@ -116,6 +118,12 @@ def _kernel():
         native-cast path is bandwidth-bound."""
         selected = tl.program_id(0)
         row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+        if SKIP_ZERO:
+            # Scalar pair weight is CTA-uniform. Always overwrite skipped
+            # outputs: graph routes may change between replays.
+            if tl.load(ROUTE_W + selected) == 0.0:
+                tl.store(Y + selected * O + row, 0.0, row < O)
+                return
         col = tl.arange(0, COLS)
         expert = tl.load(IDX + selected).to(tl.int64)
         raw = tl.load(
@@ -149,7 +157,7 @@ def _kernel():
     return _expert_gemv, _expert_gemv_native
 
 
-def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None):
+def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, route_weights=None):
     """Return BF16 [T,K,O] for BF16 x[T,I] or x[T,K,I], T <= t_cap.
 
     ``t_cap`` (default 2, the decode-validated limit) is the row cap the
@@ -200,6 +208,12 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None):
         raise OpNotEligible("inputs must share a GPU device")
     if any(not v.is_contiguous() for v in (x, weights, scales, indices)):
         raise OpNotEligible("inputs must be contiguous")
+    if route_weights is not None:
+        if (fnuz or torch.version.hip or route_weights.shape != indices.shape
+                or route_weights.dtype != torch.float32
+                or route_weights.device != x.device
+                or not route_weights.is_contiguous()):
+            raise OpNotEligible("zero-route GEMV requires CUDA-native E4M3FN and contiguous same-device FP32 [T,K] weights")
     out = torch.empty((t, k, o), device=x.device, dtype=torch.bfloat16)
     if t and k:
         import triton  # lazy: validation above needs only torch
@@ -240,6 +254,8 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None):
                 # "dynamic_func() takes 11 positional arguments but 12 were
                 # given" (regression from the fnuz-storage commit d5678ec).
                 extra_fnuz = [False] if torch.version.hip else []
+                skip_kwargs = ({"ROUTE_W": route_weights, "SKIP_ZERO": True}
+                               if route_weights is not None else {})
                 kernel[(t * k, triton.cdiv(o, 4))](
                     x,
                     weights.view(torch.uint8),
@@ -253,10 +269,21 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None):
                     4,
                     triton.next_power_of_2(i),
                     *extra_fnuz,
+                    **skip_kwargs,
                     num_warps=4,
                     enable_fp_fusion=False,
                 )
     return out
+
+
+def expert_gemv_skip_zero(x, weights, scales, indices, route_weights, storage="e4m3fn", t_cap=None):
+    """Optional EP route-aware entry: zero outputs for exact-zero pair weights.
+
+    Defaults of expert_gemv remain unchanged. CUDA-native E4M3FN only;
+    route weights are not applied to active outputs (combine does that).
+    """
+    return expert_gemv(x, weights, scales, indices, storage=storage, t_cap=t_cap,
+                       route_weights=route_weights)
 
 
 def expert_gemv_reference(x, weights, scales, indices, t_cap=None):
