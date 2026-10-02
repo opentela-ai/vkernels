@@ -1248,3 +1248,29 @@ push+execute must be atomic (scp the script, then run). (3) The correlation→la
 cpu_op parent-chain method works (1528/5184 Cijk mapped → 1440 aten::mm ← matmul ←
 linear). (4) Phase-2 death is now 5/5 on merged states but E1-E3 traces DO land before
 the phase-B kill (BrokenPipeError post-734MB-export) — harvestable.
+
+**Discriminator legs (all merged tree, arm=stack-moe-t1r unless noted):**
+
+| leg | variant | B=1 p50 | conc-4 | trace replay gate_up |
+|---|---|---|---|---|
+| 658752 | bare merged | 15.75 | 29.9 | 171.7 µs |
+| 658761 | `_DEF` reverted (rows1 4/w1 4/r2 8/w2 4) | 15.09 | 29.56 | **149.1 µs** |
+| 659025 | kvaasd `--device-pool` removed | 15.6 | 33.3 | 155.6 µs |
+| 659089 | arm=stack-moe-l5-debug (host step tables) | pending | — | — |
+
+Read-outs so far:
+- The T2R-10 moe config moves the REPLAY time only ~13% (171.7→149.1) and the WALL
+  not at all → config exonerated for the wall.
+- The kvaas device pool (6 GiB/GPU) moves neither the wall nor the replay → pool
+  exonerated. (conc-4 33.3 vs 29.9 is within the leg cluster 29.9-33.4.)
+- The old tree's trace shows a graph CAN replay `_moe_gate_up` at 44.1 µs — but
+  cross-tree per-launch comparisons are polluted: the merged per-launch durs are
+  2-4x across ALL families (moe 3.8x, elementwise 2.9x, Cijk 1.8x) while the WALL
+  is only 1.09x — most of the cross-tree per-launch delta is profiling overhead of
+  the merged stack's kineto/roctracer build, not device time. Within-merged
+  comparisons (eager vs replay) remain valid: the replay tax is real but its wall
+  share is bounded by the replay step fraction.
+- Recipe deltas ruled out: tp_control_stream (658566/658579 have it, no gain),
+  commit-defer markers (same legs), KEYTRACE logging (132 event-driven lines/serve).
+- The `_DEF` revert was restored; the nopool sbatch variant is
+  glm5-tp4-bench-nopool.sbatch on beverin scratch.
