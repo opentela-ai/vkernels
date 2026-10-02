@@ -215,6 +215,8 @@ def _kernels():
         numel,
         NP: tl.constexpr,  # power-of-2 >= numel
         NB: tl.constexpr,  # power-of-2 >= max blocks used
+        route_weights_ptr,
+        SKIP_ZERO: tl.constexpr,
     ):
         """Single-CTA moe_align for tiny batches with MANY experts (donor:
         _moe_align_small_numel_kernel, PDL hooks removed).
@@ -234,6 +236,8 @@ def _kernels():
         """
         offs_p = tl.arange(0, NP)
         mask_p = offs_p < numel
+        if SKIP_ZERO:
+            mask_p = mask_p & (tl.load(route_weights_ptr + offs_p, mask=mask_p, other=0.0) != 0.0)
         ids = tl.load(topk_ids_ptr + offs_p, mask=mask_p, other=-2)
         # Padded lanes get an out-of-range bucket and are masked out everywhere.
         bucket = tl.where(mask_p, (ids + 1).to(tl.int32), num_experts)
@@ -517,7 +521,8 @@ def per_token_group_quant_fp8(
 # moe_align_block_size (graph-safe: static shapes, device-only reads)
 # ---------------------------------------------------------------------------
 def _moe_align_block_size(
-    topk_ids: torch.Tensor, block_size: int, num_experts: int
+    topk_ids: torch.Tensor, block_size: int, num_experts: int,
+    *, route_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Align routing to block_size multiples (donor: moe_align_block_size).
 
@@ -532,6 +537,13 @@ def _moe_align_block_size(
     import triton
 
     numel = topk_ids.numel()
+    if route_weights is not None:
+        if (numel > SMALL_NUMEL_LIMIT or route_weights.shape != topk_ids.shape
+                or route_weights.device != topk_ids.device
+                or not route_weights.is_floating_point()
+                or not route_weights.is_contiguous()):
+            from ._dispatch import OpNotEligible
+            raise OpNotEligible("zero-route alignment requires <=64 pairs and contiguous same-device floating weights")
     if numel < num_experts + 1:
         max_num_tokens_padded = numel * block_size
     else:
@@ -556,6 +568,8 @@ def _moe_align_block_size(
             numel,
             NP=triton.next_power_of_2(max(numel, 2)),
             NB=triton.next_power_of_2(max(max_num_m_blocks, 2)),
+            route_weights_ptr=flat if route_weights is None else route_weights,
+            SKIP_ZERO=route_weights is not None,
             num_warps=4,
         )
         return sorted_ids, expert_ids, num_tokens_post_pad
@@ -787,6 +801,7 @@ def sgl_fused_moe(
     top_k_weights: torch.Tensor,
     *,
     swiglu_limit: float = math.inf,
+    skip_zero_weights: bool = False,
 ) -> torch.Tensor:
     """Routed-expert MLP in 5 launches: quant -> stage1 -> swiglu -> quant ->
     stage2, then the weighted top-k combine (the package's
@@ -828,13 +843,17 @@ def sgl_fused_moe(
 
     config = try_get_moe_config(E, I, T)
     sorted_token_ids, expert_ids, num_tokens_post_padded = _moe_align_block_size(
-        top_k_index, config["BLOCK_SIZE_M"], E
+        top_k_index, config["BLOCK_SIZE_M"], E,
+        route_weights=top_k_weights if skip_zero_weights else None,
     )
 
     # stage 1: quant once per token (shared across its K experts — the
     # kernel gathers rows via offs_token // top_k), then the gate/up GEMM.
     xq, xs = per_token_group_quant_fp8(x, 128)
-    cache1 = torch.empty((numel, N2), device=x.device, dtype=torch.bfloat16)
+    # Skipped slots are not written by either GEMM. Zero them on EVERY
+    # invocation/replay, not merely warmup: routes can change in a graph.
+    allocate = torch.zeros if skip_zero_weights else torch.empty
+    cache1 = allocate((numel, N2), device=x.device, dtype=torch.bfloat16)
     _invoke_fused_moe_kernel(
         xq, gate_up_proj, cache1, xs, gate_up_scale,
         top_k_weights, top_k_index, sorted_token_ids, expert_ids,
@@ -849,7 +868,7 @@ def sgl_fused_moe(
 
     # stage 2: per-slot activations (top_k == 1 — A rows are the slots).
     aq, asc = per_token_group_quant_fp8(act, 128)
-    cache3 = torch.empty((T, top_k, H), device=x.device, dtype=torch.bfloat16)
+    cache3 = allocate((T, top_k, H), device=x.device, dtype=torch.bfloat16)
     _invoke_fused_moe_kernel(
         aq, down_proj, cache3, asc, down_scale,
         top_k_weights, top_k_index, sorted_token_ids, expert_ids,
