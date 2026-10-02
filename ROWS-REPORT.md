@@ -1274,3 +1274,36 @@ Read-outs so far:
   commit-defer markers (same legs), KEYTRACE logging (132 event-driven lines/serve).
 - The `_DEF` revert was restored; the nopool sbatch variant is
   glm5-tp4-bench-nopool.sbatch on beverin scratch.
+
+**BASELINE CORRECTION (supersedes the T2R-12b table's snapshot labels):**
+
+Job 658539 — the 18.03 B=1 anchor — ran on **run-l6-clone**, NOT run-wZTCex7s.
+The eras: run-wZTCex7s = the PRE-T2R base (_DEF rows1:4/w1:4, no sparse_shape_warm
+in knobs; 13.0 B=1 re-measured today on the same flags); run-l6-clone = the l6-era
+floe + post-T2R vkernels (same _DEF as the merge). Corrected pairing, both
+measured within hours of each other, bare recipes:
+
+- run-l6-clone: **17.9 B=1** (659094, today; 18.03 on 658539's day) / conc-4 31.68
+- run-full-clone: **15.75 B=1** (658752) — **merge delta -11.8% B=1**; conc-4 deltas
+  are day-noise-dominated (31.68 vs 29.9-35.97 across legs) — do not quote -19%.
+
+The earlier "old tree" trace comparison (656984, run-ctrl-clone) is also cross-era;
+its per-launch numbers were profiling-polluted anyway (see above). The merge delta
+surface is SMALL: diff vs run-l6-clone = sparse_runtime.py (rows lane, latched off
+under t1r), forward.py (opt-in soup knobs + dispatch-contextvar fix), dispatch.py,
+knobs.py, NEW glm53flash/knobs.py (registry consolidation) + NEW engine/forward.py
+(the pure-PyTorch port moved to engine/). kvaas-src IDENTICAL (daemon theory dead:
+both trees run the same kvaasd + device_pool=on; pool on/off changes nothing).
+vkernels identical except dsa_resolve_rows.py (off under t1r). All six floe diffs
+are ~inert plumbing — yet the -11.8% reproduces across nodes/days. Next microscope:
+GST per-stage step timing (GLM5_GRAPH_STEP_TIMING), which needed a marker-file
+fallback patch in both snapshots' knobs.py (the step-time env reads hit the EDF
+os.environ-replacement trap; the import-time alias survives but the per-step gates
+don't). Legs 659095 (full-clone) / 659096 (l6-clone) = GST head-to-head.
+
+**Control failure worth remembering:** adding `--gpu-timing` (CUDA events per
+forward) + GST to BOTH trees moved the OLD snapshot's B=1 from 18.03 to **13.0**
+(659092) while the merged tree was unmoved (15.56) — the l6-era serve pays heavily
+for the instrumentation the merged one shrugs off. Never trust cross-flag wall
+comparisons; and today's per-node numbers vary enough that every claim above is a
+same-flag, same-day pairing.
