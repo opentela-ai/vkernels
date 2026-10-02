@@ -19,6 +19,7 @@ autotune-free kernel still compiles on first launch).
 
 from ._dispatch import OpNotEligible
 from functools import lru_cache
+import os
 
 
 @lru_cache(maxsize=1)
@@ -240,7 +241,20 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None):
                 # "dynamic_func() takes 11 positional arguments but 12 were
                 # given" (regression from the fnuz-storage commit d5678ec).
                 extra_fnuz = [False] if torch.version.hip else []
-                kernel[(t * k, triton.cdiv(o, 4))](
+                # Opt-in GH200 down projection geometry. Keep other shapes,
+                # architectures, and gate/up on their validated baseline.
+                rows = 4
+                if (
+                    not torch.version.hip
+                    and os.getenv("VKERNELS_GH200_EXPERT_DOWN_GEOMETRY", "0") == "1"
+                    and (o, i, k) == (4096, 512, 8)
+                    and x.ndim == 3
+                    and t in (1, 4)
+                    and torch.cuda.get_device_capability(x.device) == (9, 0)
+                    and "GH200" in torch.cuda.get_device_name(x.device)
+                ):
+                    rows = 8 if t == 1 else 16
+                kernel[(t * k, triton.cdiv(o, rows))](
                     x,
                     weights.view(torch.uint8),
                     scales,
@@ -250,7 +264,7 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None):
                     i,
                     k,
                     x.ndim == 2,
-                    4,
+                    rows,
                     triton.next_power_of_2(i),
                     *extra_fnuz,
                     num_warps=4,
