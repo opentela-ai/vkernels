@@ -1307,3 +1307,31 @@ forward) + GST to BOTH trees moved the OLD snapshot's B=1 from 18.03 to **13.0**
 for the instrumentation the merged one shrugs off. Never trust cross-flag wall
 comparisons; and today's per-node numbers vary enough that every claim above is a
 same-flag, same-day pairing.
+
+**STALE-MARKER CONFOUND FOUND (T2R-12d):** the universal marker block in the
+sbatch is ctrl-arm-only; t1r legs never rewrite the step-time sparse markers, so
+run-full-clone carried **stale FLOE_SPARSE_BATCH_TELEMETRY=1 +
+HOST_STEP_TABLES=1/DEBUG=1** (from an old diagnostic leg) into EVERY recent
+merged leg, while run-l6-clone's dir held 0s — a systematic recipe inequality
+between the trees that the scrubber-proof `_env_flag` faithfully honored at step
+time. BATCH_TELEMETRY=1 is the *batched-sync* fast path (one reduce+sync for the
+resolver fleet vs 100+ per-resolver `.item()` reads — kineto 656346), so its
+effect direction is unclear; zeroed on run-full-clone (repo + repo-prof) for the
+equalized rerun. HOST_STEP_TABLES has no consumer in the merged model code.
+
+**Instrumentation asymmetry (control failure #2):** GST=1 costs l6-clone ~2.5
+tok/s B=1 (17.9 -> 15.45, 659098) while the merged tree is unmoved (15.56, 659091
+with GPU-timing too). Cross-tree GST/GPU-timing deltas are therefore not
+evidence; only bare same-flag pairings count. The GST per-stage structure at
+matched context bands did show merged dev/step +2-4ms, but given the asymmetry
+that number is suggestive only.
+
+**New anomaly:** the GST=1 merged leg (659099) collapsed within the leg — B=1
+runs degraded 15 -> 6.6 tok/s, conc 11.9 — progressive in-run degradation never
+seen on bare legs. Suspect the per-step CUDA Event churn (prepare_inputs creates
+2 timing events per step under GST) or an accumulating kvaas state; untested.
+
+Equalized bare pair running: 659100 (merged, markers zeroed) / 659101 (l6).
+Verdict rule: merged ~15.7 -> regression real, not markers; merged ~17 ->
+the "merge regression" was the stale markers and T2R-12b bisect conclusions
+need a full re-audit against marker-equalized baselines.
