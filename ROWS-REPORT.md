@@ -1370,3 +1370,25 @@ to 5-6.6 within-leg on GST legs) — exclude it from all comparisons
 merged 14.92 (659105) — the regression is node-controlled, not placement noise.
 Marker-equalized control (659100/659105, BATCH_TELEMETRY zeroed): merged still
 ~15 — the stale-marker confound is real but NOT the regression.
+
+**T2R-12e VERIFIED (659115, nid002698, bare t1r, markers equalized):**
+merged tree + one-line fix = **18.24 B=1 p50 (17.23/18.24/18.28) / 39.53 conc-4**
+vs the same snapshot pre-fix 14.92-15.85 B=1 / 29.9-32.5 conc — **+2.4 tok/s B=1
+(+16%), +9.6 tok/s conc (+32%)** — and now level with run-l6-clone on the same
+node (17.87/36.2, 659106). The double resolve also suppressed conc
+disproportionately (each of 4 concurrent requests re-resolves the full DSA
+fleet). The merge regression chapter closes: no node effect, no kvaas effect,
+no config effect, no capture-path mystery — one leftover line.
+
+**Follow-ups opened:**
+1. Re-run the rows arm (dsa_resolve_rows_fast=true) on the FIXED tree — every
+   rows-lane number to date was measured with the bug (vectorized resolver ran
+   AND the kvaas oracle still resolved), so the true win is unmeasured; the
+   9.1ms/step kineto anatomy that motivated the lane was itself the DOUBLED
+   cost, so the expected steady-state win is roughly half the original estimate.
+2. The source repo (~/Documents/code/floe @ 2d373fe) now carries the corrected
+   rows-lane + T2R-5 prefetch port; snapshot patch scripts that re-apply these
+   hunks should be retired in favor of snapshotting from the source.
+3. Re-audit the T2R-12b bisect table: its per-cell walls were all measured on
+   the buggy tree; relative orderings likely survive but absolute numbers shift
+   ~+2.4 B=1.
