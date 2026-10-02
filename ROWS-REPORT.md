@@ -1335,3 +1335,38 @@ Equalized bare pair running: 659100 (merged, markers zeroed) / 659101 (l6).
 Verdict rule: merged ~15.7 -> regression real, not markers; merged ~17 ->
 the "merge regression" was the stale markers and T2R-12b bisect conclusions
 need a full re-audit against marker-equalized baselines.
+
+**ROOT CAUSE FOUND (T2R-12e): the merge duplicated the kvaas resolve — every
+DSA layer resolves TWICE per decode step in every merged-tree leg.**
+
+The rows-lane hunk in the merged sparse_runtime.py swap_in was added WITHOUT
+consuming the original unconditional resolve it was supposed to replace:
+
+    r = self._resolvers[g]
+    rows = None
+    if self._rows_lane_init():
+        rows = self._resolve_rows_fast(r, self._selected)
+    if rows is None:
+        rows = r.resolve(self._selected)  # [1, width, W]
+    rows = self._resolvers[g].resolve(self._selected)  # [1, width, W]  ← LEFTOVER
+
+so even with the rows lane latched off (t1r), swap_in pays r.resolve(...) AND
+self._resolvers[g].resolve(...) — two identical kvaas resolves per layer per
+step. Trace proof: kin-659091 (merged) shows **715 resolve_rows/window
+(594 replays ≈ 22/step)** vs the pre-merge era's 352/window (~11/step, one per
+DSA layer) — exactly 2x — while every other kernel family's per-step replay
+count is unchanged (moe gate_up/down 42/step both trees; fp8_grouped=True in
+both dispatches; bucket widths identical). resolve_rows was the T2R motivation
+target (829 µs x 11/step under kineto; the doubling adds the same again).
+Fixed by deleting the leftover line in run-full-clone repo + repo-prof;
+verification leg 659115 (bare t1r, markers zeroed, good node). Also note:
+under the ROWS arm the same bug nullified the vectorized resolver (it ran AND
+the kvaas oracle still resolved), so any rows-lane B=1 numbers to date are
+upper bounds on the true win.
+
+Node hygiene: nid002696 systematically degrades B=1 (13.0-13.5 bare, collapses
+to 5-6.6 within-leg on GST legs) — exclude it from all comparisons
+(--exclude=nid002696). Same-node control on nid002674: l6 18.03 (658539) vs
+merged 14.92 (659105) — the regression is node-controlled, not placement noise.
+Marker-equalized control (659100/659105, BATCH_TELEMETRY zeroed): merged still
+~15 — the stale-marker confound is real but NOT the regression.
