@@ -1161,3 +1161,90 @@ Disposition: OPT-IN stays off; the code is correct and ready. The 2.4x
 lands where the memory math works: EP-sharded experts (1/4 the twin
 cost/rank), smaller-IA variants, or evictable/hot-set twins (a
 top-working-set bf16 cache with the fp8 path as the miss handler).
+
+## T2R-12 consolidation — the merged all-in tree WORKS, the 6-knob stack REGRESSES (658566, 2026-10-02)
+
+The consolidation lane: git 3-way (base/l6/rows/soup snapshots) produced
+run-full-clone = l6 all-in + rows wiring (sparse_runtime hand-fused with
+T2R-5 selected_log) + soup caches + dsa_resolve_rows.py in vkernels +
+the 419-line parity test. sbatch gained composable ROWS=1/SOUP=1 flags
+(the RGEMV/KDAFUSE/SGFUSE pattern). All 21 knobs verified True in-serve
+(the knobs dict prints non-None only — it is the delivery oracle that
+caught 658539 silently running bare: RGEMV is env-flag gated, and the
+submission didn't pass it).
+
+Verdict vs the SAME-snapshot bare baseline (658539, t1r arm, no env
+knobs, correctness green):
+
+  B=1 p50:      16.57 vs 18.03 tok/s   (-8%)
+  conc-4 warm:  32.08 vs 39.39 tok/s   (-19%)
+  E2-PREW c4:   24.07 vs 25.84         (-7%)
+  TTFT:         +5-15% on all 4 probes
+  all_paris:    True everywhere; 0 fallbacks; 0 capture-fails
+
+The opt-in knobs LOSE to the free baseline. Context: 658520 -> 658539
+(14.26 -> 18.03 B=1, 23.69 -> 39.39 conc-4) was delivered by the T2R
+kernel-default landings alone (MoE retune default, tiling bounds) — the
+bar the config knobs must now beat, and they don't. Suspects: (a)
+tp_control_stream+commit-defer (tuned on the pre-T2R base), (b) fp32
+soup caches doubling hot-tier rows, (c) fused_kda/SGFUSE double-applying
+over the new defaults. Bisect in flight: 658578 (RGEMV+KDAFUSE+SGFUSE
+only) vs 658579 (ROWS+SOUP only), both on run-full-clone, concurrent.
+
+Two infrastructure findings:
+1. kineto phase-2 dies on the post-T2R snapshot state (2/2: 658539,
+   658566) — "External init callback must run in same thread as
+   registerClient" kills the serve during the traced bench; 658520/658530
+   completed fine. Attribution microscope broken exactly when needed.
+2. run-full-clone needs $SNAP/{repo,kvaas-src,apply_kineto_patch_bev.py}
+   — the kvaas client stages from $SNAP/kvaas-src (else silent fallthrough
+   to the stale EDF kvaas-fix = the ManagedResidencySessionLost ImportError).
+
+## T2R-12b — merge-regression bisect + trace attribution (658578/658579/658752/658759)
+
+**Bisect verdict (either subset alone reproduces the full regression — non-additive, knobs exonerated):**
+
+| leg | tree | knobs | B=1 p50 | conc-4 warm |
+|---|---|---|---|---|
+| 658539 | old (run-wZTCex7s) | bare+t1r | 18.03 | 39.39 |
+| 658566 | merged | all 6 | 16.57 | 32.08 |
+| 658578 | merged | RGEMV+KDAFUSE+SGFUSE | 16.56 | 32.27 |
+| 658579 | merged | ROWS+SOUP | 16.38 | 33.37 |
+| 658752 | merged | **zero** | **15.75** | **29.9** |
+
+The knobs are exonerated (each subset ≈ the full stack, zero-knob worst). **The merge
+base itself costs -12.6% B=1 / -24% conc-4** vs the old bare cell. Knobs only mask it.
+
+**Trace attribution (kineto decode-w1, 656984 old vs 658578 merged; correlation-mapped):**
+
+- Merged **graph replays** (hipGraphLaunch, T=1) run `_moe_gate_up` at **171.7 µs vs
+  44.1 µs** in the old tree — 3.9x, same kernel name, same T=1, 1134 launches/window
+  (+4.6 ms/step). `_moe_down` 84.9 vs 27.0 µs (3.1x, +2.1 ms/step). This is the single
+  biggest clean device-time adder.
+- Merged **eager** launches are healthy per token: 83.4 µs @ T=2, 163.9 @ T=4
+  (~41 µs/token ≈ old 44). The T2R-10 config (rows1 2/warps1 8) is fine eager but
+  catastrophic in the captured replay → the T2R-10 sweep validated the eager microbench
+  only. The 4x replay tax is either (a) the baked config or (b) capture-path memory
+  placement. **DIAG-A leg 658759 discriminates**: merged + `_DEF` reverted to
+  rows1 4/warps1 4/rows2 8/warps2 4.
+- Window composition: ~27 replay steps + 4 eager steps (capture-fail re-decode at
+  T=2/3/4 — the grid[0]=18/27/36 signature). Capture-fail count is equal old vs new
+  (12/serve) → not the differentiator.
+- `aten::linear` → hipBLASLt `Cijk MT128x32x32`: 48 mm/step @ ~70 µs in merged
+  (+2.5 ms/step net vs old Cijk) — the skinny/linear ops are NOT on the custom GEMV
+  fleet in the merged tree (old ran 351 `_gemv_bf16`/step @ 4.8 µs — the router).
+- `_grouped_gemm` appears in merged decode (11.2 launches/step, +2.3 ms/step) — new
+  shared-expert/attention route, absent in old decode.
+- `resolve_rows` calls DOUBLED in the ROWS-off leg (11.7→23.8/step); ROWS=1 recovers
+  the count (12.5/step) but tok/s is unchanged → not the driver.
+- Host syncs HALVED in merged (105/step, 516 ms vs 120/step, 1129 ms) — merged better.
+- rccl wait is node-noise-dominated (509 vs 777 µs/launch between identical-code legs)
+  — conc-4 attribution from single legs is unreliable.
+
+**Kineto tooling fixes (keep):** (1) every chunker since kin_sum2 dropped the
+`else: buf.append(s)` branch → silently empty chunks, all-zero counts; kin_sum2 was the
+only correct one. (2) beverin front-ends are round-robin with a SHARED stale /tmp —
+push+execute must be atomic (scp the script, then run). (3) The correlation→launch-ts→
+cpu_op parent-chain method works (1528/5184 Cijk mapped → 1440 aten::mm ← matmul ←
+linear). (4) Phase-2 death is now 5/5 on merged states but E1-E3 traces DO land before
+the phase-B kill (BrokenPipeError post-734MB-export) — harvestable.
