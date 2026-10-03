@@ -37,9 +37,8 @@ the manual bit-decode on BOTH backends (CUDA has no fnuz dtype), so
 Numerics contract (bit-exactness with the ladder, on a given device):
 weight decode (fp8e4nv bitcast on CUDA / manual bit-decode for fnuz),
 per-element ``value * scale``
-rounded to bf16 then fp32, the fp32 ``tl.sum`` dot (order depends only on
-the reduction-axis length — inherited from ``glm_expert_gemv``/``glm_expert_gemv_fused``
-provenance), the bf16 rounding at every stage boundary, the
+rounded to bf16 then fp32, the fp32 ``tl.sum`` dot (order depends on reduction length and launch
+geometry; defaults match ``glm_expert_gemv``/``glm_expert_gemv_fused``), the bf16 rounding at every stage boundary, the
 ``propagate_nan`` clamp semantics of ``elementwise._swiglu_limit``, and the
 ascending-k fp32 accumulation of ``_weighted_moe_sum_reduce_kernel`` are
 reproduced verbatim; ``enable_fp_fusion=False`` keeps the dots un-FMA'd.
