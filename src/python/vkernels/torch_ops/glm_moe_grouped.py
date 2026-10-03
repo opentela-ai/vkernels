@@ -74,15 +74,11 @@ __all__ = [
     "moe_grouped_decode_eligible",
 ]
 
-# (ROWS, num_warps) per stage; env-overridable JSON {"rows1": .., "warps1": ..,
-# "rows2": .., "warps2": ..} for the microbench sweep. Defaults: the ladder's
-# proven stage-1 geometry (ROWS=4/warps=4 over the gate rows) and a stage-2
-# row-group chosen by the sgs-gpu07 microbench (see RESULTS.md).
-# MI300A sweep (658491, GLM-5.3 TP4 serving shapes E73/IA512/I4096/K8/T1):
-# r1=2/w1=8/r2=4 = 66.2us (760 GB/s) vs the old 75.0us; all configs
-# bit-identical (geometry only). Tops out ~760 GB/s -- the fp8 decode
-# chain is instruction-bound; further gains need decode-chain surgery.
-_DEF = {"rows1": 2, "warps1": 8, "rows2": 4, "warps2": 4}
+# Use the incumbent expert-GEMV reduction geometry. Changing rows/warps
+# can alter the FP32 reduction tree before the BF16 store, including rare
+# cancellation cases. The previous 2-row/8-warp tuning was not bit-exact.
+# Experimental overrides must pass the same component parity gate.
+_DEF = {"rows1": 4, "warps1": 4, "rows2": 4, "warps2": 4}
 
 
 def _cfg() -> dict:
