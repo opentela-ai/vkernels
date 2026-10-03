@@ -23,6 +23,28 @@ def _stable_sigmoid(g: np.ndarray) -> np.ndarray:
     return out
 
 
+def bf16_round(x):
+    """Round float values to the bf16 grid (round-to-nearest-even), the
+    ABI rounding of the fused-decode contract (E1).
+
+    Mirrors CUDA ``__float2bfloat16`` / torch ``.to(torch.bfloat16)``:
+    keep the top 16 bits of the fp32 representation, rounding to nearest
+    with ties-to-even via the standard ``+0x7FFF + lsb`` increment. NaN
+    payloads survive; the result is widened back to the input dtype's
+    float64/float32 numpy type so executor storage stays fp32 (the
+    compiled-pool convention) while VALUES sit exactly on the bf16 grid
+    the device kernel exchanges (``glm_kda_fused_decode``'s documented
+    "raw dot / sigmoid-after-bf16-round" semantics)."""
+    a = np.asarray(x, dtype=np.float32)
+    if a.ndim and not a.flags["C_CONTIGUOUS"]:
+        a = a.copy()  # strided views (executor storage) cannot be .view-ed
+    u = a.view(np.uint32).astype(np.uint64)
+    r = u + np.uint64(0x7FFF) + ((u >> np.uint64(16)) & np.uint64(1))
+    out = (r & np.uint64(0xFFFF0000)).astype(np.uint32).view(np.float32)
+    want = np.asarray(x).dtype
+    return out.astype(want) if want.kind == "f" else out.astype(np.float64)
+
+
 class ExecutorError(Exception):
     """The executed schedule violated an obligation (§12)."""
 

@@ -451,6 +451,80 @@ single-rank oracle) after the all-reduces. The `activation` knob
 (`"swiglu"`/`"situ"`) is threaded into the same per-stage functions the
 single-rank path uses.
 
+## Kernel selection without GPU imports
+
+`vkernels.registry` selects implementations from immutable tensor and runtime
+metadata. Selection and explanations import neither Torch nor Triton. The
+first registered operation is `moe_weighted_sum`:
+
+```python
+from vkernels.registry import KernelRequest, TensorMetadata
+from vkernels.torch_ops.moe_combine_registry import MOE_COMBINE_REGISTRY
+
+request = KernelRequest(
+    operation="moe_weighted_sum",
+    tensors=(
+        TensorMetadata((4, 8, 4096), "bfloat16", "cuda:0"),
+        TensorMetadata((4, 8), "float32", "cuda:0"),
+    ),
+    backends=frozenset({"triton"}),
+    graph_capture=True,
+)
+print(MOE_COMBINE_REGISTRY.explain(request))
+selected = MOE_COMBINE_REGISTRY.select(request, override="triton")
+```
+
+The caller supplies available backends, architecture, graph requirements, and
+available workspace bytes. Selection caches the complete metadata request and
+orders eligible candidates by descending priority, then name. An unsupported
+or unknown override raises `KernelSelectionError`; the explanation includes
+each candidate's rejection reasons. `selected.load()` imports the launcher
+only when execution is needed. Graph support assumes eager compilation and
+warmup for the actual inputs before capture.
+
+Use the public operator for tensor validation and execution:
+
+```python
+from vkernels.torch_ops.moe_combine import moe_weighted_sum, moe_weighted_sum_reference
+
+combined = moe_weighted_sum(activations, weights, implementation="triton")
+oracle = moe_weighted_sum_reference(activations, weights)
+```
+
+The default remains the existing Triton implementation; a provided `result=`
+buffer must match the activation device/dtype and shape `[T,H]`, be contiguous,
+and have a byte range disjoint from both inputs. Disjoint slices of a shared
+workspace are supported; gaps inside strided input bounds count as occupied.
+Automatic selection contract misses raise `OpNotEligible`. An explicit
+`implementation=` override raises `KernelSelectionError` for unknown or
+unavailable implementations and invalid inputs, so catching `OpNotEligible`
+cannot silently replace a pinned implementation. References are excluded from registry selection unless
+`allow_reference=True` is explicitly supplied. The eager oracle preserves
+activation-dtype rounding of weights/products; the Triton kernel accumulates
+in FP32, so BF16/FP16 comparisons require a numerical tolerance.
+
+### Selected-expert FP8 GEMV
+
+`EXPERT_GEMV_REGISTRY` in `vkernels.torch_ops.expert_gemv_registry` selects the
+existing `expert_gemv` implementations. The default uses `cuda_native` for
+E4M3FN on CUDA, and `portable` bit decoding for HIP or E4M3FNUZ storage. Both
+execute the same original kernels; no math or tile configuration changes.
+
+```python
+from vkernels.torch_ops.glm_expert_gemv import expert_gemv
+
+# Explicit portable decoding is useful for cross-backend parity experiments.
+output = expert_gemv(x, weights, scales, indices, implementation="portable")
+```
+
+For offline planning, create a `KernelRequest("expert_gemv", ...)` with tensor
+metadata for `(x, weights, scales, indices)` and `parameters=(("t_cap", 8),)`
+when serving a larger decode bucket. Declare `backends={"triton"}` on HIP or
+`{"triton", "triton_cuda"}` on CUDA (as a `frozenset`). `TensorMetadata` also
+accepts `contiguous=False` to explain a layout rejection. The reference oracle
+is separately registered and supports E4M3FN storage only. Forcing
+`cuda_native` for FNUZ or a non-CUDA backend raises `KernelSelectionError`.
+
 ## Testing
 
 ```sh

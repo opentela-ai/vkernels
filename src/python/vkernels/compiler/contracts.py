@@ -84,6 +84,13 @@ CONTRACTS = MappingProxyType(
         "kda_delta": OperatorContract(
             "kda_delta", "lower_kda_delta", "kda_delta", "task_kda_delta", MappingProxyType({})
         ),
+        "kda_fused_decode": OperatorContract(
+            "kda_fused_decode",
+            "lower_kda_fused_decode",
+            "kda_fused_decode",
+            "task_kda_fused",
+            MappingProxyType({}),
+        ),
         "cache_append_paged": OperatorContract(
             "cache_append_paged",
             "lower_cache_append_paged",

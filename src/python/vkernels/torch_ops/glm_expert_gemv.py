@@ -19,6 +19,10 @@ autotune-free kernel still compiles on first launch).
 
 from ._dispatch import OpNotEligible
 from functools import lru_cache
+from importlib.util import find_spec
+
+from vkernels.registry import KernelRequest, KernelSelectionError, TensorMetadata
+from .expert_gemv_registry import EXPERT_GEMV_REGISTRY
 
 
 @lru_cache(maxsize=1)
@@ -149,7 +153,34 @@ def _kernel():
     return _expert_gemv, _expert_gemv_native
 
 
-def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None):
+@lru_cache(maxsize=1)
+def _available_backends():
+    import torch
+
+    available = {"torch"}
+    if find_spec("triton") is not None:
+        available.add("triton")
+        if not torch.version.hip:
+            available.add("triton_cuda")
+    return frozenset(available)
+
+
+@lru_cache(maxsize=256)
+def _select_implementation(specs, cap, implementation):
+    # Cache only immutable shape/dtype/device descriptors; never retain tensors.
+    # Formatting and registry metadata construction happen once per variant.
+    metadata = tuple(TensorMetadata(shape, str(dtype).removeprefix("torch."), str(device))
+                     for shape, dtype, device in specs)
+    request = KernelRequest("expert_gemv", metadata, backends=_available_backends(), parameters=(("t_cap", cap),))
+    try:
+        return EXPERT_GEMV_REGISTRY.select(request, override=implementation)
+    except KernelSelectionError as exc:
+        if implementation is not None:
+            raise
+        raise OpNotEligible(str(exc)) from exc
+
+
+def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, implementation=None):
     """Return BF16 [T,K,O] for BF16 x[T,I] or x[T,K,I], T <= t_cap.
 
     ``t_cap`` (default 2, the decode-validated limit) is the row cap the
@@ -168,94 +199,79 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None):
     produced by ``e4m3fn_to_fnuz_inplace`` — fnuz bytes with DOUBLED fp32
     scales, sharing the checkpoint's storage. The manual bit-decode handles
     both backends there (CUDA has no fnuz dtype).
+
+    ``implementation="cuda_native"`` or ``"portable"`` pins the registered
+    implementation. An unsupported explicit choice raises KernelSelectionError
+    rather than silently selecting another implementation. Omission preserves
+    the original backend/storage choice. Planning is available independently
+    through ``expert_gemv_registry.EXPERT_GEMV_REGISTRY`` without GPU imports.
     """
     import torch
 
+    contract_error = KernelSelectionError if implementation is not None else OpNotEligible
     if storage not in ("e4m3fn", "e4m3fnuz"):
-        raise OpNotEligible(f"unknown weight storage {storage!r}")
+        raise contract_error(f"unknown weight storage {storage!r}")
     fnuz = storage == "e4m3fnuz"
     want = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
     cap = max(2, int(t_cap)) if t_cap is not None else 2
     if weights.ndim != 3 or indices.ndim != 2:
-        raise OpNotEligible("expected weights [E,O,I] and indices [T,K]")
+        raise contract_error("expected weights [E,O,I] and indices [T,K]")
     e, o, i = weights.shape
     t, k = indices.shape
     if not e or not o or not i or o % 128 or i % 128 or t > cap:
-        raise OpNotEligible(f"requires positive block-128 dimensions and T<={cap}")
+        raise contract_error(f"requires positive block-128 dimensions and T<={cap}")
     if x.shape not in ((t, i), (t, k, i)):
-        raise OpNotEligible("expected x[T,I] or x[T,K,I]")
+        raise contract_error("expected x[T,I] or x[T,K,I]")
     if scales.shape != (e, o // 128, i // 128):
-        raise OpNotEligible("expected scales [E,O/128,I/128]")
+        raise contract_error("expected scales [E,O/128,I/128]")
     if (
         x.dtype != torch.bfloat16
         or weights.dtype != want
         or scales.dtype != torch.float32
         or indices.dtype != torch.int64
     ):
-        raise OpNotEligible(
+        raise contract_error(
             "requires BF16 activations, "
             f"{'E4M3FNUZ' if fnuz else 'E4M3FN'} weights, FP32 scales, int64 indices"
         )
     if any(not v.is_cuda or v.device != weights.device for v in (x, scales, indices)):
-        raise OpNotEligible("inputs must share a GPU device")
+        raise contract_error("inputs must share a GPU device")
     if any(not v.is_contiguous() for v in (x, weights, scales, indices)):
-        raise OpNotEligible("inputs must be contiguous")
+        raise contract_error("inputs must be contiguous")
+    if not (t and k) and implementation is None:
+        return torch.empty((t, k, o), device=x.device, dtype=torch.bfloat16)
+    specs = tuple((tuple(v.shape), v.dtype, v.device) for v in (x, weights, scales, indices))
+    selected = _select_implementation(specs, cap, implementation)
+    return selected.load()(x, weights, scales, indices)
+
+
+def _launch_native(x, weights, scales, indices):
+    return _launch(x, weights, scales, indices, native=True)
+
+
+def _launch_portable(x, weights, scales, indices):
+    return _launch(x, weights, scales, indices, native=False)
+
+
+def _launch(x, weights, scales, indices, *, native):
+    import torch
+
+    _, o, i = weights.shape
+    t, k = indices.shape
     out = torch.empty((t, k, o), device=x.device, dtype=torch.bfloat16)
     if t and k:
         import triton  # lazy: validation above needs only torch
 
         gemv, gemv_native = _kernel()
         with torch.cuda.device(x.device):
-            # Gate on the BACKEND, not is_cuda: HIP tensors report is_cuda,
-            # and gfx942's native fp8 is FNUZ (different bias/NaN encodings
-            # from checkpoint e4m3FN) — it needs the manual bit-decode.
-            # NVIDIA decodes e4m3FN natively: uint8 load + in-kernel bitcast
-            # to float8e4nv (direct fp8-pointer loads are rejected by this
-            # Triton), ~8x faster than the ~10-ALU-ops-per-element decode.
-            # fnuz STORAGE always takes the manual kernel (FNUZ=1): CUDA has
-            # no fnuz dtype to bitcast to, and the doubled-scale convention
-            # is part of the in-place conversion contract (issue #71).
-            if fnuz:
-                gemv[(t * k, triton.cdiv(o, 4))](
-                    x,
-                    weights.view(torch.uint8),
-                    scales,
-                    indices,
-                    out,
-                    o,
-                    i,
-                    k,
-                    x.ndim == 2,
-                    4,
-                    triton.next_power_of_2(i),
-                    True,
-                    num_warps=4,
-                    enable_fp_fusion=False,
-                )
-            else:
-                kernel = gemv if torch.version.hip else gemv_native
-                # _expert_gemv (HIP/fnuz) takes a trailing FNUZ constexpr;
-                # _expert_gemv_native (CUDA) does NOT — binding 12 args
-                # against its 11-param signature raised
-                # "dynamic_func() takes 11 positional arguments but 12 were
-                # given" (regression from the fnuz-storage commit d5678ec).
-                extra_fnuz = [False] if torch.version.hip else []
-                kernel[(t * k, triton.cdiv(o, 4))](
-                    x,
-                    weights.view(torch.uint8),
-                    scales,
-                    indices,
-                    out,
-                    o,
-                    i,
-                    k,
-                    x.ndim == 2,
-                    4,
-                    triton.next_power_of_2(i),
-                    *extra_fnuz,
-                    num_warps=4,
-                    enable_fp_fusion=False,
-                )
+            kernel = gemv_native if native else gemv
+            # Only the portable kernel accepts the storage-format constexpr.
+            extra = [] if native else [weights.dtype == torch.float8_e4m3fnuz]
+            kernel[(t * k, triton.cdiv(o, 4))](
+                x, weights.view(torch.uint8), scales, indices, out,
+                o, i, k, x.ndim == 2, 4, triton.next_power_of_2(i), *extra,
+                num_warps=4, enable_fp_fusion=False,
+            )
     return out
 
 

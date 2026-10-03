@@ -28,6 +28,16 @@ Torch and Triton load lazily. Inputs are read-only; inference-only, no
 autograd backward. Graph capture: warm up eagerly per (O, I) shape first
 (the kernel compiles per (O, I, ROWS) on first launch; the GLM decode
 step has ~15 distinct shapes -> ~15 compilations).
+
+Config resolution runs through the op-config cache
+(:mod:`vkernels.tuning.cache`, ``$VKERNELS_CACHE``): the pins/heuristic
+below remain the declared default, and the first eager call per coarse
+(O, I) bucket sweeps a small candidate space under a bounded budget,
+persisting the winner (or the default, marked as such) to
+``<op>.<arch>.json`` for every later process to replay without
+benchmarking. ``VKERNELS_CACHE=off`` (the tests/conftest default) keeps
+exactly the pinned behavior; during graph capture the resolution is
+memo-or-default only — configs are static at capture by construction.
 """
 
 from ._dispatch import OpNotEligible
@@ -168,6 +178,93 @@ def _kernel():
     return tl, triton, _gemv_bf16, _gemv_bf16_m
 
 
+def _gemv_shape_class(o, i):
+    """Coarse (O, I) tiers — the GEMV analogue of the tree's per-shape
+    gating (decode T<=8 / T<=64 / prefill): occupancy tiers over the grid
+    axis O, reduction tiers over I. NOT exact shapes — one tuned config
+    serves the whole bucket, so a new shape inside a known tier is a
+    store hit, not a sweep."""
+    ot = ("o64" if o <= 64 else "o512" if o <= 512 else
+          "o2k" if o <= 2048 else "o8k" if o <= 8192 else "oX")
+    it = "i512" if i <= 512 else "i2k" if i <= 2048 else "iX"
+    return f"{ot}-{it}"
+
+
+# (O, I) -> (rows, block_i, warps): host-side fast path over the op-config
+# cache. The STORE is keyed by coarse bucket; this memo is keyed by exact
+# shape only to keep the per-launch Python cost at one dict lookup (the
+# tier string is built once per exact shape, on the cache miss).
+_GEMV_CFG: dict = {}
+
+
+def _gemv_default(o, i, triton, torch_mod):
+    """The declared default: today's exact-shape pin, else the heuristic.
+
+    This is what the cache falls back to (off / capture / budget
+    exhaustion / bench failure) — i.e. exactly the pre-cache behavior."""
+    cfg = _CFG.get((o, i))
+    if cfg is not None and torch_mod.version.hip:
+        cfg = _CFG_MI300A.get((o, i), cfg)
+    if cfg is not None:
+        return {"rows": cfg[0], "block_i": cfg[1], "warps": cfg[2]}
+    return {
+        "rows": 4 if (o % 4 == 0 and (o > 2048 or i <= 512)) else 1,
+        "block_i": triton.next_power_of_2(min(i, 4096)),
+        "warps": 8,
+    }
+
+
+def _gemv_candidates(o, default):
+    """Small sweep space around the default; compiles dominate the budget
+    (each (ROWS, BLOCK_I) pair is a distinct Triton build), so the space
+    stays <= 5. The default leads by convention. The store is unmasked on
+    the row axis, so a row group must divide O."""
+    block_i = default["block_i"]
+    out = [dict(default)]
+    for rows in (1, 4, 8):
+        if rows != default["rows"] and o % rows == 0:
+            out.append({"rows": rows, "block_i": block_i, "warps": default["warps"]})
+    for warps in (4, 8):
+        if warps != default["warps"]:
+            out.append({"rows": default["rows"], "block_i": block_i, "warps": warps})
+    return out[:5]
+
+
+def _gemv_cfg(o, i, triton, torch_mod, x, w, kern):
+    """Resolved ``(rows, block_i, warps)`` for this exact shape — cache-first.
+
+    Per-exact-shape host memo over the per-bucket op-config cache: the
+    store (and, on a miss, the bounded sweep — benched at THIS shape) is
+    consulted once per (O, I) per process. During graph capture the
+    resolution is memo-or-default only (never bench, never write).
+    """
+    hit = _GEMV_CFG.get((o, i))
+    if hit is not None:
+        return hit
+    from ..tuning.cache import op_config
+    from triton.testing import do_bench
+
+    default = _gemv_default(o, i, triton, torch_mod)
+
+    def bench(cfg):
+        y = torch_mod.empty(1, o, device=x.device, dtype=torch_mod.bfloat16)
+        grid = ((o + cfg["rows"] - 1) // cfg["rows"],)
+
+        def launch():
+            kern[grid](x.reshape(i), w, y, o, i,
+                       cfg["rows"], cfg["block_i"], num_warps=cfg["warps"])
+
+        return do_bench(launch, return_mode="median")
+
+    cfg, _status = op_config(
+        "glm_gemv.dense_gemv", _gemv_shape_class(o, i),
+        default=default, candidates=_gemv_candidates(o, default),
+        bench=bench, source_files=(__file__,))
+    resolved = (cfg["rows"], cfg["block_i"], cfg["warps"])
+    _GEMV_CFG[(o, i)] = resolved
+    return resolved
+
+
 def dense_gemv(x, w, m_cap=None):
     """Return BF16 [M, O] (or [O] for 1-D x) for x [M, I] and w [O, I].
 
@@ -199,15 +296,7 @@ def dense_gemv(x, w, m_cap=None):
         raise OpNotEligible("empty GEMV")
     tl, triton, kern, kern_m = _kernel()
     if m == 1:
-        cfg = _CFG.get((o, i))
-        if cfg is not None and torch.version.hip:
-            cfg = _CFG_MI300A.get((o, i), cfg)
-        if cfg is not None:
-            rows, block_i, warps = cfg
-        else:
-            rows = 4 if (o % 4 == 0 and (o > 2048 or i <= 512)) else 1
-            block_i = triton.next_power_of_2(min(i, 4096))
-            warps = 8
+        rows, block_i, warps = _gemv_cfg(o, i, triton, torch, x, w, kern)
         y = torch.empty(1, o, device=x.device, dtype=torch.bfloat16)
         with torch.cuda.device(x.device):
             kern[((o + rows - 1) // rows,)](
