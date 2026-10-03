@@ -80,6 +80,12 @@ def test_bit_exact_vs_ladder_production_chain(shape, rows2, monkeypatch):
     """Bit-exact vs expert_gemv + swiglu_limit + expert_gemv + moe_weighted_sum."""
     monkeypatch.setenv("VK_MOE_GROUPED_CFG", f'{{"rows1": 4, "warps1": 4, "rows2": {rows2}, "warps2": 4}}')
     x, w13, s13, w2, s2, idx, w = _case(*shape, seed=shape[0])
+    if rows2 != 4:
+        # These formerly accepted geometries fail bitwise parity on HIP.
+        # Reject dispatch rather than widening the numerical contract.
+        with pytest.raises(OpNotEligible, match="reduction geometry"):
+            moe_grouped_decode(x, w13, s13, w2, s2, idx, w, LIMIT, t_cap=x.shape[0])
+        return
     got = moe_grouped_decode(x, w13, s13, w2, s2, idx, w, LIMIT, t_cap=x.shape[0])
     want = _ladder(x, w13, s13, w2, s2, idx, w, LIMIT, combine="combine")
     assert got.dtype == torch.bfloat16 and got.shape == (shape[0], shape[4])
@@ -305,3 +311,12 @@ def test_eligibility_contract():
     assert not moe_grouped_decode_eligible(cpu_x, cpu_w, cpu_s, cpu_w, cpu_s, cpu_idx, cpu_rw, t_cap=2)
     with pytest.raises(OpNotEligible):
         moe_grouped_decode(cpu_x, cpu_w, cpu_s, cpu_w, cpu_s, cpu_idx, cpu_rw, LIMIT, t_cap=2)
+
+
+@pytest.mark.parametrize("key", ["rows1", "rows2", "warps1", "warps2"])
+def test_noncanonical_geometry_declines(key, monkeypatch):
+    from vkernels.torch_ops.glm_moe_grouped import _cfg
+
+    monkeypatch.setenv("VK_MOE_GROUPED_CFG", f'{{"{key}": 8}}')
+    with pytest.raises(OpNotEligible, match="reduction geometry"):
+        _cfg()

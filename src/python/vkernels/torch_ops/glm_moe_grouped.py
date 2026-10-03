@@ -76,7 +76,7 @@ __all__ = [
 # Use the incumbent expert-GEMV reduction geometry. Changing rows/warps
 # can alter the FP32 reduction tree before the BF16 store, including rare
 # cancellation cases. The previous 2-row/8-warp tuning was not bit-exact.
-# Experimental overrides must pass the same component parity gate.
+# Other launch geometries can change the dot reduction order and decline.
 _DEF = {"rows1": 4, "warps1": 4, "rows2": 4, "warps2": 4}
 
 
@@ -92,6 +92,12 @@ def _cfg() -> dict:
                     out[k] = int(v)
         except (ValueError, TypeError):
             pass
+    if out != _DEF:
+        from ._dispatch import OpNotEligible
+
+        raise OpNotEligible(
+            f"grouped MoE reduction geometry {out} does not match the "
+            f"expert-GEMV parity contract {_DEF}")
     return out
 
 
