@@ -118,8 +118,8 @@ def _kernel():
         ~8x faster: the bit-twiddle path costs ~10 ALU ops per weight element
         and caps the kernel at ~390 GB/s effective on GH200; the
         native-cast path is bandwidth-bound."""
-        selected = tl.program_id(0)
-        row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+        selected = tl.program_id(1)
+        row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
         col = tl.arange(0, COLS)
         expert = tl.load(IDX + selected).to(tl.int64)
         raw = tl.load(
@@ -128,19 +128,19 @@ def _kernel():
             0,
         )
         value = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        # A four-row tile lies entirely inside one 128-row scale block.
-        # Load that block's scale vector once and broadcast it over the rows;
-        # weight/product/reduction rounding and launch geometry stay unchanged.
-        tl.static_assert(128 % ROWS == 0)
+        # compact scale load: [ROWS, COLS//128] gathered once, broadcast over
+        # the 128-wide groups via reshape (the per-element scale gather costs
+        # more bytes than the fp8 weights themselves when uncoalesced).
         scol = tl.arange(0, COLS // 128)
         scale = tl.load(
-            S + (expert * (O // 128) + (tl.program_id(1) * ROWS) // 128) * (I // 128)
-            + scol,
-            scol < I // 128,
+            S
+            + (expert * (O // 128) + row[:, None] // 128) * (I // 128)
+            + scol[None, :],
+            (row[:, None] < O) & (scol[None, :] < I // 128),
             0,
         )
         weight = (
-            (value.reshape(ROWS, COLS // 128, 128) * scale[None, :, None])
+            (value.reshape(ROWS, COLS // 128, 128) * scale[:, :, None])
             .reshape(ROWS, COLS)
             .to(tl.bfloat16)
             .to(tl.float32)
@@ -267,7 +267,9 @@ def _launch(x, weights, scales, indices, *, native):
             kernel = gemv_native if native else gemv
             # Only the portable kernel accepts the storage-format constexpr.
             extra = [] if native else [weights.dtype == torch.float8_e4m3fnuz]
-            kernel[(t * k, triton.cdiv(o, 4))](
+            # Traverse output rows before selected experts on the native path.
+            grid = (triton.cdiv(o, 4), t * k) if native else (t * k, triton.cdiv(o, 4))
+            kernel[grid](
                 x, weights.view(torch.uint8), scales, indices, out,
                 o, i, k, x.ndim == 2, 4, triton.next_power_of_2(i), *extra,
                 num_warps=4, enable_fp_fusion=False,
