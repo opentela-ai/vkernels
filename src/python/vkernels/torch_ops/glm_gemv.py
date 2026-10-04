@@ -119,7 +119,8 @@ def _kernel():
 
     @triton.jit
     def _gemv_bf16(X, W, Y, O: tl.constexpr, I: tl.constexpr,
-                   ROWS: tl.constexpr, BLOCK_I: tl.constexpr):
+                   ROWS: tl.constexpr, BLOCK_I: tl.constexpr,
+                   INDEPENDENT_ROWS: tl.constexpr = False):
         """Y[row] = sum_i W[row, i] * X[i], fp32 accumulation.
 
         One program handles ROWS consecutive output rows and streams the
@@ -127,6 +128,9 @@ def _kernel():
         all-true tail mask (BLOCK_I == I — it otherwise costs ~0.6 us per
         launch on GH200) and the row-bound mask (the wrapper only picks
         ROWS=4 when O % 4 == 0; ROWS=1 has no tail by construction)."""
+        if INDEPENDENT_ROWS:
+            X += tl.program_id(1) * I
+            Y += tl.program_id(1) * O
         row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
         acc = tl.zeros((ROWS,), tl.float32)
         for k0 in range(0, I, BLOCK_I):
@@ -265,7 +269,7 @@ def _gemv_cfg(o, i, triton, torch_mod, x, w, kern):
     return resolved
 
 
-def dense_gemv(x, w, m_cap=None):
+def dense_gemv(x, w, m_cap=None, *, independent_rows=False):
     """Return BF16 [M, O] (or [O] for 1-D x) for x [M, I] and w [O, I].
 
     ``m_cap`` bounds the accepted M (default 1 — the historical decode
@@ -273,6 +277,10 @@ def dense_gemv(x, w, m_cap=None):
     the ``dense_gemv_fp8`` convention). M == 1 rides the pinned single-
     token kernel and config table exactly as before; M in 2..m_cap rides
     the M-batched sibling (the weight tile is read once for all M rows).
+    ``independent_rows=True`` applies the single-row configuration and
+    reduction to every row in a two-dimensional launch, without sharing a
+    reduction layout across batch rows. It favors arithmetic consistency
+    over the weight reuse of the batched sibling.
     Contiguous CUDA BF16 inputs are required; anything else raises
     ``OpNotEligible`` so the caller can fall back to its BLAS path."""
     import torch
@@ -295,12 +303,13 @@ def dense_gemv(x, w, m_cap=None):
     if o <= 0 or i <= 0:
         raise OpNotEligible("empty GEMV")
     tl, triton, kern, kern_m = _kernel()
-    if m == 1:
-        rows, block_i, warps = _gemv_cfg(o, i, triton, torch, x, w, kern)
-        y = torch.empty(1, o, device=x.device, dtype=torch.bfloat16)
+    if m == 1 or independent_rows:
+        rows, block_i, warps = _gemv_cfg(o, i, triton, torch, x.reshape(m, i)[:1], w, kern)
+        y = torch.empty(m, o, device=x.device, dtype=torch.bfloat16)
         with torch.cuda.device(x.device):
-            kern[((o + rows - 1) // rows,)](
-                x.reshape(i), w, y, o, i, rows, block_i,
+            kern[((o + rows - 1) // rows, m)](
+                x.reshape(m, i), w, y, o, i, rows, block_i,
+                INDEPENDENT_ROWS=bool(independent_rows and m > 1),
                 num_warps=warps,
             )
         return y if x.ndim == 2 else y[0]

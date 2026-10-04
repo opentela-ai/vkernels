@@ -29,7 +29,11 @@ def _kernel():
 
     @triton.jit
     def fgate(H, WB, DT, ALOG, OUT, LB, HAS_LB: tl.constexpr,
-              HD: tl.constexpr, BLOCK_O: tl.constexpr):
+              HD: tl.constexpr, BLOCK_O: tl.constexpr, QKV: tl.constexpr,
+              INDEPENDENT_ROWS: tl.constexpr = False):
+        if INDEPENDENT_ROWS:
+            H += tl.program_id(1) * HD
+            OUT += tl.program_id(1) * QKV
         offs = tl.program_id(0) * BLOCK_O + tl.arange(0, BLOCK_O)
         h = tl.load(H + tl.arange(0, HD)).to(tl.float32)
         wb = tl.load(WB + offs[:, None] * HD + tl.arange(0, HD)[None, :]).to(tl.float32)
@@ -48,8 +52,12 @@ def _kernel():
     return fgate
 
 
-def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
-    """Return BF16 [1, S, H, D] log-gates for x [1, S, I].
+def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound, *,
+                independent_rows=False, m_cap=1):
+    """Return BF16 [B, 1, H, D] log-gates for decode x [B, 1, I].
+
+    With ``independent_rows=True``, B may extend to ``m_cap`` while each
+    row retains the single-row GEMV and gate reduction geometry.
 
     ``lower_bound=None`` selects the softplus branch (mirrors the eager
     ``safe_gate_lower_bound is None`` path). Anything outside the fused
@@ -57,8 +65,9 @@ def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
     """
     import torch
 
-    if x.ndim != 3 or x.shape[0] != 1:
-        raise OpNotEligible("forget gate fusion supports one sequence [1, S, I]")
+    cap = max(1, int(m_cap)) if independent_rows else 1
+    if x.ndim != 3 or not 1 <= x.shape[0] <= cap:
+        raise OpNotEligible(f"forget gate fusion supports 1..{cap} decode rows")
     if x.shape[1] != 1:
         raise OpNotEligible("forget gate fusion is decode-only (S == 1); dense_gemv is M == 1")
     if x.dtype != torch.bfloat16 or any(
@@ -81,16 +90,19 @@ def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
     from vkernels.torch_ops.glm_gemv import dense_gemv
 
     with torch.cuda.device(x.device):
-        h = dense_gemv(x.view(1, hidden), fa_weight)  # [1, HD] BF16
-        out = torch.empty(1, qkv_dim, dtype=torch.bfloat16, device=x.device)
+        batch = x.shape[0]
+        h = dense_gemv(x.view(batch, hidden), fa_weight, m_cap=cap,
+                       independent_rows=independent_rows)
+        out = torch.empty(batch, qkv_dim, dtype=torch.bfloat16, device=x.device)
         kern = _kernel()
-        kern[(qkv_dim // 64,)](
+        kern[(qkv_dim // 64, batch)](
             h, fb_weight, dt_bias, a_log, out,
             1.0 if lower_bound is None else float(lower_bound),
-            lower_bound is not None, head_dim, 64,
+            lower_bound is not None, head_dim, 64, qkv_dim,
+            INDEPENDENT_ROWS=bool(independent_rows and batch > 1),
             num_warps=4, enable_fp_fusion=False,
         )
-    return out.view(1, x.shape[1], heads, head_dim)
+    return out.view(batch, 1, heads, head_dim)
 
 
 def forget_gate_reference(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
