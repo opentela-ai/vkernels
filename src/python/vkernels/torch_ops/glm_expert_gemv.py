@@ -267,9 +267,10 @@ def _launch(x, weights, scales, indices, *, native):
             kernel = gemv_native if native else gemv
             # Only the portable kernel accepts the storage-format constexpr.
             extra = [] if native else [weights.dtype == torch.float8_e4m3fnuz]
-            kernel[(t * k, triton.cdiv(o, 4))](
+            tile_rows = 8 if native else 4
+            kernel[(t * k, triton.cdiv(o, tile_rows))](
                 x, weights.view(torch.uint8), scales, indices, out,
-                o, i, k, x.ndim == 2, 4, triton.next_power_of_2(i), *extra,
+                o, i, k, x.ndim == 2, tile_rows, triton.next_power_of_2(i), *extra,
                 num_warps=4, enable_fp_fusion=False,
             )
     return out
