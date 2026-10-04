@@ -128,19 +128,19 @@ def _kernel():
             0,
         )
         value = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        # compact scale load: [ROWS, COLS//128] gathered once, broadcast over
-        # the 128-wide groups via reshape (the per-element scale gather costs
-        # more bytes than the fp8 weights themselves when uncoalesced).
+        # A four-row tile lies entirely inside one 128-row scale block.
+        # Load that block's scale vector once and broadcast it over the rows;
+        # weight/product/reduction rounding and launch geometry stay unchanged.
+        tl.static_assert(128 % ROWS == 0)
         scol = tl.arange(0, COLS // 128)
         scale = tl.load(
-            S
-            + (expert * (O // 128) + row[:, None] // 128) * (I // 128)
-            + scol[None, :],
-            (row[:, None] < O) & (scol[None, :] < I // 128),
+            S + (expert * (O // 128) + (tl.program_id(1) * ROWS) // 128) * (I // 128)
+            + scol,
+            scol < I // 128,
             0,
         )
         weight = (
-            (value.reshape(ROWS, COLS // 128, 128) * scale[:, :, None])
+            (value.reshape(ROWS, COLS // 128, 128) * scale[None, :, None])
             .reshape(ROWS, COLS)
             .to(tl.bfloat16)
             .to(tl.float32)
