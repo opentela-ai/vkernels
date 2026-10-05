@@ -29,7 +29,7 @@ def moe_decode_eligible(x, gate_up_w, gate_up_s, down_w, down_s, indices, routes
         (down_s, 3), (indices, 2), (routes, 2),
     )):
         return False
-    if routes.shape != indices.shape or gate_up_w.shape[1] % 2:
+    if routes.shape != indices.shape or gate_up_w.shape[1] % 2 or gate_up_w.shape[0] == 0:
         return False
     from .glm_moe_grouped import moe_grouped_decode_eligible
 
@@ -79,12 +79,13 @@ def _down_kernel():
 
 def moe_decode(
     x, gate_up_w, gate_up_s, down_w, down_s, indices, routes, swiglu_limit,
-    t_cap=8, *, gate_rows=2, gate_warps=4, down_rows=16, down_warps=4,
+    t_cap=8, *, gate_rows=4, gate_warps=4, down_rows=4, down_warps=4,
 ):
     """Return BF16 [T,H], matching the unfused BF16 route-combine chain.
 
     Geometry is explicit and static; benchmark overrides do not alter global
-    tuning state. Consumers select this backend only after device validation.
+    tuning state. Defaults retain the oracle's four-row/four-warp reduction
+    layout; other geometries require separate strict device validation.
     """
     if not moe_decode_eligible(
         x, gate_up_w, gate_up_s, down_w, down_s, indices, routes, t_cap,
