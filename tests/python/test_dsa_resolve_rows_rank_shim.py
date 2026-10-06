@@ -301,7 +301,6 @@ def test_torch_reference_rank_shim_end_to_end():
     try:
         import torch
     except ImportError:
-        pytest_skip = True  # local box: the pure-python tests above suffice
         import pytest
         pytest.skip("torch not available")
     from vkernels.torch_ops.dsa_resolve_rows import resolve_rows_reference
@@ -323,9 +322,11 @@ def test_torch_reference_rank_shim_end_to_end():
         page_tokens=st["page"])
     for key in ["output", "counters", "errors", "fills", "tags",
                 "tag_generations", "ages", "clock"]:
-        assert torch.equal(ref[key], ref3[key]), key
         if key in ("tags", "tag_generations", "ages", "clock"):
-            assert ref3[key].dim() == ref[key].dim() + 1, key  # rank restored
+            assert ref3[key].shape == (1, *ref[key].shape), key  # rank restored
+            assert torch.equal(ref[key], ref3[key].squeeze(0)), key
+        else:
+            assert torch.equal(ref[key], ref3[key]), key
 
     # scalar clock (uniform across the batch)
     st2 = dict(st)

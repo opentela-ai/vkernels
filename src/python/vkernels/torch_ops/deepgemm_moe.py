@@ -385,8 +385,6 @@ _CONFIG_MEMO: dict = {}
 
 def _warm_stage(weight_shape, device):
     """JIT-compile one masked stage for these shapes (dummy operands)."""
-    import deep_gemm
-
     e, n, k = weight_shape
     a = torch.zeros(e, 1, k, device=device, dtype=_FP8)
     sfa = torch.zeros(e, 1, k // 128, device=device, dtype=torch.float32)

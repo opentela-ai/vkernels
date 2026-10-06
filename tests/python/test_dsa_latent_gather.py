@@ -1,7 +1,7 @@
 """Copy-only gather parity, bit payloads, capture reuse and eligibility."""
 
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 from vkernels.torch_ops._dispatch import OpNotEligible
 from vkernels.torch_ops.dsa_latent_gather import dsa_latent_gather

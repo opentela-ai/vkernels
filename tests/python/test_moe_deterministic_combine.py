@@ -1,6 +1,6 @@
 """Fixed-order GPU combine must match the independent FP32 product oracle."""
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 from vkernels.torch_ops.moe_deterministic_combine import deterministic_route_combine
 
