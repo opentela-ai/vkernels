@@ -11,7 +11,7 @@ reference-vs-semantics cases run everywhere.
 import pytest
 
 
-def test_import_is_lazy():
+def test_import_is_lazy(torch):
     import subprocess
     import sys
 
