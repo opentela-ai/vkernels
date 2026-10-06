@@ -9,7 +9,14 @@ from functools import lru_cache
 from ._dispatch import require, same_gpu_contiguous
 
 # Filled only from independently validated target-device measurements.
-SM90_CONFIGS = {}
+SM90_CONFIGS = {
+    (3, 1536, 4096): (64, 16, 4),
+    (3, 3072, 4096): (128, 16, 4),
+    (3, 4096, 4096): (128, 16, 4),
+    (4, 1536, 4096): (64, 16, 4),
+    (4, 3072, 4096): (128, 16, 4),
+    (4, 4096, 4096): (128, 16, 4),
+}
 
 
 @lru_cache(maxsize=1)
