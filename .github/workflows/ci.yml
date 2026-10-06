@@ -135,6 +135,7 @@ jobs:
             python3 -m pip install --quiet numpy pytest torch triton || \
               python3 -m pip install --quiet --break-system-packages numpy pytest torch triton
             export VKERNELS_LIB="$PWD/build/cuda/src/c/libvkernels_c.so"
+            export PYTHONPATH="$PWD/src/python${PYTHONPATH:+:$PYTHONPATH}"
             python3 -m pytest tests/python -q
           '
 

@@ -92,15 +92,16 @@ def deepgemm_unavailable_reason(device=None) -> Optional[str]:
     else a one-line human reason (logged once by the first eligibility
     miss). Import failure and arch rejection are both reported here —
     never raised from the hot path."""
-    try:
-        import deep_gemm  # noqa: F401
-    except Exception as exc:
-        return f"deep_gemm import failed: {exc!r}"
     if device is None:
         if not torch.cuda.is_available():
             return "no CUDA device"
         device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
+    if major in (9, 10):
+        try:
+            import deep_gemm  # noqa: F401
+        except Exception as exc:
+            return f"deep_gemm import failed: {exc!r}"
     if major == 9:
         return None  # sm90: the donor path (wgmma fp8, fp32 scales)
     if major == 10:
@@ -385,8 +386,6 @@ _CONFIG_MEMO: dict = {}
 
 def _warm_stage(weight_shape, device):
     """JIT-compile one masked stage for these shapes (dummy operands)."""
-    import deep_gemm
-
     e, n, k = weight_shape
     a = torch.zeros(e, 1, k, device=device, dtype=_FP8)
     sfa = torch.zeros(e, 1, k // 128, device=device, dtype=torch.float32)

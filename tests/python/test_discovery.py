@@ -17,7 +17,7 @@ import unittest
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[2]
-_SRC = _REPO / "src"
+_SRC = _REPO / "src" / "python"
 sys.path.insert(0, str(_SRC))
 
 from vkernels import discovery  # noqa: E402
@@ -386,7 +386,7 @@ class DiscoveryTest(unittest.TestCase):
 
 
 def _run_vkl(*args: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PYTHONPATH": str(_SRC)}
+    env = {**os.environ, "PYTHONPATH": str(_SRC) + os.pathsep + os.environ.get("PYTHONPATH", "")}
     return subprocess.run(
         [sys.executable, "-m", "vkernels.cli", *args],
         cwd=_SRC,
