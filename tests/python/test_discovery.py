@@ -386,7 +386,7 @@ class DiscoveryTest(unittest.TestCase):
 
 
 def _run_vkl(*args: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PYTHONPATH": str(_SRC)}
+    env = {**os.environ, "PYTHONPATH": str(_SRC) + os.pathsep + os.environ.get("PYTHONPATH", "")}
     return subprocess.run(
         [sys.executable, "-m", "vkernels.cli", *args],
         cwd=_SRC,
