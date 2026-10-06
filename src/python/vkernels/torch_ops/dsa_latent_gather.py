@@ -59,7 +59,8 @@ def dsa_latent_gather(latent, indices):
     # Checking on the device avoids a request-path host synchronization.
     torch._assert_async((indices < skv).all(), "selected latent row exceeds cache bounds")
     raw_type = language.int32 if latent.element_size() == 4 else language.int16
-    _kernel()[(triton.cdiv(count, 8),)](
-        triton.reinterpret(latent, raw_type), indices, triton.reinterpret(out, raw_type),
-        seq, skv, width, count, dim, triton.next_power_of_2(dim), 8, num_warps=4)
+    with torch.cuda.device(latent.device):
+        _kernel()[(triton.cdiv(count, 8),)](
+            triton.reinterpret(latent, raw_type), indices, triton.reinterpret(out, raw_type),
+            seq, skv, width, count, dim, triton.next_power_of_2(dim), 8, num_warps=4)
     return out

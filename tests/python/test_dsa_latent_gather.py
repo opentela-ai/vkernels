@@ -59,3 +59,16 @@ def test_noncontiguous_declines_and_empty_output():
     with pytest.raises(OpNotEligible, match="contiguous"):
         dsa_latent_gather(latent, idx[:, :2])
     assert dsa_latent_gather(latent, idx[:, :0]).shape == (2, 0, 7, 32)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2 or torch.version.hip is not None, reason="two CUDA devices")
+def test_noncurrent_device_owns_launch_and_restores_caller():
+    previous = torch.cuda.current_device()
+    with torch.cuda.device(0):
+        latent = torch.randn(2, 73, 512, device="cuda:1", dtype=torch.bfloat16)
+        idx = torch.randint(-1, 73, (2, 19, 35), device="cuda:1", dtype=torch.int32)
+        out = dsa_latent_gather(latent, idx)
+        assert out.device == latent.device
+        assert torch.cuda.current_device() == 0
+        assert torch.equal(out.view(torch.uint8), reference(latent, idx).view(torch.uint8))
+    assert torch.cuda.current_device() == previous
