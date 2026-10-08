@@ -1,0 +1,17 @@
+Can we check which branches can be merged in this repo: https://github.com/opentela-ai/vkernels/branches
+
+---
+
+yes, squash-merge them
+
+---
+
+ok delete them
+
+---
+
+we have a bunch of directories in @../, that starts with vkernels-, can we check which we can delete safely?
+
+---
+
+yes
