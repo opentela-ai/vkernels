@@ -1,0 +1,18 @@
+{
+  "source": "Pinned SGLang0.5.20 image; donor-source/manifest.json records Python bindings. Unmodified CUDA source/header dependency closure; Apache-2.0.",
+  "files": {
+    "csrc/distributed/custom_all_reduce.cuh": "c007771de759a02fe6bf064a1a6bc96f98a7a5b1250679db6babd85050b8084a",
+    "csrc/distributed/registry.cuh": "c1fbc95fd2eff534810026c42e85d935629905ba7baa6a6d07ef2d9a29ea5e71",
+    "include/sgl_kernel/distributed/communicator.cuh": "30d5c75e86e86da7ce99cd6eab85212fdbc71f83a8e3c715c4e9f2c6c1d8986f",
+    "include/sgl_kernel/distributed/ptx.cuh": "7ff0b9bcd2a12d1a6e848552b71d3136346a413e6a5350d3253920643a813354",
+    "include/sgl_kernel/ffi.h": "1697906c2a24cb94dec36e3cd0d6ef79e87a5c22967aca926d12f39472942d47",
+    "include/sgl_kernel/runtime.cuh": "dae99a49b116db59355c41a07495c78f9b0287e303316c07a7a63ce685eb5faf",
+    "include/sgl_kernel/tensor.h": "61747de0460e2075dc6bd298212d860b4bb9812645b33b48316b3648d9ec3d40",
+    "include/sgl_kernel/type.cuh": "4c72b0892e8d003490bdab2633056172a674bc6a9689be552861564c7aaf8edc",
+    "include/sgl_kernel/utils.cuh": "d358c786170561de62ed94bf01e7837ca6748dc37fdad089f99464b600d8d8f6",
+    "include/sgl_kernel/utils.h": "68cd3ec640f9ceaf66f46be99b1e025c2a70dde32ea95ce462a1558af78d3515",
+    "include/sgl_kernel/vec.cuh": "ffe4cddb50e84c0adf654bfd28aacdc872dadab3e56e7264a944d7e42c92c44f",
+    "include/sgl_kernel/source_location.h": "300026cbeeabe03b10b0c46b70e2e85b19a743cbe9ff462faa1dff4268cf806e"
+  },
+  "adaptation": "Remove restrict qualifiers from PushParams input/output to permit in-place aliasing; device arithmetic, polling, phases and launch policy unchanged. inplace.cu exposes in-place TP4 SM90 <=64KiB wrappers."
+}
