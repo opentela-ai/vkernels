@@ -1,0 +1,43 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "01M4GZM6CEMJANGS7DHCT9Z5D7",
+  "strategy": "manual-commit",
+  "branch": "perf/gemv-mi300",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "docs/python-bindings.md",
+    "src/python/vkernels/compiler/capture_recurrent.py",
+    "src/python/vkernels/compiler/contracts.py",
+    "src/python/vkernels/compiler/glm53_arch.py",
+    "src/python/vkernels/compiler/lowerings/__init__.py",
+    "src/python/vkernels/compiler/lowerings/recurrent.py",
+    "src/python/vkernels/compiler/model_glm53.py",
+    "src/python/vkernels/compiler/reference_recurrent.py",
+    "src/python/vkernels/compiler/reference_types.py",
+    "src/python/vkernels/compiler/triton_recurrent.py",
+    "src/python/vkernels/torch_ops/elementwise.py",
+    "src/python/vkernels/torch_ops/glm_expert_gemv.py",
+    "src/python/vkernels/torch_ops/glm_gemv.py",
+    "src/python/vkernels/torch_ops/glm_kda_decode.py",
+    "src/python/vkernels/torch_ops/glm_router.py",
+    "src/python/vkernels/torch_ops/moe_combine.py",
+    "tests/python/conftest.py",
+    "tests/python/test_tuning_cache.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 1
+  }
+}
