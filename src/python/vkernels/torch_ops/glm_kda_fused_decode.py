@@ -17,7 +17,7 @@ delta-rule state update over shared-memory-staged [32, 128] state chunks
 (cp.async double-buffer, or 1D-TMA + mbarrier staging when the slot pitch is
 16B-aligned) -> sigmoid-gated RMSNorm tail.
 
-DEVIATIONS FROM THE DONOR (mechanical, none in the math):
+DEVIATIONS FROM THE DONOR (default math unchanged):
 - no sgl_kernel/tvm-ffi stack: the CUDA source is embedded, compiled once
   with the local nvcc (donor flags: ``-O3 --use_fast_math``) into a cached
   .so under the user cache dir, and called through a plain ``extern "C"``
@@ -37,6 +37,8 @@ DEVIATIONS FROM THE DONOR (mechanical, none in the math):
   requires 16B-aligned — a pitch not divisible by 4 fp32 elements is silent
   UB in the donor; rejected here instead. Every real pool satisfies it
   (dense pitch HV*V*K, or multi-layer envelope pitches);
+- Optional ``preserve_bf16_chain`` retains Floe intermediate BF16 rounds
+  without materializing their tensors (separate JIT cache entry).
 - PDL opt-in via ``use_pdl`` (sm_90+ PTX griddepcontrol, launch attribute
   set; no-op semantics otherwise). The kernel arg list moved into the
   launcher; the kernel body itself is verbatim.
@@ -158,7 +160,27 @@ _CUDA_SOURCE = r"""
 
 using bf16_t = __nv_bfloat16;
 
+#ifndef VKDA_PRESERVE_BF16_CHAIN
+#define VKDA_PRESERVE_BF16_CHAIN 0
+#endif
+
 namespace vkda {
+
+// Optional serving-chain rounds. The default preserves donor arithmetic.
+__device__ __forceinline__ float chain_round(float value) {
+#if VKDA_PRESERVE_BF16_CHAIN
+  return __bfloat162float(__float2bfloat16_rn(value));
+#else
+  return value;
+#endif
+}
+__device__ __forceinline__ float conv_product(float value, float weight) {
+  return chain_round(value * weight);
+}
+__device__ __forceinline__ float conv_activation(float value) {
+  value = chain_round(value);
+  return chain_round(value * (1.0f / (1.0f + __expf(-value))));
+}
 
 // ---- local shims for sgl_kernel/math.cuh / warp.cuh / utils.cuh ---------
 namespace device {
@@ -693,8 +715,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       for (int w = 0; w < kConvStateWidth; ++w) {
         const __nv_bfloat16 q_state = cs_q[cs_base + w * cs_w_stride];
         const __nv_bfloat16 k_state = cs_k[cs_base + w * cs_w_stride];
-        q_acc += __bfloat162float(q_state) * fp32_at(w_q_t, w * hkv_dim + hk);
-        k_acc += __bfloat162float(k_state) * fp32_at(w_k_t, w * hkv_dim + hk);
+        q_acc += conv_product(__bfloat162float(q_state), fp32_at(w_q_t, w * hkv_dim + hk));
+        k_acc += conv_product(__bfloat162float(k_state), fp32_at(w_k_t, w * hkv_dim + hk));
         if (w == 1) {
           q_shift0 = q_state;
           k_shift0 = k_state;
@@ -705,8 +727,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       }
       const __nv_bfloat16 q_new = x_q[xq_idx];
       const __nv_bfloat16 k_new = x_k[xq_idx];
-      q_acc += __bfloat162float(q_new) * fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
-      k_acc += __bfloat162float(k_new) * fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
+      q_acc += conv_product(__bfloat162float(q_new), fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk));
+      k_acc += conv_product(__bfloat162float(k_new), fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk));
 
       cs_q[cs_base + 0] = q_shift0;
       cs_q[cs_base + cs_w_stride] = q_shift1;
@@ -715,8 +737,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       cs_k[cs_base + cs_w_stride] = k_shift1;
       cs_k[cs_base + 2 * cs_w_stride] = k_new;
 
-      s_q[k] = device::math::silu_fast(q_acc);
-      s_k[k] = device::math::silu_fast(k_acc);
+      s_q[k] = conv_activation(q_acc);
+      s_k[k] = conv_activation(k_acc);
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
@@ -736,14 +758,14 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 #pragma unroll
       for (int w = 0; w < kConvStateWidth; ++w) {
         const int64_t cs_idx = slot * cs_slot_stride + hk + w * cs_w_stride;
-        q_acc += bf16_load(cs_q, cs_idx) * fp32_at(w_q_t, w * hkv_dim + hk);
-        k_acc += bf16_load(cs_k, cs_idx) * fp32_at(w_k_t, w * hkv_dim + hk);
+        q_acc += conv_product(bf16_load(cs_q, cs_idx), fp32_at(w_q_t, w * hkv_dim + hk));
+        k_acc += conv_product(bf16_load(cs_k, cs_idx), fp32_at(w_k_t, w * hkv_dim + hk));
       }
-      q_acc += bf16_load(x_q, bos * x_row_stride + hk) * fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
-      k_acc += bf16_load(x_k, bos * x_row_stride + hk) * fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
+      q_acc += conv_product(bf16_load(x_q, bos * x_row_stride + hk), fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk));
+      k_acc += conv_product(bf16_load(x_k, bos * x_row_stride + hk), fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk));
 
-      s_q[k] = device::math::silu_fast(q_acc);
-      s_k[k] = device::math::silu_fast(k_acc);
+      s_q[k] = conv_activation(q_acc);
+      s_k[k] = conv_activation(k_acc);
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
@@ -767,7 +789,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 #pragma unroll
       for (int w = 0; w < kConvStateWidth; ++w) {
         const __nv_bfloat16 v_state = cs_v[cs_base + w * cs_w_stride];
-        v_acc += __bfloat162float(v_state) * fp32_at(w_v_t, w * hvv_dim + hvv);
+        v_acc += conv_product(__bfloat162float(v_state), fp32_at(w_v_t, w * hvv_dim + hvv));
         if (w == 1) {
           v_shift0 = v_state;
         } else if (w == 2) {
@@ -775,11 +797,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
         }
       }
       const __nv_bfloat16 v_new = x_v[xv_idx];
-      v_acc += __bfloat162float(v_new) * fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
+      v_acc += conv_product(__bfloat162float(v_new), fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv));
       cs_v[cs_base + 0] = v_shift0;
       cs_v[cs_base + cs_w_stride] = v_shift1;
       cs_v[cs_base + 2 * cs_w_stride] = v_new;
-      s_v[v] = device::math::silu_fast(v_acc);
+      s_v[v] = conv_activation(v_acc);
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
@@ -796,10 +818,10 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 #pragma unroll
       for (int w = 0; w < kConvStateWidth; ++w) {
         const int64_t cs_idx = slot * cs_slot_stride + hvv + w * cs_w_stride;
-        v_acc += bf16_load(cs_v, cs_idx) * fp32_at(w_v_t, w * hvv_dim + hvv);
+        v_acc += conv_product(bf16_load(cs_v, cs_idx), fp32_at(w_v_t, w * hvv_dim + hvv));
       }
-      v_acc += bf16_load(x_v, bos * x_row_stride + hvv) * fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
-      s_v[v] = device::math::silu_fast(v_acc);
+      v_acc += conv_product(bf16_load(x_v, bos * x_row_stride + hvv), fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv));
+      s_v[v] = conv_activation(v_acc);
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
@@ -932,10 +954,10 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
       const Sum2 dot_hq = warp_reduce_sum_pair(dot_hq_a, dot_hq_b);
       if (lane == 0) {
-        s_o[v0] = dot_hq.x;
-        s_o[v1] = dot_hq.y;
+        s_o[v0] = chain_round(dot_hq.x);
+        s_o[v1] = chain_round(dot_hq.y);
         if constexpr (kApplyOnorm && kAccumulateOnormSumsq) {
-          o_sumsq += dot_hq.x * dot_hq.x + dot_hq.y * dot_hq.y;
+          o_sumsq += s_o[v0] * s_o[v0] + s_o[v1] * s_o[v1];
         }
       }
     }
@@ -1255,15 +1277,16 @@ def _arch_flag(device) -> str:
     return f"sm_{major}{minor}"
 
 
-def _compile_or_load(device) -> ctypes.CDLL:
+def _compile_or_load(device, preserve_bf16_chain=False) -> ctypes.CDLL:
     """Compile (once, cached) and dlopen the fused-decode .so."""
     nvcc = _find_nvcc()
     if nvcc is None:
         raise OpNotEligible("nvcc not found (need CUDA toolkit to JIT glm_kda_fused_decode)")
     arch = _arch_flag(device)
     ver = subprocess.run([nvcc, "--version"], capture_output=True, text=True).stdout
+    flags = [*_NVCC_FLAGS, f"-DVKDA_PRESERVE_BF16_CHAIN={int(bool(preserve_bf16_chain))}"]
     tag = hashlib.sha256(
-        (_CUDA_SOURCE + ver + arch + " ".join(_NVCC_FLAGS)).encode()
+        (_CUDA_SOURCE + ver + arch + " ".join(flags)).encode()
     ).hexdigest()[:16]
     cache_dir = os.path.join(
         os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
@@ -1278,7 +1301,7 @@ def _compile_or_load(device) -> ctypes.CDLL:
                 f.write(_CUDA_SOURCE)
             obj = os.path.join(tmp, "kda_fused_decode.so")
             cmd = [
-                nvcc, *_NVCC_FLAGS, "-std=c++17", "--shared", "-Xcompiler", "-fPIC",
+                nvcc, *flags, "-std=c++17", "--shared", "-Xcompiler", "-fPIC",
                 f"-arch={arch}", "-DNDEBUG", src, "-o", obj,
             ]
             proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -1304,11 +1327,11 @@ def _compile_or_load(device) -> ctypes.CDLL:
     return lib
 
 
-@lru_cache(maxsize=4)
-def _lib_for(device_index: int):
+@lru_cache(maxsize=8)
+def _lib_for(device_index: int, preserve_bf16_chain=False):
     import torch
 
-    return _compile_or_load(torch.device("cuda", device_index))
+    return _compile_or_load(torch.device("cuda", device_index), preserve_bf16_chain)
 
 
 def _validate(
@@ -1448,7 +1471,7 @@ def glm_kda_fused_decode_eligible(
 def glm_kda_fused_decode(
     mixed_qkv, a, b, conv_states, w_q_t, w_k_t, w_v_t, conv_bias, A_log,
     dt_bias, onorm_g, onorm_weight, state, cache_indices, scale, onorm_eps,
-    lower_bound=None, out=None, use_pdl=False,
+    lower_bound=None, out=None, use_pdl=False, preserve_bf16_chain=False,
 ):
     """One-launch fused KDA decode step: conv update (pool shifted in place)
     + delta-rule state update (pool updated in place) + gated RMSNorm.
@@ -1461,6 +1484,11 @@ def glm_kda_fused_decode(
     ``-1`` cache indices are padded graph slots (output zeroed, both pools
     untouched). Raises :class:`~vkernels.torch_ops._dispatch.OpNotEligible`
     outside the contract so the caller falls back to the unfused chain.
+
+    ``preserve_bf16_chain`` retains the serving chain's per-tap product,
+    conv sum/activation and recurrence-output rounds inside the fused
+    launch. Its separate compiled cache entry keeps the default donor
+    arithmetic unchanged. Full-model quality must qualify either mode.
     """
     import torch
 
@@ -1475,7 +1503,7 @@ def glm_kda_fused_decode(
     )
     if b_sz == 0:
         return out.view(1, 0, hv, _V)
-    lib = _lib_for(mixed_qkv.device.index or 0)
+    lib = _lib_for(mixed_qkv.device.index or 0, preserve_bf16_chain)
     stream = torch.cuda.current_stream(mixed_qkv.device).cuda_stream
     rc = lib.vkda_fused_decode_run(
         mixed_qkv.data_ptr(), a.data_ptr(), b.data_ptr(), conv_states.data_ptr(),
@@ -1500,7 +1528,7 @@ def glm_kda_fused_decode(
 def glm_kda_fused_decode_reference(
     mixed_qkv, a, b, conv_states, w_q_t, w_k_t, w_v_t, conv_bias, A_log,
     dt_bias, onorm_g, onorm_weight, state, cache_indices, scale, onorm_eps,
-    lower_bound=None,
+    lower_bound=None, preserve_bf16_chain=False,
 ):
     """Eager fp32 torch oracle (the kernel's exact op order, CPU/GPU).
 
@@ -1536,9 +1564,15 @@ def glm_kda_fused_decode_reference(
         # --- conv update (one token): bias + w0*s0 + w1*s1 + w2*s2 + w3*x ---
         cs = next_conv[sidx]  # [3, 3*seg] bf16
         window = torch.cat([cs.float(), mq[n].unsqueeze(0)], 0)  # [4, 3*seg]
-        acc = bias_all + window[0] * w_all[0] + window[1] * w_all[1] \
-            + window[2] * w_all[2] + window[3] * w_all[3]
-        y = acc * torch.sigmoid(acc)  # SiLU, fp32, never rounded to bf16
+        products = window * w_all
+        if preserve_bf16_chain:
+            products = products.bfloat16().float()
+        acc = bias_all + products[0] + products[1] + products[2] + products[3]
+        if preserve_bf16_chain:
+            acc = acc.bfloat16().float()
+        y = acc * torch.sigmoid(acc)
+        if preserve_bf16_chain:
+            y = y.bfloat16().float()
         # state shift: [old w1, old w2, new raw x] — pure bf16 moves
         next_conv[sidx] = torch.cat([cs[1:3], mixed_qkv[n].unsqueeze(0)], 0)
 
@@ -1564,6 +1598,8 @@ def glm_kda_fused_decode_reference(
             s = s + delta[:, None] * k[None, :]
             next_state[sidx, j] = s
             o = (s * q[None, :]).sum(dim=1)
+            if preserve_bf16_chain:
+                o = o.bfloat16().float()
             rstd = torch.rsqrt((o * o).mean() + onorm_eps)
             y_o = o * rstd * ow * torch.sigmoid(og[n, j])
             out[n, j] = y_o.to(torch.bfloat16)
