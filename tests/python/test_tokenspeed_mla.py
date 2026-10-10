@@ -196,17 +196,16 @@ def test_prefill_matches_torch_reference_on_gpu():
     want = torch.empty_like(out, dtype=torch.float32)
     start = 0
     for (q_len, kv_len) in seqs:
-        qs = q[start:start + q_len].float()[:, 0]        # [q, 128]
+        qs = q[start:start + q_len].float()             # [q, heads, 128]
         ks = k[start:start + kv_len].float()[:, 0]       # [kv, 128]
         vs = v[start:start + kv_len].float()[:, 0]       # [kv, 96]
-        logits = qs @ ks.T * scale
+        logits = torch.einsum("qhd,kd->hqk", qs, ks) * scale
         pos_q = torch.arange(kv_len - q_len, kv_len, device="cuda")
         pos_k = torch.arange(kv_len, device="cuda")
         mask = pos_q[:, None] >= pos_k[None, :]
-        logits = logits.masked_fill(~mask, float("-inf"))
+        logits = logits.masked_fill(~mask[None], float("-inf"))
         probs = torch.softmax(logits, dim=-1)
-        want[start:start + q_len, 0] = probs @ vs
-        # head 1 shares K/V (MQA): replicate
-        want[start:start + q_len, 1] = want[start:start + q_len, 0]
+        # MQA shares K/V, while each query head has its own attention scores.
+        want[start:start + q_len] = torch.einsum("hqk,kd->qhd", probs, vs)
         start += q_len
     torch.testing.assert_close(out.float(), want.to(out.dtype).float(), rtol=2e-2, atol=2e-2)

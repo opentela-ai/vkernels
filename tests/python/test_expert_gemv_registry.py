@@ -63,7 +63,9 @@ from vkernels.torch_ops.glm_expert_gemv import expert_gemv
 assert not {'torch', 'triton'}.intersection(sys.modules)
 """
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[2] / "src/python"))
-    subprocess.run([sys.executable, "-c", script], check=True, env=env, capture_output=True, text=True)
+    # Disable installed editable finders so this offline probe imports the
+    # checkout named by PYTHONPATH, even inside another serving worktree's venv.
+    subprocess.run([sys.executable, "-S", "-c", script], check=True, env=env, capture_output=True, text=True)
 
 
 @pytest.mark.parametrize("invalid,reason", [

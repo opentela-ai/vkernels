@@ -38,7 +38,7 @@ assert MOE_COMBINE_REGISTRY.select(request).name == 'triton'
 assert not {'torch', 'triton'}.intersection(sys.modules)
 '''
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[2] / "src/python"))
-    subprocess.run([sys.executable, "-c", script], env=env, check=True, capture_output=True, text=True)
+    subprocess.run([sys.executable, "-S", "-c", script], env=env, check=True, capture_output=True, text=True)
 
 
 def test_cache_and_explicit_override():
