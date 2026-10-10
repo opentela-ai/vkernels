@@ -129,27 +129,82 @@ CDNA4 scale swizzle on a GPT-OSS-120B-sized scale tensor
 (368 640 × 90 = 33 MB): **942 µs** — one-time load cost, not on the
 serving path.
 
+## Follow-ups executed (round 2, same day)
+
+### gfx942 launch-table tuning (`sweep-gfx942.json`)
+
+Swept the MI355X-tuned launch tables on MI300A (script
+`bench/sweep_tokenspeed_amd_gfx942.py`, job 675500):
+
+- **routing**: `NUM_WARPS=8` is best or tied-best at every supported M
+  (33–39 µs vs 34–243 µs across upstream's `min(next_pow2(M),4)` picks).
+  Landed as a capability-gated local override in `routing.py` — the
+  re-bench (`results-triton38-v3.json`) is flat 51–55 µs across all shapes
+  (the 106–108 µs outliers are gone), 2.5–2.7× over the torch chain.
+- **argmax**: `_select_config_gfx942` override — plain (non-split)
+  16384-wide at M ≤ 64 (46 µs vs 51+ for every split variant at
+  M=64/N=152k), split-fixed 8192/16 at M ≤ 4 large-N, split 16384 at
+  M ≤ 32. Re-bench: M=1/N=32k halved (101→47 µs), M=8/N=262k 2× over
+  torch (58 vs 95 µs).
+
+### mHC full chain vs aiter (`mhc_pre_full_chain` in v3)
+
+Ported the producer (split-K prenorm GEMM, plain Triton —
+`tokenspeed_amd/mhc_gemm.py`, parity-tested) so the gluon mHC is
+end-to-end usable; `gluon_mhc_pre()` mirrors `aiter_mhc_pre`'s contract.
+Verdict on MI300A: **aiter's fused `mhc_pre` wins** — 66–69 µs vs the gluon
+chain's 114–115 µs (producer ≈ 70 µs + reduce ≈ 44 µs). Keep aiter for mHC
+on gfx942; the gluon chain is the fallback where aiter is absent.
+
+### Full python suite on beverin under triton 3.8 (job 675497)
+
+**1452 passed / 35 failed / 134 skipped / 4 errors** (12 min) — the
+container's working triton driver beats the CPU dev box (434 failures
+there). Failure triage: 11 `test_discovery` (known subprocess/CLI env
+issue), 5 `test_megakernel_triton`, and ~19 across glm_kda/glm_moe/
+kda_gemv/v41_fp8/sgl_sparse (CUDA-extension kernels — no built `.so` in the
+container, expected), plus **one real finding**: `tokenspeed_mla`
+prefill GPU parity diverges on MI300A (42% element mismatch at 2e-2 —
+first hardware run of that port; bare `tl.dot` bf16 path suspect). Marked
+hip-conditional xfail in the test with this artifact as reference; fix is
+tracked as a follow-up.
+
+### Bucket 2 opened: `kda_decode.py` vendored (compile-smoke on gfx942)
+
+Key unlock: stock triton 3.8 ships `gluon.language.amd.cdna3` (buffer
+ops + mfma). `kda/decode.py` (1562 lines, only buffer_load/store as
+arch-specific) vendored with a cdna3-first binding; GPU smoke test pins
+the launch contract. Full parity vs `glm_kda_fused_decode_reference`
+(low-rank decay-gate input conversion) is the tracked bucket-2 follow-up,
+along with `dsa/sparse_mla` (buffer_load only). See the borrowing-plan doc
+for the full density scan.
+
 ## Artifacts
 
-- `results-triton38.json` — full run, all sections error-free (job 675351)
-- `results-triton38-partial.json` — earlier triton-3.8 run before the
-  parity-reference fixes (kept for provenance)
-- `results-stock-triton34.json` — stock env: only pure-torch + argmax-torch
-  baselines measurable; every gluon kernel feature-blocked on triton 3.4
-- Repro: staging `bench-bucket1.sbatch` (stock) / `bench-bucket1-t38.sbatch`
-  (triton-3.8 scratch install), bench script
-  `bench/bench_tokenspeed_amd_bucket1.py` in-tree.
+- `results-triton38.json` — first full run (job 675351)
+- `results-triton38-v3.json` — post-tuning run incl. mhc chain (job 675506)
+- `sweep-gfx942.json` — routing/argmax config sweeps (job 675500)
+- `results-triton38-partial.json` — pre-fix triton-3.8 run (provenance)
+- `results-stock-triton34.json` — stock env: gluon kernels feature-blocked
+- `infra-request-triton38.md` — ready-to-send CSCS request (user to send)
+- Repro: `bench/bench_tokenspeed_amd_bucket1.py`,
+  `bench/sweep_tokenspeed_amd_gfx942.py` in-tree; sbatch scripts in the
+  beverin staging dir (`bench-bucket1*.sbatch`, `tune-t38.sbatch`,
+  `full-suite-t38.sbatch`).
 
-## Follow-ups
+## Follow-ups (remaining)
 
-- The triton-3.8 scratch install is a benchmark leg, not a serving change;
-  getting these into production needs the container env bumped (or the
-  scratch wheel blessed by infra).
-- Routing `NUM_WARPS` tuning for gfx942 (the M=1/E=384 and M=16 shapes are
-  2× off the best config) — small tuning table, upstream tuned MI355X.
+- **Send `infra-request-triton38.md`** to CSCS — everything gluon is gated
+  on it reaching a production env.
+- Triton-MLA prefill numerics on gfx942 (the xfail above): try
+  `input_precision="ieee"` on the bare bf16 `tl.dot`s and M-tiling ≥ 16.
+- KDA fused-decode parity vs `glm_kda_fused_decode_reference` (input
+  conversion), then bench vs our CUDA/vllm KDA decode paths; then
+  `dsa/sparse_mla`.
+- The `_CDNA4_NUM_CUS = 256` persistent-grid sizing in `kda_decode.py`
+  (MI300A has 228 CUs) — retune when profiling that kernel.
 - Sorting stays behind aiter on gfx942 except huge-prefill shapes; the
   packed-id + weights contract differs from aiter's, so a consumer switch
   is not drop-in.
-- Buckets 2/3 of the borrowing plan (CDNA3 attention ports; MI350 day-0
-  mxfp4 MoE + dense MLA/DSA/KDA Gluon set) per
+- Buckets 2/3 of the borrowing plan continue per
   `docs/borrowing-tokenspeed-deepgemm.md`.

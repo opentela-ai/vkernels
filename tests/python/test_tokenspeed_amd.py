@@ -605,6 +605,133 @@ def test_gpu_n16_shuffle_cpu_gpu_agree():
 
 
 @pytest.mark.gpu
+def test_gpu_kda_fused_decode_smoke():
+    """Compile/launch smoke for the vendored KDA fused decode on gfx942.
+
+    The kernel is the bucket-2 first target (cdna3 buffer-op binding).
+    Full parity against ``glm_kda_fused_decode_reference`` needs the
+    low-rank decay-gate input conversion (``a = f_a_out @ f_b_weight.T``
+    rounded to bf16) — tracked as the bucket-2 follow-up; this test pins
+    the launch contract and sane outputs meanwhile.
+    """
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import kda_decode as ts_kda
+
+    torch.manual_seed(12)
+    batch, heads, dim = 4, 12, 128  # kernel hard-specializes K3: 12 heads x 128
+    state_pages = 8
+    mixed_qkv = torch.randn(batch, 3 * heads * dim, device="cuda", dtype=torch.bfloat16)
+    conv_weights = torch.randn(3 * heads * dim, 4, device="cuda", dtype=torch.bfloat16) * 0.2
+    conv_states = torch.randn(
+        state_pages, 3 * heads * dim, 3, device="cuda", dtype=torch.bfloat16
+    )
+    f_a_out = torch.randn(batch, dim, device="cuda", dtype=torch.bfloat16)
+    f_b_weight = torch.randn(
+        heads * dim, dim, device="cuda", dtype=torch.bfloat16
+    ) * 0.05
+    beta_logits = torch.randn(batch, heads, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.randn(heads, device="cuda", dtype=torch.float32)
+    dt_bias = torch.randn(heads * dim, device="cuda", dtype=torch.float32) * 0.1
+    output_gate = torch.randn(batch, heads * dim, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    state_pool = torch.randn(
+        state_pages, heads, dim, dim, device="cuda", dtype=torch.float32
+    ) * 0.05
+    before = state_pool.clone()
+    read_indices = torch.arange(batch, dtype=torch.int32, device="cuda")
+    write_indices = torch.arange(batch, dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.arange(
+        0, batch + 1, dtype=torch.int32, device="cuda"
+    )
+    out = ts_kda.gluon_kda_fused_decode_gfx950(
+        mixed_qkv, conv_weights, conv_states, f_a_out, f_b_weight,
+        beta_logits, a_log, dt_bias, output_gate, norm_weight, 1e-5,
+        state_pool=state_pool, read_indices=read_indices,
+        write_indices=write_indices, num_heads=heads, head_dim=dim,
+        cu_seqlens=cu_seqlens, lower_bound=None,
+    )
+    assert out.shape == (1, batch, heads, dim)
+    assert torch.isfinite(out.float()).all()
+    # state rows written by batch slots changed; untouched pages did not
+    changed = (state_pool != before).any(dim=(1, 2, 3))
+    assert bool(changed[:batch].any())
+    assert not bool(changed[batch:].any())
+    assert torch.isfinite(state_pool).all()
+
+
+@pytest.mark.gpu
+def test_gpu_mhc_prenorm_gemm_matches_reference():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import mhc_gemm as ts_mhc_gemm
+
+    torch.manual_seed(10)
+    for tokens, hidden in ((8, 4096), (64, 4096), (3, 7168)):
+        hc, splits = 4, hidden * 4 // 64
+        x = torch.randn(tokens, hc * hidden, device="cuda", dtype=torch.bfloat16)
+        fn = torch.randn(24, hc * hidden, device="cuda", dtype=torch.float32)
+        out_mul = torch.empty(splits, tokens, 24, device="cuda")
+        out_sqrsum = torch.empty(splits, tokens, device="cuda")
+        ts_mhc_gemm.mhc_prenorm_gemm(x, fn, out_mul, out_sqrsum, splits)
+        ref = x.float() @ fn.T
+        assert torch.allclose(out_mul.sum(0), ref, atol=2e-2 * hidden, rtol=1e-3), (
+            tokens,
+            hidden,
+        )
+        assert torch.allclose(
+            out_sqrsum.sum(0), (x.float() ** 2).sum(-1), atol=2.0, rtol=1e-3
+        ), (tokens, hidden)
+        # per-split partials must sum to the reference (split coverage exact)
+        k_per_split = (hc * hidden + splits - 1) // splits
+        k_per_split = (k_per_split + 63) // 64 * 64
+        for s in (0, splits - 1):
+            lo, hi = s * k_per_split, min((s + 1) * k_per_split, hc * hidden)
+            if lo >= hc * hidden:
+                continue
+            part = x.float()[:, lo:hi] @ fn[:, lo:hi].T
+            assert torch.allclose(out_mul[s], part, atol=2e-2 * hidden, rtol=1e-3)
+
+
+@pytest.mark.gpu
+def test_gpu_mhc_full_chain_matches_reference():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import mhc_gemm as ts_mhc_gemm
+
+    torch.manual_seed(11)
+    tokens, hidden = 8, 4096
+    residual = torch.randn(tokens, 4, hidden, device="cuda", dtype=torch.bfloat16)
+    fn = torch.randn(24, 4 * hidden, device="cuda", dtype=torch.float32)
+    hc_scale = torch.randn(3, device="cuda")
+    hc_base = torch.randn(24, device="cuda")
+    post_mix, _comb_mix, layer_input = ts_mhc_gemm.gluon_mhc_pre(
+        residual, fn, hc_scale, hc_base
+    )
+    # reference: proj = (residual @ fn.T) then the verified mhc chain
+    proj = residual.reshape(tokens, -1).float() @ fn.T
+    inv_rms = torch.rsqrt(
+        (residual.float() ** 2).sum((1, 2)) / (4 * hidden) + 1e-6
+    )
+    pre = (
+        1.0
+        / (
+            1.0
+            + torch.exp(
+                -(proj[:, :4] * inv_rms[:, None] * hc_scale[0] + hc_base[:4])
+            )
+        )
+        + 1e-4
+    )
+    want_layer = (pre[:, :, None] * residual.float()).sum(1)
+    assert torch.allclose(
+        layer_input.float(), want_layer.to(torch.bfloat16).float(), atol=5e-2, rtol=2e-2
+    )
+    post = 2.0 / (
+        1.0
+        + torch.exp(-(proj[:, 4:8] * inv_rms[:, None] * hc_scale[1] + hc_base[4:8]))
+    )
+    assert torch.allclose(post_mix, post, atol=5e-3, rtol=1e-2)
+
+
+@pytest.mark.gpu
 def test_gpu_mhc_pre_matches_reference_chain():
     _gluon_driver()
     from vkernels.torch_ops.tokenspeed_amd import mhc as ts_mhc

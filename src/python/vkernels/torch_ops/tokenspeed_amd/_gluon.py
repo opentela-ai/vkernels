@@ -57,11 +57,12 @@ __all__ = [
 
 try:  # pragma: no cover - exercised only on hosts with stock triton
     import triton
-
+    from triton import language as tl
     from triton.experimental import gluon
     from triton.experimental.gluon import language as gl
 except Exception:  # noqa: BLE001 — any triton shape can be missing on a host
     triton = None
+    tl = None
     gluon = None
     gl = None
 
@@ -88,6 +89,7 @@ if gluon is not None and not _CONSTEXPR_FUNCTION_NATIVE:
 
 
 if triton is None:
+    tl = _Inert()
     triton = SimpleNamespace(
         cdiv=lambda a, b: -(-a // b),
         next_power_of_2=lambda n: 1 << max(0, n - 1).bit_length() if n > 0 else 1,

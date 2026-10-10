@@ -308,6 +308,42 @@ def parity_mhc() -> None:
     assert torch.allclose(comb_mix, comb, atol=5e-3, rtol=1e-2)
 
 
+def bench_mhc_chain(results: list) -> None:
+    """Full gluon chain (prenorm GEMM + reduce/apply) vs aiter mhc_pre."""
+    from vkernels.torch_ops.tokenspeed_amd import mhc_gemm as ts_mhc_gemm
+
+    aiter_pre = None
+    if bench_env_cached.get("aiter"):
+        try:
+            from vkernels.torch_ops.aiter_ops import aiter_mhc_pre
+
+            aiter_pre = aiter_mhc_pre
+        except Exception:  # noqa: BLE001
+            aiter_pre = None
+    for tokens in (1, 8, 64):
+        hidden = 4096
+        residual = torch.randn(tokens, 4, hidden, device="cuda", dtype=torch.bfloat16)
+        fn = torch.randn(24, 4 * hidden, device="cuda", dtype=torch.float32)
+        hc_scale = torch.randn(3, device="cuda")
+        hc_base = torch.randn(24, device="cuda")
+        entry = {
+            "op": "mhc_pre_full_chain",
+            "shape": {"tokens": tokens, "hidden": hidden},
+            "gluon": time_fn(
+                lambda: ts_mhc_gemm.gluon_mhc_pre(residual, fn, hc_scale, hc_base)  # noqa: B023
+            ),
+        }
+        if aiter_pre is not None:
+            try:
+                aiter_pre(residual, fn, hc_scale, hc_base)  # parity smoke
+                entry["aiter"] = time_fn(
+                    lambda: aiter_pre(residual, fn, hc_scale, hc_base)  # noqa: B023
+                )
+            except Exception as exc:  # noqa: BLE001
+                entry["aiter"] = f"error: {exc!r}"[:120]
+        results.append(entry)
+
+
 def bench_mhc(results: list) -> None:
     parity_mhc()
     for tokens in (1, 8, 64):
@@ -403,6 +439,7 @@ def main() -> int:
         "sorting": bench_sorting,
         "hadamard": bench_hadamard,
         "mhc": bench_mhc,
+        "mhc_chain": bench_mhc_chain,
         "argmax": bench_argmax,
         "scale": bench_scale_swizzle,
     }

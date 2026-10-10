@@ -305,11 +305,28 @@ CI skip filters.
    `torch_ops/tokenspeed_amd/` (CDNA4 MXFP4 scale swizzle, weight/N16
    preprocessing, gluon softmax/sigmoid top-k routing, 4-stage block-aligned
    MoE sort, split-atomic sampling argmax, length-128 Hadamard, decode-shaped
-   mHC pre reduce/apply; MIT-vendored verbatim with a stock-Triton gluon shim)
+   mHC pre reduce/apply + the split-K prenorm GEMM producer feeding it;
+   MIT-vendored verbatim with a stock-Triton gluon shim)
    + `tokenspeed_amd_registry.py`; measured on beverin/MI300A — see
    `meta/benchmarks/artifacts/tokenspeed-amd-bucket1/` (gluon kernels need
    triton ≥ 3.8 — stock 3.4 gluon is too primitive; routing 3× faster than
-   the torch chain, Hadamard at 854 GB/s, argmax wins at vocab ≥ 150k).
+   the torch chain, Hadamard at 854 GB/s, argmax wins at vocab ≥ 150k;
+   gfx942-tuned routing-warp and argmax-config tables measured in
+   `sweep-gfx942.json`).
+5. Bucket 2 — CDNA3 attention ports (scoped, first kernel vendored). —
+   **started 2026-11**: key unlock first: stock triton 3.8 ships a full
+   ``gluon.language.amd.cdna3`` namespace (``buffer_load/store/atomics``
+   + ``mfma``), so the survey's "CDNA4-only" verdict was too pessimistic.
+   Density scan of the gfx950 attention family (lines, distinct cdna4
+   features): ``kda/decode`` 1562/2 (buffer ops only — vendored as
+   ``torch_ops/tokenspeed_amd/kda_decode.py`` with a cdna3-first binding),
+   ``dsa/sparse_mla`` 2949/6 (buffer_load only), ``mla/extend`` 1208/4
+   (adds ``cdna4.mfma`` → ``cdna3.mfma`` re-lowering), ``mha/decode``
+   909/4, ``mla/decode`` 3100/50 (async_copy + mfma — the hard one).
+   Recipe: namespace-swap for buffer-op-only kernels, layout re-derivation
+   for MFMA kernels, ``cdna4.async_copy`` stages must be rewritten to LDS
+   pipelines (no TMA on CDNA3; see the hip-async-coordination skill).
+   Gated on the triton ≥ 3.8 env (see the bucket-1 infra request).
 
 **Still open:** §3.7 plugins (defer until needed) and §3.12 DeepJIT
 (deferred until the include layering grows); `mark_serving()` wiring from

@@ -325,6 +325,14 @@ def invoke_softmax_topk_route_gluon(
     )
     bias = correction_bias if correction_bias is not None else topk_weights
     nw = min(_next_pow2(M), 4)
+    # Local adaptation (measured MI300A/gfx942, sweep-gfx942.json in
+    # meta/benchmarks/artifacts/tokenspeed-amd-bucket1): warps=8 is best or
+    # tied-best at every supported M on gfx942; upstream's
+    # min(next_pow2(M), 4) table was tuned on MI355X.
+    if router_logits.is_cuda and torch.cuda.get_device_capability(
+        router_logits.device
+    ) == (9, 4):
+        nw = 8
     _softmax_topk_route_gluon_kernel[(1,)](
         router_logits,
         bias,

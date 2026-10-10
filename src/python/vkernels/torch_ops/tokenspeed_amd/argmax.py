@@ -342,6 +342,26 @@ def _select_config(M: int, N: int) -> tuple[int, int, bool, int | None]:
     return 8192, 4, False, None
 
 
+def _select_config_gfx942(M: int, N: int) -> tuple[int, int, bool, int | None]:
+    """MI300A/gfx942 override of ``_select_config``.
+
+    Local adaptation (measured in sweep-gfx942.json,
+    meta/benchmarks/artifacts/tokenspeed-amd-bucket1): the MI355X table
+    splits at M<=64 and never uses fixed splits above M=4; on gfx942 the
+    plain non-split path at M=64 beats every split variant (46 vs 51+ us at
+    N=152k), and the M<=4 large-N sweet spot is 8192-wide/16-split.
+    """
+    if M <= 4:
+        if N < 131072:
+            return 8192, 4, False, None
+        return 8192, 4, True, 16
+    if M <= 32:
+        return 16384, 4, True, None
+    if M <= 64:
+        return 16384, 4, False, None
+    return 8192, 4, False, None
+
+
 def launch_gluon_argmax_gfx950(
     logits: torch.Tensor,
     *,
@@ -359,7 +379,11 @@ def launch_gluon_argmax_gfx950(
     if M == 0:
         return out
 
-    block, num_warps, use_split, fixed_split_count = _select_config(M, N)
+    select = _select_config
+    # Local adaptation: gfx942 launch table (see _select_config_gfx942).
+    if torch.cuda.get_device_capability(logits.device) == (9, 4):
+        select = _select_config_gfx942
+    block, num_warps, use_split, fixed_split_count = select(M, N)
     load_elems = _load_elements_per_thread(logits.dtype)
     if fixed_split_count is not None:
         num_splits = fixed_split_count

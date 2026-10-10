@@ -1,0 +1,252 @@
+{
+  "env": {
+    "device": "AMD Instinct MI300A",
+    "capability": [
+      9,
+      4
+    ],
+    "triton": "3.8.0"
+  },
+  "results": [
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 1,
+        "E": 128,
+        "topk": 16
+      },
+      "configs": {
+        "warps=1": 38.18,
+        "warps=2": 51.3,
+        "warps=4": 84.7,
+        "warps=8": 37.48
+      },
+      "upstream_warps": 1
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 1,
+        "E": 384,
+        "topk": 16
+      },
+      "configs": {
+        "warps=1": 36.36,
+        "warps=2": 80.74,
+        "warps=4": 37.52,
+        "warps=8": 36.32
+      },
+      "upstream_warps": 1
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 8,
+        "E": 256,
+        "topk": 16
+      },
+      "configs": {
+        "warps=1": 63.22,
+        "warps=2": 45.6,
+        "warps=4": 37.22,
+        "warps=8": 35.28
+      },
+      "upstream_warps": 4
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 16,
+        "E": 128,
+        "topk": 8
+      },
+      "configs": {
+        "warps=1": 88.5,
+        "warps=2": 41.74,
+        "warps=4": 79.54,
+        "warps=8": 36.06
+      },
+      "upstream_warps": 4
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 64,
+        "E": 384,
+        "topk": 2
+      },
+      "configs": {
+        "warps=1": 195.88,
+        "warps=2": 63.68,
+        "warps=4": 44.88,
+        "warps=8": 40.56
+      },
+      "upstream_warps": 4
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 4,
+        "E": 256,
+        "topk": 8
+      },
+      "configs": {
+        "warps=1": 78.58,
+        "warps=2": 34.22,
+        "warps=4": 34.54,
+        "warps=8": 33.98
+      },
+      "upstream_warps": 4
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 32,
+        "E": 128,
+        "topk": 4
+      },
+      "configs": {
+        "warps=1": 54.44,
+        "warps=2": 41.5,
+        "warps=4": 35.62,
+        "warps=8": 34.9
+      },
+      "upstream_warps": 4
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 1,
+        "N": 32768
+      },
+      "configs": {
+        "torch": 20.1,
+        "split b=8192 w=2": 40.1,
+        "split b=8192 w=4": 94.32,
+        "split b=16384 w=2": 95.0,
+        "split b=16384 w=4": 94.18,
+        "plain b=4096 w=2": 35.56,
+        "plain b=4096 w=4": 35.12,
+        "plain b=8192 w=2": 34.88,
+        "plain b=8192 w=4": 65.4,
+        "plain b=16384 w=2": 36.32,
+        "plain b=16384 w=4": 65.82
+      },
+      "upstream": "(16384, 4, True, None)"
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 1,
+        "N": 131072
+      },
+      "configs": {
+        "torch": 37.72,
+        "split-fixed b=4096 w=2 s=8": 90.24,
+        "split-fixed b=8192 w=4 s=8": 45.96,
+        "split-fixed b=8192 w=2 s=8": 88.3,
+        "split-fixed b=4096 w=2 s=16": 44.24,
+        "split-fixed b=8192 w=4 s=16": 58.4,
+        "split-fixed b=8192 w=2 s=16": 46.08,
+        "split-fixed b=4096 w=2 s=32": 92.4,
+        "split-fixed b=8192 w=4 s=32": 45.28,
+        "split-fixed b=8192 w=2 s=32": 46.16,
+        "split b=8192 w=2": 46.66,
+        "split b=8192 w=4": 92.8,
+        "split b=16384 w=2": 47.3,
+        "split b=16384 w=4": 45.64,
+        "plain b=4096 w=2": 88.36,
+        "plain b=4096 w=4": 55.3,
+        "plain b=8192 w=2": 81.12,
+        "plain b=8192 w=4": 67.48,
+        "plain b=16384 w=2": 58.6,
+        "plain b=16384 w=4": 43.24
+      },
+      "upstream": "(4096, 4, True, 32)"
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 8,
+        "N": 131072
+      },
+      "configs": {
+        "torch": 45.26,
+        "split b=8192 w=2": 45.86,
+        "split b=8192 w=4": 44.86,
+        "split b=16384 w=2": 45.92,
+        "split b=16384 w=4": 45.14,
+        "plain b=4096 w=2": 66.52,
+        "plain b=4096 w=4": 53.28,
+        "plain b=8192 w=2": 60.9,
+        "plain b=8192 w=4": 47.78,
+        "plain b=16384 w=2": 59.58,
+        "plain b=16384 w=4": 43.2
+      },
+      "upstream": "(16384, 4, True, None)"
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 64,
+        "N": 151936
+      },
+      "configs": {
+        "torch": 62.32,
+        "split b=8192 w=2": 65.34,
+        "split b=8192 w=4": 104.84,
+        "split b=16384 w=2": 52.84,
+        "split b=16384 w=4": 90.28,
+        "plain b=4096 w=2": 100.94,
+        "plain b=4096 w=4": 59.36,
+        "plain b=8192 w=2": 92.3,
+        "plain b=8192 w=4": 48.28,
+        "plain b=16384 w=2": 70.72,
+        "plain b=16384 w=4": 69.72
+      },
+      "upstream": "(16384, 4, True, None)"
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 8,
+        "N": 262144
+      },
+      "configs": {
+        "torch": 91.02,
+        "split b=8192 w=2": 52.8,
+        "split b=8192 w=4": 86.64,
+        "split b=16384 w=2": 86.88,
+        "split b=16384 w=4": 39.12,
+        "plain b=4096 w=2": 114.94,
+        "plain b=4096 w=4": 82.72,
+        "plain b=8192 w=2": 96.96,
+        "plain b=8192 w=4": 89.46,
+        "plain b=16384 w=2": 93.46,
+        "plain b=16384 w=4": 59.52
+      },
+      "upstream": "(16384, 4, True, None)"
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 16,
+        "N": 65536
+      },
+      "configs": {
+        "torch": 26.8,
+        "split b=8192 w=2": 87.86,
+        "split b=8192 w=4": 37.6,
+        "split b=16384 w=2": 88.82,
+        "split b=16384 w=4": 36.7,
+        "plain b=4096 w=2": 64.64,
+        "plain b=4096 w=4": 41.38,
+        "plain b=8192 w=2": 38.64,
+        "plain b=8192 w=4": 30.56,
+        "plain b=16384 w=2": 44.82,
+        "plain b=16384 w=4": 60.84
+      },
+      "upstream": "(16384, 4, True, None)"
+    }
+  ]
+}
