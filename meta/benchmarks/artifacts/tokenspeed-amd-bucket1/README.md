@@ -179,6 +179,18 @@ the launch contract. Full parity vs `glm_kda_fused_decode_reference`
 along with `dsa/sparse_mla` (buffer_load only). See the borrowing-plan doc
 for the full density scan.
 
+## Self-service triton-3.8 container (no CSCS ticket needed for dev)
+
+Instead of waiting on the env bump, we repacked the container ourselves:
+`floe-beverin.sqsh` (the glm5-smoke base, a local pyxis EDF squashfs we
+own) → unsquashfs → swap `site-packages/triton` 3.4→3.8 (the proven
+rocm7.0 nightly wheel) → mksquashfs → `floe-beverin-triton38.sqsh`
+(18 GB; env toml `tokenspeed-triton38.toml`). Verified on an MI300A node
+(job 675575): boots, triton 3.8 default, gluon amd/cdna3/cdna4 present,
+aiter intact, **32/32 tokenspeed_amd tests pass with no PYTHONPATH
+tricks**. The CSCS request (`infra-request-triton38.md`) is now only
+about the *production serving* image adopting triton ≥ 3.8.
+
 ## Artifacts
 
 - `results-triton38.json` — first full run (job 675351)

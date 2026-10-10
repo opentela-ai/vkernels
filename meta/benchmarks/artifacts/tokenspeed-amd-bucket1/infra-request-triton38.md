@@ -1,5 +1,14 @@
 # Infra request: triton ≥ 3.8 in a beverin (MI300A) container env
 
+**UPDATE (same day): a self-service dev image now exists** —
+`floe-beverin-triton38.sqsh` (the glm5-smoke sqsh with site-packages triton
+3.4→3.8 swapped, repacked via unsquashfs/mksquashfs; env toml
+`tokenspeed-triton38.toml`). Boots on MI300A nodes, aiter intact, 32/32
+tokenspeed_amd tests pass with no PYTHONPATH tricks. **This request is now
+about the production/serving image** — the serving deployment's env build
+should adopt triton ≥ 3.8 the same way instead of relying on a user-owned
+scratch sqsh.
+
 **To:** CSCS service desk / owners of the `glm5-smoke` environment
 **Repo:** vkernels (AMD kernel bring-up for the serving stack)
 **Status:** ready to send — drafted 2026-10-10 after the measurement run in
