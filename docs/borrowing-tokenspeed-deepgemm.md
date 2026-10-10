@@ -343,8 +343,11 @@ CI skip filters.
    (direct register<->MFMA converts unsupported both ways). Two layout
    rules discovered: layout literals inside jit bodies need ``:
    gl.constexpr`` annotations; each 1-D offsets var is sliced on the axis
-   it expands into. Remaining port work (multi-session): ``mha/decode``
-   and ``mla/extend`` re-lowering on this scaffold.
+   it expands into. **``mha/decode`` ported** (``mha_decode.py``,
+   parity on MI300A incl. the sliding leg; synchronous-load first cut at
+   104–303 µs — the unpipelined floor). Remaining: ``mla/extend`` on the
+   same scaffold, re-pipelining the MHA loads (LDS double-buffer), and
+   the aiter flash-decode comparison.
 
 **Still open:** §3.7 plugins (defer until needed) and §3.12 DeepJIT
 (deferred until the include layering grows); `mark_serving()` wiring from
