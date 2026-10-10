@@ -1,0 +1,266 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "01M4K2BSX82N50PYN6R356H0KR",
+  "session_id": "01a121fa-1874-75d2-8151-28b5d5a059a4",
+  "strategy": "manual-commit",
+  "created_at": "2026-10-10T14:09:41.430323544Z",
+  "branch": "perf/gemv-mi300",
+  "checkpoints_count": 18,
+  "save_step_count": 18,
+  "files_touched": [
+    "docs/borrowing-tokenspeed-deepgemm.md",
+    "tests/python/test_tokenspeed_mla.py"
+  ],
+  "agent": "Pi",
+  "model": "CSCS-Inference/zai-org/GLM-5.3",
+  "turn_id": "36d75e45cf1b",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 1478768,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 109899328,
+    "output_tokens": 332145,
+    "api_call_count": 589
+  },
+  "session_metrics": {
+    "turn_count": 18
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-10-10T14:09:41.247080846Z",
+    "agent_lines": 522,
+    "agent_removed": 0,
+    "human_added": 3058,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 3580,
+    "total_lines_changed": 3598,
+    "agent_percentage": 14.508060033351864,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 14527,
+      "user_lines_removed": 278,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".agents/runs/elementwise-rungs2-3/bench_rungs2_3.json": 53,
+        ".agents/runs/elementwise-rungs2-3/report.md": 188,
+        ".agents/runs/megakernel-e1/report.md": 193,
+        ".agents/runs/pdl-probe/bench_pdl.py": 657,
+        ".agents/runs/pdl-probe/bench_results.json": 98,
+        ".agents/runs/pdl-probe/bench_results_rerun.json": 79,
+        ".agents/runs/pdl-probe/report.md": 91,
+        ".agents/runs/pdl-probe/smoke_pdl.py": 57,
+        ".agents/runs/router-dense/report.md": 133,
+        ".agents/runs/topk-bf16/bench_glm_indexer_topk.json": 371,
+        ".agents/runs/topk-bf16/report.md": 152,
+        ".agents/runs/vkernels-cache/report.md": 238,
+        "CMakeLists.txt": 7,
+        "Makefile": 9,
+        "README.md": 25,
+        "bench/glm53_e1_spine_bench.py": 623,
+        "docs/candidates/trainer-gemm-bwd-layouts.md": 283,
+        "docs/python-bindings.md": 74,
+        "meta/benchmarks/bench_elementwise_rungs2_3.py": 155,
+        "meta/benchmarks/bench_glm_indexer_topk.py": 126,
+        "meta/benchmarks/bench_router_dense.py": 85,
+        "src/c/vkernels/util/error.hpp": 20,
+        "src/python/vkernels/compiler/capture_recurrent.py": 142,
+        "src/python/vkernels/compiler/contracts.py": 7,
+        "src/python/vkernels/compiler/glm53_arch.py": 141,
+        "src/python/vkernels/compiler/lowerings/__init__.py": 1,
+        "src/python/vkernels/compiler/lowerings/recurrent.py": 86,
+        "src/python/vkernels/compiler/model_glm53.py": 138,
+        "src/python/vkernels/compiler/reference_recurrent.py": 73,
+        "src/python/vkernels/compiler/reference_types.py": 22,
+        "src/python/vkernels/compiler/triton_recurrent.py": 135,
+        "src/python/vkernels/registry.py": 140,
+        "src/python/vkernels/torch_ops/dsa_kpool_compress.py": 1676,
+        "src/python/vkernels/torch_ops/dsa_tail_scatter.py": 143,
+        "src/python/vkernels/torch_ops/elementwise.py": 69,
+        "src/python/vkernels/torch_ops/expert_gemv_registry.py": 67,
+        "src/python/vkernels/torch_ops/glm_expert_gemv.py": 75,
+        "src/python/vkernels/torch_ops/glm_gemv.py": 98,
+        "src/python/vkernels/torch_ops/glm_indexer_topk.py": 334,
+        "src/python/vkernels/torch_ops/glm_kda_decode.py": 72,
+        "src/python/vkernels/torch_ops/glm_kda_fused_decode.py": 1570,
+        "src/python/vkernels/torch_ops/glm_router.py": 138,
+        "src/python/vkernels/torch_ops/glm_router_dense.py": 321,
+        "src/python/vkernels/torch_ops/moe_combine.py": 90,
+        "src/python/vkernels/torch_ops/moe_combine_registry.py": 56,
+        "tests/python/conftest.py": 6,
+        "tests/python/test_dsa_kpool_compress.py": 632,
+        "tests/python/test_expert_gemv_registry.py": 127,
+        "tests/python/test_glm_indexer_topk.py": 420,
+        "tests/python/test_glm_kda_fused_decode.py": 501,
+        "tests/python/test_glm_router_dense.py": 475,
+        "tests/python/test_glm_router_shared.py": 265,
+        "tests/python/test_kernel_registry.py": 216,
+        "tests/python/test_megakernel_glm53_e1.py": 442,
+        "tests/python/test_tuning_cache.py": 447,
+        "verifier/CMakeLists.txt": 31,
+        "verifier/README.md": 155,
+        "verifier/bmc/README.md": 50,
+        "verifier/bmc/harness_elementwise.cpp": 51,
+        "verifier/bmc/harness_gemm.cpp": 55,
+        "verifier/bmc/harness_reduce.cpp": 43,
+        "verifier/bmc/run.sh": 95,
+        "verifier/common/verify_support.h": 47,
+        "verifier/gpu/Dockerfile.gpuverify": 27,
+        "verifier/gpu/README.md": 124,
+        "verifier/gpu/gpuverify.sh": 59,
+        "verifier/gpu/harnesses/comm_allreduce.cu": 17,
+        "verifier/gpu/harnesses/comm_kv_gather.cu": 152,
+        "verifier/gpu/harnesses/comm_kv_scatter.cu": 163,
+        "verifier/gpu/harnesses/comm_peer_copy.cu": 34,
+        "verifier/gpu/harnesses/elementwise.cu": 28,
+        "verifier/gpu/harnesses/gemm.cu": 46,
+        "verifier/gpu/harnesses/reduce.cu": 43,
+        "verifier/gpu/run.sh": 119,
+        "verifier/numerics/README.md": 78,
+        "verifier/numerics/bounds/sequential_sum_fp32.gappa": 20,
+        "verifier/numerics/run.sh": 35,
+        "verifier/smt/README.md": 23,
+        "verifier/smt/gemm_index_equivalence.py": 161,
+        "verifier/smt/run.sh": 29
+      },
+      "user_removed_per_file": {
+        "Makefile": 1,
+        "src/c/vkernels/util/error.hpp": 8,
+        "src/python/vkernels/torch_ops/elementwise.py": 2,
+        "src/python/vkernels/torch_ops/glm_expert_gemv.py": 59,
+        "src/python/vkernels/torch_ops/glm_gemv.py": 9,
+        "src/python/vkernels/torch_ops/glm_kda_decode.py": 3,
+        "src/python/vkernels/torch_ops/moe_combine.py": 4,
+        "tests/python/test_tuning_cache.py": 192
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 14527,
+      "agent_lines_removed": 278
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 7,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 8,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 9,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 14527,
+      "agent_lines_removed": 278
+    },
+    {
+      "checkpoint_number": 10,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 14527,
+      "agent_lines_removed": 278
+    },
+    {
+      "checkpoint_number": 11,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 14786,
+      "agent_lines_removed": 279
+    },
+    {
+      "checkpoint_number": 12,
+      "user_lines_added": 21,
+      "user_lines_removed": 0,
+      "agent_lines_added": 16546,
+      "agent_lines_removed": 282,
+      "user_added_per_file": {
+        "tests/python/test_kernel_registry.py": 21
+      }
+    },
+    {
+      "checkpoint_number": 13,
+      "user_lines_added": 21,
+      "user_lines_removed": 0,
+      "agent_lines_added": 17669,
+      "agent_lines_removed": 282,
+      "user_added_per_file": {
+        "tests/python/test_kernel_registry.py": 21
+      }
+    },
+    {
+      "checkpoint_number": 14,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 20667,
+      "agent_lines_removed": 316
+    },
+    {
+      "checkpoint_number": 15,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 20667,
+      "agent_lines_removed": 316
+    },
+    {
+      "checkpoint_number": 16,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 17,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 18,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}

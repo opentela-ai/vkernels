@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "01M4K2BSX82N50PYN6R356H0KR",
+  "strategy": "manual-commit",
+  "branch": "perf/gemv-mi300",
+  "checkpoints_count": 18,
+  "files_touched": [
+    "docs/borrowing-tokenspeed-deepgemm.md",
+    "tests/python/test_tokenspeed_mla.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 1478768,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 109899328,
+    "output_tokens": 332145,
+    "api_call_count": 589
+  }
+}
