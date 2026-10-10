@@ -23,6 +23,72 @@ from ._dispatch import OpNotEligible, same_gpu_contiguous
 from functools import lru_cache
 
 
+# --- op-config cache integration (vkernels.tuning) --------------------------
+# The pinned (BV=32, warps=4) launch below remains the declared default; the
+# op-config cache adds tune-once-persist-always per coarse shape class
+# (head-dim tier x batch·heads tier) under $VKERNELS_CACHE, replayed with
+# zero benchmarking by later processes. VKERNELS_CACHE=off (tests/conftest
+# default) keeps exactly today's launch; during graph capture the
+# resolution is memo-or-default only (configs static at capture).
+_KDA_OP = "glm_kda_decode.kda_decode"
+_KDA_CFG: dict = {}  # (batch*heads, dim) -> (bv, num_warps): host-side fast path
+
+
+def _kda_shape_class(bh, dim):
+    """Head-dim tag (already an eligibility tier: {32, 64, 128}) over
+    batch·heads tiers mirroring the decode ladder (<=8 / <=64 / beyond).
+    Coarse tiers, not exact shapes: one tuned config serves the bucket."""
+    bt = "bh8" if bh <= 8 else "bh64" if bh <= 64 else "bhx"
+    return f"d{dim}-{bt}"
+
+
+def _kda_candidates(dim, default):
+    """Sweep space: the default first, then BV/warp variants (BV <= dim;
+    the state tile [dim, BV] trades register pressure against column
+    parallelism). Each BV is a distinct compile — the space stays <= 5."""
+    out = [dict(default)]
+    for bv, warps in ((64, 4), (64, 8), (16, 4), (32, 8)):
+        cand = {"bv": bv, "warps": warps}
+        if bv <= dim and cand not in out:
+            out.append(cand)
+    return out
+
+
+def _kda_cfg(bh, dim, kern, triton, tensors, out, state):
+    """Resolved ``(bv, num_warps)`` for this exact (batch·heads, dim).
+
+    Per-exact-shape host memo over the per-bucket op-config cache; the
+    sweep (on a store miss) benches the live tensors. Capture-safe by the
+    cache's guard: memo-or-default during graph capture.
+    """
+    hit = _KDA_CFG.get((bh, dim))
+    if hit is not None:
+        return hit
+    from ..tuning.cache import op_config
+    from triton.testing import do_bench
+
+    query, key, value, gate, beta, initial_state = tensors
+    default = {"bv": 32, "warps": 4}
+
+    def bench(cfg):
+        grid = (bh, triton.cdiv(dim, cfg["bv"]))
+
+        def launch():
+            kern[grid](query, key, value, gate, beta, initial_state, out, state,
+                       dim, 1e-6, cfg["bv"], num_warps=cfg["warps"],
+                       enable_fp_fusion=False)
+
+        return do_bench(launch, return_mode="median")
+
+    cfg, _status = op_config(
+        _KDA_OP, _kda_shape_class(bh, dim), default=default,
+        candidates=_kda_candidates(dim, default), bench=bench,
+        source_files=(__file__,))
+    resolved = (cfg["bv"], cfg["warps"])
+    _KDA_CFG[(bh, dim)] = resolved
+    return resolved
+
+
 @lru_cache(maxsize=1)
 def _kernel():
     global tl
@@ -117,8 +183,11 @@ def kda_decode(query, key, value, gate, beta, initial_state, *, out_fp32=False):
     if batch * heads:
         import triton  # lazy: validation above needs only torch
 
+        bv, warps = _kda_cfg(
+            batch * heads, dim, _kernel(), triton,
+            (query, key, value, gate, beta, initial_state), out, state)
         with torch.cuda.device(query.device):
-            _kernel()[(batch * heads, triton.cdiv(dim, 32))](
+            _kernel()[(batch * heads, triton.cdiv(dim, bv))](
                 query,
                 key,
                 value,
@@ -129,8 +198,8 @@ def kda_decode(query, key, value, gate, beta, initial_state, *, out_fp32=False):
                 state,
                 dim,
                 1e-6,
-                32,
-                num_warps=4,
+                bv,
+                num_warps=warps,
                 enable_fp_fusion=False,
             )
     return out, state

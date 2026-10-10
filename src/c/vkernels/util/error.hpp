@@ -58,12 +58,24 @@ class Status {
 #  define VK_ENSURES(cond, msg) \
     do { (void)(cond); (void)(msg); } while (0)
 #else
-#  define VK_EXPECTS(cond, msg)                                              \
-    do {                                                                     \
-      if (!(cond)) throw ::std::invalid_argument(std::string(msg) + ": " + #cond); \
-    } while (0)
-#  define VK_ENSURES(cond, msg)                                              \
-    do {                                                                     \
-      if (!(cond)) throw ::std::runtime_error(std::string(msg) + ": " + #cond); \
-    } while (0)
+// The contract macros are overridable.  Formal-verification harnesses
+// (verifier/) predefine them as prover intrinsics, e.g.
+//   -DVK_VERIFY_CONTRACTS
+//   -D'VK_EXPECTS(cond,msg)=__ESBMC_assume(cond)'
+// so the proof ranges over exactly the contractual inputs and does not have
+// to model exceptions/std::string.  An ordinary build leaves them undefined
+// and gets the throwing behavior below, so this costs production nothing and
+// is invisible to the src/c/ coverage gate.
+#  ifndef VK_EXPECTS
+#    define VK_EXPECTS(cond, msg)                                              \
+      do {                                                                     \
+        if (!(cond)) throw ::std::invalid_argument(std::string(msg) + ": " + #cond); \
+      } while (0)
+#  endif
+#  ifndef VK_ENSURES
+#    define VK_ENSURES(cond, msg)                                              \
+      do {                                                                     \
+        if (!(cond)) throw ::std::runtime_error(std::string(msg) + ": " + #cond); \
+      } while (0)
+#  endif
 #endif

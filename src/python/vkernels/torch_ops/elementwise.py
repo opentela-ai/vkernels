@@ -323,6 +323,59 @@ def _kernels():
     )
 
 
+def _norm_shape_class(rows, d):
+    """Row-count tiers mirror the tree's decode ladder (<=8 / <=64 /
+    beyond — grid/occupancy axis); the hidden width rides as a
+    power-of-two tier (the kernel's BLOCK is pinned to next_pow2(d), so
+    it is part of the compile identity anyway). Coarse tiers, not exact
+    shapes: one tuned config serves the bucket."""
+    rt = "r8" if rows <= 8 else "r64" if rows <= 64 else "rX"
+    dt = "d2k" if d <= 2048 else "d4k" if d <= 4096 else "d8k" if d <= 8192 else "dX"
+    return f"{rt}-{dt}"
+
+
+# (rows, d) -> num_warps: host-side fast path over the op-config cache
+# (the store is keyed by coarse bucket; the tier string is built once per
+# exact (rows, d) on the cache miss, never on the hot path).
+_NORM_CFG: dict = {}
+
+
+def _norm_warps(rows, d, triton, norm, x, w, r, out, summed, eps, add):
+    """``num_warps`` for one rms_norm launch, through the op-config cache.
+
+    BLOCK stays pinned to ``next_power_of_2(d)`` — the whole row must sit
+    in one program for the row reduction — so warps is the free knob
+    (default 4, today's implicit choice and the declared default the
+    cache falls back to under ``VKERNELS_CACHE=off``, capture, budget
+    exhaustion or bench failure). On a store miss the sweep benches the
+    live shape; the winner persists per coarse bucket for every later
+    process. Capture-safe: the cache serves memo-or-default mid-capture.
+    """
+    hit = _NORM_CFG.get((rows, d))
+    if hit is not None:
+        return hit
+    from ..tuning.cache import op_config
+    from triton.testing import do_bench
+
+    block = triton.next_power_of_2(d)
+    default = {"num_warps": 4}
+
+    def bench(cfg):
+        def launch():
+            norm[(rows,)](x, w, r, out, summed, d, eps, add, block,
+                          num_warps=cfg["num_warps"], enable_fp_fusion=False)
+
+        return do_bench(launch, return_mode="median")
+
+    cfg, _status = op_config(
+        "elementwise.rms_norm", _norm_shape_class(rows, d),
+        default=default,
+        candidates=[{"num_warps": n} for n in (2, 4, 8)],
+        bench=bench, source_files=(__file__,))
+    _NORM_CFG[(rows, d)] = cfg["num_warps"]
+    return cfg["num_warps"]
+
+
 def rms_norm(x, module, residual=None):
     """Return (normalized value, rounded residual sum), without aliasing writes.
 
@@ -331,6 +384,15 @@ def rms_norm(x, module, residual=None):
     weight would change the result dtype, not just the speed) and an optional
     ``residual`` of the same shape/dtype/device. Anything else raises
     :class:`OpNotEligible` — callers fall back to :func:`rms_norm_reference`.
+
+    ``num_warps`` resolves through the op-config cache
+    (:mod:`vkernels.tuning.cache`): the implicit 4 stays the declared
+    default, and a per-bucket winner tuned once on the first eager call is
+    persisted under ``$VKERNELS_CACHE`` and replayed by later processes
+    (``VKERNELS_CACHE=off`` — the tests/conftest default — keeps today's
+    exact launch; capture sees memo-or-default only). The block size stays
+    pinned to the row width, so the config change is perf-only: every
+    intermediate rounding point of the eager expression is untouched.
     """
     import torch
 
@@ -350,8 +412,12 @@ def rms_norm(x, module, residual=None):
     summed = x if residual is None else torch.empty_like(x)
     r = x if residual is None else residual.contiguous()
     d = x.shape[-1]
+    rows = x.numel() // d
     norm = _kernels().norm
-    norm[(x.numel() // d,)](
+    add = residual is not None
+    warps = _norm_warps(rows, d, triton, norm, x, module.weight, r, out,
+                        summed, module.variance_epsilon, add)
+    norm[(rows,)](
         x,
         module.weight,
         r,
@@ -359,8 +425,9 @@ def rms_norm(x, module, residual=None):
         summed,
         d,
         module.variance_epsilon,
-        residual is not None,
+        add,
         triton.next_power_of_2(d),
+        num_warps=warps,
         enable_fp_fusion=False,
     )
     return out, summed

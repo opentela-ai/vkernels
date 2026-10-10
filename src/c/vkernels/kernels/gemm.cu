@@ -4,14 +4,20 @@
 #if VKERNELS_HAS_CUDA
 #  include <cuda_runtime.h>
 
+#  include "vkernels/kernels/common/epilogue.hpp"
+#  include "vkernels/kernels/common/launch.hpp"
 #  include "vkernels/util/error.hpp"
 
 namespace vkernels::kernels {
 
 constexpr int kTile = 16;
 
+// The store-side math is the shared epilogue::Linear (the same type the
+// CPU oracle instantiates), so fused epilogues (epilogue::Relu<Linear>,
+// ...) become a template argument here instead of a kernel copy.
+template <typename Epilogue>
 __global__ void gemm_kernel(const float* A, const float* B, float* C, int M,
-                            int N, int K, float alpha, float beta) {
+                            int N, int K, Epilogue store) {
   int row = blockIdx.y * blockDim.y + threadIdx.y;
   int col = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -29,8 +35,7 @@ __global__ void gemm_kernel(const float* A, const float* B, float* C, int M,
     for (int k = 0; k < kTile; ++k) acc += sA[threadIdx.y][k] * sB[k][threadIdx.x];
     __syncthreads();
   }
-  if (row < M && col < N)
-    C[row * N + col] = alpha * acc + (beta == 0.0f ? 0.0f : beta * C[row * N + col]);
+  if (row < M && col < N) C[row * N + col] = store.apply(acc, C[row * N + col]);
 }
 
 // The CUDA launcher lives in `cuda::` (like elementwise.cu) so the host
@@ -46,12 +51,12 @@ void gemm(std::size_t M, std::size_t N, std::size_t K, float alpha,
 
   if (M == 0 || N == 0) return;
   dim3 block(kTile, kTile);
-  dim3 grid(static_cast<int>((N + kTile - 1) / kTile), static_cast<int>((M + kTile - 1) / kTile));
-  gemm_kernel<<<grid, block>>>(A.data(), B.data(), C.data(),
-                               static_cast<int>(M), static_cast<int>(N),
-                               static_cast<int>(K), alpha, beta);
-  cudaError_t err = cudaGetLastError();
-  VK_ENSURES(err == cudaSuccess, "cuda gemm launch failed");
+  dim3 grid(static_cast<int>(common::ceil_div(N, static_cast<std::size_t>(kTile))),
+            static_cast<int>(common::ceil_div(M, static_cast<std::size_t>(kTile))));
+  common::launch(gemm_kernel<epilogue::Linear>, grid, block, "cuda gemm",
+                 A.data(), B.data(), C.data(), static_cast<int>(M),
+                 static_cast<int>(N), static_cast<int>(K),
+                 epilogue::Linear{alpha, beta});
 }
 
 }  // namespace cuda
