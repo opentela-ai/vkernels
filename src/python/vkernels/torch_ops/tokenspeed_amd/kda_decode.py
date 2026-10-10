@@ -1156,6 +1156,7 @@ def gluon_kda_fused_decode_gfx950(
     head_dim: int,
     cu_seqlens: torch.Tensor,
     lower_bound: float | None,
+    assume_valid: bool = False,
 ) -> torch.Tensor:
     """Run fused single-token K3 decode against paged convolution/KDA state.
 
@@ -1199,6 +1200,17 @@ def gluon_kda_fused_decode_gfx950(
         convolution and recurrent states at valid ``write_indices`` are
         updated as part of the call.
     """
+    # Local adaptation: ``assume_valid`` skips the wrapper's python-side
+    # contract checks (~75us of validation on the decode path). Serving
+    # callers that validate shapes once per batch should pass it; first-time
+    # callers get the full vendored validation.
+    if assume_valid:
+        return _kda_fused_decode_launch(
+            mixed_qkv, conv_weights, conv_states, f_a_out, f_b_weight,
+            beta_logits, A_log, dt_bias, output_gate, norm_weight, norm_eps,
+            state_pool, read_indices, write_indices, cu_seqlens,
+            num_heads, head_dim, read_indices.numel(), lower_bound,
+        )
     tensors = (
         mixed_qkv,
         conv_weights,
@@ -1281,6 +1293,36 @@ def gluon_kda_fused_decode_gfx950(
     if not cu_seqlens.is_contiguous():
         raise ValueError("cu_seqlens must be contiguous")
 
+    return _kda_fused_decode_launch(
+        mixed_qkv, conv_weights, conv_states, f_a_out, f_b_weight,
+        beta_logits, A_log, dt_bias, output_gate, norm_weight, norm_eps,
+        state_pool, read_indices, write_indices, cu_seqlens,
+        num_heads, head_dim, tokens, lower_bound,
+    )
+
+
+def _kda_fused_decode_launch(
+    mixed_qkv,
+    conv_weights,
+    conv_states,
+    f_a_out,
+    f_b_weight,
+    beta_logits,
+    A_log,
+    dt_bias,
+    output_gate,
+    norm_weight,
+    norm_eps,
+    state_pool,
+    read_indices,
+    write_indices,
+    cu_seqlens,
+    num_heads,
+    head_dim,
+    tokens,
+    lower_bound,
+):
+    """Launch body shared by the validated wrapper and the fast path."""
     output = torch.empty(
         (1, tokens, num_heads, head_dim),
         dtype=mixed_qkv.dtype,

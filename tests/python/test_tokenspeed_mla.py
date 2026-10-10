@@ -170,13 +170,6 @@ def test_decode_registry_shape_and_layout():
 
 
 @pytest.mark.gpu
-@pytest.mark.xfail(
-    torch.version.hip is not None,
-    reason="Triton MLA prefill numerics diverge on MI300A/gfx942 under "
-    "triton 3.8 (42% element mismatch vs the torch reference at 2e-2; the "
-    "bare tl.dot bf16 path is suspect). First hardware run of this port — "
-    "see meta/benchmarks/artifacts/tokenspeed-amd-bucket1/README.md.",
-)
 def test_prefill_matches_torch_reference_on_gpu():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -199,21 +192,21 @@ def test_prefill_matches_torch_reference_on_gpu():
     out = ts_mla.triton_mla_prefill(
         q, k, v, cu_q, cu_kv, 12, 12, scale, is_causal=True
     )
-    # per-sequence torch reference
+    # per-sequence torch reference; every q head attends with its own query
+    # over the shared K/V (MQA)
     want = torch.empty_like(out, dtype=torch.float32)
     start = 0
     for (q_len, kv_len) in seqs:
-        qs = q[start:start + q_len].float()[:, 0]        # [q, 128]
         ks = k[start:start + kv_len].float()[:, 0]       # [kv, 128]
         vs = v[start:start + kv_len].float()[:, 0]       # [kv, 96]
-        logits = qs @ ks.T * scale
         pos_q = torch.arange(kv_len - q_len, kv_len, device="cuda")
         pos_k = torch.arange(kv_len, device="cuda")
         mask = pos_q[:, None] >= pos_k[None, :]
-        logits = logits.masked_fill(~mask, float("-inf"))
-        probs = torch.softmax(logits, dim=-1)
-        want[start:start + q_len, 0] = probs @ vs
-        # head 1 shares K/V (MQA): replicate
-        want[start:start + q_len, 1] = want[start:start + q_len, 0]
+        for head in range(q.shape[1]):
+            qs = q[start:start + q_len].float()[:, head]  # [q, 128]
+            logits = qs @ ks.T * scale
+            logits = logits.masked_fill(~mask, float("-inf"))
+            probs = torch.softmax(logits, dim=-1)
+            want[start:start + q_len, head] = probs @ vs
         start += q_len
     torch.testing.assert_close(out.float(), want.to(out.dtype).float(), rtol=2e-2, atol=2e-2)
