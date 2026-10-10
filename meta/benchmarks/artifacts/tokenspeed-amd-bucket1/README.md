@@ -179,6 +179,33 @@ the launch contract. Full parity vs `glm_kda_fused_decode_reference`
 along with `dsa/sparse_mla` (buffer_load only). See the borrowing-plan doc
 for the full density scan.
 
+## MHA decode: the first MFMA-class attention kernel ported to CDNA3
+
+``torch_ops/tokenspeed_amd/mha_decode.py`` re-lowers upstream's
+gfx950 MHA decode (split-K + sliding-window + sinks plumbing kept) onto
+the proven CDNA3 scaffold: ``cdna3.mfma`` with v2 ``[16,16,16]``
+layouts, all operands (q/k/v) staged through ``SwizzledSharedLayout``
+shared memory, the ``cdna4.async_copy`` DMA pipeline replaced by
+synchronous loads (first cut, unpipelined), ``cdna4.buffer_load/store``
+via the CDNA3-first alias, and the 256-CU occupancy constant replaced by
+the device's CU count. FP8 KV paths are not ported (need dot_scaled
+MFMA); the launcher raises.
+
+**Parity on MI300A** (job 675835): split-K full attention AND the
+sliding-window leg match the eager paged reference at bf16 tolerance
+(maxdiff ≤ 5e-4 on the marker probes; 32/4 heads, dim 128, seqs
+{64,150,500}, window 127). Three port bugs were found and fixed en
+route: the collapsed synchronous loop consumed the *next* tile's page
+(marker probe: single-key attention returned page-0's value), a
+double-applied window mask (upstream's window lives entirely in
+``kv_start``), and the eager *reference* masked the first-128 positions
+of a full-sequence mask (NaN).
+
+**First-cut numbers** (32 q / 4 kv heads, dim 128, seq 4096): 104 µs
+(batch 1), 114 µs (8), 303 µs (32) — unpipelined; the async→sync load
+collapse trades overlap for correctness, so these are a floor to tune
+from, not the ceiling. aiter flash-decode comparison is future work.
+
 ## Round-3 follow-ups (same effort)
 
 - **MLA prefill xfail resolved** — the MI300A divergence was a test-reference

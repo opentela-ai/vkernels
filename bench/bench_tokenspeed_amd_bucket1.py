@@ -479,6 +479,41 @@ def bench_dsa_topk(results: list) -> None:
         )
 
 
+def bench_mha(results: list) -> None:
+    """CDNA3-ported MHA decode (split-K) vs the eager paged reference."""
+    from vkernels.torch_ops.tokenspeed_amd import mha_decode as ts_mha
+
+    torch.manual_seed(21)
+    q_heads, kv_heads, dim, page_size = 32, 4, 128, 64
+    for batch in (1, 8, 32):
+        seq = 4096
+        seq_lens = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+        max_pages = (seq + page_size - 1) // page_size
+        pages = batch * max_pages
+        q = torch.randn(batch, q_heads, dim, device="cuda", dtype=torch.bfloat16)
+        k_cache = torch.randn(pages, page_size, kv_heads, dim, device="cuda", dtype=torch.bfloat16) * 0.3
+        v_cache = torch.randn(pages, page_size, kv_heads, dim, device="cuda", dtype=torch.bfloat16) * 0.3
+        page_table = torch.randperm(pages, device="cuda")[: batch * max_pages].reshape(
+            batch, max_pages
+        ).to(torch.int32)
+        out = ts_mha.launch_gluon_mha_decode_gfx942(
+            q, k_cache, v_cache, page_table, seq_lens, max_seqlen_k=seq, max_seqlen_q=1
+        )
+        assert torch.isfinite(out.float()).all()
+        results.append(
+            {
+                "op": "mha_decode (CDNA3 port)",
+                "shape": {"batch": batch, "heads": q_heads, "dim": dim, "seq": seq},
+                "gluon_cdna3": time_fn(
+                    lambda: ts_mha.launch_gluon_mha_decode_gfx942(  # noqa: B023
+                        q, k_cache, v_cache, page_table, seq_lens,
+                        max_seqlen_k=seq, max_seqlen_q=1,
+                    )
+                ),
+            }
+        )
+
+
 def bench_argmax(results: list) -> None:
     from vkernels.torch_ops.tokenspeed_amd import argmax as ts_argmax
 
@@ -542,6 +577,7 @@ def main() -> int:
         "mhc_chain": bench_mhc_chain,
         "kda": bench_kda,
         "dsa_topk": bench_dsa_topk,
+        "mha": bench_mha,
         "argmax": bench_argmax,
         "scale": bench_scale_swizzle,
     }
