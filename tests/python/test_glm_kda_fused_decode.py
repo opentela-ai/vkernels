@@ -107,8 +107,8 @@ def _chain_oracle(inp, pool, lower_bound=None):
         if sidx < 0:
             continue
         window = torch.cat([inp["conv"][sidx].float(), mixed[n].float().unsqueeze(0)], 0)
-        acc = inp["cbias"] + window[0] * w_all[0] + window[1] * w_all[1] \
-            + window[2] * w_all[2] + window[3] * w_all[3]
+        products = (window * w_all).bfloat16().float()
+        acc = inp["cbias"] + products[0] + products[1] + products[2] + products[3]
         # the conv-update store contract: one bf16 round, SiLU on the stored
         # value, one more round
         rows[n] = torch.nn.functional.silu(acc.to(torch.bfloat16).float()).to(torch.bfloat16)
@@ -120,6 +120,22 @@ def _chain_oracle(inp, pool, lower_bound=None):
     gate = torch.sigmoid(inp["og"].float().view(b, h, 128))
     y = o * torch.rsqrt((o * o).mean(-1, keepdim=True) + _EPS) * inp["ow"].float() * gate
     return y.to(torch.bfloat16), next_s
+
+
+@pytest.mark.parametrize("lower_bound", [None, -5.0])
+def test_preserved_chain_reference(lower_bound):
+    inp = _inputs("cpu", b=3, h=4, seed=803)
+    out, conv, state = glm_kda_fused_decode_reference(
+        inp["mixed"], inp["a"], inp["b"], inp["conv"], inp["wq"], inp["wk"],
+        inp["wv"], inp["cbias"], inp["alog"], inp["dt"], inp["og"], inp["ow"],
+        inp["pool"], inp["idx"], _SCALE, _EPS, lower_bound=lower_bound,
+        preserve_bf16_chain=True,
+    )
+    expected, expected_state = _chain_oracle(inp, inp["pool"], lower_bound)
+    torch.testing.assert_close(out.squeeze(0), expected, rtol=0.008, atol=0.002)
+    torch.testing.assert_close(state, expected_state, rtol=1e-5, atol=1e-5)
+    for n, slot in enumerate(inp["idx"].tolist()):
+        assert torch.equal(conv[slot, 2], inp["mixed"][n])
 
 
 def _touched_mask(idx, slots, device):
@@ -269,6 +285,41 @@ def test_parity_vs_incumbent_chain(lower_bound):
     out_c, nstate_c = _chain_oracle(inp, inp["pool"], lower_bound)
     torch.testing.assert_close(out.float(), out_c.float().unsqueeze(0).float(), rtol=2e-2, atol=1e-2)
     torch.testing.assert_close(pool2, nstate_c, rtol=2e-2, atol=2e-3)
+
+
+@requires_jit
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("lower_bound", [None, -5.0])
+def test_preserved_chain_gpu_replay(batch, lower_bound):
+    inp = _inputs("cuda", b=batch, h=16, seed=804 + batch)
+    if batch == 4:
+        inp["idx"][1] = -1
+    pool = inp["pool"].clone()
+    conv = inp["conv"].clone()
+
+    def call():
+        return glm_kda_fused_decode(
+            inp["mixed"], inp["a"], inp["b"], conv, inp["wq"], inp["wk"],
+            inp["wv"], inp["cbias"], inp["alog"], inp["dt"], inp["og"], inp["ow"],
+            pool, inp["idx"], _SCALE, _EPS, lower_bound=lower_bound,
+            preserve_bf16_chain=True,
+        )
+
+    call()  # Compile outside capture.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = call()
+    pool.copy_(inp["pool"])
+    conv.copy_(inp["conv"])
+    inp["mixed"].mul_(-2)
+    expected, expected_state = _chain_oracle(inp, inp["pool"], lower_bound)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(result.squeeze(0), expected, rtol=0.008, atol=0.002)
+    torch.testing.assert_close(pool, expected_state, rtol=1e-5, atol=1e-5)
+    touched = _touched_mask(inp["idx"], pool.shape[0], pool.device)
+    assert torch.equal(pool[~touched], inp["pool"][~touched])
+    assert torch.equal(conv[~touched], inp["conv"][~touched])
 
 
 @requires_jit
