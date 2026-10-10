@@ -604,6 +604,133 @@ def test_gpu_n16_shuffle_cpu_gpu_agree():
     assert torch.equal(cpu.cuda(), gpu)
 
 
+def _kda_fused_decode_reference(
+    mixed_qkv, conv_weights, conv_states, f_a_out, f_b_weight, beta_logits,
+    a_log, dt_bias, output_gate, norm_weight, state_pool, read_indices,
+    write_indices, norm_eps=1e-5, lower_bound=None,
+):
+    """Eager fp32 oracle for ``gluon_kda_fused_decode_gfx950`` (K3 shape).
+
+    Mirrors the kernel's op order exactly: silu conv on bf16-moved history,
+    bf16-rounded low-rank decay gate, delta rule on the L2-normalized q/k
+    with the V-major state, gated RMSNorm output. Fresh tensors — the
+    kernel mutates the pools in place.
+    """
+    tokens = mixed_qkv.shape[0]
+    heads, dim = 12, 128
+    pw = heads * dim
+    out = torch.zeros(1, tokens, heads, dim, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    next_conv = conv_states.clone()
+    next_state = state_pool.clone()
+    for n in range(tokens):
+        ridx = int(read_indices[n])
+        widx = int(write_indices[n])
+        if ridx < 0 or ridx >= state_pool.shape[0]:
+            continue
+        beta = torch.sigmoid(beta_logits[n].float())
+        a_value = torch.exp(a_log.float())
+        qkv = torch.empty(3 * pw, dtype=torch.float32, device=mixed_qkv.device)
+        for c in range(3 * pw):
+            hist = conv_states[ridx, c].float()
+            x = mixed_qkv[n, c].float()
+            w = conv_weights[c].float()
+            value = hist[0] * w[0] + hist[1] * w[1] + hist[2] * w[2] + x * w[3]
+            qkv[c] = value * (1.0 / (1.0 + torch.exp(-value)))
+        if widx >= 0:
+            next_conv[widx, :, 0] = conv_states[ridx, :, 1]
+            next_conv[widx, :, 1] = conv_states[ridx, :, 2]
+            next_conv[widx, :, 2] = mixed_qkv[n, :]
+        for h in range(heads):
+            q = qkv[h * dim : (h + 1) * dim]
+            k = qkv[pw + h * dim : pw + (h + 1) * dim]
+            v = qkv[2 * pw + h * dim : 2 * pw + (h + 1) * dim]
+            raw_gate = (
+                f_b_weight[h * dim : (h + 1) * dim].float()
+                @ f_a_out[n].float()
+            ).to(f_a_out.dtype).float()
+            gate = raw_gate + dt_bias[h * dim : (h + 1) * dim].float()
+            if lower_bound is not None:
+                log_decay = lower_bound / (1.0 + torch.exp(-(a_value[h] * gate)))
+            else:
+                softplus = torch.maximum(gate, torch.zeros_like(gate)) + torch.log(
+                    1.0 + torch.exp(-torch.abs(gate))
+                )
+                log_decay = -a_value[h] * softplus
+            decay = torch.exp(log_decay)
+            q_scale = torch.rsqrt((q * q).sum() + 1e-6) * (dim**-0.5)
+            k_scale = torch.rsqrt((k * k).sum() + 1e-6)
+            qh = q * q_scale
+            kh = k * k_scale
+            key_query = (q * k).sum() * q_scale * k_scale
+            running = state_pool[ridx, h].float() * decay[None, :]
+            prediction = (running * kh[None, :]).sum(dim=1)
+            delta = beta[h] * (v - prediction)
+            prior_output = (running * qh[None, :]).sum(dim=1)
+            panel_out = prior_output + delta * key_query
+            updated = running + delta[:, None] * kh[None, :]
+            if widx >= 0:
+                next_state[widx, h] = updated
+            out_sumsq = (panel_out * panel_out).sum()
+            inverse_rms = torch.rsqrt(out_sumsq / dim + norm_eps)
+            gate_v = output_gate[n, h * dim : (h + 1) * dim].float()
+            weight = norm_weight.float()
+            out[0, n, h] = (
+                panel_out * inverse_rms * weight * torch.sigmoid(gate_v)
+            ).to(mixed_qkv.dtype)
+    return out, next_conv, next_state
+
+
+@pytest.mark.gpu
+def test_gpu_kda_fused_decode_matches_reference():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import kda_decode as ts_kda
+
+    torch.manual_seed(13)
+    batch, heads, dim, pages = 5, 12, 128, 9
+    pw = heads * dim
+    mixed_qkv = torch.randn(batch, 3 * pw, device="cuda", dtype=torch.bfloat16) * 0.5
+    conv_weights = torch.randn(3 * pw, 4, device="cuda", dtype=torch.bfloat16) * 0.2
+    conv_states = torch.randn(
+        pages, 3 * pw, 3, device="cuda", dtype=torch.bfloat16
+    ) * 0.3
+    f_a_out = torch.randn(batch, dim, device="cuda", dtype=torch.bfloat16)
+    f_b_weight = torch.randn(pw, dim, device="cuda", dtype=torch.bfloat16) * 0.05
+    beta_logits = torch.randn(batch, heads, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.randn(heads, device="cuda", dtype=torch.float32)
+    dt_bias = torch.randn(pw, device="cuda", dtype=torch.float32) * 0.1
+    output_gate = torch.randn(batch, pw, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    state_pool = torch.randn(
+        pages, heads, dim, dim, device="cuda", dtype=torch.float32
+    ) * 0.05
+    read_indices = torch.tensor([0, 1, 2, -1, 4], dtype=torch.int32, device="cuda")
+    write_indices = torch.tensor([0, 1, -1, 3, 4], dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+
+    ref_out, ref_conv, ref_state = _kda_fused_decode_reference(
+        mixed_qkv, conv_weights, conv_states, f_a_out, f_b_weight, beta_logits,
+        a_log, dt_bias, output_gate, norm_weight, state_pool, read_indices,
+        write_indices,
+    )
+    conv_pool = conv_states.clone()
+    state_pool_k = state_pool.clone()
+    out = ts_kda.gluon_kda_fused_decode_gfx950(
+        mixed_qkv, conv_weights, conv_pool, f_a_out, f_b_weight, beta_logits,
+        a_log, dt_bias, output_gate, norm_weight, 1e-5,
+        state_pool=state_pool_k, read_indices=read_indices,
+        write_indices=write_indices, num_heads=heads, head_dim=dim,
+        cu_seqlens=cu_seqlens, lower_bound=None,
+    )
+    # padded read row (index 3) must produce zeros
+    assert torch.equal(out[0, 3], torch.zeros_like(out[0, 3]))
+    valid = torch.tensor([True, True, True, False, True])
+    assert torch.allclose(
+        out[0][valid].float(), ref_out[0][valid].float(), atol=3e-2, rtol=3e-2
+    )
+    assert torch.equal(conv_pool, ref_conv)
+    assert torch.allclose(state_pool_k, ref_state, atol=2e-3, rtol=1e-3)
+
+
 @pytest.mark.gpu
 def test_gpu_kda_fused_decode_smoke():
     """Compile/launch smoke for the vendored KDA fused decode on gfx942.

@@ -1,0 +1,559 @@
+{
+  "env": {
+    "torch": "2.9.0a0+git7bcbafe",
+    "hip": "7.0.51831-a3e329ad8",
+    "device": "AMD Instinct MI300A",
+    "capability": [
+      9,
+      4
+    ],
+    "triton": "3.8.0",
+    "gluon": true,
+    "gluon_amd_cdna4": true,
+    "gluon_features": {
+      "gluon": true,
+      "constexpr_function": true,
+      "associative_scan": true,
+      "amd_cdna4": true
+    },
+    "aiter": true
+  },
+  "date": "2026-10-10T17:20:08",
+  "results": [
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 1,
+        "E": 128,
+        "topk": 16
+      },
+      "gluon": {
+        "us_median": 51.28,
+        "us_p10": 49.48,
+        "us_p90": 57.84
+      },
+      "torch": {
+        "us_median": 133.8,
+        "us_p10": 128.76,
+        "us_p90": 155.32
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 1,
+        "E": 384,
+        "topk": 16
+      },
+      "gluon": {
+        "us_median": 52.58,
+        "us_p10": 50.28,
+        "us_p90": 57.92
+      },
+      "torch": {
+        "us_median": 135.6,
+        "us_p10": 131.08,
+        "us_p90": 161.52
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 8,
+        "E": 256,
+        "topk": 16
+      },
+      "gluon": {
+        "us_median": 50.38,
+        "us_p10": 48.6,
+        "us_p90": 56.0
+      },
+      "torch": {
+        "us_median": 137.16,
+        "us_p10": 134.8,
+        "us_p90": 158.76
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 16,
+        "E": 128,
+        "topk": 8
+      },
+      "gluon": {
+        "us_median": 52.46,
+        "us_p10": 49.88,
+        "us_p90": 123.76
+      },
+      "torch": {
+        "us_median": 139.16,
+        "us_p10": 136.24,
+        "us_p90": 171.96
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 64,
+        "E": 384,
+        "topk": 2
+      },
+      "gluon": {
+        "us_median": 54.7,
+        "us_p10": 52.84,
+        "us_p90": 61.64
+      },
+      "torch": {
+        "us_median": 137.94,
+        "us_p10": 135.52,
+        "us_p90": 146.4
+      }
+    },
+    {
+      "op": "moe_sorting",
+      "shape": {
+        "M": 8,
+        "E": 128,
+        "topk": 4,
+        "block": 16,
+        "compact": true
+      },
+      "gluon": {
+        "us_median": 97.36,
+        "us_p10": 93.32,
+        "us_p90": 112.92
+      },
+      "torch_ref": {
+        "us_median": 179.56,
+        "us_p10": 176.32,
+        "us_p90": 192.12
+      },
+      "aiter": {
+        "us_median": 46.62,
+        "us_p10": 30.64,
+        "us_p90": 64.64
+      }
+    },
+    {
+      "op": "moe_sorting",
+      "shape": {
+        "M": 8,
+        "E": 256,
+        "topk": 8,
+        "block": 16,
+        "compact": true
+      },
+      "gluon": {
+        "us_median": 89.38,
+        "us_p10": 85.08,
+        "us_p90": 100.8
+      },
+      "torch_ref": {
+        "us_median": 181.94,
+        "us_p10": 178.48,
+        "us_p90": 206.44
+      },
+      "aiter": {
+        "us_median": 40.78,
+        "us_p10": 39.52,
+        "us_p90": 44.36
+      }
+    },
+    {
+      "op": "moe_sorting",
+      "shape": {
+        "M": 64,
+        "E": 128,
+        "topk": 8,
+        "block": 64,
+        "compact": true
+      },
+      "gluon": {
+        "us_median": 88.32,
+        "us_p10": 84.08,
+        "us_p90": 96.36
+      },
+      "torch_ref": {
+        "us_median": 171.06,
+        "us_p10": 167.76,
+        "us_p90": 187.52
+      },
+      "aiter": {
+        "us_median": 31.4,
+        "us_p10": 30.28,
+        "us_p90": 33.76
+      }
+    },
+    {
+      "op": "moe_sorting",
+      "shape": {
+        "M": 512,
+        "E": 128,
+        "topk": 4,
+        "block": 64,
+        "compact": false
+      },
+      "gluon": {
+        "us_median": 114.38,
+        "us_p10": 111.44,
+        "us_p90": 127.68
+      },
+      "torch_ref": {
+        "us_median": 171.46,
+        "us_p10": 167.12,
+        "us_p90": 188.88
+      },
+      "aiter": {
+        "us_median": 37.0,
+        "us_p10": 35.8,
+        "us_p90": 39.92
+      }
+    },
+    {
+      "op": "moe_sorting",
+      "shape": {
+        "M": 4096,
+        "E": 256,
+        "topk": 8,
+        "block": 128,
+        "compact": false
+      },
+      "gluon": {
+        "us_median": 113.8,
+        "us_p10": 111.88,
+        "us_p90": 123.6
+      },
+      "torch_ref": {
+        "us_median": 200.66,
+        "us_p10": 186.6,
+        "us_p90": 258.64
+      },
+      "aiter": {
+        "us_median": 163.66,
+        "us_p10": 158.36,
+        "us_p90": 169.4
+      }
+    },
+    {
+      "op": "hadamard_128",
+      "shape": {
+        "rows": 4096
+      },
+      "gluon": {
+        "us_median": 31.58,
+        "us_p10": 30.2,
+        "us_p90": 38.08
+      },
+      "torch_matmul_fp32": {
+        "us_median": 683849.73,
+        "us_p10": 680369.45,
+        "us_p90": 690690.8
+      },
+      "effective_GBps": 66.4
+    },
+    {
+      "op": "hadamard_128",
+      "shape": {
+        "rows": 32768
+      },
+      "gluon": {
+        "us_median": 38.84,
+        "us_p10": 38.24,
+        "us_p90": 43.36
+      },
+      "torch_matmul_fp32": {
+        "us_median": 665312.53,
+        "us_p10": 661491.52,
+        "us_p90": 671188.9
+      },
+      "effective_GBps": 432.0
+    },
+    {
+      "op": "hadamard_128",
+      "shape": {
+        "rows": 262144
+      },
+      "gluon": {
+        "us_median": 155.02,
+        "us_p10": 151.04,
+        "us_p90": 168.12
+      },
+      "torch_matmul_fp32": {
+        "us_median": 669964.75,
+        "us_p10": 664767.21,
+        "us_p90": 674781.68
+      },
+      "effective_GBps": 865.8
+    },
+    {
+      "op": "mhc_pre_reduce_apply",
+      "shape": {
+        "tokens": 1,
+        "hidden": 4096,
+        "splits": 64
+      },
+      "gluon": {
+        "us_median": 37.32,
+        "us_p10": 35.68,
+        "us_p90": 42.0
+      },
+      "torch_ref": {
+        "us_median": 1156.33,
+        "us_p10": 1126.92,
+        "us_p90": 1193.0
+      }
+    },
+    {
+      "op": "mhc_pre_reduce_apply",
+      "shape": {
+        "tokens": 8,
+        "hidden": 4096,
+        "splits": 64
+      },
+      "gluon": {
+        "us_median": 38.82,
+        "us_p10": 37.04,
+        "us_p90": 50.4
+      },
+      "torch_ref": {
+        "us_median": 1174.98,
+        "us_p10": 1143.96,
+        "us_p90": 1220.25
+      }
+    },
+    {
+      "op": "mhc_pre_reduce_apply",
+      "shape": {
+        "tokens": 64,
+        "hidden": 4096,
+        "splits": 64
+      },
+      "gluon": {
+        "us_median": 38.9,
+        "us_p10": 37.72,
+        "us_p90": 44.32
+      },
+      "torch_ref": {
+        "us_median": 1203.12,
+        "us_p10": 1173.85,
+        "us_p90": 1233.25
+      }
+    },
+    {
+      "op": "mhc_pre_full_chain",
+      "shape": {
+        "tokens": 1,
+        "hidden": 4096
+      },
+      "gluon": {
+        "us_median": 105.42,
+        "us_p10": 99.36,
+        "us_p90": 116.64
+      },
+      "aiter": {
+        "us_median": 63.78,
+        "us_p10": 61.96,
+        "us_p90": 68.28
+      }
+    },
+    {
+      "op": "mhc_pre_full_chain",
+      "shape": {
+        "tokens": 8,
+        "hidden": 4096
+      },
+      "gluon": {
+        "us_median": 105.96,
+        "us_p10": 103.84,
+        "us_p90": 118.52
+      },
+      "aiter": {
+        "us_median": 61.58,
+        "us_p10": 59.52,
+        "us_p90": 64.68
+      }
+    },
+    {
+      "op": "mhc_pre_full_chain",
+      "shape": {
+        "tokens": 64,
+        "hidden": 4096
+      },
+      "gluon": {
+        "us_median": 104.46,
+        "us_p10": 101.4,
+        "us_p90": 115.88
+      },
+      "aiter": {
+        "us_median": 59.34,
+        "us_p10": 57.52,
+        "us_p90": 66.68
+      }
+    },
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 1,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 73.92,
+        "us_p10": 72.0,
+        "us_p90": 80.68
+      },
+      "vllm_kda_amd_packed (recur+gate only)": "error: ValueError('`out` must have shape (1, 1, 12, 128) (got out.shape=(1, 12, 128)).')"
+    },
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 4,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 74.98,
+        "us_p10": 73.32,
+        "us_p90": 80.44
+      },
+      "vllm_kda_amd_packed (recur+gate only)": "error: ValueError('`out` must have shape (4, 1, 12, 128) (got out.shape=(4, 12, 128)).')"
+    },
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 8,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 75.96,
+        "us_p10": 74.4,
+        "us_p90": 114.92
+      },
+      "vllm_kda_amd_packed (recur+gate only)": "error: ValueError('`out` must have shape (8, 1, 12, 128) (got out.shape=(8, 12, 128)).')"
+    },
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 16,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 78.58,
+        "us_p10": 76.36,
+        "us_p90": 85.52
+      },
+      "vllm_kda_amd_packed (recur+gate only)": "error: ValueError('`out` must have shape (16, 1, 12, 128) (got out.shape=(16, 12, 128)).')"
+    },
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 32,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 88.36,
+        "us_p10": 86.12,
+        "us_p90": 93.12
+      },
+      "vllm_kda_amd_packed (recur+gate only)": "error: ValueError('`out` must have shape (32, 1, 12, 128) (got out.shape=(32, 12, 128)).')"
+    },
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 64,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 106.72,
+        "us_p10": 103.32,
+        "us_p90": 112.64
+      },
+      "vllm_kda_amd_packed (recur+gate only)": "error: ValueError('`out` must have shape (64, 1, 12, 128) (got out.shape=(64, 12, 128)).')"
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 1,
+        "N": 32768
+      },
+      "torch": {
+        "us_median": 21.9,
+        "us_p10": 18.92,
+        "us_p90": 28.96
+      },
+      "gluon": {
+        "us_median": 40.84,
+        "us_p10": 37.8,
+        "us_p90": 54.52
+      }
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 8,
+        "N": 131072
+      },
+      "torch": {
+        "us_median": 43.02,
+        "us_p10": 41.8,
+        "us_p90": 44.56
+      },
+      "gluon": {
+        "us_median": 55.68,
+        "us_p10": 52.28,
+        "us_p90": 63.32
+      }
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 64,
+        "N": 151936
+      },
+      "torch": {
+        "us_median": 53.64,
+        "us_p10": 51.28,
+        "us_p90": 65.52
+      },
+      "gluon": {
+        "us_median": 59.66,
+        "us_p10": 56.8,
+        "us_p90": 65.24
+      }
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 8,
+        "N": 262144
+      },
+      "torch": {
+        "us_median": 92.98,
+        "us_p10": 91.72,
+        "us_p90": 100.52
+      },
+      "gluon": {
+        "us_median": 54.18,
+        "us_p10": 50.76,
+        "us_p90": 63.28
+      }
+    },
+    {
+      "op": "scale_swizzle_cdna4 (host/torch)",
+      "shape": {
+        "rows": 368640,
+        "k_scale": 90
+      },
+      "torch": {
+        "us_median": 915.38,
+        "us_p10": 907.76,
+        "us_p90": 924.52
+      }
+    }
+  ]
+}

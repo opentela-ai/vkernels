@@ -191,6 +191,31 @@ aiter intact, **32/32 tokenspeed_amd tests pass with no PYTHONPATH
 tricks**. The CSCS request (`infra-request-triton38.md`) is now only
 about the *production serving* image adopting triton ≥ 3.8.
 
+### KDA fused decode: parity + bench (bucket-2 first kernel landed)
+
+`kda/decode.py` parity landed: an eager fp32 oracle mirrors the kernel's
+exact op order (silu conv on bf16-moved history, bf16-rounded low-rank
+decay gate, delta rule on L2-normalized q/k with V-major state, gated
+RMSNorm output, padding/negative-index semantics) — output, conv-state
+and state-pool all match on MI300A (first run, `results-kda.json`, jobs
+675578/675583). Bench (wrapper-inclusive end-to-end timings, both sides
+carry comparable python validation overhead):
+
+| batch | gluon fused (conv+gate+recur+norm) | vllm_kda_amd packed (gate+recur only) |
+|---:|---:|---:|
+| 1 | 78.6 µs | 75.1 µs |
+| 4 | 75.6 µs | 74.0 µs |
+| 8 | 76.3 µs | 74.2 µs |
+| 16 | 79.7 µs | 77.3 µs |
+| 32 | 89.8 µs | 89.3 µs |
+| 64 | 111.2 µs | 99.0 µs |
+
+**Verdict: the fusion is nearly free** — the gluon kernel adds the conv
+update and the gated-RMSNorm output on top of the packed decode's scope
+for ~1.5% at decode batches ≤ 32 (12% at 64), removing two kernel
+launches and their intermediate traffic from the serving path. All
+beverin runs in this section use the self-service triton-3.8 container.
+
 ## Artifacts
 
 - `results-triton38.json` — first full run (job 675351)

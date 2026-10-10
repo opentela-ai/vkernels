@@ -379,6 +379,70 @@ def bench_mhc(results: list) -> None:
 # --- argmax -------------------------------------------------------------------------
 
 
+def bench_kda(results: list) -> None:
+    """Gluon K3 fused decode (conv+gate+recurrence+norm) vs our Triton
+    ``vllm_kda_amd`` packed decode (gate+recurrence+L2norm only — no conv,
+    no output norm), same batch/heads/dim and state-pool layout."""
+    from vkernels.torch_ops.tokenspeed_amd import kda_decode as ts_kda
+    from vkernels.torch_ops import vllm_kda_amd
+
+    torch.manual_seed(14)
+    heads, dim = 12, 128
+    for batch in (1, 4, 8, 16, 32, 64):
+        pw = heads * dim
+        pages = batch + 4
+        mixed_qkv = torch.randn(batch, 3 * pw, device="cuda", dtype=torch.bfloat16) * 0.5
+        conv_weights = torch.randn(3 * pw, 4, device="cuda", dtype=torch.bfloat16) * 0.2
+        conv_states = torch.randn(pages, 3 * pw, 3, device="cuda", dtype=torch.bfloat16) * 0.3
+        f_a_out = torch.randn(batch, dim, device="cuda", dtype=torch.bfloat16)
+        f_b_weight = torch.randn(pw, dim, device="cuda", dtype=torch.bfloat16) * 0.05
+        beta_logits = torch.randn(batch, heads, device="cuda", dtype=torch.bfloat16)
+        a_log = torch.randn(heads, device="cuda")
+        dt_bias = torch.randn(pw, device="cuda") * 0.1
+        output_gate = torch.randn(batch, pw, device="cuda", dtype=torch.bfloat16)
+        norm_weight = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+        state_pool = torch.randn(pages, heads, dim, dim, device="cuda") * 0.05
+        read_idx = torch.arange(batch, dtype=torch.int32, device="cuda")
+        write_idx = torch.arange(batch, dtype=torch.int32, device="cuda")
+        cu = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+
+        def gluon_fn():
+            ts_kda.gluon_kda_fused_decode_gfx950(
+                mixed_qkv, conv_weights, conv_states, f_a_out, f_b_weight,
+                beta_logits, a_log, dt_bias, output_gate, norm_weight, 1e-5,
+                state_pool=state_pool, read_indices=read_idx,
+                write_indices=write_idx, num_heads=heads, head_dim=dim,
+                cu_seqlens=cu, lower_bound=None,
+            )
+
+        gluon_fn()  # smoke
+        entry = {
+            "op": "kda_fused_decode",
+            "shape": {"batch": batch, "heads": heads, "dim": dim},
+            "gluon_fused": time_fn(gluon_fn),
+        }
+        try:
+            a_head = torch.randn(batch, heads, device="cuda") * 0.1
+            dt_head = torch.randn(heads, device="cuda") * 0.1
+            vllm_out = torch.empty(batch, 1, heads, dim, device="cuda", dtype=torch.bfloat16)
+            vllm_kda_amd.fused_recurrent_gated_delta_rule_packed_decode(
+                mixed_qkv, a_head, beta_logits.float(), a_log, dt_head,
+                dim**-0.5, state_pool, vllm_out, read_idx,
+                use_qk_l2norm_in_kernel=True,
+            )
+            torch.cuda.synchronize()
+            entry["vllm_kda_amd_packed (recur+gate only)"] = time_fn(
+                lambda: vllm_kda_amd.fused_recurrent_gated_delta_rule_packed_decode(  # noqa: B023
+                    mixed_qkv, a_head, beta_logits.float(), a_log, dt_head,
+                    dim**-0.5, state_pool, vllm_out, read_idx,
+                    use_qk_l2norm_in_kernel=True,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            entry["vllm_kda_amd_packed (recur+gate only)"] = f"error: {exc!r}"[:120]
+        results.append(entry)
+
+
 def bench_argmax(results: list) -> None:
     from vkernels.torch_ops.tokenspeed_amd import argmax as ts_argmax
 
@@ -440,6 +504,7 @@ def main() -> int:
         "hadamard": bench_hadamard,
         "mhc": bench_mhc,
         "mhc_chain": bench_mhc_chain,
+        "kda": bench_kda,
         "argmax": bench_argmax,
         "scale": bench_scale_swizzle,
     }
