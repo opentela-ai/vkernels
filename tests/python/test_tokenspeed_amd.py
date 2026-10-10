@@ -981,7 +981,6 @@ def _kda_replay_reference(
                 for t in range(steps):
                     tok = n * draft_token_num + t
                     row = conv_rows[t]
-                    q = row[h * dim : (h + 1) * dim]
                     k = row[pw + h * dim : pw + (h + 1) * dim]
                     v = row[2 * pw + h * dim : 2 * pw + (h + 1) * dim]
                     gate = raw_g[tok, h * dim : (h + 1) * dim].float() + dt_bias[
@@ -1072,6 +1071,32 @@ def test_gpu_kda_fused_replay_matches_reference():
             per_layer[layer][7].float(), ref_layer[layer][7].float(),
             atol=2e-3, rtol=1e-3,
         ), ("state pool", layer)
+
+
+@pytest.mark.gpu
+def test_gpu_sigmoid_routing_matches_reference():
+    """The generic (non-cdna4) sigmoid-bias decode router vs torch noaux_tc."""
+    _gluon_driver()
+    torch.manual_seed(19)
+    for m, e, topk in ((1, 128, 8), (8, 256, 8), (16, 384, 8)):
+        logits = torch.randn(m, e, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(e, device="cuda", dtype=torch.float32)
+        ids, weights = ts_routing.invoke_sigmoid_bias_topk_route_gluon(
+            logits, bias, topk, routed_scaling_factor=2.5,
+            normalize_topk_weights=True,
+        )
+        # kernel contract: sigmoid scores round to the router dtype (bf16)
+        # BEFORE the bias add, top-k choice, and normalization
+        scores = torch.sigmoid(logits.float()).to(torch.bfloat16).float()
+        choice = scores + bias
+        sel = torch.topk(choice, topk, dim=-1).indices
+        rows = torch.arange(m, device="cuda")[:, None]
+        w = scores[rows, sel]
+        w = w / w.sum(dim=-1, keepdim=True) * 2.5
+        assert torch.equal(ids.to(torch.int64), sel), (m, e, topk)
+        got = weights.to(torch.bfloat16).float()
+        ref = w.to(torch.bfloat16).float()
+        assert torch.allclose(got, ref, atol=2e-2, rtol=2e-2), (m, e, topk)
 
 
 @pytest.mark.gpu

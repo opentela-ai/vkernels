@@ -195,6 +195,25 @@ for the full density scan.
   no-store contract): passes on MI300A first run after the call-signature
   fix (job 675645). Remaining variant: replay (uint64 pointer descriptors).
 
+## Sigmoid (noaux_tc) decode routing verified — floe integration recipe
+
+``invoke_sigmoid_bias_topk_route_gluon`` (the generic, non-cdna4 single-CTA
+sigmoid router — GLM53's ``TopkRouter`` semantics) is parity-verified on
+MI300A for M ∈ {1, 8, 16}, E ∈ {128, 256, 384}, topk=8 (job 675713). The
+contract detail that flips selections at E=384: sigmoid scores round to
+the router dtype (bf16) BEFORE the bias add, top-k choice, and
+normalization — the eager reference must apply the same rounding.
+
+Floe wiring (sibling repo, ``glm53flash/forward.py``): add an opt-in knob
+beside ``fused_router`` (e.g. ``gluon_router``) that replaces the eager
+sigmoid+bias+topk+gather+normalize+scale chain with
+``vkernels.torch_ops.tokenspeed_amd.routing.
+invoke_sigmoid_bias_topk_route_gluon(logits, e_score_correction_bias,
+topk, routed_scaling_factor=...)`` when gluon ≥ 3.8 is present
+(``gluon_available()``) and M·topk ≤ 128 (decode batches). Decode-batch
+router glue measured ~140 µs/layer eager vs ~47 µs single-launch —
+~93 µs/layer × 42 MoE layers on the table.
+
 ## Replay variant: parity landed (the KDA family is now fully verified)
 
 ``launch_gluon_kda_fused_replay_gfx950`` parity-verified on MI300A (jobs
