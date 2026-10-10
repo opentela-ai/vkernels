@@ -263,6 +263,19 @@ MI300A** (ragged seqs {16+48, 8+120}, 8/2 heads); one reference-side
 fix (bias clamps over all keys; future keys' bias is hidden by the
 causal mask).
 
+## MHA extend: ragged paged extend + split-K — the script-transform template
+
+``mha_extend.py`` — upstream's 1142-line ragged paged extend (GQA
+head-group M packing, ragged/rectangular grid binary-search resolution,
+split-K partials + wave-tile reduce, sinks/LSE) transformed onto the
+CDNA3 scaffold **by scripted substitution** rather than hand
+transcription: imports -> shim, `attention_layouts` -> the CDNA3 v2
+`[32,32,8]` variant, K smem allocation transposed + permuted stores +
+no-permuted-read, async waits deleted, `cdna4.mfma` -> `amd.cdna3.mfma`,
+SM-count -> device CUs. The transform script is the template for the
+remaining same-recipe families. **Parity on MI300A on the first GPU
+run** (ragged seqs {16+48, 8+120, 40+24}, 8/2 heads, causal).
+
 ## Round-3 follow-ups (same effort)
 
 - **MLA prefill xfail resolved** — the MI300A divergence was a test-reference
