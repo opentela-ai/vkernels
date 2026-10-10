@@ -830,6 +830,108 @@ def test_gpu_dsa_fp8_decode_topk_smoke():
         assert bool((out[t, n:] == -1).all())
 
 
+def _kda_fused_verify_reference(
+    mixed_qkv, conv_weights, conv_pool, raw_g, beta_logits, a_log, dt_bias,
+    state_pool, read_indices, draft_token_num, lower_bound=None,
+):
+    """Eager fp32 oracle for ``gluon_kda_fused_verify_gfx950`` (no-store)."""
+    batch = read_indices.numel()
+    tokens = batch * draft_token_num
+    heads, dim = 12, 128
+    pw = heads * dim
+    out = torch.zeros(1, tokens, heads, dim, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    a_value = torch.exp(a_log.float())
+    for n in range(batch):
+        ridx = int(read_indices[n])
+        if ridx < 0 or ridx >= state_pool.shape[0]:
+            continue
+        qkv_rows = []
+        h0 = conv_pool[ridx, :, 0].float()
+        h1 = conv_pool[ridx, :, 1].float()
+        h2 = conv_pool[ridx, :, 2].float()
+        w = conv_weights.float()  # [3*pw, 4]
+        for t in range(draft_token_num):
+            tok = n * draft_token_num + t
+            x = mixed_qkv[tok].float()
+            value = h0 * w[:, 0] + h1 * w[:, 1] + h2 * w[:, 2] + x * w[:, 3]
+            qkv_rows.append(value * (1.0 / (1.0 + torch.exp(-value))))
+            h0, h1, h2 = h1, h2, x
+        for h in range(heads):
+            running = state_pool[ridx, h].float().clone()
+            for t in range(draft_token_num):
+                tok = n * draft_token_num + t
+                row = qkv_rows[t]
+                q = row[h * dim : (h + 1) * dim]
+                k = row[pw + h * dim : pw + (h + 1) * dim]
+                v = row[2 * pw + h * dim : 2 * pw + (h + 1) * dim]
+                gate = raw_g[tok, h * dim : (h + 1) * dim].float() + dt_bias[
+                    h * dim : (h + 1) * dim
+                ].float()
+                if lower_bound is not None:
+                    log_decay = lower_bound / (1.0 + torch.exp(-(a_value[h] * gate)))
+                else:
+                    softplus = torch.maximum(gate, torch.zeros_like(gate)) + torch.log(
+                        1.0 + torch.exp(-torch.abs(gate))
+                    )
+                    log_decay = -a_value[h] * softplus
+                decay = torch.exp(log_decay)
+                q_scale = torch.rsqrt((q * q).sum() + 1e-6) * (dim**-0.5)
+                k_scale = torch.rsqrt((k * k).sum() + 1e-6)
+                qh = q * q_scale
+                kh = k * k_scale
+                key_query = (qh * kh).sum()
+                beta = torch.sigmoid(beta_logits[tok, h].float())
+                running *= decay[None, :]
+                prediction = (running * kh[None, :]).sum(dim=1)
+                delta = beta * (v - prediction)
+                prior_output = (running * qh[None, :]).sum(dim=1)
+                running += delta[:, None] * kh[None, :]
+                out[0, tok, h] = (prior_output + delta * key_query).to(mixed_qkv.dtype)
+    return out
+
+
+@pytest.mark.gpu
+def test_gpu_kda_fused_verify_matches_reference():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import kda_decode as ts_kda
+
+    torch.manual_seed(17)
+    batch, heads, dim, draft = 4, 12, 128, 3
+    pw = heads * dim
+    pages = batch + 3
+    tokens = batch * draft
+    mixed_qkv = torch.randn(tokens, 3 * pw, device="cuda", dtype=torch.bfloat16) * 0.5
+    conv_weights = torch.randn(3 * pw, 4, device="cuda", dtype=torch.bfloat16) * 0.2
+    conv_pool = torch.randn(pages, 3 * pw, 3, device="cuda", dtype=torch.bfloat16) * 0.3
+    raw_g = torch.randn(tokens, pw, device="cuda", dtype=torch.bfloat16) * 0.5
+    beta_logits = torch.randn(tokens, heads, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.randn(heads, device="cuda")
+    dt_bias = torch.randn(pw, device="cuda") * 0.1
+    state_pool = torch.randn(pages, heads, dim, dim, device="cuda") * 0.05
+    read_indices = torch.tensor([0, 1, -1, 3], dtype=torch.int32, device="cuda")
+    ref = _kda_fused_verify_reference(
+        mixed_qkv, conv_weights, conv_pool, raw_g, beta_logits, a_log, dt_bias,
+        state_pool, read_indices, draft,
+    )
+    pool_before = state_pool.clone()
+    out = ts_kda.gluon_kda_fused_verify_gfx950(
+        mixed_qkv, conv_weights, conv_pool, None, raw_g, beta_logits, a_log,
+        dt_bias, state_pool=state_pool, state_scratch=None,
+        read_indices=read_indices, write_indices=read_indices,
+        num_heads=heads, head_dim=dim, draft_token_num=draft,
+        lower_bound=None,
+    )
+    # no-store contract: the pools must be untouched
+    assert torch.equal(state_pool, pool_before)
+    assert out.shape == (1, tokens, heads, dim)
+    valid = read_indices >= 0
+    valid_tok = valid.repeat_interleave(draft)
+    assert torch.equal(out[0, ~valid_tok], torch.zeros_like(out[0, ~valid_tok]))
+    assert torch.allclose(
+        out[0][valid_tok].float(), ref[0][valid_tok].float(), atol=3e-2, rtol=3e-2
+    )
+
+
 @pytest.mark.gpu
 def test_gpu_kda_fused_decode_smoke():
     """Compile/launch smoke for the vendored KDA fused decode on gfx942.
