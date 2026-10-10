@@ -1,0 +1,27 @@
+# verifier/gpu/Dockerfile.gpuverify — amd64 userland for the GPUVerify bundle.
+#
+# GPUVerify 2018 bundles native x86-64 tools (clang/opt/bugle/z3) plus .NET
+# Boogie executables; its Python driver is Python 2.  This image provides the
+# runtime those need so the whole toolchain runs under amd64 emulation on an
+# aarch64 host (requires amd64 binfmt; see gpuverify.sh).
+#
+#   docker run --privileged --rm tonistiigi/binfmt --install amd64
+#   docker build --platform linux/amd64 -t gpuverify-amd64 verifier/gpu
+FROM ubuntu:20.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+# python2 + pip + psutil: GPUVerify.py is Python 2 and imports psutil.
+# mono-devel: the Boogie VC generator / cruncher are managed .NET assemblies.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python2 python2-dev mono-devel ca-certificates gcc libc6-dev curl \
+ && ln -sf /usr/bin/python2 /usr/bin/python \
+ && curl -sSL https://bootstrap.pypa.io/pip/2.7/get-pip.py -o /tmp/get-pip.py \
+ && python2 /tmp/get-pip.py \
+ && python2 -m pip install --no-cache-dir "psutil<6" \
+ && rm -rf /var/lib/apt/lists/* /tmp/get-pip.py
+
+# The bundled 2018 clang links against ncurses5/libtinfo5, which 20.04 dropped.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libtinfo5 libncurses5 \
+ && rm -rf /var/lib/apt/lists/*

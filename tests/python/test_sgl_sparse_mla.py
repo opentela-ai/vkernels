@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 from vkernels.torch_ops import sgl_sparse_mla as S
 

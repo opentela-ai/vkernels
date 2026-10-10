@@ -28,6 +28,14 @@ coverage:
 	ctest --preset coverage
 	python3 meta/scripts/coverage.py --build-dir build/coverage --source-dir src/c --min 100
 
+# Formal verification (verifier/) — opt-in; each runner skips (exit 77)
+# when its prover is absent.  Never part of the production build.  A skip is
+# not a failure; a failed proof still fails the target.
+verify:
+	@rc=0; for s in bmc smt gpu numerics; do \
+	  verifier/$$s/run.sh || { r=$$?; [ $$r -eq 77 ] || rc=$$r; }; \
+	done; exit $$rc
+
 clean:
 	rm -rf build/$(P)
 
@@ -63,4 +71,4 @@ py-lock:
 rust-test:
 	cargo test --manifest-path src/rust/Cargo.toml
 
-.PHONY: configure build test coverage clean fmt tidy vkl py-test py-sync py-lock rust-test
+.PHONY: configure build test coverage verify clean fmt tidy vkl py-test py-sync py-lock rust-test

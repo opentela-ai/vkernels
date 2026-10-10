@@ -454,3 +454,138 @@ def _t_kda_heads_batched(
         tl.store(out_ptr + bb.to(tl.int64) * (H * V) + h * V + offs_v, o)
         task += P
 
+
+
+@triton.jit
+def _t_kda_fused(
+    worker: tl.int32,
+    P: tl.int32,
+    conv_ptr,  # [slots, Kw, Cc] TIME-MAJOR pool (bf16-grid values, fp32 storage)
+    ssm_ptr,  # [slots, H, V, K] V-MAJOR fp32 pool (inner [V, K] contiguous)
+    ids_ptr,  # i32 [B] slot table; -1 = padded slot (zero out row, pools untouched)
+    qkv_ptr,  # [B, Cc] RAW pre-conv fused q|k|v projection row
+    f_ptr,  # [B, H, K] RAW f_b(f_a(x)) dots
+    b_ptr,  # [B, H] RAW b_proj dots
+    g_ptr,  # [B, H, V] RAW g_b(g_a(x)) o-norm gate dots
+    taps_ptr,  # [Kt, Cc] TIME-MAJOR fp32 conv taps
+    dtb_ptr,  # [H, K]
+    alog_ptr,  # [H]
+    onorm_ptr,  # [V] shared across heads
+    out_ptr,  # [B, H, V] bf16-grid values
+    B: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,  # K = V = D (KDA heads are square)
+    CC: tl.constexpr,  # 3 * H * D
+    KW: tl.constexpr,  # conv state width (taps - 1)
+    scale: tl.constexpr,
+    eps: tl.constexpr,
+    lower_bound: tl.constexpr,  # float; NaN sentinel selects the softplus branch
+):
+    """E1 fused KDA decode-step task body (megakernel Lever E1): conv update
+    + element-wise-decay delta rule + sigmoid-gated per-head RMSNorm in ONE
+    task per (batch row, head), under the fused-decode contract of the CUDA
+    oracle ``vkernels.torch_ops.glm_kda_fused_decode`` — the same ABI the
+    compiled ``kda_fused_decode`` op pins:
+
+    * RAW dot contract: the q|k|v row stripes and the f/b/gate dots are
+      rounded to the bf16 grid at task entry (``.to(bf16).to(f32)`` =
+      cvt.rn), and beta / the o-norm gate sigmoid apply AFTER the round;
+    * conv: fp32 time-major taps over the bf16-valued w-major window; the
+      SiLU output is NOT rounded before the recurrence; the pool shift
+      ``[old w1, old w2, new raw x]`` moves the (already bf16-grid) values;
+    * state pool V-MAJOR ``[slots, H, V, K]`` fp32 (the transpose of
+      ``_t_kda_heads_batched``'s [B, H, K, V] pool — layout only): decay
+      per (head, k) broadcasts over v-rows;
+    * out row stored on the bf16 grid (the kernel's out ABI);
+    * ``-1`` slot ids are padded slots: zero output row, pools untouched.
+    """
+    offs = tl.arange(0, D)
+    seg: tl.constexpr = CC // 3
+    task = worker
+    while task < B * H:
+        bb = task // H
+        h = task % H
+        slot = tl.load(ids_ptr + bb).to(tl.int64)
+        if slot >= 0:
+            q_cols = h * D + offs
+            k_cols = seg + h * D + offs
+            v_cols = 2 * seg + h * D + offs
+            # --- RAW dot ABI: bf16 round at entry -------------------------
+            xq = tl.load(qkv_ptr + bb.to(tl.int64) * CC + q_cols, cache_modifier=".cg").to(tl.float32)
+            xk = tl.load(qkv_ptr + bb.to(tl.int64) * CC + k_cols, cache_modifier=".cg").to(tl.float32)
+            xv = tl.load(qkv_ptr + bb.to(tl.int64) * CC + v_cols, cache_modifier=".cg").to(tl.float32)
+            xq = xq.to(tl.bfloat16).to(tl.float32)
+            xk = xk.to(tl.bfloat16).to(tl.float32)
+            xv = xv.to(tl.bfloat16).to(tl.float32)
+            # --- depthwise FIR over the w-major window (fp32 taps) --------
+            cbase = slot * (KW * CC)
+            acc_q = tl.zeros([D], tl.float32)
+            acc_k = tl.zeros([D], tl.float32)
+            acc_v = tl.zeros([D], tl.float32)
+            for w in tl.static_range(KW):
+                tq = tl.load(taps_ptr + w * CC + q_cols).to(tl.float32)
+                tk = tl.load(taps_ptr + w * CC + k_cols).to(tl.float32)
+                tv = tl.load(taps_ptr + w * CC + v_cols).to(tl.float32)
+                sq = tl.load(conv_ptr + cbase + w * CC + q_cols, cache_modifier=".cg")
+                sk = tl.load(conv_ptr + cbase + w * CC + k_cols, cache_modifier=".cg")
+                sv = tl.load(conv_ptr + cbase + w * CC + v_cols, cache_modifier=".cg")
+                acc_q += tq * sq
+                acc_k += tk * sk
+                acc_v += tv * sv
+                if w < KW - 1:  # shift: pool[w] <- pool[w+1]
+                    nq = tl.load(conv_ptr + cbase + (w + 1) * CC + q_cols, cache_modifier=".cg")
+                    nk = tl.load(conv_ptr + cbase + (w + 1) * CC + k_cols, cache_modifier=".cg")
+                    nv = tl.load(conv_ptr + cbase + (w + 1) * CC + v_cols, cache_modifier=".cg")
+                    tl.store(conv_ptr + cbase + w * CC + q_cols, nq)
+                    tl.store(conv_ptr + cbase + w * CC + k_cols, nk)
+                    tl.store(conv_ptr + cbase + w * CC + v_cols, nv)
+            tq = tl.load(taps_ptr + KW * CC + q_cols).to(tl.float32)
+            tk = tl.load(taps_ptr + KW * CC + k_cols).to(tl.float32)
+            tv = tl.load(taps_ptr + KW * CC + v_cols).to(tl.float32)
+            acc_q += tq * xq
+            acc_k += tk * xk
+            acc_v += tv * xv
+            tl.store(conv_ptr + cbase + (KW - 1) * CC + q_cols, xq)
+            tl.store(conv_ptr + cbase + (KW - 1) * CC + k_cols, xk)
+            tl.store(conv_ptr + cbase + (KW - 1) * CC + v_cols, xv)
+            # SiLU in fp32; NOT rounded before the recurrence (the contract)
+            q = acc_q / (1.0 + tl.exp(-acc_q))
+            k = acc_k / (1.0 + tl.exp(-acc_k))
+            v = acc_v / (1.0 + tl.exp(-acc_v))
+            # --- gate conditioning on the RAW dots (rounds first) ----------
+            f_raw = tl.load(f_ptr + bb.to(tl.int64) * (H * D) + h * D + offs, cache_modifier=".cg").to(tl.float32)
+            f_raw = f_raw.to(tl.bfloat16).to(tl.float32)
+            dt = tl.load(dtb_ptr + h * D + offs).to(tl.float32)
+            A = tl.exp(tl.load(alog_ptr + h).to(tl.float32))
+            x_dt = f_raw + dt
+            if lower_bound == lower_bound:  # NaN sentinel -> softplus branch
+                decay = tl.exp(lower_bound / (1.0 + tl.exp(-A * x_dt)))
+            else:
+                sp = tl.where(x_dt <= 20.0, tl.log(1.0 + tl.exp(x_dt)), x_dt)
+                decay = tl.exp(-A * sp)
+            b_raw = tl.load(b_ptr + bb.to(tl.int64) * H + h, cache_modifier=".cg").to(tl.float32)
+            beta = 1.0 / (1.0 + tl.exp(-(b_raw.to(tl.bfloat16).to(tl.float32))))
+            # --- L2 q/k (eps inside the sqrt, floe _l2norm) ----------------
+            qn = q * (1.0 / tl.sqrt(tl.sum(q * q, axis=0) + 1e-6)) * scale
+            kn = k * (1.0 / tl.sqrt(tl.sum(k * k, axis=0) + 1e-6))
+            # --- V-major delta rule over the [V, K] slice ------------------
+            sbase = ssm_ptr + slot * (H * D * D) + h * D * D
+            s = tl.load(sbase + offs[:, None] * D + offs[None, :], cache_modifier=".cg")
+            s = s * decay[None, :]
+            t = tl.sum(s * kn[None, :], axis=1)  # t[v] = sum_k s[v,k]*kn[k]
+            delta = (v - t) * beta
+            s = s + delta[:, None] * kn[None, :]
+            tl.store(sbase + offs[:, None] * D + offs[None, :], s)
+            o = tl.sum(s * qn[None, :], axis=1)  # o[v] = sum_k s[v,k]*qn[k]
+            # --- gated per-head RMSNorm + bf16 out store -------------------
+            rstd = 1.0 / tl.sqrt(tl.sum(o * o, axis=0) / D + eps)
+            g_raw = tl.load(g_ptr + bb.to(tl.int64) * (H * D) + h * D + offs, cache_modifier=".cg").to(tl.float32)
+            gate = 1.0 / (1.0 + tl.exp(-(g_raw.to(tl.bfloat16).to(tl.float32))))
+            ow = tl.load(onorm_ptr + offs).to(tl.float32)
+            y = (o * rstd * ow * gate).to(tl.bfloat16).to(tl.float32)
+            tl.store(out_ptr + bb.to(tl.int64) * (H * D) + h * D + offs, y)
+        else:
+            # padded CUDA-graph slot: zero the output row, pools untouched
+            tl.store(out_ptr + bb.to(tl.int64) * (H * D) + h * D + offs,
+                     tl.zeros([D], tl.float32))
+        task += P

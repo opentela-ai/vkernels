@@ -5,6 +5,7 @@ from typing import Optional
 
 from .operator_ir import (
     F32,
+    I32,
     Region,
 )
 
@@ -626,4 +627,145 @@ class RecurrentRecording:
             offset=sv.offset,
         )
         return out, SymbolicTensor(post)
+
+    def kda_fused_decode(
+        self,
+        conv_pool: SymbolicTensor,
+        ssm_pool: SymbolicTensor,
+        slot_ids: SymbolicTensor,
+        qkv_raw: SymbolicTensor,
+        f_raw: SymbolicTensor,
+        b_raw: SymbolicTensor,
+        g_raw: SymbolicTensor,
+        taps: SymbolicTensor,
+        dt_bias: SymbolicTensor,
+        A_log: SymbolicTensor,
+        o_norm: SymbolicTensor,
+        *,
+        layer: int,
+        scale: float,
+        eps: float,
+        lower_bound: Optional[float],
+    ) -> tuple[SymbolicTensor, SymbolicTensor, SymbolicTensor]:
+        """E1 fused KDA decode step: conv update + element-wise-decay delta
+        rule + sigmoid-gated per-head RMSNorm in ONE task family, under the
+        fused-decode contract (the CUDA oracle
+        ``vkernels.torch_ops.glm_kda_fused_decode``; megakernel E1 slice).
+
+        Consumes the RAW dot rows — the fused kernel's ABI, which the
+        megakernel keeps so a device lowering can feed it without copies:
+
+        * ``qkv_raw`` [B, Cc]: the RAW PRE-conv fused q|k|v projection row
+          (channel segments [q | k | v], each H·D wide);
+        * ``f_raw`` [B, H, K]: the RAW ``f_b(f_a(x))`` dots (kernel adds
+          ``dt_bias`` and applies the gate branch itself);
+        * ``b_raw`` [B, H]: the RAW ``b_proj`` dots (sigmoid applied
+          in-task, AFTER the ABI round);
+        * ``g_raw`` [B, H, V]: the RAW ``g_b(g_a(x))`` o-norm gate dots
+          (sigmoid in-task, after the round).
+
+        Pools are SLOT-INDIRECTED through ``slot_ids`` (external i32 [B];
+        the #94 paged access pattern — a serving-integration shape, not
+        the batch-indexed pools of the decomposed ops):
+
+        * ``conv_pool`` [slots, Kw, Cc] TIME-MAJOR (w-major), bf16-grid
+          values — the shift ``[old w1, old w2, new raw x]`` is pure moves;
+        * ``ssm_pool`` [slots, H, V, K] V-MAJOR fp32 — the transpose of
+          ``kda_delta``'s [B, H, K, V] pool (layout only, no numeric
+          divergence; a born-V-major pool serves both the fused CUDA
+          kernel and this op).
+
+        ``taps`` are TIME-MAJOR fp32 [Kt, Cc] (the kernel ABI; floe's
+        Conv1d ``[C, Kt]`` transposes at capture). ``dt_bias`` [H, K],
+        ``A_log`` [H], ``o_norm`` [V] shared across heads (K3/floe both
+        keep the o-norm weight per head-dim). ``-1`` slot ids are padded
+        CUDA-graph slots: zero output row, both pools untouched. Duplicate
+        live slot ids in one step are UB (the fused kernel's contract);
+        the family's per-task write regions are therefore recorded as the
+        whole-pool indirected slab — sound under phase order, exact under
+        the slot-disjointness obligation.
+
+        Ordering obligation: the read-modify-write on both pools
+        (RAW/WAR/WAW vs any other op touching those storages — across
+        decode steps the same layer's fused op chains through the pool
+        hazard). Returns ``(out [B, H, V], conv_pool_post, ssm_pool_post)``
+        — post-step views of the same pool storages, bumped versions.
+        """
+        cv, sv, iv = conv_pool.value, ssm_pool.value, slot_ids.value
+        qv, fv, bv, gv = qkv_raw.value, f_raw.value, b_raw.value, g_raw.value
+        tv, dv, av, ov = taps.value, dt_bias.value, A_log.value, o_norm.value
+        if len(cv.shape) != 3:
+            raise CaptureError(f"kda_fused_decode conv pool must be [slots, Kw, Cc]; got shape {cv.shape}")
+        slots, Kw, Cc = cv.shape
+        if len(sv.shape) != 4:
+            raise CaptureError(f"kda_fused_decode ssm pool must be [slots, H, V, K] (V-major); got shape {sv.shape}")
+        if sv.shape[0] != slots:
+            raise CaptureError(
+                f"kda_fused_decode pool slot counts disagree: conv {sv.shape[0]} vs ssm {sv.shape[0]}"
+            )
+        H, V, K = sv.shape[1:]
+        if K != V:
+            raise CaptureError(f"kda_fused_decode heads must be square (K = V = head_dim); got K={K}, V={V}")
+        if Cc != 3 * H * K:
+            raise CaptureError(
+                f"kda_fused_decode conv channels {Cc} != 3*H*D = {3 * H * K} (q|k|v segments of H·D)"
+            )
+        if tuple(tv.shape) != (Kw + 1, Cc):
+            raise CaptureError(
+                f"kda_fused_decode taps must be TIME-MAJOR [Kt, Cc] = [{Kw + 1}, {Cc}]; got {tv.shape}"
+            )
+        if iv.dtype != I32 or iv.shape != (qv.shape[0],):
+            raise CaptureError(
+                f"kda_fused_decode slot_ids must be i32 [B={qv.shape[0]}]; got {iv.dtype.name} {iv.shape}"
+            )
+        if qv.shape != (iv.shape[0], Cc):
+            raise CaptureError(f"kda_fused_decode qkv_raw must be [B, {Cc}]; got {qv.shape}")
+        if fv.shape != (iv.shape[0], H, K):
+            raise CaptureError(f"kda_fused_decode f_raw must be [B, {H}, {K}]; got {fv.shape}")
+        if bv.shape != (iv.shape[0], H):
+            raise CaptureError(f"kda_fused_decode b_raw must be [B, {H}]; got {bv.shape}")
+        if gv.shape != (iv.shape[0], H, V):
+            raise CaptureError(f"kda_fused_decode g_raw must be [B, {H}, {V}]; got {gv.shape}")
+        if dv.shape != (H, K):
+            raise CaptureError(f"kda_fused_decode dt_bias must be [{H}, {K}]; got {dv.shape}")
+        if av.shape != (H,):
+            raise CaptureError(f"kda_fused_decode A_log must be [{H}]; got {av.shape}")
+        if ov.shape != (V,):
+            raise CaptureError(f"kda_fused_decode o_norm must be [{V}] shared across heads; got {ov.shape}")
+        out = self.fresh_buffer(f"kda_fused_l{layer}{self._suffix()}", (iv.shape[0], H, V), dtype=qv.dtype)
+        conv_r = Region.indirect(cv, iv, axis=0)
+        ssm_r = Region.indirect(sv, iv, axis=0)
+        self._record(
+            "kda_fused_decode",
+            inputs=(conv_pool, ssm_pool, slot_ids, qkv_raw, f_raw, b_raw, g_raw, taps, dt_bias, A_log, o_norm),
+            outputs=(out,),
+            attributes={"layer": layer, "scale": scale, "eps": eps, "lower_bound": lower_bound},
+            reads=(conv_r, ssm_r, _regional_reads(iv), _regional_reads(qv), _regional_reads(fv),
+                   _regional_reads(bv), _regional_reads(gv), _regional_reads(tv),
+                   _regional_reads(dv), _regional_reads(av), _regional_reads(ov)),
+            writes=(conv_r, ssm_r, _regional_reads(out.value)),
+            source_location=f"layer {layer} kda fused decode",
+            numerical_contract={
+                "abi": "RAW dot contract: qkv_raw/f_raw/b_raw/g_raw are the RAW projection rows, rounded to the bf16 grid at task entry; every gate nonlinearity (beta, o-norm gate) applies AFTER the round",
+                "conv": "out[c] = silu(sum_j taps[j, c] * window[j, c]) fp32 taps over the bf16-valued window; NOT rounded to bf16 before the recurrence; floe conv1d is bias-free",
+                "conv_shift": "pool'[j] = pool[j+1] for j < Kw-1; pool'[Kw-1] = bf16(x_raw) — pure moves",
+                "gate": "decay = exp(lower_bound * sigmoid(exp(A_log[h]) * (bf16(f_raw) + dt_bias[h]))) per (head, k); lower_bound None -> exp(-exp(A_log) * softplus(.)) with the x>20 guard",
+                "beta": "beta = sigmoid(bf16(b_raw)) — sigmoid after the round",
+                "delta_rule": "V-major [V, K] slice: s *= decay[None, :]; t[v] = sum_k s[v,k]*k_n[k]; s += (beta*(v-t))[:, None] * k_n[None, :]; o[v] = sum_k s[v,k]*q_n[k]",
+                "qk_norm": "q_n = L2(q)*scale, k_n = L2(k) per head, eps 1e-6 inside the sqrt (floe _l2norm)",
+                "out_gate": "out = o * rsqrt(mean(o^2)+eps) * o_norm[V] * sigmoid(bf16(g_raw)), stored on the bf16 grid (the kernel's out ABI)",
+                "accumulate": "fp32 arithmetic between the ABI rounds and the state (everything between the bf16 inputs and the bf16 out store)",
+                "dtypes": "raw rows bf16-grid at entry, taps/dt_bias/A_log/o_norm fp32 params, ssm pool fp32 V-major, conv pool bf16-grid w-major, out bf16-grid",
+                "pool": "slot-indirected external pools; read-modify-write per decode step; -1 slots are padded (zero out row, pools untouched); duplicate live slot ids are UB",
+            },
+        )
+        conv_post = self.graph.add_tensor(
+            f"kda_conv_pool_l{layer}_v{self.graph.storage_versions[cv.storage_id]}",
+            cv.shape, cv.dtype, storage_id=cv.storage_id, strides=cv.strides, offset=cv.offset,
+        )
+        ssm_post = self.graph.add_tensor(
+            f"kda_ssm_pool_l{layer}_v{self.graph.storage_versions[sv.storage_id]}",
+            sv.shape, sv.dtype, storage_id=sv.storage_id, strides=sv.strides, offset=sv.offset,
+        )
+        return out, SymbolicTensor(conv_post), SymbolicTensor(ssm_post)
 

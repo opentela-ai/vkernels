@@ -9,8 +9,6 @@ here with no torch, no triton, no CUDA.
 
 from __future__ import annotations
 
-import importlib
-
 import pytest
 
 from vkernels.torch_ops import ctx_buckets

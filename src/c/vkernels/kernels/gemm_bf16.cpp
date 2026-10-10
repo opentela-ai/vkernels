@@ -13,7 +13,9 @@
 #include "vkernels/kernels/gemm_bf16.hpp"
 
 #include <cstring>
+#include <vector>
 
+#include "vkernels/kernels/common/heuristics.hpp"
 #include "vkernels/util/error.hpp"
 
 namespace vkernels::kernels {
@@ -70,7 +72,13 @@ void gemm_bf16_config_for(std::size_t M, std::size_t N, std::size_t K,
   // The selector is per-arch: the tile that saturates MI300A's 228 CUs is
   // the wrong one for GB10's 48 SMs, so the two branches below are chosen
   // independently against each chip's on-device autotuner.  BK is fixed at
-  // 64 for every architecture -- every K3 K is a multiple of 64.
+  // 64 for every architecture -- every K3 K is a multiple of 64.  Every
+  // returned tile comes from heuristics::gemm_bf16_tile_candidates() — the
+  // swept search space — so the tuned decision and the sweep table cannot
+  // drift apart.
+  const std::vector<heuristics::GemmTile> candidates =
+      heuristics::gemm_bf16_tile_candidates();
+  const heuristics::GemmTile* pick = nullptr;
   *bk = 64;
 
 #if VKERNELS_HAS_CUDA
@@ -93,13 +101,9 @@ void gemm_bf16_config_for(std::size_t M, std::size_t N, std::size_t K,
   //   (64,64): (64/16)*(64/16)*32 = 256 threads
   if (M <= 64) {
     if (N <= 1024) {
-      *bm = 16;
-      *bn = 16;
-      *threads = 32;
+      pick = &candidates[0];
     } else {
-      *bm = 16;
-      *bn = 64;
-      *threads = 128;
+      pick = &candidates[1];
     }
   } else {
     // Warmup / prefill. The selector reports the effective (64,64) output
@@ -108,9 +112,7 @@ void gemm_bf16_config_for(std::size_t M, std::size_t N, std::size_t K,
     // autotuner measured that form faster than the flat (64,64) cp.async
     // tile on every K3 shape -- 2-6% on the large-K shapes and 26-52% on
     // the small-K ones (K = 128..1536, where B reuse dominates).
-    *bm = 64;
-    *bn = 64;
-    *threads = 256;
+    pick = &candidates[2];
   }
 #else
   // --- AMD (MI300A / gfx942) and host-only builds -------------------------
@@ -127,9 +129,7 @@ void gemm_bf16_config_for(std::size_t M, std::size_t N, std::size_t K,
     // (64,64) is ~11-15% better on three small-N/small-K shapes
     // (896x7168, 7168x768, 2304x1536); that marginal gain is left to the
     // autotuner in production rather than to a brittle host heuristic.
-    *bm = 16;
-    *bn = 16;
-    *threads = 64;  // 1 wavefront (one per 16-row fragment)
+    pick = &candidates[0];
   } else {
     // Warmup / prefill: large M. Issue #77 added a cross-tile B-reuse + LDS
     // double-buffer kernel and the on-device autotuner swept it at M=8192
@@ -142,11 +142,12 @@ void gemm_bf16_config_for(std::size_t M, std::size_t N, std::size_t K,
     // pays (see gb10.md), so gfx942 keeps the flat (64,64) tile and the
     // reuse kernel stays available via gemm_bf16_reuse_with_config for the
     // autotuner / offline experiments.
-    *bm = 64;
-    *bn = 64;
-    *threads = 256;  // (64/16)*64 = 4 wavefronts
+    pick = &candidates[1];
   }
 #endif
+  *bm = pick->bm;
+  *bn = pick->bn;
+  *threads = pick->threads;
 }
 
 }  // namespace vkernels::kernels

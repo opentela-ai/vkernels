@@ -1,0 +1,20 @@
+# Certified error of a sequential fp32 accumulation, n = 4, |x_i| <= 1.
+#
+# The device reduction and the CPU oracle accumulate in different orders, so
+# they are not bit-identical; the parity tests assert agreement "within fp32
+# round-off".  This script replaces that empirical tolerance with a proof:
+# the sequential sum s3 = fl(fl(fl(x0+x1)+x2)+x3) differs from the exact sum
+# z = x0+x1+x2+x3 by at most 5*2^-24 (~2.98e-7), for all inputs in [-1,1].
+#
+# Run: gappa verifier/numerics/bounds/sequential_sum_fp32.gappa
+@rnd = float<ieee_32,ne>;
+
+s1 rnd= x0 + x1;
+s2 rnd= s1 + x2;
+s3 rnd= s2 + x3;
+z = x0 + x1 + x2 + x3;
+
+{
+  x0 in [-1,1] /\ x1 in [-1,1] /\ x2 in [-1,1] /\ x3 in [-1,1] ->
+  |s3 - z| <= 5b-24
+}

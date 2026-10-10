@@ -517,10 +517,7 @@ def warmup(device="cuda", num_heads: int = 64, head_dim: int = 512,
         return {"status": "skipped", "reason": "torch backend: nothing to pin",
                 "backend": backend}
 
-    rows_probe = 1
-    q = torch.zeros(rows_probe, num_heads, head_dim, device=dev, dtype=torch.bfloat16)
     kv = torch.zeros(topk + 1, 1, head_dim, device=dev, dtype=torch.bfloat16)
-    idx = torch.zeros(rows_probe, 1, topk, device=dev, dtype=torch.int32)
     # decode classes: the bounded sweep for t1 runs here; t8/t64 resolve
     # through the same bucket when their rows tier was already tuned, or
     # sweep on their first live launch (still outside a capture — eager).

@@ -266,6 +266,32 @@ def test_eligibility_accepts_fnuz_storage():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernel test")
+@pytest.mark.parametrize("t", [1, 2, 4, 8])
+@pytest.mark.parametrize("seed", [0, 204])
+def test_default_geometry_bit_exact_t_sweep(t, seed, monkeypatch):
+    """The DEFAULT launch geometry must reproduce the ladder's tl.sum
+    reduction order on this backend, at production dims, across the decode
+    T sweep. Regression for the GB10 sm_121 failure: a CUDA-side default of
+    rows1=2/warps1=8 (the MI300A sweep pick) split the stage-1 fp32 dot
+    reduction differently from expert_gemv's ROWS=4/num_warps=4 and broke
+    bit-parity on every tested seed, faulting
+    test_fnuz_storage_bit_exact_vs_ladder[shape2] before the FNUZ
+    conversion (diagnostics/2026-10-06-merged-main-failures, serving-sys
+    workspace). The default is backend-aware (CUDA = ladder geometry,
+    HIP = the MI300A-measured pick); this pins the CUDA side."""
+    from vkernels.torch_ops.glm_moe_grouped import _default_cfg
+
+    if torch.version.hip:
+        pytest.skip("pins the CUDA default geometry")
+    monkeypatch.delenv("VK_MOE_GROUPED_CFG", raising=False)
+    cfg = _default_cfg()
+    assert (cfg["rows1"], cfg["warps1"]) == (4, 4), cfg
+    x, w13, s13, w2, s2, idx, w = _case(t, 8, 4096, 512, 4096, seed=seed)
+    got = moe_grouped_decode(x, w13, s13, w2, s2, idx, w, LIMIT, t_cap=t)
+    assert torch.equal(got, _ladder(x, w13, s13, w2, s2, idx, w, LIMIT, combine="combine"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernel test")
 @pytest.mark.parametrize("shape", SHAPES)
 def test_fnuz_storage_bit_exact_vs_ladder(shape, monkeypatch):
     """fnuz-storage grouped decode on the IN-PLACE converted stacks must be

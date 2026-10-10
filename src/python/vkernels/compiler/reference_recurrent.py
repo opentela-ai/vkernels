@@ -260,3 +260,76 @@ class RecurrentReference:
         o = (s * qn[:, None]).sum(axis=0)  # [V] = sum_k s[k,v]*qn[k]
         out[bb, h] = o.astype(out.dtype)
 
+    def _body_kda_fused_decode(self, fam: TaskFamily, coords, scalars) -> None:
+        """E1 fused KDA decode over one (batch row, head) task: conv update
+        + element-wise-decay delta rule + sigmoid-gated per-head RMSNorm,
+        under the fused-decode contract (the CUDA oracle's ABI and op order
+        — see :func:`vkernels.compiler.glm53_arch.kda_fused_decode_reference`
+        for the pinned semantics). RAW dot rows are rounded to the bf16
+        grid at entry; gate nonlinearities apply AFTER the round; the conv
+        output stays unrounded into the recurrence; pools are updated in
+        place (slot-indirected; -1 padded slots are exact no-ops on the
+        pools and zero the output row). fp64 oracle arithmetic between the
+        rounds; stores follow each buffer's declared dtype class (fp32
+        pools, bf16-grid out)."""
+        from .reference_types import bf16_round
+
+        conv = self.tensor(fam.inputs[0])  # [slots, Kw, Cc] w-major
+        ssm = self.tensor(fam.inputs[1])  # [slots, H, V, K] V-major
+        slot_ids = self.tensor(fam.inputs[2])  # [B] i32
+        qkv_raw = self.tensor(fam.inputs[3])  # [B, Cc]
+        f_raw = self.tensor(fam.inputs[4])  # [B, H, K]
+        b_raw = self.tensor(fam.inputs[5])  # [B, H]
+        g_raw = self.tensor(fam.inputs[6])  # [B, H, V]
+        taps = self.tensor(fam.inputs[7])  # [Kt, Cc] time-major
+        dt_bias = self.tensor(fam.inputs[8])  # [H, K]
+        a_log = self.tensor(fam.inputs[9])  # [H]
+        o_norm = self.tensor(fam.inputs[10])  # [V]
+        out = self.tensor(fam.outputs[0])  # [B, H, V]
+        bb, h = coords
+        scale = fam.params["scale"]
+        eps = fam.params["eps"]
+        lower_bound = fam.params.get("lower_bound")
+        slot = int(slot_ids[bb])
+        if slot < 0:
+            out[bb, h] = 0.0  # padded graph slot: pools untouched
+            return
+        K = ssm.shape[-1]
+        Kw = conv.shape[1]
+        seg = conv.shape[-1] // 3
+        lo, hi = h * K, (h + 1) * K
+        # --- conv: fp32 taps over the bf16-valued w-major window --------
+        # (this head's q|k|v channel stripes; x rounded to the bf16 grid)
+        cols = np.concatenate([np.arange(lo, hi), seg + np.arange(lo, hi), 2 * seg + np.arange(lo, hi)])
+        x = bf16_round(qkv_raw[bb, cols].astype(np.float64))  # [3K] on the grid
+        w = taps[:, cols].astype(np.float64)  # [Kt, 3K] fp32 taps
+        st = conv[slot][: :, cols].astype(np.float64)  # [Kw, 3K] (bf16-grid values; advanced-index axis order)
+        acc = np.einsum("jc,jc->c", w[:Kw], st) + w[Kw] * x
+        y = acc * (1.0 / (1.0 + np.exp(-acc)))  # SiLU, NOT rounded (fused contract)
+        conv[slot][: :, cols] = np.concatenate([st[1:], x[None, :]], axis=0).astype(conv.dtype)
+        q = y[:K]
+        k = y[K : 2 * K]
+        v = y[2 * K :]
+        # --- gate conditioning on the RAW dots (rounds first) -------------
+        xx = bf16_round(f_raw[bb, h].astype(np.float64)) + dt_bias[h].astype(np.float64)
+        A = float(np.exp(a_log[h]))
+        if lower_bound is not None:
+            decay = np.exp(lower_bound * (1.0 / (1.0 + np.exp(-A * xx))))  # [K]
+        else:
+            sp = np.where(xx <= 20.0, np.log1p(np.exp(np.minimum(xx, 20.0))), xx)
+            decay = np.exp(-A * sp)
+        beta = 1.0 / (1.0 + np.exp(-float(bf16_round(b_raw[bb, h]))))  # sigmoid AFTER the round
+        qn = q / np.sqrt((q * q).sum() + 1e-6) * scale
+        kn = k / np.sqrt((k * k).sum() + 1e-6)
+        # --- V-major delta rule + gated norm ------------------------------
+        s = ssm[slot, h].astype(np.float64)  # [V, K]
+        s = s * decay[None, :]
+        t = (s * kn[None, :]).sum(axis=1)  # t[v] = sum_k s[v,k]*kn[k]
+        s = s + ((beta * (v - t))[:, None]) * kn[None, :]
+        ssm[slot, h] = s.astype(ssm.dtype)  # fp32 pool store
+        o = (s * qn[None, :]).sum(axis=1)  # o[v] = sum_k s[v,k]*qn[k]
+        rstd = 1.0 / np.sqrt((o * o).mean() + eps)
+        gate = 1.0 / (1.0 + np.exp(-bf16_round(g_raw[bb, h].astype(np.float64))))  # after the round
+        yv = o * rstd * o_norm.astype(np.float64) * gate  # [V] weight shared across heads
+        out[bb, h] = bf16_round(yv).astype(out.dtype)  # the kernel's bf16 out ABI
+

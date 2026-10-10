@@ -362,7 +362,6 @@ def dsa_resolve_rows(kv, host, resident, backing, generations, lengths,
                      hot_slots, selected, tags, tag_generations, ages, clock)
     layers, gpu_rows, width = kv.shape
     batch, pages = resident.shape
-    hot_rows = tags.shape[-1]
     k = selected.shape[-1]
     if scratch is None:
         scratch = {}
@@ -416,7 +415,6 @@ def dsa_resolve_rows_batched(kv, host, resident, backing, generations, lengths,
                      hot_slots, selected[0], tags, tag_generations, ages, clock)
     layers, gpu_rows, width = kv.shape
     batch, pages = resident.shape
-    hot_rows = tags.shape[-1]
     k = selected.shape[-1]
     dev = kv.device
     output = torch.empty((layers, batch, k), device=dev, dtype=torch.int64)
@@ -514,7 +512,6 @@ def resolve_rows_reference(resident, backing, generations, lengths, hot_slots,
     if has_fence:
         fence_values = torch.atleast_1d(fence_values.long().cpu())
         fence_expected = torch.atleast_1d(fence_expected.long().cpu())
-    pages = resident.shape[1]
     hot_rows = tags.shape[-1]
     k = selected.shape[-1]
     page = page_tokens

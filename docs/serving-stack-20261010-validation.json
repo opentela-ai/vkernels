@@ -1,0 +1,442 @@
+{
+  "branch": "consolidate/serving-stack-20261010",
+  "code_revisions": {
+    "floe": "d0b102db78eb6c9755fcc63ec315ee0cc01c0f15",
+    "vkernels": "c098c5584227cb605044c313e7c5ba7db986d5b7",
+    "kvaas": "4211d305dc799e224a33198a4632aece16968d79"
+  },
+  "checks": {
+    "floe_cpu": {
+      "passed": 246,
+      "skipped": 20,
+      "failed": 0,
+      "errors": 0
+    },
+    "floe_changed_modules_gpu": {
+      "passed": 359,
+      "skipped": 1,
+      "failed": 0,
+      "errors": 0
+    },
+    "floe_async_gpu": {
+      "passed": 41,
+      "skipped": 0,
+      "failed": 0,
+      "errors": 0
+    },
+    "floe_standalone": {
+      "passed": 42,
+      "skipped": 0,
+      "failed": 0,
+      "errors": 0
+    },
+    "kvaas_python": {
+      "passed": 1960,
+      "skipped": 56,
+      "failed": 0,
+      "errors": 0
+    },
+    "kvaas_rust": {
+      "passed": 942,
+      "ignored": 1,
+      "failed": 0
+    },
+    "vkernels_host_ctest": {
+      "passed": 47,
+      "disabled": 2,
+      "failed": 0
+    },
+    "vkernels_cuda_ctest": {
+      "passed": 61,
+      "failed": 0
+    },
+    "vkernels_python_host": {
+      "passed": 1031,
+      "skipped": 619,
+      "failed": 0,
+      "errors": 0
+    },
+    "vkernels_focused_gpu": {
+      "passed": 36,
+      "skipped": 0,
+      "failed": 0,
+      "errors": 0
+    },
+    "scope": "Local NVIDIA GB10, Torch2.13.0+cu130, CUDA13.0. Groups overlap and do not count unique test cases. Remote CI was not manually invoked.",
+    "vkernels_python_gpu_full": {
+      "passed": 1558,
+      "skipped": 91,
+      "failed": 1,
+      "errors": 0
+    },
+    "known_gpu_failure": {
+      "test": "test_sgl_fused_moe_matches_eager_serving_shape[8]",
+      "remote_main_revision": "edf0a5c48e3594c3003f84ae3c9187257da55b17",
+      "baseline_reproduced": true,
+      "mismatched_elements": 58,
+      "total_elements": 32768,
+      "greatest_absolute_difference": 0.035888671875,
+      "tolerance_unchanged": {
+        "rtol": 0.02,
+        "atol": 0.02
+      },
+      "assertion_preserved": true,
+      "full_gpu_suite_green": false
+    },
+    "wheel": {
+      "host_build": true,
+      "compiled_smoke_outside_checkout": true,
+      "vendored_push_files_present": true,
+      "sha256": "388431b2ed24b9e93a1c6e02bff122f089dfbc562ba56956bdda8005e92e4bdf"
+    }
+  },
+  "historical_evidence": {
+    "2026-10-09-lever34-control-frame": {
+      "manifest_sha256": "445d7bd13934f23948f3c20cc8ec2796ad580f341cf7c43b3a96f39eabe881fa",
+      "source": {
+        "base_floe": "01fa40b708aee5da8bfb06c3f40ed8c20a81ef3e",
+        "candidate_floe": "dc49614ff9c0b68de3de2546388b861511a467ae",
+        "vkernels": "bd9abf668460c9241e99c93d11a95c9d9f0793f0",
+        "precision_changed": false,
+        "kvaas_changed": false,
+        "candidate_scope": "Opt-in fixed control envelopes, pinned asynchronous receive and one-broadcast small commands; forward/reverse allocation comparison",
+        "quality_ceiling": 1.1498787944830056,
+        "refreshed_sglang_nll": 1.130313891536797,
+        "source_sha256": {
+          "device_knobs.py": "bcf7d5eee48863b259df758af55526228e67094832f0d7a8a8741c9d0910313b",
+          "candidate_forward.py": "6dbf8ee744f4db7446d69a5ceebb3065601def638ae2301790370ed4b069b6d3",
+          "frame_control.py": "3795322a6849d76e7571e3ba04b6798106d82822eeeb7cce7fb1a33175573636",
+          "device_runtime.py": "df8d56673ec2e58108c408d375b0cf2008b536885cf86d71072f0a9fc974d8c4",
+          "device_descriptors.py": "8d6d4788eb0e8e87b2e61b5301944ba3075fc3d7b0218988a4b642740deedb73",
+          "candidate_dispatch.py": "f3c38c9c9e32ad67d8c9b8a88df5a3643c70b1968a6b67ec2ea4506c3194ddc9",
+          "packet_frame.py": "e86c78e395e25acd025b6e82cf201b3729cd9686ed863252acc5359b4fa2a967",
+          "release_engine.py": "60cb0a34ae10ec48bab2055e9a35e2f4cfbb1894aee6337c3f43ef8e7908aab3"
+        },
+        "parent_floe": "5373454ea9cfba2052eae06f175627128900f413"
+      },
+      "completed_checks": {
+        "job": {
+          "job": 3628880,
+          "remote": "/iopsstor/scratch/cscs/xyao/control-frame-20261009",
+          "runs": "runs-3628880",
+          "state": "COMPLETED",
+          "source": "dc49614ff9c0b68de3de2546388b861511a467ae",
+          "discarded_startup_jobs": [
+            3628869,
+            3628877
+          ],
+          "node": "nid007651",
+          "exit_code": "0:0",
+          "elapsed": "00:33:45"
+        },
+        "complete_arms": [
+          "baseline",
+          "baseline_repeat",
+          "combined",
+          "frame",
+          "frame_repeat",
+          "stack"
+        ],
+        "ordinary_cohorts": 96,
+        "target_test_executions": 558,
+        "target_skips": 0,
+        "reviewed_profile_views": 60,
+        "frozen_submitted_artifacts_verified": 126,
+        "all_pairs_original_logits_equal": true,
+        "quality_gate_pass": false,
+        "precision_changed": false,
+        "kvaas_changed": false
+      }
+    },
+    "2026-10-09-lever35-warm-token-copy": {
+      "manifest_sha256": "27f1fb8b211bf27d95c23d502e35a9882cf7073926ac9a9d86823e423d05d294",
+      "source": {
+        "base_floe": "01fa40b708aee5da8bfb06c3f40ed8c20a81ef3e",
+        "candidate_floe": "962580bdf81fe1d5a0f8a7f4e7f0eb9064a067f5",
+        "vkernels": "bd9abf668460c9241e99c93d11a95c9d9f0793f0",
+        "precision_changed": false,
+        "kvaas_changed": false,
+        "candidate_scope": "Async fresh warm-token clone for exact identity rosters; classic/stack factorial and reverse-order stack confirmation",
+        "quality_ceiling": 1.1498787944830056,
+        "refreshed_sglang_nll": 1.130313891536797,
+        "source_sha256": {
+          "device_knobs.py": "ceb86a593350973b360368a1971cb29c52e40b889779523817d68172fb9dbd13",
+          "candidate_forward.py": "6dbf8ee744f4db7446d69a5ceebb3065601def638ae2301790370ed4b069b6d3",
+          "frame_control.py": "3795322a6849d76e7571e3ba04b6798106d82822eeeb7cce7fb1a33175573636",
+          "device_runtime.py": "df8d56673ec2e58108c408d375b0cf2008b536885cf86d71072f0a9fc974d8c4",
+          "device_descriptors.py": "8d6d4788eb0e8e87b2e61b5301944ba3075fc3d7b0218988a4b642740deedb73",
+          "candidate_dispatch.py": "f3c38c9c9e32ad67d8c9b8a88df5a3643c70b1968a6b67ec2ea4506c3194ddc9",
+          "packet_frame.py": "e86c78e395e25acd025b6e82cf201b3729cd9686ed863252acc5359b4fa2a967",
+          "warm_core.py": "cde3a2b77a58f5d11d53c76e5264905690b36bded3c42993c1a09d75cb98b03a",
+          "release_engine.py": "60cb0a34ae10ec48bab2055e9a35e2f4cfbb1894aee6337c3f43ef8e7908aab3"
+        },
+        "parent_floe": "dc49614ff9c0b68de3de2546388b861511a467ae"
+      },
+      "completed_checks": {
+        "job": {
+          "job": 3628933,
+          "remote": "/iopsstor/scratch/cscs/xyao/warm-token-copy-20261009",
+          "runs": "runs-3628933",
+          "state": "COMPLETED",
+          "source": "962580bdf81fe1d5a0f8a7f4e7f0eb9064a067f5",
+          "exit_code": "0:0",
+          "elapsed": "00:35:33",
+          "node": "nid006086"
+        },
+        "complete_arms": [
+          "baseline",
+          "clone",
+          "stack",
+          "stack_clone",
+          "stack_clone_repeat",
+          "stack_repeat"
+        ],
+        "ordinary_cohorts": 96,
+        "target_test_executions": 942,
+        "target_skips": 0,
+        "reviewed_profile_views": 60,
+        "frozen_submitted_artifacts_verified": 133,
+        "all_pairs_original_logits_equal": true,
+        "quality_gate_pass": false,
+        "precision_changed": false,
+        "kvaas_changed": false
+      }
+    }
+  },
+  "local_log_hashes": [
+    {
+      "path": "floe-async.log",
+      "sha256": "62fed77c596d9583c26f866f736c123d70cc4f2e51a0a976e593a4f47e7c0748"
+    },
+    {
+      "path": "floe-changes.log",
+      "sha256": "1d4e2b003f0263841a22ae152e20e8b0e87e21aabc6612b66b7a8ed7ced7fc09"
+    },
+    {
+      "path": "floe-cpu.log",
+      "sha256": "1b162ab7e8e96d76bd69f238bab88c78ea2c03c44904d3b720f37f08db06d050"
+    },
+    {
+      "path": "floe-first-failure.log",
+      "sha256": "b29485840f8c70f8da32ccbd73234b07a6ebe02c0e49c7c25f45c93ab57efa51"
+    },
+    {
+      "path": "floe-isolated/test_decode_descriptors.log",
+      "sha256": "1e4efa9e3363c18bf406019b3ab5bb78befab7a98cd4d5e390257656b6e5cd89"
+    },
+    {
+      "path": "floe-isolated/test_decode_ring_depth.log",
+      "sha256": "005ee6d92b495e932ef879d9702d959d87f2fe531f2a267636b80f2a4afc6773"
+    },
+    {
+      "path": "floe-isolated/test_fidelity_gate.log",
+      "sha256": "b8bc4948742bbef1eee858f0396ec08e9e7618a7c4c22248a45a8140f390550f"
+    },
+    {
+      "path": "floe-isolated/test_glm53_attention_compact_decode.log",
+      "sha256": "1c38689e8fa7fefbff9802351282ffa0241f496832c1578a2743efe6c82c53eb"
+    },
+    {
+      "path": "floe-isolated/test_glm53_batched_prefill.log",
+      "sha256": "7db8788f374603a165bd118fa036f1e6c23298ebed74a2564e1118c5019f999f"
+    },
+    {
+      "path": "floe-isolated/test_glm53_deepgemm_linear.log",
+      "sha256": "bf4ef703a305069739bd8d881fc54574afc1fc9674995cac719c45266d3ca72c"
+    },
+    {
+      "path": "floe-isolated/test_glm53_fp8_activations.log",
+      "sha256": "b41c3644372b99eb2837a71d10d0902a5b1ed9e2e30d68cf4ceec0193b46c36a"
+    },
+    {
+      "path": "floe-isolated/test_glm53_fused_indexer.log",
+      "sha256": "ff9794b1277b3b3958224a7403edb3fc2a10b5ec24f5dbd737b90c954a0cc6b8"
+    },
+    {
+      "path": "floe-isolated/test_glm53_mhc_fp32.log",
+      "sha256": "451ed81d445e0c39f36e21e641330e30c78d4e25c03b95f11a8d6da162554ee0"
+    },
+    {
+      "path": "floe-isolated/test_glm53_packed_fp8.log",
+      "sha256": "49631a521f5402edc950cb5689b6ac6c8d3002cf81207668a2d3cbd4e023c366"
+    },
+    {
+      "path": "floe-isolated/test_glm53_packed_qkv.log",
+      "sha256": "9e0b4c8fdfce656482b37043fd52d6a005d9f987ff5da682ad221ab209f6bfc3"
+    },
+    {
+      "path": "floe-isolated/test_glm53_routed_first.log",
+      "sha256": "ed8e49fdbcb7f4d8639c92f312ca8f857495c1e6535285f90f3a3175ef2676d4"
+    },
+    {
+      "path": "floe-isolated/test_glm53_sparse_mla_decode.log",
+      "sha256": "c37f27a8e134d749e98018afaf911f170025a8a1905246cf06b331a2f68508b4"
+    },
+    {
+      "path": "floe-isolated/test_glm53_state_writeback.log",
+      "sha256": "9cf7fb82bd0009a6b67e69cd48b8b23a900ba664d9f252fc923de7662b0df717"
+    },
+    {
+      "path": "floe-isolated/test_glm53_tma_quantization.log",
+      "sha256": "8f0c5271c42e2ea169c1a163518021fbcb3bc89b72e922479c6b715bdf3071ee"
+    },
+    {
+      "path": "floe-isolated/test_overlap_sched.log",
+      "sha256": "58ade4135d53737c3c42e975e0c9564c433e3d729e007163bff737700bc0abbc"
+    },
+    {
+      "path": "floe-isolated/test_parallel_device_token_relay.log",
+      "sha256": "705317e68dd9bc1e6aeed6f42c58890abf69fc058c42906c0aaf818e4c5c4fcf"
+    },
+    {
+      "path": "floe-isolated/test_parallel_runtime.log",
+      "sha256": "cce376c77da2f6d505dcf0cdd87114b59120d77c35d284fb390a4bfa79b57f79"
+    },
+    {
+      "path": "floe-isolated/test_release_checkpoint.log",
+      "sha256": "d1b6c929f4db5e706a451410fd6ebac7d48650e5d024dab847972b5034d27030"
+    },
+    {
+      "path": "floe-isolated/test_tp_commit_defer.log",
+      "sha256": "a3f3508bc9164111f39999bba941874f272407a0210feb4f3762e2cf7fb9f5b4"
+    },
+    {
+      "path": "floe-isolated/test_tp_control_waits.log",
+      "sha256": "da57924463144c475807d5c66466ceca129136d2763405e2b0d9822c31fc402b"
+    },
+    {
+      "path": "floe-isolated/test_tp_packet_frame.log",
+      "sha256": "b539135cb1da2866b57fc500bac6a7fb2fd522bed419807ff961d2f84a6e42a1"
+    },
+    {
+      "path": "floe-isolated/test_warm_decode_inputs.log",
+      "sha256": "d31a52d6a26dcd775a6b7b3b97ca878d07d13812a81c17264cfa2b7a4cf840aa"
+    },
+    {
+      "path": "floe-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    {
+      "path": "floe-standalone.log",
+      "sha256": "728cbbe9cc4901a1665262b39c880b4719aa44c6402e13a4e96f23e3315f15ea"
+    },
+    {
+      "path": "kvaas-build.log",
+      "sha256": "1d6a748b32eaa71aa4882214bc638b9c953bccad3fccf2f88552f00efd6fe1b6"
+    },
+    {
+      "path": "kvaas-python-final.log",
+      "sha256": "89486562ebf192f8aa189e607ef3ccb59a12d0340671a60128b0e360ae163990"
+    },
+    {
+      "path": "kvaas-python-gpu.log",
+      "sha256": "739843a5292919cf7235133e8f458bfbbc826d7cb6758917387939d9cf6d8823"
+    },
+    {
+      "path": "kvaas-python-verified.log",
+      "sha256": "1ff956d8f9680857050226ab49e922b34a83ba61bd88519386574978fda5e36e"
+    },
+    {
+      "path": "kvaas-python.log",
+      "sha256": "5ea16fc6d05ebf962761c98545cfd9a605c0d2af6e1e1a74c3cb851d679df150"
+    },
+    {
+      "path": "kvaas-rust.log",
+      "sha256": "95c56e57dbeefcd1f631d15520983b80cfc51149257a5623d5a196cc0b50a377"
+    },
+    {
+      "path": "test-deps-install.log",
+      "sha256": "121f19aff3d981fb5763cd4c8dfc783af28ce7264a51b1673edaa36c275f459e"
+    },
+    {
+      "path": "vkernels-cuda-build.log",
+      "sha256": "6ec7acbd09f12d37404b45745137248d0d3c4a7c7045048181bf3ff34e98d088"
+    },
+    {
+      "path": "vkernels-cuda-configure.log",
+      "sha256": "0df5f5f42a41d7a1bca2ad20abe353511938b3dbae28823f5e42796f747dc311"
+    },
+    {
+      "path": "vkernels-cuda-tests.log",
+      "sha256": "816b6680c8528789a4b2549aa2e7f9015c870347925d1916fdd0d4d2c03cb886"
+    },
+    {
+      "path": "vkernels-fused-moe-isolated.log",
+      "sha256": "eb3c672616b24529edb012ea447be9e1e607448c62d4fdf728b49b09fdf025dc"
+    },
+    {
+      "path": "vkernels-host-build.log",
+      "sha256": "aa731675f51e7aeb3a81736531387a57c4f0b6e1909b7e171fc2fc0c0bffd333"
+    },
+    {
+      "path": "vkernels-host-configure.log",
+      "sha256": "1e2263ac3f00a7acbae61429821d7474bca9dff52f54ccb50dcdaea17ad686ec"
+    },
+    {
+      "path": "vkernels-host-tests.log",
+      "sha256": "1b69c89a42b0d26ba737cd36c712b2a9d55bbfb0efcd2e87aa1eb6a8a0cb17ad"
+    },
+    {
+      "path": "vkernels-integration-regressions.log",
+      "sha256": "1768501e5fd61b041da0d9cec3580c5df0d1230c24a3bafe01b6801c64e765c8"
+    },
+    {
+      "path": "vkernels-main-b8.log",
+      "sha256": "319b3a1ece377ebc6988d12385149a171de967fb4a816b97267ecea73a836707"
+    },
+    {
+      "path": "vkernels-python-cuda.log",
+      "sha256": "2f25037fd3deb17ada6f596ff298da84dbdf57ff6c50731893268ff0682fd7c1"
+    },
+    {
+      "path": "vkernels-python-gpu-full.log",
+      "sha256": "998a951abeaf17a6e1cd47a5eb26c6fa7972e73b36515cda50cc1cabccde8a6f"
+    },
+    {
+      "path": "vkernels-python-host-verified.log",
+      "sha256": "c5a5f754b146ffa4f215dabe5aaf14556684749b510ca1fd901f42248c0407f5"
+    },
+    {
+      "path": "vkernels-python-host.log",
+      "sha256": "f8e7d744004cbd4d1c743c1b3abd48d400f715d015bcdf44bdef663b06ab1ee3"
+    },
+    {
+      "path": "vkernels-ruff-final.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    {
+      "path": "vkernels-ruff.log",
+      "sha256": "117fbb2d74fbcc0746e977f3b155c912d5e251054e66a102f5df9063ce2bcf93"
+    },
+    {
+      "path": "vkernels-wheel-build.log",
+      "sha256": "d027d03f85183a5bea38dd72bb6876a5362e8f80114bb843b41f107b63faf899"
+    },
+    {
+      "path": "vkernels-wheel-smoke.log",
+      "sha256": "93d780cd060ea7aca5905efe9cfc41a09191068e1da9954a62562f22a5fd5ea4"
+    }
+  ],
+  "original_vkernels_preserved": true,
+  "kvaas_runtime_changed": false,
+  "fresh_consolidated_tree_glm_benchmark": false,
+  "full_model_quality_qualified": false,
+  "pr_merge_followup": {
+    "scope": "Test-only optional Torch collection guards; runtime source unchanged from the validated consolidation tree.",
+    "torchless_python": {
+      "python": "3.12.14",
+      "passed": 735,
+      "skipped": 388,
+      "subtests_passed": 499,
+      "failed": 0
+    },
+    "affected_modules_gpu": {
+      "passed": 30,
+      "skipped": 0,
+      "failed": 0
+    },
+    "ruff_changed_tests": true,
+    "prior_remote_run": "https://github.com/opentela-ai/vkernels/actions/runs/38011458793",
+    "prior_ci_failures": "Host/installed-python collection assumed optional Torch was installed; guarded imports now preserve torchless host test coverage."
+  }
+}

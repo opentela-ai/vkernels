@@ -808,6 +808,7 @@ def glm_moe_grouped_gemm_native(
     topk_weights,
     swiglu_limit=7.0,
     swiglu_fn=None,
+    deterministic_combine=False,
 ):
     """Routed expert MLP via TWO single-launch grouped fp8 GEMMs.
 
@@ -933,6 +934,9 @@ def glm_moe_grouped_gemm_native(
         a_by_token=False,
     )
 
+    if deterministic_combine:
+        from .moe_deterministic_combine import deterministic_route_combine
+        return deterministic_route_combine(dn, order, topk_weights)
     w = topk_weights.reshape(-1)[order].float().unsqueeze(-1)
     y = torch.zeros((t, h), device=dev, dtype=torch.float32)
     y.index_add_(0, sorted_tok, dn.float() * w)

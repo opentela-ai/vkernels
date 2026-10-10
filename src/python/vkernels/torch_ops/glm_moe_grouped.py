@@ -75,14 +75,37 @@ __all__ = [
 ]
 
 # (ROWS, num_warps) per stage; env-overridable JSON {"rows1": .., "warps1": ..,
-# "rows2": .., "warps2": ..} for the microbench sweep. Defaults: the ladder's
-# proven stage-1 geometry (ROWS=4/warps=4 over the gate rows) and a stage-2
-# row-group chosen by the sgs-gpu07 microbench (see RESULTS.md).
-_DEF = {"rows1": 4, "warps1": 4, "rows2": 8, "warps2": 4}
+# "rows2": .., "warps2": ..} for the microbench sweep. The tl.sum
+# reduction ORDER depends on the (ROWS, num_warps) layout, so the
+# DEFAULT must reproduce the ladder's geometry on the backend it serves
+# (the bit-exactness contract above):
+# - CUDA default: rows1=4/warps1=4 — expert_gemv's proven geometry
+#   (ROWS=4, num_warps=4). warps1=8 (fewer, fatter reductions) splits
+#   the fp32 dot reduction differently and VIOLATES bit-parity on
+#   GB10 sm_121/triton 3.7.1 (every tested seed; diagnostics/
+#   2026-10-06-merged-main-failures in the serving-sys workspace),
+#   faulting test_fnuz_storage_bit_exact_vs_ladder[shape2] before the
+#   FNUZ conversion.
+# - HIP default: rows1=2/warps1=8 — the MI300A sweep pick (658491,
+#   GLM-5.3 TP4 serving shapes E73/IA512/I4096/K8/T1: 66.2us / 760 GB/s
+#   vs 75.0us), where every swept config measured bit-identical, so the
+#   tuning stays. Tops out ~760 GB/s -- the fp8 decode chain is
+#   instruction-bound; further gains need decode-chain surgery.
+_DEF_CUDA = {"rows1": 4, "warps1": 4, "rows2": 4, "warps2": 4}
+_DEF_HIP = {"rows1": 2, "warps1": 8, "rows2": 4, "warps2": 4}
+
+
+def _default_cfg() -> dict:
+    try:
+        import torch
+
+        return dict(_DEF_HIP if torch.version.hip else _DEF_CUDA)
+    except Exception:  # pragma: no cover - torch always importable in practice
+        return dict(_DEF_CUDA)
 
 
 def _cfg() -> dict:
-    out = dict(_DEF)
+    out = _default_cfg()
     raw = os.environ.get("VK_MOE_GROUPED_CFG")
     if raw:
         import json
@@ -148,6 +171,84 @@ def moe_grouped_decode_eligible(
         and all(v.is_contiguous() for v in (x, gate_up_w, gate_up_s, down_w, down_s, top_k_index, top_k_weights))
         and len({v.device for v in (x, gate_up_w, gate_up_s, down_w, down_s, top_k_index, top_k_weights)}) == 1
     )
+
+
+@functools.lru_cache(maxsize=1)
+def _kernels16():
+    """The BF16-resident decode pair (T2R-11).
+
+    Bit-exact with the fp8 stages by construction: the bf16 twin stack IS
+    the value the fp8 path computes per element — decode(byte)*scale
+    rounded to bf16 — so loading it and widening to fp32 yields the
+    identical weight; every other rounding boundary (the gate/up dots,
+    the swiglu epilogue rounds, the per-expert down dot's bf16 round, the
+    weighted fp32 accumulate, the final store) is the same code. The
+    decode chain (software fp8 + the scale multiply + the reshape round
+    trips) is what the MI300A bound (658521) proved instruction-bound:
+    bf16 reads 2x the bytes and still runs 2.4x faster (3672 GB/s,
+    L2-assisted, vs 760 GB/s).
+    """
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _gate_up16(
+        X, W, IDX, Y, LIMIT,
+        IA: tl.constexpr, I: tl.constexpr, K: tl.constexpr,
+        ROWS: tl.constexpr, COLS: tl.constexpr,
+    ):
+        selected = tl.program_id(0)
+        row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+        expert = tl.load(IDX + selected).to(tl.int64)
+        inbounds = row[:, None] < IA
+        base = W + expert * (2 * IA * I)
+        x_row = selected // K
+        col = tl.arange(0, COLS)
+        x = tl.load(X + x_row * I + col, col < I, 0).to(tl.float32)
+        wg = tl.load(base + row[:, None] * I + col[None, :],
+                     inbounds & (col[None, :] < I), 0).to(tl.float32)
+        gate = tl.sum(wg * x[None, :], axis=1)
+        wu = tl.load(base + (row[:, None] + IA) * I + col[None, :],
+                     inbounds & (col[None, :] < I), 0).to(tl.float32)
+        up = tl.sum(wu * x[None, :], axis=1)
+        gate = tl.minimum(gate.to(tl.bfloat16).to(tl.float32), LIMIT, propagate_nan=tl.PropagateNan.ALL)
+        gate = gate.to(tl.bfloat16).to(tl.float32)
+        upv = up.to(tl.bfloat16).to(tl.float32)
+        upv = (
+            tl.minimum(
+                tl.maximum(upv, -LIMIT, propagate_nan=tl.PropagateNan.ALL),
+                LIMIT,
+                propagate_nan=tl.PropagateNan.ALL,
+            )
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        act = (gate / (1.0 + tl.exp(-gate))).to(tl.bfloat16).to(tl.float32)
+        tl.store(Y + selected * IA + row, act * upv, row < IA)
+
+    @triton.jit
+    def _down16(
+        ACT, W, IDX, WTS, Y,
+        IA: tl.constexpr, H: tl.constexpr, K: tl.constexpr,
+        ROWS: tl.constexpr, COLS: tl.constexpr,
+    ):
+        token = tl.program_id(0)
+        row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+        col = tl.arange(0, COLS)
+        inbounds = row[:, None] < H
+        acc = tl.zeros((ROWS,), tl.float32)
+        for k in range(K):
+            expert = tl.load(IDX + token * K + k).to(tl.int64)
+            base = W + expert * (H * IA)
+            w = tl.load(base + row[:, None] * IA + col[None, :], inbounds, 0).to(tl.float32)
+            a = tl.load(ACT + token * K * IA + k * IA + col, col < IA, 0).to(tl.float32)
+            dot = tl.sum(w * a[None, :], axis=1)
+            w_k = tl.load(WTS + token * K + k)
+            v = dot.to(tl.bfloat16).to(tl.float32)
+            acc += w_k * v
+        tl.store(Y + token * H + row, acc.to(tl.bfloat16), row < H)
+
+    return triton, _gate_up16, _down16
 
 
 @functools.lru_cache(maxsize=1)
@@ -319,6 +420,8 @@ def moe_grouped_decode(
     swiglu_limit: float,
     t_cap: int = 8,
     storage: str = "e4m3fn",
+    w16_gate_up: torch.Tensor | None = None,
+    w16_down: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Grouped decode MoE: return ``[T, H]`` bf16 for x ``[T, I]`` bf16.
 
@@ -365,8 +468,33 @@ def moe_grouped_decode(
     fnuz = storage == "e4m3fnuz"
     act = torch.empty((t, k, ia), device=x.device, dtype=torch.bfloat16)
     out = torch.empty((t, h), device=x.device, dtype=torch.bfloat16)
-    _, gate_up, down = _kernels()
     with torch.cuda.device(x.device):
+        if (
+            w16_gate_up is not None
+            and w16_down is not None
+            and w16_gate_up.dtype == torch.bfloat16
+            and w16_down.dtype == torch.bfloat16
+            and w16_gate_up.is_contiguous()
+            and w16_down.is_contiguous()
+            and w16_gate_up.shape == gate_up_w.shape
+            and w16_down.shape == down_w.shape
+            and w16_gate_up.device == x.device
+        ):
+            # T2R-11 bf16-resident decode: bit-exact by construction (see
+            # _kernels16) and 2.4x the fp8 chain on MI300A (658521).
+            _, gate_up, down = _kernels16()
+            gate_up[(t * k, triton.cdiv(ia, cfg["rows1"]))](
+                x, w16_gate_up, top_k_index, act, float(swiglu_limit),
+                ia, i, k, cfg["rows1"], triton.next_power_of_2(i),
+                num_warps=cfg["warps1"], enable_fp_fusion=False,
+            )
+            down[(t, triton.cdiv(h, cfg["rows2"]))](
+                act, w16_down, top_k_index, top_k_weights, out,
+                ia, h, k, cfg["rows2"], triton.next_power_of_2(ia),
+                num_warps=cfg["warps2"],
+            )
+            return out
+        _, gate_up, down = _kernels()
         # COLS = next_pow2 of the reduction axis, the ladder convention (the
         # tl.sum order depends only on COLS); I and IA are powers of two
         # multiples of 128 in the serving shapes so the masks are all-true.

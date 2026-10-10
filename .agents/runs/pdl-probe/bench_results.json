@@ -1,0 +1,98 @@
+{
+  "torch": "2.14.0+cu130",
+  "triton": "3.8.0",
+  "device": "NVIDIA GB10",
+  "compute_capability": "sm_121",
+  "sms": 48,
+  "driver_note": "PDL requires sm_90+; GB10 is sm_121 (Blackwell), driver 580.95.05, torch 2.14.0+cu130 graph capture.",
+  "functional_probe": {
+    "pair_baseline": {
+      "min_us": 249.34400618076324,
+      "median_of_round_min_us": 249.56799298524857
+    },
+    "pair_pdl": {
+      "min_us": 175.99999904632568,
+      "median_of_round_min_us": 176.7360046505928
+    },
+    "solo_consumer_us": {
+      "solo_consumer": {
+        "min_us": 84.6719965338707,
+        "median_of_round_min_us": 84.927998483181
+      }
+    },
+    "pdl_parity": true,
+    "overlap_us": 73.34400713443756,
+    "pdl_honored": true
+  },
+  "minimal_pair": {
+    "baseline": {
+      "min_us": 318.84801387786865,
+      "median_of_round_min_us": 321.5840011835098
+    },
+    "pdl_early": {
+      "min_us": 313.6959969997406,
+      "median_of_round_min_us": 315.15198945999146
+    },
+    "pdl_late": {
+      "min_us": 318.9440071582794,
+      "median_of_round_min_us": 320.7840025424957
+    },
+    "pdl_consumer_only": {
+      "min_us": 346.5920090675354,
+      "median_of_round_min_us": 347.3759889602661
+    },
+    "n_launches": 200,
+    "exec_fill_us": 0.3324999997857958,
+    "exec_scale_us": 0.3370000049471855,
+    "eager_baseline_us": 1225.2479791641235,
+    "pdl_chain_parity": true
+  },
+  "mhc_chain_b1": {
+    "baseline": {
+      "min_us": 372.73600697517395,
+      "median_of_round_min_us": 373.27998876571655
+    },
+    "pdl_early": {
+      "min_us": 357.2799861431122,
+      "median_of_round_min_us": 358.0959886312485
+    },
+    "pdl_late": {
+      "min_us": 347.680002450943,
+      "median_of_round_min_us": 348.59199821949005
+    },
+    "pdl_consumer_only": {
+      "min_us": 372.9279935359955,
+      "median_of_round_min_us": 373.52000176906586
+    },
+    "sites": 40,
+    "tokens": 1,
+    "n_launches": 120,
+    "eager_baseline_us": 994.271993637085,
+    "copies_match_production": true,
+    "pdl_chain_parity": true
+  },
+  "mhc_chain_b4": {
+    "baseline": {
+      "min_us": 440.8639967441559,
+      "median_of_round_min_us": 442.80000030994415
+    },
+    "pdl_early": {
+      "min_us": 486.1760139465332,
+      "median_of_round_min_us": 488.17598819732666
+    },
+    "pdl_late": {
+      "min_us": 436.73598766326904,
+      "median_of_round_min_us": 437.00800836086273
+    },
+    "pdl_consumer_only": {
+      "min_us": 442.8800046443939,
+      "median_of_round_min_us": 443.2799965143204
+    },
+    "sites": 40,
+    "tokens": 4,
+    "n_launches": 120,
+    "eager_baseline_us": 1011.1360549926758,
+    "copies_match_production": true,
+    "pdl_chain_parity": true
+  }
+}

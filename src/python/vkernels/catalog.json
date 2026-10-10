@@ -529,6 +529,18 @@
       "contract_test": null
     },
     {
+      "name": "m_grouped_gemm_nt_masked",
+      "kind": "kernel",
+      "category": "gemm_grouped",
+      "description": "Masked m-grouped GEMM for CUDA-graph MoE decode (borrowed from DeepGEMM's m_grouped_*_gemm_nt_masked contract): C[g, m, :] = A[g, m, :] @ B[g]^T for rows m < masked_m[g]; rows at or beyond the per-group valid count are left untouched, so a graph captured without per-expert token counts computes exactly the live rows. A is [G, M, K], B is [G, N, K] (NT), masked_m is [G] device-resident int, C is [G, M, N].",
+      "signature": "m_grouped_gemm_nt_masked(std::size_t G, std::size_t M, std::size_t N, std::size_t K, Span<const float> A, Span<const float> B, Span<const int> masked_m, Span<float> C)",
+      "header": "src/c/vkernels/kernels/gemm_grouped.hpp",
+      "host": true,
+      "cuda": true,
+      "hip": false,
+      "contract_test": "tests/kernels/indexer/test_indexer_grouped.cpp"
+    },
+    {
       "name": "glm_fp8_block_gemv_cpu",
       "kind": "kernel",
       "category": "glm_moe",
@@ -971,6 +983,18 @@
       "cuda": false,
       "hip": true,
       "contract_test": null
+    },
+    {
+      "name": "mqa_logits",
+      "kind": "kernel",
+      "category": "mqa_logits",
+      "description": "Weighted ReLU MQA logits for the lightning indexer (borrowed from DeepGEMM's fp8_fp4_mqa_logits family): out[m, n] = sum_h weights[m, h] * relu(dot(q[m, h, :], kv[n, :])) for n inside the row's KV span [cu_seq_len_k_start[m], cu_seq_len_k_end[m]) and -inf outside. q is [M, H, D], kv a single-head [N, D] cache, weights [M, H], out dense [M, N] (DeepGEMM's compressed per-row layout is a caller concern).",
+      "signature": "mqa_logits(std::size_t M, std::size_t N, std::size_t H, std::size_t D, Span<const float> q, Span<const float> kv, Span<const float> weights, Span<const int> cu_seq_len_k_start, Span<const int> cu_seq_len_k_end, Span<float> out)",
+      "header": "src/c/vkernels/kernels/mqa_logits.hpp",
+      "host": true,
+      "cuda": true,
+      "hip": false,
+      "contract_test": "tests/kernels/indexer/test_indexer_grouped.cpp"
     },
     {
       "name": "mla_fwd_with_tile",
