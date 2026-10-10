@@ -29,7 +29,6 @@ torch = pytest.importorskip("torch")
 from vkernels.torch_ops._dispatch import OpNotEligible  # noqa: E402
 from vkernels.torch_ops.dsa_kpool_compress import (  # noqa: E402
     FP8_DTYPE,
-    FP8_MAX,
     INDEX_HEAD_DIM,
     append_tail_to_topk,
     expand_pools_and_append_tail,

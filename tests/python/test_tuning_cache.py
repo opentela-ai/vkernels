@@ -22,7 +22,7 @@ import json
 import pytest
 
 from vkernels.tuning import cache as tcache
-from vkernels.tuning.cache import op_config, reset_memo, seed, stored_records
+from vkernels.tuning.cache import op_config, reset_memo, seed
 
 FAKE_DEV = {"capability": "sm999", "sm_count": 1, "name": "FAKE", "software": {}}
 FAKE_DEV2 = {"capability": "sm999", "sm_count": 1, "name": "FAKE2", "software": {}}
