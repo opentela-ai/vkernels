@@ -204,15 +204,16 @@ contract detail that flips selections at E=384: sigmoid scores round to
 the router dtype (bf16) BEFORE the bias add, top-k choice, and
 normalization — the eager reference must apply the same rounding.
 
-Floe wiring (sibling repo, ``glm53flash/forward.py``): add an opt-in knob
-beside ``fused_router`` (e.g. ``gluon_router``) that replaces the eager
-sigmoid+bias+topk+gather+normalize+scale chain with
-``vkernels.torch_ops.tokenspeed_amd.routing.
-invoke_sigmoid_bias_topk_route_gluon(logits, e_score_correction_bias,
-topk, routed_scaling_factor=...)`` when gluon ≥ 3.8 is present
-(``gluon_available()``) and M·topk ≤ 128 (decode batches). Decode-batch
-router glue measured ~140 µs/layer eager vs ~47 µs single-launch —
-~93 µs/layer × 42 MoE layers on the table.
+**A/B verdict (job 675719): no floe integration needed.** floe's
+``fused_router`` knob already routes through our own
+``vkernels.torch_ops.glm_router.fused_router`` (plain Triton), and on
+MI300A it ties the gluon sigmoid router at M=1/16 (48.0 vs 47.6, 42.1 vs
+42.1 µs) and loses only 1.45× at M=8 (68.5 vs 47.4 µs) — a few µs at one
+decode width, with the gluon kernel capped at M·topk ≤ 128 anyway. The
+existing kernel is adequate; the gluon router stays available through
+``tokenspeed_amd.routing`` for shapes where it wins. (The eager chain's
+~140 µs comparison from the routing bench stands — both fused kernels
+beat it ~3×.)
 
 ## Replay variant: parity landed (the KDA family is now fully verified)
 
