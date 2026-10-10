@@ -206,6 +206,28 @@ of a full-sequence mask (NaN).
 collapse trades overlap for correctness, so these are a floor to tune
 from, not the ceiling. aiter flash-decode comparison is future work.
 
+## MLA extend: the second MFMA-class attention kernel ported to CDNA3
+
+``torch_ops/tokenspeed_amd/mla_extend.py`` re-lowers upstream's absorbed
+MLA extend (prefix-cache/chunked prefill, ragged grid, KV split + reduce)
+with three further CDNA3 deltas beyond the MHA recipe: gfx942's 64 KB LDS
+forces ``BLOCK_N=16`` single-stage staging (MI350's 128 KB LDS hosts
+upstream's 4-stage 32-wide ring); the K and V operands stage into
+**physically distinct** buffers (K transposed, V natural — replacing the
+relaxed DMA reads that served both orientations from one buffer); and the
+manual software scheduler (``sched_barrier.ll``, vendored for a future
+pass) is dropped entirely. **Parity on MI300A, first successful compile**
+(job 675877 — all five iteration fixes were host/config-level, e.g. the
+jit ``max`` helper shadowing the builtin in host code and aggregate
+stride typing). Full suite: **53/53** tokenspeed_amd + MLA tests.
+
+With this, **every MFMA-class attention kernel from the survey that is
+CDNA3-portable is ported and parity-verified on gfx942**: mha/decode,
+mla/extend (plus the buffer-op kernels from earlier rounds). The
+remaining upstream families (mla/decode 3100 lines/50 cdna4 refs,
+mha/prefill, rmha/*) are the same recipe at larger scale; FP8 KV needs
+dot_scaled MFMA and stays gated.
+
 ## Round-3 follow-ups (same effort)
 
 - **MLA prefill xfail resolved** — the MI300A divergence was a test-reference
