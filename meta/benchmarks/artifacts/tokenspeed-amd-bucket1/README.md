@@ -254,6 +254,15 @@ MI300A** (seqs {64,150,500}, 32/4 heads; zero-bias control probe exact at
 5e-4 isolating one reference-side bias-ordering bug: the kernel adds bias
 to the raw dot product BEFORE sm_scale).
 
+## rel-MHA extend: ragged paged extend with rel bias
+
+``rmha_extend.py`` — ragged multi-token extend over the paged cache
+(query-tile M packing, host-static grid, causal/window masking ladder,
+LSE, per-query-row rel bias), recipe as the other ports. **Parity on
+MI300A** (ragged seqs {16+48, 8+120}, 8/2 heads); one reference-side
+fix (bias clamps over all keys; future keys' bias is hidden by the
+causal mask).
+
 ## Round-3 follow-ups (same effort)
 
 - **MLA prefill xfail resolved** — the MI300A divergence was a test-reference
