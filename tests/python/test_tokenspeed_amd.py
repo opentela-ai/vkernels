@@ -1306,6 +1306,63 @@ def test_gpu_mla_extend_matches_reference():
     assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
 
+def _mha_prefill_reference(q, k, v, cu_seqlens, sm_scale, window_left=-1):
+    """Eager reference for ``launch_gluon_mha_prefill_gfx942``."""
+    total, heads, dim = q.shape
+    kv_heads = k.shape[1]
+    group = heads // kv_heads
+    out = torch.empty_like(q, dtype=torch.float32)
+    starts = cu_seqlens.tolist()
+    for b, start in enumerate(starts[:-1]):
+        seq_len = int(starts[b + 1] - start)
+        for h in range(heads):
+            kv_h = h // group
+            qk = q[start : start + seq_len, h].float() @ k[start : start + seq_len, kv_h].float().T * sm_scale
+            pos = torch.arange(seq_len, device=q.device)
+            mask = pos[:, None] >= pos[None, :]
+            if window_left >= 0:
+                mask &= pos[:, None] <= pos[None, :] + window_left
+            probs = torch.softmax(qk.masked_fill(~mask, float("-inf")), dim=-1)
+            out[start : start + seq_len, h] = probs @ v[start : start + seq_len, kv_h].float()
+    return out.to(q.dtype)
+
+
+@pytest.mark.gpu
+def test_gpu_mha_prefill_matches_reference():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import mha_prefill as ts_prefill
+
+    torch.manual_seed(23)
+    heads, kv_heads, dim = 32, 4, 128
+    seqs = [(200, 200), (80, 80)]
+    total = sum(s for s, _ in seqs)
+    cu = [0]
+    for s, _ in seqs:
+        cu.append(cu[-1] + s)
+    q = torch.randn(total, heads, dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    k = torch.randn(total, kv_heads, dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    v = torch.randn(total, kv_heads, dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    sm_scale = dim**-0.5
+    ref = _mha_prefill_reference(q, k, v, cu_t, sm_scale)
+    out = ts_prefill.launch_gluon_mha_prefill_gfx942(
+        q, k, v, cu_t, cu, max_seqlen=max(s for s, _ in seqs)
+    )
+    assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    # sliding window leg
+    ref_w = _mha_prefill_reference(q, k, v, cu_t, sm_scale, window_left=127)
+    out_w = ts_prefill.launch_gluon_mha_prefill_gfx942(
+        q, k, v, cu_t, cu, max_seqlen=max(s for s, _ in seqs), window_left=127
+    )
+    assert torch.allclose(out_w.float(), ref_w.float(), atol=2e-2, rtol=2e-2)
+    # skip-softmax sparsity leg (exact when threshold covers nothing)
+    out_s = ts_prefill.launch_gluon_mha_prefill_gfx942(
+        q, k, v, cu_t, cu, max_seqlen=max(s for s, _ in seqs),
+        skip_softmax_threshold=1e-9,
+    )
+    assert torch.allclose(out_s.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.gpu
 def test_gpu_kda_fused_decode_smoke():
     """Compile/launch smoke for the vendored KDA fused decode on gfx942.
