@@ -1100,6 +1100,72 @@ def test_gpu_sigmoid_routing_matches_reference():
 
 
 @pytest.mark.gpu
+def test_gpu_gluon_cdna3_mfma_tile():
+    """Minimal end-to-end CDNA3 MFMA tile on gfx942 (bucket-2 primitive pin).
+
+    Proves the exact primitive chain the MFMA-class attention ports need:
+    blocked loads -> shared staging (SwizzledSharedLayout) -> dot-operand
+    loads -> ``amd.cdna3.mfma`` -> accumulator -> ``cdna3.buffer_store``.
+    Two layout rules discovered here (see docs/borrowing-tokenspeed-deepgemm.md):
+    layout literals inside jit bodies need ``: gl.constexpr`` annotations,
+    and each 1-D offsets var is sliced on the axis it expands into (one var
+    cannot serve both orientations).
+    """
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd._gluon import gl, gluon
+    from triton.experimental.gluon.language import amd
+
+    m = n = 32
+    k = 16
+
+    def make_kernel(instr):
+        c = gl.amd.AMDMFMALayout(
+            version=2, instr_shape=instr, transposed=False, warps_per_cta=[1, 1]
+        )
+        a_lay = gl.DotOperandLayout(0, c, k_width=k)
+        b_lay = gl.DotOperandLayout(1, c, k_width=k)
+
+        @gluon.jit
+        def tile(a_ptr, b_ptr, out_ptr, MM: gl.constexpr, NN: gl.constexpr, KK: gl.constexpr):
+            row_lay: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, 1], [1, 0])
+            offs_m = gl.arange(0, MM, layout=gl.SliceLayout(1, row_lay))
+            offs_n = gl.arange(0, NN, layout=gl.SliceLayout(0, row_lay))
+            offs_kc = gl.arange(0, KK, layout=gl.SliceLayout(0, row_lay))
+            offs_kr = gl.arange(0, KK, layout=gl.SliceLayout(1, row_lay))
+            av = gl.load(a_ptr + offs_m[:, None] * KK + offs_kc[None, :]).to(gl.bfloat16)
+            bv = gl.load(b_ptr + offs_kr[:, None] * NN + offs_n[None, :]).to(gl.bfloat16)
+            a_smem = gl.allocate_shared_memory(
+                gl.bfloat16, [MM, KK], gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
+            )
+            b_smem = gl.allocate_shared_memory(
+                gl.bfloat16, [KK, NN], gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
+            )
+            a_smem.store(av)
+            b_smem.store(bv)
+            a_op = a_smem.load(a_lay)
+            b_op = b_smem.load(b_lay)
+            acc = gl.zeros([MM, NN], gl.float32, layout=c)
+            acc = amd.cdna3.mfma(a_op, b_op, acc)
+            om = gl.arange(0, MM, layout=gl.SliceLayout(1, c))
+            on = gl.arange(0, NN, layout=gl.SliceLayout(0, c))
+            amd.cdna3.buffer_store(
+                acc, out_ptr, (om[:, None] * NN + on[None, :]).to(gl.int32)
+            )
+
+        return tile
+
+    torch.manual_seed(20)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
+    ref = a.float() @ b.float()
+    for instr in ([16, 16, 16], [32, 32, 8]):
+        out = torch.zeros(m, n, device="cuda", dtype=torch.float32)
+        make_kernel(instr)[(1,)](a, b, out, MM=m, NN=n, KK=k, num_warps=1)
+        torch.cuda.synchronize()
+        assert torch.allclose(out, ref, atol=1e-4, rtol=1e-4), instr
+
+
+@pytest.mark.gpu
 def test_gpu_kda_fused_decode_smoke():
     """Compile/launch smoke for the vendored KDA fused decode on gfx942.
 
