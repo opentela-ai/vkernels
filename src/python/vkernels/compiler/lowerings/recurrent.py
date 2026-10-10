@@ -171,6 +171,92 @@ def lower_kda_delta(op: Operator, graph: OperatorGraph) -> TaskFamily:
         write_regions=writes,
     )
 
+def lower_kda_fused_decode(op: Operator, graph: OperatorGraph) -> TaskFamily:
+    """E1 fused KDA decode: ONE task per (batch row, head) — the fused
+    kernel's CTA decomposition (the CUDA oracle maps one block per
+    (token, value-head)). The task owns its head's channels in each of the
+    q|k|v segments of the RAW row + the w-major conv pool, and its head's
+    [V, K] V-major ssm slice (read-modify-write). Pool rows are addressed
+    through the runtime slot table (Region.indirect — the #94 pattern):
+    per-task pool regions are the conservative whole-pool slab, exact
+    under the op's slot-disjointness obligation (duplicate live slots in
+    one phase are UB, as in the fused kernel; -1 padded slots skip all
+    pool accesses). Two kda_fused_decode ops on one pool chain through the
+    pool-storage hazards (the cross-step recurrence), phase-ordered like
+    the KV append."""
+    from ..operator_ir import Region
+
+    conv = graph.tensor(op.inputs[0])
+    ssm = graph.tensor(op.inputs[1])
+    slot_ids = graph.tensor(op.inputs[2])
+    qkv_raw = graph.tensor(op.inputs[3])
+    f_raw = graph.tensor(op.inputs[4])
+    b_raw = graph.tensor(op.inputs[5])
+    g_raw = graph.tensor(op.inputs[6])
+    taps = graph.tensor(op.inputs[7])
+    dt_bias = graph.tensor(op.inputs[8])
+    A_log = graph.tensor(op.inputs[9])
+    o_norm = graph.tensor(op.inputs[10])
+    out = graph.tensor(op.outputs[0])
+    Kw, Cc = conv.shape[1], conv.shape[2]
+    H, V, K = ssm.shape[1:]
+    B = out.shape[0]
+    seg = Cc // 3
+    domain = TileDomain(((B, 1), (H, 1)))
+
+    def reads(coords):
+        bb, h = coords
+        conv_r = Region.indirect(conv, slot_ids, axis=0)
+        ssm_r = Region.indirect(ssm, slot_ids, axis=0)
+        return (
+            conv_r,
+            ssm_r,
+            _tile_region(slot_ids, ((bb, bb + 1),)),
+            # the task's q|k|v channel stripes of the RAW row (contiguous
+            # [h·D, (h+1)·D) inside each third — the kernel's slicing)
+            _tile_region(qkv_raw, ((bb, bb + 1), (h * K, (h + 1) * K))),
+            _tile_region(qkv_raw, ((bb, bb + 1), (seg + h * K, seg + (h + 1) * K))),
+            _tile_region(qkv_raw, ((bb, bb + 1), (2 * seg + h * K, 2 * seg + (h + 1) * K))),
+            _tile_region(f_raw, ((bb, bb + 1), (h, h + 1), (0, K))),
+            _tile_region(b_raw, ((bb, bb + 1), (h, h + 1))),
+            _tile_region(g_raw, ((bb, bb + 1), (h, h + 1), (0, V))),
+            _whole(taps),
+            _whole(dt_bias),
+            _whole(A_log),
+            _whole(o_norm),
+        )
+
+    def writes(coords):
+        bb, h = coords
+        return (
+            Region.indirect(conv, slot_ids, axis=0),
+            Region.indirect(ssm, slot_ids, axis=0),
+            _tile_region(out, ((bb, bb + 1), (h, h + 1), (0, V))),
+        )
+
+    return TaskFamily(
+        family_id=f"ph{op.opid:02d}_kda_fused",
+        kind="kda_fused_decode",
+        op=op,
+        domain=domain,
+        inputs=(conv.name, ssm.name, slot_ids.name, qkv_raw.name, f_raw.name, b_raw.name,
+                g_raw.name, taps.name, dt_bias.name, A_log.name, o_norm.name),
+        outputs=(out.name,),
+        params={
+            "layer": op.attributes.get("layer", 0),
+            "scale": op.attributes.get("scale", 1.0),
+            "eps": op.attributes.get("eps", 1e-6),
+            "lower_bound": op.attributes.get("lower_bound"),
+            "head_dim": K,
+            "conv_taps": Kw + 1,
+            "conv_dim": Cc,
+        },
+        threads=THREADS_PER_WORKER,
+        scratch_bytes=V * K * 4 + 3 * K * 4,  # the [V, K] fp32 state slice + q/k/v rows
+        read_regions=reads,
+        write_regions=writes,
+    )
+
 def lower_mhc_pre(op: Operator, graph: OperatorGraph) -> TaskFamily:
     """One task per batch row: the task owns the row's whole [hc, C] stream
     stack (the flat RMSNorm reduction and the fn GEMV both read the full

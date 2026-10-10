@@ -1,0 +1,11 @@
+{
+  "requests": [
+    {"op": "add", "size": 4096, "iters": 30},
+    {"op": "scale", "size": 4096, "iters": 30},
+    {"op": "relu", "size": 4096, "iters": 30},
+    {"op": "sum", "size": 65536, "iters": 30},
+    {"op": "max", "size": 65536, "iters": 30},
+    {"op": "gemm", "size": 128, "n": 16, "k": 16, "iters": 5},
+    {"op": "gemm", "size": 256, "n": 16, "k": 16, "iters": 5}
+  ]
+}

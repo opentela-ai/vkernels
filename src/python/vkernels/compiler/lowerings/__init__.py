@@ -37,6 +37,7 @@ from .recurrent import (
     lower_gdn_conv as lower_gdn_conv,
     lower_gdn_delta as lower_gdn_delta,
     lower_kda_delta as lower_kda_delta,
+    lower_kda_fused_decode as lower_kda_fused_decode,
     lower_mhc_pre as lower_mhc_pre,
     lower_mhc_post as lower_mhc_post,
     lower_compressor_append as lower_compressor_append,

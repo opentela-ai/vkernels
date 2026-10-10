@@ -108,6 +108,10 @@ EXPECTED_KERNELS = [
     # Same two-namespace model as dsa.hpp: the CUDA wmma GEMM (PR #30)
     # declares gemm_bf16 a second time in vkernels::kernels::cuda.
     ("gemm_bf16", "gemm_bf16"),
+    # Masked m-grouped GEMM (gemm_grouped.hpp, DeepGEMM-borrowed): the
+    # CUDA-graph MoE decode contract — only rows below the device-resident
+    # masked_m[g] are computed, the rest stay untouched.
+    ("m_grouped_gemm_nt_masked", "gemm_grouped"),
     ("glm_fp8_block_gemv_cpu", "glm_moe"),
     ("glm_e4m3_to_f32_cpu", "glm_moe"),
     ("gemv_pick_sk", "glm_moe"),
@@ -150,6 +154,9 @@ EXPECTED_KERNELS = [
     ("mla_fwd", "mla"),
     ("mla_fwd_with_split", "mla"),
     ("mla_fwd_with_tile", "mla"),
+    # Weighted-ReLU MQA logits (mqa_logits.hpp, DeepGEMM-borrowed): the
+    # lightning-indexer scoring stage feeding dsa_topk selection.
+    ("mqa_logits", "mqa_logits"),
     ("direct_lds_fill_bf16", "moe"),
     ("fp4_to_bf16_dequant", "moe"),
     ("use_async_copy_default", "moe"),

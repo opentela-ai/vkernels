@@ -354,6 +354,147 @@ def _moe_block(
     return routed + sh.T
 
 
+def kda_fused_decode_reference(
+    conv_pool: np.ndarray,  # [slots, Kw, Cc] time-major (w-major) pool, bf16-grid values
+    ssm_pool: np.ndarray,  # [slots, H, V, K] V-MAJOR fp32 pool
+    slot_ids: np.ndarray,  # i32 [B]; -1 = padded slot
+    qkv_raw: np.ndarray,  # [B, Cc] RAW pre-conv fused-projection rows (bf16 round at entry)
+    f_raw: np.ndarray,  # [B, H, K] RAW f_b(f_a(x)) dots
+    b_raw: np.ndarray,  # [B, H] RAW b_proj dots
+    g_raw: np.ndarray,  # [B, H, V] RAW g_b(g_a(x)) o-norm gate dots
+    taps: np.ndarray,  # [Kt, Cc] TIME-MAJOR fp32 conv taps (q|k|v channel segments)
+    dt_bias: np.ndarray,  # [H, K]
+    A_log: np.ndarray,  # [H]
+    o_norm: np.ndarray,  # [V] shared across heads
+    *,
+    scale: float,
+    eps: float,
+    lower_bound: float | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """fp64 mirror of the E1 fused-decode contract (one layer's decode op).
+
+    Pins EXACTLY the semantics documented by the CUDA oracle
+    ``vkernels.torch_ops.glm_kda_fused_decode`` (the correctness oracle for
+    the megakernel's KDA tasks), in the kernel's ABI and op order:
+
+    * RAW dot contract — the op consumes the RAW pre-conv fused-projection
+      row, the RAW ``f_b``/``b_proj``/``g_b`` dots; each is rounded to the
+      bf16 grid at task entry (the kernel's bf16 ABI), and every gate
+      nonlinearity (beta, o-norm gate) is applied AFTER that round;
+    * conv: fp32 time-major taps over the bf16-valued w-major window
+      ``[pool | x]``, SiLU in fp32; the conv output is NOT rounded to bf16
+      before the recurrence (the incumbent chain's conv store rounds — that
+      bf16-round class is the documented cross-path divergence, ~1e-2 rel);
+      the pool shift ``[old w1, old w2, new raw x]`` is pure bf16 moves;
+      floe's conv1d is bias-free (the CUDA ABI's ``conv_bias`` is zeros);
+    * ssm pool V-MAJOR ``[slots, H, V, K]`` fp32 (rows = v, cols = k — the
+      transpose of the decomposed ``kda_delta`` op's [B, H, K, V] pool;
+      layout only, no numeric divergence), decay per (head, k) broadcast
+      over v-rows, delta rule, plain readout;
+    * gated per-head RMSNorm with the [V] weight shared across heads and
+      the sigmoid gate applied after the bf16 round; the output row is
+      stored on the bf16 grid (the kernel's out ABI);
+    * ``-1`` slot ids are padded slots: zero output row, both pools
+      untouched. Duplicate live slot ids in one step are UB (same contract
+      as the fused kernel).
+
+    Returns fresh ``(out [B, H, V], conv_pool', ssm_pool')`` — the caller's
+    pools are never mutated (the executor mutates in place; this mirror
+    copies so both stay comparable after the fact).
+    """
+    from .reference_types import bf16_round
+
+    B, H = b_raw.shape
+    Cc = conv_pool.shape[2]
+    D = V = ssm_pool.shape[-1]
+    seg = Cc // 3
+    conv = conv_pool.copy()
+    ssm = ssm_pool.copy()
+    out = np.zeros((B, H, V), np.float64)
+    for b in range(B):
+        slot = int(slot_ids[b])
+        if slot < 0:
+            continue  # padded graph slot: output row stays zero, pools untouched
+        x = bf16_round(qkv_raw[b])  # [Cc] on the bf16 grid
+        acc_all = np.einsum("wc,wc->c", taps, np.concatenate([conv[slot], x[None, :]], axis=0))
+        y = acc_all * _sigmoid(acc_all)  # SiLU, fp64 (fp32 on device), NOT rounded
+        conv[slot] = np.concatenate([conv[slot][1:], x[None, :]], axis=0)  # pure bf16 moves
+        for h in range(H):
+            q = y[h * D : (h + 1) * D]
+            k = y[seg + h * D : seg + (h + 1) * D]
+            v = y[2 * seg + h * D : 2 * seg + (h + 1) * D]
+            xx = bf16_round(f_raw[b, h]) + dt_bias[h]
+            A = np.exp(A_log[h])
+            if lower_bound is not None:
+                decay = np.exp(lower_bound * _sigmoid(A * xx))  # [K] log-space
+            else:
+                sp = np.where(xx <= 20.0, np.log1p(np.exp(np.minimum(xx, 20.0))), xx)
+                decay = np.exp(-A * sp)
+            beta = _sigmoid(bf16_round(b_raw[b, h]))  # sigmoid AFTER the bf16 round
+            qn = q / np.sqrt((q * q).sum() + 1e-6) * scale
+            kn = k / np.sqrt((k * k).sum() + 1e-6)
+            s = ssm[slot, h] * decay[None, :]  # [V, K], decay broadcast over v-rows
+            t = (s * kn[None, :]).sum(axis=1)  # t[v] = sum_k s[v,k]*kn[k]
+            delta = (v - t) * beta
+            s = s + delta[:, None] * kn[None, :]
+            ssm[slot, h] = s  # fp32 pool store class
+            o = (s * qn[None, :]).sum(axis=1)  # o[v] = sum_k s[v,k]*qn[k]
+            rstd = 1.0 / np.sqrt((o * o).mean() + eps)
+            out[b, h] = bf16_round(o * rstd * o_norm * _sigmoid(bf16_round(g_raw[b, h])))
+    return out, conv, ssm
+
+
+def glm53_reference_kda_spine_step(
+    cfg: Glm53Config,
+    w: Glm53Weights,
+    streams: np.ndarray,  # [B, hc, C]
+    conv_pools: list,  # per-layer [slots, Kw, Cc] (NOT mutated; returns updated)
+    ssm_pools: list,  # per-layer [slots, H, V, K] V-major
+    slot_ids: np.ndarray | None = None,  # i32 [B]; default identity
+) -> np.ndarray:
+    """E1 KDA-spine mirror: the 34-KDA-layer attention sub-blocks chained
+    through the mHC streams, each layer's decode block under the FUSED
+    contract (``kda_fused_decode_reference``).
+
+    The spine is the E1 slice: ``mhc_pre → ln1 → fused qkv/f/b/g GEMVs →
+    fused decode (conv + kda-delta + gated norm) → o_proj → mhc_post`` per
+    layer, no FFN sub-block (that is E3's slice) — the exact body the
+    compiled spine (``build_glm53_kda_spine_forward``) captures. Returns
+    the post-spine streams ``[B, hc, C]`` and the updated pool lists.
+    """
+    B = streams.shape[0]
+    H, D = cfg.linear_num_heads, cfg.linear_head_dim
+    qkv = cfg.qkv_dim
+    if slot_ids is None:
+        slot_ids = np.arange(B, dtype=np.int32)
+    hidden = streams
+    new_conv, new_ssm = [], []
+    for layer in range(cfg.num_hidden_layers):
+        post, comb, h_in = _mhc_block(
+            hidden, w.hc_attn_fn[layer], w.hc_attn_base[layer], w.hc_attn_scale[layer], cfg
+        )
+        h = _rms_norm(h_in, w.ln1[layer], cfg.rms_norm_eps)
+        # RAW dots (fp64 here; the fused op rounds to bf16 at entry)
+        mixed = h @ w.qkv_proj[layer].T
+        f_raw = (h @ w.f_a[layer].T @ w.f_b[layer].T).reshape(B, H, D)
+        b_raw = h @ w.b_proj[layer].T
+        g_raw = (h @ w.g_a[layer].T @ w.g_b[layer].T).reshape(B, H, D)
+        fused, conv_pools[layer], ssm_pools[layer] = kda_fused_decode_reference(
+            conv_pools[layer], ssm_pools[layer], slot_ids,
+            mixed, f_raw, b_raw, g_raw,
+            w.conv_w[layer].T.copy(),  # [C, Kt] -> [Kt, C] time-major taps
+            w.dt_bias[layer].reshape(H, D), w.A_log[layer], w.o_norm[layer],
+            scale=D ** -0.5, eps=cfg.rms_norm_eps, lower_bound=cfg.linear_lower_bound,
+        )
+        new_conv.append(conv_pools[layer])
+        new_ssm.append(ssm_pools[layer])
+        body = fused.reshape(B, qkv) @ w.o_proj[layer].T
+        hidden = _mhc_compose(hidden, post, comb, body)
+    conv_pools[:] = new_conv
+    ssm_pools[:] = new_ssm
+    return hidden
+
+
 def glm53_reference_decode_step(
     cfg: Glm53Config, w: Glm53Weights,
     streams: np.ndarray,  # [B, hc, C]
