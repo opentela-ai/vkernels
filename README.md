@@ -70,6 +70,31 @@ Every kernel and collective in this repo is provided **twice**:
 This means you can develop, review, and get to 100% coverage on any laptop, and run the
 GPU path only on machines that have a toolkit and device.
 
+## Formally verified kernels
+
+Structural properties (data-race freedom for **all** thread/block schedules) are proved
+mechanically with GPUVerify over dialect mirrors of the CUDA kernels; the CPU oracle
+kernels are proved against their specifications with ESBMC. Full details, harnesses,
+and install instructions live in [`verifier/README.md`](verifier/README.md).
+
+| Kernels | Production source | Proved property |
+|---|---|---|
+| `add_kernel`, `scale_kernel`, `relu_kernel` | `src/c/vkernels/kernels/elementwise.cu` | no data races, all schedules |
+| `reduce<false>`, `reduce<true>` (`sum`/`max`) | `src/c/vkernels/kernels/reduce.cu` | no data races, no barrier divergence |
+| `gemm_kernel` | `src/c/vkernels/kernels/gemm.cu` | no data races, bounded sizes (M,N,K ≤ 64) |
+| `fused_reduce_stub` | `src/c/vkernels/comm/allreduce.cu` | no data races, all schedules |
+| `peer_copy_kernel` | `src/c/vkernels/comm/pipeline_boundary.cu` | no data races, all schedules |
+| `kv_gather_kernel` (`SlotT` = i32/i64) | `src/c/vkernels/comm/kv_gather.cu` | no data races on the pinned page/slot domain |
+| `kv_scatter_kernel` (`SlotT` = i32/i64) | `src/c/vkernels/comm/kv_scatter.cu` | same, via slot-uniqueness contract |
+
+That is 9 of the 20 CUDA kernels in `src/c/vkernels` (12 proof entries — reduce and
+gather/scatter split per template instantiation). Also proved: the CPU oracles match
+their specs (ESBMC: elementwise, reduce, gemm), the tiled-GEMM index map is equivalent
+to the naive traversal (z3), and the fp32 sequential-sum error bound `|fl(Σx) − Σx| ≤
+5·2⁻²⁴` (Gappa). Functional correctness of the kernels themselves is covered by the
+CTest CUDA-vs-CPU parity suite; the remaining kernels and the HIP families are not yet
+formally verified (see the coverage note in `verifier/README.md`).
+
 ## Torch operator kernels (`torch_ops`)
 
 `src/python/vkernels/torch_ops/` hosts the device-op kernels that serve

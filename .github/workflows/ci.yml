@@ -192,3 +192,49 @@ jobs:
         env:
           VKERNELS_BUILD_DIR: build/hip
         run: python3 -m pytest tests/python/test_dsa_kpool_streams.py tests/python/test_dsa_kpool_device.py -q
+
+  # ------------------------------------------------------------------
+  # Kernel benchmark comparison (merge base vs candidate): the PR gate
+  # from docs/borrowing-tokenspeed-deepgemm.md §3.4 (tokenspeed-kernel's
+  # PR benchmark flow). Runs the host suite on the merge base and on the
+  # candidate, then `python -m vkernels.benchmark compare` fails the job
+  # when any case's median runtime regressed beyond the threshold.
+  # ------------------------------------------------------------------
+  benchmark:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+
+      - name: Baseline suite (merge base)
+        run: |
+          git fetch origin +refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
+          BASE="$(git merge-base HEAD refs/remotes/origin/${{ github.base_ref }})"
+          git checkout --detach "$BASE"
+          # Restore the checked-in suite from the candidate (the baseline
+          # tree may predate it); the ops it names exist on both sides. A
+          # baseline that predates the harness itself degrades to an empty
+          # report — every case then counts as new (reported, not failed).
+          git checkout ${{ github.sha }} -- meta/benchmarks/python/host-suite.json
+          uv run python -m vkernels.benchmark run \
+            --suite meta/benchmarks/python/host-suite.json --json /tmp/base.json \
+            || printf '{"schema": 1, "results": []}\n' > /tmp/base.json
+
+      - name: Candidate suite
+        run: |
+          git checkout --detach ${{ github.sha }}
+          git checkout ${{ github.sha }} -- meta/benchmarks/python/host-suite.json
+          uv run python -m vkernels.benchmark run \
+            --suite meta/benchmarks/python/host-suite.json --json /tmp/cand.json
+
+      - name: Compare (fail on >10% median regression)
+        run: >
+          uv run python -m vkernels.benchmark compare
+          /tmp/base.json /tmp/cand.json --threshold 0.10

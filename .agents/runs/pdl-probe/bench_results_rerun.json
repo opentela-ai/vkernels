@@ -1,0 +1,79 @@
+{
+  "torch": "2.14.0+cu130",
+  "triton": "3.8.0",
+  "device": "NVIDIA GB10",
+  "compute_capability": "sm_121",
+  "sms": 48,
+  "driver_note": "PDL requires sm_90+; GB10 is sm_121 (Blackwell), driver 580.95.05, torch 2.14.0+cu130 graph capture.",
+  "minimal_pair": {
+    "baseline": {
+      "min_us": 306.91200494766235,
+      "median_of_round_min_us": 309.90399420261383
+    },
+    "pdl_early": {
+      "min_us": 300.6080090999603,
+      "median_of_round_min_us": 303.51999402046204
+    },
+    "pdl_late": {
+      "min_us": 311.2959861755371,
+      "median_of_round_min_us": 312.5919997692108
+    },
+    "pdl_consumer_only": {
+      "min_us": 336.41600608825684,
+      "median_of_round_min_us": 339.1200006008148
+    },
+    "n_launches": 200,
+    "exec_fill_us": 0.36299999919719994,
+    "exec_scale_us": 0.3600000054575503,
+    "eager_baseline_us": 1221.4399576187134,
+    "pdl_chain_parity": true
+  },
+  "mhc_chain_b1": {
+    "baseline": {
+      "min_us": 373.21600317955017,
+      "median_of_round_min_us": 373.63201379776
+    },
+    "pdl_early": {
+      "min_us": 357.08799958229065,
+      "median_of_round_min_us": 359.3439906835556
+    },
+    "pdl_late": {
+      "min_us": 347.4879860877991,
+      "median_of_round_min_us": 347.6639986038208
+    },
+    "pdl_consumer_only": {
+      "min_us": 373.56799840927124,
+      "median_of_round_min_us": 374.1919994354248
+    },
+    "sites": 40,
+    "tokens": 1,
+    "n_launches": 120,
+    "eager_baseline_us": 986.1440062522888,
+    "copies_match_production": true,
+    "pdl_chain_parity": true
+  },
+  "mhc_chain_b4": {
+    "baseline": {
+      "min_us": 440.19201397895813,
+      "median_of_round_min_us": 441.0240054130554
+    },
+    "pdl_early": {
+      "min_us": 488.99200558662415,
+      "median_of_round_min_us": 489.9359941482544
+    },
+    "pdl_late": {
+      "min_us": 433.6639940738678,
+      "median_of_round_min_us": 435.5359971523285
+    },
+    "pdl_consumer_only": {
+      "min_us": 440.64000248908997,
+      "median_of_round_min_us": 442.9440051317215
+    },
+    "sites": 40,
+    "tokens": 4,
+    "n_launches": 120,
+    "eager_baseline_us": 989.4400238990784,
+    "copies_match_production": true,
+    "pdl_chain_parity": true
+  }
+}

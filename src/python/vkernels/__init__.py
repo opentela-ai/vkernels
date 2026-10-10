@@ -39,7 +39,7 @@ __version__ = discovery.version() or "0.1.0"
 #: ``"compiled"`` when the pybind11 extension is loaded, else ``"fallback"``.
 backend: str = _backend.backend_name()
 
-_Lazy = ("core", "kernels", "comm")
+_Lazy = ("core", "kernels", "comm", "numerics", "benchmark")
 
 # Optional integration submodules that require extra dependencies (e.g.
 # torch, vLLM). Listed in ``_LazyIntegration`` so ``vkernels.<name>`` is
