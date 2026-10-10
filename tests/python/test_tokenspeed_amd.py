@@ -1515,6 +1515,75 @@ def test_gpu_rel_mha_extend_matches_reference():
     assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
 
+def _mha_extend_paged_reference(q, k_cache, v_cache, page_table, cache_seqlens,
+                                 cu_seqlens_q, sm_scale, window_left=-1):
+    """Eager reference for ``launch_gluon_mha_extend_gfx942`` (causal)."""
+    total_q, heads, head_dim = q.shape
+    kv_heads = k_cache.shape[2]
+    group = heads // kv_heads
+    out = torch.empty_like(q, dtype=torch.float32)
+    seq_starts = cu_seqlens_q.tolist()
+    for b, start in enumerate(seq_starts[:-1]):
+        q_len = int(seq_starts[b + 1] - start)
+        cache_len = int(cache_seqlens[b])
+        prefix = cache_len - q_len
+        keys, vals = [], []
+        for pos in range(cache_len):
+            if window_left >= 0 and pos < cache_len - 1 - window_left:
+                continue
+            page = int(page_table[b, pos // k_cache.shape[1]])
+            slot = pos % k_cache.shape[1]
+            keys.append(k_cache[page, slot].float())
+            vals.append(v_cache[page, slot].float())
+        k = torch.stack(keys)  # [visible, kv_heads, D]
+        v = torch.stack(vals)
+        for h in range(heads):
+            kv_h = h // group
+            for i in range(q_len):
+                qi = start + i
+                logits = q[qi, h].float() @ k[:, kv_h].T * sm_scale
+                visible = torch.arange(k.shape[0], device=q.device) < (prefix + i + 1) \
+                    if window_left < 0 else torch.ones(k.shape[0], dtype=torch.bool, device=q.device)
+                probs = torch.softmax(logits.masked_fill(~visible, float("-inf")), dim=-1)
+                out[qi, h] = probs @ v[:, kv_h]
+    return out.to(q.dtype)
+
+
+@pytest.mark.gpu
+def test_gpu_mha_extend_paged_matches_reference():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import mha_extend as ts_ext
+
+    torch.manual_seed(26)
+    heads, kv_heads, dim, page_size = 8, 2, 128, 64
+    seqs = [(16, 48), (8, 120), (40, 24)]
+    total_q = sum(q for q, _ in seqs)
+    cu = [0]
+    for q_len, _ in seqs:
+        cu.append(cu[-1] + q_len)
+    pages = 8
+    q = torch.randn(total_q, heads, dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    k_cache = torch.randn(pages, page_size, kv_heads, dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    v_cache = torch.randn(pages, page_size, kv_heads, dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    cache_seqlens = torch.tensor(
+        [q_len + pre for q_len, pre in seqs], dtype=torch.int32, device="cuda"
+    )
+    max_pages = (int(cache_seqlens.max()) + page_size - 1) // page_size
+    page_table = torch.randperm(pages, device="cuda")[
+        : len(seqs) * max_pages
+    ].reshape(len(seqs), max_pages).to(torch.int32)
+    cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    sm_scale = dim**-0.5
+    ref = _mha_extend_paged_reference(
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_t, sm_scale
+    )
+    out = ts_ext.launch_gluon_mha_extend_gfx942(
+        q, cu_t, cu_t, k_cache, v_cache, page_table, cache_seqlens,
+        max_seqlen_q=max(s[0] for s in seqs), softmax_scale=sm_scale,
+    )
+    assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.gpu
 def test_gpu_kda_fused_decode_smoke():
     """Compile/launch smoke for the vendored KDA fused decode on gfx942.
