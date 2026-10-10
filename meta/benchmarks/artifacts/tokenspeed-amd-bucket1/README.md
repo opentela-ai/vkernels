@@ -179,6 +179,22 @@ the launch contract. Full parity vs `glm_kda_fused_decode_reference`
 along with `dsa/sparse_mla` (buffer_load only). See the borrowing-plan doc
 for the full density scan.
 
+## Round-3 follow-ups (same effort)
+
+- **MLA prefill xfail resolved** — the MI300A divergence was a test-reference
+  bug (replicated head 0's result to head 1 instead of attending with head
+  1's own query over the shared KV). Reference fixed, xfail removed, the
+  speculative ieee-dot experiment reverted; kernel stays verbatim. 10/10
+  MLA tests pass on MI300A (job 675621).
+- **KDA fast path** — `assume_valid=True` on `gluon_kda_fused_decode_gfx950`
+  shares the launch body with the validated wrapper and skips ~30 python
+  checks: bit-equal outputs (pools restored between calls), 76.2 → 67.0 µs
+  call latency (job 675641). 47/47 tokenspeed_amd+mla tests there.
+- **KDA verify (no-store) parity** — eager oracle for the draft-verify
+  variant (in-register conv advance, chained recurrence, raw outputs,
+  no-store contract): passes on MI300A first run after the call-signature
+  fix (job 675645). Remaining variant: replay (uint64 pointer descriptors).
+
 ## Self-service triton-3.8 container (no CSCS ticket needed for dev)
 
 Instead of waiting on the env bump, we repacked the container ourselves:
