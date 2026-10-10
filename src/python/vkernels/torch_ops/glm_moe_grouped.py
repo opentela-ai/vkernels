@@ -75,18 +75,37 @@ __all__ = [
 ]
 
 # (ROWS, num_warps) per stage; env-overridable JSON {"rows1": .., "warps1": ..,
-# "rows2": .., "warps2": ..} for the microbench sweep. Defaults: the ladder's
-# proven stage-1 geometry (ROWS=4/warps=4 over the gate rows) and a stage-2
-# row-group chosen by the sgs-gpu07 microbench (see RESULTS.md).
-# MI300A sweep (658491, GLM-5.3 TP4 serving shapes E73/IA512/I4096/K8/T1):
-# r1=2/w1=8/r2=4 = 66.2us (760 GB/s) vs the old 75.0us; all configs
-# bit-identical (geometry only). Tops out ~760 GB/s -- the fp8 decode
-# chain is instruction-bound; further gains need decode-chain surgery.
-_DEF = {"rows1": 2, "warps1": 8, "rows2": 4, "warps2": 4}
+# "rows2": .., "warps2": ..} for the microbench sweep. The tl.sum
+# reduction ORDER depends on the (ROWS, num_warps) layout, so the
+# DEFAULT must reproduce the ladder's geometry on the backend it serves
+# (the bit-exactness contract above):
+# - CUDA default: rows1=4/warps1=4 — expert_gemv's proven geometry
+#   (ROWS=4, num_warps=4). warps1=8 (fewer, fatter reductions) splits
+#   the fp32 dot reduction differently and VIOLATES bit-parity on
+#   GB10 sm_121/triton 3.7.1 (every tested seed; diagnostics/
+#   2026-10-06-merged-main-failures in the serving-sys workspace),
+#   faulting test_fnuz_storage_bit_exact_vs_ladder[shape2] before the
+#   FNUZ conversion.
+# - HIP default: rows1=2/warps1=8 — the MI300A sweep pick (658491,
+#   GLM-5.3 TP4 serving shapes E73/IA512/I4096/K8/T1: 66.2us / 760 GB/s
+#   vs 75.0us), where every swept config measured bit-identical, so the
+#   tuning stays. Tops out ~760 GB/s -- the fp8 decode chain is
+#   instruction-bound; further gains need decode-chain surgery.
+_DEF_CUDA = {"rows1": 4, "warps1": 4, "rows2": 4, "warps2": 4}
+_DEF_HIP = {"rows1": 2, "warps1": 8, "rows2": 4, "warps2": 4}
+
+
+def _default_cfg() -> dict:
+    try:
+        import torch
+
+        return dict(_DEF_HIP if torch.version.hip else _DEF_CUDA)
+    except Exception:  # pragma: no cover - torch always importable in practice
+        return dict(_DEF_CUDA)
 
 
 def _cfg() -> dict:
-    out = dict(_DEF)
+    out = _default_cfg()
     raw = os.environ.get("VK_MOE_GROUPED_CFG")
     if raw:
         import json

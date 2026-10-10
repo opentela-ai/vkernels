@@ -35,6 +35,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Optional pinned-donor TP4 Hopper push collective; eager JIT also needs nvcc.
+sgl-push = ["apache-tvm-ffi>=0.1.11"]
 # Compiled backend: the pybind11 extension (*not* shipped in the
 # pure-Python wheel; install a platform wheel or build from source).
 compiled = []

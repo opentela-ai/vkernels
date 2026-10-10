@@ -132,7 +132,22 @@ def test_sgl_fused_moe_matches_eager_serving_shape(t):
     exactly why this knob stays opt-in and A/B'd); (2) vs the QUANT-AWARE
     oracle (same per-token-group quantization emulated in torch) at the
     house bf16 gate rtol=atol=2e-2 — this one pins KERNEL numerics
-    (mapping, scales, swiglu, combine) independent of the quant scheme."""
+    (mapping, scales, swiglu, combine) independent of the quant scheme.
+
+    GB10 sm_121 status (diagnostics/2026-10-06-merged-main-failures,
+    serving-sys workspace): gate (1) passes; gate (2) fails at t=8 seed 0
+    on 58/32768 elements (rel 0.0205), all on the token whose activations
+    carry the largest per-token-group quant error in BOTH arms. Stage
+    localization: the activation-quant emulation is bit-exact against the
+    kernel, both GEMM stages track an fp32-accurate reference at the same
+    error scale as the bf16 oracle arm itself (0.0024 vs 0.0024), and the
+    combine is bit-exact — the residual is accumulated per-slot fp8-GEMM
+    rounding summed over topk=8, which lands past the elementwise 2e-2
+    gate under this backend's accumulation layout (swap_ab=False on
+    sm_121, BLOCK_SIZE_M=16) versus the H100-calibrated margin. The
+    tolerance needs explicit per-backend qualification before this case
+    can pass; the assertion stays as the honest record of that open
+    contract."""
     x, w13_8, w13_s, w2_8, w2_s, idx, w = _make_case("cuda", 288, 4096, 512, 8, t)
     fused = sgl_fused_moe(x, w13_8, w13_s, w2_8, w2_s, idx, w,
                           swiglu_limit=SWIGLU_LIMIT)
