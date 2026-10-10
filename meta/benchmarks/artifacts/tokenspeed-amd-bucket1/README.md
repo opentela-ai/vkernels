@@ -195,7 +195,27 @@ for the full density scan.
   no-store contract): passes on MI300A first run after the call-signature
   fix (job 675645). Remaining variant: replay (uint64 pointer descriptors).
 
-## Replay-variant descriptor layout (decoded, parity pending)
+## Replay variant: parity landed (the KDA family is now fully verified)
+
+``launch_gluon_kda_fused_replay_gfx950`` parity-verified on MI300A (jobs
+675705/675706): multi-layer/multi-group (2 layers, 2 page-index groups),
+mixed accepted lengths (1/2/4 of draft 4), conv + state pools both
+matching the eager oracle. The uint64 descriptor packing: ``0``=mixed_qkv,
+``1``=conv_weights, ``2``=conv_pool, ``5``=beta_logits, ``6``=a_log,
+``7``=dt_bias, ``8``=state_pool, ``9``=raw_g; ``read/write_indices
+[groups, batch]`` hold ABSOLUTE page ids (the group pointer-advance
+selects the row — do not pre-add the group base); the launcher REQUIRES a
+real ``lower_bound`` float (HAS_LOWER_BOUND hard-codes True) and
+``conv_stride`` must be the conv POOL page stride, not the weights'.
+Two red herrings chased and disproven along the way (both were test-data
+bugs): an alleged stock-triton pointer-reassignment drop (a speculative
+load-site adaptation was applied, disproven, and reverted — kernel stays
+verbatim) and an alleged multi-group breakage (wrong index semantics).
+Full suite on the self-service container: **49/49** tokenspeed_amd + MLA
+tests (decode, verify, replay, mHC, DSA, routing, sorting, hadamard,
+argmax).
+
+## Replay-variant notes (superseded by the section above)
 
 ``launch_gluon_kda_fused_replay_gfx950`` packs raw device pointers into a
 ``[layers, 10]`` uint64 tensor; the kernel casts them back per layer:

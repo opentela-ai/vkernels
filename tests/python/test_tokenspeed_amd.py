@@ -932,6 +932,148 @@ def test_gpu_kda_fused_verify_matches_reference():
     )
 
 
+def _kda_replay_reference(
+    per_layer, group_indices, read_indices, write_indices, accepted_length,
+    draft_token_num, lower_bound=None,
+):
+    """Eager fp32 oracle for ``launch_gluon_kda_fused_replay_gfx950``.
+
+    ``per_layer[l]`` holds one layer's tensors (mixed_qkv, conv_weights,
+    conv_pool, raw_g, beta_logits, a_log, dt_bias, state_pool); the pools
+    are updated IN PLACE. ``read/write_indices [groups, batch]`` hold
+    ABSOLUTE page ids; ``group_indices[layer]`` selects each layer's row.
+    """
+    device = per_layer[0][0].device
+    batch = accepted_length.numel()
+    heads, dim = 12, 128
+    pw = heads * dim
+    for layer, tensors in enumerate(per_layer):
+        (mixed_qkv, conv_weights, conv_pool, raw_g, beta_logits, a_log,
+         dt_bias, state_pool) = tensors
+        group = int(group_indices[layer])
+        a_value = torch.exp(a_log.float())
+        for n in range(batch):
+            ridx = int(read_indices[group, n])
+            widx = int(write_indices[group, n])
+            steps = int(accepted_length[n])
+            if ridx < 0 or steps <= 0:
+                continue
+            conv_rows = []
+            h0 = conv_pool[ridx, :, 0].float()
+            h1 = conv_pool[ridx, :, 1].float()
+            h2 = conv_pool[ridx, :, 2].float()
+            w_all = conv_weights.float()
+            for t in range(draft_token_num):
+                tok = n * draft_token_num + t
+                active = t < steps
+                x = mixed_qkv[tok].float() if active else torch.zeros(3 * pw, device=device)
+                value = h0 * w_all[:, 0] + h1 * w_all[:, 1] + h2 * w_all[:, 2] + x * w_all[:, 3]
+                silu = value * (1.0 / (1.0 + torch.exp(-value)))
+                if t == steps - 1 and widx >= 0:
+                    conv_pool[widx, :, 0] = h1.to(conv_pool.dtype)
+                    conv_pool[widx, :, 1] = h2.to(conv_pool.dtype)
+                    conv_pool[widx, :, 2] = x.to(conv_pool.dtype)
+                if active:
+                    conv_rows.append(silu)
+                    h0, h1, h2 = h1, h2, x
+            for h in range(heads):
+                running = state_pool[ridx, h].float().clone()
+                for t in range(steps):
+                    tok = n * draft_token_num + t
+                    row = conv_rows[t]
+                    q = row[h * dim : (h + 1) * dim]
+                    k = row[pw + h * dim : pw + (h + 1) * dim]
+                    v = row[2 * pw + h * dim : 2 * pw + (h + 1) * dim]
+                    gate = raw_g[tok, h * dim : (h + 1) * dim].float() + dt_bias[
+                        h * dim : (h + 1) * dim
+                    ].float()
+                    if lower_bound is not None:
+                        log_decay = lower_bound / (1.0 + torch.exp(-(a_value[h] * gate)))
+                    else:
+                        softplus = torch.maximum(gate, torch.zeros_like(gate)) + torch.log(
+                            1.0 + torch.exp(-torch.abs(gate))
+                        )
+                        log_decay = -a_value[h] * softplus
+                    decay = torch.exp(log_decay)
+                    k_scale = torch.rsqrt((k * k).sum() + 1e-6)
+                    kh = k * k_scale
+                    beta = torch.sigmoid(beta_logits[tok, h].float())
+                    running *= decay[None, :]
+                    prediction = (running * kh[None, :]).sum(dim=1)
+                    delta = beta * (v - prediction)
+                    running += delta[:, None] * kh[None, :]
+                if widx >= 0:
+                    state_pool[widx, h] = running
+
+
+@pytest.mark.gpu
+def test_gpu_kda_fused_replay_matches_reference():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import kda_decode as ts_kda
+
+    torch.manual_seed(18)
+    batch, heads, dim, draft, layers, groups = 3, 12, 128, 4, 2, 2
+    pw = heads * dim
+    tokens = batch * draft
+    per_layer = []
+    descriptors = torch.zeros(layers, 10, dtype=torch.uint64, device="cuda")
+    group_indices = torch.arange(layers, dtype=torch.int32, device="cuda")
+    # each group's row holds its absolute page ids; group_indices picks the row
+    read_indices = torch.arange(
+        groups * batch, dtype=torch.int32, device="cuda"
+    ).reshape(groups, batch)
+    write_indices = read_indices.clone()
+    accepted = torch.tensor([2, 4, 1], dtype=torch.int32, device="cuda")
+    for layer in range(layers):
+        pages = groups * batch + 2
+        mixed_qkv = torch.randn(tokens, 3 * pw, device="cuda", dtype=torch.bfloat16) * 0.5
+        conv_weights = torch.randn(3 * pw, 4, device="cuda", dtype=torch.bfloat16) * 0.2
+        conv_pool = torch.randn(pages, 3 * pw, 3, device="cuda", dtype=torch.bfloat16) * 0.3
+        raw_g = torch.randn(tokens, pw, device="cuda", dtype=torch.bfloat16) * 0.5
+        beta_logits = torch.randn(tokens, heads, device="cuda", dtype=torch.bfloat16)
+        a_log = torch.randn(heads, device="cuda")
+        dt_bias = torch.randn(pw, device="cuda") * 0.1
+        state_pool = torch.randn(pages, heads, dim, dim, device="cuda") * 0.05
+        per_layer.append(
+            (mixed_qkv, conv_weights, conv_pool, raw_g, beta_logits, a_log,
+             dt_bias, state_pool)
+        )
+        for slot, tensor in zip(
+            (0, 1, 2, 5, 6, 7, 8, 9),
+            (mixed_qkv, conv_weights, conv_pool, beta_logits, a_log, dt_bias,
+             state_pool, raw_g),
+        ):
+            descriptors[layer, slot] = int(tensor.data_ptr()) & 0xFFFFFFFFFFFFFFFF
+
+    # reference runs on fresh clones of the pre-kernel pools
+    ref_layer = [
+        (t[0], t[1], t[2].clone(), t[3], t[4], t[5], t[6], t[7].clone())
+        for t in per_layer
+    ]
+    _kda_replay_reference(
+        ref_layer, group_indices.cpu(), read_indices.cpu(), write_indices.cpu(),
+        accepted.cpu(), draft, lower_bound=0.05,
+    )
+    ts_kda.launch_gluon_kda_fused_replay_gfx950(
+        descriptors, group_indices, read_indices, write_indices, accepted,
+        draft_token_num=draft, num_heads=heads, head_dim=dim, f_a_dim=dim,
+        qkv_stride=per_layer[0][0].stride(0), conv_stride=per_layer[0][2].stride(0),
+        f_a_stride=dim, beta_stride=per_layer[0][4].stride(0),
+        state_stride=per_layer[0][7].stride(0), gate_stride=per_layer[0][3].stride(0),
+        conv_width=4, lower_bound=0.05,
+    )
+    torch.cuda.synchronize()
+    for layer in range(layers):
+        assert torch.equal(per_layer[layer][2], ref_layer[layer][2]), (
+            "conv pool",
+            layer,
+        )
+        assert torch.allclose(
+            per_layer[layer][7].float(), ref_layer[layer][7].float(),
+            atol=2e-3, rtol=1e-3,
+        ), ("state pool", layer)
+
+
 @pytest.mark.gpu
 def test_gpu_kda_fused_decode_smoke():
     """Compile/launch smoke for the vendored KDA fused decode on gfx942.
