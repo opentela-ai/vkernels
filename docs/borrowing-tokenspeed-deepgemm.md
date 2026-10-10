@@ -326,7 +326,12 @@ CI skip filters.
    Recipe: namespace-swap for buffer-op-only kernels, layout re-derivation
    for MFMA kernels, ``cdna4.async_copy`` stages must be rewritten to LDS
    pipelines (no TMA on CDNA3; see the hip-async-coordination skill).
-   Gated on the triton ≥ 3.8 env (see the bucket-1 infra request).
+   Second unit done: ``dsa_indexing.py`` + ``dsa_sparse_mla.py`` vendored
+   (cdna3 binding; standard-cache kernels stubbed out — CDNA4 MFMA
+   v4/async_copy only) — logical radix top-k parity-verified vs
+   torch.topk and **2–3.9× faster** on MI300A, packed-FP8 decode top-k
+   smoke-verified. Remaining: kda wrapper fast-path, the MFMA-class
+   attention kernels, the MLA-prefill gfx942 numerics fix.
 
 **Still open:** §3.7 plugins (defer until needed) and §3.12 DeepJIT
 (deferred until the include layering grows); `mark_serving()` wiring from

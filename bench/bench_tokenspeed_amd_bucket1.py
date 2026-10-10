@@ -443,6 +443,42 @@ def bench_kda(results: list) -> None:
         results.append(entry)
 
 
+def bench_dsa_topk(results: list) -> None:
+    """Radix logical top-k (vendored sparse_mla) vs torch.topk."""
+    from vkernels.torch_ops.tokenspeed_amd import dsa_sparse_mla as ts_dsa_topk
+
+    torch.manual_seed(15)
+    cols, topk = 16384, 2048
+    starts = torch.zeros(1, dtype=torch.int32, device="cuda")
+    ends = torch.full((1,), cols, dtype=torch.int32, device="cuda")
+    for rows in (64, 512, 4096):
+        logits = torch.randn(rows, cols, device="cuda", dtype=torch.float32) * 3
+        s = starts.expand(rows).contiguous()
+        e = ends.expand(rows).contiguous()
+        idx, _lens = ts_dsa_topk.gluon_dsa_logical_topk_gfx950(
+            logits, s, e, topk=topk
+        )
+        ref = torch.topk(logits, topk, dim=-1)
+        assert torch.equal(
+            torch.sort(logits.gather(1, idx.long()), dim=-1).values,
+            torch.sort(ref.values, dim=-1).values,
+        ), rows
+        results.append(
+            {
+                "op": "dsa_logical_topk",
+                "shape": {"rows": rows, "cols": cols, "topk": topk},
+                "gluon_radix": time_fn(
+                    lambda: ts_dsa_topk.gluon_dsa_logical_topk_gfx950(  # noqa: B023
+                        logits, s, e, topk=topk
+                    )
+                ),
+                "torch_topk": time_fn(
+                    lambda: torch.topk(logits, topk, dim=-1)  # noqa: B023
+                ),
+            }
+        )
+
+
 def bench_argmax(results: list) -> None:
     from vkernels.torch_ops.tokenspeed_amd import argmax as ts_argmax
 
@@ -505,6 +541,7 @@ def main() -> int:
         "mhc": bench_mhc,
         "mhc_chain": bench_mhc_chain,
         "kda": bench_kda,
+        "dsa_topk": bench_dsa_topk,
         "argmax": bench_argmax,
         "scale": bench_scale_swizzle,
     }

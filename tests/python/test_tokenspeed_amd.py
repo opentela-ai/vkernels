@@ -41,6 +41,9 @@ from vkernels.torch_ops.tokenspeed_amd_registry import (  # noqa: E402
     SAMPLING_ARGMAX_REGISTRY,
     TOKENSPEED_AMD_REGISTRY,
 )
+from vkernels.torch_ops.tokenspeed_amd import (  # noqa: E402
+    dsa_sparse_mla as ts_dsa_topk,
+)
 from vkernels.registry import KernelRequest, TensorMetadata  # noqa: E402
 
 
@@ -729,6 +732,102 @@ def test_gpu_kda_fused_decode_matches_reference():
     )
     assert torch.equal(conv_pool, ref_conv)
     assert torch.allclose(state_pool_k, ref_state, atol=2e-3, rtol=1e-3)
+
+
+# --- DSA logical top-k (vendored sparse_mla; radix selection) ---------------
+
+
+def test_dsa_logical_topk_contract_gates():
+    logits = torch.zeros(4, 4096)
+    starts = torch.zeros(4, dtype=torch.int32)
+    ends = torch.full((4,), 4096, dtype=torch.int32)
+    with pytest.raises(ValueError, match="topk"):
+        ts_dsa_topk.gluon_dsa_logical_topk_gfx950(
+            logits, starts, ends, topk=256
+        )
+    with pytest.raises(RuntimeError, match="CUDA"):
+        ts_dsa_topk.gluon_dsa_logical_topk_gfx950(
+            logits, starts, ends, topk=512
+        )
+    fp16 = torch.zeros(4, 4096, dtype=torch.float16)
+    with pytest.raises(TypeError, match="float32"):
+        ts_dsa_topk.gluon_dsa_logical_topk_gfx950(
+            fp16, starts, ends, topk=512
+        )
+
+
+def test_dsa_standard_cache_stub_raises():
+    for name in (
+        "gluon_dsa_decode_topk_standard_gfx950",
+        "gluon_dsa_prefill_topk_standard_gfx950",
+        "gluon_kpool_prefill_topk_fp8_gfx950",
+        "gluon_kpool_prefill_topk_fp8_plan_gfx950",
+    ):
+        with pytest.raises(RuntimeError, match="CDNA4"):
+            getattr(ts_dsa_topk, name)()
+
+
+@pytest.mark.gpu
+def test_gpu_dsa_logical_topk_matches_torch():
+    _gluon_driver()
+    torch.manual_seed(15)
+    rows, cols, topk = 9, 4096, 512
+    logits = torch.randn(rows, cols, device="cuda", dtype=torch.float32) * 3
+    # one empty row and one window shorter than topk
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    ends = torch.full((rows,), cols, dtype=torch.int32, device="cuda")
+    starts[3], ends[3] = 100, 100  # empty
+    ends[5] = 100 + 300  # 300 < topk
+    idx, lens = ts_dsa_topk.gluon_dsa_logical_topk_gfx950(
+        logits, starts, ends, topk=topk
+    )
+    assert idx.shape == (rows, topk) and idx.dtype == torch.int32
+    for r in range(rows):
+        lo, hi = int(starts[r]), int(ends[r])
+        n = min(hi - lo, topk)
+        assert int(lens[r]) == n
+        got = idx[r, :n]
+        assert bool((got >= lo).all() and (got < hi).all()), r
+        # same selection as torch.topk (compare as sorted index sets; the
+        # radix order and torch's order may differ on ties)
+        ref_sel = torch.topk(logits[r, lo:hi], n).indices + lo
+        got_sorted = torch.sort(logits[r, got.long()]).values
+        ref_sorted = torch.sort(logits[r, ref_sel.long()]).values
+        assert torch.equal(got_sorted, ref_sorted), r
+        assert bool((idx[r, n:] == -1).all()), r
+
+
+@pytest.mark.gpu
+def test_gpu_dsa_fp8_decode_topk_smoke():
+    """Compile/run smoke for the packed-FP8 decode top-k (dsa_indexing)."""
+    _gluon_driver()
+    torch.manual_seed(16)
+    tokens, heads, dim, page_size = 4, 2, 128, 64
+    seq_lens = torch.tensor([1000, 700, 300, 64], dtype=torch.int32, device="cuda")
+    q = torch.randn(tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(tokens, heads, device="cuda", dtype=torch.bfloat16) + 0.5
+    slots, row_bytes = page_size * 8, dim + 4  # 8 pages of 64 slots
+    cache = torch.randint(
+        0x38, 0x48, (slots, row_bytes), dtype=torch.uint8, device="cuda"
+    )
+    cache[:, dim:] = 127  # identity e8m0 scales
+    pages = slots // page_size
+    table = torch.arange(pages, dtype=torch.int32, device="cuda").repeat(
+        tokens, 1
+    )[:, : max(1, (int(seq_lens.max()) + page_size - 1) // page_size)]
+    if table.shape[1] == 0:
+        table = torch.zeros(tokens, 1, dtype=torch.int32, device="cuda")
+    out, lens = ts_dsa_topk.launch_gluon_dsa_decode_topk_fp8_gfx950(
+        q, weights, seq_lens, table.contiguous(),
+        page_size=page_size, topk=512, softmax_scale=dim**-0.5,
+        index_k_cache=cache,
+    )
+    assert out.shape == (tokens, 512) and out.dtype == torch.int32
+    for t in range(tokens):
+        n = min(int(seq_lens[t]), 512)
+        assert int(lens[t]) == n, t
+        assert bool((out[t, :n] >= 0).all() and (out[t, :n] < int(seq_lens[t])).all())
+        assert bool((out[t, n:] == -1).all())
 
 
 @pytest.mark.gpu

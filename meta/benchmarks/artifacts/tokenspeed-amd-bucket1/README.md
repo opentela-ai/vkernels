@@ -216,6 +216,26 @@ for ~1.5% at decode batches ≤ 32 (12% at 64), removing two kernel
 launches and their intermediate traffic from the serving path. All
 beverin runs in this section use the self-service triton-3.8 container.
 
+### DSA sparse-MLA top-k vendored (bucket-2 second unit, jobs 675593/675604)
+
+Vendored ``dsa/indexing.py`` (packed-FP8 scoring) and ``dsa/sparse_mla.py``
+(radix top-k + launchers) as ``dsa_indexing.py`` / ``dsa_sparse_mla.py``
+with the CDNA3-first buffer-op binding. The upstream
+``standard_cache_logits`` kernels are **not** vendored — they need CDNA4
+MFMA v4 layouts + ``cdna4.async_copy`` with no CDNA3 equivalent; the
+module aliases raise a clear error (tested). Verified on MI300A (4/4
+tests): logical radix top-k parity vs ``torch.topk`` (selection sets,
+window bounds, -1 padding, empty/short rows) plus a packed-FP8 decode
+top-k compile/run smoke through the vendored indexing kernel.
+
+Bench (fp32 logits, topk=2048, cols=16384):
+
+| rows | gluon radix | torch.topk | speedup |
+|---:|---:|---:|---:|
+| 64 | 57.4 µs | 115.0 µs | 2.0× |
+| 512 | 75.8 µs | 258.2 µs | 3.4× |
+| 4096 | 272.8 µs | 1059.7 µs | 3.9× |
+
 ## Artifacts
 
 - `results-triton38.json` — first full run (job 675351)
