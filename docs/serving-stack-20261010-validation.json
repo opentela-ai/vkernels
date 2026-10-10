@@ -420,5 +420,23 @@
   "original_vkernels_preserved": true,
   "kvaas_runtime_changed": false,
   "fresh_consolidated_tree_glm_benchmark": false,
-  "full_model_quality_qualified": false
+  "full_model_quality_qualified": false,
+  "pr_merge_followup": {
+    "scope": "Test-only optional Torch collection guards; runtime source unchanged from the validated consolidation tree.",
+    "torchless_python": {
+      "python": "3.12.14",
+      "passed": 735,
+      "skipped": 388,
+      "subtests_passed": 499,
+      "failed": 0
+    },
+    "affected_modules_gpu": {
+      "passed": 30,
+      "skipped": 0,
+      "failed": 0
+    },
+    "ruff_changed_tests": true,
+    "prior_remote_run": "https://github.com/opentela-ai/vkernels/actions/runs/38011458793",
+    "prior_ci_failures": "Host/installed-python collection assumed optional Torch was installed; guarded imports now preserve torchless host test coverage."
+  }
 }

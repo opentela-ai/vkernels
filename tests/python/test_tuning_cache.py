@@ -385,7 +385,10 @@ def test_seed_schema_roundtrip(_store):
 
 
 def _cuda():
-    import torch
+    try:
+        import torch
+    except ImportError:
+        return False
     return torch.cuda.is_available()
 
 

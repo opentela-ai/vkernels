@@ -1,6 +1,7 @@
 """Host guards for the optional TP4 push plan; TP4 replay lives in campaign screen."""
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from vkernels.torch_ops.sgl_push import SglPushPlan, eligible
 
