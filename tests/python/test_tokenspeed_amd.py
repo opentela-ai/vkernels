@@ -1620,6 +1620,65 @@ def _rel_mha_prefill_reference(q, k, v, rel_logits, cu_seqlens, sm_scale,
 
 
 @pytest.mark.gpu
+def test_gpu_mla_prefill_matches_reference():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import mla_prefill as ts_mp
+
+    torch.manual_seed(31)
+    heads, kv_heads = 8, 2
+    seqs = [(64, 64), (24, 40), (40, 24)]
+    total_q = sum(s for s, _ in seqs)
+    total_kv = sum(s for _, s in seqs)
+    cu_q, cu_kv = [0], [0]
+    for sq, skv in seqs:
+        cu_q.append(cu_q[-1] + sq)
+        cu_kv.append(cu_kv[-1] + skv)
+    q = torch.randn(total_q, heads, 192, device="cuda", dtype=torch.bfloat16) * 0.3
+    k = torch.randn(total_kv, kv_heads, 192, device="cuda", dtype=torch.bfloat16) * 0.3
+    v = torch.randn(total_kv, kv_heads, 128, device="cuda", dtype=torch.bfloat16) * 0.3
+    cu_q_t = torch.tensor(cu_q, dtype=torch.int32, device="cuda")
+    cu_kv_t = torch.tensor(cu_kv, dtype=torch.int32, device="cuda")
+    scale = 192**-0.5
+
+    # eager reference: split nope/rope, full-192-dot logits, causal
+    out_ref = torch.zeros(total_q, heads, 128, device="cuda", dtype=torch.float32)
+    lse_ref = torch.full((total_q, heads), float("-inf"), device="cuda", dtype=torch.float32)
+    for b, start in enumerate(cu_q[:-1]):
+        sq, skv = seqs[b]
+        kv_start = cu_kv[b]
+        for h in range(heads):
+            kv_h = h // (heads // kv_heads)
+            qh = q[start : start + sq, h].float()
+            kh = k[kv_start : kv_start + skv, kv_h].float()
+            logits = qh @ kh.T * scale
+            pos_q = torch.arange(sq, device="cuda")[:, None]
+            pos_k = torch.arange(skv, device="cuda")[None, :]
+            # upstream semantics (ProgramScheduler): q_causal_start =
+            # max(kv_len - q_len, 0); query row i sees keys [0,
+            # q_causal_start + i] - left-aligned KV window
+            q_cs = max(skv - sq, 0)
+            mask = pos_q + q_cs >= pos_k
+            logits = logits.masked_fill(~mask, float("-inf"))
+            m = logits.max(dim=-1).values
+            e = torch.exp(logits - m[:, None])
+            l = e.sum(-1)
+            p = e / l[:, None]
+            out_ref[start : start + sq, h] = p @ v[kv_start : kv_start + skv, kv_h].float()
+            lse_ref[start : start + sq, h] = m + torch.log(l)
+
+    out, lse = ts_mp.launch_gluon_mla_prefill_gfx942(
+        q, k, v, cu_q_t, cu_kv_t, max(s for s, _ in seqs), max(s for _, s in seqs),
+        scale, is_causal=True, logit_cap=0.0, return_lse=True,
+    )
+    assert torch.allclose(out.float(), out_ref, atol=2e-2, rtol=2e-2), (
+        (out.float() - out_ref).abs().max().item()
+    )
+    assert torch.allclose(lse.float(), lse_ref, atol=5e-2, rtol=5e-2), (
+        (lse.float() - lse_ref).abs().max().item()
+    )
+
+
+@pytest.mark.gpu
 def test_gpu_rel_mha_prefill_matches_reference():
     _gluon_driver()
     from vkernels.torch_ops.tokenspeed_amd import rmha_prefill as ts_rp

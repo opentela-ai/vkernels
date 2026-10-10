@@ -39,9 +39,10 @@ from triton.experimental.gluon.language import amd
 _amd_ns = getattr(gl, "amd", None)
 cdna4 = getattr(_amd_ns, "cdna3", None) or getattr(_amd_ns, "cdna4", None)
 
-_INV_LN2 = 1.4426950408889634
 _INV_LN2_VALUE = 1.4426950408889634
-_LN2 = 0.6931471805599453
+_LN2_VALUE = 0.6931471805599453
+_INV_LN2 = gl.constexpr(_INV_LN2_VALUE)
+_LN2 = gl.constexpr(_LN2_VALUE)
 MAX_KV_SPLITS = 32
 
 
@@ -82,6 +83,20 @@ def select_kv_splits(*, base_ctas: int, num_pages: int, sm_count: int) -> int:
     if splits_for_pages > max_page_splits:
         splits_for_pages = max_page_splits
     return min(splits_for_occupancy, splits_for_pages)
+
+
+@gluon.constexpr_function
+def padded_shared_layout(dot_operand_layout, shape, dtype, is_k_contig=True):
+    """PORT: CDNA3 - padded (CDNA4 DMA-legal) shared layouts are replaced by
+    plain swizzled staging (shape comes from the allocation)."""
+    return gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
+
+
+@gluon.jit
+def _mfma_unscaled_fp8(a, b, acc):
+    # PORT: fp8 needs dot-scaled MFMA (gfx950-only); never traced on CDNA3
+    # because IS_FP8 is constexpr-False and the launcher rejects fp8 dtypes.
+    raise NotImplementedError("fp8 dot-scaled MFMA is not ported to CDNA3")
 
 
 @gluon.constexpr_function
@@ -159,6 +174,13 @@ def transform(src: str) -> str:
         src,
     )
 
+    # multi-buffered K-class smem: swap to [.., HEAD/ROPE DIM, BLOCK_N]
+    src = src.replace("[2, cfg.BLOCK_N, cfg.HEAD_DIM]", "[2, cfg.HEAD_DIM, cfg.BLOCK_N]")
+    src = src.replace("[2, cfg.BLOCK_N, cfg.ROPE_DIM]", "[2, cfg.ROPE_DIM, cfg.BLOCK_N]")
+    src = src.replace(
+        "[cfg.BLOCK_N, cfg.ROPE_DIM]", "[cfg.ROPE_DIM, cfg.BLOCK_N]"
+    )  # single-buffer k_pe
+
     # issue_load_k/v bodies: synchronous permuted/natural stores
     src = src.replace(
         "async_copy.buffer_load_to_shared(k_smem, self.k_cache_ptr, offsets)",
@@ -191,6 +213,16 @@ def transform(src: str) -> str:
     src = src.replace(
         "async_copy.global_load_to_shared(v_smem, self.v_cache_ptr + offsets)",
         "v_smem.store(gl.load(self.v_cache_ptr + offsets))",
+    )
+    src = src.replace(
+        "async_copy.buffer_load_to_shared(smem, self.k_ptr, offsets)",
+        "smem.store(gl.load(self.k_ptr + offsets).permute([1, 0]))",
+    )
+    src = src.replace(
+        """async_copy.buffer_load_to_shared(
+                smem, self.k_ptr, offsets, mask=mask, other=other
+            )""",
+        "smem.store(gl.load(self.k_ptr + offsets, mask=mask, other=other).permute([1, 0]))",
     )
     src = src.replace(
         "async_copy.buffer_load_to_shared(k_smem, self.k_ptr, offsets)",
@@ -228,6 +260,9 @@ def transform(src: str) -> str:
         "return k_smem.permute([1, 0]).load(cfg.k_layout)",
         "return k_smem.load(cfg.k_layout)",
     )
+
+    # K-class smem reads: physically transposed staging -> no permuted view
+    src = re.sub(r"(\w+)\.permute\(\[1, 0\]\)\.load\(", r"\1.load(", src)
 
     # drop the async waits
     src = re.sub(r"[ \t]*async_copy\.wait_group\(\d+\)\n", "", src)
