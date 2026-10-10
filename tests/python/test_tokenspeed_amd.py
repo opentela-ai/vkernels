@@ -1584,6 +1584,72 @@ def test_gpu_mha_extend_paged_matches_reference():
     assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
 
+def _rel_mha_prefill_reference(q, k, v, rel_logits, cu_seqlens, sm_scale,
+                               rel_bias_qk_scale=1.0, window_left=-1):
+    """Eager reference for ``launch_gluon_rel_mha_prefill_gfx942``."""
+    total, heads, dim = q.shape
+    kv_heads = k.shape[1]
+    group = heads // kv_heads
+    out = torch.empty_like(q, dtype=torch.float32)
+    starts = cu_seqlens.tolist()
+    for b, start in enumerate(starts[:-1]):
+        seq_len = int(starts[b + 1] - start)
+        for h in range(heads):
+            kv_h = h // group
+            pos = torch.arange(seq_len, device=q.device)
+            mask = pos[:, None] >= pos[None, :]
+            if window_left >= 0:
+                mask &= pos[:, None] <= pos[None, :] + window_left
+            logits = q[start : start + seq_len, h].float() @ k[start : start + seq_len, kv_h].float().T
+            # kernel semantics (upstream): rel bias is added to the raw dot
+            # with REL_BIAS_QK_SCALE = 1/softmax_scale, then the whole thing
+            # is scaled -> effective logits = qk * softmax_scale + bias
+            # (bias itself is NOT scaled by softmax_scale)
+            rel = rel_logits[start : start + seq_len, h].float()
+            dist = pos[:, None] - pos[None, :]
+            rel_w = rel.shape[1]
+            bias = torch.where(
+                dist < rel_w,
+                rel.gather(1, dist.clamp(0, rel_w - 1)),
+                torch.zeros_like(dist, dtype=rel.dtype),
+            )
+            logits = logits * sm_scale + bias
+            probs = torch.softmax(logits.masked_fill(~mask, float("-inf")), dim=-1)
+            out[start : start + seq_len, h] = probs @ v[start : start + seq_len, kv_h].float()
+    return out.to(q.dtype)
+
+
+@pytest.mark.gpu
+def test_gpu_rel_mha_prefill_matches_reference():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import rmha_prefill as ts_rp
+
+    torch.manual_seed(27)
+    heads, kv_heads, dim, rel_extent = 8, 2, 128, 512
+    seqs = [(200, 200), (80, 80)]
+    total = sum(s for s, _ in seqs)
+    cu = [0]
+    for s, _ in seqs:
+        cu.append(cu[-1] + s)
+    q = torch.randn(total, heads, dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    k = torch.randn(total, kv_heads, dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    v = torch.randn(total, kv_heads, dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    rel = torch.randn(total, heads, rel_extent, device="cuda", dtype=torch.bfloat16) * 0.5
+    cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    sm_scale = dim**-0.5
+    ref = _rel_mha_prefill_reference(q, k, v, rel, cu_t, sm_scale)
+    out = ts_rp.launch_gluon_rel_mha_prefill_gfx942(
+        q, k, v, rel, cu_t, cu, max_seqlen=max(s for s, _ in seqs)
+    )
+    assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    # sliding window leg
+    ref_w = _rel_mha_prefill_reference(q, k, v, rel, cu_t, sm_scale, window_left=127)
+    out_w = ts_rp.launch_gluon_rel_mha_prefill_gfx942(
+        q, k, v, rel, cu_t, cu, max_seqlen=max(s for s, _ in seqs), window_left=127
+    )
+    assert torch.allclose(out_w.float(), ref_w.float(), atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.gpu
 def test_gpu_kda_fused_decode_smoke():
     """Compile/launch smoke for the vendored KDA fused decode on gfx942.
