@@ -245,6 +245,15 @@ skip-softmax at an exact threshold; job 675914). Debug trail in the
 commit: scheduler rewritten from memory faulted and was replaced
 verbatim — the ticket/advance contracts are subtle.
 
+## rel-MHA decode: relative-position bias ported
+
+``rmha_decode.py`` — paged split-K decode plus the per-head relative-
+position bias table, on the mha/decode recipe verbatim-plus-rel-bias. The
+rel-bias add and the reduce kernel are upstream verbatim. **Parity on
+MI300A** (seqs {64,150,500}, 32/4 heads; zero-bias control probe exact at
+5e-4 isolating one reference-side bias-ordering bug: the kernel adds bias
+to the raw dot product BEFORE sm_scale).
+
 ## Round-3 follow-ups (same effort)
 
 - **MLA prefill xfail resolved** — the MI300A divergence was a test-reference
