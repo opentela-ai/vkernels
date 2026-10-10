@@ -1,4 +1,4 @@
-"""Opt-in SM90 block128 FP8 dense decode, using pinned SGL DeepGEMM."""
+"""Opt-in SM90 block128 FP8 dense projections, using pinned SGL DeepGEMM."""
 from __future__ import annotations
 
 from functools import lru_cache
@@ -54,13 +54,17 @@ def _backend():
     return deep_gemm
 
 
-def deepgemm_linear(x, weight, scales, bias=None):
+def deepgemm_linear(x, weight, scales, bias=None, *, allow_prefill=False):
     """Preserve group128 quantization and BF16 outputs; accumulation may differ.
 
     Activation scales use owned Torch MN-major, 16-byte-aligned storage,
     avoiding non-owning TVM-FFI layout aliases. Weight scales stay block128.
     Backend/JIT errors propagate; this explicit experiment never silently falls
     back to the ordered-group implementation.
+
+    The existing M1-8 contract remains the default. Explicit
+    ``allow_prefill=True`` also admits M>=128; intermediate unmeasured
+    shapes retain the decode-only eligibility failure.
     """
     if (not x.is_cuda or torch.version.hip is not None
             or torch.cuda.get_device_capability(x.device)[0] != 9
@@ -72,9 +76,9 @@ def deepgemm_linear(x, weight, scales, bias=None):
         raise ValueError("DeepGEMM dense decode requires SM90 CUDA BF16/block128 E4M3FN inputs")
     n, k = weight.shape
     m = x.numel() // k
-    if (not 1 <= m <= 8 or n % 128 or k % 128
+    if (not (1 <= m <= 8 or allow_prefill and m >= 128) or n % 128 or k % 128
             or scales.shape != (n // 128, k // 128)):
-        raise ValueError("DeepGEMM dense decode requires M1-8 and block128-aligned N/K/scales")
+        raise ValueError("DeepGEMM requires M1-8 (or explicit prefill M>=128) and block128-aligned N/K/scales")
     key = (x.device, m, n, k)
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and key not in _WARMED:
