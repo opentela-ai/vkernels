@@ -330,8 +330,19 @@ CI skip filters.
    (cdna3 binding; standard-cache kernels stubbed out — CDNA4 MFMA
    v4/async_copy only) — logical radix top-k parity-verified vs
    torch.topk and **2–3.9× faster** on MI300A, packed-FP8 decode top-k
-   smoke-verified. Remaining: kda wrapper fast-path, the MFMA-class
-   attention kernels, the MLA-prefill gfx942 numerics fix.
+   smoke-verified. Done since: the whole KDA family is parity-verified
+   on MI300A (decode + no-store verify + multi-layer replay via the
+   uint64 descriptor path), the sigmoid noaux_tc decode router is
+   verified (floe's fused_router A/B'd as already adequate — no floe
+   change needed), and the MLA-prefill xfail resolved as a test-reference
+   MQA bug. MFMA primitive de-risking (probes ``probe_mfma*.py`` in the
+   beverin staging dir): ``gl.amd.cdna3.mfma`` + ``AMDMFMALayout`` +
+   ``DotOperandLayout`` construct and compile proceeds into layout
+   conversion on gfx942 — but direct register↔MFMA layout converts are
+   unsupported in BOTH directions; everything stages through shared
+   memory, exactly the scaffolding upstream kernels are built around.
+   Building the minimal working MFMA tile IS the first unit of the
+   remaining port work (multi-session).
 
 **Still open:** §3.7 plugins (defer until needed) and §3.12 DeepJIT
 (deferred until the include layering grows); `mark_serving()` wiring from
