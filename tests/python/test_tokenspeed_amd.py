@@ -1,0 +1,660 @@
+"""Tests for the vendored TokenSpeed-Kernel-AMD ops (torch_ops/tokenspeed_amd).
+
+Host CI covers the import surface, the shim degradation behavior, the
+pure-torch preprocessing (scale swizzle, N16 banks, weight preprocessing),
+the torch fallbacks, and the metadata registry. GPU parity against torch
+references is marked ``gpu`` and runs only where a working Gluon driver
+exists (beverin / MI300A), mirroring the tokenspeed_mla test conventions.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from vkernels.torch_ops import tokenspeed_amd as ts_amd  # noqa: E402
+from vkernels.torch_ops.tokenspeed_amd import _gluon as shim  # noqa: E402
+from vkernels.torch_ops.tokenspeed_amd import (  # noqa: E402
+    argmax as ts_argmax,
+)
+from vkernels.torch_ops.tokenspeed_amd import (  # noqa: E402
+    moe_sorting as ts_sorting,
+)
+from vkernels.torch_ops.tokenspeed_amd import (  # noqa: E402
+    n16_weights as ts_n16,
+)
+from vkernels.torch_ops.tokenspeed_amd import (  # noqa: E402
+    routing as ts_routing,
+)
+from vkernels.torch_ops.tokenspeed_amd import (  # noqa: E402
+    scale_layout as ts_scale,
+)
+from vkernels.torch_ops.tokenspeed_amd import (  # noqa: E402
+    weight_preprocess as ts_wp,
+)
+from vkernels.torch_ops.tokenspeed_amd_registry import (  # noqa: E402
+    HADAMARD_TRANSFORM_REGISTRY,
+    MOE_SORTING_REGISTRY,
+    MHC_PRE_REGISTRY,
+    ROUTER_TOPK_REGISTRY,
+    SAMPLING_ARGMAX_REGISTRY,
+    TOKENSPEED_AMD_REGISTRY,
+)
+from vkernels.registry import KernelRequest, TensorMetadata  # noqa: E402
+
+
+# --- import surface / shim ----------------------------------------------------
+
+
+def test_module_exposes_probes_and_no_upstream_dependency():
+    assert isinstance(ts_amd.gluon_available(), bool)
+    assert isinstance(ts_amd.cdna4_available(), bool)
+    import sys
+
+    upstream = [m for m in sys.modules if m.startswith("tokenspeed")]
+    assert not upstream, f"upstream tokenspeed modules leaked: {upstream}"
+
+
+def test_inert_stub_sinks_attributes_and_fails_loudly_on_launch():
+    inert = shim._Inert()
+    assert inert.anything.deeper is not None
+    assert inert.constexpr(3) is not None  # module-level constants survive
+    with pytest.raises(RuntimeError, match="gluon"):
+        inert[(1,)]
+
+
+def test_probes_consistent_with_host_triton():
+    try:
+        import triton
+
+        triton.experimental.gluon  # noqa: B018
+    except (ImportError, AttributeError):
+        assert not ts_amd.gluon_available()
+    else:
+        assert ts_amd.gluon_available()
+        # cdna4 may or may not exist (triton >= ~3.5); either is fine, but
+        # the probe must agree with attribute truth.
+        assert ts_amd.cdna4_available() == (
+            getattr(getattr(triton.experimental.gluon.language, "amd", None), "cdna4", None)
+            is not None
+        )
+
+
+# --- scale_layout (pure torch) -------------------------------------------------
+
+
+def _unswizzle_via_identity(swizzled_fn, n: int, k_scale: int, scale: torch.Tensor):
+    """Recover ``scale`` by inverting the swizzle through an identity map."""
+    ids = torch.arange(n * k_scale, dtype=torch.int64).reshape(n, k_scale)
+    perm = swizzled_fn(ids).reshape(-1)  # perm[p] = original flat index at p
+    out = swizzled_fn(scale).reshape(-1)
+    recovered = torch.empty_like(out)
+    recovered[perm] = out
+    return recovered.reshape(n, k_scale)
+
+
+def test_scale_swizzle_roundtrip_and_signature():
+    torch.manual_seed(0)
+    n, k_scale = 64, 16
+    scale = torch.randint(0, 255, (n, k_scale), dtype=torch.uint8)
+    out = ts_scale.swizzle_cdna4_mxfp4_scale(scale)
+    assert ts_scale.is_swizzled_cdna4_mxfp4_scale(out)
+    assert not ts_scale.is_swizzled_cdna4_mxfp4_scale(scale)
+    recovered = _unswizzle_via_identity(ts_scale.swizzle_cdna4_mxfp4_scale, n, k_scale, scale)
+    assert torch.equal(recovered, scale)
+
+
+def test_scale_swizzle_pads_partial_blocks():
+    n, k_scale = 33, 9  # pads to 32-row/8-col multiples
+    scale = torch.randint(0, 255, (n, k_scale), dtype=torch.uint8)
+    out = ts_scale.swizzle_cdna4_mxfp4_scale(scale)
+    assert out.shape == (1, 16 * 32, 2)  # k_pad=16 -> 512, n_pad=64 -> 2 blocks
+    empty = ts_scale.empty_swizzled_cdna4_mxfp4_scale(
+        n, k_scale, device=scale.device
+    )
+    assert empty.shape == out.shape[1:] and empty.stride() == out.stride()[1:]
+    assert ts_scale.swizzle_cdna4_mxfp4_scale(scale.unsqueeze(0)).shape[0] == 1
+
+
+def test_scale_swizzle_rejects_rank1():
+    with pytest.raises(ValueError, match="at least 2"):
+        ts_scale.swizzle_cdna4_mxfp4_scale(torch.zeros(8, dtype=torch.uint8))
+
+
+def test_scale_swizzle_lane0_block_matches_documented_permutation():
+    # The docstring pins the first eight bytes lane 0 reads for a 32x8 tile:
+    # (n=0,kb=0) (n=16,kb=0) (n=0,kb=4) (n=16,kb=4) (n=1,kb=0) (n=17,kb=0) (n=1,kb=4) (n=17,kb=4)
+    n, k_scale = 32, 8
+    scale = torch.zeros(n, k_scale, dtype=torch.uint8)
+    for n_i in range(n):
+        for k_i in range(k_scale):
+            scale[n_i, k_i] = n_i * k_scale + k_i  # unique bytes
+    out = ts_scale.swizzle_cdna4_mxfp4_scale(scale)
+    first8 = out.reshape(-1)[:8].tolist()
+    expected = [
+        int(scale[0, 0]), int(scale[16, 0]), int(scale[0, 4]), int(scale[16, 4]),
+        int(scale[1, 0]), int(scale[17, 0]), int(scale[1, 4]), int(scale[17, 4]),
+    ]
+    assert first8 == expected
+
+
+# --- n16 weights (pure-torch shuffles + gluon offset helpers) ------------------
+
+
+def _n16_offset_ref(n: int, k_packed: int, packed_k: int) -> int:
+    return (
+        (n // 16 * (packed_k // 64) + k_packed // 64) * 1024
+        + (k_packed // 16 % 4) * 256
+        + n % 16 * 16
+        + k_packed % 16
+    )
+
+
+def test_n16_shuffle_weight_matches_gluon_offset_formula():
+    torch.manual_seed(1)
+    experts, columns, packed_k = 2, 64, 128
+    weight = torch.randint(0, 255, (experts, columns, packed_k), dtype=torch.uint8)
+    shuffled = ts_n16._shuffle_weight(weight, gate_up=False)
+    flat = shuffled.reshape(experts, -1)
+    for n in (0, 1, 15, 16, 31, 63):
+        for k in (0, 1, 15, 16, 63, 64, 127):
+            assert int(flat[1, _n16_offset_ref(n, k, packed_k)]) == int(weight[1, n, k])
+
+
+def test_n16_shuffle_scale_gate_up_split():
+    torch.manual_seed(2)
+    experts, columns, groups = 1, 64, 16
+    scale = torch.randint(0, 255, (experts, columns, groups), dtype=torch.uint8)
+    out = ts_n16._shuffle_scale(scale, gate_up=False)
+    assert out.shape == (experts, columns // 32, groups // 8, 4, 16, 4)
+    assert out.numel() == scale.numel()
+
+
+def _make_n16_module(hidden=256, intermediate=256, experts=2):
+    class _W(torch.nn.Module):
+        pass
+
+    w = _W()
+    two_i, packed_d = 2 * intermediate, hidden // 2
+    w.w13_weight = torch.nn.Parameter(
+        torch.randint(0, 255, (experts, two_i, packed_d), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    w.w13_weight_scale = torch.nn.Parameter(
+        torch.randint(127, 130, (experts, two_i, hidden // 32), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    w.w2_weight = torch.nn.Parameter(
+        torch.randint(0, 255, (experts, hidden, intermediate // 2), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    w.w2_weight_scale = torch.nn.Parameter(
+        torch.randint(127, 130, (experts, hidden, intermediate // 32), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    return w
+
+
+def test_n16_preprocess_produces_valid_bank():
+    w = _make_n16_module()
+    ts_n16.preprocess_n16_mxfp4_weights(w)
+    e, d, i = ts_n16.n16_mxfp4_shape(
+        w.w13_weight, w.w13_weight_scale, w.w2_weight, w.w2_weight_scale
+    )
+    assert (e, d, i) == (2, 256, 256)
+    with pytest.raises(ValueError, match="already prepared"):
+        ts_n16.preprocess_n16_mxfp4_weights(w)
+
+
+def test_n16_preprocess_rejects_bad_shapes():
+    w = _make_n16_module(hidden=200)  # not divisible by 256
+    with pytest.raises(ValueError):
+        ts_n16.preprocess_n16_mxfp4_weights(w)
+
+
+# --- weight_preprocess (pure torch) -------------------------------------------
+
+
+def _make_moe_module(experts=2, hidden=256, intermediate=256, *, bias=True):
+    class _W(torch.nn.Module):
+        pass
+
+    w = _W()
+    two_i = 2 * intermediate
+    w.w13_weight = torch.nn.Parameter(
+        torch.randint(0, 255, (experts, two_i, hidden // 2), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    w.w13_weight_scale = torch.nn.Parameter(
+        torch.randint(126, 129, (experts, two_i, hidden // 32), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    w.w2_weight = torch.nn.Parameter(
+        torch.randint(0, 255, (experts, hidden, intermediate // 2), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    w.w2_weight_scale = torch.nn.Parameter(
+        torch.randint(126, 129, (experts, hidden, intermediate // 32), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    if bias:
+        w.w13_weight_bias = torch.zeros(experts, two_i, dtype=torch.bfloat16)
+        w.w2_weight_bias = torch.zeros(experts, hidden, dtype=torch.bfloat16)
+    return w
+
+
+def test_interleave_gate_up_rows():
+    x = torch.arange(8, dtype=torch.float32).reshape(1, 8)
+    out = ts_wp._interleave_gate_up_rows(x, dim=1)
+    assert out.tolist() == [[0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]]
+    with pytest.raises(ValueError, match="even"):
+        ts_wp._interleave_gate_up_rows(torch.zeros(3, 4), dim=0)
+
+
+def test_weight_preprocess_swizzle_and_configs():
+    w = _make_moe_module()
+    raw13 = w.w13_weight.data.clone()
+    ts_wp.preprocess_gluon_mxfp4_gfx950_moe_weights({}, w, preshuffle=False)
+    # gate/up halves interleaved row-wise, then stored K-packed
+    # (``_make_k_packed_mxfp4_weight`` view: stride(-2) == 1)
+    interleaved = ts_wp._interleave_gate_up_rows(raw13, dim=-2)
+    stored = w.w13_weight_triton_tensor
+    assert stored.stride(-2) == 1 and stored.stride(-1) == interleaved.shape[-1]
+    assert torch.equal(stored.contiguous(), interleaved.transpose(-2, -1).contiguous())
+    assert ts_scale.is_swizzled_cdna4_mxfp4_scale(w.w13_precision_config.b_mx_scale)
+    assert w.w13_precision_config.b_microblock_size == ts_scale.MXFP4_BLOCK
+    assert w.w13_precision_config.out_dtype == torch.bfloat16
+    assert w._gluon_w13_bias_is_zero is True
+    assert w._gluon_w2_bias_is_zero is True
+    # original parameter slots released
+    assert not hasattr(w, "w13_weight")
+
+
+def test_weight_preprocess_pads_w2_to_block_n():
+    # intermediate=200 -> w2 N (=hidden 256) is fine; use odd intermediate to
+    # force nothing; instead force via hidden not multiple of 128 for w13 K.
+    w = _make_moe_module(experts=1, hidden=256, intermediate=192)
+    # w2_weight N = hidden = 256 (divisible); make it non-divisible manually:
+    w.w2_weight = torch.nn.Parameter(
+        w.w2_weight.data[:, :200, :].contiguous(), requires_grad=False
+    )
+    w.w2_weight_scale = torch.nn.Parameter(
+        w.w2_weight_scale.data[:, :200, :].contiguous(), requires_grad=False
+    )
+    ts_wp._pad_w2_to_block_n(w, ts_wp._GLUON_COMBINE_BLOCK_N)
+    assert w.w2_weight.shape[-2] == 256
+    assert w._w2_logical_n == 200
+    # padded scale rows are identity (127)
+    assert bool((w.w2_weight_scale.data[:, 200:, :] == 127).all())
+
+
+def test_shuffle_weight_for_gluon_dot_layout_contract():
+    torch.manual_seed(3)
+    k_pk, n = 128, 128
+    weight = torch.randint(0, 255, (k_pk, n), dtype=torch.uint8)
+    out = ts_wp.shuffle_weight_for_gluon_dot_layout(weight)
+    assert out.shape == (k_pk, n)  # leading dims preserved; 2-D in, 2-D out
+    assert out.is_shuffled_for_gluon_dot is True
+    assert out.original_k_pk == k_pk
+    # P must be a bijection over K*N bytes
+    b = ts_wp._GLUON_DOT_SUB_TILE_K * 2  # block_k_pk=128
+    block_n = 128
+    stride_k_quad = ts_wp._GLUON_DOT_N_LANE * ts_wp._GLUON_DOT_K_WIDTH
+    stride_k_block = ts_wp._GLUON_DOT_K_QUAD * stride_k_quad
+    stride_n_block = (b // ts_wp._GLUON_DOT_SUB_TILE_K) * stride_k_block
+    k = torch.arange(b).view(-1, 1)
+    nn = torch.arange(block_n).view(1, -1)
+    p = (
+        (nn // 16) * stride_n_block
+        + (k // 64) * stride_k_block
+        + ((k // 16) % 4) * stride_k_quad
+        + (nn % 16) * 16
+        + (k % 16)
+    )
+    assert len(torch.unique(p.flatten())) == b * block_n
+    # out[P[j]] = w[k, n] for j = k*N + n (k-major source flatten)
+    flat = out.reshape(-1)
+    recovered = torch.empty_like(flat)
+    recovered[p.flatten()] = weight.reshape(-1)
+    assert torch.equal(flat, recovered)
+    with pytest.raises(ValueError, match="block_k_pk"):
+        ts_wp.shuffle_weight_for_gluon_dot_layout(weight, block_k_pk=32)
+    with pytest.raises(ValueError, match="block_n"):
+        ts_wp.shuffle_weight_for_gluon_dot_layout(weight, block_n=24)
+    with pytest.raises(ValueError, match="divisible by block_n"):
+        ts_wp.shuffle_weight_for_gluon_dot_layout(weight[:, :100].contiguous())
+
+
+# --- routing / sorting host logic ---------------------------------------------
+
+
+def test_routing_support_gates_on_metadata():
+    logits_cpu = torch.randn(4, 128)
+    assert ts_routing.gluon_topk_route_supported(logits_cpu, 8) is False  # CPU
+    with pytest.raises(ValueError, match="unsupported"):
+        ts_routing.invoke_softmax_topk_route_gluon(logits_cpu, 8)
+    assert ts_routing._next_pow2(1) == 1
+    assert ts_routing._next_pow2(5) == 8
+
+
+def test_moe_sorting_capacity_bound():
+    assert ts_sorting._max_padded_route_capacity(8, 4, 16) == 64
+    assert ts_sorting._max_padded_route_capacity(0, 8, 32) == 0
+    assert ts_sorting._max_padded_route_capacity(16, 4, 8) == 16 + 4 * 7 // 8 * 8
+    with pytest.raises(ValueError):
+        ts_sorting._max_padded_route_capacity(-1, 4, 8)
+    with pytest.raises(ValueError):
+        ts_sorting._max_padded_route_capacity(4, 4, 0)
+
+
+# --- argmax torch fallback ------------------------------------------------------
+
+
+def test_argmax_fallback_matches_torch():
+    torch.manual_seed(4)
+    logits = torch.randn(7, 4096)
+    out = ts_argmax.launch_gluon_argmax_gfx950(logits)
+    assert torch.equal(out, torch.argmax(logits, dim=-1))
+    pre = torch.empty(7, dtype=torch.int64)
+    assert ts_argmax.launch_gluon_argmax_gfx950(logits, out=pre) is pre
+    assert torch.equal(pre, torch.argmax(logits, dim=-1))
+
+
+def test_argmax_pair_and_validation():
+    logits = torch.randn(3, 128)
+    pair = ts_argmax.argmax_pair(logits)
+    assert pair.shape == (3, 2) and pair.dtype == torch.float32
+    vals, idxs = torch.max(logits, dim=-1)
+    assert torch.equal(pair[:, 0], vals)
+    assert torch.equal(pair[:, 1], idxs.to(torch.float32))
+    with pytest.raises(ValueError, match="out must have shape"):
+        ts_argmax.launch_gluon_argmax_gfx950(
+            logits, out=torch.empty(4, dtype=torch.int64)
+        )
+    with pytest.raises(ValueError, match="int32 or int64"):
+        ts_argmax.launch_gluon_argmax_gfx950(
+            logits, out=torch.empty(3, dtype=torch.float32)
+        )
+
+
+def test_argmax_select_config_table():
+    assert ts_argmax._select_config(1, 200_000) == (8192, 4, True, 32)
+    assert ts_argmax._select_config(4, 200_000) == (16384, 4, True, 16)
+    assert ts_argmax._select_config(8, 100_000) == (16384, 4, True, None)
+    assert ts_argmax._select_config(64, 200_000) == (32768, 4, True, None)
+    assert ts_argmax._select_config(128, 100_000) == (8192, 4, False, None)
+    assert ts_argmax._load_elements_per_thread(torch.float16) == 8
+
+
+# --- registry -------------------------------------------------------------------
+
+
+def _request(op, *tensors):
+    return KernelRequest(
+        operation=op,
+        tensors=tuple(
+            TensorMetadata(
+                shape=t.shape, dtype=str(t.dtype).replace("torch.", ""), device="cuda"
+            )
+            for t in tensors
+        ),
+        architecture="gfx942",
+        backends=frozenset({"gluon"}),
+    )
+
+
+def test_registry_selects_and_gates():
+    logits = torch.zeros(8, 128, dtype=torch.bfloat16)
+    assert ROUTER_TOPK_REGISTRY.select(_request("router_topk", logits)).name in (
+        "gluon-softmax",
+        "gluon-sigmoid-bias",
+    )
+    with pytest.raises(Exception):
+        ROUTER_TOPK_REGISTRY.select(
+            _request("router_topk", torch.zeros(8, 2048))
+        )  # E > 1024
+    ids = torch.zeros(8, 4, dtype=torch.int32)
+    weights = torch.zeros(8, 4, dtype=torch.float32)
+    assert MOE_SORTING_REGISTRY.select(_request("moe_sorting", ids, weights)).name == "gluon"
+    assert (
+        SAMPLING_ARGMAX_REGISTRY.select(_request("sampling_argmax", logits)).name
+        == "gluon"
+    )
+    rows = torch.zeros(64, 128, dtype=torch.bfloat16)
+    assert (
+        HADAMARD_TRANSFORM_REGISTRY.select(_request("hadamard_transform", rows)).name
+        == "gluon-128"
+    )
+    with pytest.raises(Exception):
+        HADAMARD_TRANSFORM_REGISTRY.select(
+            _request("hadamard_transform", torch.zeros(64, 64))
+        )
+
+
+def test_mhc_registry_shape_gate():
+    mul = torch.zeros(64, 8, 24)
+    sqrsum = torch.zeros(64, 8)
+    residual = torch.zeros(8, 4, 4096)
+    layer_input = torch.zeros(8, 4096, dtype=torch.bfloat16)
+    ok = _request("mhc_pre", mul, sqrsum, residual, layer_input)
+    assert MHC_PRE_REGISTRY.select(ok).name == "gluon"
+    bad_residual = torch.zeros(8, 4, 2048)
+    with pytest.raises(Exception):
+        MHC_PRE_REGISTRY.select(
+            _request("mhc_pre", mul, sqrsum, bad_residual, layer_input)
+        )
+    with pytest.raises(Exception):
+        MHC_PRE_REGISTRY.select(
+            _request("mhc_pre", mul, sqrsum, torch.zeros(65, 4, 4096), layer_input)
+        )
+
+
+def test_combined_registry_view():
+    ops = {impl.operation for impl in TOKENSPEED_AMD_REGISTRY.implementations}
+    assert ops == {
+        "router_topk",
+        "moe_sorting",
+        "sampling_argmax",
+        "hadamard_transform",
+        "mhc_pre",
+    }
+
+
+def test_registry_rejects_cpu_tensors():
+    explanation = ROUTER_TOPK_REGISTRY.explain(
+        KernelRequest(
+            operation="router_topk",
+            tensors=(TensorMetadata(shape=(8, 128), dtype="bfloat16", device="cpu"),),
+            backends=frozenset({"gluon"}),
+        )
+    )
+    assert explanation.selected is None
+    reasons = [
+        r
+        for candidate in explanation.candidates
+        for r in candidate.reasons
+    ]
+    assert any("GPU" in r for r in reasons)
+
+
+# --- GPU parity (skipped without a working gluon driver) ------------------------
+
+
+def _gluon_driver():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm required")
+    if not ts_amd.gluon_available():
+        pytest.skip("gluon unavailable on this triton")
+    try:
+        import triton
+
+        triton.runtime.driver.active  # noqa: B018 — probes the runtime driver
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"triton driver unavailable: {exc}")
+
+
+@pytest.mark.gpu
+def test_gpu_softmax_routing_matches_reference():
+    _gluon_driver()
+    torch.manual_seed(5)
+    for m, e, topk in ((1, 128, 8), (8, 256, 16), (64, 384, 2)):
+        logits = torch.randn(m, e, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(e, device="cuda", dtype=torch.float32)
+        scale = 2.5
+        ids, weights = ts_routing.invoke_softmax_topk_route_gluon(
+            logits, topk, correction_bias=bias,
+            routed_scaling_factor=scale, normalize_topk_weights=True,
+        )
+        # reference: softmax + bias selects; stored weights are unbiased
+        # full-row softmax scores, renormalized, then scaled
+        probs = torch.softmax(logits.float(), dim=-1)
+        choice = probs + bias
+        sel = torch.topk(choice, topk, dim=-1).indices
+        rows = torch.arange(m, device="cuda")[:, None]
+        w = probs[rows, sel]
+        w = w / w.sum(dim=-1, keepdim=True) * scale
+        assert torch.equal(ids.to(torch.int64), sel)
+        assert torch.allclose(weights, w.to(torch.float32), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.gpu
+def test_gpu_moe_sorting_matches_reference_sort():
+    _gluon_driver()
+    torch.manual_seed(6)
+    m, e, topk, block = 512, 128, 4, 16
+    ids = torch.randint(0, e, (m, topk), device="cuda", dtype=torch.int32)
+    weights = torch.rand(m, topk, device="cuda", dtype=torch.float32)
+    (sorted_ids, sorted_weights, sorted_expert_ids, num_valid, out) = (
+        ts_sorting.gluon_moe_sorting(
+            ids, weights, e, 64, torch.bfloat16, block,
+            compact_route_programs=False,
+        )
+    )
+    # Reference block-aligned sort. sorted_ids are packed
+    # ``(topk_id << 24) | token_id``; stage-4 atomics make intra-chunk order
+    # nondeterministic, so compare per-expert multisets, block alignment,
+    # padding sentinels, and the weight<->id pairing.
+    flat = ids.reshape(-1)
+    counts = torch.bincount(flat, minlength=e)
+    starts = [0]
+    for c in counts.tolist():
+        starts.append(starts[-1] + -(-c // block) * block)
+    padded_total = starts[-1]
+    assert int(num_valid[0]) == padded_total
+    assert int(num_valid[1]) == m
+    assert out.shape == (m, 64)
+    for exp in range(0, e, 17):  # sample experts
+        s, c = starts[exp], int(counts[exp])
+        got = sorted_ids[s : s + c]
+        got_pairs = sorted(zip((got >> 24).tolist(), (got & 0xFFFFFF).tolist()))
+        ref_idx = (flat == exp).nonzero().flatten()
+        ref_pairs = sorted(
+            zip((ref_idx % topk).tolist(), (ref_idx // topk).tolist())
+        )
+        assert got_pairs == ref_pairs, f"expert {exp} route mismatch"
+        # weights follow their packed ids (pair each actual slot value)
+        for slot in range(s, s + c):
+            k = int(sorted_ids[slot] >> 24)
+            tok = int(sorted_ids[slot] & 0xFFFFFF)
+            assert float(sorted_weights[slot]) == pytest.approx(
+                float(weights[tok, k]), abs=1e-6
+            )
+        # padding sentinel: (topk << 24) | m
+        pad = sorted_ids[s + c : starts[exp + 1]]
+        if pad.numel():
+            assert bool((pad == ((topk << 24) | m)).all())
+        # block map consistency
+        for b in range(s // block, starts[exp + 1] // block):
+            assert int(sorted_expert_ids[b]) == exp
+
+
+@pytest.mark.gpu
+def test_gpu_hadamard_matches_torch_matrix():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import hadamard as ts_hadamard
+
+    torch.manual_seed(7)
+    rows = 4096
+    x = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16)
+    # build the unnormalized 128x128 Hadamard matrix via Kronecker powers
+    base = torch.tensor([[1.0, 1.0], [1.0, -1.0]])
+    mat = base
+    for _ in range(6):
+        mat = torch.kron(mat, base)
+    mat = mat.to(device="cuda", dtype=torch.float32)
+    scale = 128 ** -0.5
+    out = ts_hadamard.launch_gluon_hadamard_transform_128_gfx950(x, scale=scale)
+    ref = (x.float() @ mat.T) * scale
+    assert torch.allclose(out.float(), ref, atol=2e-2, rtol=1e-2)
+    # non-contiguous trailing dim is rejected by reshape -> verify empty rows
+    empty = ts_hadamard.launch_gluon_hadamard_transform_128_gfx950(
+        x[:0], scale=scale
+    )
+    assert empty.shape == (0, 128)
+
+
+@pytest.mark.gpu
+def test_gpu_n16_shuffle_cpu_gpu_agree():
+    _gluon_driver()
+    torch.manual_seed(8)
+    weight = torch.randint(0, 255, (2, 64, 128), dtype=torch.uint8)
+    cpu = ts_n16._shuffle_weight(weight, gate_up=False)
+    gpu = ts_n16._shuffle_weight(weight.cuda(), gate_up=False)
+    assert torch.equal(cpu.cuda(), gpu)
+
+
+@pytest.mark.gpu
+def test_gpu_mhc_pre_matches_reference_chain():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import mhc as ts_mhc
+
+    torch.manual_seed(9)
+    tokens, hidden, splits = 8, 4096, 64
+    mul = torch.randn(splits, tokens, 24, device="cuda", dtype=torch.float32)
+    sqrsum = torch.rand(splits, tokens, device="cuda", dtype=torch.float32)
+    hc_scale = torch.randn(3, device="cuda", dtype=torch.float32)
+    hc_base = torch.randn(24, device="cuda", dtype=torch.float32)
+    residual = torch.randn(tokens, 4, hidden, device="cuda", dtype=torch.float32)
+    layer_input = torch.empty(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    post_mix = torch.empty(tokens, 4, device="cuda", dtype=torch.float32)
+    comb_mix = torch.empty(tokens, 16, device="cuda", dtype=torch.float32)
+    ts_mhc.gluon_mhc_pre_reduce_apply_gfx950(
+        mul, sqrsum, hc_scale, hc_base, residual, layer_input,
+        post_mix, comb_mix, hidden, rms_eps=1e-6, hc_eps=1e-4,
+        sinkhorn_iters=20, n_splits=splits, num_tokens=tokens,
+    )
+    # torch reference from the kernel's math
+    total = sqrsum.sum(0)
+    inv_rms = torch.rsqrt(total / (4 * hidden) + 1e-6)
+    proj = mul.sum(0)  # [tokens, 24]
+    pre = (
+        1.0 / (1.0 + torch.exp(-(proj[:, :4] * inv_rms[:, None] * hc_scale[0] + hc_base[:4])))
+        + 1e-4
+    )
+    want_layer = (pre[:, :, None] * residual).sum(1)
+    assert torch.allclose(
+        layer_input.float(), want_layer.to(torch.bfloat16).float(), atol=2e-2, rtol=1e-2
+    )
+    post = 2.0 / (
+        1.0 + torch.exp(-(proj[:, 4:8] * inv_rms[:, None] * hc_scale[1] + hc_base[4:8]))
+    )
+    assert torch.allclose(post_mix, post, atol=2e-3, rtol=1e-3)
+    # comb: softmax (row-max stable, +eps after row normalize), then 20
+    # Sinkhorn iterations of row normalize (+eps) / col normalize (+eps).
+    eps = 1e-4
+    comb = proj[:, 8:].reshape(tokens, 4, 4) * inv_rms[:, None, None] * hc_scale[2]
+    comb = comb + hc_base[8:].reshape(4, 4)
+    comb = torch.exp(comb - comb.max(dim=-1, keepdim=True).values)
+    comb = comb / comb.sum(dim=-1, keepdim=True) + eps
+    comb = comb / (comb.sum(dim=1, keepdim=True) + eps)
+    # Verified on MI300A (triton 3.8): the gluon kernel places HC_EPS in the
+    # denominator during the Sinkhorn loop (matching the upstream Triton
+    # reference), not as a post-division add.
+    for _ in range(19):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=1, keepdim=True) + eps)
+    got_comb = comb_mix.reshape(tokens, 4, 4)
+    assert torch.allclose(got_comb, comb, atol=5e-3, rtol=1e-2), (
+        (got_comb - comb).abs().max()
+    )
