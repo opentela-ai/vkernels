@@ -228,6 +228,23 @@ remaining upstream families (mla/decode 3100 lines/50 cdna4 refs,
 mha/prefill, rmha/*) are the same recipe at larger scale; FP8 KV needs
 dot_scaled MFMA and stays gated.
 
+## MHA prefill: persistent scheduler + skip-softmax on gfx942
+
+``torch_ops/tokenspeed_amd/mha_prefill.py`` ports upstream's varlen
+causal MHA prefill — the 512-CTA persistent ``ProgramScheduler`` (q-cycle
+swizzle, atomic dynamic ticket counter for skip-softmax sparsity), the
+single-tile fast path, the two-tile causal boundary, and the sliding
+window — onto the CDNA3 scaffold. New deltas beyond the earlier ports:
+the scheduler's batch branch keyed on constexpr ``cfg.BATCH_SIZE``
+(stock triton rejects heterogeneous constexpr aggregate returns across
+runtime branches); slot fields normalized across branches; LDS budget at
+``BLOCK_M=64 / BLOCK_N=32`` / 2 warps; ``DEFER_V_LOAD`` retained so the
+skip-softmax V-traffic saving survives the synchronous-load collapse.
+**Parity on MI300A across all three legs** (dense, sliding window,
+skip-softmax at an exact threshold; job 675914). Debug trail in the
+commit: scheduler rewritten from memory faulted and was replaced
+verbatim — the ticket/advance contracts are subtle.
+
 ## Round-3 follow-ups (same effort)
 
 - **MLA prefill xfail resolved** — the MI300A divergence was a test-reference
