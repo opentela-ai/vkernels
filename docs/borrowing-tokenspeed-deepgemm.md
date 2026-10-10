@@ -335,14 +335,16 @@ CI skip filters.
    uint64 descriptor path), the sigmoid noaux_tc decode router is
    verified (floe's fused_router A/B'd as already adequate — no floe
    change needed), and the MLA-prefill xfail resolved as a test-reference
-   MQA bug. MFMA primitive de-risking (probes ``probe_mfma*.py`` in the
-   beverin staging dir): ``gl.amd.cdna3.mfma`` + ``AMDMFMALayout`` +
-   ``DotOperandLayout`` construct and compile proceeds into layout
-   conversion on gfx942 — but direct register↔MFMA layout converts are
-   unsupported in BOTH directions; everything stages through shared
-   memory, exactly the scaffolding upstream kernels are built around.
-   Building the minimal working MFMA tile IS the first unit of the
-   remaining port work (multi-session).
+   MQA bug. MFMA primitive de-risking **complete**: a minimal working
+   CDNA3 MFMA tile passes on gfx942 (``test_gpu_gluon_cdna3_mfma_tile``,
+   exact fp32 match for instr shapes [16,16,16] and [32,32,8]). Pinned
+   recipe: blocked loads -> ``SwizzledSharedLayout`` staging -> dot-operand
+   loads -> ``amd.cdna3.mfma`` -> accumulator out via ``cdna3.buffer_store``
+   (direct register<->MFMA converts unsupported both ways). Two layout
+   rules discovered: layout literals inside jit bodies need ``:
+   gl.constexpr`` annotations; each 1-D offsets var is sliced on the axis
+   it expands into. Remaining port work (multi-session): ``mha/decode``
+   and ``mla/extend`` re-lowering on this scaffold.
 
 **Still open:** §3.7 plugins (defer until needed) and §3.12 DeepJIT
 (deferred until the include layering grows); `mark_serving()` wiring from
