@@ -195,6 +195,22 @@ for the full density scan.
   no-store contract): passes on MI300A first run after the call-signature
   fix (job 675645). Remaining variant: replay (uint64 pointer descriptors).
 
+## Replay-variant descriptor layout (decoded, parity pending)
+
+``launch_gluon_kda_fused_replay_gfx950`` packs raw device pointers into a
+``[layers, 10]`` uint64 tensor; the kernel casts them back per layer:
+``0``=mixed_qkv(bf16), ``1``=conv_weights(bf16), ``2``=conv_pool(bf16),
+``5``=beta_logits(bf16), ``6``=a_log(fp32), ``7``=dt_bias(fp32),
+``8``=state_pool(fp32), ``9``=raw_g(bf16) (``3``/``4`` unused by the
+kernel body). ``group_indices[layer]`` selects the page-index group
+(``read/write_indices [groups, batch]`` shifted by ``group * batch``).
+Semantics: per layer, replay the accepted prefix
+(``accepted_length[seq]`` tokens): in-register conv advance with the
+final window + conv pool stored to the write page, chained recurrence
+with per-token raw-g decay, and the recurrent state stored only at the
+accepted boundary (``replay_steps == token_offset + 1``). Parity test
+needs this descriptor construction from ``data_ptr()`` — next unit.
+
 ## Self-service triton-3.8 container (no CSCS ticket needed for dev)
 
 Instead of waiting on the env bump, we repacked the container ourselves:
