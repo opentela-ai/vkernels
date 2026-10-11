@@ -802,6 +802,7 @@ def sgl_fused_moe(
     *,
     swiglu_limit: float = math.inf,
     skip_zero_weights: bool = False,
+    route_weight_in_down: bool = False,
 ) -> torch.Tensor:
     """Routed-expert MLP in 5 launches: quant -> stage1 -> swiglu -> quant ->
     stage2, then the weighted top-k combine (the package's
@@ -819,9 +820,11 @@ def sgl_fused_moe(
     Routing weights are applied at the COMBINE (stage 2 runs with
     MUL_ROUTED_WEIGHT=False), matching the landed decode path's rounding
     class: bf16 GEMM store, fp32 multiply-accumulate in the reduce, one
-    round at the final store (SGLang instead multiplies in the stage-2
-    epilogue and runs an unweighted sum — same class, one fewer load; the
-    MUL_ROUTED_WEIGHT constexpr stays available for that A/B).
+    round at the final store. With ``route_weight_in_down=True``, routing
+    weights instead multiply the FP32 down accumulator before its BF16
+    store, followed by an unweighted FP32-accumulating sum. This donor
+    order has a different BF16 rounding boundary and requires separate
+    full-model quality qualification.
     """
     if not sgl_fused_moe_eligible(
         x, gate_up_proj, gate_up_scale, down_proj, down_scale,
@@ -872,9 +875,14 @@ def sgl_fused_moe(
     _invoke_fused_moe_kernel(
         aq, down_proj, cache3, asc, down_scale,
         top_k_weights, top_k_index, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, mul_routed_weight=False, top_k=1,
+        num_tokens_post_padded, mul_routed_weight=route_weight_in_down, top_k=1,
         config=config,
     )
+
+    if route_weight_in_down:
+        # torch's BF16 reduction accumulates in FP32 and rounds at output.
+        # Do not multiply by the routing weights a second time.
+        return cache3.sum(dim=1)
 
     # weighted combine: the package's vendored reduce (fp32 MAC, one
     # rounding at the store — the moe_combine contract).
