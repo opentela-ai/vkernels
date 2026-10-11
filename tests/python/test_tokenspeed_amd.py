@@ -1673,6 +1673,7 @@ def test_gpu_mha_extend_paged_matches_reference():
     out = ts_ext.launch_gluon_mha_extend_gfx942(
         q, cu_t, cu_t, k_cache, v_cache, page_table, cache_seqlens,
         max_seqlen_q=max(s[0] for s in seqs), softmax_scale=sm_scale,
+        is_causal=True,
     )
     assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
