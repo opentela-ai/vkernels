@@ -1,6 +1,6 @@
 """Fused EP masking matches the original chain under changing graph routes."""
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 from vkernels.torch_ops._dispatch import OpNotEligible
 from vkernels.torch_ops.moe_ep_remap import ep_remap, ep_remap_eligible
