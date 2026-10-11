@@ -1,0 +1,104 @@
+{
+  "env": {
+    "torch": "2.9.0a0+git7bcbafe",
+    "hip": "7.0.51831-a3e329ad8",
+    "device": "AMD Instinct MI300A",
+    "capability": [
+      9,
+      4
+    ],
+    "triton": "3.4.0",
+    "gluon": true,
+    "gluon_amd_cdna4": false,
+    "gluon_features": {
+      "gluon": true,
+      "constexpr_function": false,
+      "associative_scan": false,
+      "amd_cdna4": false
+    },
+    "aiter": true
+  },
+  "date": "2026-10-10T03:50:51",
+  "results": [
+    {
+      "op": "routing",
+      "error": "CompilationError('def _softmax_topk_route_gluon_kernel(\\n    logits_ptr,  # (M, E)\\n    bias_ptr,  # (E), read only when HAS_BIAS\\n    topk_ids_ptr,  # (M, TOPK) int32\\n    topk_weights_ptr,  # (M, TOPK) float32\\n    stride_lm,\\n    stride_le,\\n    stride_be,\\n    stride_tim,\\n    stride_tik,\\n    stride_twm,\\n    stride_twk,\\n    M: gl.constexpr,\\n    E: gl.constexpr,\\n    TOPK: gl.constexpr,\\n    MP: gl.constexpr,\\n    EP: gl.constexpr,\\n    TKP: gl.constexpr,\\n    HAS_BIAS: gl.constexpr,\\n    NORMALIZE_TOPK_WEIGHTS: gl.constexpr,\\n    ROUTED_SCALING_FACTOR: gl.constexpr,\\n    NUM_WARPS: gl.constexpr,\\n):\\n    NEG: gl.constexpr = float(\"-inf\")\\n    lt: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [NUM_WARPS, 1], [1, 0])\\n    row = gl.expand_dims(gl.arange(0, MP, layout=gl.SliceLayout(1, lt)), 1)\\n    col = gl.expand_dims(gl.arange(0, EP, layout=gl.SliceLayout(0, lt)), 0)\\n    mask = (row < M) & (col < E)\\n\\n    logits = gl.load(\\n        logits_ptr + row.to(gl.int64) * stride_lm + col.to(gl.int64) * stride_le,\\n        mask=mask,\\n        other=NEG,\\n    ).to(gl.float32)\\n    rmax = gl.max(logits, axis=1, keep_dims=True)\\n    num = gl.exp(logits - rmax)\\n    den = gl.sum(num, axis=1, keep_dims=True)\\n    scores = gl.fdiv(num, den)\\n    choice = scores\\n    if HAS_BIAS:\\n        bias = gl.load(\\n            bias_ptr + col.to(gl.int64) * stride_be,\\n            mask=col < E,\\n            other=0.0,\\n        ).to(gl.float32)\\n        choice = choice + bias\\n    choice = gl.where(mask, choice, NEG)\\n\\n    tcol = gl.expand_dims(gl.arange(0, TKP, layout=gl.SliceLayout(0, lt)), 0)\\n    val_t = gl.zeros([MP, TKP], gl.float32, layout=lt)\\n    idx_t = gl.zeros([MP, TKP], gl.int32, layout=lt)\\n    big_e = gl.full([MP, EP], E, gl.int32, layout=lt)\\n    cur = choice\\n    for r in gl.static_range(TOPK):\\n        vmax = gl.max(cur, axis=1, keep_dims=True)\\n        ismax = (cur == vmax) & mask\\n        amax = gl.min(gl.where(ismax, col, big_e), axis=1, keep_dims=True)\\n        gate = gl.sum(gl.where(col == amax, scores, gl.zeros_like(scores)), axis=1)\\n        sel = tcol == r\\n        val_t = gl.where(sel, gl.expand_dims(gate, 1), val_t)\\n        idx_t = gl.where(sel, amax, idx_t)\\n        cur = gl.where(col == amax, NEG, cur)\\n\\n    if NORMALIZE_TOPK_WEIGHTS:\\n        denom = gl.sum(val_t, axis=1, keep_dims=True)\\n        denom = gl.where(denom != 0.0, denom, 1.0)\\n        val_t = gl.fdiv(val_t, denom)\\n    val_t = val_t * ROUTED_SCALING_FACTOR\\n\\n    m = gl.arange(0, MP, layout=gl.SliceLayout(1, lt))\\n    zero_i = gl.zeros([MP, TKP], gl.int32, layout=lt)\\n    zero_f = gl.zeros([MP, TKP], gl.float32, layout=lt)\\n    for r in gl.static_range(TOPK):\\n        sel = tcol == r\\n        idx_r = gl.sum(gl.where(sel, idx_t, zero_i), axis=1)\\n        val_r = gl.sum(gl.where(sel, val_t, zero_f), axis=1)\\n        valid_m = m < M\\n        gl.store(\\n            topk_ids_ptr + m.to(gl.int64) * stride_tim + r * stride_tik,\\n            idx_r,\\n            mask=valid_m,\\n        )\\n        gl.store(\\n            topk_weights_ptr + m.to(gl.int64) * stride_twm + r * stride_twk,\\n            val_r,\\n            mask=valid_m,\\n        )\\n', <ast.Call object at 0x14bc606c8370>, 'expected expand_dims input to be a distributed_type but got: triton.language.float32')"
+    },
+    {
+      "op": "sorting",
+      "error": "AttributeError(\"module 'triton.experimental.gluon.language' has no attribute 'histogram'\")"
+    },
+    {
+      "op": "hadamard",
+      "error": "CompilationError(\"def gluon_hadamard_transform_128_gfx950(\\n    x,\\n    out,\\n    scale: gl.constexpr,\\n):\\n    row = gl.program_id(0)\\n    offsets = gl.arange(0, 128, layout=_hadamard_128_layout())\\n    values = gl.load(x + row * 128 + offsets).to(gl.float32)\\n\\n    # This order is deliberately different from the conventional increasing\\n    # stride order. It reproduces the portable kernel's FP32 reduction tree.\\n    values = _hadamard_128_butterfly_stage(values, 8, 8)\\n    values = _hadamard_128_butterfly_stage(values, 16, 4)\\n    values = _hadamard_128_butterfly_stage(values, 32, 2)\\n    values = _hadamard_128_butterfly_stage(values, 64, 1)\\n    values = _hadamard_128_butterfly_stage(values, 4, 16)\\n    values = _hadamard_128_butterfly_stage(values, 2, 32)\\n    values = _hadamard_128_butterfly_stage(values, 1, 64)\\n\\n    values = gl.convert_layout(values, _hadamard_128_layout())\\n    gl.store(out + row * 128 + offsets, values * scale)\\n\", <ast.Name object at 0x14bc606ca6b0>, 'NameError(\"Cannot access global variable _hadamard_128_layout from within @jit\\'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.\")')"
+    },
+    {
+      "op": "mhc",
+      "error": "CompilationError('def gluon_mhc_pre_gfx950(\\n    gemm_out_mul,\\n    gemm_out_sqrsum,\\n    hc_scale,\\n    hc_base,\\n    residual,\\n    layer_input,\\n    post_mix,\\n    comb_mix,\\n    num_tokens,\\n    HIDDEN_SIZE: gl.constexpr,\\n    RMS_EPS: gl.constexpr,\\n    HC_EPS: gl.constexpr,\\n    SINKHORN_ITERS: gl.constexpr,\\n    N_SPLITS: gl.constexpr,\\n    BLOCK_H: gl.constexpr,\\n):\\n    token = gl.program_id(0)\\n    hidden_block = gl.program_id(1)\\n    split_layout: gl.constexpr = gl.BlockedLayout([2], [64], [1], [0])\\n    splits = gl.arange(0, 128, layout=split_layout)\\n    split_mask = splits < N_SPLITS\\n\\n    square_parts = gl.load(\\n        gemm_out_sqrsum + splits * num_tokens + token,\\n        mask=split_mask,\\n        other=0.0,\\n    ).to(gl.float32)\\n    square_sum = gl.sum(square_parts, axis=0)\\n    inverse_rms = gl.rsqrt(square_sum / (4 * HIDDEN_SIZE) + RMS_EPS)\\n    pre_scale = gl.load(hc_scale).to(gl.float32)\\n\\n    hidden_layout: gl.constexpr = gl.BlockedLayout([8], [64], [1], [0])\\n    dims = hidden_block * BLOCK_H + gl.arange(0, BLOCK_H, layout=hidden_layout)\\n    hidden_acc = gl.zeros([BLOCK_H], gl.float32, layout=hidden_layout)\\n    for head in gl.static_range(4):\\n        projection_parts = gl.load(\\n            gemm_out_mul + splits * num_tokens * 24 + token * 24 + head,\\n            mask=split_mask,\\n            other=0.0,\\n        ).to(gl.float32)\\n        projection = gl.sum(projection_parts, axis=0)\\n        pre = (\\n            1.0\\n            / (\\n                1.0\\n                + gl.exp(\\n                    -(\\n                        projection * inverse_rms * pre_scale\\n                        + gl.load(hc_base + head).to(gl.float32)\\n                    )\\n                )\\n            )\\n            + HC_EPS\\n        )\\n        values = gl.load(\\n            residual + token * 4 * HIDDEN_SIZE + head * HIDDEN_SIZE + dims\\n        ).to(gl.float32)\\n        hidden_acc += pre * values\\n    gl.store(layer_input + token * HIDDEN_SIZE + dims, hidden_acc.to(gl.bfloat16))\\n\\n    if hidden_block == 0:\\n        vector_layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])\\n        lane = gl.arange(0, 64, layout=vector_layout)\\n        post_projection = gl.zeros([64], gl.float32, layout=vector_layout)\\n        for split in gl.static_range(N_SPLITS):\\n            post_projection += gl.load(\\n                gemm_out_mul + split * num_tokens * 24 + token * 24 + lane,\\n                mask=(lane >= 4) & (lane < 8),\\n                other=0.0,\\n            ).to(gl.float32)\\n        post_scale = gl.load(hc_scale + 1).to(gl.float32)\\n        post_values = 2.0 / (\\n            1.0\\n            + gl.exp(\\n                -(\\n                    post_projection * inverse_rms * post_scale\\n                    + gl.load(\\n                        hc_base + lane, mask=(lane >= 4) & (lane < 8), other=0.0\\n                    ).to(gl.float32)\\n                )\\n            )\\n        )\\n        gl.store(\\n            post_mix + token * 4 + lane - 4,\\n            post_values,\\n            mask=(lane >= 4) & (lane < 8),\\n        )\\n\\n        matrix_layout: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [1, 1], [1, 0])\\n        rows = gl.arange(0, 4, layout=gl.SliceLayout(1, matrix_layout))\\n        cols = gl.arange(0, 16, layout=gl.SliceLayout(0, matrix_layout))\\n        active = cols[None, :] < 4\\n        comb_offsets = rows[:, None] * 4 + cols[None, :]\\n        comb_projection = gl.zeros([4, 16], gl.float32, layout=matrix_layout)\\n        for split in gl.static_range(N_SPLITS):\\n            comb_projection += gl.load(\\n                gemm_out_mul + split * num_tokens * 24 + token * 24 + 8 + comb_offsets,\\n                mask=active,\\n                other=0.0,\\n            ).to(gl.float32)\\n        comb_scale = gl.load(hc_scale + 2).to(gl.float32)\\n        comb = gl.where(\\n            active,\\n            comb_projection * inverse_rms * comb_scale\\n            + gl.load(hc_base + 8 + comb_offsets, mask=active, other=0.0).to(\\n                gl.float32\\n            ),\\n            0.0,\\n        )\\n        row_max = gl.max(gl.where(active, comb, -float(\"inf\")), axis=1)\\n        comb = gl.where(active, gl.exp(comb - row_max[:, None]), comb)\\n        row_sum = gl.sum(gl.where(active, comb, 0.0), axis=1)\\n        comb = gl.where(active, comb / row_sum[:, None] + HC_EPS, comb)\\n        col_sum = gl.sum(gl.where(active, comb, 0.0), axis=0)\\n        comb = gl.where(active, comb / (col_sum[None, :] + HC_EPS), comb)\\n        for _ in gl.static_range(1, SINKHORN_ITERS):\\n            row_sum = gl.sum(gl.where(active, comb, 0.0), axis=1)\\n            comb = gl.where(active, comb / (row_sum[:, None] + HC_EPS), comb)\\n            col_sum = gl.sum(gl.where(active, comb, 0.0), axis=0)\\n            comb = gl.where(active, comb / (col_sum[None, :] + HC_EPS), comb)\\n        gl.store(comb_mix + token * 16 + comb_offsets, comb, mask=active)\\n', <ast.Call object at 0x14bc60655b70>, 'expected expand_dims input to be a distributed_type but got: triton.language.float32')"
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 1,
+        "N": 32768
+      },
+      "torch": {
+        "us_median": 20.72,
+        "us_p10": 19.6,
+        "us_p90": 25.44
+      },
+      "gluon": "unavailable: gluon amd.cdna4 missing on this triton"
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 8,
+        "N": 131072
+      },
+      "torch": {
+        "us_median": 43.72,
+        "us_p10": 43.08,
+        "us_p90": 44.92
+      },
+      "gluon": "unavailable: gluon amd.cdna4 missing on this triton"
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 64,
+        "N": 151936
+      },
+      "torch": {
+        "us_median": 53.26,
+        "us_p10": 52.32,
+        "us_p90": 54.96
+      },
+      "gluon": "unavailable: gluon amd.cdna4 missing on this triton"
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 8,
+        "N": 262144
+      },
+      "torch": {
+        "us_median": 80.26,
+        "us_p10": 78.48,
+        "us_p90": 84.16
+      },
+      "gluon": "unavailable: gluon amd.cdna4 missing on this triton"
+    },
+    {
+      "op": "scale_swizzle_cdna4 (host/torch)",
+      "shape": {
+        "rows": 368640,
+        "k_scale": 90
+      },
+      "torch": {
+        "us_median": 898.74,
+        "us_p10": 877.44,
+        "us_p90": 911.68
+      }
+    }
+  ]
+}

@@ -1,0 +1,502 @@
+# TokenSpeed-Kernel-AMD "bucket 1" port: beverin (MI300A) measurements
+
+Beverin (gfx942/MI300A, x86_64 container, Slurm `mi300` partition,
+account `a-infra02`), 2026-10-10. Jobs 675311 (stock env), 675350/675351
+(triton 3.8 leg). Staging:
+`/iopsstor/scratch/cscs/xyao/floe-beverin/tokenspeed-amd-bucket1/`.
+
+## What was ported
+
+`src/python/vkernels/torch_ops/tokenspeed_amd/` — MIT-vendored from
+lightseekorg/tokenspeed `tokenspeed-kernel-amd` (fetched 2026-11, `main`):
+
+| component | kind | needs |
+|---|---|---|
+| `scale_layout.py` — CDNA4 MXFP4 e8m0 scale swizzle | pure torch | any device |
+| `weight_preprocess.py` — gate/up interleave, W2 block-N padding, gdot128 preshuffle | pure torch | any device |
+| `n16_weights.py` — N16 packed-cell weight banks | pure torch + gluon offset helpers | any device |
+| `routing.py` — softmax top-k (generic) + sigmoid-bias (cdna4) fused routers | gluon | gluon / gluon+cdna4 |
+| `moe_sorting.py` — 4-stage block-aligned expert sort | gluon | gluon |
+| `hadamard.py` — length-128 register butterfly | gluon | gluon |
+| `mhc.py` — decode-shaped hyperconnection pre reduce/apply | gluon | gluon |
+| `argmax.py` — split-atomic sampling argmax + torch fallback | gluon+cdna4 | gluon+cdna4 |
+
+Registry: `tokenspeed_amd_registry.py` (ops `router_topk`, `moe_sorting`,
+`sampling_argmax`, `hadamard_transform`, `mhc_pre`; PORTABLE band, format
+signatures). Tests: `tests/python/test_tokenspeed_amd.py` — **29/29 pass on
+MI300A** (24 CPU-side + 5 GPU parity, job 675350), 24 pass / 5 GPU-skip on
+the CPU-only dev box.
+
+## Environment finding: gluon needs triton ≥ 3.8
+
+The container's stock triton **3.4.0** ships the first experimental gluon —
+feature-incomplete for *every* vendored kernel: no
+`gluon.constexpr_function` (hadamard/argmax), no `gl.histogram` (sorting
+stage 1/2), no `gluon.language.amd.cdna4` (sigmoid routing, argmax loads),
+and routing/mhc hit `CompilationError` on the 3.4 stdlib. The vendored
+`_gluon.py` shim degrades to inert stubs (import-safe on any host) and the
+probes (`gluon_features()`) report the per-kernel availability; with stock
+3.4 only the pure-torch components run (measured: `results-stock-triton34.json`).
+
+Fix: install triton 3.8.0 from the PyTorch rocm7.0 nightly index into scratch
+(`triton-3.8.0+gitdf3f91dd-cp310-cp310-manylinux_2_27_x86_64...whl`, pip
+`--target`; the container is **x86_64** — aarch64 wheels fail with a
+misleading `cannot open shared object file` dlopen error) and prepend it to
+`PYTHONPATH`. All features green (`constexpr_function`, `associative_scan`,
+`amd.cdna4`); torch 2.9.0a+git7bcbafe (hip 7.0.51831) needs no change.
+Sbatch: `bench-bucket1-t38.sbatch` in the staging dir.
+
+## Results (MI300A, triton 3.8, medians of 50 iters after 10 warmup)
+
+`results-triton38.json`. Timings in µs.
+
+### Routing — fused softmax top-k vs torch chain
+
+Gluon single-CTA kernel (limit M·topk ≤ 128, E ≤ 1024) vs the
+vLLM-style torch chain (softmax → bias → topk → gather → normalize → scale):
+
+| M, E, topk | gluon | torch | speedup |
+|---|---:|---:|---:|
+| 1, 128, 16 | 68.3 | 139.9 | 2.0× |
+| 1, 384, 16 | 106.3 | 137.5 | 1.3× |
+| 8, 256, 16 | 47.1 | 141.9 | 3.0× |
+| 16, 128, 8 | 107.9 | 142.3 | 1.3× |
+| 64, 384, 2 | 53.8 | 139.7 | 2.6× |
+
+The 47–108 µs spread tracks `NUM_WARPS = next_pow2(M)` respecialization
+(M=1/E=384 and M=16 pick worse wave counts on gfx942 than MI355X tuning).
+Still 1.3–3× over the 5-op torch chain, and it removes the chain's extra
+kernel launches.
+
+### MoE sorting — 4 gluon stages vs aiter CK vs torch reference
+
+| M, E, topk, block | gluon | aiter | torch ref |
+|---|---:|---:|---:|
+| 8, 128, 4, 16 (decode) | 96.2 | **30.5** | 174.7 |
+| 8, 256, 8, 16 (decode) | 90.1 | **41.0** | 174.3 |
+| 64, 128, 8, 64 | 89.8 | **31.2** | 162.8 |
+| 512, 128, 4, 64 (prefill) | 114.0 | **36.0** | 165.3 |
+| 4096, 256, 8, 128 (prefill) | **125.5** | 165.9 | 221.0 |
+
+The aiter `moe_align_block_size` we already wrap stays the decode/prefill
+default on gfx942; the gluon sort only wins at the largest prefill shape
+(1.3× vs aiter) and beats the torch reference everywhere. Note the outputs
+differ in contract: gluon packs `sorted_ids = (k << 24) | token` with
+weights, aiter emits flat `token*topk + slot` with per-block experts.
+
+### Hadamard-128 (bf16 rows, fp32 butterfly, scale = 1/√128)
+
+| rows | gluon | effective BW | torch fp32 matmul |
+|---|---:|---:|---:|
+| 4 096 | 40.6 µs | 52 GB/s | 727 ms |
+| 32 768 | 42.7 µs | 336 GB/s | 713 ms |
+| 262 144 | 157.6 µs | 829 GB/s | 700 ms |
+
+Single-wave-per-row register butterfly; the torch baseline materializes an
+fp32 copy + GEMM (≈4 orders slower). 829 GB/s at the large shape is
+HBM-roofline territory for a 33.5 MB×2 streaming op on MI300A.
+
+### mHC pre reduce/apply (decode-shaped, hidden 4096, 64 split-K partials)
+
+| tokens | gluon | torch ref | speedup |
+|---|---:|---:|---:|
+| 1 | 42.3 | 1237.8 | 29× |
+| 8 | 41.8 | 1234.9 | 30× |
+| 64 | 43.0 | 1250.4 | 29× |
+
+Parity verified bit-tight on layer_input/post and to 5e-3 on the 20-iteration
+Sinkhorn comb (the kernel places `HC_EPS` in the denominator during the loop,
+matching the upstream Triton reference — verified empirically, see the test
+comment). Needs the split-K partial GEMM (`gemm_out_mul` [splits, T, 24])
+upstream of it to be useful in serving.
+
+### Sampling argmax
+
+| M, N | torch | gluon |
+|---|---:|---:|
+| 1, 32 768 | **21.7** | 101.4 |
+| 8, 131 072 | 44.9 | 51.9 |
+| 64, 151 936 | **55.8** | 57.6 |
+| 8, 262 144 | 102.5 | **50.2** (2.0×) |
+
+Split-atomic paths win at large vocab with few rows; torch wins small-M and
+M=64 (config table tuned for MI355X CU counts). The launcher's fallback
+keeps torch semantics where the probe says gluon is unavailable.
+
+### Host-side preprocessing (pure torch, any GPU)
+
+CDNA4 scale swizzle on a GPT-OSS-120B-sized scale tensor
+(368 640 × 90 = 33 MB): **942 µs** — one-time load cost, not on the
+serving path.
+
+## Follow-ups executed (round 2, same day)
+
+### gfx942 launch-table tuning (`sweep-gfx942.json`)
+
+Swept the MI355X-tuned launch tables on MI300A (script
+`bench/sweep_tokenspeed_amd_gfx942.py`, job 675500):
+
+- **routing**: `NUM_WARPS=8` is best or tied-best at every supported M
+  (33–39 µs vs 34–243 µs across upstream's `min(next_pow2(M),4)` picks).
+  Landed as a capability-gated local override in `routing.py` — the
+  re-bench (`results-triton38-v3.json`) is flat 51–55 µs across all shapes
+  (the 106–108 µs outliers are gone), 2.5–2.7× over the torch chain.
+- **argmax**: `_select_config_gfx942` override — plain (non-split)
+  16384-wide at M ≤ 64 (46 µs vs 51+ for every split variant at
+  M=64/N=152k), split-fixed 8192/16 at M ≤ 4 large-N, split 16384 at
+  M ≤ 32. Re-bench: M=1/N=32k halved (101→47 µs), M=8/N=262k 2× over
+  torch (58 vs 95 µs).
+
+### mHC full chain vs aiter (`mhc_pre_full_chain` in v3)
+
+Ported the producer (split-K prenorm GEMM, plain Triton —
+`tokenspeed_amd/mhc_gemm.py`, parity-tested) so the gluon mHC is
+end-to-end usable; `gluon_mhc_pre()` mirrors `aiter_mhc_pre`'s contract.
+Verdict on MI300A: **aiter's fused `mhc_pre` wins** — 66–69 µs vs the gluon
+chain's 114–115 µs (producer ≈ 70 µs + reduce ≈ 44 µs). Keep aiter for mHC
+on gfx942; the gluon chain is the fallback where aiter is absent.
+
+### Full python suite on beverin under triton 3.8 (job 675497)
+
+**1452 passed / 35 failed / 134 skipped / 4 errors** (12 min) — the
+container's working triton driver beats the CPU dev box (434 failures
+there). Failure triage: 11 `test_discovery` (known subprocess/CLI env
+issue), 5 `test_megakernel_triton`, and ~19 across glm_kda/glm_moe/
+kda_gemv/v41_fp8/sgl_sparse (CUDA-extension kernels — no built `.so` in the
+container, expected), plus **one real finding**: `tokenspeed_mla`
+prefill GPU parity diverges on MI300A (42% element mismatch at 2e-2 —
+first hardware run of that port; bare `tl.dot` bf16 path suspect). Marked
+hip-conditional xfail in the test with this artifact as reference; fix is
+tracked as a follow-up.
+
+### Bucket 2 opened: `kda_decode.py` vendored (compile-smoke on gfx942)
+
+Key unlock: stock triton 3.8 ships `gluon.language.amd.cdna3` (buffer
+ops + mfma). `kda/decode.py` (1562 lines, only buffer_load/store as
+arch-specific) vendored with a cdna3-first binding; GPU smoke test pins
+the launch contract. Full parity vs `glm_kda_fused_decode_reference`
+(low-rank decay-gate input conversion) is the tracked bucket-2 follow-up,
+along with `dsa/sparse_mla` (buffer_load only). See the borrowing-plan doc
+for the full density scan.
+
+## MHA decode: the first MFMA-class attention kernel ported to CDNA3
+
+``torch_ops/tokenspeed_amd/mha_decode.py`` re-lowers upstream's
+gfx950 MHA decode (split-K + sliding-window + sinks plumbing kept) onto
+the proven CDNA3 scaffold: ``cdna3.mfma`` with v2 ``[16,16,16]``
+layouts, all operands (q/k/v) staged through ``SwizzledSharedLayout``
+shared memory, the ``cdna4.async_copy`` DMA pipeline replaced by
+synchronous loads (first cut, unpipelined), ``cdna4.buffer_load/store``
+via the CDNA3-first alias, and the 256-CU occupancy constant replaced by
+the device's CU count. FP8 KV paths are not ported (need dot_scaled
+MFMA); the launcher raises.
+
+**Parity on MI300A** (job 675835): split-K full attention AND the
+sliding-window leg match the eager paged reference at bf16 tolerance
+(maxdiff ≤ 5e-4 on the marker probes; 32/4 heads, dim 128, seqs
+{64,150,500}, window 127). Three port bugs were found and fixed en
+route: the collapsed synchronous loop consumed the *next* tile's page
+(marker probe: single-key attention returned page-0's value), a
+double-applied window mask (upstream's window lives entirely in
+``kv_start``), and the eager *reference* masked the first-128 positions
+of a full-sequence mask (NaN).
+
+**First-cut numbers** (32 q / 4 kv heads, dim 128, seq 4096): 104 µs
+(batch 1), 114 µs (8), 303 µs (32) — unpipelined; the async→sync load
+collapse trades overlap for correctness, so these are a floor to tune
+from, not the ceiling. aiter flash-decode comparison is future work.
+
+## MLA extend: the second MFMA-class attention kernel ported to CDNA3
+
+``torch_ops/tokenspeed_amd/mla_extend.py`` re-lowers upstream's absorbed
+MLA extend (prefix-cache/chunked prefill, ragged grid, KV split + reduce)
+with three further CDNA3 deltas beyond the MHA recipe: gfx942's 64 KB LDS
+forces ``BLOCK_N=16`` single-stage staging (MI350's 128 KB LDS hosts
+upstream's 4-stage 32-wide ring); the K and V operands stage into
+**physically distinct** buffers (K transposed, V natural — replacing the
+relaxed DMA reads that served both orientations from one buffer); and the
+manual software scheduler (``sched_barrier.ll``, vendored for a future
+pass) is dropped entirely. **Parity on MI300A, first successful compile**
+(job 675877 — all five iteration fixes were host/config-level, e.g. the
+jit ``max`` helper shadowing the builtin in host code and aggregate
+stride typing). Full suite: **53/53** tokenspeed_amd + MLA tests.
+
+With this, **every MFMA-class attention kernel from the survey that is
+CDNA3-portable is ported and parity-verified on gfx942**: mha/decode,
+mla/extend (plus the buffer-op kernels from earlier rounds). The
+remaining upstream families (mla/decode 3100 lines/50 cdna4 refs,
+mha/prefill, rmha/*) are the same recipe at larger scale; FP8 KV needs
+dot_scaled MFMA and stays gated.
+
+## MHA prefill: persistent scheduler + skip-softmax on gfx942
+
+``torch_ops/tokenspeed_amd/mha_prefill.py`` ports upstream's varlen
+causal MHA prefill — the 512-CTA persistent ``ProgramScheduler`` (q-cycle
+swizzle, atomic dynamic ticket counter for skip-softmax sparsity), the
+single-tile fast path, the two-tile causal boundary, and the sliding
+window — onto the CDNA3 scaffold. New deltas beyond the earlier ports:
+the scheduler's batch branch keyed on constexpr ``cfg.BATCH_SIZE``
+(stock triton rejects heterogeneous constexpr aggregate returns across
+runtime branches); slot fields normalized across branches; LDS budget at
+``BLOCK_M=64 / BLOCK_N=32`` / 2 warps; ``DEFER_V_LOAD`` retained so the
+skip-softmax V-traffic saving survives the synchronous-load collapse.
+**Parity on MI300A across all three legs** (dense, sliding window,
+skip-softmax at an exact threshold; job 675914). Debug trail in the
+commit: scheduler rewritten from memory faulted and was replaced
+verbatim — the ticket/advance contracts are subtle.
+
+## rel-MHA decode: relative-position bias ported
+
+``rmha_decode.py`` — paged split-K decode plus the per-head relative-
+position bias table, on the mha/decode recipe verbatim-plus-rel-bias. The
+rel-bias add and the reduce kernel are upstream verbatim. **Parity on
+MI300A** (seqs {64,150,500}, 32/4 heads; zero-bias control probe exact at
+5e-4 isolating one reference-side bias-ordering bug: the kernel adds bias
+to the raw dot product BEFORE sm_scale).
+
+## rel-MHA extend: ragged paged extend with rel bias
+
+``rmha_extend.py`` — ragged multi-token extend over the paged cache
+(query-tile M packing, host-static grid, causal/window masking ladder,
+LSE, per-query-row rel bias), recipe as the other ports. **Parity on
+MI300A** (ragged seqs {16+48, 8+120}, 8/2 heads); one reference-side
+fix (bias clamps over all keys; future keys' bias is hidden by the
+causal mask).
+
+## MHA extend: ragged paged extend + split-K — the script-transform template
+
+``mha_extend.py`` — upstream's 1142-line ragged paged extend (GQA
+head-group M packing, ragged/rectangular grid binary-search resolution,
+split-K partials + wave-tile reduce, sinks/LSE) transformed onto the
+CDNA3 scaffold **by scripted substitution** rather than hand
+transcription: imports -> shim, `attention_layouts` -> the CDNA3 v2
+`[32,32,8]` variant, K smem allocation transposed + permuted stores +
+no-permuted-read, async waits deleted, `cdna4.mfma` -> `amd.cdna3.mfma`,
+SM-count -> device CUs. The transform script is the template for the
+remaining same-recipe families. **Parity on MI300A** (ragged seqs
+{16+48, 8+120, 40+24}, 8/2 heads, causal). Correction (found when the
+first full-suite run ran the committed test): the in-tree paged parity
+test initially omitted `is_causal=True` — the port keeps upstream's
+`is_causal=False` default, so the kernel ran non-causal against a causal
+reference (error ~C/n_visible, deepest-diagonal row exact). The kernel's
+causal branch was correct; the one-line test fix landed with the suite
+going 50/50.
+
+## rel-MHA prefill: varlen causal prefill with rel bias
+
+``rmha_prefill.py`` — the last rel-family member: varlen causal prefill
+with the per-head relative-position bias table, ``BLOCK_M=64`` to fit
+gfx942's LDS with the bias tile staged alongside K/V. New port delta:
+**inline-layout conversion** for the bias add (bias arrives in a blocked
+load layout, gets converted to the qk distributed layout in-register
+instead of round-tripping through LDS). **Parity on MI300A** (seqs
+{200, 200}, {80, 80}, 8/2 heads, rel extent 512; seed-27 legs incl.
+long-sequence bias wrap).
+
+## MLA prefill: NoPE+RoPE split-KV on gfx942
+
+``mla_prefill.py`` — multi-head-absorbed prefill: q heads 192-dim
+(NoPE 128 + RoPE 64) against the same 192-dim KV with a 128-dim value
+stream, left-aligned causal over ragged q/kv pairs (query row i sees
+keys [0, kv_len − q_len + i]), split-KV accumulate + reduce, LSE leg.
+**Parity on MI300A** (seqs {(64,64), (24,40), (40,24)}, 8 q heads / 2
+kv heads; eager reference, seed 31).
+
+## MLA decode: bh16bn64 split-K on gfx942 (the hard one)
+
+``mla_decode.py`` — upstream's 3100-line async_copy+MFMA decode
+rewritten as a **single-buffered LDS pipeline** (no TMA on CDNA3):
+BLOCK_N 64 -> 32 so the KV ring fits the 64 KB LDS alongside the Q
+tiles; v2 ``[16,16,16]`` MFMA (k_width 8 qk / 4 pv), non-transposed dot
+operands, constexpr-helper layout construction (a kernel-body
+``AMDMFMALayout`` assignment hits the tracer's ``to_tensor``). Only the
+**bh16bn64** regime is portable: bh64/small regimes stage 128-wide
+double-buffered rings, fp8 regimes need dot-scaled MFMA; the
+projected-value epilogue is fp8/bh16bn128-only upstream — guarded with
+``NotImplementedError`` (public launcher stub + internal guard) instead
+of a dangling reducer name. **Parity on MI300A** (mixed ragged seqlens,
+LSE leg, 1x1 edge; regime/dtype rejection and the projected-value
+guards covered; 90 s single-test run).
+
+Bench (`results-mla-decode.json`, job 676367; heads 16, lora 512,
+rope 64, seq 4096):
+
+| batch | gluon_cdna3 median |
+|---:|---:|
+| 1 | 121.4 µs |
+| 8 | 121.1 µs |
+| 32 | 213.0 µs |
+
+Flat to batch 8 (the split-K scheduler fills the CU array), +76% at
+batch 32 where the bh16bn64 regime exhausts per-head parallelism — the
+upstream bh64 regime (which would cover it) is one of the
+non-portable ones, so this is the expected CDNA3 ceiling for decode-side
+MLA at this shape.
+
+## Round-3 follow-ups (same effort)
+
+- **MLA prefill xfail resolved** — the MI300A divergence was a test-reference
+  bug (replicated head 0's result to head 1 instead of attending with head
+  1's own query over the shared KV). Reference fixed, xfail removed, the
+  speculative ieee-dot experiment reverted; kernel stays verbatim. 10/10
+  MLA tests pass on MI300A (job 675621).
+- **KDA fast path** — `assume_valid=True` on `gluon_kda_fused_decode_gfx950`
+  shares the launch body with the validated wrapper and skips ~30 python
+  checks: bit-equal outputs (pools restored between calls), 76.2 → 67.0 µs
+  call latency (job 675641). 47/47 tokenspeed_amd+mla tests there.
+- **KDA verify (no-store) parity** — eager oracle for the draft-verify
+  variant (in-register conv advance, chained recurrence, raw outputs,
+  no-store contract): passes on MI300A first run after the call-signature
+  fix (job 675645). Remaining variant: replay (uint64 pointer descriptors).
+
+## Sigmoid (noaux_tc) decode routing verified — floe integration recipe
+
+``invoke_sigmoid_bias_topk_route_gluon`` (the generic, non-cdna4 single-CTA
+sigmoid router — GLM53's ``TopkRouter`` semantics) is parity-verified on
+MI300A for M ∈ {1, 8, 16}, E ∈ {128, 256, 384}, topk=8 (job 675713). The
+contract detail that flips selections at E=384: sigmoid scores round to
+the router dtype (bf16) BEFORE the bias add, top-k choice, and
+normalization — the eager reference must apply the same rounding.
+
+**A/B verdict (job 675719): no floe integration needed.** floe's
+``fused_router`` knob already routes through our own
+``vkernels.torch_ops.glm_router.fused_router`` (plain Triton), and on
+MI300A it ties the gluon sigmoid router at M=1/16 (48.0 vs 47.6, 42.1 vs
+42.1 µs) and loses only 1.45× at M=8 (68.5 vs 47.4 µs) — a few µs at one
+decode width, with the gluon kernel capped at M·topk ≤ 128 anyway. The
+existing kernel is adequate; the gluon router stays available through
+``tokenspeed_amd.routing`` for shapes where it wins. (The eager chain's
+~140 µs comparison from the routing bench stands — both fused kernels
+beat it ~3×.)
+
+## Replay variant: parity landed (the KDA family is now fully verified)
+
+``launch_gluon_kda_fused_replay_gfx950`` parity-verified on MI300A (jobs
+675705/675706): multi-layer/multi-group (2 layers, 2 page-index groups),
+mixed accepted lengths (1/2/4 of draft 4), conv + state pools both
+matching the eager oracle. The uint64 descriptor packing: ``0``=mixed_qkv,
+``1``=conv_weights, ``2``=conv_pool, ``5``=beta_logits, ``6``=a_log,
+``7``=dt_bias, ``8``=state_pool, ``9``=raw_g; ``read/write_indices
+[groups, batch]`` hold ABSOLUTE page ids (the group pointer-advance
+selects the row — do not pre-add the group base); the launcher REQUIRES a
+real ``lower_bound`` float (HAS_LOWER_BOUND hard-codes True) and
+``conv_stride`` must be the conv POOL page stride, not the weights'.
+Two red herrings chased and disproven along the way (both were test-data
+bugs): an alleged stock-triton pointer-reassignment drop (a speculative
+load-site adaptation was applied, disproven, and reverted — kernel stays
+verbatim) and an alleged multi-group breakage (wrong index semantics).
+Full suite on the self-service container: **49/49** tokenspeed_amd + MLA
+tests (decode, verify, replay, mHC, DSA, routing, sorting, hadamard,
+argmax).
+
+## Replay-variant notes (superseded by the section above)
+
+``launch_gluon_kda_fused_replay_gfx950`` packs raw device pointers into a
+``[layers, 10]`` uint64 tensor; the kernel casts them back per layer:
+``0``=mixed_qkv(bf16), ``1``=conv_weights(bf16), ``2``=conv_pool(bf16),
+``5``=beta_logits(bf16), ``6``=a_log(fp32), ``7``=dt_bias(fp32),
+``8``=state_pool(fp32), ``9``=raw_g(bf16) (``3``/``4`` unused by the
+kernel body). ``group_indices[layer]`` selects the page-index group
+(``read/write_indices [groups, batch]`` shifted by ``group * batch``).
+Semantics: per layer, replay the accepted prefix
+(``accepted_length[seq]`` tokens): in-register conv advance with the
+final window + conv pool stored to the write page, chained recurrence
+with per-token raw-g decay, and the recurrent state stored only at the
+accepted boundary (``replay_steps == token_offset + 1``). Parity test
+needs this descriptor construction from ``data_ptr()`` — next unit.
+
+## Self-service triton-3.8 container (no CSCS ticket needed for dev)
+
+Instead of waiting on the env bump, we repacked the container ourselves:
+`floe-beverin.sqsh` (the glm5-smoke base, a local pyxis EDF squashfs we
+own) → unsquashfs → swap `site-packages/triton` 3.4→3.8 (the proven
+rocm7.0 nightly wheel) → mksquashfs → `floe-beverin-triton38.sqsh`
+(18 GB; env toml `tokenspeed-triton38.toml`). Verified on an MI300A node
+(job 675575): boots, triton 3.8 default, gluon amd/cdna3/cdna4 present,
+aiter intact, **32/32 tokenspeed_amd tests pass with no PYTHONPATH
+tricks**. The CSCS request (`infra-request-triton38.md`) is now only
+about the *production serving* image adopting triton ≥ 3.8.
+
+### KDA fused decode: parity + bench (bucket-2 first kernel landed)
+
+`kda/decode.py` parity landed: an eager fp32 oracle mirrors the kernel's
+exact op order (silu conv on bf16-moved history, bf16-rounded low-rank
+decay gate, delta rule on L2-normalized q/k with V-major state, gated
+RMSNorm output, padding/negative-index semantics) — output, conv-state
+and state-pool all match on MI300A (first run, `results-kda.json`, jobs
+675578/675583). Bench (wrapper-inclusive end-to-end timings, both sides
+carry comparable python validation overhead):
+
+| batch | gluon fused (conv+gate+recur+norm) | vllm_kda_amd packed (gate+recur only) |
+|---:|---:|---:|
+| 1 | 78.6 µs | 75.1 µs |
+| 4 | 75.6 µs | 74.0 µs |
+| 8 | 76.3 µs | 74.2 µs |
+| 16 | 79.7 µs | 77.3 µs |
+| 32 | 89.8 µs | 89.3 µs |
+| 64 | 111.2 µs | 99.0 µs |
+
+**Verdict: the fusion is nearly free** — the gluon kernel adds the conv
+update and the gated-RMSNorm output on top of the packed decode's scope
+for ~1.5% at decode batches ≤ 32 (12% at 64), removing two kernel
+launches and their intermediate traffic from the serving path. All
+beverin runs in this section use the self-service triton-3.8 container.
+
+### DSA sparse-MLA top-k vendored (bucket-2 second unit, jobs 675593/675604)
+
+Vendored ``dsa/indexing.py`` (packed-FP8 scoring) and ``dsa/sparse_mla.py``
+(radix top-k + launchers) as ``dsa_indexing.py`` / ``dsa_sparse_mla.py``
+with the CDNA3-first buffer-op binding. The upstream
+``standard_cache_logits`` kernels are **not** vendored — they need CDNA4
+MFMA v4 layouts + ``cdna4.async_copy`` with no CDNA3 equivalent; the
+module aliases raise a clear error (tested). Verified on MI300A (4/4
+tests): logical radix top-k parity vs ``torch.topk`` (selection sets,
+window bounds, -1 padding, empty/short rows) plus a packed-FP8 decode
+top-k compile/run smoke through the vendored indexing kernel.
+
+Bench (fp32 logits, topk=2048, cols=16384):
+
+| rows | gluon radix | torch.topk | speedup |
+|---:|---:|---:|---:|
+| 64 | 57.4 µs | 115.0 µs | 2.0× |
+| 512 | 75.8 µs | 258.2 µs | 3.4× |
+| 4096 | 272.8 µs | 1059.7 µs | 3.9× |
+
+## Artifacts
+
+- `results-triton38.json` — first full run (job 675351)
+- `results-triton38-v3.json` — post-tuning run incl. mhc chain (job 675506)
+- `results-mha.json` / `results-mla-decode.json` — attention-port benches
+  (jobs 675835+ / 676367, beverin staging dir)
+- `sweep-gfx942.json` — routing/argmax config sweeps (job 675500)
+- `results-triton38-partial.json` — pre-fix triton-3.8 run (provenance)
+- `results-stock-triton34.json` — stock env: gluon kernels feature-blocked
+- `infra-request-triton38.md` — ready-to-send CSCS request (user to send)
+- Repro: `bench/bench_tokenspeed_amd_bucket1.py`,
+  `bench/sweep_tokenspeed_amd_gfx942.py` in-tree; sbatch scripts in the
+  beverin staging dir (`bench-bucket1*.sbatch`, `tune-t38.sbatch`,
+  `full-suite-t38.sbatch`).
+
+## Follow-ups (remaining)
+
+- **Attention family perf track**: load re-pipelining of the
+  synchronous-load collapse (the nine ports are parity-first cuts), the
+  aiter flash-attention comparisons on the prefill/extend side, and
+  per-regime tile retunes (mla decode's bh16bn64 ceiling at batch 32 is
+  a regime limit, not a pipeline one).
+- **FP8 KV**: needs dot-scaled MFMA — CDNA4-only; the ported launchers
+  reject fp8 with clear errors by design.
+- **Send `infra-request-triton38.md`** to CSCS — everything gluon is gated
+  on it reaching a production env.
+- Triton-MLA prefill numerics on gfx942 (the xfail above): try
+  `input_precision="ieee"` on the bare bf16 `tl.dot`s and M-tiling ≥ 16.
+- KDA fused-decode parity vs `glm_kda_fused_decode_reference` (input
+  conversion), then bench vs our CUDA/vllm KDA decode paths; then
+  `dsa/sparse_mla`.
+- The `_CDNA4_NUM_CUS = 256` persistent-grid sizing in `kda_decode.py`
+  (MI300A has 228 CUs) — retune when profiling that kernel.
+- Sorting stays behind aiter on gfx942 except huge-prefill shapes; the
+  packed-id + weights contract differs from aiter's, so a consumer switch
+  is not drop-in.
+- Buckets 2/3 of the borrowing plan continue per
+  `docs/borrowing-tokenspeed-deepgemm.md`.

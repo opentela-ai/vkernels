@@ -1,0 +1,303 @@
+{
+  "env": {
+    "torch": "2.9.0a0+git7bcbafe",
+    "hip": "7.0.51831-a3e329ad8",
+    "device": "AMD Instinct MI300A",
+    "capability": [
+      9,
+      4
+    ],
+    "triton": "3.8.0",
+    "gluon": true,
+    "gluon_amd_cdna4": true,
+    "gluon_features": {
+      "gluon": true,
+      "constexpr_function": true,
+      "associative_scan": true,
+      "amd_cdna4": true
+    },
+    "aiter": true
+  },
+  "date": "2026-10-10T04:40:24",
+  "results": [
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 1,
+        "E": 128,
+        "topk": 16
+      },
+      "gluon": {
+        "us_median": 47.76,
+        "us_p10": 46.16,
+        "us_p90": 54.88
+      },
+      "torch": {
+        "us_median": 135.14,
+        "us_p10": 131.32,
+        "us_p90": 161.68
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 1,
+        "E": 384,
+        "topk": 16
+      },
+      "gluon": {
+        "us_median": 45.8,
+        "us_p10": 44.68,
+        "us_p90": 51.92
+      },
+      "torch": {
+        "us_median": 134.6,
+        "us_p10": 131.64,
+        "us_p90": 152.64
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 8,
+        "E": 256,
+        "topk": 16
+      },
+      "gluon": {
+        "us_median": 46.3,
+        "us_p10": 44.88,
+        "us_p90": 50.4
+      },
+      "torch": {
+        "us_median": 133.06,
+        "us_p10": 131.32,
+        "us_p90": 141.68
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 16,
+        "E": 128,
+        "topk": 8
+      },
+      "gluon": {
+        "us_median": 45.84,
+        "us_p10": 44.4,
+        "us_p90": 110.96
+      },
+      "torch": {
+        "us_median": 135.24,
+        "us_p10": 132.8,
+        "us_p90": 151.6
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 64,
+        "E": 384,
+        "topk": 2
+      },
+      "gluon": {
+        "us_median": 53.58,
+        "us_p10": 51.68,
+        "us_p90": 59.44
+      },
+      "torch": {
+        "us_median": 134.54,
+        "us_p10": 131.72,
+        "us_p90": 139.08
+      }
+    },
+    {
+      "op": "sorting",
+      "error": "AssertionError(0)"
+    },
+    {
+      "op": "hadamard_128",
+      "shape": {
+        "rows": 4096
+      },
+      "gluon": {
+        "us_median": 32.78,
+        "us_p10": 31.16,
+        "us_p90": 39.32
+      },
+      "torch_matmul_fp32": {
+        "us_median": 686392.73,
+        "us_p10": 682461.73,
+        "us_p90": 690071.11
+      },
+      "effective_GBps": 64.0
+    },
+    {
+      "op": "hadamard_128",
+      "shape": {
+        "rows": 32768
+      },
+      "gluon": {
+        "us_median": 49.98,
+        "us_p10": 41.96,
+        "us_p90": 57.12
+      },
+      "torch_matmul_fp32": {
+        "us_median": 670277.44,
+        "us_p10": 667917.48,
+        "us_p90": 674279.66
+      },
+      "effective_GBps": 335.7
+    },
+    {
+      "op": "hadamard_128",
+      "shape": {
+        "rows": 262144
+      },
+      "gluon": {
+        "us_median": 161.46,
+        "us_p10": 157.2,
+        "us_p90": 177.16
+      },
+      "torch_matmul_fp32": {
+        "us_median": 672132.72,
+        "us_p10": 669480.41,
+        "us_p90": 676851.75
+      },
+      "effective_GBps": 831.3
+    },
+    {
+      "op": "mhc_pre_reduce_apply",
+      "shape": {
+        "tokens": 1,
+        "hidden": 4096,
+        "splits": 64
+      },
+      "gluon": {
+        "us_median": 47.86,
+        "us_p10": 46.0,
+        "us_p90": 101.96
+      },
+      "torch_ref": {
+        "us_median": 1494.93,
+        "us_p10": 1460.41,
+        "us_p90": 1542.25
+      }
+    },
+    {
+      "op": "mhc_pre_reduce_apply",
+      "shape": {
+        "tokens": 8,
+        "hidden": 4096,
+        "splits": 64
+      },
+      "gluon": {
+        "us_median": 47.36,
+        "us_p10": 46.12,
+        "us_p90": 51.16
+      },
+      "torch_ref": {
+        "us_median": 1507.41,
+        "us_p10": 1468.29,
+        "us_p90": 1552.37
+      }
+    },
+    {
+      "op": "mhc_pre_reduce_apply",
+      "shape": {
+        "tokens": 64,
+        "hidden": 4096,
+        "splits": 64
+      },
+      "gluon": {
+        "us_median": 44.42,
+        "us_p10": 43.08,
+        "us_p90": 51.52
+      },
+      "torch_ref": {
+        "us_median": 1436.57,
+        "us_p10": 1410.61,
+        "us_p90": 1477.81
+      }
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 1,
+        "N": 32768
+      },
+      "torch": {
+        "us_median": 28.26,
+        "us_p10": 22.28,
+        "us_p90": 36.84
+      },
+      "gluon": {
+        "us_median": 50.98,
+        "us_p10": 48.8,
+        "us_p90": 62.88
+      }
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 8,
+        "N": 131072
+      },
+      "torch": {
+        "us_median": 45.22,
+        "us_p10": 44.12,
+        "us_p90": 54.92
+      },
+      "gluon": {
+        "us_median": 55.4,
+        "us_p10": 47.8,
+        "us_p90": 60.2
+      }
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 64,
+        "N": 151936
+      },
+      "torch": {
+        "us_median": 55.7,
+        "us_p10": 53.68,
+        "us_p90": 66.36
+      },
+      "gluon": {
+        "us_median": 109.3,
+        "us_p10": 101.44,
+        "us_p90": 130.88
+      }
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 8,
+        "N": 262144
+      },
+      "torch": {
+        "us_median": 104.98,
+        "us_p10": 102.56,
+        "us_p90": 114.76
+      },
+      "gluon": {
+        "us_median": 54.14,
+        "us_p10": 50.08,
+        "us_p90": 63.32
+      }
+    },
+    {
+      "op": "scale_swizzle_cdna4 (host/torch)",
+      "shape": {
+        "rows": 368640,
+        "k_scale": 90
+      },
+      "torch": {
+        "us_median": 936.32,
+        "us_p10": 932.12,
+        "us_p90": 964.81
+      }
+    }
+  ]
+}
