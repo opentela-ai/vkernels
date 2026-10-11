@@ -132,6 +132,27 @@ bool gemv_decode_fp8_splitk(std::size_t M, std::size_t N, std::size_t K,
                             float beta, uint16_t* C, int S, int tb,
                             int threads);
 
+// Decode-GEMV v2 entries (issue #156 follow-up): fixed TB=8 exact uint4
+// weight tiles (v1 tb=4 fetched 16 B per thread but consumed 8 B), KK-way
+// multi-K register blocking, and optional global-memory A reads
+// (a_gmem=true: no LDS stage / barrier; the split's A slice is
+// L1-resident). bf16 keeps the exact v1 numerics contract. The fp8 variant
+// applies the (128-K x 8-N) block scales DEFERRED (raw fnuz codes
+// accumulated unscaled, scale applied once per block) -- a new contract
+// without the per-element bf16 rounding, validated against an exact
+// deferred oracle. kk in {2, 4, 8}; threads 64/128/256; returns false
+// (C untouched) for N % 8 != 0, M outside [1, 8], or other unsupported
+// configs.
+bool gemv_decode_bf16_splitk_v2(std::size_t M, std::size_t N, std::size_t K,
+                                float alpha, const uint16_t* A,
+                                const uint16_t* B, float beta, uint16_t* C,
+                                int S, int threads, int kk, bool a_gmem);
+bool gemv_decode_fp8_splitk_v2(std::size_t M, std::size_t N, std::size_t K,
+                               float alpha, const uint16_t* A,
+                               const uint8_t* W8, const float* scales,
+                               float beta, uint16_t* C, int S, int threads,
+                               int kk, bool a_gmem);
+
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP
 

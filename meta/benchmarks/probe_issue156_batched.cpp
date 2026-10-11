@@ -542,6 +542,180 @@ int main(int argc, char** argv) {
       CK(hipFree(dC)); CK(hipFree(dCref));
     }
   }
+  // ------------------------------------------------------------------
+  // V2 phase (issue #156 follow-up): structural rewrite of the decode
+  // GEMV -- fixed TB=8 exact uint4 weight tiles (v1 tb=4 fetched 16 B per
+  // thread but consumed 8 B, so every B byte was requested 4x), KK-way
+  // multi-K register blocking, optional global-memory A reads (no LDS
+  // stage / barrier), and a DEFERRED-scale fp8 variant (raw fnuz codes
+  // accumulated unscaled in the value*2^-119 domain, block scale applied
+  // once per (128-K x 8-N) block -- removes the per-element bf16
+  // rounding). Sweep (kk, a_gmem, threads, S) on the issue shapes; per
+  // row: batched checksum + CPU-oracle gates (bf16: 2e-2 vs the bf16
+  // oracle; fp8: 1e-3 vs the exact deferred oracle AND 2e-2 vs the
+  // bf16-rounded dequant oracle).
+  // ------------------------------------------------------------------
+  if (phase == "v2") {
+    for (const auto& sh : shapes) {
+      const int N = sh.N, K = sh.K;
+      const int n_s8 = (N + 7) / 8, k_b = (K + 127) / 128;
+      std::vector<uint16_t> A((size_t)M * K), B((size_t)K * N);
+      for (size_t i = 0; i < A.size(); ++i) A[i] = f2bf_host(rnd(1, (int)i) * 0.5f);
+      for (size_t i = 0; i < B.size(); ++i) B[i] = f2bf_host(rnd(2, (int)i) * 0.5f);
+      // fp8 quantization (same blocks/encoder as the other phases)
+      std::vector<float> scales((size_t)n_s8 * k_b);
+      std::vector<uint8_t> W8((size_t)K * N);
+      for (int kb = 0; kb < k_b; ++kb)
+        for (int nb = 0; nb < n_s8; ++nb) {
+          float amax = 0;
+          for (int kk = 0; kk < 128; ++kk) {
+            const int k = kb * 128 + kk;
+            if (k >= K) break;
+            for (int nn = 0; nn < 8; ++nn) {
+              const int n = nb * 8 + nn;
+              if (n >= N) break;
+              amax = std::fmax(amax, std::fabs(bf16_host_to_f32(B[(size_t)k * N + n])));
+            }
+          }
+          const float scale = amax / 240.0f;
+          scales[(size_t)kb * n_s8 + nb] = scale;
+          for (int kk = 0; kk < 128; ++kk) {
+            const int k = kb * 128 + kk;
+            if (k >= K) break;
+            for (int nn = 0; nn < 8; ++nn) {
+              const int n = nb * 8 + nn;
+              if (n >= N) break;
+              W8[(size_t)k * N + n] = fnuz_enc(
+                  bf16_host_to_f32(B[(size_t)k * N + n]) / scale);
+            }
+          }
+        }
+      // Oracles:
+      //  Cref : bf16 weights, fp32-accum CPU gemm (bf16 path reference)
+      //  Crefq: bf16-ROUNDED dequantized weights (v1/MFMA fp8 contract)
+      //  Cdef : EXACT deferred-scale math in fp64 (fp8 v2 reference)
+      std::vector<double> Af((size_t)M * K);
+      for (size_t i = 0; i < A.size(); ++i) Af[i] = bf16_host_to_f32(A[i]);
+      std::vector<uint16_t> Cref((size_t)M * N, 0), Crefq((size_t)M * N, 0),
+          Cdef((size_t)M * N, 0);
+      vkernels::kernels::gemm_bf16_cpu((size_t)M, (size_t)N, (size_t)K,
+                                       1.0f, A.data(), B.data(), 0.0f,
+                                       Cref.data());
+      {
+        std::vector<uint16_t> Bdq((size_t)K * N);
+        for (int k = 0; k < K; ++k)
+          for (int n = 0; n < N; ++n)
+            Bdq[(size_t)k * N + n] = f2bf_host(
+                fnuz_dec(W8[(size_t)k * N + n]) *
+                scales[(size_t)(k / 128) * n_s8 + (n / 8)]);
+        vkernels::kernels::gemm_bf16_cpu((size_t)M, (size_t)N, (size_t)K,
+                                         1.0f, A.data(), Bdq.data(), 0.0f,
+                                         Crefq.data());
+      }
+      for (int m = 0; m < M; ++m)
+        for (int n = 0; n < N; ++n) {
+          double c = 0;
+          for (int kb = 0; kb < k_b; ++kb) {
+            double blk = 0;
+            const int khi = std::min(K, (kb + 1) * 128);
+            for (int k = kb * 128; k < khi; ++k)
+              blk += (double)fnuz_dec(W8[(size_t)k * N + n]) * Af[(size_t)m * K + k];
+            c += (double)scales[(size_t)kb * n_s8 + (n / 8)] * blk;
+          }
+          Cdef[(size_t)m * N + n] = f2bf_host((float)c);
+        }
+
+      uint16_t *dA, *dB, *dW8, *dC;
+      float* dS;
+      CK(hipMalloc(&dA, A.size() * 2));
+      CK(hipMalloc(&dB, B.size() * 2));
+      CK(hipMalloc(&dW8, W8.size()));
+      CK(hipMalloc(&dS, scales.size() * 4));
+      CK(hipMalloc(&dC, Cref.size() * 2));
+      CK(hipMemcpy(dA, A.data(), A.size() * 2, hipMemcpyHostToDevice));
+      CK(hipMemcpy(dB, B.data(), B.size() * 2, hipMemcpyHostToDevice));
+      CK(hipMemcpy(dW8, W8.data(), W8.size(), hipMemcpyHostToDevice));
+      CK(hipMemcpy(dS, scales.data(), scales.size() * 4, hipMemcpyHostToDevice));
+
+      struct V2Cfg { int S, th, kk, gm; };
+      const V2Cfg bcfgs[] = {
+          {32, 64, 2, 0}, {32, 64, 4, 0}, {32, 64, 8, 0},
+          {64, 64, 2, 0}, {64, 64, 4, 0}, {64, 64, 8, 0},
+          {96, 64, 4, 0},
+          {32, 256, 4, 0}, {64, 256, 4, 0}, {32, 256, 8, 0},
+          {64, 256, 8, 0},
+          {32, 64, 4, 1}, {64, 64, 4, 1}, {64, 64, 8, 1},
+          {32, 256, 4, 1}, {64, 256, 4, 1}, {64, 256, 8, 1},
+          {96, 64, 4, 1}, {128, 64, 4, 0}, {128, 64, 4, 1}};
+      const V2Cfg fcfgs[] = {
+          {32, 64, 2, 0}, {32, 64, 4, 0}, {64, 64, 2, 0}, {64, 64, 4, 0},
+          {32, 256, 4, 0}, {64, 256, 4, 0},
+          {32, 64, 4, 1}, {64, 64, 4, 1},
+          {32, 256, 4, 1}, {64, 256, 4, 1}, {96, 64, 4, 0}};
+
+      for (int variant = 0; variant < 2; ++variant) {
+        const bool fp8v = variant == 1;
+        const double bytes = fp8v
+            ? (double)K * N + (double)n_s8 * k_b * 4 +
+                  2.0 * ((double)M * K + (double)M * N)
+            : 2.0 * ((double)K * N + (double)M * K + (double)M * N);
+        std::printf(" -- v2-%s shape N=%d K=%d M=%d --\n",
+                    fp8v ? "fp8-deferred" : "bf16", N, K, M);
+        const V2Cfg* cfgs = fp8v ? fcfgs : bcfgs;
+        const int ncfgs = fp8v ? (int)(sizeof(fcfgs) / sizeof(fcfgs[0]))
+                               : (int)(sizeof(bcfgs) / sizeof(bcfgs[0]));
+        for (int ci = 0; ci < ncfgs; ++ci) {
+          const V2Cfg& gc = cfgs[ci];
+          if (gc.S > K) continue;
+          CK(hipMemset(dC, 0, Cref.size() * 2));
+          auto L = [&] {
+            if (fp8v)
+              vkernels::kernels::hip::gemv_decode_fp8_splitk_v2(
+                  (size_t)M, (size_t)N, (size_t)K, 1.0f, dA, dW8, dS, 0.0f,
+                  dC, gc.S, gc.th, gc.kk, gc.gm != 0);
+            else
+              vkernels::kernels::hip::gemv_decode_bf16_splitk_v2(
+                  (size_t)M, (size_t)N, (size_t)K, 1.0f, dA, dB, 0.0f,
+                  dC, gc.S, gc.th, gc.kk, gc.gm != 0);
+          };
+          char tag[160];
+          std::snprintf(tag, sizeof tag,
+                        "v2-%s S=%d th=%d kk=%d gm=%d N=%d",
+                        fp8v ? "fp8d" : "bf16", gc.S, gc.th, gc.kk, gc.gm, N);
+          double us = batched(tag, 4, 1000, L, dC, Cref.size());
+          std::printf("      -> %.0f GB/s (bytes model %.3g MB)\n",
+                      bytes / (us / 1e6) / 1e9, bytes / 1e6);
+          std::vector<uint16_t> got(Cref.size());
+          CK(hipMemcpy(got.data(), dC, got.size() * 2, hipMemcpyDeviceToHost));
+          double rel_main = 0, rel_rounded = 0;
+          const std::vector<uint16_t>& ref_main = fp8v ? Cdef : Cref;
+          const double tol_main = fp8v ? 1e-3 : 2e-2;
+          for (size_t i = 0; i < got.size(); ++i) {
+            float g = bf16_host_to_f32(got[i]);
+            float r = bf16_host_to_f32(ref_main[i]);
+            double rel = std::fabs(g - r) / std::fmax(1e-3, std::fabs(r));
+            if (rel > rel_main) rel_main = rel;
+            if (fp8v) {
+              float rq = bf16_host_to_f32(Crefq[i]);
+              double relq = std::fabs(g - rq) / std::fmax(1e-3, std::fabs(rq));
+              if (relq > rel_rounded) rel_rounded = relq;
+            }
+          }
+          if (fp8v)
+            std::printf("      -> vs-deferred-oracle max_rel=%.3g  "
+                        "vs-rounded-oracle max_rel=%.3g  %s\n",
+                        rel_main, rel_rounded,
+                        (rel_main < tol_main && rel_rounded < 2e-2) ? "PASS"
+                                                                    : "FAIL");
+          else
+            std::printf("      -> cpu max_rel=%.3g %s\n", rel_main,
+                        rel_main < tol_main ? "PASS" : "FAIL");
+        }
+      }
+      CK(hipFree(dA)); CK(hipFree(dB)); CK(hipFree(dW8)); CK(hipFree(dS));
+      CK(hipFree(dC));
+    }
+  }
   std::printf("=== probe done ===\n");
   return 0;
 }
