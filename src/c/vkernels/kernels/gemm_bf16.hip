@@ -894,15 +894,14 @@ __global__ void gemv_decode_fp8_splitk_kernel(
 //   * Optional A path (AGMEM): A[m][k] read straight from global memory
 //     (uniform across threads, L1-resident -- the split slice is only
 //     M*kl*2 bytes), removing the LDS stage and its __syncthreads.
-//   * The fp8 variant uses DEFERRED block scales: raw fnuz codes are
-//     accumulated UNscaled (in the uniform value*2^-119 domain of the
-//     branchless bit decode) and each (128-K x 8-N) block scale is applied
-//     ONCE at the block boundary, folded with the 2^119 decode-domain
-//     factor (sc * 0x1p119f), cancelling the bit-decode offset exactly. This removes the per-element f2bf bf16
-//     rounding of the v1/MFMA contract, so it is a NEW numerics contract
-//     (validated against an exact deferred oracle and within tolerance of
-//     the bf16-rounded dequant oracle); the v1 per-element-rounded path is
-//     kept unchanged for compatibility.
+//   * The fp8 variant keeps the v1/MFMA per-element-rounded numerics
+//     contract (w = bf16(f2bf(sc*0x1p119 * raw)), bit-exact vs the
+//     dequant oracle). A deferred-scale variant (raw codes accumulated
+//     unscaled, block scale applied at the boundary) was measured on
+//     MI300A and REJECTED: the second M*8 accumulator bank pushed VGPR
+//     pressure past the spill threshold and ran ~5-6x SLOWER than the
+//     bf16 v2 kernel, and its divergent contract failed the
+//     bf16-rounded-oracle cross-check at small-magnitude outputs.
 template <int M, int KK, bool AGMEM>
 __global__ void gemv_decode_bf16_v2_kernel(const uint16_t* __restrict__ A,
                                            const uint16_t* __restrict__ B,
@@ -1002,9 +1001,11 @@ __global__ void gemv_decode_bf16_v2_kernel(const uint16_t* __restrict__ A,
   }
 }
 
-// Deferred-scale block-FP8 variant of the v2 GEMV (new contract, see the
-// block comment above). 128 % KK == 0 for KK in {2, 4, 8}, so a scale-block
-// boundary can only coincide with a KK-group start: one check per group.
+// Per-element-rounded block-FP8 variant of the v2 GEMV (same numerics
+// contract as v1/MFMA, see the block comment above). 128 % KK == 0 for
+// KK in {2, 4, 8}, so a scale-block boundary can only coincide with a
+// KK-group start: one scale reload per group. Single accumulator bank --
+// VGPR profile identical to the bf16 v2 kernel.
 template <int M, int KK, bool AGMEM>
 __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
                                           const uint8_t* __restrict__ W8,
@@ -1030,31 +1031,19 @@ __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
   }
 
   const int c0 = (blockIdx.x * blockDim.x + tid) * 8;
-  float acc[M][8], blk[M][8];
+  float acc[M][8];
 #pragma unroll
   for (int m = 0; m < M; ++m)
 #pragma unroll
-    for (int t = 0; t < 8; ++t) {
-      acc[m][t] = 0.0f;
-      blk[m][t] = 0.0f;
-    }
+    for (int t = 0; t < 8; ++t) acc[m][t] = 0.0f;
 
   if (c0 + 8 <= N) {
     const int colb = c0 >> 3;  // thread's 8 columns = one scale n-block
-    float sc = scales[(size_t)(k0 >> 7) * n_s8 + colb];
+    float sc = scales[(size_t)(k0 >> 7) * n_s8 + colb] * 0x1p119f;
     int k = 0;
     for (; k + KK <= kl; k += KK) {
-      if (k > 0 && ((k0 + k) & 127) == 0) {
-        // Block boundary: apply the PREVIOUS block's scale, reset, reload.
-#pragma unroll
-        for (int m = 0; m < M; ++m)
-#pragma unroll
-          for (int t = 0; t < 8; ++t) {
-            acc[m][t] = fmaf(blk[m][t], sc * 0x1p119f, acc[m][t]);
-            blk[m][t] = 0.0f;
-          }
-        sc = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb];
-      }
+      if (k > 0 && ((k0 + k) & 127) == 0)
+        sc = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb] * 0x1p119f;
       uint4 v[KK];
 #pragma unroll
       for (int i = 0; i < KK; ++i)
@@ -1072,25 +1061,17 @@ __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
 #pragma unroll
         for (int t = 0; t < 8; ++t) {
           const uint32_t b = (vc[t >> 2] >> (8 * (t & 3))) & 0xFFu;
-          const float raw =
-              __uint_as_float(((b & 0x80u) << 24) | ((b & 0x7Fu) << 20));
+          const float w = bf16_to_f32(
+              f2bf(sc * __uint_as_float(((b & 0x80u) << 24) |
+                                        ((b & 0x7Fu) << 20))));
 #pragma unroll
-          for (int m = 0; m < M; ++m)
-            blk[m][t] = fmaf(raw, a[i][m], blk[m][t]);
+          for (int m = 0; m < M; ++m) acc[m][t] = fmaf(w, a[i][m], acc[m][t]);
         }
       }
     }
     for (; k < kl; ++k) {
-      if (k > 0 && ((k0 + k) & 127) == 0) {
-#pragma unroll
-        for (int m = 0; m < M; ++m)
-#pragma unroll
-          for (int t = 0; t < 8; ++t) {
-            acc[m][t] = fmaf(blk[m][t], sc * 0x1p119f, acc[m][t]);
-            blk[m][t] = 0.0f;
-          }
-        sc = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb];
-      }
+      if (k > 0 && ((k0 + k) & 127) == 0)
+        sc = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb] * 0x1p119f;
       const uint4 v = *(const uint4*)(&W8[(size_t)(k0 + k) * N + c0]);
       const uint32_t* vc = (const uint32_t*)(&v);
       float a[M];
@@ -1101,32 +1082,22 @@ __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
 #pragma unroll
       for (int t = 0; t < 8; ++t) {
         const uint32_t b = (vc[t >> 2] >> (8 * (t & 3))) & 0xFFu;
-        const float raw =
-            __uint_as_float(((b & 0x80u) << 24) | ((b & 0x7Fu) << 20));
+        const float w = bf16_to_f32(
+            f2bf(sc * __uint_as_float(((b & 0x80u) << 24) |
+                                      ((b & 0x7Fu) << 20))));
 #pragma unroll
-        for (int m = 0; m < M; ++m) blk[m][t] = fmaf(raw, a[m], blk[m][t]);
+        for (int m = 0; m < M; ++m) acc[m][t] = fmaf(w, a[m], acc[m][t]);
       }
     }
-#pragma unroll
-    for (int m = 0; m < M; ++m)
-#pragma unroll
-      for (int t = 0; t < 8; ++t) acc[m][t] = fmaf(blk[m][t], sc * 0x1p119f, acc[m][t]);
   } else {
-    // Rare partial-column tail: same deferred math, scalar loads. c0 is
-    // 8-aligned so the <=7 live columns all sit in ONE scale n-block.
+    // Rare partial-column tail: same per-element-rounded math, scalar
+    // loads. c0 is 8-aligned so the <=7 live columns all sit in ONE
+    // scale n-block.
     const int cmax = (c0 < N) ? (N - c0) : 0;
     const int colb = c0 >> 3;
-    float scb = scales[(size_t)(k0 >> 7) * n_s8 + colb];
     for (int k = 0; k < kl; ++k) {
-      if (k > 0 && ((k0 + k) & 127) == 0) {
-#pragma unroll
-        for (int m = 0; m < M; ++m)
-          for (int t = 0; t < cmax; ++t) {
-            acc[m][t] = fmaf(blk[m][t], scb * 0x1p119f, acc[m][t]);
-            blk[m][t] = 0.0f;
-          }
-        scb = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb];
-      }
+      const float sc =
+          scales[(size_t)((k0 + k) >> 7) * n_s8 + colb] * 0x1p119f;
       float a[M];
 #pragma unroll
       for (int m = 0; m < M; ++m)
@@ -1134,15 +1105,13 @@ __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
                                  : sA[m * klp + k]);
       for (int t = 0; t < cmax; ++t) {
         const uint32_t b = W8[(size_t)(k0 + k) * N + c0 + t];
-        const float raw =
-            __uint_as_float(((b & 0x80u) << 24) | ((b & 0x7Fu) << 20));
+        const float w = bf16_to_f32(
+            f2bf(sc * __uint_as_float(((b & 0x80u) << 24) |
+                                      ((b & 0x7Fu) << 20))));
 #pragma unroll
-        for (int m = 0; m < M; ++m) blk[m][t] = fmaf(raw, a[m], blk[m][t]);
+        for (int m = 0; m < M; ++m) acc[m][t] = fmaf(w, a[m], acc[m][t]);
       }
     }
-#pragma unroll
-    for (int m = 0; m < M; ++m)
-      for (int t = 0; t < cmax; ++t) acc[m][t] = fmaf(blk[m][t], scb * 0x1p119f, acc[m][t]);
   }
 
   float* plane = P + (size_t)s * M * N;

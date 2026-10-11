@@ -743,10 +743,11 @@ int main() {
   // --- (6b) decode-GEMV v2 (issue #156 follow-up) -------------------------
   // Fixed TB=8 exact-uint4 weight tiles + KK-way multi-K register blocking
   // + optional global-memory A reads. bf16 keeps the v1 numerics contract
-  // (oracle = gemm_bf16_cpu on B). The fp8 variant is the DEFERRED-scale
-  // contract: raw fnuz codes accumulated unscaled, block scale applied
-  // once per (128-K x 8-N) block -- oracle here is the EXACT deferred
-  // math in fp64 (tight gate), NOT the bf16-rounded dequant oracle.
+  // (oracle = gemm_bf16_cpu on B). The fp8 variant keeps the v1
+  // per-element-rounded contract (oracle = gemm_bf16_cpu on the bf16
+  // ROUNDED dequantized weights, same as the v1 section above). A
+  // deferred-scale variant was measured on MI300A and rejected for
+  // register-pressure spills (~5-6x slower) -- see NOTES-156.md.
   {
     struct Case { int M, N, K, S, kk, th; float beta; bool fp8, gm;
                   const char* what; };
@@ -758,10 +759,11 @@ int main() {
         {2,  128, 257, 32, 4, 64, 0.0f, false, false, "odd K=257 (tail)"},
         {1,  896, 7168, 96, 2, 64, 0.0f, false, true,  "M=1 a_gmem S=96"},
         {8,  896, 7168, 64, 8, 128, 0.0f, false, false, "M=8 kk=8"},
-        {5, 6288, 7168, 32, 4, 256, 0.0f, true,  false, "fp8 deferred kk=4"},
-        {5, 3584, 7168, 33, 2, 128, 0.5f, true,  true,  "fp8 deferred a_gmem beta!=0"},
+        {5, 6288, 7168, 32, 4, 256, 0.0f, true,  false, "fp8 kk=4"},
+        {5, 3584, 7168, 33, 2, 128, 0.5f, true,  true,  "fp8 a_gmem beta!=0"},
         {2,  128, 256, 3, 4, 64, 0.0f, true,  false, "fp8 tiny odd S=3 (splits span blocks)"},
-        {5, 6288, 7168, 64, 8, 64, 0.0f, true,  false, "fp8 deferred kk=8 S=64"},
+        {5, 6288, 7168, 64, 8, 64, 0.0f, true,  false, "fp8 kk=8 S=64"},
+        {1,  896, 7168, 96, 2, 64, 0.0f, true,  true,  "fp8 M=1 a_gmem S=96"},
     };
     std::printf("\n--- decode-GEMV v2 (gemv_decode_*_splitk_v2) ---\n");
     for (const auto& c : cases) {
@@ -772,12 +774,6 @@ int main() {
       for (size_t i = 0; i < C.size(); ++i) C[i] = f2bf(rnd(9, (int)i) * 0.3f);
       std::vector<uint16_t> rC(C);
       uint8_t* dW8 = nullptr; float* dS = nullptr; uint16_t* dB = nullptr;
-      std::vector<double> Af((size_t)c.M * c.K);
-      for (size_t i = 0; i < A.size(); ++i) {
-        uint32_t u = (uint32_t)A[i] << 16;
-        float f; std::memcpy(&f, &u, 4);
-        Af[i] = (double)f;
-      }
       if (c.fp8) {
         std::vector<float> scales((size_t)n_s8 * k_b);
         std::vector<uint8_t> W8((size_t)c.K * c.N);
@@ -801,26 +797,17 @@ int main() {
                 W8[idx] = fnuz_enc(f / scale);
               }
           }
-        // EXACT deferred-scale oracle in fp64, then alpha/beta + one RNE.
-        for (int m = 0; m < c.M; ++m)
-          for (int n = 0; n < c.N; ++n) {
-            double acc = 0;
-            for (int kb = 0; kb < k_b; ++kb) {
-              double blk = 0;
-              const int khi = std::min(c.K, (kb + 1) * 128);
-              for (int k = kb * 128; k < khi; ++k)
-                blk += (double)fnuz_dec(W8[(size_t)k * c.N + n]) *
-                       Af[(size_t)m * c.K + k];
-              acc += (double)scales[(size_t)kb * n_s8 + (n / 8)] * blk;
-            }
-            float v = (float)acc;
-            if (c.beta != 0.0f) {
-              uint32_t u = (uint32_t)C[(size_t)m * c.N + n] << 16;
-              float cv; std::memcpy(&cv, &u, 4);
-              v += c.beta * cv;
-            }
-            rC[(size_t)m * c.N + n] = f2bf(v);
-          }
+        // Dequant oracle: bf16-ROUNDED dequantized weights + fp32-accum
+        // CPU gemm (same contract/one-RNE as the v1 fp8 section).
+        std::vector<uint16_t> Bdq((size_t)c.K * c.N);
+        for (int k = 0; k < c.K; ++k)
+          for (int n = 0; n < c.N; ++n)
+            Bdq[(size_t)k * c.N + n] =
+                f2bf(fnuz_dec(W8[(size_t)k * c.N + n]) *
+                     scales[(size_t)(k / 128) * n_s8 + (n / 8)]);
+        vkernels::kernels::gemm_bf16_cpu((size_t)c.M, (size_t)c.N,
+                                         (size_t)c.K, 1.0f, A.data(),
+                                         Bdq.data(), c.beta, rC.data());
         CK(hipMalloc(&dW8, W8.size()), "gemv2 W8");
         CK(hipMalloc(&dS, scales.size() * 4), "gemv2 S");
         CK(hipMemcpy(dW8, W8.data(), W8.size(), hipMemcpyHostToDevice), "gemv2 cW8");
@@ -859,7 +846,7 @@ int main() {
       std::printf("  M=%-2d N=%-4d K=%-4d S=%-3d kk=%d th=%-3d gm=%d beta=%.1f %s"
                   "  max_abs=%.4f max_rel=%.6f  %s  (%s)\n",
                   c.M, c.N, c.K, c.S, c.kk, c.th, (int)c.gm, c.beta,
-                  c.fp8 ? "fp8d" : "bf16",
+                  c.fp8 ? "fp8 " : "bf16",
                   max_abs, max_rel, ok ? "PASS" : "FAIL", c.what);
       if (!ok) ++fails;
       if (dW8) hipFree(dW8);

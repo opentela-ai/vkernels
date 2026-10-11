@@ -175,6 +175,7 @@ static double batched(const char* tag, int batches, int per_batch,
 
 int main(int argc, char** argv) {
   const std::string phase = (argc > 1) ? argv[1] : "base";
+  setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: no lost output
   CK(hipInit(0));
   hipDeviceProp_t p;
   CK(hipGetDeviceProperties(&p, 0));
@@ -547,13 +548,16 @@ int main(int argc, char** argv) {
   // GEMV -- fixed TB=8 exact uint4 weight tiles (v1 tb=4 fetched 16 B per
   // thread but consumed 8 B, so every B byte was requested 4x), KK-way
   // multi-K register blocking, optional global-memory A reads (no LDS
-  // stage / barrier), and a DEFERRED-scale fp8 variant (raw fnuz codes
-  // accumulated unscaled in the value*2^-119 domain, block scale applied
-  // once per (128-K x 8-N) block -- removes the per-element bf16
-  // rounding). Sweep (kk, a_gmem, threads, S) on the issue shapes; per
-  // row: batched checksum + CPU-oracle gates (bf16: 2e-2 vs the bf16
-  // oracle; fp8: 1e-3 vs the exact deferred oracle AND 2e-2 vs the
-  // bf16-rounded dequant oracle).
+  // stage / barrier). The fp8 variant keeps the v1/MFMA per-element-
+  // rounded numerics contract (bit-exact vs the dequant oracle). A
+  // DEFERRED-scale variant (raw fnuz codes accumulated unscaled in the
+  // value*2^-119 domain, block scale applied once per (128-K x 8-N)
+  // block) was measured on MI300A and REJECTED: the second M*8
+  // accumulator bank spills and runs ~5-6x slower than the bf16 v2
+  // kernel, and its divergent contract fails the bf16-rounded-oracle
+  // cross-check at small-magnitude outputs. Sweep (kk, a_gmem, threads,
+  // S) on the issue shapes; per row: batched checksum + CPU-oracle gates
+  // (2e-2 rel; fp8 vs the bf16-rounded dequant oracle, bf16 vs B).
   // ------------------------------------------------------------------
   if (phase == "v2") {
     for (const auto& sh : shapes) {
@@ -592,12 +596,9 @@ int main(int argc, char** argv) {
         }
       // Oracles:
       //  Cref : bf16 weights, fp32-accum CPU gemm (bf16 path reference)
-      //  Crefq: bf16-ROUNDED dequantized weights (v1/MFMA fp8 contract)
-      //  Cdef : EXACT deferred-scale math in fp64 (fp8 v2 reference)
-      std::vector<double> Af((size_t)M * K);
-      for (size_t i = 0; i < A.size(); ++i) Af[i] = bf16_host_to_f32(A[i]);
-      std::vector<uint16_t> Cref((size_t)M * N, 0), Crefq((size_t)M * N, 0),
-          Cdef((size_t)M * N, 0);
+      //  Crefq: bf16-ROUNDED dequantized weights (v1/MFMA fp8 contract;
+      //         also the fp8 v2 reference -- same contract)
+      std::vector<uint16_t> Cref((size_t)M * N, 0), Crefq((size_t)M * N, 0);
       vkernels::kernels::gemm_bf16_cpu((size_t)M, (size_t)N, (size_t)K,
                                        1.0f, A.data(), B.data(), 0.0f,
                                        Cref.data());
@@ -612,18 +613,6 @@ int main(int argc, char** argv) {
                                          1.0f, A.data(), Bdq.data(), 0.0f,
                                          Crefq.data());
       }
-      for (int m = 0; m < M; ++m)
-        for (int n = 0; n < N; ++n) {
-          double c = 0;
-          for (int kb = 0; kb < k_b; ++kb) {
-            double blk = 0;
-            const int khi = std::min(K, (kb + 1) * 128);
-            for (int k = kb * 128; k < khi; ++k)
-              blk += (double)fnuz_dec(W8[(size_t)k * N + n]) * Af[(size_t)m * K + k];
-            c += (double)scales[(size_t)kb * n_s8 + (n / 8)] * blk;
-          }
-          Cdef[(size_t)m * N + n] = f2bf_host((float)c);
-        }
 
       uint16_t *dA, *dB, *dC;
       uint8_t* dW8;
@@ -682,35 +671,25 @@ int main(int argc, char** argv) {
           char tag[160];
           std::snprintf(tag, sizeof tag,
                         "v2-%s S=%d th=%d kk=%d gm=%d N=%d",
-                        fp8v ? "fp8d" : "bf16", gc.S, gc.th, gc.kk, gc.gm, N);
+                        fp8v ? "fp8" : "bf16", gc.S, gc.th, gc.kk, gc.gm, N);
           double us = batched(tag, 4, 1000, L, dC, Cref.size());
           std::printf("      -> %.0f GB/s (bytes model %.3g MB)\n",
                       bytes / (us / 1e6) / 1e9, bytes / 1e6);
           std::vector<uint16_t> got(Cref.size());
           CK(hipMemcpy(got.data(), dC, got.size() * 2, hipMemcpyDeviceToHost));
-          double rel_main = 0, rel_rounded = 0;
-          const std::vector<uint16_t>& ref_main = fp8v ? Cdef : Cref;
-          const double tol_main = fp8v ? 1e-3 : 2e-2;
+          double rel_main = 0;
+          // Both variants gate vs the CPU fp32-accum oracle on their
+          // respective weight domain (bf16 B / bf16-rounded dequant), 2e-2.
+          const std::vector<uint16_t>& ref_main = fp8v ? Crefq : Cref;
+          const double tol_main = 2e-2;
           for (size_t i = 0; i < got.size(); ++i) {
             float g = bf16_host_to_f32(got[i]);
             float r = bf16_host_to_f32(ref_main[i]);
             double rel = std::fabs(g - r) / std::fmax(1e-3, std::fabs(r));
             if (rel > rel_main) rel_main = rel;
-            if (fp8v) {
-              float rq = bf16_host_to_f32(Crefq[i]);
-              double relq = std::fabs(g - rq) / std::fmax(1e-3, std::fabs(rq));
-              if (relq > rel_rounded) rel_rounded = relq;
-            }
           }
-          if (fp8v)
-            std::printf("      -> vs-deferred-oracle max_rel=%.3g  "
-                        "vs-rounded-oracle max_rel=%.3g  %s\n",
-                        rel_main, rel_rounded,
-                        (rel_main < tol_main && rel_rounded < 2e-2) ? "PASS"
-                                                                    : "FAIL");
-          else
-            std::printf("      -> cpu max_rel=%.3g %s\n", rel_main,
-                        rel_main < tol_main ? "PASS" : "FAIL");
+          std::printf("      -> cpu max_rel=%.3g %s\n", rel_main,
+                      rel_main < tol_main ? "PASS" : "FAIL");
         }
       }
       CK(hipFree(dA)); CK(hipFree(dB)); CK(hipFree(dW8)); CK(hipFree(dS));
