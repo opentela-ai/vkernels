@@ -880,6 +880,262 @@ __global__ void gemv_decode_fp8_splitk_kernel(
   }
 }
 
+// ======================================================================
+//  Decode-GEMV v2 (issue #156 follow-up): structural rewrite targeting
+//  the instruction/latency ceiling of the v1 gemv_decode kernels above.
+//
+//  Changes vs v1:
+//   * TB FIXED at 8: each thread's uint4 (16 B) of B is fully consumed
+//     (v1 tb=4 fetched 16 B but used only 8 B, so every B byte was
+//     requested by four threads; v2 wavefronts cover N contiguously,
+//     1 KiB per 64 threads, zero overlap).
+//   * Multi-K register blocking (KK k-rows per iteration): KK independent
+//     in-flight B loads per thread and KK*8*M FMAs amortise loop overhead.
+//   * Optional A path (AGMEM): A[m][k] read straight from global memory
+//     (uniform across threads, L1-resident -- the split slice is only
+//     M*kl*2 bytes), removing the LDS stage and its __syncthreads.
+//   * The fp8 variant keeps the v1/MFMA per-element-rounded numerics
+//     contract (w = bf16(f2bf(sc*0x1p119 * raw)), bit-exact vs the
+//     dequant oracle). A deferred-scale variant (raw codes accumulated
+//     unscaled, block scale applied at the boundary) was measured on
+//     MI300A and REJECTED: the second M*8 accumulator bank pushed VGPR
+//     pressure past the spill threshold and ran ~5-6x SLOWER than the
+//     bf16 v2 kernel, and its divergent contract failed the
+//     bf16-rounded-oracle cross-check at small-magnitude outputs.
+template <int M, int KK, bool AGMEM>
+__global__ void gemv_decode_bf16_v2_kernel(const uint16_t* __restrict__ A,
+                                           const uint16_t* __restrict__ B,
+                                           float* __restrict__ P, int N,
+                                           int K, int kts_e) {
+  extern __shared__ uint16_t sA[];
+  const int tid = threadIdx.x;
+  const int s = blockIdx.z;
+  const int k0 = s * kts_e;
+  const int k1 = min(k0 + kts_e, K);
+  const int kl = k1 - k0;
+  const int klp = (kl + 7) & ~7;  // uniform stride, keeps uint2 alignment
+
+  if (!AGMEM) {
+    for (int i = tid; i < M * kl; i += blockDim.x) {
+      const int m = i / kl;
+      const int k = i - m * kl;
+      sA[m * klp + k] = A[(size_t)m * K + k0 + k];
+    }
+    __syncthreads();
+  }
+
+  const int c0 = (blockIdx.x * blockDim.x + tid) * 8;
+  float acc[M][8];
+#pragma unroll
+  for (int m = 0; m < M; ++m)
+#pragma unroll
+    for (int t = 0; t < 8; ++t) acc[m][t] = 0.0f;
+
+  if (c0 + 8 <= N) {
+    int k = 0;
+    for (; k + KK <= kl; k += KK) {
+      uint4 v[KK];
+#pragma unroll
+      for (int i = 0; i < KK; ++i)
+        v[i] = *(const uint4*)(&B[(size_t)(k0 + k + i) * N + c0]);
+      float a[KK][M];
+#pragma unroll
+      for (int i = 0; i < KK; ++i)
+#pragma unroll
+        for (int m = 0; m < M; ++m)
+          a[i][m] = bf16_to_f32(AGMEM ? A[(size_t)m * K + k0 + k + i]
+                                      : sA[m * klp + k + i]);
+#pragma unroll
+      for (int i = 0; i < KK; ++i) {
+        const uint16_t* vb = (const uint16_t*)(&v[i]);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+          const float b = bf16_to_f32(vb[t]);
+#pragma unroll
+          for (int m = 0; m < M; ++m) acc[m][t] = fmaf(b, a[i][m], acc[m][t]);
+        }
+      }
+    }
+    for (; k < kl; ++k) {
+      const uint4 v = *(const uint4*)(&B[(size_t)(k0 + k) * N + c0]);
+      const uint16_t* vb = (const uint16_t*)(&v);
+      float a[M];
+#pragma unroll
+      for (int m = 0; m < M; ++m)
+        a[m] = bf16_to_f32(AGMEM ? A[(size_t)m * K + k0 + k]
+                                 : sA[m * klp + k]);
+#pragma unroll
+      for (int t = 0; t < 8; ++t) {
+        const float b = bf16_to_f32(vb[t]);
+#pragma unroll
+        for (int m = 0; m < M; ++m) acc[m][t] = fmaf(b, a[m], acc[m][t]);
+      }
+    }
+  } else {
+    const int cmax = (c0 < N) ? (N - c0) : 0;
+    for (int k = 0; k < kl; ++k) {
+      float a[M];
+#pragma unroll
+      for (int m = 0; m < M; ++m)
+        a[m] = bf16_to_f32(AGMEM ? A[(size_t)m * K + k0 + k]
+                                 : sA[m * klp + k]);
+      for (int t = 0; t < cmax; ++t) {
+        const float b = bf16_to_f32(B[(size_t)(k0 + k) * N + c0 + t]);
+#pragma unroll
+        for (int m = 0; m < M; ++m) acc[m][t] = fmaf(b, a[m], acc[m][t]);
+      }
+    }
+  }
+
+  float* plane = P + (size_t)s * M * N;
+  if (c0 + 8 <= N) {
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+#pragma unroll
+      for (int t = 0; t < 8; ++t) plane[(size_t)m * N + c0 + t] = acc[m][t];
+  } else {
+    const int cmax = (c0 < N) ? (N - c0) : 0;
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+      for (int t = 0; t < cmax; ++t) plane[(size_t)m * N + c0 + t] = acc[m][t];
+  }
+}
+
+// Per-element-rounded block-FP8 variant of the v2 GEMV (same numerics
+// contract as v1/MFMA, see the block comment above). 128 % KK == 0 for
+// KK in {2, 4, 8}, so a scale-block boundary can only coincide with a
+// KK-group start: one scale reload per group. Single accumulator bank --
+// VGPR profile identical to the bf16 v2 kernel.
+template <int M, int KK, bool AGMEM>
+__global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
+                                          const uint8_t* __restrict__ W8,
+                                          const float* __restrict__ scales,
+                                          float* __restrict__ P, int N, int K,
+                                          int kts_e) {
+  extern __shared__ uint16_t sA[];
+  const int tid = threadIdx.x;
+  const int s = blockIdx.z;
+  const int k0 = s * kts_e;
+  const int k1 = min(k0 + kts_e, K);
+  const int kl = k1 - k0;
+  const int klp = (kl + 7) & ~7;
+  const int n_s8 = (N + 7) / 8;
+
+  if (!AGMEM) {
+    for (int i = tid; i < M * kl; i += blockDim.x) {
+      const int m = i / kl;
+      const int k = i - m * kl;
+      sA[m * klp + k] = A[(size_t)m * K + k0 + k];
+    }
+    __syncthreads();
+  }
+
+  const int c0 = (blockIdx.x * blockDim.x + tid) * 8;
+  float acc[M][8];
+#pragma unroll
+  for (int m = 0; m < M; ++m)
+#pragma unroll
+    for (int t = 0; t < 8; ++t) acc[m][t] = 0.0f;
+
+  if (c0 + 8 <= N) {
+    const int colb = c0 >> 3;  // thread's 8 columns = one scale n-block
+    // Iterate in SCALE-ALIGNED segments: kts_e is element-granular, so a
+    // split's k0 need not be 128-aligned and a (128-K x 8-N) scale-block
+    // boundary can fall MID-KK-group. Within a segment the block scale is
+    // constant; the fast KK loop only runs while it cannot cross a
+    // boundary. One scale reload per segment.
+    float sc = scales[(size_t)(k0 >> 7) * n_s8 + colb] * 0x1p119f;
+    int k = 0;
+    while (k < kl) {
+      const int seg = min(kl - k, 128 - ((k0 + k) & 127));
+      int j = 0;
+      for (; j + KK <= seg; j += KK) {
+        uint4 v[KK];
+#pragma unroll
+        for (int i = 0; i < KK; ++i)
+          v[i] = *(const uint4*)(&W8[(size_t)(k0 + k + j + i) * N + c0]);
+        float a[KK][M];
+#pragma unroll
+        for (int i = 0; i < KK; ++i)
+#pragma unroll
+          for (int m = 0; m < M; ++m)
+            a[i][m] = bf16_to_f32(AGMEM ? A[(size_t)m * K + k0 + k + j + i]
+                                        : sA[m * klp + k + j + i]);
+#pragma unroll
+        for (int i = 0; i < KK; ++i) {
+          const uint32_t* vc = (const uint32_t*)(&v[i]);
+#pragma unroll
+          for (int t = 0; t < 8; ++t) {
+            const uint32_t b = (vc[t >> 2] >> (8 * (t & 3))) & 0xFFu;
+            const float w = bf16_to_f32(
+                f2bf(sc * __uint_as_float(((b & 0x80u) << 24) |
+                                          ((b & 0x7Fu) << 20))));
+#pragma unroll
+            for (int m = 0; m < M; ++m)
+              acc[m][t] = fmaf(w, a[i][m], acc[m][t]);
+          }
+        }
+      }
+      for (; j < seg; ++j) {
+        const uint4 v = *(const uint4*)(&W8[(size_t)(k0 + k + j) * N + c0]);
+        const uint32_t* vc = (const uint32_t*)(&v);
+        float a[M];
+#pragma unroll
+        for (int m = 0; m < M; ++m)
+          a[m] = bf16_to_f32(AGMEM ? A[(size_t)m * K + k0 + k + j]
+                                   : sA[m * klp + k + j]);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+          const uint32_t b = (vc[t >> 2] >> (8 * (t & 3))) & 0xFFu;
+          const float w = bf16_to_f32(
+              f2bf(sc * __uint_as_float(((b & 0x80u) << 24) |
+                                        ((b & 0x7Fu) << 20))));
+#pragma unroll
+          for (int m = 0; m < M; ++m) acc[m][t] = fmaf(w, a[m], acc[m][t]);
+        }
+      }
+      k += seg;
+      if (k < kl) sc = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb] * 0x1p119f;
+    }
+  } else {
+    // Rare partial-column tail: same per-element-rounded math, scalar
+    // loads. c0 is 8-aligned so the <=7 live columns all sit in ONE
+    // scale n-block.
+    const int cmax = (c0 < N) ? (N - c0) : 0;
+    const int colb = c0 >> 3;
+    for (int k = 0; k < kl; ++k) {
+      const float sc =
+          scales[(size_t)((k0 + k) >> 7) * n_s8 + colb] * 0x1p119f;
+      float a[M];
+#pragma unroll
+      for (int m = 0; m < M; ++m)
+        a[m] = bf16_to_f32(AGMEM ? A[(size_t)m * K + k0 + k]
+                                 : sA[m * klp + k]);
+      for (int t = 0; t < cmax; ++t) {
+        const uint32_t b = W8[(size_t)(k0 + k) * N + c0 + t];
+        const float w = bf16_to_f32(
+            f2bf(sc * __uint_as_float(((b & 0x80u) << 24) |
+                                      ((b & 0x7Fu) << 20))));
+#pragma unroll
+        for (int m = 0; m < M; ++m) acc[m][t] = fmaf(w, a[m], acc[m][t]);
+      }
+    }
+  }
+
+  float* plane = P + (size_t)s * M * N;
+  if (c0 + 8 <= N) {
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+#pragma unroll
+      for (int t = 0; t < 8; ++t) plane[(size_t)m * N + c0 + t] = acc[m][t];
+  } else {
+    const int cmax = (c0 < N) ? (N - c0) : 0;
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+      for (int t = 0; t < cmax; ++t) plane[(size_t)m * N + c0 + t] = acc[m][t];
+  }
+}
+
 namespace {
 
 // Shared dispatch for the two gemv-decode entries: workspace + grid +
@@ -924,6 +1180,61 @@ bool gemv_decode_dispatch(
     default: return false;
   }
 #undef VK_GEMV_M_CASE
+
+  const int cols = 256;
+  dim3 gridC(Mi, (Ni + cols - 1) / cols);
+  gemm_bf16_splitk_combine_kernel<<<gridC, cols, 0, 0>>>(
+      partials.ptr, C, C, Mi, Ni, s, alpha, beta);
+  return true;
+}
+
+// Shared dispatch for the v2 gemv-decode entries (see the kernel block
+// comment): fixed TB=8, KK-way multi-K register blocking, optional
+// global-memory A reads (no LDS stage), deferred-scale fp8. Same fp32
+// partial planes + fixed-order combine as v1 => same numerics contract
+// on the combine side.
+template <int KK, bool AGMEM>
+bool gemv_decode_v2_dispatch(std::size_t M, std::size_t N, std::size_t K,
+                             float alpha, const uint16_t* A, const void* Bw,
+                             const float* scales, float beta, uint16_t* C,
+                             int S, int threads, bool fp8) {
+  if (N % 8 != 0) return false;
+  const int Mi = static_cast<int>(M);
+  const int Ni = static_cast<int>(N);
+  const int Ki = static_cast<int>(K);
+  if (Mi < 1 || Mi > 8) return false;
+  int s = S;
+  if (s < 1) s = 1;
+  if (s > Ki) s = Ki;
+  const size_t need = (size_t)s * M * N;
+  Scratch<float> partials(need);
+
+  const int kts_e = (Ki + s - 1) / s;
+  const int klp = ((kts_e + 7) & ~7);
+  const dim3 block(threads);
+  const dim3 grid((Ni + threads * 8 - 1) / (threads * 8), 1, s);
+  const int smem = AGMEM ? 0 : Mi * klp * (int)sizeof(uint16_t);
+
+#define VK_GEMV_V2_M_CASE(MV)                                          \
+  do {                                                                 \
+    if (fp8)                                                           \
+      gemv_decode_fp8_v2_kernel<MV, KK, AGMEM>                         \
+          <<<grid, block, smem>>>(A, (const uint8_t*)Bw, scales,       \
+                                  partials.ptr, Ni, Ki, kts_e);        \
+    else                                                               \
+      gemv_decode_bf16_v2_kernel<MV, KK, AGMEM>                        \
+          <<<grid, block, smem>>>(A, (const uint16_t*)Bw, partials.ptr,\
+                                  Ni, Ki, kts_e);                      \
+  } while (0)
+  switch (Mi) {
+    case 1: VK_GEMV_V2_M_CASE(1); break;
+    case 2: VK_GEMV_V2_M_CASE(2); break;
+    case 4: VK_GEMV_V2_M_CASE(4); break;
+    case 5: VK_GEMV_V2_M_CASE(5); break;
+    case 8: VK_GEMV_V2_M_CASE(8); break;
+    default: return false;
+  }
+#undef VK_GEMV_V2_M_CASE
 
   const int cols = 256;
   dim3 gridC(Mi, (Ni + cols - 1) / cols);
@@ -1307,6 +1618,47 @@ bool gemv_decode_fp8_splitk(std::size_t M, std::size_t N, std::size_t K,
                                    true, threads);
   return gemv_decode_dispatch<8>(M, N, K, alpha, A, W8, scales, beta, C, S,
                                  true, threads);
+}
+
+// Decode-GEMV v2 entries (issue #156 follow-up): fixed TB=8 (exact uint4
+// weight tiles for bf16; fp8 keeps the v1 16B-fetch pattern), KK-way
+// multi-K register blocking, optional global-memory A reads (a_gmem=true
+// removes the LDS stage and barrier). BOTH variants keep the v1/MFMA
+// per-element-rounded numerics contract (fp8: w = bf16(f2bf(sc*0x1p119 *
+// decode)), bit-exact vs the dequant oracle; scale-block boundaries
+// handled via scale-aligned segments for unaligned split starts). A
+// deferred-scale fp8 variant was measured on MI300A and REJECTED (spill +
+// 5-6x slower; see the kernel block comment above) -- the entry points
+// below never expose it. kk must be 2, 4 or 8; threads 64/128/256.
+// Returns false (C untouched) for N % 8 != 0, M outside [1, 8], or
+// unsupported kk.
+bool gemv_decode_bf16_splitk_v2(std::size_t M, std::size_t N, std::size_t K,
+                                float alpha, const uint16_t* A,
+                                const uint16_t* B, float beta, uint16_t* C,
+                                int S, int threads, int kk, bool a_gmem) {
+#define VK_GEMV_V2_KK(KKv, GM)                                              \
+  gemv_decode_v2_dispatch<KKv, GM>(M, N, K, alpha, A, B, nullptr, beta, C,  \
+                                   S, threads, false)
+  if (kk == 2) return a_gmem ? VK_GEMV_V2_KK(2, true) : VK_GEMV_V2_KK(2, false);
+  if (kk == 4) return a_gmem ? VK_GEMV_V2_KK(4, true) : VK_GEMV_V2_KK(4, false);
+  if (kk == 8) return a_gmem ? VK_GEMV_V2_KK(8, true) : VK_GEMV_V2_KK(8, false);
+#undef VK_GEMV_V2_KK
+  return false;
+}
+
+bool gemv_decode_fp8_splitk_v2(std::size_t M, std::size_t N, std::size_t K,
+                               float alpha, const uint16_t* A,
+                               const uint8_t* W8, const float* scales,
+                               float beta, uint16_t* C, int S, int threads,
+                               int kk, bool a_gmem) {
+#define VK_GEMV_V2_KK(KKv, GM)                                              \
+  gemv_decode_v2_dispatch<KKv, GM>(M, N, K, alpha, A, W8, scales, beta, C,  \
+                                   S, threads, true)
+  if (kk == 2) return a_gmem ? VK_GEMV_V2_KK(2, true) : VK_GEMV_V2_KK(2, false);
+  if (kk == 4) return a_gmem ? VK_GEMV_V2_KK(4, true) : VK_GEMV_V2_KK(4, false);
+  if (kk == 8) return a_gmem ? VK_GEMV_V2_KK(8, true) : VK_GEMV_V2_KK(8, false);
+#undef VK_GEMV_V2_KK
+  return false;
 }
 
 // Legacy split-K entry (issue #156 A/B harness): forces the #146 kernel
