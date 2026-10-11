@@ -10,6 +10,7 @@ The new operators are explicit experiments; serving dispatch does not select the
 
 Review corrections:
 
+- Allow either optional MFMA diagnostic output to be omitted independently.
 - Fix the CPU quantizer's absolute-value search across both signs. An even
   negative encoding could overwrite the matching positive encoding. Search
   positive magnitudes, apply the sign once, canonicalize underflow to unsigned

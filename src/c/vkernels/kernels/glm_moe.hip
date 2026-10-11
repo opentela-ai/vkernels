@@ -264,11 +264,13 @@ __global__ void glm_fp8_fnuz_mfma_gemv_kernel(const uint16_t* __restrict__ x,
     sxa[i] = u;
   }
   __syncthreads();
-  if (dbg_sxa != nullptr && blockIdx.x == 0 && blockIdx.y == 0) {
-    for (int i = tid; i < M * slice / 4; i += kTh)
-      dbg_sxa[i] = sxa[i];
-    for (int i = tid; i < M * segs; i += kTh)
-      dbg_s2a[i] = ss2a[i];
+  if (blockIdx.x == 0 && blockIdx.y == 0) {
+    if (dbg_sxa != nullptr)
+      for (int i = tid; i < M * slice / 4; i += kTh)
+        dbg_sxa[i] = sxa[i];
+    if (dbg_s2a != nullptr)
+      for (int i = tid; i < M * segs; i += kTh)
+        dbg_s2a[i] = ss2a[i];
   }
   __syncthreads();
 
