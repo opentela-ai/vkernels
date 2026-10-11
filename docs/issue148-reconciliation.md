@@ -10,6 +10,9 @@ The new operators are explicit experiments; serving dispatch does not select the
 
 Review corrections:
 
+- Fix the MFMA CPU oracle’s scale indexing: store one activation scale per
+  128-element group, matching its group-indexed reads. Distinct-scale, two-token
+  fixtures catch the original per-element-write/group-read mismatch.
 - Allow either optional MFMA diagnostic output to be omitted independently.
 - Fix the CPU quantizer's absolute-value search across both signs. An even
   negative encoding could overwrite the matching positive encoding. Search
@@ -32,6 +35,9 @@ Validation on the local GB10 host:
   `ctest --preset host --output-on-failure`: **47 passed**, 2 GPU tests disabled.
 - Issue 148, registry, expert-GEMV and blockwise-GEMM Python suites:
   **47 passed, 7 skipped**. The skips include four new gfx942 graph cases.
+- The native coverage gate passes at **100% line coverage across 58 files**.
+  Distinct per-group scales, both token rows, zero groups and NaNs exercise
+  both new GEMV oracles. The repaired glm_moe target passes.
 - Ruff, Python compilation and `bash -n` pass.
 - Native changes formatted using the checked-in C++ style. The existing
   `.clang-format` also contains a `Language: Cuda` stanza rejected by

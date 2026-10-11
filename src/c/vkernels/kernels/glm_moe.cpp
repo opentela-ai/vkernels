@@ -175,7 +175,7 @@ void glm_fp8_fnuz_mfma_oracle_cpu(
   for (int m = 0; m < M; ++m) {
     // quantized payload + its (token, group) scale, per kernel recipe
     std::vector<uint8_t> pcm(K);
-    std::vector<float> s2a(K);
+    std::vector<float> s2a(kb);
     for (int g = 0; g < kb; ++g) {
       float amax = 0.0f;
       for (int j = 0; j < 128; ++j) {
@@ -183,10 +183,10 @@ void glm_fp8_fnuz_mfma_oracle_cpu(
         amax = std::fmax(amax, std::fabs(xv));
       }
       const float sg = std::fmax(amax, 1e-4f) / 224.0f;
+      s2a[g] = sg;
       for (int j = 0; j < 128; ++j) {
         const float xv = bf16_to_f32_cpu(x[(size_t)m * K + g * 128 + j]);
         pcm[g * 128 + j] = glm_fp8_fnuz_quant_cpu(xv, 1.0f / sg);
-        s2a[g * 128 + j] = sg;
       }
     }
     for (int n = 0; n < N; ++n) {

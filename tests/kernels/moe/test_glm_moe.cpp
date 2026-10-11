@@ -220,3 +220,30 @@ TEST(GlmFnuz, EncodeTiesZerosAndSaturation) {
   EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(-1000, 1)), 0xff);
   EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(std::nanf(""), 1)), 0x80);
 }
+
+TEST(GlmFnuz, BothOraclesRespectTokenScaleBlocksZerosAndNan) {
+  using vkernels::kernels::glm_fp8_fnuz_block_gemv_cpu;
+  using vkernels::kernels::glm_fp8_fnuz_mfma_oracle_cpu;
+  const int M = 2, N = 256, K = 256;
+  std::vector<uint16_t> x(M * K);
+  for (int k = 0; k < K; ++k) {
+    x[k] = bf16(k < 128 ? 1.0f : 2.0f);
+    x[K + k] = bf16(k < 128 ? -0.5f : 0.0f);
+  }
+  std::vector<uint8_t> w(N * K, 0x48); // FNUZ +2
+  std::vector<float> scales = {3.0f, 5.0f, 7.0f, 11.0f};
+  std::vector<uint16_t> plain(M * N), quantized(M * N);
+  glm_fp8_fnuz_block_gemv_cpu(x.data(), w.data(), scales.data(), plain.data(), M, N, K);
+  glm_fp8_fnuz_mfma_oracle_cpu(x.data(), w.data(), scales.data(), quantized.data(), M, N, K);
+  // Constant groups are exactly representable after per-group quantization.
+  for (int n = 0; n < N; ++n) {
+    EXPECT_EQ(bf16_to_f32(plain[n]), n < 128 ? 3328.0f : 7424.0f);
+    EXPECT_EQ(bf16_to_f32(plain[N + n]), n < 128 ? -384.0f : -896.0f);
+  }
+  EXPECT_TRUE(plain == quantized);
+  w[0] = 0x80; // FNUZ's only NaN code
+  glm_fp8_fnuz_block_gemv_cpu(x.data(), w.data(), scales.data(), plain.data(), M, N, K);
+  glm_fp8_fnuz_mfma_oracle_cpu(x.data(), w.data(), scales.data(), quantized.data(), M, N, K);
+  EXPECT_TRUE(std::isnan(bf16_to_f32(plain[0])));
+  EXPECT_TRUE(std::isnan(bf16_to_f32(quantized[0])));
+}
