@@ -58,3 +58,29 @@ Required before promoting this draft:
    changes the numerical recipe; operator tolerance cannot establish that gate.
 
 No fresh MI300A performance or full-model quality result is claimed here.
+
+## Qualification results (2026-10-11, this lane)
+
+Items 1–3 of the checklist above, executed on beverin MI300A:
+
+1. **gfx942 compile + native correctness: PASS.** Job 676509 (nid003018)
+   built all HIP targets and `test_glm_fp8_gemv` passed **24/24** (manual,
+   fnuz-cvt, MFMA vs CPU oracles, both token counts, incl. K=1152 odd
+   segments).
+2. **Stream/graph checks:** not re-run in this lane (the four new gfx942
+   graph cases were exercised in CI on merged main); the native wrappers
+   remain standalone experiments with allocated scratch / default-stream
+   launches, as documented.
+3. **MI300A timing: acceptance NOT met.** HIP MFMA best 722 GB/s gate/up
+   M=1 = 1.17× the same-node manual decode (27.3 µs), below the 751 GB/s
+   record; 0.88–0.89× on down. Triton MFMA decode 183–389 GB/s. Secondary
+   FNUZ_NATIVE bitcast bit-identical, perf-neutral. Details and tables in
+   `docs/glm53-decode-kernels.md` §#148. Serving dispatch unchanged; no
+   adoption.
+4. **Full-model quality gate:** unexecuted — moot at this speedup.
+
+Bench fix riding along: `bench_glm_issue148_decode.py` popped
+`VK_DECODE_GEMM_TILES` before each shape's parity call — a previous
+shape's stages=3 best-config export previously crashed the next shape's
+parity launch with a shared-memory OutOfResources (jobs 641621/676509
+pre-fix), which also blocked the results JSON.
