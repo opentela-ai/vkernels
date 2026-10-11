@@ -189,3 +189,34 @@ TEST(GlmFp8Gemv, NanWeightPoisonsOutput) {
   // Rows without a NaN weight stay finite even in the same launch.
   EXPECT_FALSE(std::isnan(bf16_to_f32(out[2])));
 }
+
+TEST(GlmFnuz, DecodeAndEncodeExhaustiveFiniteCodes) {
+  using vkernels::kernels::glm_fnuz_e4m3_to_f32_cpu;
+  using vkernels::kernels::glm_fp8_fnuz_quant_cpu;
+  for (int code = 0; code < 256; ++code) {
+    if (code == 128) {
+      EXPECT_TRUE(std::isnan(glm_fnuz_e4m3_to_f32_cpu(code)));
+      continue;
+    }
+    const int exponent = (code >> 3) & 15;
+    const int mantissa = code & 7;
+    float value = exponent == 0 ? std::ldexp(float(mantissa), -10)
+                                : std::ldexp(1.0f + float(mantissa) / 8, exponent - 8);
+    if (code & 128) value = -value;
+    EXPECT_EQ(glm_fnuz_e4m3_to_f32_cpu(code), value);
+    EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(value, 1.0f)), code);
+  }
+}
+
+TEST(GlmFnuz, EncodeTiesZerosAndSaturation) {
+  using vkernels::kernels::glm_fp8_fnuz_quant_cpu;
+  EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(2.125f, 1)), 0x48);
+  EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(2.375f, 1)), 0x4a);
+  EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(-2.125f, 1)), 0xc8);
+  EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(-2.375f, 1)), 0xca);
+  EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(-0.0f, 1)), 0);
+  EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(-1e-10f, 1)), 0);
+  EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(1000, 1)), 0x7f);
+  EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(-1000, 1)), 0xff);
+  EXPECT_EQ(int(glm_fp8_fnuz_quant_cpu(std::nanf(""), 1)), 0x80);
+}

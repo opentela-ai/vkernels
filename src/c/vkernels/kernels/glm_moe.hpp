@@ -56,6 +56,35 @@ float glm_e4m3_to_f32_cpu(uint8_t v);
 int gemv_pick_sk(int N, int K);
 int glm_fp8_gemv_pick_sk(int N, int K);
 
+// e4m3fnuz decode (issue #148): the hardware v_cvt_pk_f32_fp8 table —
+// bias 8, subnormals m*2^-10, NaN only at 0x80. CPU oracle counterpart of
+// the fnuz-storage decode GEMV below.
+float glm_fnuz_e4m3_to_f32_cpu(uint8_t v);
+
+// glm_fp8_fnuz_block_gemv_cpu — FNUZ-storage oracle (issue #148): w holds
+// e4m3fnuz bytes and scales are the DOUBLED fp32 scales (the
+// e4m3fn_to_fnuz_inplace convention), value = fnuz(code) * s2. Same shape
+// contract as glm_fp8_block_gemv_cpu.
+void glm_fp8_fnuz_block_gemv_cpu(
+    const uint16_t* x, const uint8_t* w, const float* scales, uint16_t* out, int M, int N, int K);
+
+// fnuz fp8 encode (issue #148): round-to-nearest-even to the e4m3fnuz
+// lattice, bit-exact vs hardware v_cvt_pk_fp8_f32 (verified empirically
+// by diag_mfma_issue148.hip: ties go to the even mantissa — 2.375 -> 2.5
+// (0x4a), 2.125 -> 2.0 (0x48) — and the two-call packing streams the
+// values low-byte first).
+uint8_t glm_fp8_fnuz_quant_cpu(float v, float inv);
+
+// glm_fp8_fnuz_mfma_oracle_cpu — tensor-core fp8 GEMV oracle (issue
+// #148): models the fused fp8 payload quantize of
+// glm_fp8_fnuz_mfma_gemv_kernel (per token, per 128-k group: amax ->
+// s2a = amax/224 floor 1e-4; payload = RNE(x/s2a) fnuz codes), then
+// out[m][n] = bf16(payload x fnuz(w) x scales) in fp32. Without the
+// payload model this kernel's fp8 rounding noise (|w| spans 0.01..240)
+// dominates the 2e-2 gate — the plain fnuz oracle cannot validate it.
+void glm_fp8_fnuz_mfma_oracle_cpu(
+    const uint16_t* x, const uint8_t* w, const float* scales, uint16_t* out, int M, int N, int K);
+
 }  // namespace vkernels::kernels
 
 // HIP declarations only (no hip/hip_runtime.h here — glm_moe.cpp is a
@@ -79,6 +108,57 @@ void glm_fp8_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
                                      const float* scales, uint16_t* out,
                                      float* part, int M, int N, int K,
                                      int sk);
+
+// FNUZ-storage decode GEMV (issue #148): w holds e4m3fnuz bytes (the #71
+// in-place conversion's payload-halved encoding) and scales are the
+// DOUBLED fp32 scales, so value = fnuz(code) * s2 reproduces the original
+// e4m3fn weight exactly. Decode is the hardware fnuz converter
+// (v_cvt_pk_f32_fp8) instead of the manual bit-assembly; same split-K
+// structure, sk heuristic and shape contract as glm_fp8_block_gemv.
+void glm_fp8_fnuz_block_gemv(
+    const uint16_t* x, const uint8_t* w, const float* scales, uint16_t* out, int M, int N, int K);
+
+void glm_fp8_fnuz_block_gemv_with_scratch(const uint16_t* x,
+                                          const uint8_t* w,
+                                          const float* scales,
+                                          uint16_t* out,
+                                          float* part,
+                                          int M,
+                                          int N,
+                                          int K,
+                                          int sk);
+
+// MFMA tensor-core decode GEMV (issue #148): same FNUZ storage contract
+// and fused activation quantize, but the fp8 dot runs on the CDNA3
+// tensor core (v_mfma_f32_16x16x32_fp8_fp8, wave64 fragments) instead of
+// per-code cvt+FMA — no fp8 decode arithmetic at all. Same shape
+// contract; requires N % 64 == 0 (implied by N % 128 == 0).
+void glm_fp8_fnuz_mfma_block_gemv(
+    const uint16_t* x, const uint8_t* w, const float* scales, uint16_t* out, int M, int N, int K);
+
+void glm_fp8_fnuz_mfma_block_gemv_with_scratch(const uint16_t* x,
+                                               const uint8_t* w,
+                                               const float* scales,
+                                               uint16_t* out,
+                                               float* part,
+                                               int M,
+                                               int N,
+                                               int K,
+                                               int sk);
+
+// Debug hook (probe_mfma_fp8): also dumps block (0,0)'s quantized x
+// payload words and per-group activation scales. Callers may pass nullptr.
+void glm_fp8_fnuz_mfma_block_gemv_debug(const uint16_t* x,
+                                        const uint8_t* w,
+                                        const float* scales,
+                                        uint16_t* out,
+                                        float* part,
+                                        int M,
+                                        int N,
+                                        int K,
+                                        int sk,
+                                        uint32_t* dbg_sxa,
+                                        float* dbg_s2a);
 
 }  // namespace vkernels::kernels::hip
 #endif  // VKERNELS_HAS_HIP
