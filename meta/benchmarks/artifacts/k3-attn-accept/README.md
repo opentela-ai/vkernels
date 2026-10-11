@@ -171,3 +171,40 @@ and >1h wall — beyond the mi300 partition limit, so it is left to the owner:
 
 No acceptance claim is made by this runbook; it only executes the checks and
 writes machine-readable evidence.
+
+## Status addendum (2026-10-11, lane issue-42/vllm-attn-accept)
+
+**PART A (C ABI upstream, issue #42 scope item 4) — verified complete at
+main HEAD `100398f`.** `vk_hip_mla_fwd` / `vk_hip_kda_delta_rule_fwd` (+ the
+issue-#69 stream/scratch variants) are declared in
+`src/c/vkernels/capi/hip_capi.hpp`, defined in `hip_capi.cpp`, and exported
+from a fresh HIP build on beverin mi300: job **676514** (nid003032,
+`cmake --preset hip` under the `vkernels-rocm` EDF) `nm -D` shows all seven
+`vk_hip_*` serving entries in `libvkernels_hip.so`; job **676516** confirms
+`libvkernels.so` exports the CPU oracles `vk_mla_fwd` /
+`vk_kda_naive_delta_rule_fwd` in-container and runs the GPU correctness
+suite **5/5 PASS** (`vkernels_test_mla`, `vkernels_test_kda`,
+`vkernels_test_kda_k3_chunked`, `vkernels_test_kda_chunked_fused_gpu`,
+`vkernels_test_capi`). Recorded in `docs/serving-c-abi.md`.
+
+**PART B (the VKERNELS acceptance arm above) — still not executed.** State
+of record: baseline arm 638514 (all-MLA dummy, AC2-contrast FAIL anchored);
+tooling selftest green (641176); VKERNELS real-weight attempts 638605
+(distributed-timeout, fix known: `--cpu-distributed-timeout-seconds 21600`),
+639143/639260 (NaN logits — traced to `VKERNELS_MXFP4_BF16` MoE, use
+`VKERNELS_MOE=0`), 639740 (boot-phase NCCL RECV timeout at ~85% weight
+load — needs the post-maintenance rerun). The 6-node real-weight serve
+(~77 min load + probe/bench gate, >7 h wall incl. retries) exceeds this
+lane's budget and stays with the owner runbook above; exact launch command
+per the recipe (`serve_kimi_k3_otela_beverin.sbatch`, beverin cookbook
+deployment `e1e8aad`):
+
+```bash
+sbatch --export=ALL,VKERNELS_MLA=1,VKERNELS_MLA_FORCE=1,VKERNELS_MLA_VALIDATE=1,
+VKERNELS_KDA=1,VKERNELS_KDA_VALIDATE=1,VKERNELS_MOE=0,ENFORCE_EAGER=1,
+DISTRIBUTED_TIMEOUT_SECONDS=21600 \
+  deployments/llm/beverin/kimi-k3-vllm/serve_kimi_k3_otela_beverin.sbatch
+```
+
+then AC1–AC4 via `meta/scripts/run_issue45_accept_mi300.sh gen|recall|ac3|bench`
+as documented above.
