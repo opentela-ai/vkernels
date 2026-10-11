@@ -97,3 +97,35 @@ On-device regression coverage:
 - `meta/benchmarks/test_mla_capture.hip` — MLA stream/graph-capture safety:
   cold-workspace capture (fallback path), warm-workspace capture (split path
   inside the graph), re-feed replay, and legacy/stream parity.
+
+### On-cluster export verification (beverin MI300A/gfx942, 2026-10-11)
+
+Issue #42 PART A — the serving C ABI re-verified at main HEAD `100398f`
+(branch `issue-42/vllm-attn-accept`, fresh clone
+`/capstor/scratch/cscs/xyao/vkernels-i42`), built with `cmake --preset hip`
+inside the `vkernels-rocm` EDF (sglang ROCm image, ROCm 7.2 userspace) on a
+`mi300` compute node:
+
+- **job 676514** (nid003032, build + `nm -D`): `libvkernels_hip.so` exports
+  all seven device serving entries — `vk_hip_mla_fwd`,
+  `vk_hip_mla_fwd_stream`, `vk_hip_kda_delta_rule_fwd`,
+  `vk_hip_kda_delta_rule_fwd_with_scratch`,
+  `vk_hip_kda_delta_rule_fwd_chunked_with_scratch`,
+  `vk_hip_kda_delta_rule_fwd_with_scratch_stream`,
+  `vk_hip_kda_delta_rule_fwd_chunked_with_scratch_stream`.
+- **job 676516** (in-container `nm -D` + GPU suite): `libvkernels.so`
+  exports the CPU oracles `vk_mla_fwd` (T 0x24000) and
+  `vk_kda_naive_delta_rule_fwd` (T 0x24440); GPU correctness suite
+  **5/5 PASS** — `vkernels_test_mla`, `vkernels_test_kda`,
+  `vkernels_test_kda_k3_chunked`, `vkernels_test_kda_chunked_fused_gpu`,
+  `vkernels_test_capi` (the `vkernels_test_*` binaries live under
+  `build/hip/tests/`).
+
+Reproduce:
+
+```bash
+ssh beverin
+cd /capstor/scratch/cscs/xyao/vkernels-i42 && git log --oneline -1
+sbatch build_verify_i42.sbatch   # build + nm -D export check
+sbatch gpu_tests_i42.sbatch      # GPU correctness suite
+```

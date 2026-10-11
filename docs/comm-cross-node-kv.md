@@ -368,6 +368,21 @@ Reproduce: `sbatch` a 2-node, 1-GPU/rank job running
 `srun --mpi=pmix -N2 -n2 ./cross_node_nccl_bench --iters 101`
 (see the header of `bench_cross_node_nccl.cu`).
 
+**Striped rows (issue #152) — on-fabric numbers still pending.** The
+striped multi-lane plan implementation (`cad17f6`) and its
+`nccl-stripe` bench row are merged and host-green (47/47 host tests,
+100% line coverage on `cross_node_kv.cpp`), but no 2-node GH200 +
+InfiniBand HDR testbed was reachable when the lane ran (probed ela,
+bristen, beverin, clariden, ds6, euler: clariden/bristen are Alps GH200
+on Slingshot, ds6 is a single GB10 Spark, euler is A100 + mlx4, beverin
+is MI300/MI200, ela has no GPU fabric). The exact JSC build + submission
+recipe is staged in `meta/scripts/bench_cross_node_nccl_jsc.sh` and
+`meta/scripts/cross_node_nccl_bench_jsc.sbatch`; success criterion:
+`nccl-stripe` ≥3× `nccl-xfer` `usefGB` at 16384+ toks with all rows
+`check=ok`, plus an `NCCL_DEBUG=INFO` pass confirming each stripe
+communicator pinned a distinct `mlx5_<l>`. Until that run lands, no
+striped speedup is claimed.
+
 ---
 
 ## 9. References

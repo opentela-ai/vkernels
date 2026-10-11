@@ -135,3 +135,62 @@ Two Triton pitfalls found by testing (both encoded in the module):
 2. **Cross-program zeroing races** — a kernel must never zero partial
    slots owned by concurrent programs (other splits of the same row);
    only the launcher's pre-launch memset is safe.
+
+## #148 — hardware-fp8 decode on the fnuz storage: measured, acceptance NOT met
+
+Issue #148 proposed replacing the manual E4M3FN bit-decode (~8–10 VALU ops
+per weight byte, instruction-issue bound at 751 GB/s) with hardware-fp8
+paths once #71's `e4m3fn_to_fnuz_inplace` made fnuz storage available:
+(1) an MFMA (`v_mfma_f32_16x16x32_fp8`) decode GEMV, and (2) a Triton
+`float8e4b8` bitcast decode in `expert_gemv`. The kernels, oracles, probes
+and bench landed via #166 (`glm_fp8_fnuz_block_gemv`,
+`glm_fp8_fnuz_mfma_block_gemv` in `glm_moe.{hpp,cpp,hip}`,
+`glm_decode_fp8_gemm`/`_triton_decode_kernel` in
+`glm_fp8_blockwise_gemm.py`, `GLM53_GEMV_FNUZ_NATIVE` in
+`glm_expert_gemv.py`); this section records the gfx942 qualification
+measurements (the step #166 explicitly did not claim).
+
+Correctness (job 676509, nid003018): `test_glm_fp8_gemv` **24/24 PASS** —
+manual, fnuz-cvt and MFMA HIP kernels vs CPU oracles over 8 configs each;
+the Triton decode GEMM parity gates pass at rel ≤ 4.4e-3 vs the torch
+blockwise oracle on the same quantized operands (fnuz-rounded class, same
+policy as the prefill native path); `expert_gemv` FNUZ_NATIVE output is
+**bit-identical** to the manual decode in all four shape/M cells.
+
+Same-node HIP timing (job 676509, median of 200 per-iteration event pairs,
+unpinned clocks — ratios are the signal; this node's manual baseline ran
+~27 µs vs the 22.4 µs record, i.e. ~0.8× clock state):
+
+| shape | M | manual | fnuz-cvt | MFMA | MFMA vs manual |
+|---|---:|---:|---:|---:|---:|
+| gate/up [4096,4096] | 1 | 27.3 µs / 616 GB/s | 27.5 µs (0.99×) | **23.3 µs / 722 GB/s** | **1.17×** |
+| gate/up [4096,4096] | 2 | 31.6 µs / 531 GB/s | 27.3 µs (1.16×) | 26.5 µs / 635 GB/s | 1.19× |
+| down [4096,2048] | 1 | 14.8 µs / 566 GB/s | 14.6 µs (1.01×) | 16.8 µs / 500 GB/s | 0.88× |
+| down [4096,2048] | 2 | 16.4 µs / 512 GB/s | 16.0 µs (1.03×) | 18.4 µs / 456 GB/s | 0.89× |
+
+Triton MFMA decode sweep (job 676512, nid003028, `--sweep` over BN∈{64,128}
+× stages∈{2,3} × sk∈{2,4,8}, BM=16): best gate/up M=1 **363 GB/s** (BN=64,
+s=2, sk=2), down M=1 **183 GB/s** — ~2× behind the HIP manual kernel and
+~2× behind the HIP MFMA kernel; end-to-end `glm_decode_fp8_gemm` is ~74–76
+µs because the fused activation quantize alone costs ~36 µs. The
+`torch_blockwise` default backend (BM=128 tiles) is 2758/1400 µs at these
+shapes — the M≤16 tile is what makes the decode path viable at all.
+
+**Verdict.** The ≥2× acceptance (≥1502 GB/s on gate/up M=1) is not met by
+any variant. Best measured is the HIP MFMA kernel at 722 GB/s — 1.17× the
+same-node manual decode and still below the 751 GB/s record in absolute
+GB/s. Removing the per-byte decode did NOT make the kernels bandwidth-bound:
+at M=1/BM=16 the op mix is dominated by scale handling + LDS staging +
+the padded-tile MAC overhead, and on the down shape (K=2048) MFMA actively
+regresses. The manual-decode plateau therefore stands as the decode
+record; `glm_fp8_fnuz_mfma_block_gemv` stays in-tree as a validated
+experiment (correct, oracle-parity) but is not adopted for serving, and
+the serving dispatch remains unchanged. The secondary FNUZ_NATIVE bitcast
+is numerics-identical and perf-neutral (±3%, four cells) — kept merged, no
+win. The full-model quality gate (+0.01 nats/token vs SGLang) from
+`docs/issue148-reconciliation.md` item 4 is moot for adoption at this
+speedup and remains unexecuted.
+
+Reproduce: `SRC=/capstor/scratch/cscs/xyao/issue148 sbatch --exclusive -A
+a-infra01 meta/scripts/issue148_decode_mfma_mi300.sh` (jobs 676509,
+676512; JSON at `work/glm53/issue148_decode.json` on beverin).

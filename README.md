@@ -70,6 +70,81 @@ Every kernel and collective in this repo is provided **twice**:
 This means you can develop, review, and get to 100% coverage on any laptop, and run the
 GPU path only on machines that have a toolkit and device.
 
+## Kernel catalog
+
+One row per kernel family (details, per-function contracts and benchmarks in
+[`docs/README.md`](docs/README.md)). **Verified?** means:
+
+- **formal** — mechanically proved (GPUVerify/ESBMC; see the next section)
+- **CI** — CPU/eager oracle + GPU parity test, run in CI (host + cuda jobs)
+- **MI300A** — oracle + on-device parity validated on MI300A (the `hip` CI job
+  has no runner; records under `docs/performance/`)
+- **oracle** — oracle exists, GPU qualification open (experimental, out of dispatch)
+- **draft** — design only, unmeasured
+
+| Type | Name | Precision | Supported hardware | Verified? | Notes |
+|---|---|---|---|---|---|
+| act | `elementwise` (C++) | fp32 | CUDA + CPU oracle | formal | add/scale/relu; race-free all schedules |
+| act | `elementwise` (torch_ops) | bf16/fp32 | CUDA (Triton) | CI | HF RMSNorm/RoPE/SiLU fusions, paged KV store |
+| act | `silu_mul_clamp` | bf16 | CUDA (Triton) | CI | clamp+clamp+SiLU+mul, one launch |
+| comp | `reduce` (sum/max) | fp32 | CUDA + CPU oracle | formal | two-stage grid reduce |
+| comp | `gemm` (SGEMM) | fp32 | CUDA + CPU oracle | formal | 16×16 tiled; z3 index-map proof |
+| comp | `gemm_bf16` | bf16 (fp32 acc) | HIP gfx942; MI300A/GB10 tile tables | MI300A | K16 MFMA, Kimi-K3 projection shapes |
+| comp | `gemm_grouped` | fp8 (masked m-grouped) | CUDA + CPU oracle | CI | DeepSeek `m_grouped_fp8_gemm_nt_masked` contract |
+| comp | `mqa_logits` | fp8-e4m3 → fp32 | CUDA + CPU oracle | CI | paged MQA gated top-k logits (kpool stage) |
+| comp | `glm_gemv` + projection GEMVs | bf16 | CUDA (Triton) | CI | pinned decode GEMVs; `independent_rows` bitwise row-invariance |
+| comp | `glm_dense_fp8_gemv` | bf16 act, fp8-e4m3 w, fp32 scales | CUDA (Triton) | CI | dense block-fp8 decode GEMV, small M |
+| comp | `glm_expert_gemv` (+`_fused`) | fp8-e4m3 w, fp32 scales → bf16 | CUDA (Triton) | CI | selected-expert decode GEMV (#64/#65) |
+| comp | `glm_fp8_blockwise_gemm` (+`_glm_fp8_sm90_gemm`) | fp8 blockwise | SM90 (CuTe DSL) + Triton | CI | GLM-5.3 grouped/MoE GEMM |
+| comp | `fp8_linear` | fp8 act, block scales | CUDA (Triton) | CI | per-token-group quant dense projections |
+| comp | `deepgemm_linear` / `deepgemm_moe` | fp8 W8A8 | SM90 (pinned DeepGEMM) | CI | block-128 dense; masked grouped MoE decode |
+| comp | `v41_fp8_gemm` / `v41_mxfp4_gemv` | fp8 UE8M0 / MXFP4 | CUDA (Triton) | CI | DeepSeek-V4.1 stacks |
+| comp | `dense_fp8_small_batch` | fp8 w → bf16 | CUDA sm ≥ 9 (Triton) | oracle | small-M tensor-core GEMM, out of dispatch |
+| comp | `expert_fp8_tensorcore` | fp8 w → bf16 | CUDA sm ≥ 9 (Triton) | oracle | expert projection, out of dispatch |
+| comp | `qkv_tuned_blas` | bf16 | CUDA (BLAS) | CI | opt-in pre-tuned serialized-inference QKV |
+| attn | `mla` (C++) | bf16 (fp32 acc) | HIP gfx942 | MI300A | absorbed MLA, online softmax, chunked prefill masks |
+| attn | `triton_attn` | bf16 (fp32 acc) | CUDA (Triton) | CI | paged single-token decode |
+| attn | `tokenspeed_mla` | bf16 | CUDA (Triton, vendored) | CI | MLA prefill/decode portable path |
+| attn | `tokenspeed_dsa` / `vllm_sparse_mla` / `sgl_sparse_mla` | bf16 | CUDA (vendored) | CI | sparse-MLA donors (TokenSpeed / vLLM / SGLang, SM90) |
+| attn | `v41_sparse_attention` | bf16 | CUDA (Triton) | CI | DSA forward + attention sink |
+| attn | `dsa` (C++) | bf16; fp8-e4m3fnuz logits | HIP gfx942 | MI300A | sparse-MLA fwd + top-k transform + kpool cache (#51, #58, #60) |
+| attn | DSA Triton tier (`dsa_kpool_*`, `dsa_resolve_rows`, `dsa_tail_scatter`, `dsa_latent_gather`, `dsa_qkva_stacked`) | bf16/fp8 | CUDA (Triton) | CI | indexer metadata, row resolve, gathers/scatters |
+| attn | `glm_indexer_topk` / `v41_dsa_indexer` | fp32 | CUDA (Triton) | CI | exact deterministic top-k; V4.1 Lightning scores |
+| attn | tokenspeed_amd MHA/MLA/RMHA | bf16 | AMD Gluon CDNA3/4 | MI300A | vendored TokenSpeed-Kernel-AMD (MIT); CDNA3 ports validated on-device |
+| ssm | `kda` (C++) | bf16 | HIP gfx942 | MI300A | per-key-dim delta rule; WY chunked (#70); CP state handoff |
+| ssm | `glm_kda_decode` / `_fused` / `_packed` | fp32/bf16 | CUDA | CI | decode variants; packed ≈2× the Triton path |
+| ssm | `glm_kda_conv_update` / `glm_forget_gate` | bf16 | CUDA (Triton) | CI | conv+SiLU+state roll; fused 2nd projection + gate |
+| ssm | `vllm_kda` / `glm_kda_chunk` | bf16 | CUDA (Triton, vendored fla) | CI | chunked prefill |
+| ssm | `vllm_kda_amd` | bf16 | HIP gfx942 (vendored vLLM) | MI300A | the GLM-5.3 ROCm path |
+| ssm | `gdn_commit` | bf16 | CUDA (Triton) | CI | deferred GDN SSM commit (DFlash2 verify) |
+| mhc | `mhc` (C++) | bf16 in → fp32 out | HIP gfx942 | MI300A | pre GEMM+sqrsum and post combine, static LDS (#51) |
+| mhc | `glm_mhc_mix` / `mhc_compose` / `mhc_chain` / `glm_mhc_big_fuse` | bf16 | CUDA (Triton) | CI | gate/Sinkhorn/collapse chain fusions |
+| mhc | `aiter_mhc_fused` | bf16 | gfx942 (AITER) | vendor | `mhc_fused_post_pre` bridge |
+| moe | `glm_moe` (C++ `glm_fp8_block_gemv`) | fp8-e4m3 w, fp32 scales | HIP gfx942 | MI300A | split-K dequant-fused expert GEMV (#64) |
+| moe | `moe` primitives #12–#15 | bf16 / fp4 | HIP gfx942 + CPU | MI300A | direct-LDS fill, fp4→bf16, async gate, K16 MFMA |
+| moe | `moe_aux` | bf16 → MXFP4 | HIP gfx942 + CPU | MI300A | quant / sort / scatter-reduce orchestration (#22) |
+| moe | `moe_fused` | bf16 act, fp4 (E2M1+UE8M0) w | HIP gfx90a + gfx942 | MI300A + MI250X | end-to-end fused MXFP4 MoE; exact vs oracle |
+| moe | `dist` (TP/EP/PP) | — | host + HIP stages | CI | MoE weight sharding + orchestration (#18) |
+| moe | `glm_moe_grouped` / `glm_moe_decode` | fp8 w, bf16 act | CUDA (Triton) | CI | 2-/3-launch grouped MoE decode |
+| moe | `sgl_moe` | fp8_w8a8, block [128,128] | CUDA (Triton, vendored SGLang) | CI | fused MoE + per-token-group quant; per-layout tol gate |
+| moe | `moe_combine` / `moe_deterministic_combine` / `moe_ep_remap` | bf16/fp32 | CUDA (Triton) | CI | weighted top-k combine; EP route translation |
+| moe | `glm_router` / `glm_router_dense` | bf16/fp32 | CUDA (Triton) | CI | sigmoid top-k router + scoring-GEMV fold |
+| quant | `glm_expert_gather_dequant` | e4m3 → bf16/fp16 | CUDA (Triton) | CI | gather + block-dequant |
+| quant | `v41_mxfp4_dequant` | E2M1+E8M0 → bf16/fp16 | CUDA (Triton) | CI | microscale dequant |
+| spec | `dflash` | bf16 | CUDA (Triton) | CI | block accept, draft prepare, selector walk |
+| mem | `state_transfer` | bit-exact (any) | CUDA (Triton) | CI | row pool ↔ fixed-address stage tensors |
+| comm | ring `allreduce` | fp32 | CUDA + mock channel/CPU | formal | GPUVerify-checked fused stub; channel transport |
+| comm | `overlap` executor | — | CUDA | CI | dual-stream lockstep compute/comm overlap |
+| comm | `pipeline_boundary` | bytes | CUDA / NCCL | formal | graph-capturable PP transfer + eager-break (#10) |
+| comm | `kv_gather` / `kv_scatter` | bf16/fp16 | CUDA | formal | fused indexed K/V layer gather/scatter (#1, #2) |
+| comm | `p2p_gather` (run-list) | bytes | CUDA (UVA) | CI | 1-D/2-D disjoint runs, plan API, adaptive dispatch |
+| comm | `p2p_kv_restore` (+plan) | bf16/fp16 | CUDA (UVA) | CI | fused peer gather + indexed scatter; per-layer reuse (#27) |
+| comm | `p2p_kv_donate` (+plan) | bf16/fp16 | CUDA (UVA) | CI | fused indexed gather + peer store; adaptive (#36) |
+| comm | `cross_node_kv` + `fabric_import` | bf16/fp16 | CUDA / NCCL / fabric (IMEX) | CI | prepared plans over cross-node memory; JSC-HDR measured (#49) |
+| comm | `cross_node_kv_allgather` | bf16/fp16 | CUDA / fabric | draft | N−1-edge all-gather plan, unmeasured (#49) |
+| comm | RCCL transport + OFI/CXI plugin | bytes | HIP/RCCL (+Slingshot) | CI | graph-capturable RCCL plans; host oracle always built (#19) |
+| comm | `sgl_push` | bf16 (in-place SUM) | SM90, TP4 | CI | pinned SGLang 0.5.20 one-shot push |
+
 ## Formally verified kernels
 
 Structural properties (data-race freedom for **all** thread/block schedules) are proved

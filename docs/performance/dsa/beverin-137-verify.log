@@ -1,0 +1,509 @@
+=== node: nid003028  date: 2026-10-11T14:28:07Z ===
+GPU[0]		: Card Series: 		Aqua Vanjaram [Instinct MI300A]
+GPU[0]		: Card Model: 		0x74a0
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+=== lock perf level high ===
+(setperflevel not permitted; continuing)
+GPU[0]		: mclk clock level: 3: (1300Mhz)
+GPU[0]		: sclk clock level: S: (96Mhz)
+GPU[1]		: mclk clock level: 3: (1300Mhz)
+GPU[1]		: sclk clock level: S: (102Mhz)
+=== configure (HIP, gfx942, Release, benchmarks ON) ===
+-- Configuring done (0.7s)
+-- Generating done (1.3s)
+-- Build files have been written to: /capstor/scratch/cscs/xyao/vkernels-i137-verify/build-i137
+=== build (test_dsa_correct + dsa_bench_split137) ===
+[ 95%] Built target vkernels
+[100%] Built target test_dsa_correct
+[ 95%] Built target vkernels
+[100%] Built target dsa_bench_split137
+
+###### 1. CORRECTNESS (test_dsa_correct) — every dispatch variant ######
+--- 1a. default (unfused vec partial + separate combine) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+--- 1b. VK_DSA_VEC=0 (legacy serial/db dispatch, pre-#137 paths) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+--- 1c. VK_DSA_DB=2 (db kernel forced at every split) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+--- 1d. VK_DSA_FUSE=1 (fused combine: fence+atomic+last-warp merge) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+--- 1e. VK_DSA_VECG=4 (register batch G=4) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+--- 1f. VK_DSA_VECG=8 (deeper register batch, tail-group masking) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+--- 1g. fused + G=4 combined (641089 2f config) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+--- 1h. nondeterminism probe: default env, 3 reps ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+########## rep=0 ##########
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+########## rep=1 ##########
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+########## rep=2 ##########
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=0   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=64 dim=256 tail=0  topk=256  split=0   out[a=0.0019 r=0.001947] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=0   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=256 tail=0  topk=128  split=0   out[a=0.0039 r=0.003850] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=512  H=16 dim=576 tail=64 topk=256  split=0   out[a=0.0019 r=0.001941] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0020 r=0.001953] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=8192 S_kv=1024 H=1  dim=576 tail=64 topk=256  split=0   out[a=0.0039 r=0.003687] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=0  topk=2    split=0   out[a=0.0011 r=0.000808] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2    H=1  dim=2   tail=1  topk=2    split=0   out[a=0.0006 r=0.000486] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=1   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=2   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=7   out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=256  H=16 dim=576 tail=64 topk=256  split=14  out[a=0.0019 r=0.001946] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=2048 H=64 dim=256 tail=0  topk=2048 split=3   out[a=0.0010 r=0.000977] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=1    S_kv=128  H=64 dim=256 tail=0  topk=128  split=128 out[a=0.0036 r=0.003602] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=7   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+  S_q=64   S_kv=256  H=1  dim=256 tail=0  topk=128  split=2   out[a=0.0030 r=0.002837] lse[a=0.0000 r=0.000000 inf=0.0]  PASS
+
+PASS (0 failure(s))
+
+###### 2. SPLIT SWEEP (dsa_bench_split137) — serial vs db vs vec ######
+--- 2a. serial baseline (VK_DSA_DB=0 VK_DSA_VEC=0) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+env: VK_DSA_DB=0 VK_DSA_VEC=0 VK_DSA_FUSE=(unset) VK_DSA_VECG=(unset)
+
+=== DSA split-key sweep, issue #137 (decode shapes; split x partial [+ combine]) ===
+
+  H=64 S_q=1 topk=2048 (dim=256 tail=0): dsa_sparse_fwd_split_for = 32
+    split   us(min)   us(med)      GB/s  speedup  note
+        1    2341.6    2353.3      28.5     1.0x  
+        2    1600.6    1605.0      41.9     1.5x  
+        4     823.6     832.5      80.7     2.8x  
+        8     434.6     438.0     153.4     5.4x  
+       16     247.0     248.5     270.3     9.5x  
+       32     171.1     173.1     388.2    13.6x  <- split_for
+       64     165.9     169.2     397.2    13.9x  
+      128     235.6     240.2     279.7     9.8x  
+      256     393.6     397.9     168.9     5.9x  
+
+  H=64 S_q=1 topk=256 (dim=256 tail=0): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     298.7     300.4      28.1     1.0x  
+        2     210.6     212.9      39.7     1.4x  
+        4     114.0     118.0      71.7     2.5x  
+        8      70.7      73.6     114.8     4.1x  
+       16      56.5      59.7     141.7     5.0x  <- split_for
+       32      65.4      69.1     122.4     4.3x  
+       64     101.6     104.4      81.0     2.9x  
+      128     181.0     184.8      45.8     1.6x  
+      256     345.5     349.1      24.2     0.9x  
+
+  H=64 S_q=1 topk=128 (dim=256 tail=0): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     152.2     155.8      27.3     1.0x  
+        2     110.3     113.8      37.5     1.4x  
+        4      64.8      67.0      63.5     2.3x  
+        8      45.2      48.6      87.6     3.2x  
+       16      42.7      45.8      93.0     3.4x  <- split_for
+       32       0.0       0.0       inf     infx  
+       64      96.7      99.7      42.7     1.6x  
+      128     178.2     181.7      23.4     0.9x  
+
+  H=16 S_q=1 topk=256 (dim=576 tail=64): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     535.1     543.0       9.7     1.0x  
+        2     387.2     390.1      13.5     1.4x  
+        4     206.2     208.8      25.3     2.6x  
+        8     120.2     123.5      42.8     4.4x  
+       16      92.4      95.3      55.4     5.7x  <- split_for
+       32     102.8     106.7      49.5     5.1x  
+       64     160.4     164.0      32.2     3.3x  
+      128     290.0     293.2      18.0     1.9x  
+      256     562.2     565.9       9.3     1.0x  
+--- 2b. db kernel forced at every split (VK_DSA_DB=2 VK_DSA_VEC=0) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+env: VK_DSA_DB=2 VK_DSA_VEC=0 VK_DSA_FUSE=(unset) VK_DSA_VECG=(unset)
+
+=== DSA split-key sweep, issue #137 (decode shapes; split x partial [+ combine]) ===
+
+  H=64 S_q=1 topk=2048 (dim=256 tail=0): dsa_sparse_fwd_split_for = 32
+    split   us(min)   us(med)      GB/s  speedup  note
+        1    2339.4    2350.9      28.6     1.0x  
+        2    1361.8    1364.2      49.2     1.7x  
+        4     690.2     694.2      96.8     3.4x  
+        8     374.2     377.3     178.1     6.2x  
+       16     218.9     221.7     303.1    10.6x  
+       32     228.8     230.7     291.2    10.2x  <- split_for
+       64     233.9     237.6     282.8     9.9x  
+      128     320.4     322.9     208.1     7.3x  
+      256     490.8     495.4     135.6     4.7x  
+
+  H=64 S_q=1 topk=256 (dim=256 tail=0): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     299.1     301.2      28.1     1.0x  
+        2     180.6     183.8      46.0     1.6x  
+        4      98.5     102.2      82.8     2.9x  
+        8      63.5      66.5     127.2     4.5x  
+       16      53.0      56.2     150.4     5.4x  <- split_for
+       32      74.8      76.3     110.8     3.9x  
+       64     112.0     116.3      72.7     2.6x  
+      128     203.8     205.1      41.2     1.5x  
+      256     379.8     382.1      22.1     0.8x  
+
+  H=64 S_q=1 topk=128 (dim=256 tail=0): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     152.2     154.6      27.6     1.0x  
+        2      95.4      98.4      43.3     1.6x  
+        4      55.8      59.0      72.2     2.6x  
+        8      41.6      44.9      94.9     3.4x  
+       16      41.3      44.9      94.8     3.4x  <- split_for
+       32      63.5      65.4      65.1     2.4x  
+       64     105.3     108.0      39.5     1.4x  
+      128     196.6     198.6      21.4     0.8x  
+
+  H=16 S_q=1 topk=256 (dim=576 tail=64): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     538.0     544.0       9.7     1.0x  
+        2     318.6     321.2      16.4     1.7x  
+        4     173.3     174.6      30.2     3.1x  
+        8     102.8     106.5      49.6     5.1x  
+       16      82.9      86.5      61.1     6.3x  <- split_for
+       32     118.6     121.7      43.4     4.5x  
+       64     181.6     184.6      28.6     2.9x  
+      128     321.4     324.5      16.3     1.7x  
+      256     606.6     612.4       8.6     0.9x  
+--- 2c. shipped default dispatch (unfused vec, split_for 32/16) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+env: VK_DSA_DB=(unset) VK_DSA_VEC=(unset) VK_DSA_FUSE=(unset) VK_DSA_VECG=(unset)
+
+=== DSA split-key sweep, issue #137 (decode shapes; split x partial [+ combine]) ===
+
+  H=64 S_q=1 topk=2048 (dim=256 tail=0): dsa_sparse_fwd_split_for = 32
+    split   us(min)   us(med)      GB/s  speedup  note
+        1    2335.6    2349.9      28.6     1.0x  
+        2     551.2     553.7     121.3     4.2x  
+        4     283.9     287.8     233.4     8.2x  
+        8     156.6     161.0     417.2    14.6x  
+       16     103.6     106.4     631.2    22.1x  
+       32      94.0      98.8     680.0    23.8x  <- split_for
+       64     123.4     126.2     532.5    18.6x  
+      128     197.8     200.1     335.7    11.7x  
+      256     358.1     363.7     184.7     6.5x  
+
+  H=64 S_q=1 topk=256 (dim=256 tail=0): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     297.2     301.0      28.1     1.0x  
+        2      78.5      81.8     103.4     3.7x  
+        4      47.8      50.8     166.4     5.9x  
+        8      36.4      39.6     213.5     7.6x  
+       16       0.0       0.0       inf     infx  <- split_for
+       32      55.4      58.1     145.5     5.2x  
+       64      95.0      98.8      85.5     3.0x  
+      128     177.0     180.8      46.8     1.7x  
+      256     341.6     346.0      24.4     0.9x  
+
+  H=64 S_q=1 topk=128 (dim=256 tail=0): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     151.8     155.3      27.4     1.0x  
+        2      47.3      48.2      88.5     3.2x  
+        4      30.9      34.1     125.0     4.6x  
+        8      30.0      30.9     138.0     5.0x  
+       16      33.2      36.7     116.1     4.2x  <- split_for
+       32      53.6      56.0      76.0     2.8x  
+       64      95.0      97.6      43.7     1.6x  
+      128     178.2     179.4      23.7     0.9x  
+
+  H=16 S_q=1 topk=256 (dim=576 tail=64): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     539.9     543.7       9.7     1.0x  
+        2     317.4     322.0      16.4     1.7x  
+        4     172.4     175.0      30.2     3.1x  
+        8     102.8     106.8      49.4     5.1x  
+       16      82.4      86.4      61.1     6.3x  <- split_for
+       32     103.2     107.0      49.4     5.1x  
+       64     160.4     164.4      32.1     3.3x  
+      128     292.4     295.1      17.9     1.8x  
+      256     564.5     568.1       9.3     1.0x  
+--- 2d. fused combine (VK_DSA_FUSE=1; expected ~20-25% slower) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+env: VK_DSA_DB=(unset) VK_DSA_VEC=(unset) VK_DSA_FUSE=1 VK_DSA_VECG=(unset)
+
+=== DSA split-key sweep, issue #137 (decode shapes; split x partial [+ combine]) ===
+
+  H=64 S_q=1 topk=2048 (dim=256 tail=0): dsa_sparse_fwd_split_for = 32
+    split   us(min)   us(med)      GB/s  speedup  note
+        1    2339.2    2351.7      28.6     1.0x  
+        2     565.0     570.5     117.8     4.1x  
+        4     297.6     305.2     220.1     7.7x  
+        8     188.3     190.6     352.6    12.3x  
+       16     146.8     150.6     446.1    15.6x  
+       32     162.8     165.7     405.5    14.2x  <- split_for
+       64     249.2     255.2     263.3     9.2x  
+      128     442.7     455.5     147.5     5.2x  
+      256     853.0     870.2      77.2     2.7x  
+
+  H=64 S_q=1 topk=256 (dim=256 tail=0): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     298.4     301.0      28.1     1.0x  
+        2      98.7     103.8      81.4     2.9x  
+        4      73.0      77.6     109.0     3.9x  
+        8      72.8      76.1     111.1     4.0x  
+       16      87.6      90.0      93.9     3.3x  <- split_for
+       32     131.9     136.8      61.8     2.2x  
+       64     225.5     243.1      34.8     1.2x  
+      128     438.8     454.2      18.6     0.7x  
+      256     831.7     867.1       9.8     0.3x  
+
+  H=64 S_q=1 topk=128 (dim=256 tail=0): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     151.7     155.7      27.4     1.0x  
+        2      66.8      71.2      59.8     2.2x  
+        4       0.0       0.0       inf     infx  
+        8      64.6      67.7      62.9     2.3x  
+       16      79.4      84.4      50.5     1.8x  <- split_for
+       32     127.4     132.2      32.2     1.2x  
+       64     234.8     240.6      17.7     0.6x  
+      128     425.0     445.1       9.6     0.3x  
+
+  H=16 S_q=1 topk=256 (dim=576 tail=64): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     539.4     544.2       9.7     1.0x  
+        2     318.7     322.1      16.4     1.7x  
+        4     173.6     174.8      30.2     3.1x  
+        8     102.7     106.6      49.5     5.1x  
+       16      82.8      86.2      61.2     6.3x  <- split_for
+       32     102.3     106.8      49.4     5.1x  
+       64     160.3     163.1      32.4     3.3x  
+      128     291.3     294.8      17.9     1.8x  
+      256     560.6     570.6       9.3     1.0x  
+--- 2e. vec G=4, unfused (VK_DSA_VECG=4) ---
+GPU: AMD Instinct MI300A (arch=gfx942:sramecc+:xnack-)
+env: VK_DSA_DB=(unset) VK_DSA_VEC=(unset) VK_DSA_FUSE=(unset) VK_DSA_VECG=4
+
+=== DSA split-key sweep, issue #137 (decode shapes; split x partial [+ combine]) ===
+
+  H=64 S_q=1 topk=2048 (dim=256 tail=0): dsa_sparse_fwd_split_for = 32
+    split   us(min)   us(med)      GB/s  speedup  note
+        1    2343.0    2352.8      28.6     1.0x  
+        2     623.6     626.5     107.2     3.8x  
+        4     325.4     328.3     204.6     7.2x  
+        8     184.1     187.4     358.4    12.6x  
+       16     119.2     123.3     545.0    19.1x  
+       32     106.6     109.7     612.3    21.4x  <- split_for
+       64     138.1     143.0     469.8    16.5x  
+      128     233.4     244.0     275.4     9.6x  
+      256     396.9     406.7     165.2     5.8x  
+
+  H=64 S_q=1 topk=256 (dim=256 tail=0): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     297.7     300.5      28.1     1.0x  
+        2      87.2      91.1      92.8     3.3x  
+        4      52.8      56.7     149.1     5.3x  
+        8      39.8      43.4     194.8     6.9x  
+       16      40.8      44.0     192.0     6.8x  <- split_for
+       32      58.2      61.1     138.4     4.9x  
+       64     101.8     104.9      80.6     2.9x  
+      128     180.5     183.9      46.0     1.6x  
+      256     343.4     350.1      24.2     0.9x  
+
+  H=64 S_q=1 topk=128 (dim=256 tail=0): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     151.8     155.1      27.5     1.0x  
+        2      49.3      52.4      81.3     3.0x  
+        4       0.0       0.0       inf     infx  
+        8      32.3      33.0     128.9     4.7x  
+       16      34.7      38.9     109.5     4.0x  <- split_for
+       32      55.0      57.8      73.7     2.7x  
+       64      96.3      98.4      43.3     1.6x  
+      128     177.0     181.4      23.5     0.9x  
+
+  H=16 S_q=1 topk=256 (dim=576 tail=64): dsa_sparse_fwd_split_for = 16
+    split   us(min)   us(med)      GB/s  speedup  note
+        1     539.6     544.8       9.7     1.0x  
+        2     319.2     321.6      16.4     1.7x  
+        4     171.7     174.5      30.3     3.1x  
+        8     102.6     106.7      49.5     5.1x  
+       16      83.9      86.2      61.3     6.3x  <- split_for
+       32     102.6     106.9      49.4     5.1x  
+       64     158.6     162.9      32.4     3.3x  
+      128     292.6     294.8      17.9     1.8x  
+      256     566.2     571.1       9.2     1.0x  
+=== done 2026-10-11T14:28:45Z ===
