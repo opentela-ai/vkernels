@@ -26,18 +26,9 @@ MIT-licensed ``aiter/ops/triton/gluon/mla_gluon.py`` at commit
 ``ae0bae8954110b12655e3232f68262dd63cd694e``. The implementation here retains
 TokenSpeed's paged-cache interface (page IDs plus an arbitrary page size).
 
-The shared kernel supports five fixed regimes:
-
-* ``bh16bn128`` -- BF16/FP8 Q + FP8 KV, BLOCK_H=16, BLOCK_N=128 and
-  ``num_q_heads <= 16`` and arbitrary batch sizes.
-* ``bh16bn64`` -- BF16 Q + BF16 KV, BLOCK_H=16, BLOCK_N=64,
-  ``num_q_heads <= 16``.
-* ``bh64`` -- BLOCK_H=64, BLOCK_N=64, ``num_q_heads in {64, 128}``, 3-D
-  XCD-aware grid, ``batch_size`` divisible by 64.
-* ``bh16-multiblock`` -- BF16 Q/KV, BLOCK_H=16,
-  ``num_q_heads == 64``, ``batch_size == 1``, 3-D grid.
-* ``bh64-small`` -- BF16 Q/KV, BLOCK_H=64,
-  ``num_q_heads == 64``, ``batch_size in {2, 4}``, 3-D grid.
+The CDNA3 port supports only the ``bh16bn64`` launcher: BF16 Q/KV,
+BLOCK_H=16, num_q_heads <= 16. Its implementation uses BLOCK_N=32 to
+fit gfx942 LDS. Other upstream regimes and FP8 inputs are rejected.
 """
 
 from __future__ import annotations
@@ -46,8 +37,6 @@ import torch
 from vkernels.torch_ops.tokenspeed_amd._gluon import gl, gluon, tl, triton
 
 # --- PORT (CDNA3/gfx942): inlined upstream ``_common`` pieces ---
-
-from triton.experimental.gluon.language import amd
 
 # Upstream binds ``gl.amd.cdna4``; CDNA3 exposes identical buffer ops.
 _amd_ns = getattr(gl, "amd", None)
@@ -991,8 +980,6 @@ class AttentionProgram:
         p = gl.exp2((qk - n_e_max[:, None]) * _INV_LN2)
         e_sum = e_sum * re_scale + gl.sum(p, 1)
         e_max = n_e_max
-        if cfg.IS_FP8_Q:
-            p *= _FP8_PROBABILITY_SCALE
         p = p.to(dtype)
         p = gl.convert_layout(p, cfg.p_layout)
         acc *= re_scale[:, None]
@@ -1030,8 +1017,6 @@ class AttentionProgram:
         )
         acc *= self.kv_scale
         rcp = 1.0 / e_sum
-        if cfg.IS_FP8_Q:
-            rcp /= _FP8_PROBABILITY_SCALE
         stored_value = (acc * rcp[:, None]).to(out_dtype)
         if cfg.NHEAD < cfg.BLOCK_H:
             gl.amd.cdna3.buffer_store(
@@ -1503,64 +1488,16 @@ def _gluon_mla_decode_gfx950(
     is_fp8_q = False
 
     batch_size, _, nhead, _ = q.shape
-    if regime == "bh16bn128":
-        if not is_fp8_kv:
-            raise NotImplementedError(
-                "gluon MLA decode (bh16bn128) requires an FP8 kv_cache"
-            )
-        if not 1 <= nhead <= 16:
-            raise NotImplementedError(
-                "gluon MLA decode (bh16bn128) requires num_q_heads in [1, 16], "
-                f"got {nhead}"
-            )
-        block_h = 16
-        block_n = 128
-        num_xcds = 1
-    elif regime == "bh16bn64":
-        if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
-            raise NotImplementedError(
-                "gluon MLA decode (bh16bn64) requires bf16 q and kv_cache"
-            )
-        if not 1 <= nhead <= 16:
-            raise NotImplementedError(
-                "gluon MLA decode (bh16bn64) requires num_q_heads in [1, 16], "
-                f"got {nhead}"
-            )
-        block_h = 16
-        # PORT (CDNA3): 32 instead of 64 - the single-buffered KV ring must
-        # fit gfx942's 64 KB LDS alongside the Q tiles.
-        block_n = 32
-        num_xcds = 1
-    elif regime == "bh64":
-        if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
-            raise NotImplementedError("gluon MLA bh64 requires bf16 q and kv_cache")
-        if nhead not in (64, 128):
-            raise NotImplementedError(
-                "gluon MLA decode (bh64) requires num_q_heads in {64, 128}, "
-                f"got {nhead}"
-            )
-        block_h = 64
-        block_n = 64
-        num_xcds = _NUM_XCDS
-        if batch_size % 64 != 0:
-            raise NotImplementedError(
-                "gluon MLA decode (bh64) is large-batch only and requires "
-                f"batch_size divisible by 64, got {batch_size}"
-            )
-    else:
-        if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
-            raise NotImplementedError(
-                f"gluon MLA decode ({regime}) requires bf16 q and kv_cache"
-            )
-        if nhead != 64 or batch_size not in _DEFAULT_SMALL_BATCH_TARGET_WORKGROUPS:
-            raise NotImplementedError(
-                f"gluon MLA decode ({regime}) requires num_q_heads=64 and "
-                f"batch_size in {sorted(_DEFAULT_SMALL_BATCH_TARGET_WORKGROUPS)}, "
-                f"got H={nhead}, B={batch_size}"
-            )
-        block_h = 16 if regime == "bh16-multiblock" else 64
-        block_n = 64
-        num_xcds = 1
+    if not 1 <= nhead <= 16:
+        raise NotImplementedError(
+            "gluon MLA decode (bh16bn64) requires num_q_heads in [1, 16], "
+            f"got {nhead}"
+        )
+    block_h = 16
+    # PORT (CDNA3): 32 instead of 64 - the single-buffered KV ring must
+    # fit gfx942's 64 KB LDS alongside the Q tiles.
+    block_n = 32
+    num_xcds = 1
     if kv_cache.dim() == 4:
         if kv_cache.shape[2] != 1 or kv_cache.shape[3] != qk_dim:
             raise ValueError(

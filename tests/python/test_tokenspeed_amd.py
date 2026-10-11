@@ -481,12 +481,28 @@ def test_registry_rejects_cpu_tensors():
     assert any("GPU" in r for r in reasons)
 
 
+@pytest.mark.parametrize("regime", ["bh16bn128", "bh64", "bh16-multiblock", "bh64-small"])
+def test_mla_decode_rejects_unported_regimes_before_launch(regime):
+    pytest.importorskip("triton.experimental.gluon.language.amd.cdna3")
+    gluon = pytest.importorskip("triton.experimental.gluon")
+    if not hasattr(gluon, "aggregate"):
+        pytest.skip("MLA decode requires Triton 3.8 Gluon aggregates")
+    from vkernels.torch_ops.tokenspeed_amd import mla_decode
+
+    with pytest.raises(ValueError, match="unsupported MLA decode regime"):
+        mla_decode._gluon_mla_decode_gfx950(
+            None, None, None, None, 0, 128, 512, 64, 1.0, regime=regime,
+        )
+
+
 # --- GPU parity (skipped without a working gluon driver) ------------------------
 
 
 def _gluon_driver():
+    if not torch.version.hip:
+        pytest.skip("AMD Gluon kernels require ROCm")
     if not torch.cuda.is_available():
-        pytest.skip("CUDA/ROCm required")
+        pytest.skip("ROCm GPU required")
     if not ts_amd.gluon_available():
         pytest.skip("gluon unavailable on this triton")
     try:
