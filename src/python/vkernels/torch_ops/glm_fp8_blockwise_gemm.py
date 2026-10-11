@@ -225,7 +225,7 @@ def _torch_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out):
 # ---------------------------------------------------------------------------
 
 
-def _route_counts(topk_index, n_experts, device):
+def _route_counts(topk_index, n_experts, device, route_weights=None):
     """Host-sync-free routing metadata.
 
     ``argsort`` is stable, so sorting the flattened (token, slot) expert ids
@@ -243,11 +243,18 @@ def _route_counts(topk_index, n_experts, device):
 
     t, k = topk_index.shape
     flat = topk_index.reshape(-1)
+    if route_weights is not None:
+        # Put dropped routes at the end of the full, stable permutation.
+        # The extra count bucket is discarded on-device: no host count or
+        # data-dependent tensor shape, and no GEMM tile for dropped slots.
+        flat = torch.where((flat >= 0) & (route_weights.reshape(-1) != 0),
+                           flat, n_experts)
     tokens = torch.arange(t, device=device).repeat_interleave(k)
     order = torch.argsort(flat, stable=True)
-    counts = torch.zeros(n_experts, dtype=torch.int64, device=device).scatter_add_(
+    buckets = n_experts + int(route_weights is not None)
+    counts = torch.zeros(buckets, dtype=torch.int64, device=device).scatter_add_(
         0, flat, torch.ones_like(flat)
-    )
+    )[:n_experts]
     seg = torch.cumsum(counts, 0) - counts
     return order, tokens[order], counts, seg
 
@@ -809,6 +816,8 @@ def glm_moe_grouped_gemm_native(
     swiglu_limit=7.0,
     swiglu_fn=None,
     deterministic_combine=False,
+    skip_zero_weights=False,
+    round_products_to_bf16=False,
 ):
     """Routed expert MLP via TWO single-launch grouped fp8 GEMMs.
 
@@ -826,6 +835,13 @@ def glm_moe_grouped_gemm_native(
     silu+clamp kernel here (fused_silu_clamp, the SGLang
     silu_and_mul_with_thresh design). The callable owns its eligibility
     and never raises; ``None`` (default) keeps the eager chain below.
+
+    ``skip_zero_weights`` keeps a static-capacity permutation but excludes
+    zero-weight and negative-sentinel routes from expert tile counts. Tail
+    rows are initialized each invocation so activation and combine cannot
+    consume stale data. It avoids host compaction without reducing workspace
+    capacity. ``round_products_to_bf16`` with deterministic combine retains
+    the weighted-row boundary of a compacted [P,1] invocation.
 
     Host work per call: one sort, a handful of tiny torch ops for the
     tile map, two grouped launches, one swiglu + per-row quantize — no
@@ -871,7 +887,10 @@ def glm_moe_grouped_gemm_native(
             "[E,O/128,I/128] scales")
     dev = x.device
 
-    order, sorted_tok, counts, seg = _route_counts(topk_index, n_experts, dev)
+    if round_products_to_bf16 and not deterministic_combine:
+        raise ValueError("product rounding requires deterministic combine")
+    order, sorted_tok, counts, seg = _route_counts(
+        topk_index, n_experts, dev, topk_weights if skip_zero_weights else None)
 
     quantize = _activation_quantizer(gate_up_nz.dtype)
     a_nz, asc2 = quantize(x)
@@ -888,7 +907,10 @@ def glm_moe_grouped_gemm_native(
     cap = min(slots, slots // bm + n_experts + 1)
     tile_exp, tile_r0, tile_m = _tile_map_static(counts, seg, bm, dev, cap)
 
-    gu = torch.empty((slots, two_i), device=dev, dtype=torch.bfloat16)
+    # Static-capacity skipped slots must be initialized on every call/replay;
+    # activation/quantization still covers capacity, including the tail.
+    allocate = torch.zeros if skip_zero_weights else torch.empty
+    gu = allocate((slots, two_i), device=dev, dtype=torch.bfloat16)
     _grouped_backend(
         a_nz,
         asc2,
@@ -918,7 +940,7 @@ def glm_moe_grouped_gemm_native(
     # act rows are per-SLOT in sorted order (K expert assignments per
     # token) — the down GEMM indexes A directly, no gather.
     a2_nz, a2sc2 = quantize(act)
-    dn = torch.empty((slots, h), device=dev, dtype=torch.bfloat16)
+    dn = allocate((slots, h), device=dev, dtype=torch.bfloat16)
     _grouped_backend(
         a2_nz,
         a2sc2,
@@ -936,7 +958,9 @@ def glm_moe_grouped_gemm_native(
 
     if deterministic_combine:
         from .moe_deterministic_combine import deterministic_route_combine
-        return deterministic_route_combine(dn, order, topk_weights)
+        return deterministic_route_combine(
+            dn, order, topk_weights,
+            round_products_to_bf16=round_products_to_bf16)
     w = topk_weights.reshape(-1)[order].float().unsqueeze(-1)
     y = torch.zeros((t, h), device=dev, dtype=torch.float32)
     y.index_add_(0, sorted_tok, dn.float() * w)

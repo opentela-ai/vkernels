@@ -26,7 +26,8 @@ def _kernels():
 
     @triton.jit
     def combine(down, inverse, weights, output,
-                hidden: tl.constexpr, top_k: tl.constexpr, block: tl.constexpr):
+                hidden: tl.constexpr, top_k: tl.constexpr, block: tl.constexpr,
+                round_products_to_bf16: tl.constexpr):
         token = tl.program_id(0)
         col = tl.program_id(1) * block + tl.arange(0, block)
         acc = tl.zeros((block,), tl.float32)
@@ -36,13 +37,17 @@ def _kernels():
             value = tl.load(down + row * hidden + col, col < hidden, 0).to(tl.float32)
             weight = tl.load(weights + original).to(tl.float32)
             product = value * weight
+            if round_products_to_bf16:
+                # Match the compacted [P,1] path's weighted BF16 store
+                # before the outer original-slot FP32 reduction.
+                product = product.to(tl.bfloat16).to(tl.float32)
             acc = acc + product
         tl.store(output + token * hidden + col, acc, col < hidden)
 
     return triton, inverse_order, combine
 
 
-def _fused_route_combine(down, order, weights):
+def _fused_route_combine(down, order, weights, round_products_to_bf16):
     triton, inverse_kernel, combine_kernel = _kernels()
     tokens, top_k = weights.shape
     hidden = down.shape[1]
@@ -56,7 +61,8 @@ def _fused_route_combine(down, order, weights):
     # are part of the reference contract. FMA would change that contract.
     combine_kernel[(tokens, triton.cdiv(hidden, 256))](
         down, inverse, weights, output, hidden=hidden, top_k=top_k,
-        block=256, enable_fp_fusion=False)
+        block=256, round_products_to_bf16=round_products_to_bf16,
+        enable_fp_fusion=False)
     return output
 
 
@@ -67,11 +73,13 @@ def _fixed_sum(rows):
     return out.to(torch.bfloat16)
 
 
-def deterministic_route_combine(down, order, topk_weights):
+def deterministic_route_combine(down, order, topk_weights, *, round_products_to_bf16=False):
     """BF16 expert-sorted rows -> original-route FP32 products -> BF16 sum.
 
     Caller supplies the stable-sort permutation of all T*K original slots.
     No synchronization or data-dependent order/permutation validation occurs.
+    Optional product rounding preserves a compacted weighted-BF16 row
+    boundary while retaining the original route-slot addition order.
     """
     if (down.ndim != 2 or topk_weights.ndim != 2 or order.ndim != 1
             or down.dtype != torch.bfloat16 or order.dtype != torch.int64
@@ -83,10 +91,12 @@ def deterministic_route_combine(down, order, topk_weights):
         raise ValueError("deterministic combine requires one unique permutation slot per routed row")
     if (down.is_cuda and down.is_contiguous() and order.is_contiguous()
             and topk_weights.is_contiguous()):
-        return _fused_route_combine(down, order, topk_weights)
+        return _fused_route_combine(down, order, topk_weights, round_products_to_bf16)
     # Exactly the frozen native expression's FP32 products, before changing
     # ONLY reduction order. scatter has unique original-route destinations.
     weighted = down.float() * topk_weights.reshape(-1)[order].float()[:, None]
+    if round_products_to_bf16:
+        weighted = weighted.to(torch.bfloat16).float()
     original = torch.empty_like(weighted)
     original.index_copy_(0, order, weighted)
     return _fixed_sum(original.reshape(t, k, down.shape[1]))
