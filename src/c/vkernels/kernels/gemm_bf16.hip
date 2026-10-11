@@ -1621,15 +1621,17 @@ bool gemv_decode_fp8_splitk(std::size_t M, std::size_t N, std::size_t K,
 }
 
 // Decode-GEMV v2 entries (issue #156 follow-up): fixed TB=8 (exact uint4
-// weight tiles, zero overlapped fetch), KK-way multi-K register blocking,
-// optional global-memory A reads (a_gmem=true removes the LDS stage and
-// barrier). The bf16 path keeps the exact v1/MFMA numerics contract; the
-// fp8 path uses DEFERRED (128-K x 8-N) block scales -- raw fnuz codes are
-// accumulated unscaled and the scale applied once per block -- which is a
-// NEW contract (no per-element bf16 rounding; validated against an exact
-// deferred oracle, within tolerance of the rounded dequant oracle).
-// kk must be 2, 4 or 8; threads 64/128/256. Returns false (C untouched)
-// for N % 8 != 0, M outside [1, 8], or unsupported kk.
+// weight tiles for bf16; fp8 keeps the v1 16B-fetch pattern), KK-way
+// multi-K register blocking, optional global-memory A reads (a_gmem=true
+// removes the LDS stage and barrier). BOTH variants keep the v1/MFMA
+// per-element-rounded numerics contract (fp8: w = bf16(f2bf(sc*0x1p119 *
+// decode)), bit-exact vs the dequant oracle; scale-block boundaries
+// handled via scale-aligned segments for unaligned split starts). A
+// deferred-scale fp8 variant was measured on MI300A and REJECTED (spill +
+// 5-6x slower; see the kernel block comment above) -- the entry points
+// below never expose it. kk must be 2, 4 or 8; threads 64/128/256.
+// Returns false (C untouched) for N % 8 != 0, M outside [1, 8], or
+// unsupported kk.
 bool gemv_decode_bf16_splitk_v2(std::size_t M, std::size_t N, std::size_t K,
                                 float alpha, const uint16_t* A,
                                 const uint16_t* B, float beta, uint16_t* C,
