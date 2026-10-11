@@ -35,3 +35,24 @@ def test_gpu_cancellation_preserves_product_rounding_and_add_order():
     order = torch.tensor([2, 0, 1], device='cuda')
     actual = deterministic_route_combine(down[order], order, weights)
     assert actual.item() == 2.**-26
+
+
+@pytest.mark.gpu
+def test_gpu_inverse_order_reuses_variant_across_live_counts():
+    if not torch.cuda.is_available():
+        pytest.skip('GPU required')
+    from vkernels.torch_ops.moe_deterministic_combine import _kernels
+
+    # Isolate the in-process dispatch cache from other combine tests. Include
+    # block boundaries and different divisibility classes, like real EP counts.
+    _kernels.cache_clear()
+    triton, inverse_kernel, _ = _kernels()
+    variants = set()
+    for size in (1, 15, 16, 255, 256, 257, 511, 512, 513, 1024, 3071, 3072):
+        order = torch.randperm(size, device='cuda')
+        inverse = torch.full_like(order, -1)
+        compiled = inverse_kernel[(triton.cdiv(size, 256),)](
+            order, inverse, size=size, block=256)
+        variants.add(compiled.hash)
+        assert torch.equal(inverse[order], torch.arange(size, device='cuda'))
+    assert len(variants) == 1
