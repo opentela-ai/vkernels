@@ -2,7 +2,7 @@
 import inspect
 
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 import vkernels.torch_ops.sgl_moe as module
 

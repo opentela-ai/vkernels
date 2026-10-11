@@ -1,6 +1,6 @@
 """Static-capacity routes preserve the compacted weighted-BF16 contract."""
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 from vkernels.torch_ops.glm_fp8_blockwise_gemm import (
     _route_counts,

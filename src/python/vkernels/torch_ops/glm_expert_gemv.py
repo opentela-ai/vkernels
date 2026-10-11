@@ -45,16 +45,18 @@ def _kernel():
         ROWS: tl.constexpr,
         COLS: tl.constexpr,
         FNUZ: tl.constexpr,
+        FNUZ_NATIVE: tl.constexpr = False,
     ):
         selected = tl.program_id(0)
         row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
         col = tl.arange(0, COLS)
         expert = tl.load(IDX + selected).to(tl.int64)
-        raw = tl.load(
+        raw8 = tl.load(
             W + expert * (O * I) + row[:, None] * I + col[None, :],
             (row[:, None] < O) & (col[None, :] < I),
             0,
-        ).to(tl.int32)
+        )
+        raw = raw8.to(tl.int32)
         exponent, mantissa = (raw >> 3) & 15, raw & 7
         if FNUZ:
             # e4m3fnuz storage (AMD-native fp8; issue #71 in-place
@@ -62,16 +64,23 @@ def _kernel():
             # is no -0), subnormals m*2^-10. The stored scales are the
             # DOUBLED scales from e4m3fn_to_fnuz_inplace, so value*scale
             # reproduces the original e4m3fn weight exactly (verified
-            # exhaustive over all 256 bytes). No hardware shortcut: CUDA
-            # has no fnuz dtype and this Triton rejects direct fp8-pointer
-            # loads, so both backends take the manual bit-decode.
-            bits = ((exponent + 119) << 23) | (mantissa << 20)
-            value = tl.where(
-                exponent == 0,
-                mantissa.to(tl.float32) * 0.0009765625,
-                bits.to(tl.float32, bitcast=True),
-            )
-            value = tl.where(raw == 128, float("nan"), value)
+            # exhaustive over all 256 bytes). FNUZ_NATIVE (issue #148): let
+            # the hardware fnuz converter decode (uint8 bitcast to
+            # float8e4b8) — value-identical to the manual decode (the
+            # fnuz->f32 convert is exact, NaN 0x80 included), one cvt
+            # instead of ~10 ALU/SEL ops per weight element; enabled via
+            # GLM53_GEMV_FNUZ_NATIVE=1, measured in
+            # meta/benchmarks/bench_glm_issue148_decode.py.
+            if FNUZ_NATIVE:
+                value = raw8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
+            else:
+                bits = ((exponent + 119) << 23) | (mantissa << 20)
+                value = tl.where(
+                    exponent == 0,
+                    mantissa.to(tl.float32) * 0.0009765625,
+                    bits.to(tl.float32, bitcast=True),
+                )
+                value = tl.where(raw == 128, float("nan"), value)
         else:
             bits = ((exponent + 120) << 23) | (mantissa << 20)
             value = tl.where(
@@ -272,6 +281,7 @@ def _launch_portable(x, weights, scales, indices):
 
 
 def _launch(x, weights, scales, indices, *, native, route_weights=None):
+    import os
     import torch
 
     _, o, i = weights.shape
@@ -284,7 +294,9 @@ def _launch(x, weights, scales, indices, *, native, route_weights=None):
         with torch.cuda.device(x.device):
             kernel = gemv_native if native else gemv
             # Only the portable kernel accepts the storage-format constexpr.
-            extra = [] if native else [weights.dtype == torch.float8_e4m3fnuz]
+            fnuz_native = (weights.dtype == torch.float8_e4m3fnuz and torch.version.hip
+                           and os.environ.get("GLM53_GEMV_FNUZ_NATIVE", "0") not in ("", "0"))
+            extra = [] if native else [weights.dtype == torch.float8_e4m3fnuz, bool(fnuz_native)]
             skip_kwargs = ({"ROUTE_W": route_weights, "SKIP_ZERO": True}
                            if route_weights is not None else {})
             kernel[(t * k, triton.cdiv(o, 4))](

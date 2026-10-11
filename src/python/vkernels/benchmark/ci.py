@@ -2,9 +2,12 @@
 
 The flow (borrowed from tokenspeed-kernel's PR benchmark comparison):
 run the suite on the merge base, run it on the candidate, compare — a case
-whose median runtime regressed beyond the threshold fails the check; new
+whose runtime regressed beyond the threshold fails the check; new
 and removed cases are reported but do not fail it (a new case has no
-baseline; a removed one cannot regress).
+baseline; a removed one cannot regress). The CI interleaves several
+runs per arm and merges them (concatenated samples), so the compared
+number is each arm's floor — the min across repeats — which is robust
+to shared-runner drift between sequential phases.
 """
 
 from __future__ import annotations
