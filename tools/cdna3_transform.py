@@ -29,7 +29,7 @@ from __future__ import annotations
 import argparse
 import re
 
-HEADER = '''from vkernels.torch_ops.tokenspeed_amd._gluon import gl, gluon
+HEADER = '''from vkernels.torch_ops.tokenspeed_amd._gluon import gl, gluon, tl, triton
 
 # --- PORT (CDNA3/gfx942): inlined upstream ``_common`` pieces ---
 
@@ -160,6 +160,9 @@ def transform(src: str) -> str:
     src = re.sub(r"async_copy = cdna4\.async_copy\n", "", src)
 
     # mfma -> cdna3
+    # Fully-qualified ``gl.amd.cdna4.mfma`` (decode.py) first; the bare-alias
+    # rule must not run on it (would yield gl.amd.amd.cdna3).
+    src = src.replace("gl.amd.cdna4.mfma(", "gl.amd.cdna3.mfma(")
     src = src.replace("cdna4.mfma(", "amd.cdna3.mfma(")
 
     # K smem: physically transposed staging ([BLOCK_N, HEAD_DIM] -> [HEAD_DIM, BLOCK_N])
@@ -248,7 +251,38 @@ def transform(src: str) -> str:
         "async_copy.buffer_load_to_shared(k_smem, self.k_ptr, offsets, mask=mask, other=other)",
         "k_smem.store(gl.load(self.k_ptr + offsets, mask=mask, other=other).permute([1, 0]))",
     )
-    src = src.replace("async_copy.commit_group()\n", "")
+    src = src.replace("gl.amd.cdna4.async_copy.commit_group()\n", "")
+    src = re.sub(r"[ \t]*gl\.amd\.cdna[34]\.\n", "", src)
+
+    # Generic async-copy -> synchronous load/store (decode.py pattern:
+    # arbitrary smem/ptr/offsets names, optional masks). Zero-fill masked
+    # lanes: masked page-ID loads rely on lane 0/valid IDs persisting, and
+    # KV tails are boundary-masked downstream anyway.
+    src = re.sub(
+        r"gl\.amd\.cdna4\.async_copy\.buffer_load_to_shared\(\n?"
+        r"\s*([\w.]+),\s*\n?\s*([\w.]+(?:\([^()]*\))?),\s*\n?\s*([\w.+*\[\]:() ]+?),\s*\n?\s*([\w<>()\[\], :.]+?)\s*,?\s*\n?\s*\)",
+        r"\1.store(gl.load(\2 + \3, mask=\4, other=0.0))",
+        src,
+    )
+    src = re.sub(
+        r"gl\.amd\.cdna4\.async_copy\.buffer_load_to_shared\(\n?"
+        r"\s*([\w.]+),\s*\n?\s*([\w.]+(?:\([^()]*\))?),\s*\n?\s*([\w.+*\[\]:() ]+?),\s*\n?\s*mask=([\w<>()\[\], :.]+?)\s*,?\s*\n?\s*\)",
+        r"\1.store(gl.load(\2 + \3, mask=\4, other=0.0))",
+        src,
+    )
+    src = re.sub(
+        r"gl\.amd\.cdna4\.async_copy\.buffer_load_to_shared\(\n?"
+        r"\s*([\w.]+),\s*\n?\s*([\w.]+(?:\([^()]*\))?),\s*\n?\s*([\w.+*\[\]:() ]+?),\s*\n?\s*\)",
+        r"\1.store(gl.load(\2 + \3))",
+        src,
+    )
+    src = re.sub(
+        r"gl\.amd\.cdna4\.async_copy\.load_shared_relaxed\(\n?\s*([\w.]+(?:\([^()]*\))?),\s*([^)]+?)\s*\)",
+        r"\1.load(\2)",
+        src,
+    )
+    # Remaining CDNA4 namespaces (mfma/buffer_store/buffer_load) -> cdna3.
+    src = src.replace("gl.amd.cdna4.", "gl.amd.cdna3.")
 
     # shared_load_k: drop the permuted view (physically transposed now)
     src = src.replace(

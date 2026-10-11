@@ -514,6 +514,47 @@ def bench_mha(results: list) -> None:
         )
 
 
+def bench_mla_decode(results: list) -> None:
+    """CDNA3-ported absorbed MLA decode (bh16bn64, split-K) timing."""
+    from vkernels.torch_ops.tokenspeed_amd import mla_decode as ts_mla
+
+    torch.manual_seed(28)
+    nhead, lora, rope, page_size = 16, 512, 64, 16
+    head_dim = lora + rope
+    for batch in (1, 8, 32):
+        seq = 4096
+        seq_lens = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+        max_pages = (seq + page_size - 1) // page_size
+        pages = 2 * batch * max_pages
+        kv_cache = torch.randn(pages, page_size, 1, head_dim, device="cuda",
+                               dtype=torch.bfloat16) * 0.3
+        page_table = torch.randperm(pages, device="cuda")[
+            : batch * max_pages
+        ].reshape(batch, max_pages).to(torch.int32)
+        q = torch.randn(batch, 1, nhead, head_dim, device="cuda",
+                        dtype=torch.bfloat16) * 0.3
+        out = ts_mla.gluon_mla_decode_bf16xbf16_gfx950(
+            q, kv_cache, page_table, seq_lens, seq,
+            qk_nope_head_dim=128, kv_lora_rank=lora, qk_rope_head_dim=rope,
+            softmax_scale=head_dim**-0.5,
+        )
+        assert torch.isfinite(out.float()).all()
+        results.append(
+            {
+                "op": "mla_decode (CDNA3 port, bh16bn64)",
+                "shape": {"batch": batch, "heads": nhead, "lora": lora,
+                          "rope": rope, "seq": seq},
+                "gluon_cdna3": time_fn(
+                    lambda: ts_mla.gluon_mla_decode_bf16xbf16_gfx950(  # noqa: B023
+                        q, kv_cache, page_table, seq_lens, seq,
+                        qk_nope_head_dim=128, kv_lora_rank=lora,
+                        qk_rope_head_dim=rope, softmax_scale=head_dim**-0.5,
+                    )
+                ),
+            }
+        )
+
+
 def bench_argmax(results: list) -> None:
     from vkernels.torch_ops.tokenspeed_amd import argmax as ts_argmax
 
@@ -578,6 +619,7 @@ def main() -> int:
         "kda": bench_kda,
         "dsa_topk": bench_dsa_topk,
         "mha": bench_mha,
+        "mla_decode": bench_mla_decode,
         "argmax": bench_argmax,
         "scale": bench_scale_swizzle,
     }

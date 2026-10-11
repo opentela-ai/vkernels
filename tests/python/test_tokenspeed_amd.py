@@ -1306,6 +1306,99 @@ def test_gpu_mla_extend_matches_reference():
     assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
 
+def _mla_decode_reference(q, kv_cache, page_table, cache_seqlens, sm_scale,
+                          kv_lora_rank=512):
+    """Eager reference for ``gluon_mla_decode_bf16xbf16_gfx950`` (absorbed:
+    q rows are [latent | rope], cache rows are [ckv | kpe])."""
+    rope_dim = q.shape[-1] - kv_lora_rank
+    page_size = kv_cache.shape[1]
+    out = torch.zeros(q.shape[0], 1, q.shape[2], kv_lora_rank,
+                      dtype=torch.float32, device=q.device)
+    lse = torch.zeros(q.shape[0], 1, q.shape[2], dtype=torch.float32,
+                      device=q.device)
+    for b in range(q.shape[0]):
+        seq_len = int(cache_seqlens[b])
+        n_pages = (seq_len + page_size - 1) // page_size
+        ids = page_table[b, :n_pages].long()
+        ckv = kv_cache[ids][:, :, 0, :kv_lora_rank].reshape(-1, kv_lora_rank)[:seq_len].float()
+        kpe = kv_cache[ids][:, :, 0, kv_lora_rank:].reshape(-1, rope_dim)[:seq_len].float()
+        for h in range(q.shape[2]):
+            qb = q[b, 0, h].float()
+            logits = (qb[:kv_lora_rank] @ ckv.T
+                      + qb[kv_lora_rank:] @ kpe.T) * sm_scale
+            e_max = logits.max()
+            e_sum = torch.exp(logits - e_max).sum()
+            probs = torch.exp(logits - e_max) / e_sum
+            out[b, 0, h] = probs @ ckv
+            lse[b, 0, h] = e_max + torch.log(e_sum)
+    return out.to(torch.bfloat16), lse
+
+
+@pytest.mark.gpu
+def test_gpu_mla_decode_matches_reference():
+    _gluon_driver()
+    from vkernels.torch_ops.tokenspeed_amd import mla_decode as ts_mla
+
+    torch.manual_seed(28)
+    lora, rope, page_size = 512, 64, 16
+    head_dim = lora + rope
+    nhead = 8
+    seq_lens = torch.tensor([150, 64, 500], dtype=torch.int32, device="cuda")
+    pages = 128
+    max_pages = (int(seq_lens.max()) + page_size - 1) // page_size
+    kv_cache = torch.randn(pages, page_size, 1, head_dim, device="cuda",
+                           dtype=torch.bfloat16) * 0.3
+    page_table = torch.randperm(pages, device="cuda")[: 3 * max_pages].reshape(
+        3, max_pages
+    ).to(torch.int32)
+    q = torch.randn(3, 1, nhead, head_dim, device="cuda",
+                    dtype=torch.bfloat16) * 0.3
+    sm_scale = head_dim**-0.5
+    ref, ref_lse = _mla_decode_reference(q, kv_cache, page_table, seq_lens, sm_scale)
+    kwargs = dict(
+        qk_nope_head_dim=128, kv_lora_rank=lora, qk_rope_head_dim=rope,
+        softmax_scale=sm_scale,
+    )
+    out = ts_mla.gluon_mla_decode_bf16xbf16_gfx950(
+        q, kv_cache, page_table, seq_lens, int(seq_lens.max()), **kwargs
+    )
+    assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    # LSE leg
+    out2, lse = ts_mla.gluon_mla_decode_bf16xbf16_gfx950(
+        q, kv_cache, page_table, seq_lens, int(seq_lens.max()),
+        return_lse=True, **kwargs
+    )
+    assert torch.allclose(out2.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(lse.float(), ref_lse.float(), atol=2e-2, rtol=2e-2)
+    # single-batch/single-head edge
+    q1 = q[:1, :, :1]
+    ref1, _ = _mla_decode_reference(q1, kv_cache, page_table[:1], seq_lens[:1], sm_scale)
+    out1 = ts_mla.gluon_mla_decode_bf16xbf16_gfx950(
+        q1, kv_cache, page_table[:1], seq_lens[:1], int(seq_lens.max()), **kwargs
+    )
+    assert torch.allclose(out1.float(), ref1.float(), atol=2e-2, rtol=2e-2)
+    # non-bf16 q is rejected (CDNA3 ports bf16 only)
+    with pytest.raises(NotImplementedError, match="bf16"):
+        ts_mla.gluon_mla_decode_bf16xbf16_gfx950(
+            q.half(), kv_cache, page_table, seq_lens, int(seq_lens.max()), **kwargs
+        )
+    # regimes beyond bh16bn64 are out of port scope
+    with pytest.raises(ValueError, match="unsupported MLA decode regime"):
+        ts_mla.launch_gluon_mla_decode_bf16xbf16_gfx950_bh64(
+            q, kv_cache, page_table, seq_lens, int(seq_lens.max()), **kwargs
+        )
+    # projected-value epilogue is fp8/bh16bn128-only upstream (stub scope)
+    with pytest.raises(NotImplementedError, match="projected-value"):
+        ts_mla.launch_gluon_mla_decode_bf16xbf16_gfx950_bh16bn64(
+            q, kv_cache, page_table, seq_lens, int(seq_lens.max()),
+            value_weight=torch.zeros(4, device="cuda"), **kwargs
+        )
+    with pytest.raises(NotImplementedError, match="fp8-only upstream"):
+        ts_mla.launch_gluon_mla_decode_projected_value_gfx950(
+            q, kv_cache, page_table, seq_lens, int(seq_lens.max()), **kwargs
+        )
+
+
 def _mha_prefill_reference(q, k, v, cu_seqlens, sm_scale, window_left=-1):
     """Eager reference for ``launch_gluon_mha_prefill_gfx942``."""
     total, heads, dim = q.shape
