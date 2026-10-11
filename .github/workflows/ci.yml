@@ -219,36 +219,40 @@ jobs:
         with:
           install: true
 
-      - name: Interleaved suites (base x3, candidate x2)
+      - name: Interleaved suites (warmup + base/candidate x2 each)
         run: |
           git fetch origin +refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
           BASE="$(git merge-base HEAD refs/remotes/origin/${{ github.base_ref }})"
-          n=0
-          for TREE in "$BASE" "${{ github.sha }}" "$BASE" "${{ github.sha }}" "$BASE"; do
-            n=$((n+1))
-            git checkout --detach "$TREE"
-            # Restore the checked-in suite from the candidate (the baseline
-            # tree may predate it); the ops it names exist on both sides. A
-            # baseline that predates the harness itself degrades to an empty
-            # report — every case then counts as new (reported, not failed).
-            git checkout ${{ github.sha }} -- meta/benchmarks/python/host-suite.json
-            if [ "$TREE" = "$BASE" ]; then
-              ARM=base
-              uv run python -m vkernels.benchmark run \
-                --suite meta/benchmarks/python/host-suite.json --json /tmp/run-$n.json \
-                || printf '{"schema": 1, "results": []}\n' > /tmp/run-$n.json
-            else
-              ARM=cand
-              uv run python -m vkernels.benchmark run \
-                --suite meta/benchmarks/python/host-suite.json --json /tmp/run-$n.json
-            fi
-            echo "run $n -> $ARM"
-          done
-          # Leave the tree on the candidate: merge/compare below import the
-          # harness, which a baseline that predates it would not provide.
+          run_suite () {
+            # $1 = tree sha, $2 = output json, $3 = arm (base|cand|warm)
+            git checkout --detach "$1"
+            # Instrumentation from the candidate for every arm: the suite
+            # and the benchmark harness itself (a base that predates the
+            # harness degrades to an empty report — every case then counts
+            # as new, reported not failed; its ops exist on both sides).
+            git checkout ${{ github.sha }} -- \
+              meta/benchmarks/python/host-suite.json src/python/vkernels/benchmark/
+            # Rebuild the package from THIS tree: uv otherwise reuses the
+            # wheel built by an earlier phase, so every arm would run the
+            # first tree's binary instead of its own.
+            uv run --reinstall-package vkernels-cli \
+              python -m vkernels.benchmark run \
+              --suite meta/benchmarks/python/host-suite.json --json "$2" \
+              || { [ "$3" != cand ] && printf '{"schema": 1, "results": []}\n' > "$2"; }
+          }
+          # Discarded warmup: builds the wheel and settles the machine
+          # (the first suite run after setup is ~1.5x faster than every
+          # later one on hosted runners; measuring it would hand whichever
+          # arm ran first a floor the other can never reach).
+          run_suite "$BASE" /tmp/warmup.json warm
+          # Measured, interleaved: candidate first, base second, x2 each.
+          run_suite "${{ github.sha }}" /tmp/run-c1.json cand
+          run_suite "$BASE" /tmp/run-b1.json base
+          run_suite "${{ github.sha }}" /tmp/run-c2.json cand
+          run_suite "$BASE" /tmp/run-b2.json base
           git checkout --detach "${{ github.sha }}"
-          uv run python -m vkernels.benchmark merge /tmp/base.json /tmp/run-1.json /tmp/run-3.json /tmp/run-5.json
-          uv run python -m vkernels.benchmark merge /tmp/cand.json /tmp/run-2.json /tmp/run-4.json
+          uv run python -m vkernels.benchmark merge /tmp/base.json /tmp/run-b1.json /tmp/run-b2.json
+          uv run python -m vkernels.benchmark merge /tmp/cand.json /tmp/run-c1.json /tmp/run-c2.json
 
       - name: Compare (fail on >10% regression of the per-case floor)
         run: >
