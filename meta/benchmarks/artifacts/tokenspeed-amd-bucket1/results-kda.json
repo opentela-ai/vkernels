@@ -1,0 +1,132 @@
+{
+  "env": {
+    "torch": "2.9.0a0+git7bcbafe",
+    "hip": "7.0.51831-a3e329ad8",
+    "device": "AMD Instinct MI300A",
+    "capability": [
+      9,
+      4
+    ],
+    "triton": "3.8.0",
+    "gluon": true,
+    "gluon_amd_cdna4": true,
+    "gluon_features": {
+      "gluon": true,
+      "constexpr_function": true,
+      "associative_scan": true,
+      "amd_cdna4": true
+    },
+    "aiter": true
+  },
+  "date": "2026-10-10T17:25:35",
+  "results": [
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 1,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 78.58,
+        "us_p10": 76.44,
+        "us_p90": 87.28
+      },
+      "vllm_kda_amd_packed (recur+gate only)": {
+        "us_median": 75.1,
+        "us_p10": 73.12,
+        "us_p90": 85.2
+      }
+    },
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 4,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 75.64,
+        "us_p10": 73.84,
+        "us_p90": 84.48
+      },
+      "vllm_kda_amd_packed (recur+gate only)": {
+        "us_median": 74.0,
+        "us_p10": 72.84,
+        "us_p90": 80.72
+      }
+    },
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 8,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 76.28,
+        "us_p10": 74.56,
+        "us_p90": 80.84
+      },
+      "vllm_kda_amd_packed (recur+gate only)": {
+        "us_median": 74.18,
+        "us_p10": 72.72,
+        "us_p90": 79.16
+      }
+    },
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 16,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 79.72,
+        "us_p10": 77.4,
+        "us_p90": 85.0
+      },
+      "vllm_kda_amd_packed (recur+gate only)": {
+        "us_median": 77.26,
+        "us_p10": 76.36,
+        "us_p90": 80.12
+      }
+    },
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 32,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 89.84,
+        "us_p10": 87.76,
+        "us_p90": 96.92
+      },
+      "vllm_kda_amd_packed (recur+gate only)": {
+        "us_median": 89.26,
+        "us_p10": 87.76,
+        "us_p90": 93.52
+      }
+    },
+    {
+      "op": "kda_fused_decode",
+      "shape": {
+        "batch": 64,
+        "heads": 12,
+        "dim": 128
+      },
+      "gluon_fused": {
+        "us_median": 111.2,
+        "us_p10": 107.72,
+        "us_p90": 122.76
+      },
+      "vllm_kda_amd_packed (recur+gate only)": {
+        "us_median": 98.98,
+        "us_p10": 96.6,
+        "us_p90": 103.92
+      }
+    }
+  ]
+}

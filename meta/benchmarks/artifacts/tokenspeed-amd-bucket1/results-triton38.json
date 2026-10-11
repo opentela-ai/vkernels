@@ -1,0 +1,424 @@
+{
+  "env": {
+    "torch": "2.9.0a0+git7bcbafe",
+    "hip": "7.0.51831-a3e329ad8",
+    "device": "AMD Instinct MI300A",
+    "capability": [
+      9,
+      4
+    ],
+    "triton": "3.8.0",
+    "gluon": true,
+    "gluon_amd_cdna4": true,
+    "gluon_features": {
+      "gluon": true,
+      "constexpr_function": true,
+      "associative_scan": true,
+      "amd_cdna4": true
+    },
+    "aiter": true
+  },
+  "date": "2026-10-10T05:00:48",
+  "results": [
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 1,
+        "E": 128,
+        "topk": 16
+      },
+      "gluon": {
+        "us_median": 68.3,
+        "us_p10": 65.76,
+        "us_p90": 76.72
+      },
+      "torch": {
+        "us_median": 139.9,
+        "us_p10": 136.84,
+        "us_p90": 157.32
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 1,
+        "E": 384,
+        "topk": 16
+      },
+      "gluon": {
+        "us_median": 106.3,
+        "us_p10": 103.6,
+        "us_p90": 113.8
+      },
+      "torch": {
+        "us_median": 137.48,
+        "us_p10": 135.32,
+        "us_p90": 156.16
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 8,
+        "E": 256,
+        "topk": 16
+      },
+      "gluon": {
+        "us_median": 47.14,
+        "us_p10": 45.48,
+        "us_p90": 51.96
+      },
+      "torch": {
+        "us_median": 141.88,
+        "us_p10": 138.92,
+        "us_p90": 159.28
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 16,
+        "E": 128,
+        "topk": 8
+      },
+      "gluon": {
+        "us_median": 107.9,
+        "us_p10": 46.36,
+        "us_p90": 117.28
+      },
+      "torch": {
+        "us_median": 142.26,
+        "us_p10": 138.84,
+        "us_p90": 151.04
+      }
+    },
+    {
+      "op": "routing_softmax_topk",
+      "shape": {
+        "M": 64,
+        "E": 384,
+        "topk": 2
+      },
+      "gluon": {
+        "us_median": 53.8,
+        "us_p10": 52.16,
+        "us_p90": 58.36
+      },
+      "torch": {
+        "us_median": 139.66,
+        "us_p10": 137.08,
+        "us_p90": 155.28
+      }
+    },
+    {
+      "op": "moe_sorting",
+      "shape": {
+        "M": 8,
+        "E": 128,
+        "topk": 4,
+        "block": 16,
+        "compact": true
+      },
+      "gluon": {
+        "us_median": 96.2,
+        "us_p10": 93.84,
+        "us_p90": 146.4
+      },
+      "torch_ref": {
+        "us_median": 174.7,
+        "us_p10": 170.08,
+        "us_p90": 183.84
+      },
+      "aiter": {
+        "us_median": 30.46,
+        "us_p10": 29.04,
+        "us_p90": 60.4
+      }
+    },
+    {
+      "op": "moe_sorting",
+      "shape": {
+        "M": 8,
+        "E": 256,
+        "topk": 8,
+        "block": 16,
+        "compact": true
+      },
+      "gluon": {
+        "us_median": 90.14,
+        "us_p10": 87.96,
+        "us_p90": 135.32
+      },
+      "torch_ref": {
+        "us_median": 174.3,
+        "us_p10": 171.64,
+        "us_p90": 181.12
+      },
+      "aiter": {
+        "us_median": 40.96,
+        "us_p10": 40.24,
+        "us_p90": 42.6
+      }
+    },
+    {
+      "op": "moe_sorting",
+      "shape": {
+        "M": 64,
+        "E": 128,
+        "topk": 8,
+        "block": 64,
+        "compact": true
+      },
+      "gluon": {
+        "us_median": 89.76,
+        "us_p10": 86.6,
+        "us_p90": 102.8
+      },
+      "torch_ref": {
+        "us_median": 162.76,
+        "us_p10": 160.0,
+        "us_p90": 171.24
+      },
+      "aiter": {
+        "us_median": 31.18,
+        "us_p10": 30.16,
+        "us_p90": 32.28
+      }
+    },
+    {
+      "op": "moe_sorting",
+      "shape": {
+        "M": 512,
+        "E": 128,
+        "topk": 4,
+        "block": 64,
+        "compact": false
+      },
+      "gluon": {
+        "us_median": 113.98,
+        "us_p10": 110.44,
+        "us_p90": 123.72
+      },
+      "torch_ref": {
+        "us_median": 165.3,
+        "us_p10": 161.88,
+        "us_p90": 174.68
+      },
+      "aiter": {
+        "us_median": 36.02,
+        "us_p10": 35.04,
+        "us_p90": 39.24
+      }
+    },
+    {
+      "op": "moe_sorting",
+      "shape": {
+        "M": 4096,
+        "E": 256,
+        "topk": 8,
+        "block": 128,
+        "compact": false
+      },
+      "gluon": {
+        "us_median": 125.54,
+        "us_p10": 122.04,
+        "us_p90": 137.84
+      },
+      "torch_ref": {
+        "us_median": 221.0,
+        "us_p10": 215.8,
+        "us_p90": 235.56
+      },
+      "aiter": {
+        "us_median": 165.88,
+        "us_p10": 160.32,
+        "us_p90": 172.2
+      }
+    },
+    {
+      "op": "hadamard_128",
+      "shape": {
+        "rows": 4096
+      },
+      "gluon": {
+        "us_median": 40.56,
+        "us_p10": 37.0,
+        "us_p90": 47.72
+      },
+      "torch_matmul_fp32": {
+        "us_median": 726987.73,
+        "us_p10": 724055.18,
+        "us_p90": 730545.29
+      },
+      "effective_GBps": 51.7
+    },
+    {
+      "op": "hadamard_128",
+      "shape": {
+        "rows": 32768
+      },
+      "gluon": {
+        "us_median": 42.72,
+        "us_p10": 40.04,
+        "us_p90": 48.8
+      },
+      "torch_matmul_fp32": {
+        "us_median": 713016.85,
+        "us_p10": 709329.04,
+        "us_p90": 716580.57
+      },
+      "effective_GBps": 392.7
+    },
+    {
+      "op": "hadamard_128",
+      "shape": {
+        "rows": 262144
+      },
+      "gluon": {
+        "us_median": 157.6,
+        "us_p10": 152.88,
+        "us_p90": 165.92
+      },
+      "torch_matmul_fp32": {
+        "us_median": 700486.82,
+        "us_p10": 696479.61,
+        "us_p90": 704195.43
+      },
+      "effective_GBps": 851.6
+    },
+    {
+      "op": "mhc_pre_reduce_apply",
+      "shape": {
+        "tokens": 1,
+        "hidden": 4096,
+        "splits": 64
+      },
+      "gluon": {
+        "us_median": 42.26,
+        "us_p10": 40.92,
+        "us_p90": 98.88
+      },
+      "torch_ref": {
+        "us_median": 1237.83,
+        "us_p10": 1206.57,
+        "us_p90": 1296.33
+      }
+    },
+    {
+      "op": "mhc_pre_reduce_apply",
+      "shape": {
+        "tokens": 8,
+        "hidden": 4096,
+        "splits": 64
+      },
+      "gluon": {
+        "us_median": 41.78,
+        "us_p10": 40.68,
+        "us_p90": 44.68
+      },
+      "torch_ref": {
+        "us_median": 1234.93,
+        "us_p10": 1212.29,
+        "us_p90": 1269.05
+      }
+    },
+    {
+      "op": "mhc_pre_reduce_apply",
+      "shape": {
+        "tokens": 64,
+        "hidden": 4096,
+        "splits": 64
+      },
+      "gluon": {
+        "us_median": 43.02,
+        "us_p10": 41.6,
+        "us_p90": 45.88
+      },
+      "torch_ref": {
+        "us_median": 1250.41,
+        "us_p10": 1205.01,
+        "us_p90": 1298.33
+      }
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 1,
+        "N": 32768
+      },
+      "torch": {
+        "us_median": 21.68,
+        "us_p10": 20.0,
+        "us_p90": 27.68
+      },
+      "gluon": {
+        "us_median": 101.36,
+        "us_p10": 48.36,
+        "us_p90": 112.0
+      }
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 8,
+        "N": 131072
+      },
+      "torch": {
+        "us_median": 44.9,
+        "us_p10": 43.32,
+        "us_p90": 46.68
+      },
+      "gluon": {
+        "us_median": 51.92,
+        "us_p10": 48.48,
+        "us_p90": 116.92
+      }
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 64,
+        "N": 151936
+      },
+      "torch": {
+        "us_median": 55.84,
+        "us_p10": 53.92,
+        "us_p90": 58.44
+      },
+      "gluon": {
+        "us_median": 57.6,
+        "us_p10": 55.56,
+        "us_p90": 123.64
+      }
+    },
+    {
+      "op": "sampling_argmax",
+      "shape": {
+        "M": 8,
+        "N": 262144
+      },
+      "torch": {
+        "us_median": 102.48,
+        "us_p10": 101.28,
+        "us_p90": 104.84
+      },
+      "gluon": {
+        "us_median": 50.16,
+        "us_p10": 48.04,
+        "us_p90": 57.6
+      }
+    },
+    {
+      "op": "scale_swizzle_cdna4 (host/torch)",
+      "shape": {
+        "rows": 368640,
+        "k_scale": 90
+      },
+      "torch": {
+        "us_median": 942.32,
+        "us_p10": 934.76,
+        "us_p90": 973.04
+      }
+    }
+  ]
+}

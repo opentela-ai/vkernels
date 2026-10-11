@@ -27,6 +27,11 @@ Residual deviation vs the eager chain is bounded by fp32 reduction-order
 — at most last-ulp fp32 before each single rounding, i.e. 0 or 1 ulp of
 the stored dtype. The parity test pins the max abs drift.
 
+An optional ``fp32_norm`` mode follows fused-norm arithmetic instead:
+variance on the unrounded collapse, a rounded collapsed numerator, and
+FP32 normalization/weight multiplication until the final output round.
+It changes numerics and requires separate model-level qualification.
+
 Decode-shaped: static per-bucket shapes (token count is the grid), plain
 current-stream Triton launches, no host syncs, no device scalars — CUDA
 graph-capture safe.
@@ -69,6 +74,7 @@ def _kernel():
         ITERS: tl.constexpr,
         NORM_EPS: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        FP32_NORM: tl.constexpr,
     ):
         token = tl.program_id(0)
         k = tl.arange(0, HC)
@@ -87,10 +93,16 @@ def _kernel():
         # RMSNorm reads it back up — pay the same round here.
         collapsed = acc.to(OUT.dtype.element_ty).to(tl.float32)
         # -- weighted RMSNorm (Glm53RMSNorm rounding points) ---------------
-        rstd = tl.rsqrt(tl.sum(collapsed * collapsed, axis=0) / D + NORM_EPS)
         w = tl.load(NORM_W + offs).to(tl.float32)
-        y = (collapsed * rstd).to(OUT.dtype.element_ty).to(tl.float32)
-        tl.store(OUT + token * D + offs, (w * y).to(OUT.dtype.element_ty))
+        if FP32_NORM:
+            # Fused-norm precision: variance uses the unrounded collapse;
+            # the weighted output has one final serving-dtype round.
+            rstd = tl.rsqrt(tl.sum(acc * acc, axis=0) / D + NORM_EPS)
+            y = collapsed * rstd * w
+        else:
+            rstd = tl.rsqrt(tl.sum(collapsed * collapsed, axis=0) / D + NORM_EPS)
+            y = (collapsed * rstd).to(OUT.dtype.element_ty).to(tl.float32) * w
+        tl.store(OUT + token * D + offs, y.to(OUT.dtype.element_ty))
 
     return _big_fuse
 
@@ -105,6 +117,7 @@ def mhc_pre_big_fuse(
     eps=1e-6,
     sinkhorn_iters=20,
     norm_eps=1e-6,
+    fp32_norm=False,
 ):
     """Fused mHC pre epilogue: return fp32 ``(post, comb)`` plus the
     RMSNorm'd collapsed streams.
@@ -116,6 +129,10 @@ def mhc_pre_big_fuse(
     RMSNorm's learned scale). Shapes of ``logits`` and ``streams`` must
     share every leading dim. Returns ``(post [..., hc] fp32,
     comb [..., hc, hc] fp32, layer_input [..., d] in streams.dtype)``.
+
+    ``fp32_norm`` uses the unrounded collapse for the variance and keeps
+    the normalization/weight product FP32 until the final output round.
+    The default retains the standalone norm's historical rounding points.
     """
     import torch
 
@@ -177,6 +194,7 @@ def mhc_pre_big_fuse(
                 sinkhorn_iters,
                 norm_eps,
                 d,
+                fp32_norm,
                 num_warps=8,
                 enable_fp_fusion=False,
             )
@@ -193,6 +211,7 @@ def mhc_pre_big_fuse_reference(
     eps=1e-6,
     sinkhorn_iters=20,
     norm_eps=1e-6,
+    fp32_norm=False,
 ):
     """Eager oracle: the exact chain the kernel replaces, composed from the
     landed reference pieces (``mhc_mix_reference`` + ``mhc_collapse_reference``
@@ -206,6 +225,10 @@ def mhc_pre_big_fuse_reference(
     pre, post, comb = mhc_mix_reference(
         logits.float(), base, scale, hc=hc, eps=eps, sinkhorn_iters=sinkhorn_iters
     )
+    if fp32_norm:
+        unrounded = (pre.unsqueeze(-1) * streams.float()).sum(dim=-2)
+        inverse = torch.rsqrt(unrounded.square().mean(-1, keepdim=True) + norm_eps)
+        return post, comb, (unrounded.to(streams.dtype).float() * inverse * norm_weight.float()).to(streams.dtype)
     collapsed = mhc_collapse_reference(pre, streams, hc=hc)
     x = collapsed.float()
     var = x.pow(2).mean(-1, keepdim=True)

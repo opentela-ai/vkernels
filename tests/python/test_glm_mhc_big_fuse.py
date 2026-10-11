@@ -40,7 +40,7 @@ def torch():
 HC = 4
 D = 4096
 WIDTH = HC * (HC + 2)
-TOKENS = (1, 2, 4, 8)
+TOKENS = (1, 2, 4, 8, 128)
 
 
 def _rig_inputs(torch, tokens, seed=11, sinkhorn_iters=20):
@@ -77,7 +77,8 @@ def test_contract(torch):
         mhc_pre_big_fuse(logits, base, scale, bad, torch.randn(4000))
 
 
-def test_gpu_parity_and_drift(torch):
+@pytest.mark.parametrize("fp32_norm", [False, True])
+def test_gpu_parity_and_drift(torch, fp32_norm):
     """Per-bucket parity vs the composed eager chain + drift probe."""
     pytest.importorskip("triton")
     from vkernels.torch_ops.glm_mhc_big_fuse import (
@@ -91,11 +92,11 @@ def test_gpu_parity_and_drift(torch):
         )
         post, comb, layer_input = mhc_pre_big_fuse(
             logits, base, scale, streams, norm_weight,
-            hc=HC, sinkhorn_iters=iters, norm_eps=1e-6,
+            hc=HC, sinkhorn_iters=iters, norm_eps=1e-6, fp32_norm=fp32_norm,
         )
         post_r, comb_r, layer_r = mhc_pre_big_fuse_reference(
             logits, base, scale, streams, norm_weight,
-            hc=HC, eps=1e-6, sinkhorn_iters=iters, norm_eps=1e-6,
+            hc=HC, eps=1e-6, sinkhorn_iters=iters, norm_eps=1e-6, fp32_norm=fp32_norm,
         )
         assert post.shape == (tokens, HC) and post.dtype == torch.float32
         assert comb.shape == (tokens, HC, HC) and comb.dtype == torch.float32
@@ -111,7 +112,8 @@ def test_gpu_parity_and_drift(torch):
         print(f"tokens={tokens}: max|dlayer_input| = {drift:.3e}")
 
 
-def test_gpu_parity_random_sweeps(torch):
+@pytest.mark.parametrize("fp32_norm", [False, True])
+def test_gpu_parity_random_sweeps(torch, fp32_norm):
     """Many seeds incl. extreme gate scales — the Sinkhorn loop amplifies
     scale[2] outliers, so sweep rather than spot-check."""
     pytest.importorskip("triton")
@@ -127,10 +129,12 @@ def test_gpu_parity_random_sweeps(torch):
         if seed % 2:
             scale = scale * 8.0  # stress the gate/softmax dynamic range
         post, comb, layer_input = mhc_pre_big_fuse(
-            logits, base, scale, streams, norm_weight, hc=HC, sinkhorn_iters=6
+            logits, base, scale, streams, norm_weight, hc=HC, sinkhorn_iters=6,
+            fp32_norm=fp32_norm,
         )
         post_r, comb_r, layer_r = mhc_pre_big_fuse_reference(
-            logits, base, scale, streams, norm_weight, hc=HC, sinkhorn_iters=6
+            logits, base, scale, streams, norm_weight, hc=HC, sinkhorn_iters=6,
+            fp32_norm=fp32_norm,
         )
         torch.testing.assert_close(post, post_r, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(comb, comb_r, atol=1e-5, rtol=1e-5)
@@ -139,7 +143,8 @@ def test_gpu_parity_random_sweeps(torch):
         )
 
 
-def test_graph_capture_replay(torch):
+@pytest.mark.parametrize("fp32_norm", [False, True])
+def test_graph_capture_replay(torch, fp32_norm):
     """CUDA-graph capture/replay with static per-bucket shapes: the decode
     graphs bank (lane D) requires launches with no host syncs and static
     shapes; replay must track new inputs without re-capture."""
@@ -150,14 +155,15 @@ def test_graph_capture_replay(torch):
     logits, base, scale, streams, norm_weight, iters = _rig_inputs(torch, tokens)
     # Warm the JIT specialization outside capture (prewarmed-bucket model).
     mhc_pre_big_fuse(
-        logits, base, scale, streams, norm_weight, hc=HC, sinkhorn_iters=iters
+        logits, base, scale, streams, norm_weight, hc=HC, sinkhorn_iters=iters,
+        fp32_norm=fp32_norm,
     )
     g = torch.cuda.CUDAGraph()
     static = (logits, base, scale, streams, norm_weight)
     torch.cuda.synchronize()
     with torch.cuda.graph(g):
         p, c, o = mhc_pre_big_fuse(
-            *static, hc=HC, sinkhorn_iters=iters
+            *static, hc=HC, sinkhorn_iters=iters, fp32_norm=fp32_norm,
         )
     # fresh data in the same static buffers
     logits.copy_(torch.randn(tokens, WIDTH, device="cuda"))
@@ -165,8 +171,29 @@ def test_graph_capture_replay(torch):
     g.replay()
     torch.cuda.synchronize()
     post2, comb2, out2 = mhc_pre_big_fuse(
-        logits, base, scale, streams, norm_weight, hc=HC, sinkhorn_iters=iters
+        logits, base, scale, streams, norm_weight, hc=HC, sinkhorn_iters=iters,
+        fp32_norm=fp32_norm,
     )
     torch.testing.assert_close(p, post2, atol=0, rtol=0)
     torch.testing.assert_close(c, comb2, atol=0, rtol=0)
     torch.testing.assert_close(o, out2, atol=0, rtol=0)
+
+
+def test_fp32_norm_matches_independent_fp64_oracle():
+    import torch
+    from vkernels.torch_ops.glm_mhc_big_fuse import mhc_pre_big_fuse_reference
+
+    torch.manual_seed(798)
+    streams = torch.randn(2, HC, 512).bfloat16()
+    weight = torch.randn(512).bfloat16()
+    logits = torch.zeros(2, WIDTH)
+    base, scale = torch.zeros(WIDTH), torch.zeros(3)
+    _, _, result = mhc_pre_big_fuse_reference(logits, base, scale, streams, weight, fp32_norm=True)
+    # Zero gate logits give an analytic constant mix, avoiding a second
+    # implementation of the Sinkhorn/gate code in the oracle.
+    mixed = streams.double().sum(dim=1) * (0.5 + 1e-6)
+    inverse = torch.rsqrt(mixed.square().mean(-1, keepdim=True) + 1e-6)
+    expected = (mixed.bfloat16().double() * inverse * weight.double()).bfloat16()
+    torch.testing.assert_close(result, expected, rtol=0.008, atol=0.002)
+    legacy = mhc_pre_big_fuse_reference(logits, base, scale, streams, weight)[2]
+    assert torch.count_nonzero(result != legacy) > 0

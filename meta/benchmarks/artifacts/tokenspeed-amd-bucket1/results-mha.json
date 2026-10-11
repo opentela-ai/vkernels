@@ -1,0 +1,66 @@
+{
+  "env": {
+    "torch": "2.9.0a0+git7bcbafe",
+    "hip": "7.0.51831-a3e329ad8",
+    "device": "AMD Instinct MI300A",
+    "capability": [
+      9,
+      4
+    ],
+    "triton": "3.8.0",
+    "gluon": true,
+    "gluon_amd_cdna4": true,
+    "gluon_features": {
+      "gluon": true,
+      "constexpr_function": true,
+      "associative_scan": true,
+      "amd_cdna4": true
+    },
+    "aiter": true
+  },
+  "date": "2026-10-10T21:10:13",
+  "results": [
+    {
+      "op": "mha_decode (CDNA3 port)",
+      "shape": {
+        "batch": 1,
+        "heads": 32,
+        "dim": 128,
+        "seq": 4096
+      },
+      "gluon_cdna3": {
+        "us_median": 103.56,
+        "us_p10": 99.04,
+        "us_p90": 117.68
+      }
+    },
+    {
+      "op": "mha_decode (CDNA3 port)",
+      "shape": {
+        "batch": 8,
+        "heads": 32,
+        "dim": 128,
+        "seq": 4096
+      },
+      "gluon_cdna3": {
+        "us_median": 114.18,
+        "us_p10": 112.2,
+        "us_p90": 120.56
+      }
+    },
+    {
+      "op": "mha_decode (CDNA3 port)",
+      "shape": {
+        "batch": 32,
+        "heads": 32,
+        "dim": 128,
+        "seq": 4096
+      },
+      "gluon_cdna3": {
+        "us_median": 302.85,
+        "us_p10": 299.89,
+        "us_p90": 308.49
+      }
+    }
+  ]
+}
