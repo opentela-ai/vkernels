@@ -15,8 +15,11 @@ def _kernels():
     import triton
     import triton.language as tl
 
-    @triton.jit
-    def inverse_order(order, inverse, size: tl.constexpr, block: tl.constexpr):
+    @triton.jit(do_not_specialize=["size"])
+    def inverse_order(order, inverse, size, block: tl.constexpr):
+        # EP live-route counts change with every input. The mask needs the
+        # runtime count; specializing it creates a new dispatch variant for
+        # each count even though the permutation algorithm is unchanged.
         row = tl.program_id(0) * block + tl.arange(0, block)
         original = tl.load(order + row, row < size, 0)
         tl.store(inverse + original, row, row < size)
