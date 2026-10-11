@@ -15,6 +15,9 @@ option(VKERNELS_BUILD_CUDA "Compile CUDA kernel sources when a toolkit is found"
 option(VKERNELS_BUILD_HIP "Compile HIP kernel sources when ROCm is found (AMD gfx942)" OFF)
 option(VKERNELS_BUILD_PYTHON "Build Python bindings (opt-in)" OFF)
 option(VKERNELS_BUILD_RUST "Register the Rust binding test suite (opt-in, needs cargo)" OFF)
+# Formal-verification harnesses (verifier/).  Off by default and never
+# linked into libvkernels or the test binaries: production builds pay nothing.
+option(VKERNELS_BUILD_VERIFICATIONS "Register formal-verification harnesses (opt-in; needs a prover)" OFF)
 option(VKERNELS_ENABLE_COVERAGE "Enable gcov line-coverage instrumentation" OFF)
 option(VKERNELS_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(VKERNELS_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
@@ -76,6 +79,10 @@ add_subdirectory(src/c)
 if(VKERNELS_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+if(VKERNELS_BUILD_VERIFICATIONS)
+  add_subdirectory(verifier)
 endif()
 
 if(VKERNELS_BUILD_BENCHMARKS)

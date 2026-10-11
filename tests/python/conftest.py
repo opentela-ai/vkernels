@@ -43,6 +43,12 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     import os
+    # Op-config cache (vkernels.tuning) defaults OFF for the whole test
+    # session: integrated ops keep their exact pre-cache launch behavior,
+    # no sweep runs, and the developer's real ~/.cache/vkernels is never
+    # touched by a test run. Tests that exercise the cache re-enable it
+    # per-test against a tmp store via monkeypatch.setenv.
+    os.environ.setdefault("VKERNELS_CACHE", "off")
     for name, description in {
         "integration": "requires explicitly installed external dependencies",
         "checkpoint": "requires an explicitly selected model checkpoint",

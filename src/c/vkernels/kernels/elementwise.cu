@@ -4,6 +4,7 @@
 #if VKERNELS_HAS_CUDA
 #  include <cuda_runtime.h>
 
+#  include "vkernels/kernels/common/launch.hpp"
 #  include "vkernels/util/error.hpp"
 
 namespace vkernels::kernels {
@@ -30,25 +31,22 @@ void add(Span<const float> a, Span<const float> b, Span<float> out) {
   VK_EXPECTS(a.size() == out.size(), "out must have the same length as inputs");
   int n = static_cast<int>(a.size());
   // NOTE: device pointers expected here; host launch path wired in a later change.
-  add_kernel<<<(n + 255) / 256, 256>>>(a.data(), b.data(), out.data(), n);
-  cudaError_t err = cudaGetLastError();
-  VK_ENSURES(err == cudaSuccess, "cuda add launch failed");
+  common::launch_1d(add_kernel, static_cast<std::size_t>(n), "cuda add",
+                    a.data(), b.data(), out.data(), n);
 }
 
 void scale(Span<const float> x, float alpha, Span<float> out) {
   VK_EXPECTS(x.size() == out.size(), "x and out must have equal length");
   int n = static_cast<int>(x.size());
-  scale_kernel<<<(n + 255) / 256, 256>>>(x.data(), alpha, out.data(), n);
-  cudaError_t err = cudaGetLastError();
-  VK_ENSURES(err == cudaSuccess, "cuda scale launch failed");
+  common::launch_1d(scale_kernel, static_cast<std::size_t>(n), "cuda scale",
+                    x.data(), alpha, out.data(), n);
 }
 
 void relu(Span<const float> x, Span<float> out) {
   VK_EXPECTS(x.size() == out.size(), "x and out must have equal length");
   int n = static_cast<int>(x.size());
-  relu_kernel<<<(n + 255) / 256, 256>>>(x.data(), out.data(), n);
-  cudaError_t err = cudaGetLastError();
-  VK_ENSURES(err == cudaSuccess, "cuda relu launch failed");
+  common::launch_1d(relu_kernel, static_cast<std::size_t>(n), "cuda relu",
+                    x.data(), out.data(), n);
 }
 
 }  // namespace cuda

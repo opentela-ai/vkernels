@@ -16,6 +16,8 @@ target_sources(vkernels
     vkernels/kernels/reduce.cpp
     vkernels/kernels/gemm.cpp
     vkernels/kernels/gemm_bf16.cpp
+    vkernels/kernels/gemm_grouped.cpp
+    vkernels/kernels/mqa_logits.cpp
     vkernels/kernels/moe.cpp
     vkernels/kernels/moe_fused.cpp
     vkernels/kernels/moe_aux.cpp
@@ -64,6 +66,8 @@ if(VKERNELS_HAS_CUDA)
       vkernels/kernels/reduce.cu
       vkernels/kernels/gemm.cu
       vkernels/kernels/gemm_bf16.cu
+      vkernels/kernels/gemm_grouped.cu
+      vkernels/kernels/mqa_logits.cu
       vkernels/kernels/dsa.cu
       vkernels/comm/allreduce.cu
       vkernels/comm/p2p_gather.cu

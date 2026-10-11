@@ -209,12 +209,16 @@ def gemm(
     a = A.flat
     b = B.flat
     c = C.flat
+    read_prev = beta != np.float32(0.0)
     for i in range(M):
         for j in range(N):
             acc = np.float32(0.0)
             for k in range(K):
                 acc = np.float32(acc + a[i * K + k] * b[k * N + j])
-            c[i * N + j] = np.float32(alpha * acc + beta * c[i * N + j])
+            # BLAS semantics: beta == 0 must not read C (mirrors gemm.cpp
+            # and the CUDA kernel's guarded epilogue).
+            prev = c[i * N + j] if read_prev else np.float32(0.0)
+            c[i * N + j] = np.float32(alpha * acc + beta * prev)
 
 
 # --- moe: fp4 dequant, LDS fill, MFMA ---------------------------------------

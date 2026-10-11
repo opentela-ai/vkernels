@@ -13,9 +13,11 @@ vkernels_add_test(NAME device      SOURCES core/test_device.cpp)
 vkernels_add_test(NAME tuning      SOURCES core/test_tuning.cpp)
 vkernels_add_test(NAME allocator   SOURCES core/test_allocator.cpp)
 vkernels_add_test(NAME elementwise SOURCES kernels/elementwise/test_elementwise.cpp)
+vkernels_add_test(NAME kernel_common SOURCES kernels/common/test_common.cpp)
 vkernels_add_test(NAME reduce      SOURCES kernels/reduce/test_reduce.cpp)
 vkernels_add_test(NAME gemm        SOURCES kernels/gemm/test_gemm.cpp)
 vkernels_add_test(NAME gemm_bf16   SOURCES kernels/gemm/test_gemm_bf16.cpp)
+vkernels_add_test(NAME indexer_grouped SOURCES kernels/indexer/test_indexer_grouped.cpp)
 vkernels_add_test(NAME mla         SOURCES kernels/attn/test_mla.cpp)
 vkernels_add_test(NAME dsa         SOURCES kernels/attn/test_dsa.cpp)
 vkernels_add_test(NAME dsa_topk    SOURCES kernels/attn/test_dsa_topk.cpp)
@@ -166,6 +168,8 @@ endif()
 
 if(VKERNELS_HAS_CUDA)
   vkernels_add_test(NAME cuda_contracts SOURCES kernels/test_cuda_contracts.cu
+    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
+  vkernels_add_test(NAME indexer_grouped_cuda SOURCES kernels/indexer/test_indexer_grouped_cuda.cu
     INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
 endif()
 # A host placeholder is a skipped device contract, never a passing GPU test.

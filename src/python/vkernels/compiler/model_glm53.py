@@ -200,3 +200,141 @@ def build_glm53_forward(ops: RecordingBackend, args: Glm53ModelArgs) -> Symbolic
     streams_flat = ops.view_of(streams, "streams_flat", (B, hc * C))
     head = ops.linear(streams_flat, args.head_mean, name="hc_head_mean")
     return ops.rms_norm(head, args.final_norm, cfg.rms_norm_eps, name="final_norm")
+
+
+# ---------------------------------------------------------------------------
+# E1 — the KDA-spine slice (megakernel readiness Lever E, first real slice)
+# ---------------------------------------------------------------------------
+
+
+class Glm53KdaSpineArgs:
+    """Symbolic externals for ONE E1 KDA-spine decode step (batch B, slots).
+
+    The E1 slice is the attention sub-block of every KDA layer —
+    ``mhc_pre → ln1 → fused qkv/f/b/g GEMVs → fused decode (conv +
+    kda-delta + gated norm) → o_proj → mhc_post`` — chained across layers
+    through the mHC streams. Unlike :class:`Glm53ModelArgs` (the whole-step
+    frontend whose conv/ssm pools are batch-indexed and K-major), the
+    spine's state pools follow the FUSED-DECODE contract: slot-indirected
+    through an external i32 ``[B]`` table (``-1`` = padded graph slot), the
+    ssm pool V-MAJOR ``[slots, H, V, K]``, the conv pool TIME-MAJOR
+    ``[slots, Kt-1, Cc]`` with bf16-grid values, and the conv taps
+    transposed to the kernel ABI ``[Kt, Cc]``. A born-V-major pool serves
+    both this op and the fused CUDA kernel at the serving boundary.
+    """
+
+    def __init__(self, ops: RecordingBackend, cfg: Glm53Config, weights: Glm53Weights,
+                 batch: int = 1, *, slots: int | None = None, materialize_hosts: bool = True):
+        B, C = batch, cfg.hidden_size
+        H, D = cfg.linear_num_heads, cfg.linear_head_dim
+        hc, Kt = cfg.hc_mult, cfg.linear_conv_kernel_dim
+        Cc = cfg.conv_dim
+        L = cfg.num_hidden_layers
+        self.cfg, self.batch = cfg, B
+        self.slots = slots if slots is not None else B
+        if self.slots < 0:
+            raise ValueError(f"spine slots ({self.slots}) must be >= 0")
+        # NOTE: slots < batch is legal — the pad rows of a ragged decode step
+        # carry ``-1`` cache indices (padded CUDA-graph slots: zero output,
+        # pools untouched), so only the LIVE rows need pool slots.
+
+        def ext(name, arr, dtype=F32):
+            t = ops.external_tensor(name, tuple(arr.shape), dtype=dtype, storage_id=next(self._sid))
+            if not materialize_hosts:
+                self.host[name] = None
+                self.host_by_sid[t.value.storage_id] = None
+                return t
+            self.host[name] = (arr.astype(np.float32) if dtype is F32 else arr)
+            self.host_by_sid[t.value.storage_id] = self.host[name]
+            return t
+
+        self.host_by_sid: dict[int, np.ndarray] = {}
+        self.host: dict[str, np.ndarray] = {}
+        self._sid = iter(range(2000, 200000))
+
+        # token-row streams (the spine's cross-layer carrier — layer i's
+        # mhc_post output is layer i+1's mhc_pre input; the phase barrier
+        # between them IS the cross-layer recurrence gate)
+        self.streams_in = ops.external_tensor("spine_streams_in", (B, hc, C), storage_id=next(self._sid))
+        self.host_by_sid[self.streams_in.value.storage_id] = None  # filled per test
+        # slot table + per-layer pools (fused-decode contract shapes)
+        self.cache_indices = ops.external_tensor(
+            "spine_cache_indices", (B,), I32, storage_id=next(self._sid)
+        )
+        if materialize_hosts:
+            self.host_by_sid[self.cache_indices.value.storage_id] = np.arange(B, dtype=np.int32) % self.slots
+        self.conv_pool: list[SymbolicTensor] = []
+        self.ssm_pool: list[SymbolicTensor] = []
+        for i in range(L):
+            cp = ops.external_tensor(f"spine_conv_pool_l{i}", (self.slots, Kt - 1, Cc), storage_id=next(self._sid))
+            sp = ops.external_tensor(f"spine_ssm_pool_l{i}", (self.slots, H, D, D), storage_id=next(self._sid))
+            self.conv_pool.append(cp)
+            self.ssm_pool.append(sp)
+            if materialize_hosts:
+                self.host_by_sid[cp.value.storage_id] = np.zeros((self.slots, Kt - 1, Cc), np.float32)
+                self.host_by_sid[sp.value.storage_id] = np.zeros((self.slots, H, D, D), np.float32)
+        # per-layer weights (floe [out, in] transposed for the linear op's
+        # [Cin, Cout]; conv taps to the kernel's time-major ABI)
+        self.hc_attn_fn = [ext(f"hc_a_fn_{i}", weights.hc_attn_fn[i]) for i in range(L)]
+        self.hc_attn_base = [ext(f"hc_a_base_{i}", weights.hc_attn_base[i]) for i in range(L)]
+        self.hc_attn_scale = [ext(f"hc_a_scale_{i}", weights.hc_attn_scale[i]) for i in range(L)]
+        self.ln1 = [ext(f"ln1_{i}", weights.ln1[i]) for i in range(L)]
+        self.qkv_proj = [ext(f"qkv_proj_{i}", weights.qkv_proj[i].T.copy()) for i in range(L)]  # [C, 3qkv]
+        self.taps = [ext(f"taps_{i}", weights.conv_w[i].T.copy()) for i in range(L)]  # [Kt, Cc] time-major
+        self.f_a = [ext(f"f_a_{i}", weights.f_a[i].T.copy()) for i in range(L)]
+        self.f_b = [ext(f"f_b_{i}", weights.f_b[i].T.copy()) for i in range(L)]
+        self.b_proj = [ext(f"b_proj_{i}", weights.b_proj[i].T.copy()) for i in range(L)]
+        self.dt_bias = [ext(f"dt_bias_{i}", weights.dt_bias[i].reshape(H, D)) for i in range(L)]  # [H, K]
+        self.A_log = [ext(f"A_log_{i}", weights.A_log[i]) for i in range(L)]
+        self.g_a = [ext(f"g_a_{i}", weights.g_a[i].T.copy()) for i in range(L)]
+        self.g_b = [ext(f"g_b_{i}", weights.g_b[i].T.copy()) for i in range(L)]
+        self.o_norm = [ext(f"o_norm_{i}", weights.o_norm[i]) for i in range(L)]
+        self.o_proj = [ext(f"o_proj_{i}", weights.o_proj[i].T.copy()) for i in range(L)]
+
+
+def build_glm53_kda_spine_forward(ops: RecordingBackend, args: Glm53KdaSpineArgs) -> SymbolicTensor:
+    """E1 KDA-spine decode-step body → the post-spine mHC streams [B, hc, C].
+
+    Eleven ops per layer — ``mhc_pre, rms_norm, linear(qkv), linear(f_a),
+    linear(f_b), linear(b_proj), linear(g_a), linear(g_b), kda_fused_decode,
+    linear(o_proj), mhc_post`` — so a 34-layer spine schedules as 374
+    phases = 374 in-kernel grid barriers, ONE launch for the whole slice.
+    The cross-layer recurrence is explicit: layer i's ``mhc_post`` writes
+    the streams workspace that layer i+1's ``mhc_pre`` reads (RAW hazard —
+    the barrier between those two phases is the recurrence gate), and each
+    layer's fused decode RMWs its own slot pool (the cross-step chain:
+    step t+1's fused op on layer i RAWs step t's write through the pool
+    storage hazard, ordered by the launch boundary / graph node).
+    """
+    cfg, B = args.cfg, args.batch
+    H, D = cfg.linear_num_heads, cfg.linear_head_dim
+    qkv = cfg.qkv_dim
+    streams = args.streams_in
+    for i in range(cfg.num_hidden_layers):
+        h_in, post_a, comb_a = ops.mhc_pre(
+            streams, args.hc_attn_fn[i], args.hc_attn_base[i], args.hc_attn_scale[i],
+            layer=i, iters=cfg.hc_sinkhorn_iters, eps=cfg.hc_eps, rms_eps=cfg.rms_norm_eps,
+        )
+        h = ops.rms_norm(h_in, args.ln1[i], cfg.rms_norm_eps, name=f"spine_ln1_l{i}")
+        # RAW dot rows — the fused-decode ABI (rounded to bf16 inside the op)
+        mixed = ops.linear(h, args.qkv_proj[i], name=f"spine_qkv_l{i}")  # [B, 3qkv] pre-conv
+        f_raw = ops.view_of(
+            ops.linear(ops.linear(h, args.f_a[i], name=f"spine_f_a_l{i}"), args.f_b[i], name=f"spine_f_b_l{i}"),
+            f"spine_f_l{i}", (B, H, D),
+        )
+        b_raw = ops.linear(h, args.b_proj[i], name=f"spine_b_l{i}")  # [B, H]
+        g_raw = ops.view_of(
+            ops.linear(ops.linear(h, args.g_a[i], name=f"spine_g_a_l{i}"), args.g_b[i], name=f"spine_g_b_l{i}"),
+            f"spine_g_l{i}", (B, H, D),
+        )
+        fused, conv_post, ssm_post = ops.kda_fused_decode(
+            args.conv_pool[i], args.ssm_pool[i], args.cache_indices,
+            mixed, f_raw, b_raw, g_raw, args.taps[i], args.dt_bias[i], args.A_log[i], args.o_norm[i],
+            layer=i, scale=D ** -0.5, eps=cfg.rms_norm_eps, lower_bound=cfg.linear_lower_bound,
+        )
+        args.conv_pool[i] = conv_post
+        args.ssm_pool[i] = ssm_post
+        body = ops.linear(ops.view_of(fused, f"spine_kda_flat_l{i}", (B, qkv)), args.o_proj[i],
+                          name=f"spine_o_proj_l{i}")
+        streams = ops.mhc_post(streams, body, post_a, comb_a, layer=i)
+    return streams
