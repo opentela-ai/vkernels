@@ -1,0 +1,162 @@
+# .github/workflows/nightly.yml — build and publish the shared libraries
+# (.so) every night.
+#
+# Assets (raw .so, one per config, plus a BUILD-INFO record):
+#   libvkernels_c-cu<major>-sm<arch>-<uname -m>.so   — CUDA C ABI (vkernels_c)
+#   libvkernels_hip-<uname -m>.so                    — HIP C ABI (vkernels_hip)
+#   libvkernels-hostc-<uname -m>.so                  — host-oracle C ABI (HIP build)
+#
+# They ride a rolling `nightly` tag: the tag is force-moved to the built SHA
+# and same-named assets are clobbered, so the release always holds exactly
+# the latest successful build. The release is marked pre-release and never
+# "latest" (that belongs to version tags via release.yml).
+#
+# Host-only builds produce no bare .so by design (static archive + the
+# _core extension inside the wheel) — release.yml covers those on tags.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "30 3 * * *" # 03:30 UTC, after the daily quiet period starts
+  workflow_dispatch:
+
+permissions:
+  contents: write # tag force-push + release create/upload
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------
+  # CUDA shared library — the serving C ABI (libvkernels_c.so) on the
+  # self-hosted GB10 runner, built inside the pinned cuda13 container.
+  # ------------------------------------------------------------------
+  so-cuda:
+    runs-on: [self-hosted, cuda]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure + build (cuda preset)
+        run: |
+          ~/runners/cuda-run.sh vkernels-ci:cuda13 cmake --preset cuda
+          ~/runners/cuda-run.sh vkernels-ci:cuda13 cmake --build --preset cuda -j"$(nproc)"
+
+      - name: Test (gate the upload on parity)
+        run: ~/runners/cuda-run.sh vkernels-ci:cuda13 ctest --preset cuda --output-on-failure
+
+      - name: Collect .so + build info
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          arch="$(uname -m)"
+          cu="$(~/runners/cuda-run.sh vkernels-ci:cuda13 nvcc --version \
+                | sed -n 's/.*release \([0-9]\+\).*/\1/p' | head -1)"
+          sm="$(sed -n 's/^CMAKE_CUDA_ARCHITECTURES:\(STRING\|INTERNAL\)=\([0-9]\+\).*/\2/p' \
+                build/cuda/CMakeCache.txt | head -1)"
+          cp "build/cuda/src/c/libvkernels_c.so" \
+             "dist/libvkernels_c-cu${cu:-?}-sm${sm:-?}-${arch}.so"
+          {
+            echo "nightly $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "commit $GITHUB_SHA"
+            echo "config cuda (GB10 self-hosted, vkernels-ci:cuda13 container)"
+            echo "arch ${arch} sm_${sm:-?} cuda ${cu:-?}"
+            echo "builder $(~/runners/cuda-run.sh vkernels-ci:cuda13 nvcc --version | tail -1)"
+            echo "glibc $(ldd --version | head -1)"
+          } > "dist/BUILD-INFO-cuda-${arch}.txt"
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: so-cuda
+          path: dist/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # HIP shared libraries — vkernels_hip + the host-oracle C ABI. Same
+  # gating as the ci.yml hip job: no runner, no (empty) assets.
+  # ------------------------------------------------------------------
+  so-hip:
+    if: vars.VKERNELS_HIP_CI == 'true'
+    runs-on: [self-hosted, hip]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure + build + test (hip preset)
+        run: |
+          cmake --preset hip
+          cmake --build --preset hip --parallel
+          ctest --test-dir build/hip --output-on-failure
+
+      - name: Collect .so + build info
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          arch="$(uname -m)"
+          cp build/hip/src/c/libvkernels_hip.so "dist/libvkernels_hip-${arch}.so"
+          cp build/hip/src/c/libvkernels.so   "dist/libvkernels-hostc-${arch}.so"
+          {
+            echo "nightly $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "commit $GITHUB_SHA"
+            echo "config hip (gfx942)"
+            echo "arch ${arch}"
+            echo "compiler $(hipcc --version | tail -1)"
+            echo "glibc $(ldd --version | head -1)"
+          } > "dist/BUILD-INFO-hip-${arch}.txt"
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: so-hip
+          path: dist/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Rolling `nightly` release: move the tag to the built SHA, refresh the
+  # release, clobber same-named assets.
+  # ------------------------------------------------------------------
+  nightly-release:
+    needs: [so-cuda]
+    if: ${{ !cancelled() && contains(needs.*.result, 'success') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Move nightly tag
+        run: |
+          git tag -f nightly "$GITHUB_SHA"
+          git push -f origin nightly
+
+      - name: Publish release (create or refresh, clobber assets)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Nightly $(date -u +%Y-%m-%d) ${GITHUB_SHA::7}"
+          {
+            echo "Automated nightly build of the shared libraries."
+            echo
+            echo "- commit: \`${GITHUB_SHA}\`"
+            echo "- cuda asset: from the \`so-cuda\` job (GB10, cuda13 container)"
+            echo "- hip assets: from \`so-hip\` when a ROCm runner is provisioned"
+            echo
+            echo "Rolling tag — these files are replaced every night. See"
+            echo "BUILD-INFO-*.txt for the exact toolchain of each asset."
+          } > notes.md
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly --title "$title" --notes-file notes.md \
+              --prerelease --latest=false
+          else
+            gh release create nightly --title "$title" --notes-file notes.md \
+              --prerelease --latest=false --verify-tag
+          fi
+          gh release upload nightly dist/*.so dist/BUILD-INFO-*.txt --clobber
