@@ -1,0 +1,68 @@
+{
+  "hardware": "Local NVIDIA GB10, one GPU; no fresh GH200 or MI300A combined-tree model benchmark",
+  "code_revisions": {
+    "floe": "3f8d1b014e164780a3a11ff4780b97027de289a5",
+    "vkernels": "338cb1792396019695ac27041c060bf3591919cb",
+    "kvaas": "140a1232b8b151f394363eb4456a41512f81676c"
+  },
+  "checks": [
+    {
+      "name": "floe-focused-verified",
+      "tests": 123,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 24,
+      "junit_sha256": "de722a57c740e28bf241518c27b51a42ebb6b5adc0d90e71ac804423d4f9342e",
+      "log_sha256": "4889e48903a20e98c677bf311e71cd1e005b392dd19c09f4d38347712a5dc88b",
+      "passed": 99
+    },
+    {
+      "name": "floe-cpu-contracts-final",
+      "tests": 266,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 20,
+      "junit_sha256": "d22dcb80a18a6bf639bd5250eff4840949e0e2e9b8ecdf7d234d2369956194b4",
+      "log_sha256": "1b17c027b1209438349d6cb6ed790178d4361b810c386d021feb9d835109155c",
+      "passed": 246
+    },
+    {
+      "name": "floe-gpu-verified-restored",
+      "tests": 32,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "junit_sha256": "ea4ff22ed935741b881a2642abb741aba60edf1d38905b537567180187b395e9",
+      "log_sha256": "f46069feb78614c429366c3281aca8585a0ceb6ab4d8355f77493856692243c1",
+      "passed": 32
+    },
+    {
+      "name": "vkernels-focused-verified",
+      "tests": 217,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 32,
+      "junit_sha256": "fc46850a789855070dd893661fffefe705d9b3ad7bf9ca922122f7e19d100ad4",
+      "log_sha256": "779a30dcdd84c314ab6e28222fdc6668cd9e34613acc990d540d93354192817e",
+      "passed": 185
+    }
+  ],
+  "ruff": {
+    "floe": "passed",
+    "vkernels": "passed"
+  },
+  "limits": [
+    "SM90 DeepGEMM unavailable locally",
+    "ROCm and Triton 3.8 aggregate-dependent AMD cases skipped",
+    "Two-GPU NCCL/Gloo tests skipped locally; historical Clariden arms passed them",
+    "Existing documentation-only duplicate-slot undefined-behavior case skipped",
+    "No combined-tree full-model NLL or speed qualification; experimental policies remain opt-in"
+  ],
+  "resolved_findings": [
+    "CPU block-table allocation now pins only for CUDA targets",
+    "CPU KDA parameter and small-projection caches avoid CUDA capture queries",
+    "AMD GPU tests require ROCm",
+    "Unsupported MLA decode fragments with undefined variables removed without changing the sole supported BF16 regime"
+  ],
+  "exploratory_logs_retained": "consolidated/2026-10-11/records; initial GPU test run aborted on AMD instructions on NVIDIA, CPU runs failed before device guards; one verification interrupted by concurrent worktree removal"
+}
