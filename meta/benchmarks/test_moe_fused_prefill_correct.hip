@@ -36,6 +36,13 @@
 
 namespace {
 
+static float bf16_to_f32(uint16_t h) {
+  uint32_t b = (uint32_t)h << 16;
+  float f;
+  std::memcpy(&f, &b, 4);
+  return f;
+}
+
 float rnd(int seed, int i) {
   unsigned x = (unsigned)(seed * 2654435761u + (unsigned)i * 40503u);
   x ^= x >> 13;
@@ -69,12 +76,54 @@ uint16_t f2bf(float v) {
   return (uint16_t)(b >> 16);
 }
 
+// Persistent device buffers, allocated once at maximum size and reused by
+// every case.  On MI300A + ROCm 6.3.0 a per-case hipMalloc/hipFree cycle
+// triggers a driver-level "Memory access fault ... Reason: Unknown" at
+// phantom addresses (see meta/benchmarks/repro_issue150_fault.hip): the
+// fault fires asynchronously, even in waves of *earlier* cases whose
+// hipDeviceSynchronize() already returned success, and only when several
+// alloc/free rounds precede it.  Single cases, repeated cases and
+// churn-free multi-case sequences all pass deterministically, so the test
+// allocates once up front and frees at the end.
+struct DevBufs {
+  uint16_t *dA, *dAct;
+  uint8_t *dw13, *dw13s, *dw2, *dw2s;
+  float *dOut, *dTw, *db13, *db2;
+  int32_t *dTids, *dSids, *dEids;
+};
+
+// Worst-case geometry over all cases in main(): M=128, block=128.
+static void alloc_dev_bufs(DevBufs& B, int hidden, int ispp, int top_k, int E) {
+  const int M_max = 128, N_max = M_max * top_k;
+  const int EM_max = N_max + E * 128;  // safe upper bound for both blocks
+  CK(hipMalloc(&B.dA, M_max * hidden * 2), "A");
+  CK(hipMalloc(&B.dw13, E * 2 * ispp * (hidden / 2)), "w13");
+  CK(hipMalloc(&B.dw13s, E * 2 * ispp * (hidden / 32)), "w13s");
+  CK(hipMalloc(&B.dw2, E * hidden * (ispp / 2)), "w2");
+  CK(hipMalloc(&B.dw2s, E * hidden * (ispp / 32)), "w2s");
+  CK(hipMalloc(&B.db13, E * 2 * ispp * 4), "b13");
+  CK(hipMalloc(&B.db2, E * hidden * 4), "b2");
+  CK(hipMalloc(&B.dAct, EM_max * ispp * 2), "act");
+  CK(hipMalloc(&B.dOut, M_max * hidden * 4), "out");
+  CK(hipMalloc(&B.dTw, N_max * 4), "tw");
+  CK(hipMalloc(&B.dTids, N_max * 4), "tids");
+  CK(hipMalloc(&B.dSids, EM_max * 4), "sids");
+  CK(hipMalloc(&B.dEids, (EM_max / 64) * 4), "eids");  // smallest block
+}
+
+static void free_dev_bufs(DevBufs& B) {
+  hipFree(B.dA); hipFree(B.dw13); hipFree(B.dw13s); hipFree(B.dw2);
+  hipFree(B.dw2s); hipFree(B.db13); hipFree(B.db2); hipFree(B.dAct);
+  hipFree(B.dOut); hipFree(B.dTw); hipFree(B.dTids); hipFree(B.dSids);
+  hipFree(B.dEids);
+}
+
 // Run one prefill correctness case. Returns true on PASS.
 // `gpu_block_m` is the alignment the GPU path consumes: 64 for the shipped
 // prefill tiles, 128 for the issue-#150 M-tile config (VK_MOE_PF_VARIANT=6;
 // the launcher falls back to the 64-row v5 path when the alignment is 64).
 bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E,
-             int activation, int gpu_block_m) {
+             int activation, int gpu_block_m, DevBufs& B) {
   constexpr int CPU_BLOCK_M = 16;
   const int GPU_BLOCK_M = gpu_block_m;
   constexpr int group_size = 32;
@@ -149,24 +198,13 @@ bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E,
       hb13.data(), hb2.data());
 
   // --- Device ---
-  uint16_t *dA, *dAct;
-  uint8_t *dw13, *dw13s, *dw2, *dw2s;
-  float *dOut, *dTw, *db13, *db2;
-  int32_t *dTids, *dSids, *dEids;
-  CK(hipMalloc(&dA, M * hidden * 2), "A");
-  CK(hipMalloc(&dw13, w13_sz), "w13");
-  CK(hipMalloc(&dw13s, w13s_sz), "w13s");
-  CK(hipMalloc(&dw2, w2_sz), "w2");
-  CK(hipMalloc(&dw2s, w2s_sz), "w2s");
-  CK(hipMalloc(&db13, E * 2 * ispp * 4), "b13");
-  CK(hipMalloc(&db2, E * hidden * 4), "b2");
-  CK(hipMalloc(&dAct, EM_gpu * ispp * 2), "act");
-  CK(hipMalloc(&dOut, M * hidden * 4), "out");
-  CK(hipMalloc(&dTw, N * 4), "tw");
-  CK(hipMalloc(&dTids, N * 4), "tids");
-  CK(hipMalloc(&dSids, EM_gpu * 4), "sids");
-  CK(hipMalloc(&dEids, (EM_gpu / GPU_BLOCK_M) * 4), "eids");
+  // Aliases into the persistent pre-allocated buffers (see DevBufs note).
+  uint16_t *dA = B.dA, *dAct = B.dAct;
+  uint8_t *dw13 = B.dw13, *dw13s = B.dw13s, *dw2 = B.dw2, *dw2s = B.dw2s;
+  float *dOut = B.dOut, *dTw = B.dTw, *db13 = B.db13, *db2 = B.db2;
+  int32_t *dTids = B.dTids, *dSids = B.dSids, *dEids = B.dEids;
 
+  CK(hipMemset(B.dAct, 0xAB, (size_t)EM_gpu * ispp * 2), "zAct");
   CK(hipMemcpy(dA, hA.data(), M * hidden * 2, hipMemcpyHostToDevice), "cpyA");
   CK(hipMemcpy(dw13, hw13.data(), w13_sz, hipMemcpyHostToDevice), "cpw13");
   CK(hipMemcpy(dw13s, hw13s.data(), w13s_sz, hipMemcpyHostToDevice), "cpw13s");
@@ -201,9 +239,77 @@ bool run_case(const char* name, int M, int hidden, int ispp, int top_k, int E,
               name, M, hidden, ispp, top_k, E, EM_gpu, EM_cpu);
   std::printf("  OUT max_rel=%.6f %s\n", max_rel, max_rel < 0.02 ? "PASS" : "FAIL");
 
-  hipFree(dA); hipFree(dw13); hipFree(dw13s); hipFree(dw2); hipFree(dw2s);
-  hipFree(db13); hipFree(db2); hipFree(dAct); hipFree(dOut);
-  hipFree(dTw); hipFree(dTids); hipFree(dSids); hipFree(dEids);
+  if (max_rel >= 0.02) {
+    // Worst-element diagnostics.
+    int wi = 0; double we = 0;
+    for (int i = 0; i < M * hidden; ++i) {
+      double e = std::fabs((double)out_gpu[i] - (double)out_cpu[i]);
+      double d = std::fmax(std::fabs((double)out_cpu[i]), 1.0);
+      if (e / d > we) { we = e / d; wi = i; }
+    }
+    std::printf("  worst out[%d] (token %d, ch %d): gpu=%.6f cpu=%.6f\n",
+                wi, wi / hidden, wi % hidden, out_gpu[wi], out_cpu[wi]);
+    // Fraction of badly-wrong elements + per-token worst.
+    int bad = 0;
+    std::vector<int> bad_tok(M, 0);
+    for (int i = 0; i < M * hidden; ++i) {
+      double e = std::fabs((double)out_gpu[i] - (double)out_cpu[i]);
+      double d = std::fmax(std::fabs((double)out_cpu[i]), 1.0);
+      if (e / d > 0.02) { ++bad; ++bad_tok[i / hidden]; }
+    }
+    std::printf("  bad elements: %d / %d; per-token bad counts:",
+                bad, M * hidden);
+    for (int t = 0; t < M; ++t) std::printf(" %d", bad_tok[t]);
+    std::printf("\n");
+    // Optional gateup-stage isolation: compare device act vs oracle act.
+    if (std::getenv("VK150_DIAG")) {
+      // Re-run the CPU oracle with the GPU's own alignment so act rows are
+      // directly comparable (act rows encode the sorted order of their
+      // alignment; cross-alignment comparison is meaningless).
+      std::vector<float> tws_gpu(EM_gpu, 0.0f);
+      for (int i = 0; i < EM_gpu; ++i)
+        if (h_sids_gpu[i] < N) tws_gpu[i] = h_topk_w[h_sids_gpu[i]];
+      // The CPU oracle tiles M by 16 internally: expand the 128-row eids.
+      std::vector<int32_t> eids16(EM_gpu / 16, -1);
+      for (size_t j = 0; j < eids16.size(); ++j)
+        eids16[j] = h_eids_gpu[j / (128 / 16)];
+      std::vector<uint16_t> act_ref(EM_gpu * ispp, 0);
+      std::vector<float> out_ref(M * hidden, 0.0f);
+      vkernels::kernels::fused_moe_mxfp4_cpu(
+          hA.data(), hw13.data(), hw13s.data(), hw2.data(), hw2s.data(),
+          h_sids_gpu.data(), tws_gpu.data(), eids16.data(),
+          act_ref.data(), out_ref.data(),
+          M, hidden, ispp, top_k, EM_gpu, group_size, LIMIT, activation,
+          4.0f, 25.0f, hb13.data(), hb2.data());
+      double out_ref_rel = 0;
+      for (int i = 0; i < M * hidden; ++i) {
+        double e = std::fabs((double)out_gpu[i] - (double)out_ref[i]);
+        double d = std::fmax(std::fabs((double)out_ref[i]), 1.0);
+        if (e / d > out_ref_rel) out_ref_rel = e / d;
+      }
+      std::printf("  OUT vs aligned-oracle max_rel=%.6f\n", out_ref_rel);
+      std::vector<uint16_t> act_gpu(EM_gpu * ispp);
+      CK(hipMemcpy(act_gpu.data(), B.dAct, (size_t)EM_gpu * ispp * 2,
+                   hipMemcpyDeviceToHost), "rdAct");
+      int act_bad = 0; double act_rel = 0; int awi = 0;
+      for (int r = 0; r < EM_gpu; ++r) {
+        int32_t flat = h_sids_gpu[r];
+        if (flat >= N) continue;  // padding row
+        for (int c = 0; c < ispp; ++c) {
+          float g = bf16_to_f32(act_gpu[r * ispp + c]);
+          float o = bf16_to_f32(act_ref[r * ispp + c]);
+          double e = std::fabs((double)g - (double)o);
+          double d = std::fmax(std::fabs((double)o), 1.0);
+          if (e / d > act_rel) { act_rel = e / d; awi = r * ispp + c; }
+          if (e / d > 0.05) ++act_bad;
+        }
+      }
+      std::printf("  ACT max_rel=%.6f bad=%d worst=(row %d, ch %d) gpu=%.5f cpu=%.5f\n",
+                  act_rel, act_bad, awi / ispp, awi % ispp,
+                  bf16_to_f32(act_gpu[awi]), act_ref[awi]);
+    }
+  }
+
   return max_rel < 0.02;
 }
 
@@ -218,10 +324,13 @@ int main(int argc, char** argv) {
   const int activation = situ ? vkernels::kernels::kSiTU : vkernels::kernels::kSwiGLU;
   std::printf("activation=%s\n", situ ? "situ" : "swiglu");
 
+  DevBufs B;
+  alloc_dev_bufs(B, 512, 256, 2, 4);
+
   // Clean prefill: 64 tokens/expert -> one full 64-row block, no padding.
-  bool ok1 = run_case("clean64", 128, 512, 256, 2, 4, activation, 64);
+  bool ok1 = run_case("clean64", 128, 512, 256, 2, 4, activation, 64, B);
   // Padded prefill: 40 tokens/expert -> 24 padding rows per expert.
-  bool ok2 = run_case("padded64", 80, 512, 256, 2, 4, activation, 64);
+  bool ok2 = run_case("padded64", 80, 512, 256, 2, 4, activation, 64, B);
 
   // Issue #150: the 128-row M-tile config (VK_MOE_PF_VARIANT=6) plus its
   // 64-row fall-back.  The padded case exercises 128-row alignment with
@@ -230,10 +339,11 @@ int main(int argc, char** argv) {
   const char* venv = std::getenv("VK_MOE_PF_VARIANT");
   const int pf_variant = venv ? std::atoi(venv) : 5;
   if (pf_variant == 6) {
-    ok3 = run_case("clean128", 128, 512, 256, 2, 4, activation, 128);
-    ok4 = run_case("padded128", 80, 512, 256, 2, 4, activation, 128);
+    ok3 = run_case("clean128", 128, 512, 256, 2, 4, activation, 128, B);
+    ok4 = run_case("padded128", 80, 512, 256, 2, 4, activation, 128, B);
   }
 
+  free_dev_bufs(B);
   std::printf("%s\n", (ok1 && ok2 && ok3 && ok4) ? "PASS" : "FAIL");
   return (ok1 && ok2 && ok3 && ok4) ? 0 : 1;
 }
