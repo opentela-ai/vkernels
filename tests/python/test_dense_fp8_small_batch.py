@@ -5,7 +5,8 @@ torch = pytest.importorskip("torch")
 from vkernels.torch_ops._dispatch import OpNotEligible
 from vkernels.torch_ops.dense_fp8_small_batch import _run, dense_fp8_small_batch
 
-CUDA = torch.cuda.is_available() and torch.version.hip is None
+CUDA = (torch.cuda.is_available() and torch.version.hip is None
+        and torch.cuda.get_device_capability()[0] >= 9)
 
 
 def operands(m, o, k, device):

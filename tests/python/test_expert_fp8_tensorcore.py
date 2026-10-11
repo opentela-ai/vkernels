@@ -23,8 +23,9 @@ def reference(x, weight, scales, indices):
     return (selected * activations.float().unsqueeze(-2)).sum(-1).to(torch.bfloat16)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip,
-                    reason="CUDA BF16 tensor cores")
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip
+                    or torch.cuda.get_device_capability()[0] < 9,
+                    reason="SM90 or newer CUDA tensor cores")
 @pytest.mark.parametrize("routed", [False, True])
 @pytest.mark.parametrize("tile", [32, 64, 128])
 def test_changed_input_graph_and_owned_outputs(routed, tile):
