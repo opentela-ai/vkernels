@@ -764,6 +764,7 @@ int main() {
         {2,  128, 256, 3, 4, 64, 0.0f, true,  false, "fp8 tiny odd S=3 (splits span blocks)"},
         {5, 6288, 7168, 64, 8, 64, 0.0f, true,  false, "fp8 kk=8 S=64"},
         {1,  896, 7168, 96, 2, 64, 0.0f, true,  true,  "fp8 M=1 a_gmem S=96"},
+        {5, 3584, 7168, 96, 4, 128, 0.5f, true, false, "fp8 S=96 unaligned k0 kk=4"},
     };
     std::printf("\n--- decode-GEMV v2 (gemv_decode_*_splitk_v2) ---\n");
     for (const auto& c : cases) {

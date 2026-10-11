@@ -1039,25 +1039,51 @@ __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
 
   if (c0 + 8 <= N) {
     const int colb = c0 >> 3;  // thread's 8 columns = one scale n-block
+    // Iterate in SCALE-ALIGNED segments: kts_e is element-granular, so a
+    // split's k0 need not be 128-aligned and a (128-K x 8-N) scale-block
+    // boundary can fall MID-KK-group. Within a segment the block scale is
+    // constant; the fast KK loop only runs while it cannot cross a
+    // boundary. One scale reload per segment.
     float sc = scales[(size_t)(k0 >> 7) * n_s8 + colb] * 0x1p119f;
     int k = 0;
-    for (; k + KK <= kl; k += KK) {
-      if (k > 0 && ((k0 + k) & 127) == 0)
-        sc = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb] * 0x1p119f;
-      uint4 v[KK];
+    while (k < kl) {
+      const int seg = min(kl - k, 128 - ((k0 + k) & 127));
+      int j = 0;
+      for (; j + KK <= seg; j += KK) {
+        uint4 v[KK];
 #pragma unroll
-      for (int i = 0; i < KK; ++i)
-        v[i] = *(const uint4*)(&W8[(size_t)(k0 + k + i) * N + c0]);
-      float a[KK][M];
+        for (int i = 0; i < KK; ++i)
+          v[i] = *(const uint4*)(&W8[(size_t)(k0 + k + j + i) * N + c0]);
+        float a[KK][M];
 #pragma unroll
-      for (int i = 0; i < KK; ++i)
+        for (int i = 0; i < KK; ++i)
+#pragma unroll
+          for (int m = 0; m < M; ++m)
+            a[i][m] = bf16_to_f32(AGMEM ? A[(size_t)m * K + k0 + k + j + i]
+                                        : sA[m * klp + k + j + i]);
+#pragma unroll
+        for (int i = 0; i < KK; ++i) {
+          const uint32_t* vc = (const uint32_t*)(&v[i]);
+#pragma unroll
+          for (int t = 0; t < 8; ++t) {
+            const uint32_t b = (vc[t >> 2] >> (8 * (t & 3))) & 0xFFu;
+            const float w = bf16_to_f32(
+                f2bf(sc * __uint_as_float(((b & 0x80u) << 24) |
+                                          ((b & 0x7Fu) << 20))));
+#pragma unroll
+            for (int m = 0; m < M; ++m)
+              acc[m][t] = fmaf(w, a[i][m], acc[m][t]);
+          }
+        }
+      }
+      for (; j < seg; ++j) {
+        const uint4 v = *(const uint4*)(&W8[(size_t)(k0 + k + j) * N + c0]);
+        const uint32_t* vc = (const uint32_t*)(&v);
+        float a[M];
 #pragma unroll
         for (int m = 0; m < M; ++m)
-          a[i][m] = bf16_to_f32(AGMEM ? A[(size_t)m * K + k0 + k + i]
-                                      : sA[m * klp + k + i]);
-#pragma unroll
-      for (int i = 0; i < KK; ++i) {
-        const uint32_t* vc = (const uint32_t*)(&v[i]);
+          a[m] = bf16_to_f32(AGMEM ? A[(size_t)m * K + k0 + k + j]
+                                   : sA[m * klp + k + j]);
 #pragma unroll
         for (int t = 0; t < 8; ++t) {
           const uint32_t b = (vc[t >> 2] >> (8 * (t & 3))) & 0xFFu;
@@ -1065,29 +1091,11 @@ __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
               f2bf(sc * __uint_as_float(((b & 0x80u) << 24) |
                                         ((b & 0x7Fu) << 20))));
 #pragma unroll
-          for (int m = 0; m < M; ++m) acc[m][t] = fmaf(w, a[i][m], acc[m][t]);
+          for (int m = 0; m < M; ++m) acc[m][t] = fmaf(w, a[m], acc[m][t]);
         }
       }
-    }
-    for (; k < kl; ++k) {
-      if (k > 0 && ((k0 + k) & 127) == 0)
-        sc = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb] * 0x1p119f;
-      const uint4 v = *(const uint4*)(&W8[(size_t)(k0 + k) * N + c0]);
-      const uint32_t* vc = (const uint32_t*)(&v);
-      float a[M];
-#pragma unroll
-      for (int m = 0; m < M; ++m)
-        a[m] = bf16_to_f32(AGMEM ? A[(size_t)m * K + k0 + k]
-                                 : sA[m * klp + k]);
-#pragma unroll
-      for (int t = 0; t < 8; ++t) {
-        const uint32_t b = (vc[t >> 2] >> (8 * (t & 3))) & 0xFFu;
-        const float w = bf16_to_f32(
-            f2bf(sc * __uint_as_float(((b & 0x80u) << 24) |
-                                      ((b & 0x7Fu) << 20))));
-#pragma unroll
-        for (int m = 0; m < M; ++m) acc[m][t] = fmaf(w, a[m], acc[m][t]);
-      }
+      k += seg;
+      if (k < kl) sc = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb] * 0x1p119f;
     }
   } else {
     // Rare partial-column tail: same per-element-rounded math, scalar
