@@ -52,6 +52,7 @@ def _kernel():
         MP: tl.constexpr,
         ROWS: tl.constexpr,
         BLOCK_I: tl.constexpr,
+        INDEPENDENT_ROWS: tl.constexpr = False,
     ):
         """Y[m, n] for m < M, n = pid*ROWS + arange(ROWS).
 
@@ -65,6 +66,9 @@ def _kernel():
         rounded to bf16 before the fp32 accumulation — the
         loader-dequant rounding point.
         """
+        if INDEPENDENT_ROWS:
+            X += tl.program_id(1) * I
+            Y += tl.program_id(1) * O
         pid = tl.program_id(0)
         rows = pid * ROWS + tl.arange(0, ROWS)
         rmask = rows < O
@@ -187,13 +191,15 @@ def _tiles(o: int, i: int, m: int = 1) -> tuple[int, int, int]:
     return (4 if o % 4 == 0 else 1), _next_pow2(min(i, 4096)), 4
 
 
-def dense_gemv_fp8(x, w8, scales, m_cap=None):
+def dense_gemv_fp8(x, w8, scales, m_cap=None, *, independent_rows=False):
     """Return bf16 [M, O] for bf16 x [M, I] (or [I]), fp8-e4m3fn w8 [O, I]
     and fp32 block scales [O//128, I//128].
 
     M <= ``m_cap`` (default 2, the decode-validated limit; floe passes its
     ``moe_decode_max_tokens`` knob so decode and DFlash2 verify blocks
     route consistently). The padded constexpr is the next power of two.
+    ``independent_rows=True`` uses the M=1 tile and reduction independently
+    for every input row; batch width does not select a different tile.
     Anything outside the contract raises ``OpNotEligible`` so the caller
     can fall back to its BLAS/dequant path.
     """
@@ -220,21 +226,24 @@ def dense_gemv_fp8(x, w8, scales, m_cap=None):
     if not (x.is_contiguous() and w8.is_contiguous() and scales.is_contiguous()):
         raise OpNotEligible("inputs must be contiguous")
     tl, triton, kern = _kernel()
-    rows, block_i, warps = _tiles(o, i, m)
-    mp = triton.next_power_of_2(m)
+    kernel_m = 1 if independent_rows else m
+    rows, block_i, warps = _tiles(o, i, kernel_m)
+    mp = triton.next_power_of_2(kernel_m)
     y = torch.empty(m, o, device=x.device, dtype=torch.bfloat16)
     with torch.cuda.device(x.device):
-        kern[(triton.cdiv(o, rows),)](
+        kern[(triton.cdiv(o, rows), m) if independent_rows and m > 1
+             else (triton.cdiv(o, rows),)](
             x.reshape(m, i),
             w8.view(torch.uint8),
             scales,
             y,
-            m,
+            kernel_m,
             o,
             i,
             MP=mp,
             ROWS=rows,
             BLOCK_I=block_i,
+            INDEPENDENT_ROWS=bool(independent_rows and m > 1),
             num_warps=warps,
         )
     return y
