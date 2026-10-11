@@ -119,6 +119,9 @@ def main():
             dref = x.float() @ wref.T  # fp32 dequant reference [m, n]
 
             # ---- parity ------------------------------------------------
+            # a previous shape's sweep may have exported its best tiles;
+            # a stages=3 BN=128 pick exceeds gfx942 LDS at other shapes.
+            os.environ.pop("VK_DECODE_GEMM_TILES", None)
             out = glm_decode_fp8_gemm(x, w_fnuz, s2, split_k=4)
             assert torch.isfinite(out).all()
             rel_ref = ((out.float() - dref).norm() / dref.norm().clamp_min(1e-12)).item()
