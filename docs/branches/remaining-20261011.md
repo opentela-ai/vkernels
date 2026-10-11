@@ -49,3 +49,11 @@ Local NVIDIA GB10 (SM121), Torch 2.13.0+cu130, Triton 3.7.1: 201 passed, 2 skipp
 Ruff passes on all edited Python modules; collective benchmark CLI and syntax checked. The collective needs four colocated GPUs and has not been executed locally. SM90 public small-batch selection, GH200/MI300A timing and full-model NLL are not established by SM121 operator tests. The two tensor-core experiments remain outside automatic dispatch. No new serving speedup or quality pass is claimed; the existing +0.01 nats/token budget remains required before serving promotion.
 
 Historical `t5-soup` timings include corrections and confounds and are archived as such. The MI300 WIP is preserved without reapplying code already superseded by main. The separate Issue 148 draft requires ROCm/gfx942 compile, operator parity, graph/stream checks and model NLL before promotion.
+
+CI follow-up: optional Torch imports were guarded in three consolidated MoE
+test modules and the CPU mHC oracle test. A clean NumPy/pytest environment
+runs **735 passed, 403 skipped, 499 subtests passed**. The three MoE suites
+also pass **44 tests** on GB10. The hosted benchmark comparison reproduced
+failures on add/scale/relu/GEMM; this PR changes none of their native or Python
+benchmark execution code. That check remains unresolved; its threshold was
+not relaxed and its results are not evidence of a serving regression or win.

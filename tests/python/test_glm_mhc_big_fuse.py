@@ -180,7 +180,7 @@ def test_graph_capture_replay(torch, fp32_norm):
 
 
 def test_fp32_norm_matches_independent_fp64_oracle():
-    import torch
+    torch = pytest.importorskip("torch")
     from vkernels.torch_ops.glm_mhc_big_fuse import mhc_pre_big_fuse_reference
 
     torch.manual_seed(798)
