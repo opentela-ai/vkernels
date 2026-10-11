@@ -138,6 +138,52 @@ Steps 3–5 touch the sglang image and are the remaining open items of issue
 #60; steps 1–2 are already automated in this repo (CI `cuda` job + the
 registered CTest test).
 
+## Tier-1 on-cluster bring-up (bristen) — staged 2026-10-11
+
+The cookbook recipe (issue-comment wiring + `apply_sm80_patch.sh`) carries the
+dtype-dispatched bridge with the tier-1 C-ABI device path; the bristen deploy
+dir still served the tier-2 torch port (jobs 83120/83152/83166). The staged
+bring-up (`meta/scripts/issue60_kpool_a100_bringup.sh`) closes that gap:
+
+* **stage** (done, login-node side): main-tip source exported to
+  `$DEPLOY_DIR/vkernels-src`; the deployed `vkernels-python/vkernels` package
+  refreshed (adds `dsa_kpool_device.py`); the cookbook tier-1
+  `kpool_fp8_index.py` installed into `patches_full/` (prior copy kept as
+  `.pre-tier1`); the `VKERNELS_LIB` export block inserted into the deployed
+  `serve_glm_53_flash_sglang.sbatch` (prior copy `.pre-tier1`) so the bridge
+  picks tier 1 when the library exists and falls back to tier 2 otherwise.
+* **build** (pending cluster access): one srun inside the serving container
+  (same `sglang-dev-cu13` image → same CUDA ABI) configures, builds
+  `vkernels_c` + `test_dsa_kpool_correct`, gates device-vs-oracle (expect
+  14/14 PASS on sm_80), installs `libvkernels_c.so` into
+  `$VKERNELS_PYTHON/lib/` and probes the four `vk_hip_dsa_kpool_*` exports
+  via ctypes inside the very container that serves.
+* **Build path verified off-cluster** (GB10, CUDA 13.0, no ROCm): the same
+  two cmake commands compile clean and the gate passes (device-vs-oracle
+  `PASS (0 failure(s))`); `nm -D` shows exactly the four
+  `vk_hip_dsa_kpool_{assemble,decode_update}{,_fp8}` exports; the
+  device-ABI python suite (`tests/python/test_dsa_kpool_device.py`) passes
+  13/13 (5 torch-dependent skips) against that `.so`; the tier-1 patched
+  `kpool_fp8_index.py` byte-compiles.
+
+Reproduction after `cscs-key sign` (MFA):
+
+```bash
+# from a vkernels checkout
+meta/scripts/issue60_kpool_a100_bringup.sh stage /path/to/cookbook
+# on bristen (1 GPU node, ~20 min)
+srun -A infra02 -N1 --gpus-per-node=1 --time=0:40:00 \
+  --container-image="$DEPLOY_DIR/cache/enroot/sglang-dev-cu13.sqsh" \
+  --container-mounts=/capstor:/capstor --container-name=vk60build \
+  bash "$DEPLOY_DIR/vkernels-src/meta/scripts/issue60_kpool_a100_bringup.sh" build
+# then the 2-node PP2 serving run (existing recipe), probe at full budget
+sbatch --export=ALL,GEN_PROBE_TIMEOUT=900,GEN_CORRECTNESS_PER_REQ_TIMEOUT=300 \
+  "$DEPLOY_DIR/serve_glm_53_flash_sglang.sbatch"
+# go/no-go lines in logs/glm53-bristen-<job>.out:
+#   "[kpool] device tier: ..."   (tier 1 active)
+#   "GEN_PROBE_OK" + run/<job>/gen_correctness_*.json verdict
+```
+
 ## Test coverage map (what pins this contract)
 
 * Host oracles + C ABI wiring: `tests/kernels/attn/test_dsa_kpool{,_fp8}.cpp`,
