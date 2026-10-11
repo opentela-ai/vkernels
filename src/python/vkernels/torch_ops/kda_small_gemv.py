@@ -14,9 +14,9 @@ This op takes the three weights ROW-CONCATENATED at load time
 single ``x`` read: the GLM-5.3-Flash TP4 stack is [16 + 128 + 128, 4096].
 
 Numerics contract (the node-cuts E class):
-- per-slice dots are IDENTICAL to ``dense_gemv`` — fp32 accumulation over
-  the same product tile with the same ``tl.sum`` reduction tree, rounded
-  once to bf16 at the store;
+- per-slice dots accumulate FP32 products and round once to BF16 at the
+  store; layout-dependent reduction trees can differ from ``dense_gemv``
+  near BF16 rounding boundaries;
 - the beta slice applies ``sigmoid`` AFTER the bf16 round (the eager
   rounding point pinned by ``beta = torch.sigmoid(linear(x, b_proj))``);
   the transcendental itself may differ from torch by ulps in fp32 before
@@ -118,8 +118,7 @@ def _kernel():
         """Y[m, row] for m < M; sigmoid epilogue on rows < OB, raw bf16 after.
 
         W: bf16 [O, K] row-concat stack. The reduction streams BLOCK_I chunks
-        with fp32 accumulation — the same product tile + tl.sum tree as
-        dense_gemv (bit-identical per dot), vectorized over the MP token
+        with fp32 accumulation, vectorized over the MP token
         lanes exactly like dense_gemv_fp8. ``SIG=0`` stores the RAW bf16
         dots everywhere (the kda_packed_decode wiring: its kernel applies
         the sigmoid in-kernel and wants the pre-fold slice).
@@ -170,7 +169,8 @@ def kda_small_gemv_eligible(x, stack, ob, ofa, oga) -> bool:
     return True
 
 
-def kda_small_gemv(x, stack, ob, ofa, oga, m_cap=None, sigmoid_beta=True):
+def kda_small_gemv(x, stack, ob, ofa, oga, m_cap=None, sigmoid_beta=True,
+                   backend="triton"):
     """Return BF16 ``[M, OB+OFA+OGA]`` — one launch over the row-concat stack.
 
     Output layout (zero-copy slices for the caller): ``beta`` = ``[:, :ob]``
@@ -183,6 +183,11 @@ def kda_small_gemv(x, stack, ob, ofa, oga, m_cap=None, sigmoid_beta=True):
     applies the sigmoid in-kernel). Raises
     :class:`~vkernels.torch_ops._dispatch.OpNotEligible` outside the
     contract so the caller keeps the 3-GEMV eager chain.
+
+    ``backend="linear"`` follows the serving projection policy: dense_gemv
+    for M1, BF16 BLAS for M>1, against the same cached stack. Stacking can
+    still change BLAS/reduction selection; it is not a universal bitwise
+    guarantee. The default retains the original Triton reduction.
     """
     import torch
 
@@ -190,13 +195,28 @@ def kda_small_gemv(x, stack, ob, ofa, oga, m_cap=None, sigmoid_beta=True):
     cap = int(m_cap) if m_cap is not None else _MAX_M
     if m > cap:
         raise OpNotEligible(f"M={m} above the caller cap {cap}")
+    if backend not in {"triton", "linear"}:
+        raise ValueError(f"unknown small-projection backend {backend!r}")
+    key = (x.device.index, m, bool(sigmoid_beta), backend)
+    with torch.cuda.device(x.device):
+        if torch.cuda.is_current_stream_capturing() and key not in _WARMED:
+            raise RuntimeError("warm up kda_small_gemv eagerly on this device/row-count/mode before capture")
+        if backend == "linear":
+            flat = x.reshape(m, k)
+            if m == 1:
+                from .glm_gemv import dense_gemv
+
+                out = dense_gemv(flat, stack)
+            else:
+                out = torch.nn.functional.linear(flat, stack)
+            if sigmoid_beta:
+                out = torch.cat([torch.sigmoid(out[:, :ob]), out[:, ob:]], dim=-1)
+            _WARMED.add(key)
+            return out
     triton = __import__("triton")
     rows, warps = _tiles(total)
     mp = triton.next_power_of_2(m)
     with torch.cuda.device(x.device):
-        key = (x.device.index, m)
-        if torch.cuda.is_current_stream_capturing() and key not in _WARMED:
-            raise RuntimeError("warm up kda_small_gemv eagerly on this device/row-count before capture")
         out = torch.empty(m, total, dtype=torch.bfloat16, device=x.device)
         _kernel()[(triton.cdiv(total, rows),)](
             x.reshape(m, k), stack, out, m, total, k, ob, mp, rows,

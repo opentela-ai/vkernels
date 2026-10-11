@@ -221,6 +221,60 @@ int main(int argc, char** argv) {
         }, a, b, 5, iters);
         if (t < fused) { fused = t; best_sk = sk_try; }
       }
+      // Issue #148: fnuz storage + hardware v_cvt_pk_f32_fp8 decode.
+      // Separate fnuz weight buffer (payload-halved encoding, no 0x80 NaN
+      // code) with DOUBLED scales; timing-only (parity lives in
+      // test_glm_fp8_gemv.hip).
+      std::vector<uint8_t> wf(nw);
+      for (size_t i = 0; i < nw; ++i) {
+        uint8_t b = (uint8_t)(rnd(2, (int)i) * 127.0f + 128.0f);
+        wf[i] = (b == 0x80u) ? (uint8_t)0x00u : b;
+      }
+      std::vector<float> s2(ns);
+      for (size_t i = 0; i < ns; ++i)
+        s2[i] = 0.0625f * (float)(1 + (i % 128));
+      uint8_t* dwf;
+      float* ds2;
+      CK(hipMalloc(&dwf, nw), "awf");
+      CK(hipMalloc(&ds2, ns * 4), "asf");
+      CK(hipMemcpy(dwf, wf.data(), nw, hipMemcpyHostToDevice), "cwf");
+      CK(hipMemcpy(ds2, s2.data(), ns * 4, hipMemcpyHostToDevice), "csf");
+      double fnzcv = 1e30;
+      int best_sk_f = sk;
+      for (int sk_try = 1; sk_try <= 8; sk_try <<= 1) {
+        if ((c.K / 128) % sk_try != 0) continue;
+        const double t = bench_us(
+            [&] {
+              h::glm_fp8_fnuz_block_gemv_with_scratch(
+                  dx, dwf, ds2, dout, dpart, M, c.N, c.K, sk_try);
+            },
+            a,
+            b,
+            5,
+            iters);
+        if (t < fnzcv) {
+          fnzcv = t;
+          best_sk_f = sk_try;
+        }
+      }
+      double mfma = 1e30;
+      int best_sk_m = sk;
+      for (int sk_try = 1; sk_try <= 8; sk_try <<= 1) {
+        if ((c.K / 128) % sk_try != 0) continue;
+        const double t = bench_us(
+            [&] {
+              h::glm_fp8_fnuz_mfma_block_gemv_with_scratch(
+                  dx, dwf, ds2, dout, dpart, M, c.N, c.K, sk_try);
+            },
+            a,
+            b,
+            5,
+            iters);
+        if (t < mfma) {
+          mfma = t;
+          best_sk_m = sk_try;
+        }
+      }
       const double mat = bench_us([&] {
         const int grid = (int)((nw + kTh - 1) / kTh);
         bf16_gemv_kernel<<<(c.N + 31) / 32, kTh>>>(dx, dwb, dout, M, c.N, c.K);
@@ -238,9 +292,28 @@ int main(int argc, char** argv) {
       const double roof_f = fused_bytes / roof_gbs / 1e9 * 1e6;
       const double roof_m = mat_bytes / roof_gbs / 1e9 * 1e6;
       std::printf("%-22s %2d  %9.1f %8.0f %9.1f %8.0f %9.1f   %.2fx "
-                  "(best sk=%d of {1,2,4,8}, roofs %.1f/%.1f us)\n",
-                  c.tag, M, fused, fgb, mat, mgb, dq,
-                  mat / (fused > 0 ? fused : 1), best_sk, roof_f, roof_m);
+                  "(best sk=%d of {1,2,4,8}, roofs %.1f/%.1f us)  "
+                  "fnuz-cvt %8.1f us %8.0f GB/s (sk=%d, %.2fx vs manual)  "
+                  "mfma %7.1f us %8.0f GB/s (sk=%d, %.2fx vs manual)\n",
+                  c.tag,
+                  M,
+                  fused,
+                  fgb,
+                  mat,
+                  mgb,
+                  dq,
+                  mat / (fused > 0 ? fused : 1),
+                  best_sk,
+                  roof_f,
+                  roof_m,
+                  fnzcv,
+                  fused_bytes / (fnzcv / 1e6) / 1e9,
+                  best_sk_f,
+                  fused / (fnzcv > 0 ? fnzcv : 1),
+                  mfma,
+                  fused_bytes / (mfma / 1e6) / 1e9,
+                  best_sk_m,
+                  fused / (mfma > 0 ? mfma : 1));
       if (do_persist && M == 1) {
         // Parity gate before persisting: the winner must match the CPU
         // oracle (bf16 tolerance). The selector-side contract check catches
@@ -290,6 +363,8 @@ int main(int argc, char** argv) {
         }
       }
       hipFree(dx); hipFree(dw); hipFree(ds); hipFree(dout); hipFree(dwb);
+      hipFree(dwf);
+      hipFree(ds2);
       hipFree(dpart);
     }
   return 0;

@@ -164,6 +164,51 @@ def test_small_gemv_m_cap():
         kda_small_gemv(x4, stack, 16, 128, 128, m_cap=2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("rows", [1, 4])
+@pytest.mark.parametrize("sigmoid_beta", [False, True])
+def test_linear_backend_changed_input_replay(rows, sigmoid_beta, monkeypatch):
+    from vkernels.torch_ops.glm_gemv import dense_gemv
+
+    monkeypatch.setenv("VKERNELS_CACHE", "off")
+    stack, parts = _stack(torch.device("cuda"), seed=913)
+    x = torch.randn(rows, 4096, device="cuda", dtype=torch.bfloat16) / 8
+
+    def call():
+        return kda_small_gemv(x, stack, 16, 128, 128,
+                              sigmoid_beta=sigmoid_beta, backend="linear")
+
+    for _ in range(3):
+        call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    for zero in (True, False):
+        x.zero_() if zero else x.normal_(std=.125)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, call())
+        dots = [dense_gemv(x, part) if rows == 1 else
+                torch.nn.functional.linear(x, part) for part in parts]
+        if sigmoid_beta:
+            dots[0] = torch.sigmoid(dots[0])
+        expected = torch.cat(dots, -1)
+        torch.testing.assert_close(captured, expected, rtol=.0078125, atol=.0078125)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_small_backend_warm_modes_are_independent():
+    from vkernels.torch_ops.kda_small_gemv import _WARMED
+
+    stack, _ = _stack(torch.device("cuda"), seed=914)
+    x = torch.zeros(1, 4096, device="cuda", dtype=torch.bfloat16)
+    keys = {(x.device.index, 1, sigmoid, backend)
+            for sigmoid in (False, True) for backend in ("triton", "linear")}
+    _WARMED.difference_update(keys)
+    kda_small_gemv(x, stack, 16, 128, 128, sigmoid_beta=False, backend="linear")
+    assert _WARMED.intersection(keys) == {(x.device.index, 1, False, "linear")}
+
+
 # ---------------------------------------------------------------------------
 # F: stacked q_a | kv_a fp8 GEMV
 # ---------------------------------------------------------------------------

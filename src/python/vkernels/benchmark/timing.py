@@ -11,7 +11,6 @@ callers can see variance, never a single opaque number.
 
 from __future__ import annotations
 
-import statistics
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
@@ -35,12 +34,19 @@ class TimingResult:
 
     @property
     def seconds(self) -> float:
-        """Median sample — the reported runtime of the callable."""
-        return statistics.median(self.samples) if self.samples else float("nan")
+        """Best (minimum) sample — the reported runtime of the callable.
+
+        Timing noise is strictly additive: preemption, interrupts and
+        frequency dips only ever add time, so the minimum is the robust
+        estimate of a callable's true cost. Medians from two sequential
+        runs mostly measure the environment drift between them (the PR
+        CI compares two such runs, so it compares floors, not medians).
+        """
+        return min(self.samples) if self.samples else float("nan")
 
     @property
     def spread(self) -> float:
-        """(max - min) / median; 0.0 for a single sample."""
+        """(max - min) / min; 0.0 for a single sample."""
         if len(self.samples) < 2:
             return 0.0
         med = self.seconds

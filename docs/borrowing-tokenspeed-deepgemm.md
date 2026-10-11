@@ -300,6 +300,58 @@ CI skip filters.
    `kernels/gemm_grouped.{hpp,cpp,cu}` (masked m-grouped NT GEMM,
    untouched-rows contract + device parity); both in the shipped catalog
    (`mqa_logits`, `gemm_grouped` categories).
+4. TokenSpeed-Kernel-AMD "bucket 1": arch-independent host machinery +
+   generic-Gluon small ops. — **done 2026-11**:
+   `torch_ops/tokenspeed_amd/` (CDNA4 MXFP4 scale swizzle, weight/N16
+   preprocessing, gluon softmax/sigmoid top-k routing, 4-stage block-aligned
+   MoE sort, split-atomic sampling argmax, length-128 Hadamard, decode-shaped
+   mHC pre reduce/apply + the split-K prenorm GEMM producer feeding it;
+   MIT-vendored verbatim with a stock-Triton gluon shim)
+   + `tokenspeed_amd_registry.py`; measured on beverin/MI300A — see
+   `meta/benchmarks/artifacts/tokenspeed-amd-bucket1/` (gluon kernels need
+   triton ≥ 3.8 — stock 3.4 gluon is too primitive; routing 3× faster than
+   the torch chain, Hadamard at 854 GB/s, argmax wins at vocab ≥ 150k;
+   gfx942-tuned routing-warp and argmax-config tables measured in
+   `sweep-gfx942.json`).
+5. Bucket 2 — CDNA3 attention ports (scoped, first kernel vendored). —
+   **started 2026-11**: key unlock first: stock triton 3.8 ships a full
+   ``gluon.language.amd.cdna3`` namespace (``buffer_load/store/atomics``
+   + ``mfma``), so the survey's "CDNA4-only" verdict was too pessimistic.
+   Density scan of the gfx950 attention family (lines, distinct cdna4
+   features): ``kda/decode`` 1562/2 (buffer ops only — vendored as
+   ``torch_ops/tokenspeed_amd/kda_decode.py`` with a cdna3-first binding),
+   ``dsa/sparse_mla`` 2949/6 (buffer_load only), ``mla/extend`` 1208/4
+   (adds ``cdna4.mfma`` → ``cdna3.mfma`` re-lowering), ``mha/decode``
+   909/4, ``mla/decode`` 3100/50 (async_copy + mfma — the hard one).
+   Recipe: namespace-swap for buffer-op-only kernels, layout re-derivation
+   for MFMA kernels, ``cdna4.async_copy`` stages must be rewritten to LDS
+   pipelines (no TMA on CDNA3; see the hip-async-coordination skill).
+   Second unit done: ``dsa_indexing.py`` + ``dsa_sparse_mla.py`` vendored
+   (cdna3 binding; standard-cache kernels stubbed out — CDNA4 MFMA
+   v4/async_copy only) — logical radix top-k parity-verified vs
+   torch.topk and **2–3.9× faster** on MI300A, packed-FP8 decode top-k
+   smoke-verified. Done since: the whole KDA family is parity-verified
+   on MI300A (decode + no-store verify + multi-layer replay via the
+   uint64 descriptor path), the sigmoid noaux_tc decode router is
+   verified (floe's fused_router A/B'd as already adequate — no floe
+   change needed), and the MLA-prefill xfail resolved as a test-reference
+   MQA bug. MFMA primitive de-risking **complete**: a minimal working
+   CDNA3 MFMA tile passes on gfx942 (``test_gpu_gluon_cdna3_mfma_tile``,
+   exact fp32 match for instr shapes [16,16,16] and [32,32,8]). Pinned
+   recipe: blocked loads -> ``SwizzledSharedLayout`` staging -> dot-operand
+   loads -> ``amd.cdna3.mfma`` -> accumulator out via ``cdna3.buffer_store``
+   (direct register<->MFMA converts unsupported both ways). Two layout
+   rules discovered: layout literals inside jit bodies need ``:
+   gl.constexpr`` annotations; each 1-D offsets var is sliced on the axis
+   **The whole attention family is now ported and parity-verified on
+   gfx942** — nine kernels: ``mha/decode``, ``mha/prefill``,
+   ``mha/extend``, ``rmha/decode``, ``rmha/extend``, ``rmha/prefill``,
+   ``mla/extend``, ``mla/prefill``, ``mla/decode`` (the last the
+   hardest: single-buffered LDS pipeline, BLOCK_N 32, v2 [16,16,16]
+   MFMA; 121-213 µs at seq 4096). Remaining on this track: FP8 KV
+   (dot-scaled MFMA — CDNA4-only, stubbed with clear errors), load
+   re-pipelining (the synchronous-load collapse costs perf, not
+   correctness), and the aiter flash comparisons.
 
 **Still open:** §3.7 plugins (defer until needed) and §3.12 DeepJIT
 (deferred until the include layering grows); `mark_serving()` wiring from

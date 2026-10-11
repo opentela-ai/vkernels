@@ -4,8 +4,9 @@ The eager chain per decode step is: ``h = x @ f_a^T`` (GEMV), ``fg = h @ f_b^T``
 (GEMV), then ``g = fg + dt_bias``, ``decay = exp(A_log)`` per head,
 ``out = lower_bound * sigmoid(decay * g)`` (or the softplus branch), rounded
 once to the serving dtype. That is ~8 small launches per layer per step on
-tiny tensors. This op keeps the first GEMV on ``dense_gemv`` (its numerics are
-the adopted class) and fuses everything after it into one Triton kernel.
+tiny tensors. This op keeps the first projection on ``dense_gemv`` for one
+row and BLAS for multiple rows, and fuses everything after it into one
+Triton kernel. Each sequence has an independent program row.
 
 Numerics contract: the fused kernel accumulates the second projection in FP32
 and re-rounds it through BF16, reproducing dense_gemv's output rounding before
@@ -31,7 +32,8 @@ def _kernel():
     def fgate(H, WB, DT, ALOG, OUT, LB, HAS_LB: tl.constexpr,
               HD: tl.constexpr, BLOCK_O: tl.constexpr):
         offs = tl.program_id(0) * BLOCK_O + tl.arange(0, BLOCK_O)
-        h = tl.load(H + tl.arange(0, HD)).to(tl.float32)
+        row = tl.program_id(1)
+        h = tl.load(H + row * HD + tl.arange(0, HD)).to(tl.float32)
         wb = tl.load(WB + offs[:, None] * HD + tl.arange(0, HD)[None, :]).to(tl.float32)
         fg = tl.sum(wb * h[None, :], 1)
         # dense_gemv rounds its output to the serving dtype before the gate
@@ -43,13 +45,13 @@ def _kernel():
         else:
             gs = tl.where(g > 20.0, g, tl.log(1.0 + tl.exp(g)))
             out = -decay * gs
-        tl.store(OUT + offs, out.to(tl.bfloat16))
+        tl.store(OUT + row * tl.num_programs(0) * BLOCK_O + offs, out.to(tl.bfloat16))
 
     return fgate
 
 
 def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
-    """Return BF16 [1, S, H, D] log-gates for x [1, S, I].
+    """Return BF16 [B, 1, H, D] log-gates for decode x [B, 1, I].
 
     ``lower_bound=None`` selects the softplus branch (mirrors the eager
     ``safe_gate_lower_bound is None`` path). Anything outside the fused
@@ -57,10 +59,12 @@ def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
     """
     import torch
 
-    if x.ndim != 3 or x.shape[0] != 1:
-        raise OpNotEligible("forget gate fusion supports one sequence [1, S, I]")
+    if x.ndim != 3 or x.shape[0] < 1:
+        raise OpNotEligible("forget gate fusion requires a nonempty batch [B, S, I]")
     if x.shape[1] != 1:
-        raise OpNotEligible("forget gate fusion is decode-only (S == 1); dense_gemv is M == 1")
+        raise OpNotEligible("forget gate fusion is decode-only (S == 1)")
+    if fa_weight.ndim != 2 or fb_weight.ndim != 2 or dt_bias.ndim != 1 or a_log.ndim != 1:
+        raise OpNotEligible("forget gate weights must be matrices and gate constants vectors")
     if x.dtype != torch.bfloat16 or any(
         w.dtype != torch.bfloat16 for w in (fa_weight, fb_weight)
     ):
@@ -73,24 +77,30 @@ def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
     head_dim, hidden = fa_weight.shape
     qkv_dim = fb_weight.shape[0]
     heads = a_log.shape[0]
+    if head_dim <= 0 or head_dim & (head_dim - 1) or heads <= 0:
+        raise OpNotEligible("forget gate requires a positive power-of-two head dimension and heads")
     if head_dim * heads != qkv_dim or qkv_dim != dt_bias.shape[0] or hidden != x.shape[-1]:
         raise OpNotEligible("forget gate shape mismatch (fa [HD,I], fb [QKV,HD], A_log [H])")
     if qkv_dim % 64:
         raise OpNotEligible("QKV dim must be a multiple of the 64-wide block")
 
-    from vkernels.torch_ops.glm_gemv import dense_gemv
-
     with torch.cuda.device(x.device):
-        h = dense_gemv(x.view(1, hidden), fa_weight)  # [1, HD] BF16
-        out = torch.empty(1, qkv_dim, dtype=torch.bfloat16, device=x.device)
+        batch = x.shape[0]
+        if batch == 1:
+            from vkernels.torch_ops.glm_gemv import dense_gemv
+
+            h = dense_gemv(x.view(1, hidden), fa_weight)
+        else:
+            h = torch.nn.functional.linear(x.view(batch, hidden), fa_weight)
+        out = torch.empty(batch, qkv_dim, dtype=torch.bfloat16, device=x.device)
         kern = _kernel()
-        kern[(qkv_dim // 64,)](
+        kern[(qkv_dim // 64, batch)](
             h, fb_weight, dt_bias, a_log, out,
             1.0 if lower_bound is None else float(lower_bound),
             lower_bound is not None, head_dim, 64,
             num_warps=4, enable_fp_fusion=False,
         )
-    return out.view(1, x.shape[1], heads, head_dim)
+    return out.view(batch, 1, heads, head_dim)
 
 
 def forget_gate_reference(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
@@ -101,7 +111,7 @@ def forget_gate_reference(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
     fg = torch.nn.functional.linear(h.float(), fb_weight.float()).to(torch.bfloat16)
     heads = a_log.shape[0]
     head_dim = fb_weight.shape[0] // heads
-    g = (fg.float() + dt_bias.float().view(1, 1, -1)).view(1, -1, heads, head_dim)
+    g = (fg.float() + dt_bias.float().view(1, 1, -1)).view(*x.shape[:2], heads, head_dim)
     decay = torch.exp(a_log.float()).view(1, 1, heads, 1)
     if lower_bound is not None:
         out = lower_bound * torch.sigmoid(decay * g)
