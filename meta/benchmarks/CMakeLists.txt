@@ -295,6 +295,16 @@ if(VKERNELS_HAS_HIP)
 
   # GLM block-FP8 decode-fused GEMV (#64): correctness vs the CPU oracle +
   # fused-vs-materialized microbenchmark.
+  add_executable(probe_mfma_fp8 probe_mfma_fp8.hip)
+  target_link_libraries(probe_mfma_fp8 PRIVATE vkernels::vkernels)
+  target_compile_features(probe_mfma_fp8 PRIVATE cxx_std_17)
+  vkernels_set_warnings(probe_mfma_fp8)
+
+  add_executable(diag_mfma_issue148 diag_mfma_issue148.hip)
+  target_link_libraries(diag_mfma_issue148 PRIVATE vkernels::vkernels)
+  target_compile_features(diag_mfma_issue148 PRIVATE cxx_std_17)
+  vkernels_set_warnings(diag_mfma_issue148)
+
   add_executable(test_glm_fp8_gemv test_glm_fp8_gemv.hip)
   target_link_libraries(test_glm_fp8_gemv PRIVATE vkernels::vkernels)
   target_compile_features(test_glm_fp8_gemv PRIVATE cxx_std_17)

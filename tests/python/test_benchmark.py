@@ -62,10 +62,12 @@ def test_host_timer_records_per_call_samples():
     assert result.seconds > 0
 
 
-def test_timing_result_median_and_spread():
+def test_timing_result_min_and_spread():
+    # seconds is the floor (min): timing noise is additive, so the minimum
+    # sample is the robust cost estimate the CI comparison relies on.
     result = TimingResult("host", (1.0, 2.0, 3.0))
-    assert result.seconds == 2.0
-    assert result.spread == pytest.approx(1.0)
+    assert result.seconds == 1.0
+    assert result.spread == pytest.approx(2.0)
     assert TimingResult("host", (1.0,)).spread == 0.0
 
 
@@ -206,7 +208,40 @@ def test_compare_new_missing_and_error_rows():
 def test_format_table_includes_op_and_throughput():
     request = bm.BenchmarkRequest("add", size=64, warmup=1, iters=2)
     table = bm.format_table([bm.run_benchmark(request)])
-    assert "add" in table and "GB/s" in table
+    assert "add" in table and "GB/s" in table and "min ms" in table
+
+
+def test_merge_reports_takes_floor_across_repeats():
+    # Interleaved CI repeats are merged per arm: samples concatenate and
+    # the reported seconds becomes the floor across the repeats, so the
+    # comparison sees each arm's best environment, not one phase's drift.
+    first = _result_document(1.0)
+    first["results"][0]["samples"] = [1.0, 1.1]
+    second = _result_document(1.6)
+    second["results"][0]["samples"] = [1.6, 1.7]  # drifted phase
+    merged = bm.merge_reports([first, second])["results"][0]
+    assert merged["samples"] == [1.0, 1.1, 1.6, 1.7]
+    assert merged["seconds"] == 1.0
+    assert merged["gflops"] == pytest.approx(64 / 1.0 / 1e9)
+    assert merged["gbytes"] == pytest.approx(768 / 1.0 / 1e9)
+
+
+def test_merge_reports_redeems_errors_and_keeps_clean():
+    errored = _result_document(1.0)
+    errored["results"][0]["error"] = "boom"
+    errored["results"][0]["samples"] = []
+    clean = _result_document(1.0)
+    clean["results"][0]["samples"] = [0.9]
+    merged = bm.merge_reports([errored, clean])["results"][0]
+    assert merged["error"] is None and merged["seconds"] == 0.9
+    # a later failing run never poisons a clean one
+    merged = bm.merge_reports([clean, errored])["results"][0]
+    assert merged["error"] is None and merged["seconds"] == 0.9
+
+
+def test_merge_reports_schema_mismatch_rejected():
+    with pytest.raises(ValueError, match="schema"):
+        bm.merge_reports([{"schema": 99, "results": []}])
 
 
 # --- CLI ------------------------------------------------------------------------
