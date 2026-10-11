@@ -897,7 +897,8 @@ __global__ void gemv_decode_fp8_splitk_kernel(
 //   * The fp8 variant uses DEFERRED block scales: raw fnuz codes are
 //     accumulated UNscaled (in the uniform value*2^-119 domain of the
 //     branchless bit decode) and each (128-K x 8-N) block scale is applied
-//     once at the block boundary. This removes the per-element f2bf bf16
+//     ONCE at the block boundary, folded with the 2^119 decode-domain
+//     factor (sc * 0x1p119f), cancelling the bit-decode offset exactly. This removes the per-element f2bf bf16
 //     rounding of the v1/MFMA contract, so it is a NEW numerics contract
 //     (validated against an exact deferred oracle and within tolerance of
 //     the bf16-rounded dequant oracle); the v1 per-element-rounded path is
@@ -1049,7 +1050,7 @@ __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
         for (int m = 0; m < M; ++m)
 #pragma unroll
           for (int t = 0; t < 8; ++t) {
-            acc[m][t] = fmaf(blk[m][t], sc, acc[m][t]);
+            acc[m][t] = fmaf(blk[m][t], sc * 0x1p119f, acc[m][t]);
             blk[m][t] = 0.0f;
           }
         sc = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb];
@@ -1085,7 +1086,7 @@ __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
         for (int m = 0; m < M; ++m)
 #pragma unroll
           for (int t = 0; t < 8; ++t) {
-            acc[m][t] = fmaf(blk[m][t], sc, acc[m][t]);
+            acc[m][t] = fmaf(blk[m][t], sc * 0x1p119f, acc[m][t]);
             blk[m][t] = 0.0f;
           }
         sc = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb];
@@ -1109,7 +1110,7 @@ __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
 #pragma unroll
     for (int m = 0; m < M; ++m)
 #pragma unroll
-      for (int t = 0; t < 8; ++t) acc[m][t] = fmaf(blk[m][t], sc, acc[m][t]);
+      for (int t = 0; t < 8; ++t) acc[m][t] = fmaf(blk[m][t], sc * 0x1p119f, acc[m][t]);
   } else {
     // Rare partial-column tail: same deferred math, scalar loads. c0 is
     // 8-aligned so the <=7 live columns all sit in ONE scale n-block.
@@ -1121,7 +1122,7 @@ __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
 #pragma unroll
         for (int m = 0; m < M; ++m)
           for (int t = 0; t < cmax; ++t) {
-            acc[m][t] = fmaf(blk[m][t], scb, acc[m][t]);
+            acc[m][t] = fmaf(blk[m][t], scb * 0x1p119f, acc[m][t]);
             blk[m][t] = 0.0f;
           }
         scb = scales[(size_t)((k0 + k) >> 7) * n_s8 + colb];
@@ -1141,7 +1142,7 @@ __global__ void gemv_decode_fp8_v2_kernel(const uint16_t* __restrict__ A,
     }
 #pragma unroll
     for (int m = 0; m < M; ++m)
-      for (int t = 0; t < cmax; ++t) acc[m][t] = fmaf(blk[m][t], scb, acc[m][t]);
+      for (int t = 0; t < cmax; ++t) acc[m][t] = fmaf(blk[m][t], scb * 0x1p119f, acc[m][t]);
   }
 
   float* plane = P + (size_t)s * M * N;

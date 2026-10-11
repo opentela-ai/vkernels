@@ -625,7 +625,8 @@ int main(int argc, char** argv) {
           Cdef[(size_t)m * N + n] = f2bf_host((float)c);
         }
 
-      uint16_t *dA, *dB, *dW8, *dC;
+      uint16_t *dA, *dB, *dC;
+      uint8_t* dW8;
       float* dS;
       CK(hipMalloc(&dA, A.size() * 2));
       CK(hipMalloc(&dB, B.size() * 2));
