@@ -273,8 +273,65 @@ transcription: imports -> shim, `attention_layouts` -> the CDNA3 v2
 `[32,32,8]` variant, K smem allocation transposed + permuted stores +
 no-permuted-read, async waits deleted, `cdna4.mfma` -> `amd.cdna3.mfma`,
 SM-count -> device CUs. The transform script is the template for the
-remaining same-recipe families. **Parity on MI300A on the first GPU
-run** (ragged seqs {16+48, 8+120, 40+24}, 8/2 heads, causal).
+remaining same-recipe families. **Parity on MI300A** (ragged seqs
+{16+48, 8+120, 40+24}, 8/2 heads, causal). Correction (found when the
+first full-suite run ran the committed test): the in-tree paged parity
+test initially omitted `is_causal=True` — the port keeps upstream's
+`is_causal=False` default, so the kernel ran non-causal against a causal
+reference (error ~C/n_visible, deepest-diagonal row exact). The kernel's
+causal branch was correct; the one-line test fix landed with the suite
+going 50/50.
+
+## rel-MHA prefill: varlen causal prefill with rel bias
+
+``rmha_prefill.py`` — the last rel-family member: varlen causal prefill
+with the per-head relative-position bias table, ``BLOCK_M=64`` to fit
+gfx942's LDS with the bias tile staged alongside K/V. New port delta:
+**inline-layout conversion** for the bias add (bias arrives in a blocked
+load layout, gets converted to the qk distributed layout in-register
+instead of round-tripping through LDS). **Parity on MI300A** (seqs
+{200, 200}, {80, 80}, 8/2 heads, rel extent 512; seed-27 legs incl.
+long-sequence bias wrap).
+
+## MLA prefill: NoPE+RoPE split-KV on gfx942
+
+``mla_prefill.py`` — multi-head-absorbed prefill: q heads 192-dim
+(NoPE 128 + RoPE 64) against the same 192-dim KV with a 128-dim value
+stream, left-aligned causal over ragged q/kv pairs (query row i sees
+keys [0, kv_len − q_len + i]), split-KV accumulate + reduce, LSE leg.
+**Parity on MI300A** (seqs {(64,64), (24,40), (40,24)}, 8 q heads / 2
+kv heads; eager reference, seed 31).
+
+## MLA decode: bh16bn64 split-K on gfx942 (the hard one)
+
+``mla_decode.py`` — upstream's 3100-line async_copy+MFMA decode
+rewritten as a **single-buffered LDS pipeline** (no TMA on CDNA3):
+BLOCK_N 64 -> 32 so the KV ring fits the 64 KB LDS alongside the Q
+tiles; v2 ``[16,16,16]`` MFMA (k_width 8 qk / 4 pv), non-transposed dot
+operands, constexpr-helper layout construction (a kernel-body
+``AMDMFMALayout`` assignment hits the tracer's ``to_tensor``). Only the
+**bh16bn64** regime is portable: bh64/small regimes stage 128-wide
+double-buffered rings, fp8 regimes need dot-scaled MFMA; the
+projected-value epilogue is fp8/bh16bn128-only upstream — guarded with
+``NotImplementedError`` (public launcher stub + internal guard) instead
+of a dangling reducer name. **Parity on MI300A** (mixed ragged seqlens,
+LSE leg, 1x1 edge; regime/dtype rejection and the projected-value
+guards covered; 90 s single-test run).
+
+Bench (`results-mla-decode.json`, job 676367; heads 16, lora 512,
+rope 64, seq 4096):
+
+| batch | gluon_cdna3 median |
+|---:|---:|
+| 1 | 121.4 µs |
+| 8 | 121.1 µs |
+| 32 | 213.0 µs |
+
+Flat to batch 8 (the split-K scheduler fills the CU array), +76% at
+batch 32 where the bh16bn64 regime exhausts per-head parallelism — the
+upstream bh64 regime (which would cover it) is one of the
+non-portable ones, so this is the expected CDNA3 ceiling for decode-side
+MLA at this shape.
 
 ## Round-3 follow-ups (same effort)
 
@@ -409,6 +466,8 @@ Bench (fp32 logits, topk=2048, cols=16384):
 
 - `results-triton38.json` — first full run (job 675351)
 - `results-triton38-v3.json` — post-tuning run incl. mhc chain (job 675506)
+- `results-mha.json` / `results-mla-decode.json` — attention-port benches
+  (jobs 675835+ / 676367, beverin staging dir)
 - `sweep-gfx942.json` — routing/argmax config sweeps (job 675500)
 - `results-triton38-partial.json` — pre-fix triton-3.8 run (provenance)
 - `results-stock-triton34.json` — stock env: gluon kernels feature-blocked
@@ -420,6 +479,13 @@ Bench (fp32 logits, topk=2048, cols=16384):
 
 ## Follow-ups (remaining)
 
+- **Attention family perf track**: load re-pipelining of the
+  synchronous-load collapse (the nine ports are parity-first cuts), the
+  aiter flash-attention comparisons on the prefill/extend side, and
+  per-regime tile retunes (mla decode's bh16bn64 ceiling at batch 32 is
+  a regime limit, not a pipeline one).
+- **FP8 KV**: needs dot-scaled MFMA — CDNA4-only; the ported launchers
+  reject fp8 with clear errors by design.
 - **Send `infra-request-triton38.md`** to CSCS — everything gluon is gated
   on it reaching a production env.
 - Triton-MLA prefill numerics on gfx942 (the xfail above): try
