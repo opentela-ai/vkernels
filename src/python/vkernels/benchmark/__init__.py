@@ -11,23 +11,32 @@ Layered like tokenspeed-kernel's benchmark package, scaled to this repo:
   :class:`BenchmarkRequest` into a timed, optionally oracle-verified
   :class:`BenchmarkResult`; ops outside the numerics generators plug in
   with :func:`register_benchmark_case` (the torch_ops extension point).
-* :mod:`vkernels.benchmark.report` — fixed-width tables and versioned JSON.
+* :mod:`vkernels.benchmark.report` — fixed-width tables and versioned JSON,
+  plus ``merge_reports`` for interleaved CI repeats.
 * :mod:`vkernels.benchmark.ci` — ``compare``: the PR check that flags a
-  case whose median runtime regressed beyond a threshold against the
-  merge-base baseline.
+  case whose floor (min across interleaved repeats) regressed beyond a
+  threshold against the merge-base baseline.
 
 Command line::
 
     python -m vkernels.benchmark ops
     python -m vkernels.benchmark run --ops add gemm --sizes 1024 4096 --json out.json
     python -m vkernels.benchmark run --suite my-arch.json --json out.json
+    python -m vkernels.benchmark merge merged.json run1.json run2.json
     python -m vkernels.benchmark compare baseline.json current.json --threshold 0.1
 """
 
 from __future__ import annotations
 
 from vkernels.benchmark.ci import ComparisonReport, ComparisonRow, compare
-from vkernels.benchmark.report import format_table, from_json, read_json, to_json, write_json
+from vkernels.benchmark.report import (
+    format_table,
+    from_json,
+    merge_reports,
+    read_json,
+    to_json,
+    write_json,
+)
 from vkernels.benchmark.runner import (
     BenchmarkCase,
     BenchmarkRequest,
@@ -58,6 +67,7 @@ __all__ = [
     "compare",
     "format_table",
     "from_json",
+    "merge_reports",
     "model_for",
     "read_json",
     "register_benchmark_case",

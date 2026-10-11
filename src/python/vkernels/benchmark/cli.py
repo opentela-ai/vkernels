@@ -5,6 +5,8 @@ Subcommands:
 * ``ops`` — list ops the harness can benchmark.
 * ``run [--ops ...] [--sizes ...] [--suite FILE] [--json OUT]`` — run a
   suite and print the table (and optionally write the JSON report).
+* ``merge OUT IN...`` — merge several run documents of the same suite
+  (concatenated samples, floor across repeats) into one report.
 * ``compare BASELINE CURRENT [--threshold 0.1]`` — the PR CI check: exit 1
   when any case regressed beyond the threshold.
 
@@ -47,6 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--verify", action="store_true", help="oracle-check before timing")
     p_run.add_argument("--suite", type=Path, default=None, help="JSON suite file")
     p_run.add_argument("--json", type=Path, default=None, help="write JSON report here")
+
+    p_merge = sub.add_parser(
+        "merge", help="merge several run documents of the same suite"
+    )
+    p_merge.add_argument("output", type=Path)
+    p_merge.add_argument("inputs", nargs="+", type=Path)
 
     p_cmp = sub.add_parser("compare", help="PR CI comparison of two JSON reports")
     p_cmp.add_argument("baseline", type=Path)
@@ -102,6 +110,17 @@ def main(argv: list[str] | None = None) -> int:
             write_json(args.json, results)
             print(f"wrote {args.json}")
         return 0 if all(r.error is None for r in results) else 1
+
+    if args.command == "merge":
+        import json
+
+        from vkernels.benchmark.report import merge_reports
+
+        reports = [json.loads(p.read_text(encoding="utf-8")) for p in args.inputs]
+        merged = merge_reports(reports)
+        args.output.write_text(json.dumps(merged, indent=1) + "\n", encoding="utf-8")
+        print(f"merged {len(args.inputs)} report(s) -> {args.output}")
+        return 0
 
     if args.command == "compare":
         report = compare_json_files(args.baseline, args.current, args.threshold)

@@ -197,9 +197,14 @@ jobs:
   # ------------------------------------------------------------------
   # Kernel benchmark comparison (merge base vs candidate): the PR gate
   # from docs/borrowing-tokenspeed-deepgemm.md §3.4 (tokenspeed-kernel's
-  # PR benchmark flow). Runs the host suite on the merge base and on the
-  # candidate, then `python -m vkernels.benchmark compare` fails the job
-  # when any case's median runtime regressed beyond the threshold.
+  # PR benchmark flow). Interleaves the host suite between the merge
+  # base and the candidate (B-C-B-C-B) in one job so both arms sample the
+  # same runner environment; repeats are merged per arm (concatenated
+  # samples, per-case floor = min), and `python -m vkernels.benchmark
+  # compare` fails the job when any case's floor regressed beyond the
+  # threshold. Sequential single runs measured environment drift, not
+  # code (µs-scale host timings move 1.4-1.6x between phases on shared
+  # runners while within-run spread stays small).
   # ------------------------------------------------------------------
   benchmark:
     if: github.event_name == 'pull_request'
@@ -214,28 +219,38 @@ jobs:
         with:
           install: true
 
-      - name: Baseline suite (merge base)
+      - name: Interleaved suites (base x3, candidate x2)
         run: |
           git fetch origin +refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
           BASE="$(git merge-base HEAD refs/remotes/origin/${{ github.base_ref }})"
-          git checkout --detach "$BASE"
-          # Restore the checked-in suite from the candidate (the baseline
-          # tree may predate it); the ops it names exist on both sides. A
-          # baseline that predates the harness itself degrades to an empty
-          # report — every case then counts as new (reported, not failed).
-          git checkout ${{ github.sha }} -- meta/benchmarks/python/host-suite.json
-          uv run python -m vkernels.benchmark run \
-            --suite meta/benchmarks/python/host-suite.json --json /tmp/base.json \
-            || printf '{"schema": 1, "results": []}\n' > /tmp/base.json
+          n=0
+          for TREE in "$BASE" "${{ github.sha }}" "$BASE" "${{ github.sha }}" "$BASE"; do
+            n=$((n+1))
+            git checkout --detach "$TREE"
+            # Restore the checked-in suite from the candidate (the baseline
+            # tree may predate it); the ops it names exist on both sides. A
+            # baseline that predates the harness itself degrades to an empty
+            # report — every case then counts as new (reported, not failed).
+            git checkout ${{ github.sha }} -- meta/benchmarks/python/host-suite.json
+            if [ "$TREE" = "$BASE" ]; then
+              ARM=base
+              uv run python -m vkernels.benchmark run \
+                --suite meta/benchmarks/python/host-suite.json --json /tmp/run-$n.json \
+                || printf '{"schema": 1, "results": []}\n' > /tmp/run-$n.json
+            else
+              ARM=cand
+              uv run python -m vkernels.benchmark run \
+                --suite meta/benchmarks/python/host-suite.json --json /tmp/run-$n.json
+            fi
+            echo "run $n -> $ARM"
+          done
+          # Leave the tree on the candidate: merge/compare below import the
+          # harness, which a baseline that predates it would not provide.
+          git checkout --detach "${{ github.sha }}"
+          uv run python -m vkernels.benchmark merge /tmp/base.json /tmp/run-1.json /tmp/run-3.json /tmp/run-5.json
+          uv run python -m vkernels.benchmark merge /tmp/cand.json /tmp/run-2.json /tmp/run-4.json
 
-      - name: Candidate suite
-        run: |
-          git checkout --detach ${{ github.sha }}
-          git checkout ${{ github.sha }} -- meta/benchmarks/python/host-suite.json
-          uv run python -m vkernels.benchmark run \
-            --suite meta/benchmarks/python/host-suite.json --json /tmp/cand.json
-
-      - name: Compare (fail on >10% median regression)
+      - name: Compare (fail on >10% regression of the per-case floor)
         run: >
           uv run python -m vkernels.benchmark compare
           /tmp/base.json /tmp/cand.json --threshold 0.10

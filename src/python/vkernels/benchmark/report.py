@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Iterable
 if TYPE_CHECKING:
     from vkernels.benchmark.runner import BenchmarkResult
 
-__all__ = ["format_table", "to_json", "from_json", "write_json", "read_json"]
+__all__ = ["format_table", "to_json", "from_json", "merge_reports", "write_json", "read_json"]
 
 SCHEMA_VERSION = 1
 
@@ -28,13 +28,13 @@ def format_table(results: Iterable["BenchmarkResult"]) -> str:
         return "(no results)"
     header = (
         f"{'op':<10} {'params':<18} {'backend':<10} {'method':<12} "
-        f"{'med ms':>9} {'spread':>7} {'GFLOP/s':>9} {'GB/s':>8} {'ok':>4}"
+        f"{'min ms':>9} {'spread':>7} {'GFLOP/s':>9} {'GB/s':>8} {'ok':>4}"
     )
     lines = [header, "-" * len(header)]
     for r in rows:
         p = r.request.params()
         params = ",".join(f"{k}={v}" for k, v in sorted(p.items()))
-        med_ms = r.seconds * 1e3 if r.seconds == r.seconds else float("nan")
+        min_ms = r.seconds * 1e3 if r.seconds == r.seconds else float("nan")
         timing_spread = (max(r.samples) - min(r.samples)) / r.seconds if len(r.samples) > 1 and r.seconds else 0.0
         spread = f"{timing_spread:.0%}"
         verified = "-" if r.verified is None else ("y" if r.verified else "N")
@@ -43,7 +43,7 @@ def format_table(results: Iterable["BenchmarkResult"]) -> str:
         error = f"  !! {r.error}" if r.error else ""
         lines.append(
             f"{r.request.op:<10} {params:<18} {r.backend:<10} {r.method:<12} "
-            f"{med_ms:>9.3f} {spread:>7} {gflops:>9} {gbytes:>8} {verified:>4}{error}"
+            f"{min_ms:>9.3f} {spread:>7} {gflops:>9} {gbytes:>8} {verified:>4}{error}"
         )
     return "\n".join(lines)
 
@@ -56,6 +56,46 @@ def to_json(results: Iterable["BenchmarkResult"]) -> dict:
         row["samples"] = list(r.samples)
         rows.append(row)
     return {"schema": SCHEMA_VERSION, "results": rows}
+
+
+def merge_reports(reports: Iterable[dict]) -> dict:
+    """Merge several run documents of the *same* suite into one report.
+
+    Used by the PR CI flow to interleave baseline and candidate suite
+    runs (B-C-B-C-B) in one job: interleaving samples both arms from the
+    same environment, and merging concatenates each case's samples so the
+    reported :attr:`seconds <vkernels.benchmark.timing.TimingResult.seconds>`
+    becomes the floor across repeats. A case keeps the request/params of
+    its first occurrence; ``verified`` is true if any run verified it; an
+    ``error`` survives only when every occurrence failed.
+    """
+    merged: dict[str, dict] = {}
+    for report in reports:
+        if report.get("schema") != SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported benchmark JSON schema {report.get('schema')!r}; "
+                f"this harness writes {SCHEMA_VERSION}"
+            )
+        for row in report.get("results", []):
+            key = row["key"]
+            if key not in merged:
+                merged[key] = dict(row)
+                continue
+            acc = merged[key]
+            acc["samples"] = list(acc.get("samples", [])) + list(row.get("samples", []))
+            if acc.get("error") is not None and row.get("error") is None:
+                # a later clean run redeems the case
+                acc["error"] = None
+            if row.get("verified"):
+                acc["verified"] = True
+    for acc in merged.values():
+        samples = acc.get("samples", [])
+        seconds = min(samples) if samples else float("nan")
+        acc["seconds"] = seconds
+        if seconds and seconds > 0:
+            acc["gflops"] = acc.get("flops", 0) / seconds / 1e9
+            acc["gbytes"] = acc.get("bytes", 0) / seconds / 1e9
+    return {"schema": SCHEMA_VERSION, "results": [merged[k] for k in sorted(merged)]}
 
 
 def from_json(data: dict) -> list["BenchmarkResult"]:
