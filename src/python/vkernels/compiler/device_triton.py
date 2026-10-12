@@ -77,8 +77,8 @@ def triton_available() -> bool:
 
 
 @triton.jit
-def grid_barrier(bar_ptr, target: tl.int64):
-    """Monotonic spin barrier over all resident blocks.
+def _grid_barrier_sm(bar_ptr, target: tl.int64):
+    """Monotonic spin barrier over all resident blocks (NVIDIA formulation).
 
     ``bar_ptr`` is a single int64 counter that never resets within (or
     across) invocations; ``target`` is the absolute arrival count that
@@ -93,6 +93,42 @@ def grid_barrier(bar_ptr, target: tl.int64):
     c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu")
     while c < target:
         c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu")
+
+
+@triton.jit
+def _grid_barrier_cdna(bar_ptr, target: tl.int64):
+    """Monotonic spin barrier over all resident blocks (CDNA formulation).
+
+    Same contract as ``_grid_barrier_sm``; only the poll differs, because
+    the atomic-RMW poll above does not survive the AMD backend.  Outlined
+    through a ``@triton.jit`` helper its spin lowers to an irreducible CFG
+    (LLVM ``%irr.guard``/``%irr.guardendcf`` blocks), whose guards
+    mis-predicate the spin so the barrier never releases: on gfx942 with
+    triton 3.5.1 every ``milestone0_barrier_test`` launch hangs above one
+    round (P=1 included, either wave count), while the byte-identical
+    barrier written inline in the kernel passes and reports the exact
+    expected counter.
+
+    So the spin polls with a coherent ``.cv`` load -- which also drops the
+    L2 read-modify-write storm that an RMW poll from every resident block's
+    every lane creates -- and takes one acquire RMW once the release wave
+    has been observed, followed by a convergence point so the acquire is
+    not reordered past the post-barrier loads.
+    """
+    tl.debug_barrier()  # all threads' stores issued before the arrival
+    tl.atomic_add(bar_ptr, 1, sem="acq_rel", scope="gpu")
+    c = tl.load(bar_ptr, cache_modifier=".cv")
+    while c < target:
+        c = tl.load(bar_ptr, cache_modifier=".cv")
+    tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu")
+    tl.debug_barrier()
+
+
+# The megakernel and the M0 microprogram call this name from jit code, and
+# Triton resolves module globals at compile time, so this alias is the whole
+# vendor switch.  torch.version.hip is set by every ROCm build (no device
+# touch at import), which keeps the choice valid on GPU-less hosts too.
+grid_barrier = _grid_barrier_cdna if torch.version.hip is not None else _grid_barrier_sm
 
 
 @triton.jit
