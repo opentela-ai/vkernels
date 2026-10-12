@@ -42,6 +42,7 @@ Run:  python bench/glm53_e1_spine_bench.py   (needs CUDA + triton; B needs nvcc)
 
 from __future__ import annotations
 
+import os
 import sys
 import pathlib
 
@@ -555,7 +556,13 @@ def main():
               f"{type(exc).__name__}: {str(exc)[:100]})")
 
     # -- gate 2: the megakernel vs incumbent A (final streams + ssm pools)
-    mega = KdaSpineMegakernel(w, workers=min(32, props.multi_processor_count))
+    # Bring-up knob.  At P=1 every phase runs in one block, so nothing in the
+    # result can depend on cross-block barrier ordering: a run that fails
+    # gate 2 at P=1 has a codegen/numerics fault, one that passes at P=1 and
+    # fails at P>1 has a barrier-ordering fault.  Default unchanged.
+    gate2_workers = int(os.environ.get("GLM53_E1_WORKERS",
+                                       min(32, props.multi_processor_count)))
+    mega = KdaSpineMegakernel(w, workers=gate2_workers)
     streams0 = (0.5 * torch.randn(1, HC, C, generator=torch.Generator(device=DEV).manual_seed(9), device=DEV)).float()
     conv_a, ssm_a, _ = w.fresh_pools(seed=5)
     st_a = eager_spine_step(w, streams0.clone(), conv_a, ssm_a)
@@ -576,10 +583,11 @@ def main():
     print(f"gate 2b — chained step 2: streams rel {rel2:.2e}")
     assert rel2 < 5e-2
     # barrier soak: 500 steps, counter must track exactly
-    for _ in range(500):
+    soak = int(os.environ.get("GLM53_E1_SOAK", 500))
+    for _ in range(soak):
         mega.run()
     mega.run(check_counter=True)
-    print(f"gate 3 — barrier counter soak: 502 steps, counter == base (no drift)")
+    print(f"gate 3 — barrier counter soak: {soak + 2} steps, counter == base (no drift)")
 
     k_mega = count_kernels(lambda: mega.run())
     print(f"launch check (megakernel): {k_mega} CUDA kernel event(s) per step")
