@@ -25,7 +25,7 @@ def _kernels():
     from vkernels.compiler.device_triton import grid_barrier
 
     @triton.jit
-    def routing(IDS, RW, TOK, INV, TE, TR, TM, LIVE,
+    def routing(IDS, RW, TOK, INV, SO, TE, TR, TM, LIVE,
                 S: tl.constexpr, KTOP: tl.constexpr, E: tl.constexpr,
                 BS: tl.constexpr, BE: tl.constexpr, CAP: tl.constexpr,
                 BC: tl.constexpr, BM: tl.constexpr, SKIP: tl.constexpr,
@@ -42,6 +42,9 @@ def _kernels():
         sorted_expert = key // (S + 1)
         tl.store(TOK + original, sorted_original // KTOP, original < S)
         tl.store(INV + sorted_original, original, original < S)
+        # Sorted position -> original slot: the SGL down GEMM weights each
+        # expert-sorted row by the route weight of its original slot.
+        tl.store(SO + original, sorted_original, original < S)
         histogram = tl.histogram(sorted_expert, BE, mask=(original < S) & (sorted_expert < E))
         ex = tl.arange(0, BE)
         counts = tl.where(ex < E, histogram, 0)
@@ -71,21 +74,27 @@ def _kernels():
         tl.store(TM + tid, tl.where(valid, size, 0), tid < CAP)
 
     @triton.jit
-    def quantize(task, X, Q, QS, WIDTH: tl.constexpr):
+    def quantize(task, X, Q, QS, WIDTH: tl.constexpr, SGL: tl.constexpr):
         row = task // (WIDTH // 128)
         group = task % (WIDTH // 128)
         col = group * 128 + tl.arange(0, 128)
         x = tl.load(X + row * WIDTH + col).to(tl.float32)
-        maximum = tl.maximum(tl.max(tl.abs(x), 0), 1.0e-4)
-        scale = tl.maximum(libdevice.mul_rn(maximum, 1.0 / 448.0), 1.0e-12)
-        q = tl.minimum(tl.maximum(tl.div_rn(x, scale), -448.0), 448.0)
+        if SGL:
+            # SGL donor: amax floor 1e-10, reciprocal multiply, no scale floor.
+            maximum = tl.maximum(tl.max(tl.abs(x), 0), 1.0e-10)
+            scale = maximum / 448.0
+            q = tl.minimum(tl.maximum(x * (1.0 / scale), -448.0), 448.0)
+        else:
+            maximum = tl.maximum(tl.max(tl.abs(x), 0), 1.0e-4)
+            scale = tl.maximum(libdevice.mul_rn(maximum, 1.0 / 448.0), 1.0e-12)
+            q = tl.minimum(tl.maximum(tl.div_rn(x, scale), -448.0), 448.0)
         tl.store(Q + row * WIDTH + col, q)
         tl.store(QS + task, scale)
 
     @triton.jit
-    def gemm(task, A, SA, W, SW, OUT, TOK, TE, TR, TM,
+    def gemm(task, A, SA, W, SW, OUT, TOK, TE, TR, TM, RW, INV, SO,
              N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr,
-             BN: tl.constexpr, BY_TOKEN: tl.constexpr):
+             BN: tl.constexpr, BY_TOKEN: tl.constexpr, WEIGHT: tl.constexpr):
         tile = task // tl.cdiv(N, BN)
         column = task % tl.cdiv(N, BN)
         expert = tl.load(TE + tile, cache_modifier=".cg").to(tl.int64)
@@ -109,11 +118,19 @@ def _kernels():
                 block = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
                 # Same block order and fused accumulation as grouped GEMM.
                 acc += block * (sa[:, None] * sb[None, :])
+            if WEIGHT:
+                # SGL donor applies the route weight in fp32 before the BF16
+                # store; rows are expert-sorted, so map back to the original
+                # slot to fetch the right route weight.
+                original = tl.load(SO + row, mask, 0, cache_modifier=".cg")
+                weight = tl.load(RW + original, mask, 0.0).to(tl.float32)
+                acc = acc * weight[:, None]
             tl.store(OUT + row[:, None] * N + col[None, :], acc.to(tl.bfloat16),
                      mask[:, None] & (col[None, :] < N))
 
     @triton.jit
-    def activate_quantize(task, GU, Q, QS, LIVE, I: tl.constexpr, LIMIT: tl.constexpr):
+    def activate_quantize(task, GU, Q, QS, LIVE, I: tl.constexpr, LIMIT: tl.constexpr,
+                          SGL: tl.constexpr):
         # Four independent groups per task; the maximum still reduces only
         # the original 128 elements of each group.
         flat_group = task * 4 + tl.arange(0, 4)
@@ -125,20 +142,32 @@ def _kernels():
                        cache_modifier=".cg").to(tl.float32)
         up = tl.load(GU + row[:, None] * (2 * I) + I + col, valid[:, None], 0,
                      cache_modifier=".cg").to(tl.float32)
-        gate = tl.minimum(gate, LIMIT)
-        up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
-        silu = tl.div_rn(gate, libdevice.add_rn(1.0, libdevice.exp(-gate)))
-        # Virtual eager activation store: BF16 round precedes FP8 amax.
-        x = libdevice.mul_rn(silu, up).to(tl.bfloat16).to(tl.float32)
-        maximum = tl.maximum(tl.max(tl.abs(x), 1), 1.0e-4)
-        scale = tl.maximum(libdevice.mul_rn(maximum, 1.0 / 448.0), 1.0e-12)
-        q = tl.minimum(tl.maximum(tl.div_rn(x, scale[:, None]), -448.0), 448.0)
+        if SGL:
+            # SGL donor rounds every clamp/SiLU/product boundary through BF16.
+            gate = tl.minimum(gate, LIMIT, propagate_nan=tl.PropagateNan.ALL).to(tl.bfloat16).to(tl.float32)
+            up = tl.minimum(tl.maximum(up, -LIMIT, propagate_nan=tl.PropagateNan.ALL),
+                            LIMIT, propagate_nan=tl.PropagateNan.ALL).to(tl.bfloat16).to(tl.float32)
+            silu = (gate / (1.0 + tl.exp(-gate))).to(tl.bfloat16).to(tl.float32)
+            x = (silu * up).to(tl.bfloat16).to(tl.float32)
+            maximum = tl.maximum(tl.max(tl.abs(x), 1), 1.0e-10)
+            scale = maximum / 448.0
+            q = tl.minimum(tl.maximum(x * (1.0 / scale[:, None]), -448.0), 448.0)
+        else:
+            gate = tl.minimum(gate, LIMIT)
+            up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
+            silu = tl.div_rn(gate, libdevice.add_rn(1.0, libdevice.exp(-gate)))
+            # Virtual eager activation store: BF16 round precedes FP8 amax.
+            x = libdevice.mul_rn(silu, up).to(tl.bfloat16).to(tl.float32)
+            maximum = tl.maximum(tl.max(tl.abs(x), 1), 1.0e-4)
+            scale = tl.maximum(libdevice.mul_rn(maximum, 1.0 / 448.0), 1.0e-12)
+            q = tl.minimum(tl.maximum(tl.div_rn(x, scale[:, None]), -448.0), 448.0)
         tl.store(Q + row[:, None] * I + col, q, valid[:, None])
         tl.store(QS + flat_group, scale, valid)
 
     @triton.jit
     def combine(task, DN, INV, IDS, RW, OUT, H: tl.constexpr,
-                KTOP: tl.constexpr, SKIP: tl.constexpr, ROUND: tl.constexpr):
+                KTOP: tl.constexpr, SKIP: tl.constexpr, ROUND: tl.constexpr,
+                WEIGHTED: tl.constexpr):
         token = task // tl.cdiv(H, 256)
         col = task % tl.cdiv(H, 256) * 256 + tl.arange(0, 256)
         acc = tl.zeros((256,), tl.float32)
@@ -150,35 +179,42 @@ def _kernels():
             if SKIP:
                 live = (tl.load(IDS + original) >= 0) & (weight != 0)
             value = tl.load(DN + row * H + col, (col < H) & live, 0, cache_modifier=".cg").to(tl.float32)
-            product = libdevice.mul_rn(value, weight)
-            if ROUND:
-                product = product.to(tl.bfloat16).to(tl.float32)
-            acc = libdevice.add_rn(acc, product)
+            if WEIGHTED:
+                product = libdevice.mul_rn(value, weight)
+                if ROUND:
+                    product = product.to(tl.bfloat16).to(tl.float32)
+                acc = libdevice.add_rn(acc, product)
+            else:
+                # SGL donor: the route weight already lives in the down store,
+                # so the final reduction is a plain fp32 sum over k.
+                acc = libdevice.add_rn(acc, value)
         tl.store(OUT + token * H + col, acc, col < H)
 
     @triton.jit
-    def region(X, GUW, GUS, DNW, DNS, IDS, RW, TOK, INV, TE, TR, TM,
+    def region(X, GUW, GUS, DNW, DNS, IDS, RW, TOK, INV, SO, TE, TR, TM,
                LIVE, Q1, S1, GU, Q2, S2, DN, OUT, COUNTER, BASE,
                T: tl.constexpr, H: tl.constexpr, I: tl.constexpr,
                E: tl.constexpr, KTOP: tl.constexpr, P: tl.constexpr,
                CAP: tl.constexpr, BS: tl.constexpr, BE: tl.constexpr,
                BC: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                STEPS: tl.constexpr, LIMIT: tl.constexpr,
-               SKIP: tl.constexpr, ROUND: tl.constexpr):
+               SKIP: tl.constexpr, ROUND: tl.constexpr, SGL: tl.constexpr,
+               WEIGHT_DOWN: tl.constexpr, WEIGHT_COMBINE: tl.constexpr):
         worker = tl.program_id(0)
         base = tl.load(BASE)
         task = worker
         while task < 1 + T * (H // 128):
             if task == 0:
-                routing(IDS, RW, TOK, INV, TE, TR, TM, LIVE, T * KTOP,
+                routing(IDS, RW, TOK, INV, SO, TE, TR, TM, LIVE, T * KTOP,
                         KTOP, E, BS, BE, CAP, BC, BM, SKIP, STEPS)
             else:
-                quantize(task - 1, X, Q1, S1, H)
+                quantize(task - 1, X, Q1, S1, H, SGL)
             task += P
         grid_barrier(COUNTER, base + P)
         task = worker
         while task < CAP * tl.cdiv(2 * I, BN):
-            gemm(task, Q1, S1, GUW, GUS, GU, TOK, TE, TR, TM, 2 * I, H, BM, BN, True)
+            gemm(task, Q1, S1, GUW, GUS, GU, TOK, TE, TR, TM, RW, INV, SO,
+                 2 * I, H, BM, BN, True, False)
             task += P
         grid_barrier(COUNTER, base + 2 * P)
         task = worker
@@ -186,17 +222,18 @@ def _kernels():
         # read by down/combine, so its quantization needs no work or fill.
         activation_tasks = tl.cdiv(tl.load(LIVE, cache_modifier=".cg") * (I // 128), 4)
         while task < activation_tasks:
-            activate_quantize(task, GU, Q2, S2, LIVE, I, LIMIT)
+            activate_quantize(task, GU, Q2, S2, LIVE, I, LIMIT, SGL)
             task += P
         grid_barrier(COUNTER, base + 3 * P)
         task = worker
         while task < CAP * tl.cdiv(H, BN):
-            gemm(task, Q2, S2, DNW, DNS, DN, TOK, TE, TR, TM, H, I, BM, BN, False)
+            gemm(task, Q2, S2, DNW, DNS, DN, TOK, TE, TR, TM, RW, INV, SO,
+                 H, I, BM, BN, False, WEIGHT_DOWN)
             task += P
         grid_barrier(COUNTER, base + 4 * P)
         task = worker
         while task < T * tl.cdiv(H, 256):
-            combine(task, DN, INV, IDS, RW, OUT, H, KTOP, SKIP, ROUND)
+            combine(task, DN, INV, IDS, RW, OUT, H, KTOP, SKIP, ROUND, WEIGHT_COMBINE)
             task += P
         if worker == 0:
             tl.store(BASE, base + 4 * P)
@@ -214,11 +251,26 @@ class PersistentMoE:
     it must happen before capture. Every run/replay must use the preparation
     stream and retain this object through completion. Output is overwritten
     on the next run. Separate concurrent regions need separate instances.
+
+    ``numerics='native'`` (default) keeps the block-FP8 grouped-prefill
+    boundaries (amax floor ``1e-4``) and rounds the route weight in the
+    combine. ``numerics='sgl_decode'`` keeps the SGLang decode donor's
+    boundaries instead (amax floor ``1e-10``, reciprocal multiply, BF16
+    round-trips at every clamp/SiLU/product stage, route weight applied in
+    fp32 by the down GEMM before its BF16 store, and a plain fp32 reduction),
+    with a small-row tile and EP zero-route skipping for decode geometry.
     """
 
     def __init__(self, x, gate_up, gate_scales, down, down_scales, indices, weights,
                  *, swiglu_limit=7.0, skip_zero_weights=False,
-                 round_products_to_bf16=False, workers=None, blocks_per_sm=1):
+                 round_products_to_bf16=False, workers=None, blocks_per_sm=1,
+                 numerics="native", block_m=None):
+        if numerics not in ("native", "sgl_decode"):
+            raise ValueError("numerics must be 'native' or 'sgl_decode'")
+        if numerics == "sgl_decode" and round_products_to_bf16:
+            raise ValueError(
+                "sgl_decode already keeps the route weight in the down store; "
+                "round_products_to_bf16 would double-round")
         tensors = x, gate_up, gate_scales, down, down_scales, indices, weights
         if not (
             x.is_cuda and torch.version.hip is None
@@ -263,19 +315,27 @@ class PersistentMoE:
         self._spec = tuple((tuple(v.shape), v.dtype) for v in (x, indices, weights))
         self._input_alignment = tuple(v.data_ptr() % 16 for v in (x, indices, weights))
         triton, self._kernel = _kernels()
-        bm, bn = 64, 128
+        sgl = numerics == "sgl_decode"
+        self.numerics = numerics
+        # Prefill keeps the qualified BM64 tile. Decode keeps the SGL donor's
+        # small-row tile so the block accumulation order is unchanged.
+        bm = (16 if sgl else 64) if block_m is None else int(block_m)
+        bn = 128
         cap = min(slots, slots // bm + e + 1)
         self._constants = dict(T=t, H=h, I=i, E=e, KTOP=top_k, P=self.workers,
                                CAP=cap, BS=triton.next_power_of_2(slots),
                                BE=triton.next_power_of_2(e + 1), BC=triton.next_power_of_2(cap),
                                BM=bm, BN=bn, STEPS=e.bit_length() + 1,
                                LIMIT=float(swiglu_limit), SKIP=bool(skip_zero_weights),
-                               ROUND=bool(round_products_to_bf16), num_warps=4, num_stages=3,
+                               ROUND=bool(round_products_to_bf16),
+                               SGL=sgl, WEIGHT_DOWN=sgl, WEIGHT_COMBINE=not sgl,
+                               num_warps=4, num_stages=3,
                                launch_cooperative_grid=True)
         def empty(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=x.device)
         self.tokens = empty(slots, torch.int64)
         self.inverse = empty(slots, torch.int64)
+        self.order = empty(slots, torch.int64)
         self.tile_expert, self.tile_start, self.tile_count = (empty(cap, torch.int64) for _ in range(3))
         self.live = empty((), torch.int32)
         self.q1 = empty((t, h), torch.float8_e4m3fn)
@@ -296,7 +356,7 @@ class PersistentMoE:
 
     def _args(self, x, indices, weights, expert_weights=None):
         return (x, *(self.weights if expert_weights is None else expert_weights),
-                indices, weights, self.tokens, self.inverse,
+                indices, weights, self.tokens, self.inverse, self.order,
                 self.tile_expert, self.tile_start, self.tile_count, self.live,
                 self.q1, self.s1, self.gate_up, self.q2, self.s2, self.down,
                 self.output, self.counter, self.base)
