@@ -1083,6 +1083,7 @@ def glm_moe_grouped_gemm_native(
     deterministic_combine=False,
     skip_zero_weights=False,
     round_products_to_bf16=False,
+    fused_prefill_glue=False,
 ):
     """Routed expert MLP via TWO single-launch grouped fp8 GEMMs.
 
@@ -1107,6 +1108,11 @@ def glm_moe_grouped_gemm_native(
     consume stale data. It avoids host compaction without reducing workspace
     capacity. ``round_products_to_bf16`` with deterministic combine retains
     the weighted-row boundary of a compacted [P,1] invocation.
+
+    ``fused_prefill_glue`` replaces only the integer tile-map chain and the
+    two BF16-to-E4M3FN activation quantizers with single-launch equivalents
+    on CUDA. Stable sorting, grouped GEMMs, activation and combine are kept.
+    FP8 payloads and FP32 scales retain the eager rounding boundaries.
 
     Host work per call: one sort, a handful of tiny torch ops for the
     tile map, two grouped launches, one swiglu + per-row quantize — no
@@ -1158,6 +1164,12 @@ def glm_moe_grouped_gemm_native(
         topk_index, n_experts, dev, topk_weights if skip_zero_weights else None)
 
     quantize = _activation_quantizer(gate_up_nz.dtype)
+    if fused_prefill_glue:
+        from .grouped_prefill_glue import quantize_per_token_fp8_exact
+
+        if gate_up_nz.dtype != torch.float8_e4m3fn or torch.version.hip is not None:
+            raise OpNotEligible("fused prefill glue currently requires CUDA E4M3FN")
+        quantize = quantize_per_token_fp8_exact
     a_nz, asc2 = quantize(x)
 
     slots = t * k
@@ -1170,7 +1182,12 @@ def glm_moe_grouped_gemm_native(
     # decode regression. Taking the min keeps prefill's tight bound and stops
     # decode from paying for experts it cannot have routed to.
     cap = min(slots, slots // bm + n_experts + 1)
-    tile_exp, tile_r0, tile_m = _tile_map_static(counts, seg, bm, dev, cap)
+    if fused_prefill_glue:
+        from .grouped_prefill_glue import grouped_tile_map
+
+        tile_exp, tile_r0, tile_m = grouped_tile_map(counts, seg, bm, cap)
+    else:
+        tile_exp, tile_r0, tile_m = _tile_map_static(counts, seg, bm, dev, cap)
 
     # Static-capacity skipped slots must be initialized on every call/replay;
     # activation/quantization still covers capacity, including the tail.

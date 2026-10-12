@@ -86,6 +86,39 @@ def test_gpu_parity_vs_reference(torch):
     torch.testing.assert_close(out.float(), out_r.float(), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize("implementation", ["decode_attention", "decode_attention_gqa", "decode_attention_split"])
+@pytest.mark.parametrize("strided", ["k", "v"])
+def test_fresh_kv_distinct_strides(torch, implementation, strided):
+    """Packed projections and normalized K need independent fresh-K/V strides."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires GPU")
+    pytest.importorskip("triton")
+    from vkernels.torch_ops import triton_attn
+
+    torch.manual_seed(27)
+    batch, heads, dim, width = 4, 2, 64, 160
+    q = torch.randn(batch, 4, dim, device="cuda", dtype=torch.bfloat16)
+    packed = torch.randn(batch, heads * 3, dim, device="cuda", dtype=q.dtype)
+    view = packed[:, heads : 2 * heads]
+    contiguous = torch.randn(batch, heads, dim, device="cuda", dtype=q.dtype)
+    kn, vn = (view, contiguous) if strided == "k" else (contiguous, view)
+    assert kn.stride() != vn.stride()
+    kc = torch.randn(1 + batch * width, heads, dim, device="cuda", dtype=q.dtype)
+    vc = torch.randn_like(kc)
+    table = torch.arange(1, 1 + batch * width, device="cuda", dtype=torch.int32).reshape(batch, width)
+    lengths = torch.tensor([3, 71, 129, 155], device="cuda", dtype=torch.int32)
+    expected_k, expected_v = kc.clone(), vc.clone()
+    slots = table[torch.arange(batch, device="cuda"), lengths.long() - 1].long()
+    expected_k[slots], expected_v[slots] = kn, vn
+    op = getattr(triton_attn, implementation)
+    options = {"max_len_hint": width} if implementation.endswith("split") else {}
+    expected = op(q, expected_k, expected_v, table, lengths, **options)
+    actual = op(q, kc, vc, table, lengths, k_new=kn, v_new=vn, scratch_slot=0, **options)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(kc, expected_k, atol=0, rtol=0)
+    torch.testing.assert_close(vc, expected_v, atol=0, rtol=0)
+
+
 def test_decode_attention_split_matches_reference():
     pytest.importorskip("torch")
     pytest.importorskip("torch.cuda")
