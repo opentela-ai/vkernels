@@ -99,26 +99,30 @@ def _grid_barrier_sm(bar_ptr, target: tl.int64):
 def _grid_barrier_cdna(bar_ptr, target: tl.int64):
     """Monotonic spin barrier over all resident blocks (CDNA formulation).
 
-    Same contract as ``_grid_barrier_sm``.  The poll is the same acquire
-    RMW, plus a trailing ``tl.debug_barrier()`` convergence point: without
-    it the outlined spin does not survive the AMD backend (it either hangs
-    or lets blocks through early), while the byte-identical body written
-    inline in the kernel -- or outlined with the trailing barrier -- passes
-    the race-free microprogram below at P = 1/8/48/228 on gfx942.
+    Same contract as ``_grid_barrier_sm``, and the same acquire-RMW poll.
+    Two things are load-bearing on gfx942 (triton 3.5.1), both measured with
+    the race-free per-round-slot microprogram in ``meta/scripts/probe*.py``:
 
-    Do not "optimise" the poll into a plain coherent load.  A ``.cv`` load
-    polled to ``target`` and followed by one acquire RMW *releases early*
-    on both vendors: a race-free judge (each round writes a private slot,
-    so no block can clobber the value its neighbour is about to read) shows
-    stale/future reads at every worker count on GB10 and MI300A, and an L1
-    invalidate (``buffer_inv``) does not repair it -- the loss is the
-    acquire edge, not L1 staleness.  The acquire-RMW poll is exact.
+    * The poll must acquire.  A coherent ``.cv`` load followed by one acquire
+      RMW *releases early* -- stale and future reads at every worker count on
+      GB10 as well as MI300A -- and an L1 invalidate does not repair it, so
+      the loss is the acquire edge, not L1 staleness.
+    * The spin guard must be 32-bit.  Written with an int64 comparison the
+      outlined spin miscompiles into an *infinite loop* at every worker
+      count, P=1 included, whether the int64 arrives as the argument or is
+      produced inside the helper; the byte-identical body written inline in
+      the kernel or guarded in 32 bits releases and is exact.  So keep the
+      low 32 bits and compare the difference: the counter is monotonic and
+      the barrier's release lag is bounded by a couple of rounds (a block
+      cannot pass round r+k while a neighbour is still in round r), so a
+      signed 32-bit difference stays correct even once the counter wraps.
     """
     tl.debug_barrier()  # all threads' stores issued before the arrival
     tl.atomic_add(bar_ptr, 1, sem="acq_rel", scope="gpu")
-    c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu")
-    while c < target:
-        c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu")
+    t32 = target.to(tl.int32)
+    c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu").to(tl.int32)
+    while t32 - c > 0:
+        c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu").to(tl.int32)
     tl.debug_barrier()  # converge before post-barrier loads / next arrival
 
 
