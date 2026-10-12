@@ -740,6 +740,147 @@ int main() {
     }
   }
 
+  // --- (6b) decode-GEMV v2 (issue #156 follow-up) -------------------------
+  // Fixed TB=8 exact-uint4 weight tiles + KK-way multi-K register blocking
+  // + optional global-memory A reads. bf16 keeps the v1 numerics contract
+  // (oracle = gemm_bf16_cpu on B). The fp8 variant keeps the v1
+  // per-element-rounded contract (oracle = gemm_bf16_cpu on the bf16
+  // ROUNDED dequantized weights, same as the v1 section above). A
+  // deferred-scale variant was measured on MI300A and rejected for
+  // register-pressure spills (~5-6x slower) -- see NOTES-156.md.
+  {
+    struct Case { int M, N, K, S, kk, th; float beta; bool fp8, gm;
+                  const char* what; };
+    const Case cases[] = {
+        {5, 6288, 7168, 32, 4, 256, 0.0f, false, false, "QKV shape kk=4"},
+        {5, 6288, 7168, 64, 8, 64, 0.0f, false, true,  "a_gmem kk=8"},
+        {5, 6288, 7168, 31, 2, 64, 0.0f, false, false, "odd prime S=31"},
+        {5, 3584, 7168, 33, 4, 128, 0.5f, false, false, "beta!=0"},
+        {2,  128, 257, 32, 4, 64, 0.0f, false, false, "odd K=257 (tail)"},
+        {1,  896, 7168, 96, 2, 64, 0.0f, false, true,  "M=1 a_gmem S=96"},
+        {8,  896, 7168, 64, 8, 128, 0.0f, false, false, "M=8 kk=8"},
+        {5, 6288, 7168, 32, 4, 256, 0.0f, true,  false, "fp8 kk=4"},
+        {5, 3584, 7168, 33, 2, 128, 0.5f, true,  true,  "fp8 a_gmem beta!=0"},
+        {2,  128, 256, 3, 4, 64, 0.0f, true,  false, "fp8 tiny odd S=3 (splits span blocks)"},
+        {5, 6288, 7168, 64, 8, 64, 0.0f, true,  false, "fp8 kk=8 S=64"},
+        {1,  896, 7168, 96, 2, 64, 0.0f, true,  true,  "fp8 M=1 a_gmem S=96"},
+        {5, 3584, 7168, 96, 4, 128, 0.5f, true, false, "fp8 S=96 unaligned k0 kk=4"},
+    };
+    std::printf("\n--- decode-GEMV v2 (gemv_decode_*_splitk_v2) ---\n");
+    for (const auto& c : cases) {
+      const int n_s8 = (c.N + 7) / 8, k_b = (c.K + 127) / 128;
+      std::vector<uint16_t> A((size_t)c.M * c.K), B((size_t)c.K * c.N),
+          C((size_t)c.M * c.N, 0);
+      fill_AB(A, B, c.M, c.N, c.K, 23);
+      for (size_t i = 0; i < C.size(); ++i) C[i] = f2bf(rnd(9, (int)i) * 0.3f);
+      std::vector<uint16_t> rC(C);
+      uint8_t* dW8 = nullptr; float* dS = nullptr; uint16_t* dB = nullptr;
+      if (c.fp8) {
+        std::vector<float> scales((size_t)n_s8 * k_b);
+        std::vector<uint8_t> W8((size_t)c.K * c.N);
+        for (int kb = 0; kb < k_b; ++kb)
+          for (int nb = 0; nb < n_s8; ++nb) {
+            float amax = 0;
+            for (int kk = 0; kk < 128 && kb * 128 + kk < c.K; ++kk)
+              for (int nn = 0; nn < 8 && nb * 8 + nn < c.N; ++nn) {
+                const size_t idx = (size_t)(kb * 128 + kk) * c.N + nb * 8 + nn;
+                uint32_t u = (uint32_t)B[idx] << 16;
+                float f; std::memcpy(&f, &u, 4);
+                amax = std::max(amax, std::fabs(f));
+              }
+            const float scale = amax / 240.0f;
+            scales[(size_t)kb * n_s8 + nb] = scale;
+            for (int kk = 0; kk < 128 && kb * 128 + kk < c.K; ++kk)
+              for (int nn = 0; nn < 8 && nb * 8 + nn < c.N; ++nn) {
+                const size_t idx = (size_t)(kb * 128 + kk) * c.N + nb * 8 + nn;
+                uint32_t u = (uint32_t)B[idx] << 16;
+                float f; std::memcpy(&f, &u, 4);
+                W8[idx] = fnuz_enc(f / scale);
+              }
+          }
+        // Dequant oracle: bf16-ROUNDED dequantized weights + fp32-accum
+        // CPU gemm (same contract/one-RNE as the v1 fp8 section).
+        std::vector<uint16_t> Bdq((size_t)c.K * c.N);
+        for (int k = 0; k < c.K; ++k)
+          for (int n = 0; n < c.N; ++n)
+            Bdq[(size_t)k * c.N + n] =
+                f2bf(fnuz_dec(W8[(size_t)k * c.N + n]) *
+                     scales[(size_t)(k / 128) * n_s8 + (n / 8)]);
+        vkernels::kernels::gemm_bf16_cpu((size_t)c.M, (size_t)c.N,
+                                         (size_t)c.K, 1.0f, A.data(),
+                                         Bdq.data(), c.beta, rC.data());
+        CK(hipMalloc(&dW8, W8.size()), "gemv2 W8");
+        CK(hipMalloc(&dS, scales.size() * 4), "gemv2 S");
+        CK(hipMemcpy(dW8, W8.data(), W8.size(), hipMemcpyHostToDevice), "gemv2 cW8");
+        CK(hipMemcpy(dS, scales.data(), scales.size() * 4, hipMemcpyHostToDevice), "gemv2 cS");
+      } else {
+        vkernels::kernels::gemm_bf16_cpu((size_t)c.M, (size_t)c.N,
+                                         (size_t)c.K, 1.0f, A.data(),
+                                         B.data(), c.beta, rC.data());
+        CK(hipMalloc(&dB, B.size() * 2), "gemv2 B");
+        CK(hipMemcpy(dB, B.data(), B.size() * 2, hipMemcpyHostToDevice), "gemv2 cB");
+      }
+      CK(hipMemcpy(dA, A.data(), (size_t)c.M * c.K * 2, hipMemcpyHostToDevice), "gemv2 cA");
+      CK(hipMemcpy(dC, C.data(), (size_t)c.M * c.N * 2, hipMemcpyHostToDevice), "gemv2 cC");
+      if (c.fp8)
+        vkernels::kernels::hip::gemv_decode_fp8_splitk_v2(
+            (size_t)c.M, (size_t)c.N, (size_t)c.K, 1.0f, dA, dW8, dS, c.beta,
+            dC, c.S, c.th, c.kk, c.gm);
+      else
+        vkernels::kernels::hip::gemv_decode_bf16_splitk_v2(
+            (size_t)c.M, (size_t)c.N, (size_t)c.K, 1.0f, dA, dB, c.beta,
+            dC, c.S, c.th, c.kk, c.gm);
+      CK(hipDeviceSynchronize(), "gemv2 sync");
+      std::vector<uint16_t> hC(C.size());
+      CK(hipMemcpy(hC.data(), dC, hC.size() * 2, hipMemcpyDeviceToHost), "gemv2 rC");
+      double max_abs = 0, max_rel = 0;
+      for (int i = 0; i < c.M * c.N; ++i) {
+        float hf, rf;
+        uint32_t hu = (uint32_t)hC[i] << 16, ru = (uint32_t)rC[i] << 16;
+        std::memcpy(&hf, &hu, 4); std::memcpy(&rf, &ru, 4);
+        double e = std::fabs((double)hf - rf);
+        if (e > max_abs) max_abs = e;
+        double d = std::fmax(std::fabs((double)rf), 1.0);
+        if (e / d > max_rel) max_rel = e / d;
+      }
+      const bool ok = max_rel < THRESH;
+      std::printf("  M=%-2d N=%-4d K=%-4d S=%-3d kk=%d th=%-3d gm=%d beta=%.1f %s"
+                  "  max_abs=%.4f max_rel=%.6f  %s  (%s)\n",
+                  c.M, c.N, c.K, c.S, c.kk, c.th, (int)c.gm, c.beta,
+                  c.fp8 ? "fp8 " : "bf16",
+                  max_abs, max_rel, ok ? "PASS" : "FAIL", c.what);
+      if (!ok) ++fails;
+      if (dW8) hipFree(dW8);
+      if (dS) hipFree(dS);
+      if (dB) hipFree(dB);
+    }
+    // v2 rejections: unsupported kk and M > 8 must leave C untouched.
+    {
+      std::vector<uint16_t> A(9 * 256), C(9 * 128, 0x3c00);
+      std::vector<uint16_t> B((size_t)256 * 128, 0);
+      uint16_t *dA, *dB, *dC;
+      CK(hipMalloc(&dA, A.size() * 2), "rj3 A");
+      CK(hipMalloc(&dB, B.size() * 2), "rj3 B");
+      CK(hipMalloc(&dC, C.size() * 2), "rj3 C");
+      CK(hipMemcpy(dC, C.data(), C.size() * 2, hipMemcpyHostToDevice), "rj3 cpyC");
+      bool untouched = true;
+      vkernels::kernels::hip::gemv_decode_bf16_splitk_v2(
+          9, 128, 256, 1.0f, dA, dB, 0.0f, dC, 4, 64, 4, false);
+      CK(hipDeviceSynchronize(), "rj3 sync");
+      vkernels::kernels::hip::gemv_decode_bf16_splitk_v2(
+          5, 128, 256, 1.0f, dA, dB, 0.0f, dC, 4, 64, 3, false);  // kk=3
+      CK(hipDeviceSynchronize(), "rj3 sync2");
+      std::vector<uint16_t> hC(C.size());
+      CK(hipMemcpy(hC.data(), dC, hC.size() * 2, hipMemcpyDeviceToHost), "rj3 rC");
+      for (size_t i = 0; i < hC.size(); ++i)
+        if (hC[i] != 0x3c00) { untouched = false; break; }
+      std::printf("  v2 rejections (M=9, kk=3): C %s  %s\n",
+                  untouched ? "untouched" : "MODIFIED", untouched ? "PASS" : "FAIL");
+      if (!untouched) ++fails;
+      hipFree(dA); hipFree(dB); hipFree(dC);
+    }
+  }
+
   hipFree(dA); hipFree(dB); hipFree(dC);
   std::printf("\n%s (%d failure(s))\n", fails ? "FAIL" : "PASS", fails);
   return fails ? 1 : 0;

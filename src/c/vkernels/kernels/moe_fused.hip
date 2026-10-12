@@ -1101,6 +1101,15 @@ void gateup_swiglu_kernel_prefill_pipe(
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int expert = expert_ids[pid_m];
   if (expert < 0) return;
+#ifdef VK150_DEBUG
+  if (expert > 63)
+    printf("[vk150][gateup_pipe] bad expert=%d pid=(%d,%d) tid=%d\n",
+           expert, (int)blockIdx.x, (int)blockIdx.y, (int)threadIdx.x);
+  if (threadIdx.x == 0)
+    printf("[vk150][gateup] bid=(%d,%d) gdim=(%d,%d) kBM=%d expert=%d\n",
+           (int)blockIdx.x, (int)blockIdx.y, (int)gridDim.x, (int)gridDim.y,
+           (int)kBM, expert);
+#endif
 
   int tk_base = pid_m * kBM;
   const size_t w13_bytes  = 2 * (size_t)ispp * (hidden / 2);
@@ -1344,6 +1353,15 @@ void down_combine_kernel_prefill_pipe(
   int pid_m = blockIdx.x, pid_n = blockIdx.y;
   int expert = expert_ids[pid_m];
   if (expert < 0) return;
+#ifdef VK150_DEBUG
+  if (expert > 63)
+    printf("[vk150][down_pipe] bad expert=%d pid=(%d,%d) tid=%d\n",
+           expert, (int)blockIdx.x, (int)blockIdx.y, (int)threadIdx.x);
+  if (threadIdx.x == 0)
+    printf("[vk150][down] bid=(%d,%d) gdim=(%d,%d) kBM=%d expert=%d\n",
+           (int)blockIdx.x, (int)blockIdx.y, (int)gridDim.x, (int)gridDim.y,
+           (int)kBM, expert);
+#endif
 
   int tk_base = pid_m * kBM;
   const size_t w2_bytes  = (size_t)hidden * (ispp / 2);
@@ -1537,7 +1555,7 @@ void fused_moe_mxfp4(
             sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
             activation, beta, linear_beta, b13 != nullptr);
         VK_TEND("gateup");
-      } else if (pf_variant == 4 || pf_variant == 5) {
+      } else if (pf_variant == 4 || pf_variant == 5 || pf_variant == 6) {
         dim3 g(EM / kBM_pf, ispp / kBN_pf_g16);
         VK_TBEGIN();
         gateup_swiglu_kernel_prefill_pipe<kBM_pf, kBN_pf_g16>
@@ -1578,27 +1596,35 @@ void fused_moe_mxfp4(
       // v5 keeps the narrow N tile through the down GEMM as well; every
       // other variant uses the 64-wide tile (the down grid is
       // (EM/64) x (hidden/64), already 4096 blocks at the default shape).
-      if (pf_variant == 5) {
-        dim3 g(EM / kBM_pf, hidden / kBN_pf_g32);
-        VK_TBEGIN();
-        down_combine_kernel_prefill_pipe<kBM_pf, kBN_pf_g32>
-            <<<g, kThreads_pf, 0, hipstream>>>(
-            act_scratch, w2, w2_scale, b2, out, topk_w,
-            sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
-        VK_TEND("down");
-      } else {
-        dim3 g(EM / kBM_pf, hidden / kBN_pf);
-        VK_TBEGIN();
-        if (pf_variant >= 1 && pf_variant <= 4)
-          down_combine_kernel_prefill_pipe<kBM_pf, kBN_pf>
+      // Variant 6 with 128-row alignment already launched both stages in
+      // the block above (launching the 64-row down path here too would
+      // re-read expert_ids per 64 rows — past the end of the 128-row
+      // expert_ids array — and corrupt `out` with garbage experts), so it
+      // is skipped entirely.  Variant 6 with 64-row alignment falls back
+      // to the v5 down path to match its v5-fallback gateup.
+      if (!(pf_variant == 6 && block_size >= kBM_pf128)) {
+        if (pf_variant == 5 || pf_variant == 6) {
+          dim3 g(EM / kBM_pf, hidden / kBN_pf_g32);
+          VK_TBEGIN();
+          down_combine_kernel_prefill_pipe<kBM_pf, kBN_pf_g32>
               <<<g, kThreads_pf, 0, hipstream>>>(
               act_scratch, w2, w2_scale, b2, out, topk_w,
               sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
-        else
-          down_combine_kernel_prefill<kBN_pf><<<g, kThreads_pf, 0, hipstream>>>(
-              act_scratch, w2, w2_scale, b2, out, topk_w,
-              sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
-        VK_TEND("down");
+          VK_TEND("down");
+        } else {
+          dim3 g(EM / kBM_pf, hidden / kBN_pf);
+          VK_TBEGIN();
+          if (pf_variant >= 1 && pf_variant <= 4)
+            down_combine_kernel_prefill_pipe<kBM_pf, kBN_pf>
+                <<<g, kThreads_pf, 0, hipstream>>>(
+                act_scratch, w2, w2_scale, b2, out, topk_w,
+                sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
+          else
+            down_combine_kernel_prefill<kBN_pf><<<g, kThreads_pf, 0, hipstream>>>(
+                act_scratch, w2, w2_scale, b2, out, topk_w,
+                sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
+          VK_TEND("down");
+        }
       }
     }
   } else {

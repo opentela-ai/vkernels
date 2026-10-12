@@ -1,0 +1,208 @@
+=== node: nid002664  date: 2026-10-11T16:19:17Z  job=676555 ===
+GPU[2]		: Valid mclk range: 900Mhz - 1300Mhz
+GPU[3]		: Valid mclk range: 900Mhz - 1300Mhz
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+=== gates: test_gemm_bf16_correct ===
+  M=8   N=3072 K=512  S=8  beta=0.0  bit_exact=1 max_abs=0.0039 max_rel=0.003906  PASS  (S=8, kts=1: odd kt0 splits (ring parity))
+  M=8   N=7168 K=1536 S=8  beta=0.0  bit_exact=1 max_abs=0.1250 max_rel=0.006329  PASS  (S=8, kts=3: odd kt0 splits (ring parity))
+  M=5   N=3584 K=7168 S=16 beta=0.0  bit_exact=1 max_abs=0.0625 max_rel=0.007407  PASS  (S=16, kts=7: odd kt0 splits (ring parity))
+  M=5   N=6288 K=7168 S=16 beta=0.0  bit_exact=1 max_abs=0.1250 max_rel=0.007576  PASS  (QKV shape, S=16, kts=7 (ring parity))
+
+--- block-FP8 split-K (gemm_fp8_block_splitk_with_config) ---
+  M=5   N=6288 K=7168 S=8 beta=0.0 16x16  max_abs=0.2500 max_rel=0.007634  PASS  (QKV shape, tile 16x16, S=8)
+  M=8   N=3584 K=7168 S=8 beta=0.0 16x64  max_abs=0.2500 max_rel=0.007407  PASS  (gate shape, tile 16x64, S=8)
+  M=16  N=896  K=7168 S=4 beta=0.5 16x16  max_abs=0.2500 max_rel=0.003937  PASS  (small-N shape, beta!=0, S=4)
+  M=5   N=6288 K=7168 S=9 beta=0.0 32x64  max_abs=0.1250 max_rel=0.007634  PASS  (QKV shape, tile 32x64, S=9 clamp)
+  M=5   N=128  K=256  S=3 beta=0.0 16x16  max_abs=0.0000 max_rel=0.000000  PASS  (tiny shape, odd S=3)
+  N%8!=0 rejection (N=100): C untouched  PASS
+
+--- decode-GEMV split-K (gemv_decode_*_splitk) ---
+  M=5  N=6288 K=7168 S=32  tb=8 th=64  beta=0.0 bf16  max_abs=0.1250 max_rel=0.006993  PASS  (QKV shape bf16 S=32 tb=8)
+  M=5  N=6288 K=7168 S=31  tb=8 th=64  beta=0.0 bf16  max_abs=0.1250 max_rel=0.006993  PASS  (odd prime S=31 (element splits))
+  M=5  N=6288 K=7168 S=32  tb=4 th=64  beta=0.0 bf16  max_abs=0.1250 max_rel=0.006993  PASS  (tb=4 narrow columns)
+  M=5  N=6288 K=7168 S=64  tb=8 th=128 beta=0.0 bf16  max_abs=0.1250 max_rel=0.006993  PASS  (th=128 blocks)
+  M=5  N=3584 K=7168 S=32  tb=8 th=64  beta=0.5 bf16  max_abs=0.0156 max_rel=0.003968  PASS  (beta!=0)
+  M=8  N=896  K=7168 S=64  tb=8 th=64  beta=0.0 bf16  max_abs=0.2500 max_rel=0.006369  PASS  (small-N shape)
+  M=2  N=128  K=257  S=32  tb=8 th=64  beta=0.0 bf16  max_abs=0.0000 max_rel=0.000000  PASS  (odd K=257 element splits)
+  M=1  N=896  K=7168 S=32  tb=8 th=64  beta=0.0 bf16  max_abs=0.0625 max_rel=0.005181  PASS  (M=1 pure GEMV)
+  M=5  N=6288 K=7168 S=32  tb=8 th=64  beta=0.0 fp8   max_abs=0.0625 max_rel=0.006536  PASS  (QKV shape fp8 S=32)
+  M=5  N=3584 K=7168 S=33  tb=8 th=64  beta=0.5 fp8   max_abs=0.1250 max_rel=0.007519  PASS  (fp8 odd S=33, beta!=0)
+  M=5  N=128  K=256  S=3   tb=8 th=64  beta=0.0 fp8   max_abs=0.0000 max_rel=0.000000  PASS  (fp8 tiny, odd S=3)
+  M=2  N=896  K=7168 S=64  tb=4 th=64  beta=0.0 fp8   max_abs=0.2500 max_rel=0.005102  PASS  (fp8 tb=4)
+  M=9 rejection (M>8): C untouched  PASS
+
+--- decode-GEMV v2 (gemv_decode_*_splitk_v2) ---
+  M=5  N=6288 K=7168 S=32  kk=4 th=256 gm=0 beta=0.0 bf16  max_abs=0.2500 max_rel=0.005495  PASS  (QKV shape kk=4)
+  M=5  N=6288 K=7168 S=64  kk=8 th=64  gm=1 beta=0.0 bf16  max_abs=0.2500 max_rel=0.007353  PASS  (a_gmem kk=8)
+  M=5  N=6288 K=7168 S=31  kk=2 th=64  gm=0 beta=0.0 bf16  max_abs=0.1250 max_rel=0.006369  PASS  (odd prime S=31)
+  M=5  N=3584 K=7168 S=33  kk=4 th=128 gm=0 beta=0.5 bf16  max_abs=0.2500 max_rel=0.005376  PASS  (beta!=0)
+  M=2  N=128  K=257  S=32  kk=4 th=64  gm=0 beta=0.0 bf16  max_abs=0.0000 max_rel=0.000000  PASS  (odd K=257 (tail))
+  M=1  N=896  K=7168 S=96  kk=2 th=64  gm=1 beta=0.0 bf16  max_abs=0.0000 max_rel=0.000000  PASS  (M=1 a_gmem S=96)
+  M=8  N=896  K=7168 S=64  kk=8 th=128 gm=0 beta=0.0 bf16  max_abs=0.0625 max_rel=0.006897  PASS  (M=8 kk=8)
+  M=5  N=6288 K=7168 S=32  kk=4 th=256 gm=0 beta=0.0 fp8   max_abs=0.2500 max_rel=0.005848  PASS  (fp8 kk=4)
+  M=5  N=3584 K=7168 S=33  kk=2 th=128 gm=1 beta=0.5 fp8   max_abs=0.1250 max_rel=0.004808  PASS  (fp8 a_gmem beta!=0)
+  M=2  N=128  K=256  S=3   kk=4 th=64  gm=0 beta=0.0 fp8   max_abs=0.0000 max_rel=0.000000  PASS  (fp8 tiny odd S=3 (splits span blocks))
+  M=5  N=6288 K=7168 S=64  kk=8 th=64  gm=0 beta=0.0 fp8   max_abs=0.2500 max_rel=0.005848  PASS  (fp8 kk=8 S=64)
+  M=1  N=896  K=7168 S=96  kk=2 th=64  gm=1 beta=0.0 fp8   max_abs=0.0000 max_rel=0.000000  PASS  (fp8 M=1 a_gmem S=96)
+  M=5  N=3584 K=7168 S=96  kk=4 th=128 gm=0 beta=0.5 fp8   max_abs=0.1250 max_rel=0.004808  PASS  (fp8 S=96 unaligned k0 kk=4)
+  v2 rejections (M=9, kk=3): C untouched  PASS
+
+PASS (0 failure(s))
+=== probe (v2 phase) ===
+      -> cpu max_rel=0.00699 PASS
+  v2-fp8 S=64 th=64 kk=4 gm=0 N=3584         batches: 68.8 68.8 68.9 69.3  | med 68.90 us  sum=901.84337
+      -> 376 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+  v2-fp8 S=32 th=256 kk=4 gm=0 N=3584        batches: 90.0 90.1 90.2 90.2  | med 90.16 us  sum=901.87267
+      -> 287 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00637 PASS
+  v2-fp8 S=64 th=256 kk=4 gm=0 N=3584        batches: 70.8 70.8 71.0 71.1  | med 71.03 us  sum=901.84337
+      -> 365 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+  v2-fp8 S=32 th=64 kk=4 gm=1 N=3584         batches: 94.8 94.9 94.9 95.1  | med 94.91 us  sum=901.87267
+      -> 273 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00637 PASS
+  v2-fp8 S=64 th=64 kk=4 gm=1 N=3584         batches: 72.8 72.9 72.9 73.3  | med 72.95 us  sum=901.84337
+      -> 355 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+  v2-fp8 S=32 th=256 kk=4 gm=1 N=3584        batches: 109.0 109.1 109.2 109.2  | med 109.16 us  sum=901.87267
+      -> 237 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00637 PASS
+  v2-fp8 S=64 th=256 kk=4 gm=1 N=3584        batches: 79.6 79.6 79.6 79.9  | med 79.62 us  sum=901.84337
+      -> 325 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+  v2-fp8 S=96 th=64 kk=4 gm=0 N=3584         batches: 79.7 79.8 79.8 80.1  | med 79.83 us  sum=901.87462
+      -> 324 GB/s (bytes model 25.9 MB)
+      -> cpu max_rel=0.00699 PASS
+ -- v2-bf16 shape N=896 K=7168 M=5 --
+  v2-bf16 S=32 th=64 kk=2 gm=0 N=896         batches: 72.7 72.7 72.8 72.8  | med 72.83 us  sum=381.52185
+      -> 177 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=32 th=64 kk=4 gm=0 N=896         batches: 60.3 60.3 60.4 60.4  | med 60.37 us  sum=381.52185
+      -> 214 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=32 th=64 kk=8 gm=0 N=896         batches: 107.9 107.9 107.9 108.3  | med 107.92 us  sum=381.52185
+      -> 120 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=64 th=64 kk=2 gm=0 N=896         batches: 57.3 57.5 57.5 57.8  | med 57.52 us  sum=381.52185
+      -> 225 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=64 th=64 kk=4 gm=0 N=896         batches: 51.0 51.0 51.1 51.1  | med 51.06 us  sum=381.52185
+      -> 253 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=64 th=64 kk=8 gm=0 N=896         batches: 75.6 75.6 75.6 75.6  | med 75.61 us  sum=381.52185
+      -> 171 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=96 th=64 kk=4 gm=0 N=896         batches: 54.6 54.6 54.7 54.7  | med 54.69 us  sum=381.52185
+      -> 236 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=32 th=256 kk=4 gm=0 N=896        batches: 59.3 59.4 59.5 59.5  | med 59.46 us  sum=381.52185
+      -> 217 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=64 th=256 kk=4 gm=0 N=896        batches: 51.2 51.3 51.3 51.3  | med 51.28 us  sum=381.52185
+      -> 252 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=32 th=256 kk=8 gm=0 N=896        batches: 135.3 135.4 135.4 135.4  | med 135.36 us  sum=381.52185
+      -> 95 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=64 th=256 kk=8 gm=0 N=896        batches: 89.1 89.2 89.2 89.3  | med 89.18 us  sum=381.52185
+      -> 145 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=32 th=64 kk=4 gm=1 N=896         batches: 67.2 67.2 67.3 67.4  | med 67.27 us  sum=381.52185
+      -> 192 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=64 th=64 kk=4 gm=1 N=896         batches: 54.5 54.5 54.5 54.6  | med 54.53 us  sum=381.52185
+      -> 237 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=64 th=64 kk=8 gm=1 N=896         batches: 65.8 65.9 66.0 66.0  | med 65.97 us  sum=381.52185
+      -> 196 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=32 th=256 kk=4 gm=1 N=896        batches: 69.0 69.0 69.0 69.1  | med 68.98 us  sum=381.52185
+      -> 187 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=64 th=256 kk=4 gm=1 N=896        batches: 56.2 56.2 56.3 56.3  | med 56.28 us  sum=381.52185
+      -> 230 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=64 th=256 kk=8 gm=1 N=896        batches: 83.9 84.0 84.1 84.1  | med 84.09 us  sum=381.52185
+      -> 154 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=96 th=64 kk=4 gm=1 N=896         batches: 56.8 56.9 56.9 56.9  | med 56.87 us  sum=381.52185
+      -> 227 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=128 th=64 kk=4 gm=0 N=896        batches: 60.8 61.1 61.1 61.2  | med 61.11 us  sum=381.51794
+      -> 212 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+  v2-bf16 S=128 th=64 kk=4 gm=1 N=896        batches: 62.7 62.9 62.9 63.1  | med 62.91 us  sum=381.51794
+      -> 205 GB/s (bytes model 12.9 MB)
+      -> cpu max_rel=0.00719 PASS
+ -- v2-fp8-deferred shape N=896 K=7168 M=5 --
+  v2-fp8 S=32 th=64 kk=2 gm=0 N=896          batches: 99.0 99.1 99.1 99.4  | med 99.11 us  sum=392.41809
+      -> 66 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  v2-fp8 S=32 th=64 kk=4 gm=0 N=896          batches: 82.9 83.0 83.0 83.0  | med 83.00 us  sum=392.41809
+      -> 79 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  v2-fp8 S=64 th=64 kk=2 gm=0 N=896          batches: 70.7 70.7 70.7 70.8  | med 70.73 us  sum=392.41809
+      -> 92 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  v2-fp8 S=64 th=64 kk=4 gm=0 N=896          batches: 62.6 62.6 62.6 62.7  | med 62.60 us  sum=392.41809
+      -> 104 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  v2-fp8 S=32 th=256 kk=4 gm=0 N=896         batches: 83.0 83.0 83.1 83.1  | med 83.08 us  sum=392.41809
+      -> 79 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  v2-fp8 S=64 th=256 kk=4 gm=0 N=896         batches: 63.2 63.3 63.4 63.4  | med 63.37 us  sum=392.41809
+      -> 103 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  v2-fp8 S=32 th=64 kk=4 gm=1 N=896          batches: 91.4 91.4 91.5 91.5  | med 91.50 us  sum=392.41809
+      -> 71 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  v2-fp8 S=64 th=64 kk=4 gm=1 N=896          batches: 66.8 66.8 66.8 66.8  | med 66.77 us  sum=392.41809
+      -> 98 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  v2-fp8 S=32 th=256 kk=4 gm=1 N=896         batches: 93.8 94.0 94.0 94.0  | med 93.98 us  sum=392.41809
+      -> 69 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  v2-fp8 S=64 th=256 kk=4 gm=1 N=896         batches: 68.9 68.9 69.0 69.0  | med 68.97 us  sum=392.41809
+      -> 95 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+  v2-fp8 S=96 th=64 kk=4 gm=0 N=896          batches: 62.2 62.2 62.3 62.3  | med 62.27 us  sum=392.41809
+      -> 105 GB/s (bytes model 6.53 MB)
+      -> cpu max_rel=0.00741 PASS
+=== prefill V5 after-check ===
+   128      512 |      401.6      4.011 |      226.9      7.099 |   1.77x
+  cpu-check block_size=16 M=256 max_rel=0.0274 ok
+  cpu-check block_size=64 M=256 max_rel=0.0274 ok
+   256      512 |      567.3      5.678 |      238.4     13.514 |   2.38x
+   512     1024 |      905.4      7.116 |      381.8     16.874 |   2.37x
+  1024     2048 |     1655.2      7.784 |      633.2     20.347 |   2.61x
+  2048     4096 |     3181.7      8.099 |     1187.2     21.707 |   2.68x
+Done.
+=== moe_aux ===
+    32     1024  sort+quant+sort_scales     147.9      276.9      9.22
+    32     1024  mxfp4_moe_scatter_reduce      10.1     2991.9     99.66
+    32     1024  mxfp4_moe_scatter_reduce_q      13.9      346.0     11.53
+    64     1024  mxfp4_moe_sorted_quant  parity OK
+    64     1024  mxfp4_moe_quant             14.1       82.5      2.75
+    64     1024  mxfp4_moe_sort              17.6     1672.0     55.69
+    64     1024  mxfp4_moe_sort_scales        8.8       52.1      1.74
+    64     1024  mxfp4_moe_sorted_quant     120.0      154.8      5.16
+    64     1024  sort+quant+sort_scales     147.5      328.1     10.93
+    64     1024  mxfp4_moe_scatter_reduce      14.1     2215.6     73.80
+    64     1024  mxfp4_moe_scatter_reduce_q      16.3      352.2     11.73
+   112     2048  mxfp4_moe_sorted_quant  parity OK
+   112     2048  mxfp4_moe_quant             19.6      103.5      3.45
+   112     2048  mxfp4_moe_sort              26.2     2101.2     69.99
+   112     2048  mxfp4_moe_sort_scales        8.5      101.4      3.38
+   112     2048  mxfp4_moe_sorted_quant     229.4      146.0      4.86
+   112     2048  sort+quant+sort_scales     263.8      352.8     11.75
+   112     2048  mxfp4_moe_scatter_reduce      21.2     2915.8     97.13
+   112     2048  mxfp4_moe_scatter_reduce_q      22.7      484.6     16.14
+
+(%L2 uses the K3-sized copy roof (3002 GB/s) since warm
+ iterations of these ops fit in the MI300A L2; HBM peak
+ 2818 GB/s, published ~5.3 TB/s. Latency is the primary
+ metric -- these are lightweight orchestration steps around
+ the heavy fused GEMM.)
+===== DONE 2026-10-11T16:21:14Z =====
