@@ -111,6 +111,29 @@ def h_k_i32arg(bar_ptr, target: tl.int32):
 
 
 @triton.jit
+def h_l_i64arg_cguard(bar_ptr, target: tl.int64):
+    """L: int64 argument, truncated inside, case-C guard ``c < t32``."""
+    tl.debug_barrier()
+    tl.atomic_add(bar_ptr, 1, sem="acq_rel", scope="gpu")
+    t32 = target.to(tl.int32)
+    c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu")
+    while c < t32:
+        c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu")
+    tl.debug_barrier()
+
+
+@triton.jit
+def h_m_i64arg_wide(bar_ptr, target: tl.int64):
+    """M: int64 argument, case-C guard against the raw int64 target."""
+    tl.debug_barrier()
+    tl.atomic_add(bar_ptr, 1, sem="acq_rel", scope="gpu")
+    c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu")
+    while c < target:
+        c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu")
+    tl.debug_barrier()
+
+
+@triton.jit
 def h_cv(bar_ptr, target: tl.int64):
     tl.debug_barrier()
     tl.atomic_add(bar_ptr, 1, sem="acq_rel", scope="gpu")
@@ -154,6 +177,10 @@ def k_A(out_ptr, bar_ptr, P, ROUNDS, base: tl.int64, CASE: tl.constexpr):
             h_j_i64arg(bar_ptr, base + (r + 1) * P)
         elif CASE == "K":
             h_k_i32arg(bar_ptr, (base + (r + 1) * P).to(tl.int32))
+        elif CASE == "L":
+            h_l_i64arg_cguard(bar_ptr, base + (r + 1) * P)
+        elif CASE == "M":
+            h_m_i64arg_wide(bar_ptr, base + (r + 1) * P)
         nb = (pid + 1) % P
         acc += tl.load(out_ptr + r * P + nb)
         r += 1

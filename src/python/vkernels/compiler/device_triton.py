@@ -107,22 +107,26 @@ def _grid_barrier_cdna(bar_ptr, target: tl.int64):
       RMW *releases early* -- stale and future reads at every worker count on
       GB10 as well as MI300A -- and an L1 invalidate does not repair it, so
       the loss is the acquire edge, not L1 staleness.
-    * The spin guard must be 32-bit.  Written with an int64 comparison the
-      outlined spin miscompiles into an *infinite loop* at every worker
-      count, P=1 included, whether the int64 arrives as the argument or is
-      produced inside the helper; the byte-identical body written inline in
-      the kernel or guarded in 32 bits releases and is exact.  So keep the
-      low 32 bits and compare the difference: the counter is monotonic and
-      the barrier's release lag is bounded by a couple of rounds (a block
-      cannot pass round r+k while a neighbour is still in round r), so a
-      signed 32-bit difference stays correct even once the counter wraps.
+    * The spin guard must be a 32-bit comparison.  Written with an int64
+      comparison the outlined spin miscompiles into an *infinite loop* at
+      every worker count, P=1 included -- whether the int64 arrives as the
+      argument (``while c < target``) or is produced inside the helper, and
+      whichever way the guard is phrased (``not (c >= target)``, a widened
+      ``.to(tl.int64)`` compare, or a difference all hang).  The byte-
+      identical body written inline in the kernel releases.  So keep the low
+      32 bits in a local and let the compare narrow: the counter is
+      monotonic and the barrier's release leg is bounded by a couple of
+      rounds (a block cannot pass round r+k while a neighbour is still in
+      round r), so a signed 32-bit compare of the low halves is correct even
+      once the counter itself passes 2**31 -- there is no 32-bit ceiling on
+      the counter, only on the compare.
     """
     tl.debug_barrier()  # all threads' stores issued before the arrival
     tl.atomic_add(bar_ptr, 1, sem="acq_rel", scope="gpu")
     t32 = target.to(tl.int32)
-    c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu").to(tl.int32)
-    while t32 - c > 0:
-        c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu").to(tl.int32)
+    c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu")
+    while c < t32:
+        c = tl.atomic_add(bar_ptr, 0, sem="acquire", scope="gpu")
     tl.debug_barrier()  # converge before post-barrier loads / next arrival
 
 
