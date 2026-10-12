@@ -280,7 +280,7 @@ def qwen3_reference_forward(
             s = s - s.max(axis=-1, keepdims=True)
             e = np.exp(s)
             probs = e / e.sum(axis=-1, keepdims=True)
-            ctx[:, h] = np.einsum("bt,btd->d", probs, V[:, kvh])
+            ctx[:, h] = np.einsum("bt,btd->bd", probs, V[:, kvh])
         attn = ctx.reshape(B, H * D) @ lw.o_proj_w  # o_proj input width is H*D (head_dim is explicit)
         x = x + attn
 
