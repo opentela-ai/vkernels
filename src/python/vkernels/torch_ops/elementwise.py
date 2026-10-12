@@ -165,6 +165,7 @@ def _kernels():
         GS: tl.constexpr,
         US: tl.constexpr,
         BLOCK: tl.constexpr,
+        ROUND_INTERMEDIATES: tl.constexpr,
     ):
         row = tl.program_id(0)
         col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -178,15 +179,18 @@ def _kernels():
         # matches torch.clamp (NaN stays NaN; minnum semantics would return
         # LIMIT instead) — and makes LIMIT=+inf an exact identity, which is
         # how silu_mul shares this kernel (see silu_mul's docstring).
-        g = tl.minimum(g, LIMIT, propagate_nan=tl.PropagateNan.ALL).to(
-            G.dtype.element_ty
-        ).to(tl.float32)
+        g = tl.minimum(g, LIMIT, propagate_nan=tl.PropagateNan.ALL)
         u = tl.minimum(
             tl.maximum(u, -LIMIT, propagate_nan=tl.PropagateNan.ALL),
             LIMIT,
             propagate_nan=tl.PropagateNan.ALL,
-        ).to(G.dtype.element_ty).to(tl.float32)
-        act = (g / (1.0 + tl.exp(-g))).to(G.dtype.element_ty).to(tl.float32)
+        )
+        if ROUND_INTERMEDIATES:
+            g = g.to(G.dtype.element_ty).to(tl.float32)
+            u = u.to(G.dtype.element_ty).to(tl.float32)
+        act = g / (1.0 + tl.exp(-g))
+        if ROUND_INTERMEDIATES:
+            act = act.to(G.dtype.element_ty).to(tl.float32)
         tl.store(Y + row * D + col, act * u, col < D)
 
     @triton.jit(do_not_specialize=["N"])
@@ -597,7 +601,7 @@ def silu_mul(gate, up):
     return swiglu_limit(gate, up, math.inf)
 
 
-def swiglu_limit(gate, up, limit):
+def swiglu_limit(gate, up, limit, *, round_intermediates=True):
     """GLM swiglu in one launch: ``silu(clamp(gate, max=limit)) * clamp(up, ±limit)``.
 
     The family kernel of this module's activation lane — :func:`silu_mul`
@@ -610,6 +614,11 @@ def swiglu_limit(gate, up, limit):
     chain; fp32 follows the same rounding points but triton's ``exp`` can
     differ from torch's by ULPs (the long-standing ``silu_mul`` fp32
     behavior).
+
+    ``round_intermediates=False`` instead keeps clamps, SiLU and product
+    in FP32 until the final store. This is a separate precision contract
+    for compiled dense/shared activations; existing callers retain eager
+    intermediate rounding by default.
 
     Eligibility: CUDA bf16/fp16/fp32 ``gate``/``up`` of the same shape and
     dtype on one device; raises :class:`OpNotEligible` otherwise.
@@ -638,6 +647,7 @@ def swiglu_limit(gate, up, limit):
         g.stride(0),
         u.stride(0),
         256,
+        round_intermediates,
         enable_fp_fusion=False,
     )
     return out
