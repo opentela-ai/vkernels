@@ -1,7 +1,8 @@
 """The final-store activation contract is separate from eager BF16 rounding."""
 import pytest
-import torch
-import torch.nn.functional as F
+
+torch = pytest.importorskip("torch")
+F = torch.nn.functional
 
 from vkernels.torch_ops._dispatch import OpNotEligible
 from vkernels.torch_ops.elementwise import swiglu_limit

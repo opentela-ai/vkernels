@@ -1,7 +1,8 @@
 """Persistent region arithmetic, replay, ownership and one-launch contract."""
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from vkernels.torch_ops._dispatch import OpNotEligible
 from vkernels.torch_ops.glm_fp8_blockwise_gemm import (

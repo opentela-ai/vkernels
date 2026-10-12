@@ -1,7 +1,8 @@
 """Selected attention preserves request isolation and selection multiplicity."""
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from vkernels.torch_ops._dispatch import OpNotEligible
 from vkernels.torch_ops.selected_attention_sdpa import selected_attention_sdpa

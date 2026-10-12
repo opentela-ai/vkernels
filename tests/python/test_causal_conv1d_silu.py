@@ -1,8 +1,9 @@
 """Single-round convolution, arbitrary input strides and read-only state."""
 
 import pytest
-import torch
-import torch.nn.functional as F
+
+torch = pytest.importorskip("torch")
+F = torch.nn.functional
 
 from vkernels.torch_ops._dispatch import OpNotEligible
 from vkernels.torch_ops.causal_conv1d_silu import causal_conv1d_silu

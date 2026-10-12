@@ -1,7 +1,8 @@
 """Exact parity against the frozen eager metadata/quantization and full MoE."""
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from vkernels.torch_ops._dispatch import OpNotEligible
 from vkernels.torch_ops.glm_fp8_blockwise_gemm import (
