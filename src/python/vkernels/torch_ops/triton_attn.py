@@ -43,6 +43,8 @@ def _kernel():
         stride_oh,
         stride_knb,
         stride_knh,
+        stride_vnb,
+        stride_vnh,
         G: tl.constexpr,
         D: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -68,7 +70,7 @@ def _kernel():
                 if pid_h % G == 0:
                     kn = tl.load(kn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d)
                     tl.store(k_ptr + slot * stride_kb + hkv * stride_kh + offs_d, kn)
-                    vn = tl.load(vn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d)
+                    vn = tl.load(vn_ptr + pid_b * stride_vnb + hkv * stride_vnh + offs_d)
                     tl.store(v_ptr + slot * stride_vb + hkv * stride_vh + offs_d, vn)
         m = float("-inf")
         l = 0.0
@@ -97,7 +99,7 @@ def _kernel():
                 other=0.0,
             ).to(tl.float32)
             if HAS_NEW:
-                vn = tl.load(vn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d).to(tl.float32)
+                vn = tl.load(vn_ptr + pid_b * stride_vnb + hkv * stride_vnh + offs_d).to(tl.float32)
                 vblk = tl.where((idx == slot)[:, None], vn[None, :], vblk)
             acc = acc * alpha + tl.sum(p[:, None] * vblk, axis=0)
             m = m_new
@@ -125,6 +127,7 @@ def _gqa_kernel():
         stride_btb,
         stride_ob, stride_oh,
         stride_knb, stride_knh,
+        stride_vnb, stride_vnh,
         G: tl.constexpr, BG: tl.constexpr,
         D: tl.constexpr, BLOCK_N: tl.constexpr,
         HAS_NEW: tl.constexpr, SCRATCH: tl.constexpr,
@@ -155,7 +158,7 @@ def _gqa_kernel():
             # page is never written but still substituted in the math).
             slot = tl.load(bt_ptr + pid_b * stride_btb + (seq - 1))
             kn = tl.load(kn_ptr + pid_b * stride_knb + pid_kv * stride_knh + offs_d)
-            vn = tl.load(vn_ptr + pid_b * stride_knb + pid_kv * stride_knh + offs_d)
+            vn = tl.load(vn_ptr + pid_b * stride_vnb + pid_kv * stride_vnh + offs_d)
             if slot != SCRATCH:
                 tl.store(k_ptr + slot * stride_kb + pid_kv * stride_kh + offs_d, kn)
                 tl.store(v_ptr + slot * stride_vb + pid_kv * stride_vh + offs_d, vn)
@@ -245,6 +248,8 @@ def decode_attention_gqa(q, kc, vc, block_table, seq_lens, *, k_new=None, v_new=
         out.stride(0), out.stride(1),
         k_new.stride(0) if has_new else 0,
         k_new.stride(1) if has_new else 0,
+        v_new.stride(0) if has_new else 0,
+        v_new.stride(1) if has_new else 0,
         G=G, BG=bg, D=D, BLOCK_N=block_n,
         HAS_NEW=has_new,
         SCRATCH=scratch_slot if scratch_slot is not None else -1,
@@ -263,7 +268,8 @@ def decode_attention(q, kc, vc, block_table, seq_lens, *, k_new=None, v_new=None
     this kernel: the fresh values are used directly in the attention math
     and written to the pool by one program per (batch, kv head), replacing
     the separate ``store_kv`` launch. ``scratch_slot`` (the shared null
-    page) is never written."""
+    page) is never written. Fresh K and V may have distinct batch/head
+    strides, e.g. contiguous normalized K and a view of packed QKV V."""
     import math
 
     import torch
@@ -305,6 +311,8 @@ def decode_attention(q, kc, vc, block_table, seq_lens, *, k_new=None, v_new=None
         out.stride(1),
         k_new.stride(0) if has_new else 0,
         k_new.stride(1) if has_new else 0,
+        v_new.stride(0) if has_new else 0,
+        v_new.stride(1) if has_new else 0,
         G=G,
         D=D,
         BLOCK_N=128,
@@ -371,6 +379,7 @@ def _split_kernels():
         stride_ab, stride_ah, stride_as,
         stride_mb, stride_mh,
         stride_knb, stride_knh,
+        stride_vnb, stride_vnh,
         G: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr, SPLITS: tl.constexpr,
         HAS_NEW: tl.constexpr, SCRATCH: tl.constexpr,
     ):
@@ -397,7 +406,7 @@ def _split_kernels():
                 if pid_h % G == 0:
                     kn = tl.load(kn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d)
                     tl.store(k_ptr + slot * stride_kb + hkv * stride_kh + offs_d, kn)
-                    vn = tl.load(vn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d)
+                    vn = tl.load(vn_ptr + pid_b * stride_vnb + hkv * stride_vnh + offs_d)
                     tl.store(v_ptr + slot * stride_vb + hkv * stride_vh + offs_d, vn)
         if start < seq:
             end = tl.minimum(start + split_len, seq)
@@ -427,7 +436,7 @@ def _split_kernels():
                     mask=mask[:, None], other=0.0,
                 ).to(tl.float32)
                 if HAS_NEW:
-                    vn = tl.load(vn_ptr + pid_b * stride_knb + hkv * stride_knh + offs_d).to(tl.float32)
+                    vn = tl.load(vn_ptr + pid_b * stride_vnb + hkv * stride_vnh + offs_d).to(tl.float32)
                     vblk = tl.where((idx == slot)[:, None], vn[None, :], vblk)
                 acc = acc * alpha + tl.sum(p[:, None] * vblk, axis=0)
                 m = m_new
@@ -554,6 +563,8 @@ def decode_attention_split(q, kc, vc, block_table, seq_lens, *, max_splits=_MAX_
         ml[0].stride(0), ml[0].stride(1),
         k_new.stride(0) if has_new else 0,
         k_new.stride(1) if has_new else 0,
+        v_new.stride(0) if has_new else 0,
+        v_new.stride(1) if has_new else 0,
         G=G, D=D, BLOCK_N=block_n, SPLITS=splits,
         HAS_NEW=has_new,
         SCRATCH=scratch_slot if scratch_slot is not None else -1,
