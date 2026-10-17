@@ -30,9 +30,14 @@ module list
 
 echo "NCCL root: ${EBROOTNCCL:-<unset>}"
 
-# 2. Configure + build only the bench target (NCCL is opt-in; the bench is
-#    built only when VKERNELS_HAS_NCCL is found).
-cmake --preset cuda
+# 2. Configure + build only the bench target. TWO opt-ins are needed:
+#    - VKERNELS_BUILD_BENCHMARKS (defaults OFF -> meta/benchmarks is never
+#      added and the build below fails with "No rule to make target
+#      'cross_node_nccl_bench'"; verified locally on a GB10 before staging
+#      this fix).
+#    - NCCL: the bench is built only when VKERNELS_HAS_NCCL is found
+#      (EBROOTNCCL from the module above feeds meta/cmake/NcclSupport.cmake).
+cmake --preset cuda -DVKERNELS_BUILD_BENCHMARKS=ON
 cmake --build --preset cuda --target cross_node_nccl_bench -j
 
 BENCH=build/cuda/meta/benchmarks/cross_node_nccl_bench
