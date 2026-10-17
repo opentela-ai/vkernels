@@ -46,6 +46,7 @@ def _kernel():
         COLS: tl.constexpr,
         FNUZ: tl.constexpr,
         FNUZ_NATIVE: tl.constexpr = False,
+        COMPACT_SCALES: tl.constexpr = False,
     ):
         selected = tl.program_id(0)
         row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
@@ -92,14 +93,32 @@ def _kernel():
         value = (value.to(tl.int32, bitcast=True) | ((raw & 128) << 24)).to(
             tl.float32, bitcast=True
         )
-        scale = tl.load(
-            S
-            + (expert * (O // 128) + row[:, None] // 128) * (I // 128)
-            + col[None, :] // 128,
-            (row[:, None] < O) & (col[None, :] < I),
-            0,
-        )
-        weight = (value * scale).to(tl.bfloat16).to(tl.float32)
+        if COMPACT_SCALES:
+            # Preserve per-element scaling/BF16 rounding and the original
+            # reduction tile. Gather each 128-column block scale once.
+            scol = tl.arange(0, COLS // 128)
+            scale = tl.load(
+                S
+                + (expert * (O // 128) + row[:, None] // 128) * (I // 128)
+                + scol[None, :],
+                (row[:, None] < O) & (scol[None, :] < I // 128),
+                0,
+            )
+            weight = (
+                (value.reshape(ROWS, COLS // 128, 128) * scale[:, :, None])
+                .reshape(ROWS, COLS)
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+        else:
+            scale = tl.load(
+                S
+                + (expert * (O // 128) + row[:, None] // 128) * (I // 128)
+                + col[None, :] // 128,
+                (row[:, None] < O) & (col[None, :] < I),
+                0,
+            )
+            weight = (value * scale).to(tl.bfloat16).to(tl.float32)
         x_row = selected // K if BROADCAST else selected
         x = tl.load(X + x_row * I + col, col < I, 0).to(tl.float32)
         result = tl.sum(weight * x[None, :], axis=1)
@@ -280,6 +299,19 @@ def _launch_portable(x, weights, scales, indices):
     return _launch(x, weights, scales, indices, native=False)
 
 
+def _compact_scales_enabled(x, weights):
+    """Experimental gfx942 FNUZ layout; defaults and CUDA stay unchanged."""
+    import os
+    import torch
+
+    return bool(
+        torch.version.hip
+        and weights.dtype == torch.float8_e4m3fnuz
+        and os.environ.get("GLM53_GEMV_FNUZ_COMPACT_SCALES", "0") not in ("", "0")
+        and torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0] == "gfx942"
+    )
+
+
 def _launch(x, weights, scales, indices, *, native, route_weights=None):
     import os
     import torch
@@ -296,7 +328,8 @@ def _launch(x, weights, scales, indices, *, native, route_weights=None):
             # Only the portable kernel accepts the storage-format constexpr.
             fnuz_native = (weights.dtype == torch.float8_e4m3fnuz and torch.version.hip
                            and os.environ.get("GLM53_GEMV_FNUZ_NATIVE", "0") not in ("", "0"))
-            extra = [] if native else [weights.dtype == torch.float8_e4m3fnuz, bool(fnuz_native)]
+            extra = [] if native else [weights.dtype == torch.float8_e4m3fnuz, bool(fnuz_native),
+                                      _compact_scales_enabled(x, weights)]
             skip_kwargs = ({"ROUTE_W": route_weights, "SKIP_ZERO": True}
                            if route_weights is not None else {})
             kernel[(t * k, triton.cdiv(o, 4))](
