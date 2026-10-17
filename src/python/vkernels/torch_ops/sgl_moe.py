@@ -107,16 +107,38 @@ def sgl_fused_moe_eligible(
     down_scale: Optional[torch.Tensor],
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
+    *,
+    storage: str = "e4m3fn",
 ) -> bool:
     """Contract for :func:`sgl_fused_moe`.
 
     CUDA bf16 activations [T, H]; fp8-e4m3fn expert stacks [E, 2I, H] /
     [E, H, I] (contiguous) with fp32 128x128-block scales [E, 2I/128, H/128]
     / [E, H/128, I/128]; int routing [T, K] with float [T, K] weights
-    (unit inner stride); H, I multiples of 128. e4m3fn storage only — CDNA3
-    keeps its fnuz stacks on the vkernels grouped path (that lane's
-    e4m3fn_to_fnuz rewrite is orthogonal to this H100-targeted vendor).
+    (unit inner stride); H, I multiples of 128. Default storage is FN; CDNA3
+    requires explicit storage="e4m3fnuz" on gfx942. Those payloads and scales
+    must already follow the loader's half-value/double-scale contract; this
+    wrapper never rewrites weights. Default calls retain the FN-only contract.
     """
+    if storage == "e4m3fnuz":
+        if (not x.is_cuda or not torch.version.hip
+                or getattr(torch.cuda.get_device_properties(x.device), "gcnArchName", "").split(":")[0] != "gfx942"):
+            return False
+        if (x.ndim != 2 or x.shape[0] <= 0 or x.shape[1] <= 0
+                or top_k_index.ndim != 2 or top_k_weights.ndim != 2):
+            return False
+        dtype = torch.float8_e4m3fnuz
+        tensors = (gate_up_proj, gate_up_scale, down_proj, down_scale, top_k_index, top_k_weights)
+        if any(value is None or value.device != x.device for value in tensors):
+            return False
+        if (not gate_up_scale.is_contiguous() or not down_scale.is_contiguous()
+                or not top_k_index.is_contiguous() or not top_k_weights.is_contiguous()
+                or top_k_index.dtype not in (torch.int32, torch.int64)):
+            return False
+    elif storage == "e4m3fn":
+        dtype = _FP8_DTYPE
+    else:
+        return False
     return (
         x.is_cuda
         and x.dim() == 2
@@ -124,8 +146,8 @@ def sgl_fused_moe_eligible(
         and x.is_contiguous()
         and gate_up_proj.dim() == 3
         and down_proj.dim() == 3
-        and gate_up_proj.dtype == _FP8_DTYPE
-        and down_proj.dtype == _FP8_DTYPE
+        and gate_up_proj.dtype == dtype
+        and down_proj.dtype == dtype
         and gate_up_proj.is_contiguous()
         and down_proj.is_contiguous()
         and gate_up_scale is not None
@@ -691,7 +713,7 @@ def try_get_moe_config(E: int, N: int, M: int) -> dict:
 # note + should_enable_swap_ab; batch-invariant-mode hook not vendored).
 @functools.lru_cache(maxsize=8)
 def _should_enable_swap_ab(BLOCK_SIZE_M: int, BLOCK_SIZE_N: int) -> bool:
-    if not torch.cuda.is_available():
+    if torch.version.hip or not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
     return major == 9 and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64
@@ -719,7 +741,8 @@ def _invoke_fused_moe_kernel(
 
     assert topk_weights.stride(-1) == 1
     assert sorted_token_ids.stride(0) == 1
-    assert A.dtype == _FP8_DTYPE and A_scale.ndim == 2 and A_scale.dtype == torch.float32
+    assert A.dtype == B.dtype and A.dtype in (_FP8_DTYPE, torch.float8_e4m3fnuz)
+    assert A_scale.ndim == 2 and A_scale.dtype == torch.float32
     triton = _kernels().triton
 
     grid = lambda META: (  # noqa: E731 - donor form
@@ -803,6 +826,7 @@ def sgl_fused_moe(
     swiglu_limit: float = math.inf,
     skip_zero_weights: bool = False,
     route_weight_in_down: bool = False,
+    storage: str = "e4m3fn",
 ) -> torch.Tensor:
     """Routed-expert MLP in 5 launches: quant -> stage1 -> swiglu -> quant ->
     stage2, then the weighted top-k combine (the package's
@@ -825,19 +849,31 @@ def sgl_fused_moe(
     store, followed by an unweighted FP32-accumulating sum. This donor
     order has a different BF16 rounding boundary and requires separate
     full-model quality qualification.
+
+    Explicit storage="e4m3fnuz" enables the same pipeline on gfx942 with
+    already-converted weights and FN-equivalent activation quantization.
+    Tile tuning, numerical qualification and timing remain caller obligations.
     """
     if not sgl_fused_moe_eligible(
         x, gate_up_proj, gate_up_scale, down_proj, down_scale,
-        top_k_index, top_k_weights,
+        top_k_index, top_k_weights, storage=storage,
     ):
         from ._dispatch import OpNotEligible
 
         raise OpNotEligible(
-            "sgl_fused_moe contract: CUDA bf16 x [T,H] with fp8-e4m3fn "
+            "sgl_fused_moe contract: device bf16 x [T,H] with explicit FP8 storage "
             "[E,2I,H]/[E,H,I] expert stacks, fp32 128x128-block scales, int "
             "routing and float weights (see sgl_fused_moe_eligible)"
         )
 
+    if storage == "e4m3fnuz":
+        # Already-converted checkpoint payloads retain their doubled weight
+        # scales. Quantize activations with the FN donor's exact normalization,
+        # then store half-valued FNUZ with doubled activation scales.
+        from .fp8_linear_hip import quantize_fn_as_fnuz
+        quantize = quantize_fn_as_fnuz
+    else:
+        quantize = per_token_group_quant_fp8
     T, H = x.shape
     E, N2, _ = gate_up_proj.shape
     I = N2 // 2
@@ -852,7 +888,7 @@ def sgl_fused_moe(
 
     # stage 1: quant once per token (shared across its K experts — the
     # kernel gathers rows via offs_token // top_k), then the gate/up GEMM.
-    xq, xs = per_token_group_quant_fp8(x, 128)
+    xq, xs = quantize(x)
     # Skipped slots are not written by either GEMM. Zero them on EVERY
     # invocation/replay, not merely warmup: routes can change in a graph.
     allocate = torch.zeros if skip_zero_weights else torch.empty
@@ -870,7 +906,7 @@ def sgl_fused_moe(
     act = _swiglu(gate, up, swiglu_limit)  # [numel, I] bf16
 
     # stage 2: per-slot activations (top_k == 1 — A rows are the slots).
-    aq, asc = per_token_group_quant_fp8(act, 128)
+    aq, asc = quantize(act)
     cache3 = allocate((T, top_k, H), device=x.device, dtype=torch.bfloat16)
     _invoke_fused_moe_kernel(
         aq, down_proj, cache3, asc, down_scale,
