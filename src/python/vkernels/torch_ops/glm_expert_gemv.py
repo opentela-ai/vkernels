@@ -46,9 +46,17 @@ def _kernel():
         COLS: tl.constexpr,
         FNUZ: tl.constexpr,
         FNUZ_NATIVE: tl.constexpr = False,
+        ROUTE_W=None,
+        SKIP_ZERO: tl.constexpr = False,
     ):
         selected = tl.program_id(0)
         row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+        if SKIP_ZERO:
+            # Pair-uniform decision, before any expert/input/scale read. Every
+            # replay overwrites the full output row even when routes change.
+            if tl.load(ROUTE_W + selected) == 0.0:
+                tl.store(Y + selected * O + row, 0.0, row < O)
+                return
         col = tl.arange(0, COLS)
         expert = tl.load(IDX + selected).to(tl.int64)
         raw8 = tl.load(
@@ -256,19 +264,22 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, im
     if any(not v.is_contiguous() for v in (x, weights, scales, indices)):
         raise contract_error("inputs must be contiguous")
     if route_weights is not None:
-        if (fnuz or torch.version.hip or route_weights.shape != indices.shape
+        hip_fnuz = bool(fnuz and torch.version.hip and
+                        torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0] == "gfx942")
+        if ((not hip_fnuz and (fnuz or torch.version.hip)) or route_weights.shape != indices.shape
                 or route_weights.dtype != torch.float32
                 or route_weights.device != x.device
                 or not route_weights.is_contiguous()):
-            raise contract_error("zero-route GEMV requires CUDA-native E4M3FN and contiguous same-device FP32 [T,K] weights")
+            raise contract_error("zero-route GEMV requires CUDA-native E4M3FN or gfx942 portable FNUZ, and contiguous same-device FP32 [T,K] weights")
     if not (t and k) and implementation is None:
         return torch.empty((t, k, o), device=x.device, dtype=torch.bfloat16)
     specs = tuple((tuple(v.shape), v.dtype, v.device) for v in (x, weights, scales, indices))
     selected = _select_implementation(specs, cap, implementation)
     if route_weights is not None:
-        if selected.name != "cuda_native":
-            raise contract_error("zero-route GEMV requires the cuda_native implementation")
-        return _launch_native(x, weights, scales, indices, route_weights=route_weights)
+        allowed = ("portable", "portable_fnuz") if hip_fnuz else ("cuda_native",)
+        if selected.name not in allowed:
+            raise contract_error("zero-route GEMV requires " + "/".join(allowed) + " implementation")
+        return selected.load()(x, weights, scales, indices, route_weights=route_weights)
     return selected.load()(x, weights, scales, indices)
 
 
@@ -276,8 +287,8 @@ def _launch_native(x, weights, scales, indices, *, route_weights=None):
     return _launch(x, weights, scales, indices, native=True, route_weights=route_weights)
 
 
-def _launch_portable(x, weights, scales, indices):
-    return _launch(x, weights, scales, indices, native=False)
+def _launch_portable(x, weights, scales, indices, *, route_weights=None):
+    return _launch(x, weights, scales, indices, native=False, route_weights=route_weights)
 
 
 def _launch(x, weights, scales, indices, *, native, route_weights=None):
@@ -311,8 +322,10 @@ def _launch(x, weights, scales, indices, *, native, route_weights=None):
 def expert_gemv_skip_zero(x, weights, scales, indices, route_weights, storage="e4m3fn", t_cap=None):
     """Optional EP route-aware entry: zero outputs for exact-zero pair weights.
 
-    Defaults of expert_gemv remain unchanged. CUDA-native E4M3FN only;
-    route weights are not applied to active outputs (combine does that).
+    Defaults of expert_gemv remain unchanged. Supports CUDA-native E4M3FN
+    and gfx942 portable FNUZ; route weights are not applied to active
+    outputs (combine does that). Active arithmetic and launch geometry
+    match the ordinary GEMV.
     """
     return expert_gemv(x, weights, scales, indices, storage=storage, t_cap=t_cap,
                        route_weights=route_weights)
