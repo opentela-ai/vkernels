@@ -65,10 +65,11 @@ def test_each_dot_matches_float64_quantized_oracle(monkeypatch, rows, experts, h
     def check(a, b, c, sa, sb, route_w, route_ids, sorted_ids, experts_ids, padded, **kwargs):
         original(a, b, c, sa, sb, route_w, route_ids, sorted_ids, experts_ids, padded, **kwargs)
         aq = a.cpu().double() * sa.cpu().double().repeat_interleave(128, -1)
-        ids = route_ids.cpu().reshape(-1)
+        device_ids = route_ids.reshape(-1)
+        ids = device_ids.cpu()
         # Only selected matrices are copied to the CPU oracle.
-        selected = b.view(torch.uint8).index_select(0, ids).view(torch.float8_e4m3fnuz).cpu().double()
-        scales = sb.index_select(0, ids).cpu().double().repeat_interleave(128, -2).repeat_interleave(128, -1)
+        selected = b.view(torch.uint8).index_select(0, device_ids).view(torch.float8_e4m3fnuz).cpu().double()
+        scales = sb.index_select(0, device_ids).cpu().double().repeat_interleave(128, -2).repeat_interleave(128, -1)
         weights = selected * scales
         positions = torch.arange(ids.numel()) // kwargs['top_k']
         expected = torch.bmm(weights, aq[positions, :, None]).squeeze(-1)
