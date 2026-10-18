@@ -60,7 +60,8 @@ def _accumulate_groups(P, SA, SW, Y, M: tl.constexpr, N: tl.constexpr,
 
 
 def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor,
-               bias: torch.Tensor | None = None) -> torch.Tensor:
+               bias: torch.Tensor | None = None, *,
+               prescale_activation: bool = False) -> torch.Tensor:
     """BF16 inputs, E4M3FN weights and FP32 block-128 scales; BF16 output."""
     if (not x.is_cuda or torch.version.hip is not None or x.dtype != torch.bfloat16
             or weight.dtype != torch.float8_e4m3fn or scales.dtype != torch.float32
@@ -80,10 +81,21 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor,
         if parallel:
             groups = inputs // 128
             partial = torch.empty((groups, *result.shape), device=x.device, dtype=torch.float32)
-            _group_products[(triton.cdiv(flat.shape[0], block_rows), triton.cdiv(outputs, 128), groups)](
-                quantized, weight, partial, flat.shape[0], outputs, inputs, block_rows, 128, num_warps=4, num_stages=2)  # ty: ignore[invalid-argument-type,unknown-argument]  # Triton launch.
-            _accumulate_groups[(triton.cdiv(result.numel(), 256),)](
-                partial, activation_scales, scales, result, flat.shape[0], outputs, groups, 256, num_warps=4)  # ty: ignore[invalid-argument-type,unknown-argument]  # Triton launch.
+            if prescale_activation:
+                from .fp8_linear_prescale import scaled_group_products, accumulate_scaled_groups
+
+                scaled_group_products[(triton.cdiv(flat.shape[0], block_rows), triton.cdiv(outputs, 128), groups)](
+                    quantized, weight, activation_scales, partial, flat.shape[0], outputs,
+                    inputs, block_rows, 128, num_warps=4, num_stages=2)
+                # One output per lane distributes narrow decode projections
+                # across more SMs; each lane retains ascending group order.
+                accumulate_scaled_groups[(triton.cdiv(result.numel(), 32),)](
+                    partial, scales, result, flat.shape[0], outputs, groups, 32, num_warps=1)
+            else:
+                _group_products[(triton.cdiv(flat.shape[0], block_rows), triton.cdiv(outputs, 128), groups)](
+                    quantized, weight, partial, flat.shape[0], outputs, inputs, block_rows, 128, num_warps=4, num_stages=2)  # ty: ignore[invalid-argument-type,unknown-argument]  # Triton launch.
+                _accumulate_groups[(triton.cdiv(result.numel(), 256),)](
+                    partial, activation_scales, scales, result, flat.shape[0], outputs, groups, 256, num_warps=4)  # ty: ignore[invalid-argument-type,unknown-argument]  # Triton launch.
         else:
             _linear[(triton.cdiv(flat.shape[0], block_rows), triton.cdiv(outputs, 128))](
                 quantized, weight, activation_scales, scales, result,
