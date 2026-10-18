@@ -1448,6 +1448,47 @@ __global__ void dsa_sparse_fwd_combine_kernel(
     lse_out[(size_t)gi * H + h] = m + log2f(denom);
 }
 
+// Tile only independent output columns. Each column retains the original
+// ascending split reduction, scale operations and final BF16 rounding.
+template<int Columns>
+__global__ void dsa_sparse_fwd_combine_tiled_kernel(const float* __restrict__ part_out,
+                                                    const float* __restrict__ part_lse,
+                                                    uint16_t* __restrict__ out,
+                                                    float* __restrict__ lse_out,
+                                                    int S_q,
+                                                    int H,
+                                                    int d_v,
+                                                    int split_kv,
+                                                    bool return_lse) {
+  const int gi = blockIdx.x;
+  const int h = blockIdx.y;
+  const int lane = threadIdx.x;
+  const int d = blockIdx.z * Columns + lane;
+  const bool active = lane < Columns && d < d_v;
+  const size_t base = ((size_t)gi * H + h) * split_kv;
+  float m = -INFINITY;
+  for (int s = 0; s < split_kv; ++s)
+    m = fmaxf(m, part_lse[base + s]);
+  uint16_t* orow = out + ((size_t)gi * H + h) * d_v;
+  if (m == -INFINITY) {
+    if (active) orow[d] = 0;
+    if (lane == 0 && blockIdx.z == 0 && return_lse) lse_out[(size_t)gi * H + h] = -INFINITY;
+    return;
+  }
+  float o = 0.0f;
+  float denom = 0.0f;
+  for (int s = 0; s < split_kv; ++s) {
+    const float l = part_lse[base + s];
+    const float w = (l == -INFINITY) ? 0.0f : exp2f(l - m);
+    denom += w;
+    const float* po = part_out + (base + s) * d_v;
+    if (active) o += w * po[d];
+  }
+  const float inv = 1.0f / denom;
+  if (active) orow[d] = f2bf(o * inv);
+  if (lane == 0 && blockIdx.z == 0 && return_lse) lse_out[(size_t)gi * H + h] = m + log2f(denom);
+}
+
 namespace {
 template <int BQ>
 void launch_partial(const void* q, const void* kv, const void* indices,
@@ -1718,6 +1759,24 @@ void dsa_sparse_fwd_split_run(int S_q, int S_kv, int H, int dim, int tail_dim,
         tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
         static_cast<hipStream_t>(stream));
   if (!need_combine) return;
+  static const bool tiled_combine = [] {
+    const char* e = std::getenv("VK_DSA_COMBINE_TILED");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  if (tiled_combine && dim == 512 && tail_dim == 0) {
+    dsa_sparse_fwd_combine_tiled_kernel<32>
+        <<<dim3(S_q, H, (dim - tail_dim + 31) / 32), 64, 0, static_cast<hipStream_t>(stream)>>>(
+            reinterpret_cast<const float*>(partial_out),
+            reinterpret_cast<const float*>(partial_lse),
+            reinterpret_cast<uint16_t*>(out),
+            reinterpret_cast<float*>(lse),
+            S_q,
+            H,
+            dim - tail_dim,
+            split_kv,
+            return_lse);
+    return;
+  }
   dim3 cgrid(S_q, H);
   dsa_sparse_fwd_combine_kernel<<<cgrid, 64, 0, static_cast<hipStream_t>(stream)>>>(
       reinterpret_cast<const float*>(partial_out),
