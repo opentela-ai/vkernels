@@ -393,11 +393,8 @@ def _cuda():
 
 
 @pytest.mark.skipif(not _cuda(), reason="op integration is CUDA-gated")
-def test_gpu_dense_gemv_tune_persist_reload_bit_identical(_store, monkeypatch):
-    """The full loop on the real op: first call sweeps+persists, a fresh
-    memo replays the store with zero re-tuning, and the outputs across the
-    reload boundary are bit-identical (same config → same kernel → same
-    reduction order)."""
+def test_gpu_dense_gemv_stable_without_operator_store(_store, monkeypatch):
+    """Fresh operator memos preserve the original fixed reduction geometry."""
     import torch
 
     from vkernels.torch_ops import glm_gemv
@@ -411,23 +408,18 @@ def test_gpu_dense_gemv_tune_persist_reload_bit_identical(_store, monkeypatch):
 
     out1 = glm_gemv.dense_gemv(x, w)
     torch.cuda.synchronize()
-    doc = _read(_store, "glm_gemv.dense_gemv", _cap())
-    assert set(doc["records"]) == {"o64-i512"}
-    rec = doc["records"]["o64-i512"]
-    assert rec["status"] in ("tuned", "default")
-    cfg1 = (rec["config"]["rows"], rec["config"]["block_i"], rec["config"]["warps"])
-    assert glm_gemv._GEMV_CFG[(o, i)] == cfg1
-
-    updated_before = doc["updated"]
+    assert not _record_file(_store, "glm_gemv.dense_gemv", _cap()).exists()
+    cfg1 = glm_gemv._GEMV_CFG[(o, i)]
     reset_memo()
     tcache._FILES.clear()
-    out2 = glm_gemv.dense_gemv(x, w)  # reload: store hit, no re-tune
+    glm_gemv._GEMV_CFG.clear()
+    out2 = glm_gemv.dense_gemv(x, w)
     torch.cuda.synchronize()
-    assert _read(_store, "glm_gemv.dense_gemv", _cap())["updated"] == updated_before
+    assert not _record_file(_store, "glm_gemv.dense_gemv", _cap()).exists()
     assert glm_gemv._GEMV_CFG[(o, i)] == cfg1
     assert torch.equal(out1, out2)
 
-    # and the parity contract still holds with tuning active
+    # The original numerical parity contract remains unchanged.
     ref = (x.float() @ w.float().T).to(torch.bfloat16)
     assert torch.allclose(out2.float(), ref.float(), atol=2e-2, rtol=0)
 
@@ -452,12 +444,9 @@ def test_gpu_kda_decode_parity_with_cache_on(_store, monkeypatch):
     ref_out, ref_state = kda_decode_reference(q, k, v, g, beta, state)
     torch.testing.assert_close(out, ref_out, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(nxt, ref_state, atol=1e-4, rtol=1e-4)
-    doc = _read(_store, "glm_kda_decode.kda_decode", _cap())
-    rec = doc["records"]["d64-bh8"]
-    assert rec["status"] in ("tuned", "default")
-    assert rec["config"]["bv"] <= d
-    assert glm_kda_decode._KDA_CFG[(b * h, d)] == (rec["config"]["bv"],
-                                                   rec["config"]["warps"])
+    assert not _record_file(_store, "glm_kda_decode.kda_decode", _cap()).exists()
+    assert glm_kda_decode._KDA_CFG[(b * h, d)] == (32, 4)
+
 
 
 @pytest.mark.skipif(not _cuda(), reason="op integration is CUDA-gated")
