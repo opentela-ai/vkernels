@@ -362,59 +362,23 @@ def _kernels():
     )
 
 
-def _norm_shape_class(rows, d):
-    """Row-count tiers mirror the tree's decode ladder (<=8 / <=64 /
-    beyond — grid/occupancy axis); the hidden width rides as a
-    power-of-two tier (the kernel's BLOCK is pinned to next_pow2(d), so
-    it is part of the compile identity anyway). Coarse tiers, not exact
-    shapes: one tuned config serves the bucket."""
-    rt = "r8" if rows <= 8 else "r64" if rows <= 64 else "rX"
-    dt = "d2k" if d <= 2048 else "d4k" if d <= 4096 else "d8k" if d <= 8192 else "dX"
-    return f"{rt}-{dt}"
-
-
-# (rows, d) -> num_warps: host-side fast path over the op-config cache
-# (the store is keyed by coarse bucket; the tier string is built once per
-# exact (rows, d) on the cache miss, never on the hot path).
+# Actual launch geometry for diagnostics, including the precision mode.
+# RMSNorm reduction layout is fixed; operator stores cannot select its warps.
 _NORM_CFG: dict = {}
 
 
-def _norm_warps(rows, d, triton, norm, x, w, r, out, summed, eps, add, round_intermediates=True):
-    """``num_warps`` for one rms_norm launch, through the op-config cache.
+def _norm_warps(rows, d, round_intermediates=True):
+    """Keep the declared four-warp FP32 reduction order on every launch.
 
-    BLOCK stays pinned to ``next_power_of_2(d)`` — the whole row must sit
-    in one program for the row reduction — so warps is the free knob
-    (default 4, today's implicit choice and the declared default the
-    cache falls back to under ``VKERNELS_CACHE=off``, capture, budget
-    exhaustion or bench failure). On a store miss the sweep benches the
-    live shape; the winner persists per coarse bucket for every later
-    process. Capture-safe: the cache serves memo-or-default mid-capture.
+    Exact-input GH200 replays produce different rounded BF16 values at
+    2/4/8 warps. Cold rank-local tuning can therefore disagree with both
+    peers and the persisted winner used by a later process. Retain the
+    original cache-off layout without reading or calibrating any store.
     """
     key = (rows, d) if round_intermediates else (rows, d, False)
-    hit = _NORM_CFG.get(key)
-    if hit is not None:
-        return hit
-    from ..tuning.cache import op_config
-    from triton.testing import do_bench
-
-    block = triton.next_power_of_2(d)
-    default = {"num_warps": 4}
-
-    def bench(cfg):
-        def launch():
-            norm[(rows,)](x, w, r, out, summed, d, eps, add, block,
-                          ROUND_INTERMEDIATES=round_intermediates,
-                          num_warps=cfg["num_warps"], enable_fp_fusion=False)
-
-        return do_bench(launch, return_mode="median")
-
-    cfg, _status = op_config(
-        "elementwise.rms_norm" if round_intermediates else "elementwise.rms_norm.fused", _norm_shape_class(rows, d),
-        default=default,
-        candidates=[{"num_warps": n} for n in (2, 4, 8)],
-        bench=bench, source_files=(__file__,))
-    _NORM_CFG[key] = cfg["num_warps"]
-    return cfg["num_warps"]
+    if _NORM_CFG.get(key) != 4:
+        _NORM_CFG[key] = 4
+    return 4
 
 
 def rms_norm(x, module, residual=None, *, round_intermediates=True):
@@ -426,14 +390,10 @@ def rms_norm(x, module, residual=None, *, round_intermediates=True):
     ``residual`` of the same shape/dtype/device. Anything else raises
     :class:`OpNotEligible` — callers fall back to :func:`rms_norm_reference`.
 
-    ``num_warps`` resolves through the op-config cache
-    (:mod:`vkernels.tuning.cache`): the implicit 4 stays the declared
-    default, and a per-bucket winner tuned once on the first eager call is
-    persisted under ``$VKERNELS_CACHE`` and replayed by later processes
-    (``VKERNELS_CACHE=off`` — the tests/conftest default — keeps today's
-    exact launch; capture sees memo-or-default only). The block size stays
-    pinned to the row width, so the config change is perf-only: every
-    intermediate rounding point of the eager expression is untouched.
+    The four-warp reduction layout is fixed, including when operator caches
+    are enabled. Changing the warp count changes FP32 reduction ordering and
+    can change rounded output bits even with identical intermediate casts.
+    The block size stays pinned to the next power of two of the row width.
     """
     import torch
 
@@ -456,8 +416,7 @@ def rms_norm(x, module, residual=None, *, round_intermediates=True):
     rows = x.numel() // d
     norm = _kernels().norm
     add = residual is not None
-    warps = _norm_warps(rows, d, triton, norm, x, module.weight, r, out,
-                        summed, module.variance_epsilon, add, round_intermediates)
+    warps = _norm_warps(rows, d, round_intermediates)
     norm[(rows,)](
         x,
         module.weight,

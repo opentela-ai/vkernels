@@ -3,8 +3,8 @@
 The cache is lenient by design, so the tests pin the contract from both
 sides: every resolution path (tune-on-miss under budget, store replay,
 seeds, off switch, capture guard, budget exhaustion, stale source/device)
-and the three integrated ops' hot paths (dense_gemv, kda_decode,
-rms_norm) — parity holds with the cache ON, and the off switch keeps
+and the integrated ops' hot paths (dense_gemv, kda_decode) plus the
+fixed-layout rms_norm — parity holds with the cache ON, and the off switch keeps
 exactly the pre-cache behavior.
 
 CPU-safe tests inject the device identity and a scripted bench, so the
@@ -482,11 +482,8 @@ def test_gpu_rms_norm_parity_with_cache_on(_store, monkeypatch):
     ref_out, ref_summed = rms_norm_reference(x, M(), residual=r)
     torch.testing.assert_close(out, ref_out)
     torch.testing.assert_close(summed, ref_summed)
-    doc = _read(_store, "elementwise.rms_norm", _cap())
-    rec = doc["records"]["r8-d2k"]
-    assert rec["status"] in ("tuned", "default")
-    assert rec["config"]["num_warps"] in (2, 4, 8)
-    assert elementwise._NORM_CFG[(rows, d)] == rec["config"]["num_warps"]
+    assert elementwise._NORM_CFG[(rows, d)] == 4
+    assert not _record_file(_store, "elementwise.rms_norm", _cap()).exists()
 
 
 @pytest.mark.skipif(not _cuda(), reason="op integration is CUDA-gated")
