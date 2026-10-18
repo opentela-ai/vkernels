@@ -2,7 +2,9 @@
 
 Keep the low-precision intermediate roundings of the eager HF expressions.
 In particular, RMSNorm casts before multiplying its weight, RoPE rounds each
-product, and SiLU rounds before multiplying the up projection. No input (or
+product, and SiLU rounds before multiplying the up projection. An explicit ``round_intermediates=False`` option instead preserves FP32
+residual sums and products until their output storage cast, as fused serving
+kernels do. The default remains HF-compatible. No input (or
 residual) is mutated, so graph padding and projection views remain safe.
 
 Adopted from floe's ``engine/runner/kernels/elementwise.py`` (vkernels owns
@@ -76,17 +78,23 @@ def _kernels():
         EPS: tl.constexpr,
         ADD: tl.constexpr,
         BLOCK: tl.constexpr,
+        ROUND_INTERMEDIATES: tl.constexpr = True,
     ):
         row = tl.program_id(0)
         col = tl.arange(0, BLOCK)
         x = tl.load(X + row * D + col, col < D, 0).to(tl.float32)
         if ADD:
             r = tl.load(R + row * D + col, col < D, 0).to(tl.float32)
-            x = (x + r).to(X.dtype.element_ty).to(tl.float32)
+            x = x + r
+            if ROUND_INTERMEDIATES:
+                x = x.to(X.dtype.element_ty).to(tl.float32)
             tl.store(SUM + row * D + col, x, col < D)
         inv = tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
         w = tl.load(W + col, col < D, 0).to(tl.float32)
-        y = (x * inv).to(X.dtype.element_ty).to(tl.float32) * w
+        y = x * inv
+        if ROUND_INTERMEDIATES:
+            y = y.to(X.dtype.element_ty).to(tl.float32)
+        y = y * w
         tl.store(Y + row * D + col, y, col < D)
 
     @triton.jit
@@ -105,19 +113,24 @@ def _kernels():
         QE: tl.constexpr,
         KE: tl.constexpr,
         BLOCK: tl.constexpr,
+        ROUND_INTERMEDIATES: tl.constexpr = True,
     ):
         row, head = tl.program_id(0), tl.program_id(1)
         col = tl.arange(0, BLOCK)
         if head < HQ:
             x = tl.load(Q + row * QS + head * D + col, col < D, 0).to(tl.float32)
             w = tl.load(WQ + col, col < D, 0).to(tl.float32)
-            y = (x * tl.rsqrt(tl.sum(x * x, 0) / D + QE)).to(Q.dtype.element_ty)
+            y = x * tl.rsqrt(tl.sum(x * x, 0) / D + QE)
+            if ROUND_INTERMEDIATES:
+                y = y.to(Q.dtype.element_ty)
             tl.store(OQ + (row * HQ + head) * D + col, y.to(tl.float32) * w, col < D)
         else:
             h = head - HQ
             x = tl.load(K + row * KS + h * D + col, col < D, 0).to(tl.float32)
             w = tl.load(WK + col, col < D, 0).to(tl.float32)
-            y = (x * tl.rsqrt(tl.sum(x * x, 0) / D + KE)).to(K.dtype.element_ty)
+            y = x * tl.rsqrt(tl.sum(x * x, 0) / D + KE)
+            if ROUND_INTERMEDIATES:
+                y = y.to(K.dtype.element_ty)
             tl.store(OK + (row * HK + h) * D + col, y.to(tl.float32) * w, col < D)
 
     @triton.jit
@@ -134,6 +147,7 @@ def _kernels():
         QS: tl.constexpr,
         KS: tl.constexpr,
         BLOCK: tl.constexpr,
+        ROUND_INTERMEDIATES: tl.constexpr = True,
     ):
         row, head = tl.program_id(0), tl.program_id(1)
         col = tl.arange(0, BLOCK)
@@ -144,15 +158,19 @@ def _kernels():
         if head < HQ:
             x = tl.load(Q + row * QS + head * D + col, col < D, 0).to(tl.float32)
             r = tl.load(Q + row * QS + head * D + other, col < D, 0).to(tl.float32)
-            a = (x * c).to(Q.dtype.element_ty).to(tl.float32)
-            b = (r * sign * s).to(Q.dtype.element_ty).to(tl.float32)
+            a, b = x * c, r * sign * s
+            if ROUND_INTERMEDIATES:
+                a = a.to(Q.dtype.element_ty).to(tl.float32)
+                b = b.to(Q.dtype.element_ty).to(tl.float32)
             tl.store(OQ + (row * HQ + head) * D + col, a + b, col < D)
         else:
             h = head - HQ
             x = tl.load(K + row * KS + h * D + col, col < D, 0).to(tl.float32)
             r = tl.load(K + row * KS + h * D + other, col < D, 0).to(tl.float32)
-            a = (x * c).to(K.dtype.element_ty).to(tl.float32)
-            b = (r * sign * s).to(K.dtype.element_ty).to(tl.float32)
+            a, b = x * c, r * sign * s
+            if ROUND_INTERMEDIATES:
+                a = a.to(K.dtype.element_ty).to(tl.float32)
+                b = b.to(K.dtype.element_ty).to(tl.float32)
             tl.store(OK + (row * HK + h) * D + col, a + b, col < D)
 
     @triton.jit
@@ -242,6 +260,7 @@ def _kernels():
         QE: tl.constexpr,
         KE: tl.constexpr,
         BLOCK: tl.constexpr,
+        ROUND_INTERMEDIATES: tl.constexpr = True,
     ):
         row, head = tl.program_id(0), tl.program_id(1)
         col = tl.arange(0, BLOCK)
@@ -259,10 +278,18 @@ def _kernels():
             # yp's weight loads at `other`, not at `col`.
             wp = tl.load(WQ + other, mask, 0).to(tl.float32)
             inv = tl.rsqrt(tl.sum(x * x, 0) / D + QE)
-            y = ((x * inv).to(Q.dtype.element_ty).to(tl.float32) * w).to(Q.dtype.element_ty).to(tl.float32)
-            yp = ((xp * inv).to(Q.dtype.element_ty).to(tl.float32) * wp).to(Q.dtype.element_ty).to(tl.float32)
-            a = (y * c).to(Q.dtype.element_ty).to(tl.float32)
-            b = (yp * sign * s).to(Q.dtype.element_ty).to(tl.float32)
+            y, yp = x * inv, xp * inv
+            if ROUND_INTERMEDIATES:
+                y = y.to(Q.dtype.element_ty).to(tl.float32)
+                yp = yp.to(Q.dtype.element_ty).to(tl.float32)
+            # QK norm and RoPE remain distinct numerical stages: the norm
+            # output is stored in the model dtype before rotary consumes it.
+            y = (y * w).to(Q.dtype.element_ty).to(tl.float32)
+            yp = (yp * wp).to(Q.dtype.element_ty).to(tl.float32)
+            a, b = y * c, yp * sign * s
+            if ROUND_INTERMEDIATES:
+                a = a.to(Q.dtype.element_ty).to(tl.float32)
+                b = b.to(Q.dtype.element_ty).to(tl.float32)
             tl.store(OQ + (row * HQ + head) * D + col, a + b, mask)
         else:
             h = head - HQ
@@ -271,10 +298,18 @@ def _kernels():
             w = tl.load(WK + col, mask, 0).to(tl.float32)
             wp = tl.load(WK + other, mask, 0).to(tl.float32)
             inv = tl.rsqrt(tl.sum(x * x, 0) / D + KE)
-            y = ((x * inv).to(K.dtype.element_ty).to(tl.float32) * w).to(K.dtype.element_ty).to(tl.float32)
-            yp = ((xp * inv).to(K.dtype.element_ty).to(tl.float32) * wp).to(K.dtype.element_ty).to(tl.float32)
-            a = (y * c).to(K.dtype.element_ty).to(tl.float32)
-            b = (yp * sign * s).to(K.dtype.element_ty).to(tl.float32)
+            y, yp = x * inv, xp * inv
+            if ROUND_INTERMEDIATES:
+                y = y.to(K.dtype.element_ty).to(tl.float32)
+                yp = yp.to(K.dtype.element_ty).to(tl.float32)
+            # QK norm and RoPE remain distinct numerical stages: the norm
+            # output is stored in the model dtype before rotary consumes it.
+            y = (y * w).to(K.dtype.element_ty).to(tl.float32)
+            yp = (yp * wp).to(K.dtype.element_ty).to(tl.float32)
+            a, b = y * c, yp * sign * s
+            if ROUND_INTERMEDIATES:
+                a = a.to(K.dtype.element_ty).to(tl.float32)
+                b = b.to(K.dtype.element_ty).to(tl.float32)
             tl.store(OK + (row * HK + h) * D + col, a + b, mask)
 
     @triton.jit
@@ -344,7 +379,7 @@ def _norm_shape_class(rows, d):
 _NORM_CFG: dict = {}
 
 
-def _norm_warps(rows, d, triton, norm, x, w, r, out, summed, eps, add):
+def _norm_warps(rows, d, triton, norm, x, w, r, out, summed, eps, add, round_intermediates=True):
     """``num_warps`` for one rms_norm launch, through the op-config cache.
 
     BLOCK stays pinned to ``next_power_of_2(d)`` — the whole row must sit
@@ -355,7 +390,8 @@ def _norm_warps(rows, d, triton, norm, x, w, r, out, summed, eps, add):
     live shape; the winner persists per coarse bucket for every later
     process. Capture-safe: the cache serves memo-or-default mid-capture.
     """
-    hit = _NORM_CFG.get((rows, d))
+    key = (rows, d) if round_intermediates else (rows, d, False)
+    hit = _NORM_CFG.get(key)
     if hit is not None:
         return hit
     from ..tuning.cache import op_config
@@ -367,20 +403,21 @@ def _norm_warps(rows, d, triton, norm, x, w, r, out, summed, eps, add):
     def bench(cfg):
         def launch():
             norm[(rows,)](x, w, r, out, summed, d, eps, add, block,
+                          ROUND_INTERMEDIATES=round_intermediates,
                           num_warps=cfg["num_warps"], enable_fp_fusion=False)
 
         return do_bench(launch, return_mode="median")
 
     cfg, _status = op_config(
-        "elementwise.rms_norm", _norm_shape_class(rows, d),
+        "elementwise.rms_norm" if round_intermediates else "elementwise.rms_norm.fused", _norm_shape_class(rows, d),
         default=default,
         candidates=[{"num_warps": n} for n in (2, 4, 8)],
         bench=bench, source_files=(__file__,))
-    _NORM_CFG[(rows, d)] = cfg["num_warps"]
+    _NORM_CFG[key] = cfg["num_warps"]
     return cfg["num_warps"]
 
 
-def rms_norm(x, module, residual=None):
+def rms_norm(x, module, residual=None, *, round_intermediates=True):
     """Return (normalized value, rounded residual sum), without aliasing writes.
 
     Eligibility: CUDA bf16/fp16 ``x`` whose ``module.weight`` shares its dtype
@@ -420,7 +457,7 @@ def rms_norm(x, module, residual=None):
     norm = _kernels().norm
     add = residual is not None
     warps = _norm_warps(rows, d, triton, norm, x, module.weight, r, out,
-                        summed, module.variance_epsilon, add)
+                        summed, module.variance_epsilon, add, round_intermediates)
     norm[(rows,)](
         x,
         module.weight,
@@ -432,12 +469,13 @@ def rms_norm(x, module, residual=None):
         add,
         triton.next_power_of_2(d),
         num_warps=warps,
+        ROUND_INTERMEDIATES=round_intermediates,
         enable_fp_fusion=False,
     )
     return out, summed
 
 
-def qk_norm(q, k, q_norm, k_norm):
+def qk_norm(q, k, q_norm, k_norm, *, round_intermediates=True):
     """Per-head QK-RMSNorm in one launch over both projections.
 
     Eligibility: CUDA bf16/fp16 ``q``/``k`` sharing device, token grid and
@@ -476,12 +514,13 @@ def qk_norm(q, k, q_norm, k_norm):
         q_norm.variance_epsilon,
         k_norm.variance_epsilon,
         triton.next_power_of_2(d),
+        ROUND_INTERMEDIATES=round_intermediates,
         enable_fp_fusion=False,
     )
     return oq, ok
 
 
-def rotary(q, k, cos, sin):
+def rotary(q, k, cos, sin, *, round_intermediates=True):
     """Half-rotation rotary embedding over every head in one launch.
 
     Eligibility: CUDA ``q``/``k``/``cos``/``sin`` on one device, ``q``/``k``
@@ -523,12 +562,13 @@ def rotary(q, k, cos, sin):
         q3.stride(0),
         k3.stride(0),
         triton.next_power_of_2(d),
+        ROUND_INTERMEDIATES=round_intermediates,
         enable_fp_fusion=False,
     )
     return oq, ok
 
 
-def qk_norm_rope(q, k, q_norm, k_norm, cos, sin):
+def qk_norm_rope(q, k, q_norm, k_norm, cos, sin, *, round_intermediates=True):
     """Fused per-head QK-RMSNorm + rotary embedding (one kernel).
 
     Equivalent to :func:`qk_norm` followed by :func:`rotary` on the normed
@@ -581,12 +621,13 @@ def qk_norm_rope(q, k, q_norm, k_norm, cos, sin):
         q_norm.variance_epsilon,
         k_norm.variance_epsilon,
         triton.next_power_of_2(d),
+        ROUND_INTERMEDIATES=round_intermediates,
         enable_fp_fusion=False,
     )
     return oq, ok
 
 
-def silu_mul(gate, up):
+def silu_mul(gate, up, *, round_intermediates=True):
     """SiLU(gate) * up in one launch (SiLU rounds before the product).
 
     The unclamped member of the GLM swiglu family: the same kernel and
@@ -598,7 +639,7 @@ def silu_mul(gate, up):
     Eligibility: CUDA bf16/fp16/fp32 ``gate``/``up`` of the same shape and
     dtype on one device; raises :class:`OpNotEligible` otherwise.
     """
-    return swiglu_limit(gate, up, math.inf)
+    return swiglu_limit(gate, up, math.inf, round_intermediates=round_intermediates)
 
 
 def swiglu_limit(gate, up, limit, *, round_intermediates=True):
@@ -778,7 +819,7 @@ def rms_norm_gated(x, gate, module):
     return out
 
 
-def rms_norm_reference(x, module, residual=None):
+def rms_norm_reference(x, module, residual=None, *, round_intermediates=True):
     """Eager HF oracle for :func:`rms_norm` (exact intermediate rounding)."""
     import torch
 
@@ -786,12 +827,17 @@ def rms_norm_reference(x, module, residual=None):
     if residual is None:
         summed = x
     else:
-        x32 = (x32 + residual.float()).to(x.dtype).float()
+        x32 = x32 + residual.float()
         summed = x32.to(x.dtype)
+        if round_intermediates:
+            x32 = summed.float()
     inv = torch.rsqrt(
         x32.pow(2).sum(-1, keepdim=True) / x.shape[-1] + module.variance_epsilon
     )
-    y = ((x32 * inv).to(x.dtype).float() * module.weight.float()).to(x.dtype)
+    y = x32 * inv
+    if round_intermediates:
+        y = y.to(x.dtype).float()
+    y = (y * module.weight.float()).to(x.dtype)
     return y, summed
 
 
@@ -813,21 +859,24 @@ def rms_norm_gated_reference(x, gate, module):
     return (y * torch.sigmoid(gate.float())).to(x.dtype)
 
 
-def qk_norm_reference(q, k, q_norm, k_norm):
+def qk_norm_reference(q, k, q_norm, k_norm, *, round_intermediates=True):
     """Eager HF oracle for :func:`qk_norm`."""
     import torch
 
     def _one(t, w, eps):
         t32 = t.float()
         inv = torch.rsqrt(t32.pow(2).sum(-1, keepdim=True) / t.shape[-1] + eps)
-        return ((t32 * inv).to(t.dtype).float() * w.float()).to(t.dtype)
+        y = t32 * inv
+        if round_intermediates:
+            y = y.to(t.dtype).float()
+        return (y * w.float()).to(t.dtype)
 
     return _one(q, q_norm.weight, q_norm.variance_epsilon), _one(
         k, k_norm.weight, k_norm.variance_epsilon
     )
 
 
-def rotary_reference(q, k, cos, sin):
+def rotary_reference(q, k, cos, sin, *, round_intermediates=True):
     """Eager HF oracle for :func:`rotary` (rounded halves, rotated pairs)."""
     import torch
 
@@ -836,20 +885,30 @@ def rotary_reference(q, k, cos, sin):
     other = torch.cat([torch.arange(d // 2, d), torch.arange(0, d // 2)])
     sign = torch.cat([-torch.ones(d // 2), torch.ones(d - d // 2)]).to(q.device)
     c, s = cos.float()[:, None, :], sin.float()[:, None, :]
-    aq = (q3 * c).to(q.dtype).float()
-    bq = (q3[:, :, other] * sign * s).to(q.dtype).float()
-    ak = (k3 * c).to(k.dtype).float()
-    bk = (k3[:, :, other] * sign * s).to(k.dtype).float()
+    aq = q3 * c
+    if round_intermediates:
+        aq = aq.to(q.dtype).float()
+    bq = q3[:, :, other] * sign * s
+    if round_intermediates:
+        bq = bq.to(q.dtype).float()
+    ak = k3 * c
+    if round_intermediates:
+        ak = ak.to(k.dtype).float()
+    bk = k3[:, :, other] * sign * s
+    if round_intermediates:
+        bk = bk.to(k.dtype).float()
     return (aq + bq).to(q.dtype).reshape(q.shape), (ak + bk).to(k.dtype).reshape(
         k.shape
     )
 
 
-def silu_mul_reference(gate, up):
+def silu_mul_reference(gate, up, *, round_intermediates=True):
     """Eager HF oracle for :func:`silu_mul` (SiLU rounds before the product)."""
     import torch
 
-    act = (gate.float() / (1.0 + torch.exp(-gate.float()))).to(gate.dtype)
+    act = gate.float() / (1.0 + torch.exp(-gate.float()))
+    if round_intermediates:
+        act = act.to(gate.dtype)
     return (act.float() * up.float()).to(gate.dtype)
 
 
@@ -865,6 +924,21 @@ def store_kv_reference(k, v, kc, vc, block_table, seqlens, scratch_slot):
             kc[slot] = k[bi, t]
             vc[slot] = v[bi, t]
     return kc, vc
+
+
+def with_rounding(*, round_intermediates):
+    """Bind one standard dense precision policy outside the model's hot loop.
+
+    The adapter changes arithmetic inside kernels, preserving launch count,
+    storage dtypes and the native-slot store. Default callers retain the
+    module's HF-compatible entry points without an extra dispatch layer.
+    """
+    from functools import partial
+    from types import SimpleNamespace
+
+    bound = {name: partial(globals()[name], round_intermediates=round_intermediates)
+             for name in ("rms_norm", "qk_norm", "qk_norm_rope", "rotary", "silu_mul")}
+    return SimpleNamespace(**bound, store_kv=store_kv)
 
 
 def supports_model(model):
