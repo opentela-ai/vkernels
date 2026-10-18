@@ -2,13 +2,15 @@
 import json
 import os
 from pathlib import Path
+from runpy import run_path
 import subprocess
 import sys
 
 import pytest
 import torch
 
-from test_hip_dsa_combine import CHILD
+# The public witness also runs as a standalone frozen pytest file on ROCm.
+CHILD = run_path(str(Path(__file__).with_name('test_hip_dsa_combine.py')))['CHILD']
 
 LIBRARY = os.environ.get('VKERNELS_TEST_HIP_COMBINE_LIB')
 BASE = os.environ.get('VKERNELS_TEST_HIP_STACK_BASE')
