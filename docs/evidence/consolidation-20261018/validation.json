@@ -1,0 +1,27 @@
+{
+  "host_ctest": {
+    "passed": 47,
+    "disabled_gpu": 2
+  },
+  "python_cpu": {
+    "passed": 1094,
+    "skipped": 1054,
+    "subtests_passed": 499
+  },
+  "local_gpu": {
+    "hardware": "NVIDIA GB10",
+    "passed": 153,
+    "skipped": 0
+  },
+  "hip_source_sha256": "2e897fcc48f7c58428081ee5760bb486d3596057531f47a46247ee563e7a778d",
+  "hip_qualified_job": 686161,
+  "hip_component_raw_tensor_pairs": 14400,
+  "hip_public_api_pairs": 144,
+  "hip_original_incumbent_stack_pairs": 288,
+  "experimental_defaults": "off",
+  "limitations": "HIP decode speed is a component result; original AMD external quality failure remains; full-model composed-stack qualification is still running.",
+  "repo": "vkernels",
+  "date": "2026-10-18",
+  "source_head_before_evidence": "8a4f98506f062ac7b1e8eff0f98e5b481e9a6b8e",
+  "validation_environment": "Isolated interpreter; imports pinned to the consolidated sibling sources. Torch2.13.0+cu130 on localGB10. HIP kernel source byte-identical to qualified6871992."
+}
