@@ -57,6 +57,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 
 #include "vkernels/kernels/dsa.hpp"
 #include "vkernels/util/error.hpp"  // VK_EXPECTS (host: throws std::invalid_argument)
@@ -989,13 +990,15 @@ __global__ void dsa_sparse_fwd_partial_kernel(
 #define VK_DSA_WARP_SYNC() __syncwarp()
 #endif
 
-template <int BQ>
+template <int BQ, int Dim = 0, int Tail = -1>
 __global__ void dsa_sparse_fwd_partial_db_kernel(
     const uint16_t* __restrict__ q, const uint16_t* __restrict__ kv,
     const int32_t* __restrict__ indices, float* __restrict__ part_out,
     float* __restrict__ part_lse,
-    int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
+    int S_q, int S_kv, int H, int dim_arg, int tail_arg, int topk, int kv_group,
     float sm_scale, int split_kv, int kti, int pipeline) {
+  const int dim = Dim > 0 ? Dim : dim_arg;
+  const int tail_dim = Tail >= 0 ? Tail : tail_arg;
   // Issue #80: double-buffered variant of dsa_sparse_fwd_partial_kernel.
   // Key tiles are staged into LDS so the global loads of tile i+1 issue
   // while the warp runs the online-softmax update over tile i (gfx942 has
@@ -1445,6 +1448,47 @@ __global__ void dsa_sparse_fwd_combine_kernel(
     lse_out[(size_t)gi * H + h] = m + log2f(denom);
 }
 
+// Tile only independent output columns. Each column retains the original
+// ascending split reduction, scale operations and final BF16 rounding.
+template<int Columns>
+__global__ void dsa_sparse_fwd_combine_tiled_kernel(const float* __restrict__ part_out,
+                                                    const float* __restrict__ part_lse,
+                                                    uint16_t* __restrict__ out,
+                                                    float* __restrict__ lse_out,
+                                                    int S_q,
+                                                    int H,
+                                                    int d_v,
+                                                    int split_kv,
+                                                    bool return_lse) {
+  const int gi = blockIdx.x;
+  const int h = blockIdx.y;
+  const int lane = threadIdx.x;
+  const int d = blockIdx.z * Columns + lane;
+  const bool active = lane < Columns && d < d_v;
+  const size_t base = ((size_t)gi * H + h) * split_kv;
+  float m = -INFINITY;
+  for (int s = 0; s < split_kv; ++s)
+    m = fmaxf(m, part_lse[base + s]);
+  uint16_t* orow = out + ((size_t)gi * H + h) * d_v;
+  if (m == -INFINITY) {
+    if (active) orow[d] = 0;
+    if (lane == 0 && blockIdx.z == 0 && return_lse) lse_out[(size_t)gi * H + h] = -INFINITY;
+    return;
+  }
+  float o = 0.0f;
+  float denom = 0.0f;
+  for (int s = 0; s < split_kv; ++s) {
+    const float l = part_lse[base + s];
+    const float w = (l == -INFINITY) ? 0.0f : exp2f(l - m);
+    denom += w;
+    const float* po = part_out + (base + s) * d_v;
+    if (active) o += w * po[d];
+  }
+  const float inv = 1.0f / denom;
+  if (active) orow[d] = f2bf(o * inv);
+  if (lane == 0 && blockIdx.z == 0 && return_lse) lse_out[(size_t)gi * H + h] = m + log2f(denom);
+}
+
 namespace {
 template <int BQ>
 void launch_partial(const void* q, const void* kv, const void* indices,
@@ -1491,6 +1535,12 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
     const char* e = std::getenv("VK_DSA_DBPIPE");
     return e ? std::atoi(e) : 1;
   }();
+  // Explicit opt-in for the absorbed GLM width. Graph replay still consumes
+  // current indices; selected-key ordering and split boundaries stay fixed.
+  static const bool fixed_width = [] {
+    const char* e = std::getenv("VK_DSA_DB_WIDTH");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
   if (db_mode == 0) return false;
   const int W = dim + tail_dim;
   const size_t shq = (size_t)BQ * (size_t)W * 4u;                // sQ
@@ -1533,13 +1583,21 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
   }
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, split_kv);
-  dsa_sparse_fwd_partial_db_kernel<BQ><<<grid, block, shmem, stream>>>(
+  const auto launch = [&](auto width) {
+    constexpr int kDim = decltype(width)::value;
+    dsa_sparse_fwd_partial_db_kernel<BQ, kDim, kDim ? 0 : -1>
+        <<<grid, block, shmem, stream>>>(
       reinterpret_cast<const uint16_t*>(q),
       reinterpret_cast<const uint16_t*>(kv),
       reinterpret_cast<const int32_t*>(indices),
       reinterpret_cast<float*>(part_out), reinterpret_cast<float*>(part_lse),
       S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, split_kv, kti,
       dbpipe);
+  };
+  if (fixed_width && dim == 512 && tail_dim == 0)
+    launch(std::integral_constant<int, 512>{});
+  else
+    launch(std::integral_constant<int, 0>{});
   return true;
 }
 
@@ -1701,6 +1759,24 @@ void dsa_sparse_fwd_split_run(int S_q, int S_kv, int H, int dim, int tail_dim,
         tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
         static_cast<hipStream_t>(stream));
   if (!need_combine) return;
+  static const bool tiled_combine = [] {
+    const char* e = std::getenv("VK_DSA_COMBINE_TILED");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  if (tiled_combine && dim == 512 && tail_dim == 0) {
+    dsa_sparse_fwd_combine_tiled_kernel<32>
+        <<<dim3(S_q, H, (dim - tail_dim + 31) / 32), 64, 0, static_cast<hipStream_t>(stream)>>>(
+            reinterpret_cast<const float*>(partial_out),
+            reinterpret_cast<const float*>(partial_lse),
+            reinterpret_cast<uint16_t*>(out),
+            reinterpret_cast<float*>(lse),
+            S_q,
+            H,
+            dim - tail_dim,
+            split_kv,
+            return_lse);
+    return;
+  }
   dim3 cgrid(S_q, H);
   dsa_sparse_fwd_combine_kernel<<<cgrid, 64, 0, static_cast<hipStream_t>(stream)>>>(
       reinterpret_cast<const float*>(partial_out),
