@@ -415,8 +415,11 @@ def merge_16x16_to_32x32_inverse_kernel(
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @persistent_autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
+        # Warp count changes the FP32 triangular reduction order. Exact-input
+        # GH200 replays produce different outputs/state at 2, 4 and 8 warps;
+        # all four stage counts agree at a fixed warp count. Keep the reduction
+        # layout stable across cold tuning, warm stores and TP ranks.
+        triton.Config({}, num_warps=4, num_stages=num_stages)
         for num_stages in [2, 3, 4, 5]
     ],
     key=["H", "BT", "IS_VARLEN"],
