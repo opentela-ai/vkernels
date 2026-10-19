@@ -1,0 +1,16 @@
+{
+  "job": 687229,
+  "node": "nid002672",
+  "hardware": "AMD Instinct MI300A, gfx942",
+  "scope": "Standalone primitive versus blocked CPU oracle; full-chain and speed unqualified",
+  "cases": 8,
+  "absolute_tolerance": 0.0002,
+  "max_absolute_error": 2.38419e-07,
+  "command": "hipcc -O2 -std=c++17 --offload-arch=gfx942 -DVKERNELS_HAS_HIP=1 -Isrc gate.cpp src/vkernels/kernels/kda.cpp src/vkernels/kernels/kda.hip -o kda-gate",
+  "sources": {
+    "src/c/vkernels/kernels/kda.cpp": "d09acef12d6ec5666a98b871e54b2431a53cab8c340ba4bd0881a7d12ee75bbf",
+    "src/c/vkernels/kernels/kda.hip": "21fd184082a4ce967327fceddd305cc9edde076651c1f8305e201195f418f8ae",
+    "src/c/vkernels/kernels/kda.hpp": "713470c3ee36106d99222c077d401ec19f6ec002f63fafd9a9e16b60eb0c44b9",
+    "tests/kernels/attn/test_kda_grams_gpu.cpp": "86f35a26115654fbad49bd6839c3fb7e48c4f43194bdfb9032ed0d34ee7b7fca"
+  }
+}

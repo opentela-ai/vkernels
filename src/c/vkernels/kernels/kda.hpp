@@ -287,7 +287,7 @@ void kda_delta_rule_fwd_state_cpu(
 // P == Q, where the positive exponent is bounded by ONE block's decay
 // (<= blk * |log g|max nats; <= 80 at the trainer's |g| <= 5, inside
 // fp32 exp). Two effects, both wanted by the device rung: the exp count
-// drops from ~(cs^2/2)*D to nblk*(nblk+1)/2 * 2*blk*D per chunk (65x
+// drops from ~(cs^2/2)*D to nblk*(nblk+1)/2 * 2*blk*D per chunk (6.5x
 // fewer at cs=64 blk=16 — the scalar gram kernel is exp/SFU bound), and
 // every dot becomes a [blk x D] x [D x blk] GEMM — a 16x16 MFMA shape.
 // fp32-equivalent to the exact form but NOT bit-equal (the product rounds
@@ -411,10 +411,9 @@ void kda_delta_rule_fwd_chunked(const float* q, const float* k,
 // Selected inside kda_delta_rule_fwd_chunked_with_scratch by
 // VK_KDA_GRAM_MFMA=1 (default off — the proven scalar gram chain stays
 // the default until the gfx942 A/B, mirroring VK_KDA_CHUNKED_FUSED).
-// SKELETON (perf3/kda-hip lane C): grid/fragment/masking/epilogue
-// structure is final-form but device compile + parity vs
-// kda_k3_grams_blocked_cpu goldens is the FIRST step of the next lane —
-// this lane has no gfx942 to compile or run it on.
+// Primitive device/oracle parity qualified on gfx942 (Beverin687212):
+// D={16,32,64,128}, full-history and forgetting gates. Full-chain A/B and
+// performance qualification are separate; the dispatch remains opt-in.
 void kda_k3_grams_blocked(const float* q, const float* k, const float* beta,
                           const float* L, float* M, float* N,
                           int B, int H, int nc, int S, int D, int blk,
@@ -423,7 +422,8 @@ void kda_k3_grams_blocked(const float* q, const float* k, const float* beta,
 // Tuning aid (#70): best wall time (us) of each chunked launch —
 // out_us[0]=cumsum, [1]=grams, [2]=chunk-local (inverse+GEMMs),
 // [3]=state pass, [4..9]=local-internal phase deltas (clock64/1000),
-// [10]=block-anchored MFMA grams, the rung-1 A/B hook —
+// [10]=block-anchored MFMA grams (0 on the CUDA shim), the rung-1 A/B hook —
+// out_us must hold 11 doubles.
 // over `iters` timed runs after a warmup of each. Same buffers/contract.
 void kda_chunked_phase_times(const float* q, const float* k, const float* v,
                              const float* g, const float* beta, float* state,

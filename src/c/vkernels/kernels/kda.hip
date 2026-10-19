@@ -620,7 +620,7 @@ __global__ void kda_k3_gram_cumsum_kernel(
 // factorisation): per (row-block P, col-block Q <= P) of 16 rows/cols the
 // decay product factors around the anchor S[d] = L[col_end(Q)-1][d],
 //   exp(L_t - L_j) = exp(L_t - S) * exp(S - L_j),
-// so the exps fold into the GEMM OPERANDS at LDS-stage time — 65x fewer
+// so the exps fold into the GEMM OPERANDS at LDS-stage time — 6.5x fewer
 // exp than the per-pair kernel at cs=64/blk=16 (which is exp/SFU bound
 // once LDS-staged) — and each pair's two dots become one [16 x D] x
 // [D x 16] GEMM executed as D/4 MFMA_F32_16x16x4K1 instructions (fp32
@@ -628,16 +628,16 @@ __global__ void kda_k3_gram_cumsum_kernel(
 // the bf16-operand rung 2 is gated on the golden-harness tolerance study
 // and deliberately NOT taken here).
 //
-// SKELETON status (lane C: no gfx942 in this lane's CI): grid/block
-// structure, anchor factorisation, masking and epilogue are final-form
-// and mirror the CPU oracle statement-for-statement. The MFMA fragment
+// Standalone primitive parity passed on gfx942 (Beverin687212, eight
+// width/gate combinations); full-chain and performance gates remain open.
+// Grid/block structure, anchor factorisation, masking and epilogue mirror
+// the CPU oracle statement-for-statement. The MFMA fragment
 // layouts follow the verified 16x16 discipline of gemm_bf16.hip (A:
 // m = lane%16, k = lane/16; B: n = lane%16, k = lane/16; C: col =
 // lane%16, row = (lane/16)*4 + i — empirically confirmed there on gfx90a
-// for the K=16 bf16 variant). The FIRST device-lane step is: compile on
-// gfx942, empirically confirm the f32 16x16x4 fragment layout, then
-// parity vs kda_k3_grams_blocked_cpu goldens (and end-to-end vs the
-// oracle) before any perf work. Selected by VK_KDA_GRAM_MFMA=1 inside
+// for the K=16 bf16 variant). The f32 layout is now checked against the
+// blocked CPU oracle; full-chain/golden parity is required before any
+// performance claim. Selected by VK_KDA_GRAM_MFMA=1 inside
 // kda_delta_rule_fwd_chunked_with_scratch — default OFF, the proven
 // scalar chain stays the default (the VK_KDA_CHUNKED_FUSED discipline).
 #ifndef VKERNELS_KDA_CUDA_SHIM
@@ -1202,12 +1202,12 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
       kda_k3_gram_kernel<64><<<gchunk, kThL>>>(q, k, beta, L, M, N, nc, S);
       hipDeviceSynchronize();
     });
-#ifndef VKERNELS_KDA_CUDA_SHIM
   else
     out_us[1] = time_launch([&] {
       kda_k3_gram_kernel<128><<<gchunk, kThL>>>(q, k, beta, L, M, N, nc, S);
       hipDeviceSynchronize();
     });
+#ifndef VKERNELS_KDA_CUDA_SHIM
   // rung-1 A/B hook (native HIP/CK ladder, perf3/kda-hip): the
   // block-anchored MFMA grams on the same M/N buffers. out_us[10] vs
   // out_us[1] is the ladder's first perf gate (numerical parity is the
@@ -1236,6 +1236,8 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
                                                        nc, S);
       hipDeviceSynchronize();
     });
+#else
+  out_us[10] = 0.0;  // No MFMA timing on the CUDA-shim backend.
 #endif
   if (D <= 16) {
     out_us[2] = time_launch([&] {

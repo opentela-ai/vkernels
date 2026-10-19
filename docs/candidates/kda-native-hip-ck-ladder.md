@@ -1,7 +1,27 @@
 # KDA delta rule — the native HIP/CK ladder (perf3/kda-hip)
 
-**Status: lane C (skeleton + oracle harness) landed. Device rungs 1–3
-skeletonised/planned, not yet device-validated.**
+**Status: lane C (skeleton + oracle harness) landed. The rung-1 standalone
+primitive passed gfx942 device/oracle parity on 2026-10-19. Full-chain and
+performance qualification remain outstanding; rungs 2–3 are planned.**
+
+## Rung-1 device check, 2026-10-19
+
+Beverin job **687212**, a separate MI300A allocation on `nid002682`, compiled
+the native HIP implementation with ROCm 7 and compared the standalone MFMA
+grams with `kda_k3_grams_blocked_cpu` for D=16/32/64/128, two heads, two
+64-token chunks, and both no forgetting and random gates in [0.1, 0.99].
+All eight cases passed the existing 2e-4 absolute tolerance; the largest
+observed M/N error was 2.38419e-7. The cases check the strict/inclusive
+triangles as well as values. The permanent HIP CTest is `kda_grams_gpu`. The final formatted test and
+CUDA-shim timing correction were rechecked by job **687229** on `nid002672`,
+with the same eight passing cases and maximum error. See the
+[raw results and source hashes](evidence/2026-10-19-kda-grams-mi300a/validation.json).
+
+This checks the standalone primitive, not the full chunked-WY opt-in route or
+its speed. `VK_KDA_GRAM_MFMA` remains off by default. The factorisation reduces
+the analytical exponent count by about 6.5x at cs=64/blk=16, not 65x; this is
+not a measured end-to-end speedup. The consolidation also keeps the D=128
+scalar timing path available to CUDA-shim builds.
 
 Branch `perf3/kda-hip` (off 137d590). This doc is the working plan for
 moving the K3 per-key-dim gated-delta-rule forward from the committed
@@ -60,7 +80,7 @@ default).
 | # | piece (per chunk, cs=64) | math shape | current | planned | effort* |
 |---|---|---|---|---|---|
 | — | per-key log-cumsum | [cs×D] scan | `kda_k3_cumsum_kernel` (+ fused prologue variant) | keep (1% of chain) | — |
-| 1 | grams M/N | per (P,Q≤P) 16-row block pair: `M,N[16×16] = ±(A·Bᵀ)`, K=D | scalar per-pair, exp/SFU-bound (1325 µs) | **block-anchored MFMA** (skeleton landed; the anchor factorisation kills 65× of the exp work, MFMA kills the FMA work) | 1–2 d |
+| 1 | grams M/N | per (P,Q≤P) 16-row block pair: `M,N[16×16] = ±(A·Bᵀ)`, K=D | scalar per-pair, exp/SFU-bound (1325 µs) | **block-anchored MFMA** (skeleton landed; the anchor factorisation kills 6.5× of the exp work, MFMA kills the FMA work) | 1–2 d |
 | 2 | chunk-local: Ainv, U_v/W, T/Opar | `Ainv@X`: [64×64]·[64×D]; `N@X` tril-incl | scalar loops (607 µs) | MFMA GEMMs (M=64→4 row frags, N=D→8 col frags, K=64); Ainv diagonal blocks stay warp-substitution, off-diagonal level products become 16×16 MFMA chains | 2–3 d |
 | 3 | state pass: u, o, C-update | `W@Cᵀ` [64×128]·[128×Rb]; `Kgbᵀ@u` [128×64]·[64×Rb], Rb=32 | chunk-serial scalar, 3 barriers/chunk (1333 µs) | MFMA per chunk (still serial over nc; LDS C tile with D+4 padding stays) | 2–3 d |
 | 4 | cross-chunk scan (optional) | per-chunk affine maps A_c [D×D], B_c [D×D_v]; log2(nc) associative combine | not built (trainer ships `_scan_linear` in torch) | only if the serial pass still binds after rung 3: the D×D map products are plain [128×128]² GEMMs | 3–5 d |
@@ -187,12 +207,12 @@ HIP skeleton + dispatch + bench hook; this plan. Host CI-equivalent
 (`cmake --preset host` + full ctest) passes 47/47; the nvcc HIP-shim
 build compiles `kda.hip` (MFMA region excluded by design — gfx942-only).
 
+Completed on 2026-10-19: hipcc compile on gfx942 and standalone
+`hip::kda_k3_grams_blocked` parity for all four admitted widths.
+
 Next lane (device, gfx942):
-1. hipcc compile of `kda.hip` on gfx942 (the MFMA region has never been
-   compiled); fix fragment-layout constants via a probe if parity fails.
-2. Parity: `hip::kda_k3_grams_blocked` vs `kda_k3_grams_blocked_cpu` on
-   random contract inputs; full chain vs `kda_delta_rule_fwd_state_cpu`;
-   end-to-end vs the golden file (`*_vk` tensors).
-3. `phases` A/B at H∈{1,32} S∈{512,2048,8192} D=128; decide rung-1
+1. Full chain vs `kda_delta_rule_fwd_state_cpu`; end-to-end vs the golden
+   file (`*_vk` tensors), including restored initial/final state.
+2. `phases` A/B at H∈{1,32} S∈{512,2048,8192} D=128; decide rung-1
    variant (pair batching, 32×32 tiles, bf16 study).
-4. Then rung 2 (local GEMMs), rung 3 (state pass), re-gating each.
+3. Then rung 2 (local GEMMs), rung 3 (state pass), re-gating each.
