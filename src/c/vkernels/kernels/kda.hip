@@ -612,6 +612,122 @@ __global__ void kda_k3_gram_cumsum_kernel(
   }
 }
 
+// ---- (2a-MFMA) block-anchored grams — the matrix-core rung (skeleton) --
+// Rung 1 of the native HIP/CK ladder (branch perf3/kda-hip; the plan:
+// docs/candidates/kda-native-hip-ck-ladder.md). Computes the SAME M/N as
+// kda_k3_gram_kernel above, but in the block-anchored form of the CPU
+// oracle kda_k3_grams_blocked_cpu (the trainer's _wy_grams
+// factorisation): per (row-block P, col-block Q <= P) of 16 rows/cols the
+// decay product factors around the anchor S[d] = L[col_end(Q)-1][d],
+//   exp(L_t - L_j) = exp(L_t - S) * exp(S - L_j),
+// so the exps fold into the GEMM OPERANDS at LDS-stage time — 6.5x fewer
+// exp than the per-pair kernel at cs=64/blk=16 (which is exp/SFU bound
+// once LDS-staged) — and each pair's two dots become one [16 x D] x
+// [D x 16] GEMM executed as D/4 MFMA_F32_16x16x4K1 instructions (fp32
+// operands, fp32 accumulate: the same numerics class as the scalar rung;
+// the bf16-operand rung 2 is gated on the golden-harness tolerance study
+// and deliberately NOT taken here).
+//
+// Standalone primitive parity passed on gfx942 (Beverin687212, eight
+// width/gate combinations); full-chain and performance gates remain open.
+// Grid/block structure, anchor factorisation, masking and epilogue mirror
+// the CPU oracle statement-for-statement. The MFMA fragment
+// layouts follow the verified 16x16 discipline of gemm_bf16.hip (A:
+// m = lane%16, k = lane/16; B: n = lane%16, k = lane/16; C: col =
+// lane%16, row = (lane/16)*4 + i — empirically confirmed there on gfx90a
+// for the K=16 bf16 variant). The f32 layout is now checked against the
+// blocked CPU oracle; full-chain/golden parity is required before any
+// performance claim. Selected by VK_KDA_GRAM_MFMA=1 inside
+// kda_delta_rule_fwd_chunked_with_scratch — default OFF, the proven
+// scalar chain stays the default (the VK_KDA_CHUNKED_FUSED discipline).
+#ifndef VKERNELS_KDA_CUDA_SHIM
+namespace {
+typedef float v4f __attribute__((ext_vector_type(4)));
+constexpr int kGramBlk = 16;   // block-anchor size (== the MFMA M/N tile)
+constexpr int kGramTh  = 64;   // one wavefront (MFMA is wavefront-wide)
+
+template <int D>
+__global__ void kda_k3_gram_mfma_kernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ beta, const float* __restrict__ L,
+    float* __restrict__ M, float* __restrict__ N,
+    int nc, int S) {
+  static_assert(D % 16 == 0, "D must be a multiple of 16");
+  static_assert(kCs % kGramBlk == 0, "blk must divide the chunk size");
+  const int bh = blockIdx.x, c = blockIdx.y, tid = threadIdx.x;
+  const int t0 = c * kCs;
+  const size_t tok = (size_t)bh * S + t0;
+  const size_t lb  = ((size_t)bh * nc + c) * kCs * D;
+  const size_t lbq = ((size_t)bh * nc + c) * kCs * kCs;
+  const int lane = tid;          // kGramTh == 64: one wavefront, no warp split
+
+  // exp-folded operand tiles for the current (P, Q) pair: sAk/sAq rows t
+  // of block P (scaled by exp(L_t - S)), sB rows j of block Q (beta-folded,
+  // scaled by exp(S - L_j)). 3 x 16 x D floats = 24 KB at D=128.
+  __shared__ float sAk[kGramBlk * D];
+  __shared__ float sAq[kGramBlk * D];
+  __shared__ float sB[kGramBlk * D];
+
+  // prologue: zero the strict-upper cells of both grams AND the M
+  // diagonal — pairs cover only Q <= P, and the local kernel reads full
+  // rows (must not see stale scratch)
+  for (int i = tid; i < kCs * kCs; i += kGramTh) {
+    const int t = i / kCs, j = i % kCs;
+    if (j >= t) M[lbq + i] = 0.0f;
+    if (j > t)  N[lbq + i] = 0.0f;
+  }
+
+  for (int p = 0; p < kCs / kGramBlk; ++p) {
+    const int i0 = p * kGramBlk;
+    for (int qb = 0; qb <= p; ++qb) {
+      const int j0 = qb * kGramBlk, j1 = j0 + kGramBlk;
+      __syncthreads();   // pair reuse barrier: previous pair's fragment
+                         // reads complete before this pair restages
+      for (int i = tid; i < kGramBlk * D; i += kGramTh) {
+        const int t = i / D, e = i % D;
+        const float s  = L[lb + (size_t)(j1 - 1) * D + e];
+        const float ew = expf(L[lb + (size_t)(i0 + t) * D + e] - s);
+        sAk[i] = ew * k[(tok + (size_t)(i0 + t)) * D + e];
+        sAq[i] = ew * q[(tok + (size_t)(i0 + t)) * D + e];
+      }
+      for (int i = tid; i < kGramBlk * D; i += kGramTh) {
+        const int j = i / D, e = i % D;
+        const float s = L[lb + (size_t)(j1 - 1) * D + e];
+        sB[i] = beta[tok + (size_t)(j0 + j)] *
+                expf(s - L[lb + (size_t)(j0 + j) * D + e]) *
+                k[(tok + (size_t)(j0 + j)) * D + e];
+      }
+      __syncthreads();
+
+      // C = A @ B^T over K = D, in K=4 MFMA steps. Fragment loads per
+      // step: a = A[m][k0 + lane/16], b = B[n][k0 + lane/16] (B staged
+      // [row j = n][col d = k]). One b fragment serves BOTH accumulators.
+      v4f accM = {0.0f, 0.0f, 0.0f, 0.0f};
+      v4f accN = {0.0f, 0.0f, 0.0f, 0.0f};
+      const int mn = lane % 16, lk = lane / 16;
+      for (int k0 = 0; k0 < D; k0 += 4) {
+        const float a_k = sAk[(size_t)mn * D + k0 + lk];
+        const float a_q = sAq[(size_t)mn * D + k0 + lk];
+        const float b_j = sB[(size_t)mn * D + k0 + lk];
+        accM = __builtin_amdgcn_mfma_f32_16x16x4f32(a_k, b_j, accM, 0, 0, 0);
+        accN = __builtin_amdgcn_mfma_f32_16x16x4f32(a_q, b_j, accN, 0, 0, 0);
+      }
+
+      // epilogue: C row = (lane/16)*4 + i, col = lane%16 -> strict-lower
+      // M (j < t), tril-inclusive N (j <= t); upper cells stay at the
+      // prologue's zeros
+      for (int i = 0; i < 4; ++i) {
+        const int t = i0 + lk * 4 + i;
+        const int j = j0 + mn;
+        if (j < t) M[lbq + (size_t)t * kCs + j] = accM[i];
+        if (j <= t) N[lbq + (size_t)t * kCs + j] = accN[i];
+      }
+    }
+  }
+}
+}  // namespace
+#endif  // !VKERNELS_KDA_CUDA_SHIM
+
 // ---- (2b) chunk-local artifacts (Ainv + U_v/W/T/Opar) ------------------
 template <int D>
 __global__ void kda_k3_local_kernel(
@@ -889,6 +1005,7 @@ void launch_chunked(const float* q, const float* k, const float* v,
   float* Opar = T + ncsd;
   float* M    = Opar + ncsd;
   float* N    = M + (size_t)B * H * nc * kCs * kCs;
+  // (discipline comment stays above, in kda.hpp/plan)
   const dim3 gchunk(B * H, nc);
   if (fused_cumsum) {
     // VK_KDA_CHUNKED_FUSED=1: cumsum folded into the gram prologue —
@@ -897,7 +1014,23 @@ void launch_chunked(const float* q, const float* k, const float* v,
         g, q, k, beta, L, M, N, nc, S);
   } else {
     kda_k3_cumsum_kernel<<<gchunk, kTh, 0, stream>>>(g, L, nc, S, D);
-    kda_k3_gram_kernel<D><<<gchunk, kThL, 0, stream>>>(q, k, beta, L, M, N, nc, S);
+#ifndef VKERNELS_KDA_CUDA_SHIM
+    // VK_KDA_GRAM_MFMA=1 swaps launch (2a) to the block-anchored MFMA rung
+    // (kda_k3_gram_mfma_kernel). DEFAULT OFF — the scalar per-pair gram
+    // kernel is the proven chain; flip only after the gfx942 A/B + parity
+    // gate (the VK_KDA_CHUNKED_FUSED discipline). The M/N cell contract is
+    // identical (M strict lower, N tril-inclusive, upper zeroed), so the
+    // (2b) local kernel is unchanged.
+    const char* gram_mfma_env = std::getenv("VK_KDA_GRAM_MFMA");
+    if (gram_mfma_env != nullptr && gram_mfma_env[0] == '1') {
+      kda_k3_gram_mfma_kernel<D><<<gchunk, kGramTh, 0, stream>>>(
+          q, k, beta, L, M, N, nc, S);
+    } else
+#endif
+    {
+      kda_k3_gram_kernel<D><<<gchunk, kThL, 0, stream>>>(
+          q, k, beta, L, M, N, nc, S);
+    }
   }
   kda_k3_local_kernel<D><<<gchunk, kThL, 0, stream>>>(
       q, k, v, beta, L, M, N, Kgw, Qgw, Kgb, dgG, U_v, W, T, Opar, nc, S,
@@ -970,6 +1103,46 @@ void kda_delta_rule_fwd_chunked(const float* q, const float* k,
   hipFree(scratch);
 }
 
+// #L8a standalone entry: the block-anchored MFMA grams (rung 1 of the
+// native HIP/CK ladder) as its own launch, so the device-parity harness
+// and the bench can drive it directly without the full chunked chain.
+// Same contract as kda_k3_grams_blocked_cpu (blk == 16 on device).
+void kda_k3_grams_blocked(const float* q, const float* k, const float* beta,
+                          const float* L, float* M, float* N,
+                          int B, int H, int nc, int S, int D, int blk,
+                          void* stream) {
+  if (B == 0 || H == 0 || nc == 0) return;
+  const hipStream_t st = static_cast<hipStream_t>(stream);
+#ifdef VKERNELS_KDA_CUDA_SHIM
+  (void)q; (void)k; (void)beta; (void)L; (void)M; (void)N;
+  (void)S; (void)D; (void)blk; (void)st;
+  std::fprintf(stderr,
+               "kda_k3_grams_blocked: the MFMA rung targets gfx942; the "
+               "CUDA-shim build serves the scalar gram kernels only\n");
+#else
+  if (blk != kGramBlk) {
+    std::fprintf(stderr,
+                 "kda_k3_grams_blocked: requires blk==16 (the MFMA M/N "
+                 "tile; got %d)\n",
+                 blk);
+    return;
+  }
+  if (D <= 16)
+    kda_k3_gram_mfma_kernel<16><<<dim3(B * H, nc), kGramTh, 0, st>>>(
+        q, k, beta, L, M, N, nc, S);
+  else if (D <= 32)
+    kda_k3_gram_mfma_kernel<32><<<dim3(B * H, nc), kGramTh, 0, st>>>(
+        q, k, beta, L, M, N, nc, S);
+  else if (D <= 64)
+    kda_k3_gram_mfma_kernel<64><<<dim3(B * H, nc), kGramTh, 0, st>>>(
+        q, k, beta, L, M, N, nc, S);
+  else
+    kda_k3_gram_mfma_kernel<128><<<dim3(B * H, nc), kGramTh, 0, st>>>(
+        q, k, beta, L, M, N, nc, S);
+  if (st == nullptr) hipDeviceSynchronize();
+#endif
+}
+
 // Tuning aid (#70): median wall time of each of the three chunked launches
 // (cumsum / chunk-local / state-pass), in microseconds, over `iters`
 // timed runs after one warmup of each. out_us[0..2] = K1, K2, K3.
@@ -1029,12 +1202,42 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
       kda_k3_gram_kernel<64><<<gchunk, kThL>>>(q, k, beta, L, M, N, nc, S);
       hipDeviceSynchronize();
     });
-#ifndef VKERNELS_KDA_CUDA_SHIM
   else
     out_us[1] = time_launch([&] {
       kda_k3_gram_kernel<128><<<gchunk, kThL>>>(q, k, beta, L, M, N, nc, S);
       hipDeviceSynchronize();
     });
+#ifndef VKERNELS_KDA_CUDA_SHIM
+  // rung-1 A/B hook (native HIP/CK ladder, perf3/kda-hip): the
+  // block-anchored MFMA grams on the same M/N buffers. out_us[10] vs
+  // out_us[1] is the ladder's first perf gate (numerical parity is the
+  // device test's job, not this timing aid's).
+  if (D <= 16)
+    out_us[10] = time_launch([&] {
+      kda_k3_gram_mfma_kernel<16><<<gchunk, kGramTh>>>(q, k, beta, L, M, N,
+                                                      nc, S);
+      hipDeviceSynchronize();
+    });
+  else if (D <= 32)
+    out_us[10] = time_launch([&] {
+      kda_k3_gram_mfma_kernel<32><<<gchunk, kGramTh>>>(q, k, beta, L, M, N,
+                                                      nc, S);
+      hipDeviceSynchronize();
+    });
+  else if (D <= 64)
+    out_us[10] = time_launch([&] {
+      kda_k3_gram_mfma_kernel<64><<<gchunk, kGramTh>>>(q, k, beta, L, M, N,
+                                                      nc, S);
+      hipDeviceSynchronize();
+    });
+  else
+    out_us[10] = time_launch([&] {
+      kda_k3_gram_mfma_kernel<128><<<gchunk, kGramTh>>>(q, k, beta, L, M, N,
+                                                       nc, S);
+      hipDeviceSynchronize();
+    });
+#else
+  out_us[10] = 0.0;  // No MFMA timing on the CUDA-shim backend.
 #endif
   if (D <= 16) {
     out_us[2] = time_launch([&] {

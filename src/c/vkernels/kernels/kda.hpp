@@ -68,6 +68,9 @@
 //
 // Two-implementation model:
 //   kda.cpp  -- CPU reference (oracle), always compiled, in vkernels::kernels.
+//               ... plus #L8a kda_k3_grams_blocked_cpu: the block-anchored
+//               grams (rung 1 of the native HIP/CK ladder — see
+//               docs/candidates/kda-native-hip-ck-ladder.md).
 //               kda_naive_delta_rule_fwd_cpu is the K3 per-key-dim oracle
 //               (cross-checked by hand + the zero-gate independence
 //               property). The chunked pieces (gate cumsum / intra /
@@ -268,6 +271,49 @@ void kda_delta_rule_fwd_state_cpu(
     int B, int H, int S, int D, int chunk_size);
 
 // ---------------------------------------------------------------------------
+// #L8a — kda_k3_grams_blocked: block-anchored gate-weighted grams (the
+// math of rung 1 on the native HIP/CK ladder,
+// docs/candidates/kda-native-hip-ck-ladder.md).
+//
+// Produces the SAME M/N as the exact per-pair gram loops inside
+// kda_delta_rule_fwd_state_cpu, but factorised per (row-block P,
+// col-block Q <= P) of `blk` rows/cols with the per-(Q, key-dim) anchor
+//   S[k] = L[col_end(Q)-1][k]
+// so the gate product G_{j+1,t}[k] = exp(L_t[k] - L_j[k]) splits as
+//   exp(L_t[k] - S[k]) * exp(S[k] - L_j[k])
+// — the factorisation of the trainer's `_wy_grams` (vtrainer model/kda.py).
+// L is monotone DECREASING in t (gates in (0,1]), so for every pair in
+// P >= Q both exponent arguments are <= 0 except on the diagonal block
+// P == Q, where the positive exponent is bounded by ONE block's decay
+// (<= blk * |log g|max nats; <= 80 at the trainer's |g| <= 5, inside
+// fp32 exp). Two effects, both wanted by the device rung: the exp count
+// drops from ~(cs^2/2)*D to nblk*(nblk+1)/2 * 2*blk*D per chunk (6.5x
+// fewer at cs=64 blk=16 — the scalar gram kernel is exp/SFU bound), and
+// every dot becomes a [blk x D] x [D x blk] GEMM — a 16x16 MFMA shape.
+// fp32-equivalent to the exact form but NOT bit-equal (the product rounds
+// once per factor instead of once per pair).
+//
+//   q, k   : [B, H, S, D]  float, pre-normalised (the #L8 contract: k
+//                           L2-normalised, q L2-normalised + D^-1/2)
+//   beta   : [B, H, S]     float, scalar delta gate (folded on the j side,
+//                           exactly as the #L8 grams do)
+//   L      : [B, H, nc, cs, D] float, per-key within-chunk INCLUSIVE
+//            log-cumsum (log_gate of the normal-space gate; the layout the
+//            hip::kda_delta_rule_fwd_chunked_with_scratch cumsum launch
+//            produces). MONOTONE DECREASING in t required — the anchor
+//            argument keeps both exp factors <= 1.
+//   M      : [B, H, nc, cs, cs] float OUT — M[t][j] = b_j Σ_k G_{j+1,t}[k]
+//            k_j[k] k_t[k] for j < t (strict lower), 0 elsewhere.
+//   N      : [B, H, nc, cs, cs] float OUT — N[t][j] = b_j Σ_k G_{j+1,t}[k]
+//            k_j[k] q_t[k] for j <= t (incl diag), 0 elsewhere.
+//   blk must divide chunk_size (16 on the device rung).
+void kda_k3_grams_blocked_cpu(const float* q, const float* k,
+                              const float* beta, const float* L,
+                              float* M, float* N,
+                              int B, int H, int nc, int S, int D,
+                              int chunk_size, int blk);
+
+// ---------------------------------------------------------------------------
 // #P — kda_pack_bitmatrix: pack a binary matrix into bytes (MSB first)
 // ---------------------------------------------------------------------------
 //   bits   : [n_bits]        uint8  (each 0 or 1)
@@ -356,9 +402,28 @@ void kda_delta_rule_fwd_chunked(const float* q, const float* k,
                                 const float* beta, float* out,
                                 int B, int H, int S, int D, int chunk_size);
 
+// #L8a — block-anchored grams, the matrix-core rung (rung 1 of the
+// native HIP/CK ladder, docs/candidates/kda-native-hip-ck-ladder.md).
+// Device counterpart of kda_k3_grams_blocked_cpu: same inputs/outputs/
+// cell conventions (M strict lower, N incl diag, upper zeroed), same
+// anchor factorisation, one MFMA_F32_16x16x4K1 GEMM per (blk-row-block,
+// blk-col-block) pair. blk must be 16 on device (the MFMA M/N tile).
+// Selected inside kda_delta_rule_fwd_chunked_with_scratch by
+// VK_KDA_GRAM_MFMA=1 (default off — the proven scalar gram chain stays
+// the default until the gfx942 A/B, mirroring VK_KDA_CHUNKED_FUSED).
+// Primitive device/oracle parity qualified on gfx942 (Beverin687212):
+// D={16,32,64,128}, full-history and forgetting gates. Full-chain A/B and
+// performance qualification are separate; the dispatch remains opt-in.
+void kda_k3_grams_blocked(const float* q, const float* k, const float* beta,
+                          const float* L, float* M, float* N,
+                          int B, int H, int nc, int S, int D, int blk,
+                          void* stream = nullptr);
+
 // Tuning aid (#70): best wall time (us) of each chunked launch —
 // out_us[0]=cumsum, [1]=grams, [2]=chunk-local (inverse+GEMMs),
-// [3]=state pass, [4..9]=local-internal phase deltas (clock64/1000) —
+// [3]=state pass, [4..9]=local-internal phase deltas (clock64/1000),
+// [10]=block-anchored MFMA grams (0 on the CUDA shim), the rung-1 A/B hook —
+// out_us must hold 11 doubles.
 // over `iters` timed runs after a warmup of each. Same buffers/contract.
 void kda_chunked_phase_times(const float* q, const float* k, const float* v,
                              const float* g, const float* beta, float* state,

@@ -106,6 +106,16 @@ if(VKERNELS_HAS_HIP)
     ${VKERNELS_HIP_RUNTIME_INCLUDE_DIRS})
   set_property(TARGET vkernels_test_kda_chunked_fused_gpu APPEND PROPERTY
     COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__=1)
+
+  # Native gfx942 MFMA grams: compare all supported widths with the CPU
+  # blocked oracle, including strict-triangle masks and forgetting gates.
+  set_source_files_properties(kernels/attn/test_kda_grams_gpu.cpp
+    PROPERTIES LANGUAGE HIP)
+  add_executable(vkernels_test_kda_grams_gpu
+    kernels/attn/test_kda_grams_gpu.cpp)
+  target_compile_features(vkernels_test_kda_grams_gpu PRIVATE cxx_std_17)
+  target_link_libraries(vkernels_test_kda_grams_gpu PRIVATE vkernels)
+  add_test(NAME kda_grams_gpu COMMAND vkernels_test_kda_grams_gpu)
 endif()
 
 # DSA top-k fused-chain GPU test (fusion lane dsa-topk-tailfold): the device

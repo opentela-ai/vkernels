@@ -15,6 +15,8 @@
 //     "ab chunked B=1 H=.. S=.. D=.. us(min)=.. us(med)=.. TFLOP/s=.. GB/s=.. AI=.. bound=mem"
 //     "ab H=.. S=.. D=.. coop=..us chunked=..us speedup=..x"
 //   bench_kda_chunked phases H S D   per-launch phase decomposition
+//     (incl. the rung-1 A/B hook: gram (scalar, per-pair) vs gram_mfma
+//     (block-anchored MFMA, the native HIP/CK ladder — out_us[10])
 //   bench_kda_chunked          sweep H in {1,8,16,32,64,128} at S=512 D=128 (legacy
 //                              one-line format; run one shape per process on
 //                              beverin via ab_kda_chunked_mi300.sh instead)
@@ -241,13 +243,16 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(dv, v.data(), m * 4, hipMemcpyHostToDevice), "cv");
     CK(hipMemcpy(dg, g.data(), g.size() * 4, hipMemcpyHostToDevice), "cg");
     CK(hipMemcpy(db, beta.data(), ng * 4, hipMemcpyHostToDevice), "cb");
-    double us[10] = {0};
+    double us[11] = {0};
     hipk::kda_chunked_phase_times(dq, dk, dv, dg, db, dstate, dout, dscratch,
                                   1, H, S, D, 10, us);
     std::printf("phases H=%d S=%d D=%d  cumsum=%.1fus gram=%.1fus "
                 "local=%.1fus state=%.1fus  (sum %.1f)\n",
                 H, S, D, us[0], us[1], us[2], us[3],
                 us[0] + us[1] + us[2] + us[3]);
+    std::printf("  rung1 gramsab: scalar=%.1fus mfma=%.1fus (%.2fx)\n",
+                us[1], us[10],
+                us[10] > 0 ? us[1] / us[10] : 0.0);
     std::printf("  local phases: Mnload+p0=%.1f inv2a=%.1f inv2b=%.1f "
                 "gemm3=%.1f gemm4=%.1f\n",
                 us[4], us[5], us[6], us[7], us[8]);
