@@ -57,6 +57,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 
 #include "vkernels/kernels/dsa.hpp"
 #include "vkernels/util/error.hpp"  // VK_EXPECTS (host: throws std::invalid_argument)
@@ -989,13 +990,15 @@ __global__ void dsa_sparse_fwd_partial_kernel(
 #define VK_DSA_WARP_SYNC() __syncwarp()
 #endif
 
-template <int BQ>
+template <int BQ, bool SkipInvalid = false, int Dim = 0, int Tail = -1>
 __global__ void dsa_sparse_fwd_partial_db_kernel(
     const uint16_t* __restrict__ q, const uint16_t* __restrict__ kv,
     const int32_t* __restrict__ indices, float* __restrict__ part_out,
     float* __restrict__ part_lse,
-    int S_q, int S_kv, int H, int dim, int tail_dim, int topk, int kv_group,
+    int S_q, int S_kv, int H, int dim_arg, int tail_arg, int topk, int kv_group,
     float sm_scale, int split_kv, int kti, int pipeline) {
+  const int dim = Dim > 0 ? Dim : dim_arg;
+  const int tail_dim = Tail >= 0 ? Tail : tail_arg;
   // Issue #80: double-buffered variant of dsa_sparse_fwd_partial_kernel.
   // Key tiles are staged into LDS so the global loads of tile i+1 issue
   // while the warp runs the online-softmax update over tile i (gfx942 has
@@ -1125,6 +1128,13 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
       const uint16_t* rowp =
           sKey + (size_t)((buf * BQ + warp) * kti + tk) * W;
       const bool valid = (idx >= 0) && (idx < S_kv);
+
+      // All lanes of this wave own the same selected key. A masked key
+      // contributes neither a score nor a value. Keep split boundaries,
+      // staging order and every valid key's arithmetic unchanged.
+      if constexpr (SkipInvalid) {
+        if (!valid) continue;
+      }
 
       // --- lane-local partial score (main + tail), then warp-reduce ---
       float partial = 0.0f;
@@ -1491,6 +1501,16 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
     const char* e = std::getenv("VK_DSA_DBPIPE");
     return e ? std::atoi(e) : 1;
   }();
+  // Experimental, process-latched opt-in. Capture records the chosen kernel;
+  // replay still reads current indices, including newly masked keys.
+  static const bool skip_invalid = [] {
+    const char* e = std::getenv("VK_DSA_SKIP_INVALID");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  static const bool fixed_width = [] {
+    const char* e = std::getenv("VK_DSA_DB_WIDTH");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
   if (db_mode == 0) return false;
   const int W = dim + tail_dim;
   const size_t shq = (size_t)BQ * (size_t)W * 4u;                // sQ
@@ -1533,13 +1553,25 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
   }
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, split_kv);
-  dsa_sparse_fwd_partial_db_kernel<BQ><<<grid, block, shmem, stream>>>(
+  const auto launch = [&](auto skip, auto width) {
+    constexpr int kDim = decltype(width)::value;
+    dsa_sparse_fwd_partial_db_kernel<BQ, decltype(skip)::value, kDim,
+                                   kDim ? 0 : -1>
+        <<<grid, block, shmem, stream>>>(
       reinterpret_cast<const uint16_t*>(q),
       reinterpret_cast<const uint16_t*>(kv),
       reinterpret_cast<const int32_t*>(indices),
       reinterpret_cast<float*>(part_out), reinterpret_cast<float*>(part_lse),
       S_q, S_kv, H, dim, tail_dim, topk, kv_group, sm_scale, split_kv, kti,
       dbpipe);
+  };
+  if (fixed_width && dim == 512 && tail_dim == 0) {
+    if (skip_invalid) launch(std::true_type{}, std::integral_constant<int, 512>{});
+    else launch(std::false_type{}, std::integral_constant<int, 512>{});
+  } else {
+    if (skip_invalid) launch(std::true_type{}, std::integral_constant<int, 0>{});
+    else launch(std::false_type{}, std::integral_constant<int, 0>{});
+  }
   return true;
 }
 
