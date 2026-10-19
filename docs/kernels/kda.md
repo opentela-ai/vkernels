@@ -271,3 +271,19 @@ rocprof per-launch average 6.15 µs. Output identical to the one-thread
 layout (max_abs_diff 3e-7) and to the CPU oracle (max_rel 1e-6,
 test_kda_correct 11/11 PASS). The one-thread-per-row kernel remains as
 the fallback for `D % 4 != 0`.
+
+---
+
+## Native HIP/CK ladder (in progress, `perf3/kda-hip`)
+
+The matrix-core follow-up to the chunked WY chain: the two dominant
+phases (grams 1325 µs, state pass 1333 µs at H=32 S=2048 D=128 on
+gfx942) are scalar today. Rung 1 (block-anchored MFMA grams — the
+trainer's `_wy_grams` factorisation, 65× fewer exp, 16×16 MFMA tiles)
+is **skeletonised** in `kda.hip` (`kda_k3_gram_mfma_kernel`, selectable
+via `VK_KDA_GRAM_MFMA=1`, default off) with its CPU oracle
+`kda_k3_grams_blocked_cpu` + host tests landed. The golden-tensor
+harness `bench/kda_trainer_golden.py` generates trainer-reference
+goldens (both layout conventions) for the device-parity gates. Full
+piece→kernel map, MFMA tiling, triangular-solve placement and effort
+estimates: [`docs/candidates/kda-native-hip-ck-ladder.md`](../candidates/kda-native-hip-ck-ladder.md).

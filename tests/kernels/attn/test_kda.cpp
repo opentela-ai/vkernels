@@ -8,7 +8,10 @@
 // pipeline) implements the OLD standard gated delta rule (scalar gate
 // [B,H,S], pre-gate prediction) -- a DIFFERENT recurrence -- and is cross-
 // checked against an inline standard-rule oracle (kda_standard_delta_rule_fwd
-// below) at random gates and at full-history (g==1) accumulation.
+// below) at random gates and at full-history (g==1) accumulation. The
+// block-anchored grams oracle (#L8a, rung 1 of the native HIP/CK ladder) is
+// cross-checked against the exact per-pair grams of the chunked WY path
+// (k3_exact_grams below).
 #include "minitest.hpp"
 
 #include <cmath>
@@ -301,6 +304,204 @@ TEST(KdaPackBitmatrix, EmptyIsNoOp) {
   std::vector<uint8_t> packed = {9};
   kda_pack_bitmatrix_cpu(nullptr, packed.data(), 0);
   EXPECT_EQ(packed[0], 9);
+}
+
+// --- #L8a block-anchored grams (rung 1 of the native HIP/CK ladder) ----
+// Reference: the EXACT per-pair grams inside kda_delta_rule_fwd_state_cpu
+// (M[t][j] = b_j Σ_k exp(L_t−L_j) k_j k_t, strict lower; N the same with
+// q, tril-inclusive; upper cells zeroed), spelled inline. The blocked
+// oracle (kda_k3_grams_blocked_cpu) must match it within the fp32
+// round-off of the two-sided exp factorisation — the same class of
+// agreement the trainer measured for _wy_grams vs its mask reference.
+
+// Per-key within-chunk INCLUSIVE log-cumsum for all (b,h,c) — the layout
+// the oracle consumes ([B,H,nc,cs,D], monotone decreasing in t; log(0)
+// clamp exactly as kda.cpp's log_gate).
+static void k3_build_L(const std::vector<float>& g, int B, int H, int nc,
+                        int S, int D, int cs, std::vector<float>* L) {
+  L->assign((size_t)B * H * nc * cs * D, 0.0f);
+  for (int bh = 0; bh < B * H; ++bh)
+    for (int c = 0; c < nc; ++c) {
+      const size_t tok = (size_t)bh * S + (size_t)c * cs;
+      const size_t lb = ((size_t)bh * nc + c) * cs * D;
+      for (int e = 0; e < D; ++e) {
+        float acc = 0.0f;
+        for (int t = 0; t < cs; ++t) {
+          const float gg = g[(tok + t) * D + e];
+          acc += (gg <= 0.0f) ? -1.0e9f : std::log(gg);
+          (*L)[lb + (size_t)t * D + e] = acc;
+        }
+      }
+    }
+}
+
+// The exact per-pair grams (the reference the blocked form must match).
+// Same signature discipline as kda_k3_grams_blocked_cpu but taking the
+// normal-space gate g (it builds its own L via k3_build_L).
+static void k3_exact_grams(const std::vector<float>& q,
+                           const std::vector<float>& k,
+                           const std::vector<float>& beta,
+                           const std::vector<float>& g, int B, int H, int nc,
+                           int S, int D, int cs, std::vector<float>* M,
+                           std::vector<float>* N) {
+  std::vector<float> L;
+  k3_build_L(g, B, H, nc, S, D, cs, &L);
+  M->assign((size_t)B * H * nc * cs * cs, 0.0f);
+  N->assign((size_t)B * H * nc * cs * cs, 0.0f);
+  for (int bh = 0; bh < B * H; ++bh)
+    for (int c = 0; c < nc; ++c) {
+      const size_t tok = (size_t)bh * S + (size_t)c * cs;
+      const size_t lb = ((size_t)bh * nc + c) * cs * D;
+      const size_t lbq = ((size_t)bh * nc + c) * cs * cs;
+      for (int t = 0; t < cs; ++t)
+        for (int j = 0; j <= t; ++j) {
+          float mk = 0.0f, nk = 0.0f;
+          for (int e = 0; e < D; ++e) {
+            const float gw =
+                std::exp(L[lb + (size_t)t * D + e] - L[lb + (size_t)j * D + e]);
+            mk += gw * k[(tok + j) * D + e] * k[(tok + t) * D + e];
+            nk += gw * k[(tok + j) * D + e] * q[(tok + t) * D + e];
+          }
+          const float bj = beta[tok + j];
+          (*M)[lbq + (size_t)t * cs + j] = (j < t) ? bj * mk : 0.0f;
+          (*N)[lbq + (size_t)t * cs + j] = bj * nk;
+        }
+    }
+}
+
+TEST(KdaK3GramsBlocked, MatchesExactPairwiseGrams) {
+  // Random per-key gates in (0.05, 1], k L2-normalised (the #L8 contract),
+  // several (cs, blk, D) combos incl. the K3 head shapes and the device
+  // rung's blk=16. Tolerance: the blocked form rounds exp once per factor
+  // (rel ~1e-7 each; |M|,|N| <= ~1 after beta) — 2e-4 abs is generous but
+  // still 3 orders below anything a gate-shape or sign regression moves.
+  struct { int cs, blk, D; } cases[] = {
+      {16, 4, 16}, {16, 8, 32}, {32, 8, 128}, {64, 16, 128}, {64, 16, 64}};
+  for (const auto& tc : cases) {
+    const int B = 1, H = 2, nc = 3, S = nc * tc.cs;
+    std::mt19937 rng(7 + tc.cs + tc.blk);
+    auto rf = [&]() { return (float)(rng() % 2000) / 1000.0f - 1.0f; };
+    auto rg = [&]() { return 0.05f + 0.95f * (rng() % 1000) / 1000.0f; };
+    const size_t m = (size_t)B * H * S * tc.D;
+    std::vector<float> q(m), k(m), g(m), beta((size_t)B * H * S);
+    for (auto& x : q) x = rf();
+    for (auto& x : k) x = rf();
+    for (auto& x : g) x = rg();
+    for (auto& x : beta) x = 0.3f + 0.7f * (rng() % 1000) / 1000.0f;
+    for (int x = 0; x < B * H * S; ++x) {  // L2-normalise k (the contract)
+      float* kk = k.data() + (size_t)x * tc.D;
+      float n = 0.0f;
+      for (int e = 0; e < tc.D; ++e) n += kk[e] * kk[e];
+      n = 1.0f / std::sqrt(n + 1e-12f);
+      for (int e = 0; e < tc.D; ++e) kk[e] *= n;
+    }
+    std::vector<float> L;
+    k3_build_L(g, B, H, nc, S, tc.D, tc.cs, &L);
+    std::vector<float> Mb((size_t)B * H * nc * tc.cs * tc.cs), Nb(Mb.size()),
+        Me, Ne;
+    kda_k3_grams_blocked_cpu(q.data(), k.data(), beta.data(), L.data(),
+                             Mb.data(), Nb.data(), B, H, nc, S, tc.D, tc.cs,
+                             tc.blk);
+    k3_exact_grams(q, k, beta, g, B, H, nc, S, tc.D, tc.cs, &Me, &Ne);
+    for (size_t i = 0; i < Me.size(); ++i) {
+      EXPECT_NEAR(Mb[i], Me[i], 2e-4f);
+      EXPECT_NEAR(Nb[i], Ne[i], 2e-4f);
+    }
+  }
+}
+
+TEST(KdaK3GramsBlocked, FullHistoryEdgeAndStructure) {
+  // g == 1 everywhere -> L == 0 -> the grams degenerate to the plain
+  // beta-weighted Gram/dot products: M[t][j] = b_j (k_j . k_t),
+  // N[t][t] = b_t (k_t . q_t) on the diagonal. Also checks the cell
+  // structure the (2b) local kernel relies on: M strict lower + zero
+  // diagonal, N tril-inclusive, strict-upper cells of both exactly 0.
+  constexpr int B = 1, H = 1, nc = 2, cs = 32, blk = 16, D = 32;
+  const int S = nc * cs;
+  std::mt19937 rng(3);
+  auto rf = [&]() { return (float)(rng() % 2000) / 1000.0f - 1.0f; };
+  const size_t m = (size_t)B * H * S * D;
+  std::vector<float> q(m), k(m), g(m, 1.0f), beta((size_t)B * H * S, 0.5f),
+      L((size_t)B * H * nc * cs * D, 0.0f);  // log(1)=0 -> L stays 0
+  for (auto& x : q) x = rf();
+  for (auto& x : k) x = rf();
+  for (int x = 0; x < B * H * S; ++x) {
+    float* kk = k.data() + (size_t)x * D;
+    float n = 0.0f;
+    for (int e = 0; e < D; ++e) n += kk[e] * kk[e];
+    n = 1.0f / std::sqrt(n + 1e-12f);
+    for (int e = 0; e < D; ++e) kk[e] *= n;
+  }
+  std::vector<float> M((size_t)B * H * nc * cs * cs), N(M.size());
+  kda_k3_grams_blocked_cpu(q.data(), k.data(), beta.data(), L.data(),
+                           M.data(), N.data(), B, H, nc, S, D, cs, blk);
+  for (int c = 0; c < nc; ++c) {
+    const size_t lbq = ((size_t)c) * cs * cs;
+    for (int t = 0; t < cs; ++t)
+      for (int j = 0; j < cs; ++j) {
+        const float mcell = M[lbq + (size_t)t * cs + j];
+        const float ncell = N[lbq + (size_t)t * cs + j];
+        if (j > t) {
+          EXPECT_EQ(mcell, 0.0f);
+          EXPECT_EQ(ncell, 0.0f);
+        }
+        if (j == t) {
+          EXPECT_EQ(mcell, 0.0f);  // M diagonal is 0
+          float kq = 0.0f;
+          for (int e = 0; e < D; ++e)
+            kq += k[((size_t)c * cs + t) * D + e] * q[((size_t)c * cs + t) * D + e];
+          EXPECT_NEAR(ncell, 0.5f * kq, 1e-5f);  // b_t (k_t . q_t)
+        }
+        if (j < t) {
+          float kk_ = 0.0f;
+          for (int e = 0; e < D; ++e)
+            kk_ += k[((size_t)c * cs + j) * D + e] * k[((size_t)c * cs + t) * D + e];
+          EXPECT_NEAR(mcell, 0.5f * kk_, 1e-5f);  // b_j (k_j . k_t)
+        }
+      }
+  }
+}
+
+TEST(KdaK3GramsBlocked, ContractThrowsAndZeroSizeNoOp) {
+  const int B = 1, H = 1, nc = 1, S = 16, D = 8, cs = 16, blk = 8;
+  std::vector<float> q((size_t)S * D, 0.5f), k(q), beta(S, 0.5f),
+      L((size_t)nc * cs * D, -0.1f), M((size_t)nc * cs * cs), N(M.size());
+  // null args (with work present) throw
+  EXPECT_THROW(kda_k3_grams_blocked_cpu(nullptr, k.data(), beta.data(),
+                                         L.data(), M.data(), N.data(), B, H,
+                                         nc, S, D, cs, blk),
+               std::invalid_argument);
+  EXPECT_THROW(kda_k3_grams_blocked_cpu(q.data(), nullptr, beta.data(),
+                                         L.data(), M.data(), N.data(), B, H,
+                                         nc, S, D, cs, blk),
+               std::invalid_argument);
+  EXPECT_THROW(kda_k3_grams_blocked_cpu(q.data(), k.data(), nullptr,
+                                         L.data(), M.data(), N.data(), B, H,
+                                         nc, S, D, cs, blk),
+               std::invalid_argument);
+  EXPECT_THROW(kda_k3_grams_blocked_cpu(q.data(), k.data(), beta.data(),
+                                         nullptr, M.data(), N.data(), B, H,
+                                         nc, S, D, cs, blk),
+               std::invalid_argument);
+  EXPECT_THROW(kda_k3_grams_blocked_cpu(q.data(), k.data(), beta.data(),
+                                         L.data(), nullptr, N.data(), B, H,
+                                         nc, S, D, cs, blk),
+               std::invalid_argument);
+  EXPECT_THROW(kda_k3_grams_blocked_cpu(q.data(), k.data(), beta.data(),
+                                         L.data(), M.data(), nullptr, B, H,
+                                         nc, S, D, cs, blk),
+               std::invalid_argument);
+  // blk must divide cs
+  EXPECT_THROW(kda_k3_grams_blocked_cpu(q.data(), k.data(), beta.data(),
+                                         L.data(), M.data(), N.data(), B, H,
+                                         nc, S, D, cs, 12),
+               std::invalid_argument);
+  // zero-size is a no-op (no throw, nothing written)
+  std::vector<float> M0(4, -1.0f), N0(4, -1.0f);
+  kda_k3_grams_blocked_cpu(q.data(), k.data(), beta.data(), L.data(),
+                           M0.data(), N0.data(), 0, H, nc, S, D, cs, blk);
+  EXPECT_EQ(M0[0], -1.0f);
+  EXPECT_EQ(N0[3], -1.0f);
 }
 
 // --- null-arg contracts ------------------------------------------------------

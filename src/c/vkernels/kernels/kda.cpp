@@ -566,6 +566,94 @@ void kda_delta_rule_fwd_state_cpu(
 }
 
 // ---------------------------------------------------------------------------
+// #L8a kda_k3_grams_blocked: block-anchored gate-weighted grams (the
+// matrix-core rung's math — rung 1 of the native HIP/CK ladder; see the
+// full derivation/overflow analysis on the kda.hpp declaration and
+// docs/candidates/kda-native-hip-ck-ladder.md).
+//
+// Per (row-block P, col-block Q <= P) of blk rows/cols, with the anchor
+// S[k] = L[col_end(Q)-1][k] (monotone-decreasing L keeps both exp
+// factors <= 1; only the diagonal block carries a positive exponent,
+// bounded by one block's decay):
+//   a^k_t[d] = exp(L_t - S)[d] k_t[d]          (row operand, M)
+//   a^q_t[d] = exp(L_t - S)[d] q_t[d]          (row operand, N)
+//   b_j[d]   = b_j exp(S - L_j)[d] k_j[d]      (col operand, both)
+//   M[t][j]  = Σ_d a^k_t[d] b_j[d]   (j < t)   N[t][j] = Σ_d a^q_t[d] b_j[d]
+//                                                                           (j <= t)
+void kda_k3_grams_blocked_cpu(const float* q, const float* k,
+                              const float* beta, const float* L,
+                              float* M, float* N,
+                              int B, int H, int nc, int S, int D,
+                              int chunk_size, int blk) {
+  VK_EXPECTS(B == 0 || H == 0 || nc == 0 || q != nullptr, "q must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || nc == 0 || k != nullptr, "k must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || nc == 0 || beta != nullptr,
+             "beta must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || nc == 0 || L != nullptr, "L must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || nc == 0 || M != nullptr, "M must not be null");
+  VK_EXPECTS(B == 0 || H == 0 || nc == 0 || N != nullptr, "N must not be null");
+  VK_EXPECTS(D > 0, "D must be positive");
+  VK_EXPECTS(chunk_size > 0 && blk > 0 && chunk_size % blk == 0,
+             "blk must divide chunk_size");
+  if (B == 0 || H == 0 || nc == 0) return;
+
+  const int cs = chunk_size;
+  const int nblk = cs / blk;
+  std::vector<float> ak((size_t)blk * D), aq((size_t)blk * D),
+      b((size_t)blk * D);
+  for (int bh = 0; bh < B * H; ++bh)
+    for (int c = 0; c < nc; ++c) {
+      const size_t tok = (size_t)bh * S + (size_t)c * cs;
+      const size_t lb = ((size_t)bh * nc + c) * cs * D;
+      const size_t lbq = ((size_t)bh * nc + c) * cs * cs;
+      // strict-upper cells of both grams (never written by any pair —
+      // pairs only cover Q <= P) plus the M diagonal: the chunk-local
+      // kernel reads full rows, so they must be 0, not stale
+      for (int t = 0; t < cs; ++t) {
+        M[lbq + (size_t)t * cs + t] = 0.0f;
+        for (int j = t + 1; j < cs; ++j) {
+          M[lbq + (size_t)t * cs + j] = 0.0f;
+          N[lbq + (size_t)t * cs + j] = 0.0f;
+        }
+      }
+      for (int p = 0; p < nblk; ++p) {
+        const int i0 = p * blk;
+        for (int qb = 0; qb <= p; ++qb) {
+          const int j0 = qb * blk, j1 = j0 + blk;
+          // exp-folded operand tiles for this (P, Q) pair
+          for (int i = 0; i < blk * D; ++i) {
+            const int t = i / D, e = i % D;
+            const float s = L[lb + (size_t)(j1 - 1) * D + e];
+            const float lt = L[lb + (size_t)(i0 + t) * D + e];
+            const float ew = std::exp(lt - s);
+            ak[(size_t)i] = ew * k[(tok + (size_t)(i0 + t)) * D + e];
+            aq[(size_t)i] = ew * q[(tok + (size_t)(i0 + t)) * D + e];
+          }
+          for (int i = 0; i < blk * D; ++i) {
+            const int j = i / D, e = i % D;
+            const float s = L[lb + (size_t)(j1 - 1) * D + e];
+            const float lj = L[lb + (size_t)(j0 + j) * D + e];
+            b[(size_t)i] = beta[tok + (size_t)(j0 + j)] * std::exp(s - lj) *
+                           k[(tok + (size_t)(j0 + j)) * D + e];
+          }
+          for (int t = 0; t < blk; ++t)
+            for (int j = 0; j < blk; ++j) {
+              const int gt = i0 + t, gj = j0 + j;
+              if (gj > gt) continue;  // pair-local upper cells stay 0
+              float mk = 0.0f, nk = 0.0f;
+              for (int e = 0; e < D; ++e) {
+                mk += ak[(size_t)t * D + e] * b[(size_t)j * D + e];
+                nk += aq[(size_t)t * D + e] * b[(size_t)j * D + e];
+              }
+              M[lbq + (size_t)gt * cs + gj] = (gj < gt) ? mk : 0.0f;
+              N[lbq + (size_t)gt * cs + gj] = nk;  // incl diag (gj == gt)
+            }
+        }
+      }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #P pack_bitmatrix (MSB-first)
 // ---------------------------------------------------------------------------
 void kda_pack_bitmatrix_cpu(const uint8_t* bits, uint8_t* packed,
