@@ -118,7 +118,7 @@ trailing-`void* stream` convention is identical).
    `nm -D build/cuda/src/c/libvkernels_c.so | grep vk_hip_dsa_kpool`
    → four hits. (Reference build: `meta/scripts/build_dsa_kpool_a100_cuda.sh`.)
 2. **Offline correctness** (no sglang needed): `ctest --test-dir build/cuda
-   -R dsa_kpool_device_cuda` (or run `meta/benchmarks/test_dsa_kpool_correct`
+   -R dsa_kpool_device` (or run `build/cuda/tests/test_dsa_kpool_correct`
    directly) → device-vs-oracle **14/14 PASS** on the GPU. Registered as a
    CTest test on every CUDA build; CI runs it on every PR.
 3. **Wire the indexer**: point `dsa/dsa_indexer_kpool.py::_compress_write` /
@@ -130,7 +130,9 @@ trailing-`void* stream` convention is identical).
    `ValueError("type fp8e4nv ...")` — the original blocker.
 5. **Serving-parity gate**: 2-node PP2 `gen_correctness.py` reaches
    `verdict=PASS pass=5/6 crisp=3/3` — parity with the Clariden runs.
-6. **Perf sanity** (optional): `meta/benchmarks/dsa_kpool_bench` — expect
+6. **Perf sanity** (optional): `build/cuda/meta/benchmarks/dsa_kpool_bench`
+   (source `meta/benchmarks/bench_dsa_kpool.hip`; configure with
+   `-DVKERNELS_BUILD_BENCHMARKS=ON`) — expect
    6–22 µs per step, launch-bound (see A100.md); noise against a ms-scale
    decode pass. No regression risk expected from the swap itself.
 
@@ -188,8 +190,8 @@ sbatch --export=ALL,GEN_PROBE_TIMEOUT=900,GEN_CORRECTNESS_PER_REQ_TIMEOUT=300 \
 
 * Host oracles + C ABI wiring: `tests/kernels/attn/test_dsa_kpool{,_fp8}.cpp`,
   `tests/capi/test_capi.cpp` (run in every CI job, host and CUDA).
-* Device-vs-oracle on the actual GPU: `meta/benchmarks/test_dsa_kpool_correct.hip`,
-  registered as CTest `dsa_kpool_device_cuda` (CUDA builds; skips with code
+* Device-vs-oracle on the actual GPU: `tests/kernels/attn/test_dsa_kpool_correct.hip`,
+  registered as CTest `dsa_kpool_device` (CUDA builds; skips with code
   77 on GPU-less boxes), executed by the CI `cuda` job.
 * Device-ABI python wrappers + bf16/no-fp8e4nv contract:
   `tests/python/test_dsa_kpool_device.py` (stdlib unittest; runs anywhere,

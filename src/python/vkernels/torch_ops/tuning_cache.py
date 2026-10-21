@@ -99,6 +99,29 @@ def device_fingerprint(device=None) -> dict:
     }
 
 
+_DEVICE_IDENTITIES: dict = {}  # device index -> (fingerprint, identity)
+
+
+def _device_identity(device=None) -> tuple[dict, str]:
+    """Memoized ``(device_fingerprint(device), canonical JSON of it)``.
+
+    The fingerprint is fixed for a device index within one process (props
+    and software versions do not change), so the autotuner hot path pays
+    one dict lookup instead of a property query + ``json.dumps`` per launch.
+    """
+    import torch
+
+    index = getattr(device, "index", device)
+    if index is None:
+        index = torch.cuda.current_device()
+    cached = _DEVICE_IDENTITIES.get(index)
+    if cached is None:
+        fingerprint = device_fingerprint(index)
+        cached = (fingerprint, json.dumps(fingerprint, sort_keys=True))
+        _DEVICE_IDENTITIES[index] = cached
+    return cached
+
+
 def fingerprint_file(path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as source:
@@ -391,8 +414,7 @@ class PersistentAutotuner:
             # Compile-only: no launch, no benchmarking, no store write.
             return self.fn.run(*args, grid=grid, warmup=True, **kwargs)
         device = next((v.device for v in (*args, *kwargs.values()) if getattr(v, "is_cuda", False)), None)
-        fingerprint = device_fingerprint(device)
-        identity = json.dumps(fingerprint, sort_keys=True)
+        fingerprint, identity = _device_identity(device)
         if identity not in self._stores:
             self._stores[identity] = TuningCache(
                 self._cache.kernel_name, self._cache.source_files,

@@ -25,7 +25,8 @@ nvcc --version | tail -1
 echo
 
 echo "== cmake configure (CUDA-only node: ROCm absent, nvcc present) =="
-cmake -S "$SRC" -B "$B" -DCMAKE_BUILD_TYPE=Release -DVKERNELS_BUILD_HIP=OFF
+cmake -S "$SRC" -B "$B" -DCMAKE_BUILD_TYPE=Release -DVKERNELS_BUILD_HIP=OFF \
+  -DVKERNELS_BUILD_BENCHMARKS=ON
 echo
 
 echo "== build =="
@@ -33,7 +34,7 @@ cmake --build "$B" --target test_dsa_kpool_correct dsa_kpool_bench -j 16
 echo
 
 echo "== device correctness (device kernels vs host oracle) =="
-"$B/meta/benchmarks/test_dsa_kpool_correct"
+"$B/tests/test_dsa_kpool_correct"
 echo
 
 echo "== benchmark =="

@@ -135,7 +135,7 @@ bool gemv_decode_fp8_splitk(std::size_t M, std::size_t N, std::size_t K,
 // Decode-GEMV v2 entries (issue #156 follow-up) -- EXPERIMENTAL, NOT
 // RECOMMENDED: measured on MI300A 6-21% SLOWER than the v1 entries above
 // across all issue shapes (occupancy cost of acc[M][8] + halved TLP at
-// TB=8; see docs/performance/moe-fused/gfx942.md and NOTES-156.md).
+// TB=8; see docs/performance/moe-fused/gfx942.md and docs/reports/NOTES-156.md).
 // Kept only so the A/B is reproducible. Fixed TB=8 exact uint4 weight
 // tiles, KK-way multi-K register blocking, optional global-memory A
 // reads (a_gmem=true: no LDS stage / barrier). Both variants keep the

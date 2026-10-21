@@ -747,7 +747,7 @@ int main() {
   // per-element-rounded contract (oracle = gemm_bf16_cpu on the bf16
   // ROUNDED dequantized weights, same as the v1 section above). A
   // deferred-scale variant was measured on MI300A and rejected for
-  // register-pressure spills (~5-6x slower) -- see NOTES-156.md.
+  // register-pressure spills (~5-6x slower) -- see docs/reports/NOTES-156.md.
   {
     struct Case { int M, N, K, S, kk, th; float beta; bool fp8, gm;
                   const char* what; };

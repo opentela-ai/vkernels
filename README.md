@@ -1,10 +1,11 @@
-# vkernels — low-level CUDA kernels and communication primitives
+# vkernels — low-level CUDA and HIP kernels and communication primitives
 
 `vkernels` is the kernel layer for [opentela](https://github.com/opentela-ai): hand-tuned
-CUDA kernels and the communication primitives (collectives, overlap, topology) that sit
-beside them. Everything ships with a **CPU reference implementation** so it can be unit-tested
-and measured for coverage on machines **without a GPU**, and a CUDA implementation that is
-compiled automatically when a CUDA toolkit is present.
+CUDA and HIP (ROCm) kernels and the communication primitives (collectives, overlap,
+topology) that sit beside them. Everything ships with a **CPU reference implementation** so
+it can be unit-tested and measured for coverage on machines **without a GPU**, and a device
+implementation that is compiled automatically when a CUDA toolkit (or, with
+`VKERNELS_BUILD_HIP=ON`, ROCm) is present.
 
 > **Documentation in depth:** the [project wiki](https://github.com/opentela-ai/vkernels/wiki)
 > distills the engineering knowledge — the roofline method, the kernel optimization ladder,
@@ -18,43 +19,48 @@ compiled automatically when a CUDA toolkit is present.
 vkernels/
 ├── pyproject.toml            # Python project (src/python/vkernels), managed with uv
 ├── uv.lock                   #   `uv sync` installs the `vkl` CLI + deps
-├── src/c/                     # C++/CUDA sources (the kernel library)
-│   └── vkernels/
-│       ├── util/             # Span, error/status, logging, build annotations
-│       ├── core/             # device, stream, allocator abstractions
-│       ├── kernels/          # low-level CUDA kernels, each with a CPU oracle
-│       │   ├── elementwise/  #   add, scale, relu, …
-│       │   ├── reduce/       #   block/grid reduction
-│       │   └── gemm/         #   tiled SGEMM
-│       └── comm/             # communication optimisation
-│           ├── topology.{hpp,cpp}   #   rank/world/peer discovery
-│           ├── channel.{hpp,cpp}    #   transport abstraction + mock backend
-│           ├── allreduce.{hpp,cpp,cu}#  ring all-reduce
-│           ├── overlap.{hpp,cpp}    #   compute/communication overlap
-│           └── pipeline_boundary.{hpp,cpp,cu} # graph-capturable PP boundary (#10)
+├── src/
+│   ├── c/vkernels/           # C++/CUDA/HIP sources (the kernel library)
+│   │   ├── util/             #   Span, error/status, logging, build annotations
+│   │   ├── core/             #   device, stream, allocator, native tuning store
+│   │   ├── kernels/          #   flat: <family>.hpp + .cpp CPU oracle + .cu and/or .hip
+│   │   │   │                 #   (elementwise, reduce, gemm, gemm_bf16, gemm_grouped,
+│   │   │   │                 #    mqa_logits, dsa, dsa_kpool, dsa_topk, mla, kda, mhc,
+│   │   │   │                 #    moe, moe_aux, moe_fused, glm_moe)
+│   │   │   ├── common/       #     shared epilogue / heuristics / launch helpers
+│   │   │   └── cuda_compat/  #     HIP-on-CUDA shim headers (build .hip sources with nvcc)
+│   │   ├── comm/             #   topology, channels, allreduce, overlap, pipeline boundary,
+│   │   │                     #   p2p/kv gather/scatter, cross-node KV, fabric import, RCCL
+│   │   ├── dist/             #   distributed MoE sharding + orchestration (#18)
+│   │   └── capi/             #   C ABI shims (extern "C" + exception translation)
+│   ├── python/vkernels/      # Python package: `vkl` CLI + kernel bindings
+│   │   ├── cli/              #   argparse CLI (`list`, `info`, …)
+│   │   ├── torch_ops/        #   device-op kernels adopted from floe (see below)
+│   │   ├── compiler/         #   CuTe DSL / Triton megakernel model compiler
+│   │   ├── cutedsl/          #   CuTe DSL kernels (flash attention, tensor-op GEMM)
+│   │   ├── tuning/           #   op-config cache: tune once per (op, arch, shape), replay
+│   │   ├── numerics/         #   standalone verification: tolerances, compare, bisect
+│   │   ├── benchmark/        #   benchmark harness: timing, throughput models, CI compare
+│   │   ├── kernels.py        #   add/scale/relu/sum/max/gemm (public API)
+│   │   ├── comm.py           #   topology/channels/allreduce/overlap/p2p
+│   │   ├── core.py           #   Device/Stream
+│   │   ├── hip_dsa_mhc.py    #   ctypes bridge to libvkernels_hip (DSA/MHC/KDA)
+│   │   ├── _core.cpp         #   optional pybind11 backend (built by CMake)
+│   │   └── _fallback.py      #   pure-Python reference (no build needed)
+│   └── rust/                 # Rust bindings (workspace: `vkernels-sys` FFI + `vkernels` safe API)
 ├── tests/                    # C++ unit tests mirroring src/c/ (100% line coverage target)
-│   ├── python/               #   Python tests (vkl CLI + bindings)
+│   ├── python/               #   Python tests (vkl CLI, bindings, torch_ops parity)
 │   └── third_party/minitest.hpp     # dependency-free test harness
+├── bench/                    # Python A/B and parity benchmarks (Triton/vendored donors)
 ├── meta/                     # build support: cmake, scripts, docker, benchmarks
-│   ├── cmake/                #   CMake helpers (CUDA, coverage, sanitizers, testing)
-│   ├── scripts/              #   build / test / coverage / format helpers
+│   ├── cmake/                #   CMake helpers (CUDA/HIP, coverage, sanitizers, testing, benchmarks)
+│   ├── scripts/              #   build / test / A/B / on-device run helpers
 │   ├── docker/               #   Dockerfiles and profiling toolchain
-│   └── benchmarks/           #   micro-benchmarks
-├── src/                      # Language bindings
-│   ├── python/               #   Python package: `vkl` CLI + kernel bindings
-│   │   └── vkernels/
-│   │       ├── cli/          #     argparse CLI (`list`, `info`)
-│   │       ├── torch_ops/    #     device-op kernels adopted from floe (see below)
-│   │       ├── kernels.py    #     add/scale/relu/sum/max/gemm (public API)
-│   │       ├── comm.py       #     topology/channels/allreduce/overlap/p2p
-│   │       ├── core.py       #     Device/Stream
-│   │       ├── _core.cpp     #     optional pybind11 backend (built by CMake)
-│   │       └── _fallback.py  #     pure-Python reference (no build needed)
-│   └── rust/                 #   Rust bindings (workspace: `vkernels-sys` FFI + `vkernels` safe API)
-│       ├── vkernels-sys/     #     unsafe FFI; build.rs links the C++ library via CMake
-│       └── vkernels/         #     safe `kernels`/`comm`/`core` API mirroring the Python one
-├── src/c/vkernels/capi/       # C ABI shim (extern "C" + exception translation) for non-C++ consumers
-├── docs/                     # architecture, kernels, communication, testing
+│   ├── tuning-stores/        #   checked-in native tuning stores (per arch)
+│   └── benchmarks/           #   C++/CUDA/HIP micro-benchmarks + device correctness harnesses
+├── verifier/                 # formal-verification harnesses (GPUVerify/ESBMC/z3/Gappa)
+├── plugins/rccl-net-ofi/     # RCCL OFI/CXI network plugin (HIP builds)
+├── docs/                     # architecture, kernels, communication, testing, reports
 └── .github/workflows/        # host (coverage) + CUDA CI
 ```
 
@@ -198,6 +204,21 @@ tests under `tests/python/`:
 | `gdn_commit` | deferred GDN SSM commit (DFlash2 spec decoding) |
 | `triton_attn` | paged single-token decode attention |
 | `elementwise` | HF RMSNorm/RoPE/SiLU fusions + paged KV store |
+| `persistent_moe` | prepared, single-launch block-FP8 routed MLP for bounded CUDA cohorts |
+| `sgl_moe_decode_glue` | five-launch decode MoE around the unchanged vendored SGLang GEMMs (fused align+quant, SwiGLU+quant) |
+| `selected_attention_sdpa` | bounded selected attention via SDPA without a per-query gathered KV tensor |
+| `causal_conv1d_silu` | inference causal depthwise conv with one rounding after SiLU (SGLang GLM prefill design) |
+| `aiter_ops` | AMD AITER op bridge (gfx942) for the mHC / grouped-fp8-MoE dispatch sites |
+| `dsa_kpool_compress` | vLLM kpool compression kernels for the GLM-5.3-Flash DSA indexer (Triton tier) |
+| `glm_kda_fused_decode` | CUDA KDA fused decode: conv update + delta rule + gated RMSNorm in one kernel (vendored SGLang) |
+| `glm_kda_packed_decode` | CUDA KDA packed decode: row-streaming state update, ~2x the Triton path (vendored SGLang) |
+| `kda_small_gemv` | fused KDA small-projection GEMV (`b` / `f_a` / `g_a`) in one launch |
+| `mhc_pre_gemv` | mHC pre-GEMV fusion: unweighted RMSNorm + mix GEMV in one launch |
+| `router_gemv` | FP32 router scoring GEMV (the GLM-5.3 top-k router logits off BLAS) |
+| `paged_decode_indices` | compacts caller-owned slot metadata into CSR order in one launch |
+| `paged_decode_inputs` | stages integer inputs for a one-token paged decode graph in one launch |
+| `_dispatch` | the calling convention: ops validate their own eligibility (`require` / `OpNotEligible`) |
+| `aiter_mhc_fused` | *experimental, not wired into floe:* AITER `mhc_fused_post_pre` bridge (gfx942) |
 
 ## Development environment (mise)
 

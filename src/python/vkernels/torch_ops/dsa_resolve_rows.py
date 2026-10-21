@@ -348,7 +348,7 @@ def dsa_resolve_rows(kv, host, resident, backing, generations, lengths,
     ``[gpu_pages]`` tensors (``SparseHotSlotFence`` semantics). ``scratch``
     is an optional dict caching the bitmap/worklist/output/counters/errors/
     fills allocations across calls (callers inside a decode step should
-    cache — see the floe patch in ROWS-REPORT.md); any missing entry is
+    cache — see the floe patch in docs/reports/ROWS-REPORT.md); any missing entry is
     allocated. Returns ``(output, counters, errors, fills)`` where
     ``output`` is ``[batch, top_k]`` int64 row ids (-1 masked) and ``fills``
     is ``[batch, top_k, 2]`` (source host row, destination hot row) with

@@ -129,6 +129,12 @@ void fill_AB(std::vector<uint16_t>& A, std::vector<uint16_t>& B,
 }  // namespace
 
 int main() {
+  // Graceful skip (ctest SKIP_RETURN_CODE 77) when no GPU is visible.
+  int ndev = 0;
+  if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) {
+    std::printf("SKIP: no CUDA device visible\n");
+    return 77;
+  }
   cudaDeviceProp p;
   CK(cudaGetDeviceProperties(&p, 0), "props");
   std::printf("GPU: %s (sm_%d%d)\n", p.name, p.major, p.minor);

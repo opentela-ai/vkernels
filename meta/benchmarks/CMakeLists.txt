@@ -1,7 +1,9 @@
 # Micro-benchmarks for GPU kernel primitives.
 #
 # Built only when both VKERNELS_BUILD_BENCHMARKS (opt-in) and a GPU toolkit
-# (CUDA or HIP) are available.
+# (CUDA or HIP) are available. Executables go through vkernels_add_benchmark
+# (meta/cmake/Benchmarks.cmake); the self-checking `test_*` correctness
+# harnesses also register with CTest (TEST, label `benchmark_correctness`).
 if(NOT VKERNELS_BUILD_BENCHMARKS)
   return()
 endif()
@@ -10,20 +12,14 @@ endif()
 # The cost model + host ring all-reduce reference run anywhere, so this bench
 # is the CI-verifiable acceptance surface for issue #19 (OFI < Socket at
 # >= 1 MiB over >= 1 edge). The HIP/RCCL A/B is run on a Slingshot node.
-add_executable(rccl_bench bench_rccl.cpp)
-target_link_libraries(rccl_bench PRIVATE vkernels::vkernels)
-target_compile_features(rccl_bench PRIVATE cxx_std_17)
-vkernels_set_warnings(rccl_bench)
+vkernels_add_benchmark(NAME rccl_bench SOURCES bench_rccl.cpp)
 
 # --- Host-only benchmark (no GPU needed): graph-capturable PP boundary ---
 # The transport classification + GraphCapture + host plan run anywhere, so
 # this bench is the CI-verifiable surface for issue #10 (per-decode-iteration
 # host coordination overhead: device-capture vs eager-break). The CUDA path
 # (pipeline_boundary.cu) is A/B'd on a multi-node + NCCL node.
-add_executable(pipeline_boundary_bench bench_pipeline_boundary.cpp)
-target_link_libraries(pipeline_boundary_bench PRIVATE vkernels::vkernels)
-target_compile_features(pipeline_boundary_bench PRIVATE cxx_std_17)
-vkernels_set_warnings(pipeline_boundary_bench)
+vkernels_add_benchmark(NAME pipeline_boundary_bench SOURCES bench_pipeline_boundary.cpp)
 
 # --- Host-only benchmark (no GPU needed): cross-node KV transfer ---
 # The fabric-import classification + the per-hop cost model run anywhere, so
@@ -32,10 +28,7 @@ vkernels_set_warnings(pipeline_boundary_bench)
 # bulk-copy fallback, with the GH200 DRAM-only / host-bounce caveat). The
 # real-RDMA-fabric per-hop number on H-CLARIDEN / H-JSC is the on-site step
 # (no real RDMA fabric is in any container today).
-add_executable(cross_node_kv_bench bench_cross_node_kv.cpp)
-target_link_libraries(cross_node_kv_bench PRIVATE vkernels::vkernels)
-target_compile_features(cross_node_kv_bench PRIVATE cxx_std_17)
-vkernels_set_warnings(cross_node_kv_bench)
+vkernels_add_benchmark(NAME cross_node_kv_bench SOURCES bench_cross_node_kv.cpp)
 
 # --- Host-only benchmark (no GPU needed): MXFP4 fused-MoE CPU oracle ---
 # The CPU reference (fused_moe_mxfp4_cpu) is the golden oracle the gfx942/
@@ -47,10 +40,7 @@ vkernels_set_warnings(cross_node_kv_bench)
 # that contribute exactly zero) and is the CI-verifiable surface for the
 # oracle-speed work that makes K3-shape validation feasible.  K3 decode
 # (M=1, top_k=16) pads each 16-row block to ~94% padding.
-add_executable(moe_fused_oracle_bench bench_moe_fused_oracle.cpp)
-target_link_libraries(moe_fused_oracle_bench PRIVATE vkernels::vkernels)
-target_compile_features(moe_fused_oracle_bench PRIVATE cxx_std_17)
-vkernels_set_warnings(moe_fused_oracle_bench)
+vkernels_add_benchmark(NAME moe_fused_oracle_bench SOURCES bench_moe_fused_oracle.cpp)
 
 # --- Host-only A/B for the MXFP4 weight-tile dequant (issue #41) ---
 # Times dequant_weight_tile (optimized: LUT nibble/scale decode +
@@ -61,10 +51,7 @@ vkernels_set_warnings(moe_fused_oracle_bench)
 # the ratio here is the speedup the oracle sees.  Run anywhere; run on a
 # beverin compute node for the on-MI300A-CPU number (closes the gap that
 # the 4.6x dev-host measurement was never saved as a log).
-add_executable(bench_dequant_ab bench_dequant_ab.cpp)
-target_link_libraries(bench_dequant_ab PRIVATE vkernels::vkernels)
-target_compile_features(bench_dequant_ab PRIVATE cxx_std_17)
-vkernels_set_warnings(bench_dequant_ab)
+vkernels_add_benchmark(NAME bench_dequant_ab SOURCES bench_dequant_ab.cpp)
 
 if(NOT VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
   message(STATUS "vkernels: benchmarks skipped (no GPU toolkit)")
@@ -73,15 +60,9 @@ endif()
 
 # --- CUDA benchmarks ---
 if(VKERNELS_HAS_CUDA)
-  add_executable(p2p_gather_bench p2p_gather_bench.cu)
-  target_link_libraries(p2p_gather_bench PRIVATE vkernels::vkernels)
-  target_compile_features(p2p_gather_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(p2p_gather_bench)
+  vkernels_add_benchmark(NAME p2p_gather_bench SOURCES p2p_gather_bench.cu)
 
-  add_executable(p2p_kv_restore_bench p2p_kv_restore_bench.cu)
-  target_link_libraries(p2p_kv_restore_bench PRIVATE vkernels::vkernels)
-  target_compile_features(p2p_kv_restore_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(p2p_kv_restore_bench)
+  vkernels_add_benchmark(NAME p2p_kv_restore_bench SOURCES p2p_kv_restore_bench.cu)
 
   # Fused indexed-KV-to-peer donation (issue #36): the donation-side mirror
   # of p2p_kv_restore. Reads scattered local K/V slots and writes
@@ -89,10 +70,7 @@ if(VKERNELS_HAS_CUDA)
   # two-stage fallback and the prepared-plan sweep across all 40 model
   # layers. H100 NVL real peer path; single-GPU box falls back to a
   # same-device simulation.
-  add_executable(p2p_kv_donate_bench p2p_kv_donate_bench.cu)
-  target_link_libraries(p2p_kv_donate_bench PRIVATE vkernels::vkernels)
-  target_compile_features(p2p_kv_donate_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(p2p_kv_donate_bench)
+  vkernels_add_benchmark(NAME p2p_kv_donate_bench SOURCES p2p_kv_donate_bench.cu)
 
   # Fused indexed K/V layer gather (issue #2): the donation-side building
   # block that packs arbitrary KV-pool slots into a contiguous per-layer
@@ -100,10 +78,7 @@ if(VKERNELS_HAS_CUDA)
   # PyTorch reference (two separate advanced-index gather kernels, one per
   # tensor) across 64..8192 tokens, plus effective bandwidth and the
   # one-launch-vs-two saving. Single-GPU box reads/writes device 0.
-  add_executable(kv_gather_bench kv_gather_bench.cu)
-  target_link_libraries(kv_gather_bench PRIVATE vkernels::vkernels)
-  target_compile_features(kv_gather_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(kv_gather_bench)
+  vkernels_add_benchmark(NAME kv_gather_bench SOURCES kv_gather_bench.cu)
 
   # Fused indexed K/V layer scatter (issue #1): the restore-side mirror of
   # kv_gather. Scatters a contiguous per-layer scratch buffer into
@@ -114,10 +89,7 @@ if(VKERNELS_HAS_CUDA)
   # Issue #1 acceptance: >= 10% faster at >= 2048 tokens, <= 2% slower
   # below (or a documented dispatch threshold) -- judged on H100-class
   # hardware. Single-GPU box reads/writes device 0.
-  add_executable(kv_scatter_bench kv_scatter_bench.cu)
-  target_link_libraries(kv_scatter_bench PRIVATE vkernels::vkernels)
-  target_compile_features(kv_scatter_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(kv_scatter_bench)
+  vkernels_add_benchmark(NAME kv_scatter_bench SOURCES kv_scatter_bench.cu)
 
   # Cross-node KV plan execute() (issue #49): measures the four C ABI plan
   # paths (restore/donate x direct/host-bounce) over a same-device stand-in
@@ -126,11 +98,9 @@ if(VKERNELS_HAS_CUDA)
   # bench_pipeline_boundary.cu is for #10. The C ABI symbols live in the
   # separate vkernels_c shared boundary (see Testing.cmake), so link that
   # instead of the static vkernels to avoid two copies of the CUDA kernels.
-  add_executable(cross_node_kv_cuda_bench bench_cross_node_kv_cuda.cu)
-  target_include_directories(cross_node_kv_cuda_bench PRIVATE ${CMAKE_SOURCE_DIR}/src/c)
-  target_link_libraries(cross_node_kv_cuda_bench PRIVATE vkernels::vkernels_c)
-  target_compile_features(cross_node_kv_cuda_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(cross_node_kv_cuda_bench)
+  vkernels_add_benchmark(NAME cross_node_kv_cuda_bench SOURCES bench_cross_node_kv_cuda.cu
+    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c
+    NO_VKERNELS_LIB LIBS vkernels::vkernels_c)
 
   # Cross-node KV transfer over REAL InfiniBand (issue #49 on-site step):
   # the per-hop number bench_cross_node_kv_cuda.cu explicitly defers. A
@@ -141,16 +111,14 @@ if(VKERNELS_HAS_CUDA)
   # vkernels headers), so link vkernels::nccl + the CUDA driver stub
   # (for the optional --probe-vram cuMemExportToShareableHandle path).
   if(VKERNELS_HAS_NCCL)
-    add_executable(cross_node_nccl_bench bench_cross_node_nccl.cu)
-    target_link_libraries(cross_node_nccl_bench PRIVATE vkernels::nccl)
+    vkernels_add_benchmark(NAME cross_node_nccl_bench SOURCES bench_cross_node_nccl.cu
+      NO_VKERNELS_LIB LIBS vkernels::nccl)
     # cuMemExportToShareableHandle (the optional --probe-vram path)
     # lives in libcuda. CudaSupport.cmake's find_package(CUDAToolkit)
     # exposes it as CUDA::cuda_driver; link that when available.
     if(TARGET CUDA::cuda_driver)
       target_link_libraries(cross_node_nccl_bench PRIVATE CUDA::cuda_driver)
     endif()
-    target_compile_features(cross_node_nccl_bench PRIVATE cxx_std_17)
-    vkernels_set_warnings(cross_node_nccl_bench)
   endif()
 
   # Graph-capturable PP-boundary transfer (issue #10). Measures the actual
@@ -158,44 +126,25 @@ if(VKERNELS_HAS_CUDA)
   # graph-replay vs eager-re-issue round trip (the host progress the graph
   # removes). H100 NVL real peer path; single-GPU box falls back to a
   # same-device simulation.
-  add_executable(pipeline_boundary_bench_c bench_pipeline_boundary.cu)
-  target_link_libraries(pipeline_boundary_bench_c PRIVATE vkernels::vkernels)
-  target_compile_features(pipeline_boundary_bench_c PRIVATE cxx_std_17)
-  vkernels_set_warnings(pipeline_boundary_bench_c)
+  vkernels_add_benchmark(NAME pipeline_boundary_bench_c
+    SOURCES bench_pipeline_boundary.cu)
 endif()
 
 # --- HIP benchmarks ---
 if(VKERNELS_HAS_HIP)
-  add_executable(moe_bench bench_moe.hip)
-  target_link_libraries(moe_bench PRIVATE vkernels::vkernels)
-  target_compile_features(moe_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(moe_bench)
+  vkernels_add_benchmark(NAME moe_bench SOURCES bench_moe.hip)
 
-  add_executable(moe_fused_bench bench_moe_fused.hip)
-  target_link_libraries(moe_fused_bench PRIVATE vkernels::vkernels)
-  target_compile_features(moe_fused_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(moe_fused_bench)
+  vkernels_add_benchmark(NAME moe_fused_bench SOURCES bench_moe_fused.hip)
 
   # Issue #86 stage-split oracle probe at ispp >= 4096 (fault vs mismatch).
-  add_executable(probe_moe_largeispp probe_moe_largeispp.hip)
-  target_link_libraries(probe_moe_largeispp PRIVATE vkernels::vkernels)
-  target_compile_features(probe_moe_largeispp PRIVATE cxx_std_17)
-  vkernels_set_warnings(probe_moe_largeispp)
+  vkernels_add_benchmark(NAME probe_moe_largeispp SOURCES probe_moe_largeispp.hip)
 
-  add_executable(moe_fused_prefill_bench bench_moe_fused_prefill.hip)
-  target_link_libraries(moe_fused_prefill_bench PRIVATE vkernels::vkernels)
-  target_compile_features(moe_fused_prefill_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(moe_fused_prefill_bench)
+  vkernels_add_benchmark(NAME moe_fused_prefill_bench SOURCES bench_moe_fused_prefill.hip)
 
-  add_executable(moe_aux_bench bench_moe_aux.hip)
-  target_link_libraries(moe_aux_bench PRIVATE vkernels::vkernels)
-  target_compile_features(moe_aux_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(moe_aux_bench)
+  vkernels_add_benchmark(NAME moe_aux_bench SOURCES bench_moe_aux.hip)
 
-  add_executable(test_moe_fused_correct test_moe_fused_correct.hip)
-  target_link_libraries(test_moe_fused_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_moe_fused_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_moe_fused_correct)
+  vkernels_add_benchmark(NAME test_moe_fused_correct
+    SOURCES test_moe_fused_correct.hip TEST)
 
   # Big-shape fused-MoE correctness (issue #41 blocker): the kernels used to
   # compute per-expert weight offsets in INT32, which wraps negative once
@@ -203,154 +152,92 @@ if(VKERNELS_HAS_HIP)
   # ispp >= 4096" on gfx942.  Validates GPU vs CPU oracle at and beyond the
   # old wrap thresholds (ispp=4096 E=256; ispp=33792 E=32), decode + prefill
   # regimes, with routing pinned to the previously-wrapping expert ids.
-  add_executable(test_moe_fused_bigshape_correct test_moe_fused_bigshape_correct.hip)
-  target_link_libraries(test_moe_fused_bigshape_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_moe_fused_bigshape_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_moe_fused_bigshape_correct)
+  vkernels_add_benchmark(NAME test_moe_fused_bigshape_correct
+    SOURCES test_moe_fused_bigshape_correct.hip TEST)
 
   # C ABI correctness: same data as test_moe_fused_correct, exercised
   # through the extern "C" boundary (vkernels::vkernels_hip) that ctypes /
   # torch.ops.load_library / Rust consumers use.
-  add_executable(test_capi_moe test_capi_moe.hip)
-  target_link_libraries(test_capi_moe PRIVATE vkernels::vkernels vkernels::vkernels_hip)
-  target_compile_features(test_capi_moe PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_capi_moe)
+  vkernels_add_benchmark(NAME test_capi_moe
+    SOURCES test_capi_moe.hip LIBS vkernels::vkernels_hip TEST)
 
   # C ABI correctness for the on-device moe_align_block_size (issue #46
   # follow-up): parity between vk_hip_moe_align_block_size (no topk_ids.cpu()
   # host round-trip) and the CPU reference across several routings, plus an
   # end-to-end check that GPU-aligned routing feeds the GEMM identically.
-  add_executable(test_capi_moe_align test_capi_moe_align.hip)
-  target_link_libraries(test_capi_moe_align PRIVATE vkernels::vkernels vkernels::vkernels_hip)
-  target_compile_features(test_capi_moe_align PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_capi_moe_align)
+  vkernels_add_benchmark(NAME test_capi_moe_align
+    SOURCES test_capi_moe_align.hip LIBS vkernels::vkernels_hip TEST)
 
   # DSA pool-level radix top-k transform (issue #56): exercise the exported
   # C ABI against the host oracle for every supported group-top-k, including
   # the short-row guard, page-table/ragged modes, row starts, and tail append.
-  add_executable(test_capi_dsa_topk test_capi_dsa_topk.hip)
-  target_link_libraries(test_capi_dsa_topk PRIVATE vkernels::vkernels vkernels::vkernels_hip)
-  target_compile_features(test_capi_dsa_topk PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_capi_dsa_topk)
+  vkernels_add_benchmark(NAME test_capi_dsa_topk
+    SOURCES test_capi_dsa_topk.hip LIBS vkernels::vkernels_hip TEST)
 
-  add_executable(dsa_topk_bench bench_dsa_topk.hip)
-  target_link_libraries(dsa_topk_bench PRIVATE vkernels::vkernels)
-  target_compile_features(dsa_topk_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(dsa_topk_bench)
+  vkernels_add_benchmark(NAME dsa_topk_bench SOURCES bench_dsa_topk.hip)
 
-  add_executable(test_moe_aux_correct test_moe_aux_correct.hip)
-  target_link_libraries(test_moe_aux_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_moe_aux_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_moe_aux_correct)
+  vkernels_add_benchmark(NAME test_moe_aux_correct SOURCES test_moe_aux_correct.hip TEST)
 
-  add_executable(test_moe_fused_prefill_correct test_moe_fused_prefill_correct.hip)
-  target_link_libraries(test_moe_fused_prefill_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_moe_fused_prefill_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_moe_fused_prefill_correct)
+  vkernels_add_benchmark(NAME test_moe_fused_prefill_correct
+    SOURCES test_moe_fused_prefill_correct.hip TEST)
 
-  add_executable(test_moe_fused_dist_correct test_moe_fused_dist_correct.hip)
-  target_link_libraries(test_moe_fused_dist_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_moe_fused_dist_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_moe_fused_dist_correct)
+  vkernels_add_benchmark(NAME test_moe_fused_dist_correct
+    SOURCES test_moe_fused_dist_correct.hip TEST)
 
-  add_executable(test_gemm_bf16_correct test_gemm_bf16_correct.hip)
-  target_link_libraries(test_gemm_bf16_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_gemm_bf16_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_gemm_bf16_correct)
+  vkernels_add_benchmark(NAME test_gemm_bf16_correct
+    SOURCES test_gemm_bf16_correct.hip TEST)
 
-  add_executable(gemm_bf16_bench bench_gemm_bf16.hip)
-  target_link_libraries(gemm_bf16_bench PRIVATE vkernels::vkernels)
-  target_compile_features(gemm_bf16_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(gemm_bf16_bench)
+  vkernels_add_benchmark(NAME gemm_bf16_bench SOURCES bench_gemm_bf16.hip)
 
-  add_executable(test_mla_correct test_mla_correct.hip)
-  target_link_libraries(test_mla_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_mla_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_mla_correct)
+  vkernels_add_benchmark(NAME test_mla_correct SOURCES test_mla_correct.hip TEST)
 
   # MLA stream/graph-capture safety (issues #45/#69): exercises the C ABI
   # entry `vk_hip_mla_fwd_stream` under hipStreamBeginCapture — cold
   # workspace (fallback path), warm workspace (split path in the graph),
   # re-feed replay, and legacy/stream parity. vkernels for the CPU oracle,
   # vkernels_hip for the C ABI (vk_hip_mla_fwd / vk_hip_mla_fwd_stream).
-  add_executable(test_mla_capture test_mla_capture.hip)
-  target_link_libraries(test_mla_capture PRIVATE vkernels::vkernels vkernels::vkernels_hip)
-  target_compile_features(test_mla_capture PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_mla_capture)
+  vkernels_add_benchmark(NAME test_mla_capture
+    SOURCES test_mla_capture.hip LIBS vkernels::vkernels_hip TEST)
 
-  add_executable(test_kda_correct test_kda_correct.hip)
-  target_link_libraries(test_kda_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_kda_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_kda_correct)
+  vkernels_add_benchmark(NAME test_kda_correct SOURCES test_kda_correct.hip TEST)
 
-  add_executable(mla_bench bench_mla.hip)
-  target_link_libraries(mla_bench PRIVATE vkernels::vkernels)
-  target_compile_features(mla_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(mla_bench)
+  vkernels_add_benchmark(NAME mla_bench SOURCES bench_mla.hip)
 
-  add_executable(kda_bench bench_kda.hip)
-  target_link_libraries(kda_bench PRIVATE vkernels::vkernels)
-  target_compile_features(kda_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(kda_bench)
+  vkernels_add_benchmark(NAME kda_bench SOURCES bench_kda.hip)
 
   # GLM block-FP8 decode-fused GEMV (#64): correctness vs the CPU oracle +
   # fused-vs-materialized microbenchmark.
-  add_executable(probe_mfma_fp8 probe_mfma_fp8.hip)
-  target_link_libraries(probe_mfma_fp8 PRIVATE vkernels::vkernels)
-  target_compile_features(probe_mfma_fp8 PRIVATE cxx_std_17)
-  vkernels_set_warnings(probe_mfma_fp8)
+  vkernels_add_benchmark(NAME probe_mfma_fp8 SOURCES probe_mfma_fp8.hip)
 
-  add_executable(diag_mfma_issue148 diag_mfma_issue148.hip)
-  target_link_libraries(diag_mfma_issue148 PRIVATE vkernels::vkernels)
-  target_compile_features(diag_mfma_issue148 PRIVATE cxx_std_17)
-  vkernels_set_warnings(diag_mfma_issue148)
+  vkernels_add_benchmark(NAME diag_mfma_issue148 SOURCES diag_mfma_issue148.hip)
 
-  add_executable(test_glm_fp8_gemv test_glm_fp8_gemv.hip)
-  target_link_libraries(test_glm_fp8_gemv PRIVATE vkernels::vkernels)
-  target_compile_features(test_glm_fp8_gemv PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_glm_fp8_gemv)
+  vkernels_add_benchmark(NAME test_glm_fp8_gemv SOURCES test_glm_fp8_gemv.hip TEST)
 
-  add_executable(glm_fp8_gemv_bench bench_glm_fp8_gemv.hip)
-  target_link_libraries(glm_fp8_gemv_bench PRIVATE vkernels::vkernels)
-  target_compile_features(glm_fp8_gemv_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(glm_fp8_gemv_bench)
+  vkernels_add_benchmark(NAME glm_fp8_gemv_bench SOURCES bench_glm_fp8_gemv.hip)
 
   # Chunked WY K3 forward (#70): correctness vs the CPU oracle + A/B vs the
   # committed cooperative kernel.
-  add_executable(test_kda_chunked test_kda_chunked.hip)
-  target_link_libraries(test_kda_chunked PRIVATE vkernels::vkernels)
-  target_compile_features(test_kda_chunked PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_kda_chunked)
+  vkernels_add_benchmark(NAME test_kda_chunked SOURCES test_kda_chunked.hip TEST)
 
-  add_executable(kda_chunked_bench bench_kda_chunked.hip)
-  target_link_libraries(kda_chunked_bench PRIVATE vkernels::vkernels)
-  target_compile_features(kda_chunked_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(kda_chunked_bench)
+  vkernels_add_benchmark(NAME kda_chunked_bench SOURCES bench_kda_chunked.hip)
 
   # DeepseekSparseAttn sparse-MLA forward (issue #51).
-  add_executable(test_dsa_correct test_dsa_correct.hip)
-  target_link_libraries(test_dsa_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_dsa_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_dsa_correct)
+  vkernels_add_benchmark(NAME test_dsa_correct SOURCES test_dsa_correct.hip TEST)
 
   # Issue #137 focused split-sweep (decode shapes, env-selected dispatch
   # variant per run -- see the file header).
-  add_executable(dsa_bench_split137 bench_dsa_split137.hip)
-  target_link_libraries(dsa_bench_split137 PRIVATE vkernels::vkernels)
-  target_compile_features(dsa_bench_split137 PRIVATE cxx_std_17)
-  vkernels_set_warnings(dsa_bench_split137)
+  vkernels_add_benchmark(NAME dsa_bench_split137 SOURCES bench_dsa_split137.hip)
 
   # DSA paged-MQA gated top-k logits (issue #51): the kpool>1 indexer path.
-  add_executable(test_dsa_topk_correct test_dsa_topk_correct.hip)
-  target_link_libraries(test_dsa_topk_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_dsa_topk_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_dsa_topk_correct)
+  vkernels_add_benchmark(NAME test_dsa_topk_correct
+    SOURCES test_dsa_topk_correct.hip TEST)
 
   # DSA kpool-cache compress/write (issue #60): the kpool>1 INDEXER cache
   # path -- the bf16-storage / no-fp8e4nv HIP kernels for sglang's
   # kpool_assemble_softmax_rotate_write_cache (prefill) and
   # kpool_decode_update_and_maybe_write_cache (decode), cross-checked
-  # against the CPU fp32 oracles.
+  # against the CPU fp32 oracles by tests/kernels/attn/
+  # test_dsa_kpool_correct.hip (CTest `dsa_kpool_device`, tests/CMakeLists.txt).
 
   # DSA kpool-cache compress/write BENCHMARK (issue #60): same harness style
   # as bench_dsa.hip (HIP events, variance-driven iters, roofline table) for
@@ -358,10 +245,7 @@ if(VKERNELS_HAS_HIP)
   # + effective GB/s vs the ~5300 GB/s HBM roof for both the prefill
   # (dsa_kpool_assemble, 1 warp/pool) and decode (dsa_kpool_decode_update,
   # 1 warp/req) paths at GLM-5.3-Flash serving shapes.
-  add_executable(dsa_kpool_bench bench_dsa_kpool.hip)
-  target_link_libraries(dsa_kpool_bench PRIVATE vkernels::vkernels)
-  target_compile_features(dsa_kpool_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(dsa_kpool_bench)
+  vkernels_add_benchmark(NAME dsa_kpool_bench SOURCES bench_dsa_kpool.hip)
 
   # DSA sparse-fwd launch-path preconditions (issue #57): the on-device
   # regression for the silent gfx942 "D"-state hang. A valid decode-shape
@@ -371,15 +255,10 @@ if(VKERNELS_HAS_HIP)
   # return_lse) must return VK_ERROR_INVALID_ARGUMENT with a named message in
   # microseconds instead of hanging. Links both libs: vkernels for the CPU
   # oracle, vkernels_hip for the C ABI (vk_hip_dsa_sparse_fwd).
-  add_executable(test_dsa_precond_correct test_dsa_precond_correct.hip)
-  target_link_libraries(test_dsa_precond_correct PRIVATE vkernels::vkernels vkernels::vkernels_hip)
-  target_compile_features(test_dsa_precond_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_dsa_precond_correct)
+  vkernels_add_benchmark(NAME test_dsa_precond_correct
+    SOURCES test_dsa_precond_correct.hip LIBS vkernels::vkernels_hip TEST)
 
-  add_executable(dsa_bench bench_dsa.hip)
-  target_link_libraries(dsa_bench PRIVATE vkernels::vkernels)
-  target_compile_features(dsa_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(dsa_bench)
+  vkernels_add_benchmark(NAME dsa_bench SOURCES bench_dsa.hip)
 
   # DSA paged-MQA gated top-k logits (issue #51): the kpool>1 indexer path
   # that FEEDS dsa_sparse_fwd. Same harness style as bench_dsa.hip (HIP
@@ -387,26 +266,17 @@ if(VKERNELS_HAS_HIP)
   # kernel. Renamed from bench_dsa_topk.hip / dsa_topk_bench to avoid an
   # add/add collision with the DSA radix top-k TRANSFORM bench (issue #56,
   # bench_dsa_topk.hip / dsa_topk_bench on main).
-  add_executable(dsa_topk_logits_bench bench_dsa_topk_logits.hip)
-  target_link_libraries(dsa_topk_logits_bench PRIVATE vkernels::vkernels)
-  target_compile_features(dsa_topk_logits_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(dsa_topk_logits_bench)
+  vkernels_add_benchmark(NAME dsa_topk_logits_bench SOURCES bench_dsa_topk_logits.hip)
 
   # MHC multi-head hybrid-attention pre-norm (issue #51, part 2).
-  add_executable(test_mhc_correct test_mhc_correct.hip)
-  target_link_libraries(test_mhc_correct PRIVATE vkernels::vkernels)
-  target_compile_features(test_mhc_correct PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_mhc_correct)
+  vkernels_add_benchmark(NAME test_mhc_correct SOURCES test_mhc_correct.hip TEST)
 
-  add_executable(mhc_bench bench_mhc.hip)
-  target_link_libraries(mhc_bench PRIVATE vkernels::vkernels)
-  target_compile_features(mhc_bench PRIVATE cxx_std_17)
-  vkernels_set_warnings(mhc_bench)
+  vkernels_add_benchmark(NAME mhc_bench SOURCES bench_mhc.hip)
 endif()
 
-# DSA kpool-cache correctness + benchmark on NVIDIA (issue #60 A100 port):
-# the same two executables as the HIP block above, built when a CUDA toolkit
-# is present and ROCm is not. The .hip device sources compile with nvcc
+# DSA kpool-cache benchmark on NVIDIA (issue #60 A100 port): the same
+# executable as the HIP block above, built when a CUDA toolkit is present
+# and ROCm is not. The .hip device sources compile with nvcc
 # through the HIP compat shim (src/c/CMakeLists.txt adds them to libvkernels
 # with VKERNELS_HAS_HIP defined per-source); these executable TUs get the
 # same per-source treatment (their TUs include only the kernel header, never
@@ -415,18 +285,14 @@ if(VKERNELS_HAS_CUDA AND NOT VKERNELS_HAS_HIP)
   set_source_files_properties(bench_dsa_kpool.hip
     PROPERTIES LANGUAGE CUDA COMPILE_DEFINITIONS VKERNELS_HAS_HIP=1)
 
+  vkernels_add_benchmark(NAME dsa_kpool_bench SOURCES bench_dsa_kpool.hip
+    INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
 
-  add_executable(dsa_kpool_bench bench_dsa_kpool.hip)
-  target_link_libraries(dsa_kpool_bench PRIVATE vkernels::vkernels)
-  target_compile_features(dsa_kpool_bench PRIVATE cxx_std_17)
-  target_include_directories(dsa_kpool_bench PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/c/vkernels/kernels/cuda_compat)
-  vkernels_set_warnings(dsa_kpool_bench)
-
-  # The device-vs-oracle harness is registered with CTest on the CUDA build
-  # (issue #60: until now the kpool .hip sources were COMPILED by the CUDA CI
-  # but never RUN there). The binary exits 77 when no GPU is visible, so the
-  # test skips (SKIP_RETURN_CODE) on GPU-less CUDA boxes instead of failing.
+  # The device-vs-oracle harness (CTest `dsa_kpool_device`) lives under
+  # tests/ and is registered there on the CUDA build (issue #60: until then
+  # the kpool .hip sources were COMPILED by the CUDA CI but never RUN there).
+  # The binary exits 77 when no GPU is visible, so the test skips
+  # (SKIP_RETURN_CODE) on GPU-less CUDA boxes instead of failing.
 endif()
 
 # bf16 GEMM correctness + benchmark on NVIDIA (issue #29 CUDA port): the
@@ -437,15 +303,10 @@ endif()
 # box (the dsa CUDA block below follows the same convention). No HIP compat
 # shim is needed -- these are plain CUDA TUs using <cuda_runtime.h>/<mma.h>.
 if(VKERNELS_HAS_CUDA)
-  add_executable(test_gemm_bf16_correct_cuda test_gemm_bf16_correct.cu)
-  target_link_libraries(test_gemm_bf16_correct_cuda PRIVATE vkernels::vkernels)
-  target_compile_features(test_gemm_bf16_correct_cuda PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_gemm_bf16_correct_cuda)
+  vkernels_add_benchmark(NAME test_gemm_bf16_correct_cuda
+    SOURCES test_gemm_bf16_correct.cu TEST)
 
-  add_executable(gemm_bf16_bench_cuda bench_gemm_bf16.cu)
-  target_link_libraries(gemm_bf16_bench_cuda PRIVATE vkernels::vkernels)
-  target_compile_features(gemm_bf16_bench_cuda PRIVATE cxx_std_17)
-  vkernels_set_warnings(gemm_bf16_bench_cuda)
+  vkernels_add_benchmark(NAME gemm_bf16_bench_cuda SOURCES bench_gemm_bf16.cu)
 endif()
 
 # DSA paged-MQA gated top-k logits correctness + benchmark on NVIDIA
@@ -456,13 +317,8 @@ endif()
 # stacks build side by side on a dual-toolkit box). No HIP compat shim is
 # needed -- these are plain CUDA TUs using <cuda_runtime.h>/<mma.h>.
 if(VKERNELS_HAS_CUDA)
-  add_executable(test_dsa_topk_correct_cuda test_dsa_topk_correct.cu)
-  target_link_libraries(test_dsa_topk_correct_cuda PRIVATE vkernels::vkernels)
-  target_compile_features(test_dsa_topk_correct_cuda PRIVATE cxx_std_17)
-  vkernels_set_warnings(test_dsa_topk_correct_cuda)
+  vkernels_add_benchmark(NAME test_dsa_topk_correct_cuda
+    SOURCES test_dsa_topk_correct.cu TEST)
 
-  add_executable(dsa_topk_logits_bench_cuda bench_dsa_topk_logits.cu)
-  target_link_libraries(dsa_topk_logits_bench_cuda PRIVATE vkernels::vkernels)
-  target_compile_features(dsa_topk_logits_bench_cuda PRIVATE cxx_std_17)
-  vkernels_set_warnings(dsa_topk_logits_bench_cuda)
+  vkernels_add_benchmark(NAME dsa_topk_logits_bench_cuda SOURCES bench_dsa_topk_logits.cu)
 endif()

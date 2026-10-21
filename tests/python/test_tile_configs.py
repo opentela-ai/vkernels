@@ -97,9 +97,55 @@ def test_manifest_audit_catches_edit(config_dir):
     write_tile_manifest(path, manifest)
     assert lookup_tiles("glm_fp8_dense_fnuz", 16) == (16, 128, 4, 3)
     # Edit the artifact after production → sha256 mismatch → loud failure.
+    # (Pin distinct mtimes: the audit is memoized per (mtime_ns, size), and a
+    # same-length rewrite within one filesystem timestamp tick is invisible.)
+    import os
+    os.utime(path, ns=(1_000_000_000, 1_000_000_000))
     path.write_text(json.dumps({"op": "glm_fp8_dense_fnuz", "buckets": {"16": [64, 128, 4, 3]}}))
+    os.utime(path, ns=(2_000_000_000, 2_000_000_000))
     with pytest.raises(Exception):
         lookup_tiles("glm_fp8_dense_fnuz", 16)
+    with pytest.raises(Exception):  # failures are never cached
+        lookup_tiles("glm_fp8_dense_fnuz", 16)
+
+
+def test_manifest_audit_runs_once_per_artifact_state(config_dir, monkeypatch):
+    from vkernels.torch_ops import tile_configs
+
+    path = _write(config_dir, "glm_fp8_dense_fnuz", {"16": [16, 128, 4, 3]})
+    producer = config_dir / "producer_ref.py"
+    producer.write_text("# reference source\n")
+    write_tile_manifest(path, build_tile_manifest(
+        path, kernel="glm_fp8_blockwise_gemm", op="glm_fp8_dense_fnuz",
+        producer_paths=[str(producer)],
+    ))
+    audits = []
+    real_validate = tile_configs.validate_manifest
+    monkeypatch.setattr(tile_configs, "validate_manifest",
+                        lambda *a, **k: audits.append(1) or real_validate(*a, **k))
+    for m in (1, 16, 4096):
+        assert lookup_tiles("glm_fp8_dense_fnuz", m) == (16, 128, 4, 3)
+    assert len(audits) == 1
+    # A new artifact state (mtime bump) re-audits once.
+    import os
+    os.utime(path, ns=(3_000_000_000, 3_000_000_000))
+    assert lookup_tiles("glm_fp8_dense_fnuz", 16) == (16, 128, 4, 3)
+    assert lookup_tiles("glm_fp8_dense_fnuz", 16) == (16, 128, 4, 3)
+    assert len(audits) == 2
+
+
+def test_config_dir_env_switch_is_not_masked_by_cache(tmp_path, monkeypatch):
+    first, second = tmp_path / "a", tmp_path / "b"
+    first.mkdir()
+    second.mkdir()
+    _write(first, "glm_fp8_dense_fnuz", {"16": [16, 128, 4, 3]})
+    _write(second, "glm_fp8_dense_fnuz", {"16": [32, 64, 2, 2]})
+    monkeypatch.setenv("VK_TILE_CONFIGS_DIR", str(first))
+    assert lookup_tiles("glm_fp8_dense_fnuz", 16) == (16, 128, 4, 3)
+    monkeypatch.setenv("VK_TILE_CONFIGS_DIR", str(second))
+    assert lookup_tiles("glm_fp8_dense_fnuz", 16) == (32, 64, 2, 2)
+    (second / "glm_fp8_dense_fnuz.json").unlink()
+    assert lookup_tiles("glm_fp8_dense_fnuz", 16) is None
 
 
 def test_mtime_edit_is_picked_up(config_dir):
