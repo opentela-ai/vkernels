@@ -1,0 +1,120 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "01M5ERKNHCHC9DKBAWZKBSN0B1",
+  "session_id": "01a14ab5-e478-71df-8170-0322f1b4903a",
+  "strategy": "manual-commit",
+  "created_at": "2026-10-21T08:17:57.33563675Z",
+  "branch": "maint/structural-cleanup",
+  "checkpoints_count": 9,
+  "save_step_count": 9,
+  "files_touched": [
+    "src/python/vkernels/torch_ops/elementwise.py"
+  ],
+  "agent": "Pi",
+  "model": "glm-5.3",
+  "turn_id": "a664cb5feb9d",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 1014061,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 46899328,
+    "output_tokens": 183635,
+    "api_call_count": 251
+  },
+  "session_metrics": {
+    "turn_count": 9
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-10-21T08:17:57.229857541Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 1409,
+    "human_modified": 101,
+    "human_removed": 0,
+    "total_committed": 1409,
+    "total_lines_changed": 2909,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 570,
+      "user_lines_removed": 567,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        "src/python/vkernels/torch_ops/elementwise.py": 114,
+        "src/python/vkernels/torch_ops/paged_decode_indices.py": 59,
+        "src/python/vkernels/torch_ops/paged_decode_inputs.py": 108,
+        "tests/python/test_elementwise_fused_rounding.py": 87,
+        "tests/python/test_paged_decode_indices.py": 84,
+        "tests/python/test_paged_decode_inputs.py": 118
+      },
+      "user_removed_per_file": {
+        "ISSUE-REPORT-150.md": 142,
+        "ISSUE-REPORT-152.md": 96,
+        "ISSUE-REPORT-42.md": 92,
+        "ISSUE-REPORT-60.md": 98,
+        "ISSUE-REPORT.md": 99,
+        "src/python/vkernels/torch_ops/elementwise.py": 40
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 570,
+      "agent_lines_removed": 567
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 570,
+      "agent_lines_removed": 567
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 570,
+      "agent_lines_removed": 567
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 570,
+      "agent_lines_removed": 567
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 570,
+      "agent_lines_removed": 567
+    },
+    {
+      "checkpoint_number": 7,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 570,
+      "agent_lines_removed": 567
+    },
+    {
+      "checkpoint_number": 8,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 570,
+      "agent_lines_removed": 567
+    },
+    {
+      "checkpoint_number": 9,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 570,
+      "agent_lines_removed": 567
+    }
+  ]
+}

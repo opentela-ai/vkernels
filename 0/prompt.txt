@@ -1,0 +1,33 @@
+Can you spin up an agent for each of the issues: https://github.com/opentela-ai/vkernels/issues
+
+---
+
+in the meantime, scout what optimizations we can make, (read progress from @../floe, @../kvaas), and file issues if there's anything
+
+---
+
+Inspect subagent updates above. Answer pending supervisor requests within your authority. For completed work, read saved results and resume the already-authorized parent task, or report completion. If approval is required, explicitly ask the user. Do not silently yield, rerun completed work, or infer new authorization.
+
+---
+
+ok work on #124 and #125
+
+---
+
+line up the runs next
+
+---
+
+yes keep watching
+
+---
+
+continue, we should have enough slots
+
+---
+
+check again
+
+---
+
+can you submit to normal partition?
