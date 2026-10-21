@@ -108,21 +108,6 @@ def _device_guard(t):
     return contextlib.nullcontext() if t is None else torch.cuda.device(t.device)
 
 
-def _launch(f_stream, f_legacy, args, stream):
-    """Call the _stream symbol when present (returning the launch error so a
-    partial failure is never silent); fall back to the legacy symbol for
-    pre-#69 libraries (stream must be None there)."""
-    if f_stream is not None:
-        rc = f_stream(*args, _stream_ptr(stream))
-        if rc != 0:
-            raise RuntimeError(f"HIP launch failed: error {rc}")
-        return
-    if stream is not None:
-        raise RuntimeError("this libvkernels_hip build predates the #69 "
-                           "stream ABI; pass stream=None or rebuild")
-    f_legacy(*args)
-
-
 def _sym(lib, name):
     return getattr(lib, name, None)
 

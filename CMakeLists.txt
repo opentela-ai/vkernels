@@ -65,6 +65,7 @@ include(NcclSupport)
 include(HipSupport)
 include(RcclSupport)
 include(Testing)
+include(Benchmarks)
 
 if(VKERNELS_ENABLE_COVERAGE)
   message(STATUS "vkernels: line-coverage instrumentation enabled (gcov)")

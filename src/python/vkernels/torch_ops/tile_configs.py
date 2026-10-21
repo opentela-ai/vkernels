@@ -72,13 +72,13 @@ def _resolve_manifest_fingerprints(manifest: dict) -> list[str]:
     return resolved
 
 
+_PACKAGED_CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
+
+
 def _config_path(op: str) -> Path | None:
     """Env dir wins; else the packaged ``configs/`` dir beside this module."""
     env_dir = os.environ.get("VK_TILE_CONFIGS_DIR", "").strip()
-    if env_dir:
-        candidate = Path(env_dir) / f"{op}.json"
-        return candidate if candidate.is_file() else None
-    candidate = Path(__file__).resolve().parent / "configs" / f"{op}.json"
+    candidate = (Path(env_dir) if env_dir else _PACKAGED_CONFIGS_DIR) / f"{op}.json"
     return candidate if candidate.is_file() else None
 
 
@@ -115,6 +115,53 @@ def _nearest_bucket(buckets: dict, m: int):
     return min(ordered, key=lambda b: (abs(b - int(m)), b))
 
 
+def _stat_key(path: Path):
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _validated_buckets(path: Path) -> dict:
+    """The sidecar's bucket table, audited once per (path, mtime) state.
+
+    ``lookup_tiles`` runs on every launch, so the manifest audit (sha256 of
+    the sidecar and its producer sources, plus a device query) is memoized
+    on the sidecar's and manifest's ``(mtime_ns, size)``; an edit to either
+    re-audits. Failures are never cached — a bad artifact raises every call.
+    """
+    manifest_path = path.with_suffix(".manifest.json")
+    key = (str(path), _stat_key(path), _stat_key(manifest_path))
+    cached = _validated_buckets._cache.get(key)
+    if cached is not None:
+        return cached
+
+    data = _load_json(path)
+    if not isinstance(data, dict):
+        raise TileConfigError(f"tile config {path} must be a JSON object")
+    buckets = data.get("buckets")
+    if not isinstance(buckets, dict) or not buckets:
+        raise TileConfigError(f"tile config {path} has no usable 'buckets' table")
+
+    if key[2] is not None:
+        manifest = load_manifest(path, manifest_path)
+        validate_manifest(
+            manifest,
+            csv_path=path,
+            environment=None,
+            producer_paths=_resolve_manifest_fingerprints(manifest),
+        )
+
+    for stale in [k for k in _validated_buckets._cache if k[0] == key[0]]:
+        _validated_buckets._cache.pop(stale)
+    _validated_buckets._cache[key] = buckets
+    return buckets
+
+
+_validated_buckets._cache = {}
+
+
 def lookup_tiles(op: str, m: int, *, config_path=None) -> tuple[int, int, int, int] | None:
     """Return ``(BM, BN, warps, stages)`` for ``m`` rows, or ``None``.
 
@@ -126,23 +173,7 @@ def lookup_tiles(op: str, m: int, *, config_path=None) -> tuple[int, int, int, i
     path = Path(config_path) if config_path is not None else _config_path(op)
     if path is None:
         return None
-    data = _load_json(path)
-    if not isinstance(data, dict):
-        raise TileConfigError(f"tile config {path} must be a JSON object")
-    buckets = data.get("buckets")
-    if not isinstance(buckets, dict) or not buckets:
-        raise TileConfigError(f"tile config {path} has no usable 'buckets' table")
-
-    manifest_path = path.with_suffix(".manifest.json")
-    if manifest_path.is_file():
-        manifest = load_manifest(path, manifest_path)
-        validate_manifest(
-            manifest,
-            csv_path=path,
-            environment=None,
-            producer_paths=_resolve_manifest_fingerprints(manifest),
-        )
-
+    buckets = _validated_buckets(path)
     bucket = _nearest_bucket(buckets, m)
     if bucket is None:
         return None

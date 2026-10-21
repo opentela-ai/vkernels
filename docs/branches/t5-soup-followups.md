@@ -1,7 +1,7 @@
 # Archived t5-soup follow-ups
 
 Source: `t5-soup@c3de2f5`; historical claims and corrections, not fresh validation.
-The preceding report is already in main as `ROWS-REPORT.md`.
+The preceding report is already in main as `docs/reports/ROWS-REPORT.md`.
 
 
 ## T2R-5 lever-1 (graph prefetch) — FALSIFIED on device time; the captured-step baseline is 36ms device-bound
