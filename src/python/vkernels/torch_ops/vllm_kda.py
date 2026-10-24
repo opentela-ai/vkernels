@@ -73,6 +73,14 @@ FLA_TRIL_PRECISION = "ieee"  # solve_tril.py default; "tf32" not exposed here
 RCP_LN2 = 1.4426950408889634  # 1/ln(2) = log2(e): exp(x) == exp2(x * RCP_LN2)
 BS_LIST = [16, 32]  # cumsum.py conservative branch (portable shared mem)
 
+# gfx942 (MI300A) has a 64 KB shared-memory limit (vs sm90's 228 KB): the
+# NVIDIA-tuned config space (BK 64 x BV 128 x stages 3-4) requires ~145 KB
+# and fails triton's OutOfResources at launch. The HIP config set trades
+# tile width for occupancy; parity is unchanged (same fp32 math, smaller
+# tiles) and floe's dispatch falls back to the eager reference on any
+# remaining ineligibility.
+_ON_HIP = torch.version.hip is not None
+
 # floe's KDA core-numerics contract is fp32 (bf16 state accumulation diverges
 # prefill-vs-decode at real dims — beverin bench finding). tl.dot on fp32
 # operands defaults to tf32 on CUDA (10-bit mantissa), which shows up as ~1e-3
@@ -661,9 +669,9 @@ def solve_tril(
 @persistent_autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3]
-        for BV in [32, 64]
+        for num_warps in ([4] if _ON_HIP else [2, 4])
+        for num_stages in ([2] if _ON_HIP else [2, 3])
+        for BV in ([32] if _ON_HIP else [32, 64])
     ],
     key=["H", "K", "V", "BT"],
     kernel_name='chunk_gated_delta_rule_fwd_kernel_h_blockdim64',
@@ -1212,8 +1220,8 @@ def recompute_w_u_fwd(
     B, T, H, K = k.shape
     V = v.shape[-1]
     BT = A.shape[-1]
-    BK = 64
-    BV = 64
+    BK = 32 if _ON_HIP else 64
+    BV = 32 if _ON_HIP else 64
     NT = cdiv(T, BT)
 
     w = torch.empty_like(k)
@@ -1250,10 +1258,10 @@ def recompute_w_u_fwd(
 @persistent_autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for BK in ([32] if _ON_HIP else [32, 64])
+        for BV in ([32, 64] if _ON_HIP else [64, 128])
+        for num_warps in ([4] if _ON_HIP else [2, 4, 8])
+        for num_stages in ([2] if _ON_HIP else [2, 3, 4])
     ],
     key=["BT"],
     kernel_name='chunk_gla_fwd_kernel_o',

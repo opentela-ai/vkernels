@@ -51,9 +51,13 @@ def _kernel():
 
 
 def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
-    """Return BF16 [B, 1, H, D] log-gates for decode x [B, 1, I].
+    """Return BF16 [B, S, H, D] log-gates for x [B, S, I] (S == 1 decode,
+    or the small-T speculative-verify block, 1 <= S <= 8).
 
-    ``lower_bound=None`` selects the softplus branch (mirrors the eager
+    The math is row-parallel: S rows flatten onto the batch axis and the
+    kernel grid is (qkv/64, B*S). Longer sequences (prefill chunks) stay
+    on the audited eager path via OpNotEligible. ``lower_bound=None``
+    selects the softplus branch (mirrors the eager
     ``safe_gate_lower_bound is None`` path). Anything outside the fused
     contract raises ``OpNotEligible`` so the caller falls back to eager.
     """
@@ -61,8 +65,8 @@ def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
 
     if x.ndim != 3 or x.shape[0] < 1:
         raise OpNotEligible("forget gate fusion requires a nonempty batch [B, S, I]")
-    if x.shape[1] != 1:
-        raise OpNotEligible("forget gate fusion is decode-only (S == 1)")
+    if not (1 <= x.shape[1] <= 8):
+        raise OpNotEligible("forget gate fusion covers decode and small-T verify blocks (1 <= S <= 8)")
     if fa_weight.ndim != 2 or fb_weight.ndim != 2 or dt_bias.ndim != 1 or a_log.ndim != 1:
         raise OpNotEligible("forget gate weights must be matrices and gate constants vectors")
     if x.dtype != torch.bfloat16 or any(
@@ -85,22 +89,23 @@ def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
         raise OpNotEligible("QKV dim must be a multiple of the 64-wide block")
 
     with torch.cuda.device(x.device):
-        batch = x.shape[0]
-        if batch == 1:
+        B, S = x.shape[0], x.shape[1]
+        rows = B * S
+        if rows == 1:
             from vkernels.torch_ops.glm_gemv import dense_gemv
 
             h = dense_gemv(x.view(1, hidden), fa_weight)
         else:
-            h = torch.nn.functional.linear(x.view(batch, hidden), fa_weight)
-        out = torch.empty(batch, qkv_dim, dtype=torch.bfloat16, device=x.device)
+            h = torch.nn.functional.linear(x.reshape(rows, hidden), fa_weight)
+        out = torch.empty(rows, qkv_dim, dtype=torch.bfloat16, device=x.device)
         kern = _kernel()
-        kern[(qkv_dim // 64, batch)](
+        kern[(qkv_dim // 64, rows)](
             h, fb_weight, dt_bias, a_log, out,
             1.0 if lower_bound is None else float(lower_bound),
             lower_bound is not None, head_dim, 64,
             num_warps=4, enable_fp_fusion=False,
         )
-    return out.view(batch, 1, heads, head_dim)
+    return out.view(B, S, heads, head_dim)
 
 
 def forget_gate_reference(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):

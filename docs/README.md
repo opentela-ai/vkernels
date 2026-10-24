@@ -1,5 +1,12 @@
 # vkernels — Supported Kernels & Primitives
 
+The sibling [Floe dataflow design](../../floe/docs/dataflow-serving.md) defines
+the serving integration. vkernels owns compute IR, alias/scratch lifetime
+analysis and kernel lowering; Floe owns region dependencies and submission;
+kvaas owns storage placement, leases and publication. See the
+[stack consolidation](../../floe/docs/consolidated-serving-stack.md) for current
+implementation status and validation across the three repositories.
+
 > Looking for measured performance? See
 > [kernels-reference.md](kernels-reference.md) — every measured kernel,
 > tested hardware, and gap to speed of light in one table. For the *methods*
