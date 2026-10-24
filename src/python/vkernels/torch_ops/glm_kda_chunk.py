@@ -58,6 +58,25 @@ _HEAD_DIMS = (64, 128, 256)  # fwd_h splits K into 64-wide register blocks
 _CHUNK_SIZES = (16, 32, 64)  # solve_tril / kkt block structure supports these
 
 
+def _allow_hip(heads: int) -> bool:
+    """``VK_GLM_KDA_CHUNK_TRITON_HIP=1``: run the fused Triton chunk
+    pipeline on AMD gfx942, within the MI300A-validated envelope.
+
+    Validated (job 693808, chunk-32 tiles for the 64 KB shared limit):
+    per-call heads <= 16 -- the TP4 serving shape -- at rel <= 1.6e-6 vs
+    the eager fp32 reference, 5-19x faster (H16 S4 0.66 vs 3.7 ms; S2048
+    1.9 vs 35.3 ms). Solo heads (64) shows output rel 2e-4 with the state
+    still exact (7.9e-6) -- consistent with the GH200 lane-C precedent
+    (the EAGER oracle's own matmul precision degrading on this vendor) --
+    but outside the validated envelope, so those calls stay on the audited
+    eager reference."""
+    import os
+
+    if os.environ.get("VK_GLM_KDA_CHUNK_TRITON_HIP", "").strip() not in ("1", "true", "yes", "on"):
+        return False
+    return heads <= 16
+
+
 def kda_chunk(
     query,
     key,
@@ -120,11 +139,22 @@ def kda_chunk(
     devices = {t.device for t in (*tensors, beta, initial_state) if t is not None}
     if len(devices) != 1:
         raise OpNotEligible("inputs must live on one GPU")
-    if torch.version.hip is not None:
+    if torch.version.hip is not None and not _allow_hip(int(key.shape[2]) if key.ndim == 4 else 1 << 30):
         raise OpNotEligible(
             "the fused Triton chunk pipeline is wired for NVIDIA; AMD uses the "
-            "kda_chunk_hip WY path"
+            "kda_chunk_hip WY path (or set VK_GLM_KDA_CHUNK_TRITON_HIP=1 to "
+            "try the Triton pipeline on gfx942 -- parity-gated, floe's "
+            "dispatch falls back here on any issue)"
         )
+
+    # gfx942's 64 KB shared limit: BT=64 tiles (A is BT x BT fp32, k/w/u
+    # are BT x K/V with K=V=128 constexpr) require ~145 KB at the h-state
+    # recurrence. Chunk 32 halves every BT-dim tile; the chunked WY math
+    # is exact for ANY chunk multiple, so this is a pure tiling change.
+    import torch as _torch
+
+    if _torch.version.hip is not None and chunk_size > 32:
+        chunk_size = 32
 
     # Zero-pad S to the next chunk multiple (exactly the reference's
     # padding): every fla boundary check then passes fully in-bounds, so no
