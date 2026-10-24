@@ -421,3 +421,11 @@ no config effect, no capture-path mystery — one leftover line.
 3. Re-audit the T2R-12b bisect table: its per-cell walls were all measured on
    the buggy tree; relative orderings likely survive but absolute numbers shift
    ~+2.4 B=1.
+
+## gfx942 Triton KDA chunk (2026-10-24)
+
+`VK_GLM_KDA_CHUNK_TRITON_HIP=1` (heads<=16): the fla chunk_kda Triton
+pipeline on MI300A -- HIP chunk 32 + reduced config sets for the 64 KB
+shared limit. Op parity job 693808 (5-19x vs eager at H16); probe
+tests/python/probe_kda_chunk_gfx942.py is the gate. Serving engagement
+(floe's verify-lane capture warmup) is the open item.
