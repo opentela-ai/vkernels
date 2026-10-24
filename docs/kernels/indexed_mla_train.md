@@ -54,21 +54,29 @@ FP64 absorbed projections match the unabsorbed computation and all weight
 gradients. BF16 absorption changes intermediate rounding points and therefore
 is an explicit numeric mode.
 
-Initial trained-layer measurement (beverin job 693819, torch 2.9.1+rocm6.3,
+Final trained-layer measurement (beverin job 693832, torch 2.9.1+rocm6.3,
 Triton 3.5.1, BF16, B=1, S=4096, H=16, R=512, P=64):
 
 | Implementation | Forward + backward median | Peak allocated |
 | --- | ---: | ---: |
-| Original sparse math SDPA | 22.38 ms | 4.62 GiB |
-| Zero-padded efficient SDPA | 16.96 ms | 1.23 GiB |
-| Gathered latent MLA | 28.39 ms | 0.98 GiB |
+| Original sparse math SDPA | 22.36 ms | 4.62 GiB |
+| Zero-padded efficient SDPA | 16.52 ms | 1.23 GiB |
+| Gathered latent MLA | 27.91 ms | 1.04 GiB |
 
 Every trained-layer parameter/input gradient passed the 1% gate; maximum
-relative error was below 0.46%. Those initial timings used one key-gradient
-accumulator. Kernel-only tuning at K=773 found about 2.7 ms forward and
+relative error was below 0.46%. The final primitive, its two-batch/empty-row
+tests and the trainer's backend/Liger checks all passed (46 tests). The
+first version used one key-gradient accumulator and measured 28.39 ms with
+0.98 GiB peak (job 693819). Kernel-only tuning at K=773 found about 2.7 ms forward and
 18.6–19.0 ms backward with four warps and 16-key tiles; using 4–16
 accumulators changes total time by less than 2%. Larger tiles/warp counts
 were slower. This is not yet the recommended throughput path.
+
+Real training from the frozen step-7500 checkpoint also passed six optimizer
+steps with gradient checkpointing and 32-to-four-rank optimizer resharding
+(job 693824): maximum paired CE difference 0.0017 and gradient-norm relative
+difference 0.65%. It measured 7,645 vs 7,820 reference tokens/s at a
+65,536-token global batch; peaks were 68.84 vs 77.36 GiB on rank 0.
 
 Run the focused tests with torch and Triton already installed:
 
