@@ -289,6 +289,8 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, im
         if selected.name != "cuda_native":
             raise contract_error("zero-route GEMV requires the cuda_native implementation")
         return _launch_native(x, weights, scales, indices, route_weights=route_weights)
+    if native_decode is True and selected.name == "portable":
+        return _launch(x, weights, scales, indices, native=False, native_decode=True)
     return selected.load()(x, weights, scales, indices)
 
 
@@ -300,7 +302,7 @@ def _launch_portable(x, weights, scales, indices):
     return _launch(x, weights, scales, indices, native=False)
 
 
-def _launch(x, weights, scales, indices, *, native, route_weights=None):
+def _launch(x, weights, scales, indices, *, native, route_weights=None, native_decode=False):
     import os
     import torch
 
@@ -320,7 +322,7 @@ def _launch(x, weights, scales, indices, *, native, route_weights=None):
             # Only measured inference cells use native FN-byte conversion.
             # Other stacks/geometries keep the original implementation.
             use_native_decode = (
-                native_decode is True and not native and not fnuz
+                native_decode is True and not native and weights.dtype == torch.float8_e4m3fn
                 and t in (1, 2, 4) and k == 8
                 and (o, i) in ((1024, 4096), (4096, 512))
                 and str(torch.__version__) == "2.9.0a0+git7bcbafe"
