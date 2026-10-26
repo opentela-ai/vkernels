@@ -46,6 +46,7 @@ def _kernel():
         COLS: tl.constexpr,
         FNUZ: tl.constexpr,
         FNUZ_NATIVE: tl.constexpr = False,
+        FN_NATIVE: tl.constexpr = False,
     ):
         selected = tl.program_id(0)
         row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
@@ -82,13 +83,20 @@ def _kernel():
                 )
                 value = tl.where(raw == 128, float("nan"), value)
         else:
-            bits = ((exponent + 120) << 23) | (mantissa << 20)
-            value = tl.where(
-                exponent == 0,
-                mantissa.to(tl.float32) * 0.001953125,
-                bits.to(tl.float32, bitcast=True),
-            )
-            value = tl.where((raw & 127) == 127, float("nan"), value)
+            if FN_NATIVE:
+                # FN = 2 * FNUZ for finite nonzero values. FN -0 must
+                # avoid FNUZ's NaN byte; the common sign step restores it.
+                compatible = tl.where(raw == 128, 0, raw8).to(tl.uint8)
+                value = compatible.to(tl.float8e4b8, bitcast=True).to(tl.float32) * 2.0
+                value = tl.where((raw & 127) == 127, float("nan"), value)
+            else:
+                bits = ((exponent + 120) << 23) | (mantissa << 20)
+                value = tl.where(
+                    exponent == 0,
+                    mantissa.to(tl.float32) * 0.001953125,
+                    bits.to(tl.float32, bitcast=True),
+                )
+                value = tl.where((raw & 127) == 127, float("nan"), value)
         value = (value.to(tl.int32, bitcast=True) | ((raw & 128) << 24)).to(
             tl.float32, bitcast=True
         )
@@ -167,7 +175,15 @@ def _kernel():
         result = tl.sum(weight * x[None, :], axis=1)
         tl.store(Y + selected * O + row, result, row < O)
 
-    return _expert_gemv, _expert_gemv_native
+    @triton.jit
+    def _expert_gemv_fn_native(X, W, S, IDX, Y, O: tl.constexpr,
+                               I: tl.constexpr, K: tl.constexpr,
+                               BROADCAST: tl.constexpr, ROWS: tl.constexpr,
+                               COLS: tl.constexpr):
+        _expert_gemv(X, W, S, IDX, Y, O, I, K, BROADCAST, ROWS, COLS,
+                     False, False, True)
+
+    return _expert_gemv, _expert_gemv_native, _expert_gemv_fn_native
 
 
 @lru_cache(maxsize=1)
@@ -197,7 +213,7 @@ def _select_implementation(specs, cap, implementation):
         raise OpNotEligible(str(exc)) from exc
 
 
-def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, implementation=None, route_weights=None):
+def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, implementation=None, route_weights=None, native_decode=False):
     """Return BF16 [T,K,O] for BF16 x[T,I] or x[T,K,I], T <= t_cap.
 
     ``t_cap`` (default 2, the decode-validated limit) is the row cap the
@@ -206,6 +222,10 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, im
     verify/replay blocks route here. The kernel body is shape-generic —
     one program per (token, expert-slot) pair — so only this wrapper
     guard needs the cap; parity at the raised T is the caller's job.
+
+    ``native_decode=True`` opts into exact FN-byte hardware conversion on
+    the pinned gfx942 inference cells; unsupported cells retain the original
+    implementation. It changes no weight storage, scale, or reduction.
 
     Contiguous GPU inputs and valid expert IDs are required. On NVIDIA the
     FN bytes are hardware-decoded (e4m3FN == e4m3nv semantics there); on
@@ -290,13 +310,26 @@ def _launch(x, weights, scales, indices, *, native, route_weights=None):
     if t and k:
         import triton  # lazy: validation above needs only torch
 
-        gemv, gemv_native = _kernel()
+        gemv, gemv_native, gemv_fn_native = _kernel()
         with torch.cuda.device(x.device):
             kernel = gemv_native if native else gemv
             # Only the portable kernel accepts the storage-format constexpr.
             fnuz_native = (weights.dtype == torch.float8_e4m3fnuz and torch.version.hip
                            and os.environ.get("GLM53_GEMV_FNUZ_NATIVE", "0") not in ("", "0"))
             extra = [] if native else [weights.dtype == torch.float8_e4m3fnuz, bool(fnuz_native)]
+            # Only measured inference cells use native FN-byte conversion.
+            # Other stacks/geometries keep the original implementation.
+            use_native_decode = (
+                native_decode is True and not native and not fnuz
+                and t in (1, 2, 4) and k == 8
+                and (o, i) in ((1024, 4096), (4096, 512))
+                and str(torch.__version__) == "2.9.0a0+git7bcbafe"
+                and torch.version.hip == "7.0.51831-a3e329ad8"
+                and triton.__version__ == "3.4.0"
+                and torch.cuda.get_device_properties(x.device).gcnArchName.split(":", 1)[0] == "gfx942"
+            )
+            if use_native_decode:
+                kernel, extra = gemv_fn_native, []
             skip_kwargs = ({"ROUTE_W": route_weights, "SKIP_ZERO": True}
                            if route_weights is not None else {})
             kernel[(t * k, triton.cdiv(o, 4))](
