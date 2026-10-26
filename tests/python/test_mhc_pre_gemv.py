@@ -137,3 +137,35 @@ def test_graph_capture_replay(torch):
     diff = (out.float() - want.float()).abs().max().item()
     scale = want.float().abs().max().item()
     assert diff <= max(2e-2, scale * 2e-2), diff
+
+
+@pytest.mark.parametrize('rows', [9,12,16])
+def test_explicit_prefix_envelope_preserves_row_arithmetic(torch, rows):
+    from vkernels.torch_ops.mhc_pre_gemv import mhc_pre_gemv
+    x,fn=_inputs(torch,4,4096,rows,seed=rows+191)
+    with pytest.raises(ValueError,match='decode-sized'):
+        mhc_pre_gemv(x,fn)
+    before_x,before_fn=x.clone(),fn.clone()
+    actual=mhc_pre_gemv(x,fn,max_rows=16)
+    expected=torch.cat([mhc_pre_gemv(v,fn) for v in x.split(8)])
+    assert torch.equal(actual.view(torch.int16),expected.view(torch.int16))
+    assert torch.equal(x,before_x) and torch.equal(fn,before_fn)
+    graph=torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):captured=mhc_pre_gemv(x,fn,max_rows=16)
+    for index in range(4):
+        x.copy_(torch.randn_like(x))
+        if index==0:x[1:].zero_()
+        graph.replay()
+        expected=torch.cat([mhc_pre_gemv(v,fn) for v in x.split(8)])
+        torch.cuda.synchronize()
+        assert torch.equal(captured.view(torch.int16),expected.view(torch.int16))
+    with pytest.raises(ValueError,match='decode-sized'):
+        mhc_pre_gemv(x.repeat(2,1),fn,max_rows=16)
+
+
+@pytest.mark.parametrize('cap',[0,4,17,True,8.0])
+def test_prefix_cap_is_bounded(torch,cap):
+    from vkernels.torch_ops.mhc_pre_gemv import mhc_pre_gemv
+    x,fn=_inputs(torch,4,4096,1)
+    with pytest.raises(ValueError,match='max_rows'):
+        mhc_pre_gemv(x,fn,max_rows=cap)

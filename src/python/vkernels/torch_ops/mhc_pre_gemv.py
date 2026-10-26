@@ -17,7 +17,7 @@ folds the mix GEMV into the same launch: a pre site drops from 5 kernels
 (norm → GEMV → ``_mix`` gates → ``_collapse`` → post-collapse ``_norm``,
 ~12-13 us of launch-bound single-CTA work at bs=1) to 2
 (``mhc_pre_gemv`` + ``mhc_pre_big_fuse``) under floe's ``mhc_big_fuse``
-knob. Rows ≤ 8 (the decode-graph ladder: buckets 1/2/4, envelope to 8)
+knob. Rows ≤ 8 by default; explicit max_rows=16 covers prefix verification
 so the B=4 bucket rides the fused launch too. Grid ``(tokens, mix)``:
 each program computes one output row,
 re-deriving the (tiny) row statistic — the fn stack (the only real
@@ -74,7 +74,7 @@ def _kernels():
     return _pre_gemv
 
 
-def mhc_pre_gemv(streams_flat, fn, hc=4, hidden_size=4096, eps=1e-6):
+def mhc_pre_gemv(streams_flat, fn, hc=4, hidden_size=4096, eps=1e-6, *, max_rows=8):
     """Return the mix logits ``RMSNorm(streams_flat) @ fnᵀ`` in one launch.
 
     ``streams_flat`` is ``[..., hc·hidden]`` bf16/fp16 (the flattened
@@ -98,17 +98,15 @@ def mhc_pre_gemv(streams_flat, fn, hc=4, hidden_size=4096, eps=1e-6):
     if streams_flat.dtype not in (torch.bfloat16, torch.float16):
         raise OpNotEligible("streams must be bf16/fp16")
     rows = streams_flat.numel() // k
-    if rows > 8:
-        # Decode-sized rows only (the decode-graph ladder tops out at the
-        # 8-token bucket; floe's B<=4 serving runs rows<=4). The grid is
-        # (tokens, mix) — one program per output row — so extra rows are
-        # trivially M-safe (no per-program state beyond the row index);
-        # at prefill row counts the per-row GEMV grid still wastes the
-        # machine, so prefill keeps the BLAS GEMM (bit-identical to the
-        # eager chain). The per-row rounding contract is row-local: the
-        # fp32 statistic and fp32-accum GEMV never mix rows, so lifting
-        # the cap changes no rounding, only which shapes take the launch.
-        raise OpNotEligible("decode-sized rows only (<= 8)")
+    if type(max_rows) is not int or max_rows not in (8, 16):
+        raise OpNotEligible("max_rows must be 8 or 16")
+    if rows > max_rows:
+        # Prefix verification can submit B4 x T4 = 16 rows. Its short
+        # repair oracle must use the same row-local fused arithmetic;
+        # mixing the fused path with the BLAS fallback can drift. Keep
+        # the ordinary decode envelope at eight unless explicitly raised.
+        # Grid rows are independent; the kernel's reduction is unchanged.
+        raise OpNotEligible(f"decode-sized rows only (<= {max_rows})")
     if fn.dtype != streams_flat.dtype:
         raise OpNotEligible("fn must share the streams' dtype")
     for x in (streams_flat, fn):
