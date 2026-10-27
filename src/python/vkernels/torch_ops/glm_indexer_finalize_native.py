@@ -9,14 +9,12 @@ def _kernel(dynamic_geometry=False):
     import triton
     import triton.language as tl
 
-    scalar = int if dynamic_geometry else tl.constexpr
     dynamic = ["K", "L", "IB", "IK", "IS", "SB", "SK", "VB", "VL", "KB", "KL", "MB"]
-    @triton.jit(do_not_specialize=dynamic if dynamic_geometry else [])
     def _emit(Indices,SelectedValid,Visible,KeyValid,Mask,Out,
-              K:scalar,L:scalar,W:tl.constexpr,
-              IB:scalar,IK:scalar,IS:scalar,
-              SB:scalar,SK:scalar,VB:scalar,VL:scalar,
-              KB:scalar,KL:scalar,MB:scalar,
+              K,L,W:tl.constexpr,
+              IB,IK,IS,
+              SB,SK,VB,VL,
+              KB,KL,MB,
               BLOCK_L:tl.constexpr,BLOCK_W:tl.constexpr):
         row=tl.program_id(0)
         pos=tl.arange(0,BLOCK_L)
@@ -44,7 +42,11 @@ def _kernel(dynamic_geometry=False):
         value=tl.where(enabled,value,-1).to(tl.int32)
         tl.store(Out+row*W+out_pos,value,out_pos<W)
 
-    return _emit
+    # Triton 3.4 resolves source annotations during compilation; local type
+    # aliases are not supported. Bind static scalar annotations before JIT.
+    if not dynamic_geometry:
+        _emit.__annotations__.update({name: tl.constexpr for name in dynamic})
+    return triton.jit(_emit, do_not_specialize=dynamic if dynamic_geometry else [])
 
 
 def glm_indexer_native_finalize(selected_indices, selected_valid, visible,
