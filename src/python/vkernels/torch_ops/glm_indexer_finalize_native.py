@@ -3,18 +3,20 @@ from functools import lru_cache
 from ._dispatch import OpNotEligible
 
 
-@lru_cache(maxsize=1)
-def _kernel():
+@lru_cache(maxsize=2)
+def _kernel(dynamic_geometry=False):
     global tl
     import triton
     import triton.language as tl
 
-    @triton.jit
+    scalar = int if dynamic_geometry else tl.constexpr
+    dynamic = ["K", "L", "IB", "IK", "IS", "SB", "SK", "VB", "VL", "KB", "KL", "MB"]
+    @triton.jit(do_not_specialize=dynamic if dynamic_geometry else [])
     def _emit(Indices,SelectedValid,Visible,KeyValid,Mask,Out,
-              K:tl.constexpr,L:tl.constexpr,W:tl.constexpr,
-              IB:tl.constexpr,IK:tl.constexpr,IS:tl.constexpr,
-              SB:tl.constexpr,SK:tl.constexpr,VB:tl.constexpr,VL:tl.constexpr,
-              KB:tl.constexpr,KL:tl.constexpr,MB:tl.constexpr,
+              K:scalar,L:scalar,W:tl.constexpr,
+              IB:scalar,IK:scalar,IS:scalar,
+              SB:scalar,SK:scalar,VB:scalar,VL:scalar,
+              KB:scalar,KL:scalar,MB:scalar,
               BLOCK_L:tl.constexpr,BLOCK_W:tl.constexpr):
         row=tl.program_id(0)
         pos=tl.arange(0,BLOCK_L)
@@ -46,15 +48,19 @@ def _kernel():
 
 
 def glm_indexer_native_finalize(selected_indices, selected_valid, visible,
-                                valid_keys, mask):
+                                valid_keys, mask, *, dynamic_geometry=False):
     """Emit native picked tokens and visible tail, or decline unsupported inputs.
 
     Pool selection and its order are supplied by the unchanged Torch top-k.
+    Private MTP uses dynamic_geometry to avoid compiling each growing context
+    length and pool count. Its integer/bool math and reduction tiles are unchanged.
     Only integer/bool operations are fused; the selected prefix, tail placement,
     invalid picks, output padding and int32 conversion retain their native order.
     """
     import torch
 
+    if not isinstance(dynamic_geometry, bool):
+        raise OpNotEligible("dynamic geometry selection must be boolean")
     if selected_indices.ndim != 4 or selected_indices.dtype != torch.int64:
         raise OpNotEligible("requires int64 selected pools with four dimensions")
     batch, width, k, pool = selected_indices.shape
@@ -82,7 +88,7 @@ def glm_indexer_native_finalize(selected_indices, selected_valid, visible,
     if triton.__version__ != "3.4.0":
         raise OpNotEligible("unqualified Triton stack")
     output = torch.empty((batch, 1, 2051), device=selected_indices.device, dtype=torch.int32)
-    _kernel()[(batch,)](selected_indices, selected_valid, visible, valid_keys, mask, output,
+    _kernel(dynamic_geometry)[(batch,)](selected_indices, selected_valid, visible, valid_keys, mask, output,
         k, length, 2051, selected_indices.stride(0), selected_indices.stride(2), selected_indices.stride(3),
         selected_valid.stride(0), selected_valid.stride(2), visible.stride(0), visible.stride(2),
         valid_keys.stride(0), valid_keys.stride(1), mask.stride(0), triton.next_power_of_2(length), 4096,
