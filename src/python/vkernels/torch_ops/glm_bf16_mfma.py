@@ -4,7 +4,10 @@ Prototype pins matched native hipBLASLt results on gfx942. Operand
 order and K packing are part of the numerical policy; do not tune them at
 runtime. Two prototype operator stages tested these 27 cells, including
 1024 changing inputs/four new weights per cell and signed-zero/cancellation
-cases. This API and full-model speed/quality require separate qualification.
+cases. The full-vocabulary single-row head also matched 30 trained MTP
+hidden rows and 4096 cells across four new weights, including signed zero
+and cancellation. This API and full-model speed/quality require separate
+qualification.
 """
 from functools import lru_cache
 from ._dispatch import OpNotEligible
@@ -41,6 +44,7 @@ _PINS = {
     (38720, 4096, 2): (512, False, 2),
     (38720, 4096, 3): (128, False, 2),
     (38720, 4096, 4): (512, False, 2),
+    (154880, 4096, 1): (512, False, 2),
 }
 
 

@@ -9,6 +9,11 @@ from vkernels.torch_ops import glm_bf16_mfma as op
 from vkernels.torch_ops._dispatch import OpNotEligible
 
 
+def test_full_vocabulary_head_admission_is_single_row_only():
+    assert op._PINS[(154880, 4096, 1)] == op._PINS[(38720, 4096, 1)]
+    assert all((154880, 4096, rows) not in op._PINS for rows in [0, 2, 3, 4, 8])
+
+
 def test_cpu_declines_before_compiling(monkeypatch):
     monkeypatch.setattr(op, '_kernels', lambda: pytest.fail('compiled on CPU'))
     with pytest.raises(OpNotEligible, match='HIP device'):
