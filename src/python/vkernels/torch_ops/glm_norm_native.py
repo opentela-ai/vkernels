@@ -116,11 +116,11 @@ def rms_norm_native(x, module, gate=None, *, fp32_weight=False, canonical_rows=F
             x, squared, x.numel(), 256, enable_fp_fusion=False)
         if canonical_rows and weighted and not gated and dim == 1536 and rows >= 4 and x.is_contiguous():
             # HIP Torch selects a different mean reduction at four rows.
-            # Two-row groups retain the reference reduction and rounding;
+            # Three-row groups retain the reference reduction and rounding;
             # square and the BF16 epilogue remain unchanged.
             inv = torch.cat([
                 torch.rsqrt(part.mean(-1, keepdim=True) + eps)
-                for part in squared.view(rows, dim).split(2)
+                for part in squared.view(rows, dim).split(3)
             ], dim=0).contiguous()
         else:
             inv = torch.rsqrt(squared.mean(-1, keepdim=True) + eps).contiguous()
