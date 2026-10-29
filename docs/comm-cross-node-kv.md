@@ -383,6 +383,62 @@ recipe is staged in `meta/scripts/bench_cross_node_nccl_jsc.sh` and
 communicator pinned a distinct `mlx5_<l>`. Until that run lands, no
 striped speedup is claimed.
 
+**Issue #153 status — measurement is one command away; nothing measured
+yet.** Re-verified from the operator environment for #153:
+
+- Host gate on the branch holding `cad17f6`: 47/47 `ctest --preset host`
+  (including `cross_node_kv_striped`).
+- `bench_cross_node_nccl.cu` compiles **and links** at the local GB10's
+  native `sm_121` (CUDA 13.0, NCCL 2.30.7 wheel through a symlink
+  prefix) — the built binary then refuses `<2`-rank launches by design,
+  so no local number exists. This pass caught a real recipe defect
+  (fixed in this branch): `cmake --preset cuda` alone leaves
+  `VKERNELS_BUILD_BENCHMARKS` OFF, so `cross_node_nccl_bench` had **no
+  build rule**; the staged script now passes the flag.
+- Access re-probe (unchanged from the #152 lane): no reachable host has
+  2-node GH200 + InfiniBand HDR. Needed: a JSC project slot on the GH200
+  HDR partition of the §8 baseline (2 distinct GH200 120 GB nodes, 4×
+  mlx5, GPUDirect RDMA, shared scratch for the NCCL bootstrap file) —
+  then on a JSC login node, in a clone of this repo at ≥ `cad17f6`:
+
+  ```
+  bash meta/scripts/bench_cross_node_nccl_jsc.sh
+  ```
+
+  (builds `build/cuda/meta/benchmarks/cross_node_nccl_bench`, then
+  sbatches the 2-node `--stripe 4` sweep; output:
+  `vk152-stripe-<jobid>.out`).
+
+**Striped results table — DRAFT, placeholders until the JSC run.**
+Every `TBD` below is filled from the `vk152-stripe-<jobid>.out` rows of
+that one command; do not treat any `TBD` as data. Expected shape: xfer
+stays ~24 GB/s flat; stripe jumps to ~70–90 GB/s at ≥16384 tok (4-lane
+aggregate is 100 GB/s); below 16384 tok the striped row should sit at
+≈ xfer (the plan collapses to a single lane there — the auto-fallback
+the issue asks to verify).
+
+| toks | nccl-xfer usefGB | nccl-stripe(4) usefGB | ratio (need ≥3 at ≥16384) | check |
+|-----:|-----------------:|----------------------:|--------------------------:|:-----:|
+|   256 | TBD | TBD | TBD | TBD |
+|  1024 | TBD | TBD | TBD | TBD |
+|  2048 | TBD | TBD | TBD | TBD |
+|  4096 | TBD | TBD | TBD | TBD |
+|  8192 | TBD | TBD | TBD | TBD |
+| 16384 | TBD | TBD | TBD | TBD |
+| 32768 | TBD | TBD | TBD | TBD |
+| 65536 | TBD | TBD | TBD | TBD |
+
+Acceptance checklist for closing #152 (all three, or the measured
+numbers get written up as a negative result instead):
+
+1. `nccl-stripe` ≥3× `nccl-xfer` `usefGB` at each of 16384/32768/65536
+   toks, all rows `check=ok`.
+2. <16384 tok: the striped row does not regress `nccl-xfer`
+   (single-QP/single-lane fallback behaves).
+3. The `NCCL_DEBUG=INFO --quick` pass shows each stripe communicator
+   landed on a distinct `mlx5_<l>` (paste the `NET/IB : Using` lines
+   here: TBD).
+
 ---
 
 ## 9. References

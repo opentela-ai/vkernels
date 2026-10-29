@@ -23,7 +23,8 @@
 # at 16384+ toks (~24 -> ~70-90 GB/s), with all rows reporting check=ok.
 # Do NOT present results from a non-HDR fabric as the JSC result.
 #SBATCH --job-name=vk152-stripe
-#SBATCH --partition=boot            # FIXME: verify the GH200 partition name on the JSC system at submission time
+# FIXME: verify the GH200 partition name on the JSC system at submission time
+#SBATCH --partition=boot
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
@@ -32,6 +33,15 @@
 #SBATCH --output=vk152-stripe-%j.out
 
 set -euo pipefail
+
+# Toolchain on the compute nodes: the bench binary links libnccl.so.2 from
+# the EasyBuild tree (and libcuda from the driver), so load the modules
+# inside the job rather than relying on the submit-shell environment being
+# propagated. Keep the module names in sync with the .sh build script.
+module purge
+module load CUDA/13.0
+module load NCCL/2.29.7-CUDA-13.0 || module load NCCL  # FIXME: exact name via module spider
+module list
 
 BENCH=${BENCH:-build/cuda/meta/benchmarks/cross_node_nccl_bench}
 REPO=${SLURM_SUBMIT_DIR:-$PWD}
