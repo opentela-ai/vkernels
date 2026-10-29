@@ -54,12 +54,15 @@ def _kernels():
     return square_kernel, epilogue
 
 
-def rms_norm_native(x, module, gate=None, *, fp32_weight=False):
+def rms_norm_native(x, module, gate=None, *, fp32_weight=False, canonical_rows=False):
     """Return native-rounded BF16 output; unsupported contracts decline.
 
     Eligibility covers measured dense BF16 matrices and head layouts on
     gfx942/Torch2.9-HIP7/Triton3.4. There are no global backend changes,
     cache writes, input mutations or data-dependent synchronization.
+    ``canonical_rows`` keeps contiguous weighted width-1536 reductions in
+    the one-to-three-row reference regime on this stack. Callers must opt
+    in only where short-block outputs must agree with single-token decode.
     """
     import math
     import torch
@@ -111,7 +114,16 @@ def rms_norm_native(x, module, gate=None, *, fp32_weight=False):
         squared = torch.empty_like(x, dtype=torch.float32)
         square[(triton.cdiv(x.numel(), 256),)](
             x, squared, x.numel(), 256, enable_fp_fusion=False)
-        inv = torch.rsqrt(squared.mean(-1, keepdim=True) + eps).contiguous()
+        if canonical_rows and weighted and not gated and dim == 1536 and rows >= 4 and x.is_contiguous():
+            # HIP Torch selects a different mean reduction at four rows.
+            # Two-row groups retain the reference reduction and rounding;
+            # square and the BF16 epilogue remain unchanged.
+            inv = torch.cat([
+                torch.rsqrt(part.mean(-1, keepdim=True) + eps)
+                for part in squared.view(rows, dim).split(2)
+            ], dim=0).contiguous()
+        else:
+            inv = torch.rsqrt(squared.mean(-1, keepdim=True) + eps).contiguous()
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         finish[(rows,)](
             x, gate if gated else x, module.weight if weighted else x, inv, out,
