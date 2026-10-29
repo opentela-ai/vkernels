@@ -100,14 +100,32 @@ def _kernel():
         value = (value.to(tl.int32, bitcast=True) | ((raw & 128) << 24)).to(
             tl.float32, bitcast=True
         )
-        scale = tl.load(
-            S
-            + (expert * (O // 128) + row[:, None] // 128) * (I // 128)
-            + col[None, :] // 128,
-            (row[:, None] < O) & (col[None, :] < I),
-            0,
-        )
-        weight = (value * scale).to(tl.bfloat16).to(tl.float32)
+        if COMPACT_SCALES:
+            # Preserve per-element scaling/BF16 rounding and the original
+            # reduction tile. Gather each 128-column block scale once.
+            scol = tl.arange(0, COLS // 128)
+            scale = tl.load(
+                S
+                + (expert * (O // 128) + row[:, None] // 128) * (I // 128)
+                + scol[None, :],
+                (row[:, None] < O) & (scol[None, :] < I // 128),
+                0,
+            )
+            weight = (
+                (value.reshape(ROWS, COLS // 128, 128) * scale[:, :, None])
+                .reshape(ROWS, COLS)
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+        else:
+            scale = tl.load(
+                S
+                + (expert * (O // 128) + row[:, None] // 128) * (I // 128)
+                + col[None, :] // 128,
+                (row[:, None] < O) & (col[None, :] < I),
+                0,
+            )
+            weight = (value * scale).to(tl.bfloat16).to(tl.float32)
         x_row = selected // K if BROADCAST else selected
         x = tl.load(X + x_row * I + col, col < I, 0).to(tl.float32)
         result = tl.sum(weight * x[None, :], axis=1)
