@@ -956,6 +956,258 @@ def glm_decode_fp8_gemm(
 
 
 @lru_cache(maxsize=1)
+def _quantize_fnuz_fused_kernel():
+    """One-launch fnuz activation quantize (issue #148 decode path): the
+    torch-op chain behind ``quantize_activations_fnuz`` is ~10 tiny kernels,
+    whose launch overhead dwarfs a ~7 us decode GEMM at M=1. One program per
+    token row computes the per-128-group amax/doubled scale and the fnuz
+    payload (fp32->float8e4b8 hardware convert) in a single launch."""
+    global tl
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _quantize_fnuz(X, Q, S, K, GROUPS: tl.constexpr):
+        # one program per (token, 128-group): at M=1 the serial per-row
+        # variant ran 32 groups on ONE warp — the launch grid, not the
+        # memory, set the floor.
+        row = tl.program_id(0).to(tl.int64)
+        g = tl.program_id(1)
+        cols = tl.arange(0, 128)
+        off = row * K + g * 128 + cols
+        x = tl.load(X + off).to(tl.float32)
+        amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
+        # doubled scale = 2 * (amax/448): payload x scale reproduces x
+        s2 = amax / 224.0
+        q8 = (x / s2).to(tl.float8e4b8).to(tl.uint8, bitcast=True)
+        tl.store(Q + off, q8)
+        tl.store(S + row * GROUPS + g, s2)
+
+    return _quantize_fnuz
+
+
+def quantize_activations_fnuz_fused(x):
+    """BF16 [M, K] -> (fnuz payload uint8-view, DOUBLED fp32 scales) in ONE
+    kernel launch. Same contract as :func:`quantize_activations_fnuz` (the
+    native-backend convention: payload x doubled-scale = value), but a
+    single launch instead of the ~10-kernel torch-op chain — at M=1 decode
+    the chain's launch overhead exceeds the entire GEMM. The payload tensor
+    is returned as uint8; ``.view(torch.float8_e4m3fnuz)`` reinterprets it
+    for the fp8 dot kernels.
+    """
+    import torch
+
+    if x.ndim != 2:
+        raise ValueError("expected x [M, K]")
+    m, k = x.shape
+    if k % 128:
+        raise ValueError(f"K ({k}) must be a multiple of 128")
+    if not x.is_cuda:
+        raise ValueError("fused quantize requires a GPU tensor")
+    q = torch.empty((m, k), device=x.device, dtype=torch.uint8)
+    s = torch.empty((m, k // 128), device=x.device, dtype=torch.float32)
+    _quantize_fnuz_fused_kernel()[(m, k // 128)](
+        x, q, s, k, GROUPS=k // 128, num_warps=1
+    )
+    return q.view(torch.float8_e4m3fnuz), s
+
+
+@lru_cache(maxsize=1)
+def _triton_decode_kernel():
+    """M<=16 hardware-fp8 MFMA decode GEMM on the fnuz storage (issue #148).
+
+    Weight rows stream once as raw e4m3fnuz bytes straight into the CDNA3
+    ``v_mfma`` fp8 dot — the ~10-ALU-op manual per-byte bit-decode that
+    caps every structure at 500-800 GB/s (docs/glm53-decode-kernels.md,
+    three measured rounds) is gone. Operands follow the native-backend
+    convention: fnuz payloads with DOUBLED fp32 scales
+    (``e4m3fn_to_fnuz_inplace`` stacks, ``quantize_activations_fnuz(_fused)``
+    activations). Scales apply per 128-K-block to the fp32 block partials
+    (same math as the torch oracle, fnuz-rounded operands); split-K over
+    the scale blocks writes fp32 partials that the launcher reduces in
+    fixed split order (deterministic per config).
+    """
+    global tl
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _decode_gemm(
+        A,
+        SA,
+        W,
+        SW,
+        PART,
+        M,
+        N,
+        K,
+        sam,
+        sakb,
+        swn,
+        swkb,
+        NKB: tl.constexpr,
+        SK: tl.constexpr,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        KP: tl.constexpr,  # K-blocks (of 128) per iteration; 2 lets the two
+        # mfma chains overlap (the single-block variant measured ~15% slower
+        # on MI300A: one dot -> scale -> acc dependency per 16 KB load)
+        FUSE_Q: tl.constexpr,  # quantize the bf16 activation in-kernel
+    ):
+        pid_n = tl.program_id(0)
+        pid_k = tl.program_id(1)
+        rm = tl.arange(0, BM)
+        rn = pid_n * BN + tl.arange(0, BN)
+        rmask = rm < M
+        nmask = rn < N
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        KB_PER_SPLIT: tl.constexpr = NKB // SK
+        kb0 = pid_k * KB_PER_SPLIT
+        for kbi in range(kb0, kb0 + KB_PER_SPLIT, KP):
+            acc_it = tl.zeros((BM, BN), dtype=tl.float32)
+            for j in tl.static_range(KP):
+                kb = kbi + j
+                rk = kb * 128 + tl.arange(0, 128)
+                if FUSE_Q:
+                    # per-token per-128-group amax quantize, recomputed per
+                    # CTA (an 8 KB bf16 read — a launch + round-trip saved,
+                    # which is what dominates at M=1)
+                    xa = tl.load(
+                        A + rm[:, None] * K + rk[None, :],
+                        mask=rmask[:, None],
+                        other=0.0,
+                    ).to(tl.float32)
+                    amax = tl.maximum(tl.max(tl.abs(xa), axis=1), 1e-4)
+                    sa = amax / 224.0
+                    a = (xa / sa[:, None]).to(tl.float8e4b8)
+                else:
+                    a = tl.load(
+                        A + rm[:, None] * K + rk[None, :],
+                        mask=rmask[:, None],
+                        other=0.0,
+                    )
+                    sa = tl.load(SA + rm * sam + kb * sakb, mask=rmask, other=0.0)
+                b = tl.load(
+                    W + rn[:, None] * K + rk[None, :],
+                    mask=nmask[:, None],
+                    other=0.0,
+                )
+                sb = tl.load(SW + (rn // 128) * swn + kb * swkb, mask=nmask, other=0.0)
+                blk = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
+                acc_it += blk * (sa[:, None] * sb[None, :])
+            acc += acc_it
+        tl.store(
+            PART + pid_k.to(tl.int64) * M * N + rm[:, None] * N + rn[None, :],
+            acc,
+            mask=rmask[:, None] & nmask[None, :],
+        )
+
+    return _decode_gemm
+
+
+def glm_decode_fp8_gemm(
+    x,
+    w_fnuz,
+    w_scales2,
+    split_k=None,
+    fused_quantize=True,
+    out_dtype=None,
+):
+    """Decode GEMV/GEMM (M <= 16) against one expert weight panel on the
+    fnuz storage (issue #148).
+
+    x: BF16 [M, K] (M <= 16, the decode cap). w_fnuz: [N, K] e4m3fnuz —
+    the in-place converted checkpoint panel (``e4m3fn_to_fnuz_inplace``) —
+    with its DOUBLED fp32 scales w_scales2 [N//128, K//128]. By default
+    (fused_quantize=True) the per-token per-128-group fnuz activation
+    quantize happens INSIDE the GEMM launch (each CTA re-derives the row
+    scales from an 8 KB bf16 read — at M=1 the standalone quantize launch
+    plus payload/scale round-trip cost more than the whole GEMM); the
+    fp8 product is the CDNA3 ``v_mfma`` hardware path (no per-byte manual
+    decode).
+
+    ``VK_DECODE_GEMM_TILES='BN,warps,stages'`` overrides the tile config;
+    ``split_k`` (default ``VK_DECODE_GEMM_SK``, else 4) must divide
+    K//128. Returns BF16 [M, N] with fnuz-rounded parity vs the fp32
+    dequant reference — the same documented divergence class as the
+    prefill native path (fp8 activation quantization + fnuz subnormal
+    grid), NOT bit-identical to the bf16-GEMV decode.
+    """
+    import torch
+
+    m, k = x.shape
+    n, k2 = w_fnuz.shape
+    if k != k2 or k % 128 or n % 128:
+        raise ValueError(
+            f"shape mismatch x[{m},{k}] W[{n},{k2}] (K,N multiples of 128)"
+        )
+    if w_fnuz.dtype != torch.float8_e4m3fnuz:
+        raise TypeError(
+            "weights must be e4m3fnuz (run e4m3fn_to_fnuz_inplace first)"
+        )
+    if w_scales2.shape != (n // 128, k // 128):
+        raise ValueError("expected DOUBLED scales [N//128, K//128]")
+    if m > 16:
+        raise ValueError(
+            f"M={m} exceeds the decode tile (16); use fp8_blockwise_gemm"
+        )
+    if not (x.is_cuda and w_fnuz.is_cuda):
+        raise ValueError("inputs must be GPU tensors")
+    out_dtype = out_dtype or torch.bfloat16
+
+    if fused_quantize:
+        # activation quantize happens INSIDE the GEMM kernel (FUSE_Q) —
+        # no separate launch, no payload/scale round-trip; SA is unused
+        asc2 = w_scales2
+    else:
+        a_nz, asc2 = quantize_activations_fnuz(x)
+
+    bn, warps, kp = 128, 4, 2
+    # KP=2 keeps two mfma chains in flight but doubles the staged B tiles;
+    # stages=3 with KP=2 exceeds the 64 KB LDS limit (67.5 KB measured)
+    stages = 3 if kp == 1 else 2
+    cfg = os.environ.get("VK_DECODE_GEMM_TILES", "")
+    if cfg:
+        parts = [int(v) for v in cfg.split(",")]
+        bn, warps, stages = parts[:3]
+        kp = parts[3] if len(parts) > 3 else 2
+    nkb = k // 128
+    sk = split_k if split_k is not None else int(
+        os.environ.get("VK_DECODE_GEMM_SK", "4")
+    )
+    if nkb % sk:
+        raise ValueError(f"split_k={sk} must divide K//128={nkb}")
+    if (nkb // sk) % kp:
+        kp = 1  # KP K-blocks must fit each split cleanly
+    import triton
+
+    part = torch.empty((sk, m, n), device=x.device, dtype=torch.float32)
+    _triton_decode_kernel()[(triton.cdiv(n, bn), sk)](
+        x if fused_quantize else a_nz,
+        asc2,
+        w_fnuz,
+        w_scales2,
+        part,
+        m,
+        n,
+        k,
+        asc2.stride(0),
+        asc2.stride(1),
+        w_scales2.stride(0),
+        w_scales2.stride(1),
+        NKB=nkb,
+        SK=sk,
+        BM=16,
+        BN=bn,
+        KP=kp,
+        FUSE_Q=fused_quantize,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return part.sum(0).to(out_dtype)
+
+
+@lru_cache(maxsize=1)
 def _grouped_kernel():
     """Single-launch grouped blockwise fp8 GEMM (MoE): one grid covers
     every active expert's (row-tile, N-tile) work. A rows are GATHERED
