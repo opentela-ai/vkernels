@@ -115,12 +115,12 @@ def _cfg() -> dict:
                     out[k] = int(v)
         except (ValueError, TypeError):
             pass
-    if out != _DEF:
+    if out != _default_cfg():
         from ._dispatch import OpNotEligible
 
         raise OpNotEligible(
             f"grouped MoE reduction geometry {out} does not match the "
-            f"expert-GEMV parity contract {_DEF}")
+            f"expert-GEMV parity contract {_default_cfg()}")
     return out
 
 

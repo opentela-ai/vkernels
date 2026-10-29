@@ -47,6 +47,9 @@ def _kernel():
         FNUZ: tl.constexpr,
         FNUZ_NATIVE: tl.constexpr = False,
         FN_NATIVE: tl.constexpr = False,
+        COMPACT_SCALES: tl.constexpr = False,
+        ROUTE_W=None,
+        SKIP_ZERO: tl.constexpr = False,
     ):
         selected = tl.program_id(0)
         row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
@@ -312,9 +315,11 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, im
     specs = tuple((tuple(v.shape), v.dtype, v.device) for v in (x, weights, scales, indices))
     selected = _select_implementation(specs, cap, implementation)
     if route_weights is not None:
-        if selected.name != "cuda_native":
-            raise contract_error("zero-route GEMV requires the cuda_native implementation")
-        return _launch_native(x, weights, scales, indices, route_weights=route_weights)
+        accepted = (selected.name in ("portable", "portable_fnuz") if hip_fnuz
+                    else selected.name == "cuda_native")
+        if not accepted:
+            raise contract_error("zero-route GEMV requires cuda_native or a compatible gfx942 portable implementation")
+        return selected.load()(x, weights, scales, indices, route_weights=route_weights)
     if native_decode is True and selected.name == "portable":
         return _launch(x, weights, scales, indices, native=False, native_decode=True)
     return selected.load()(x, weights, scales, indices)
@@ -326,6 +331,19 @@ def _launch_native(x, weights, scales, indices, *, route_weights=None):
 
 def _launch_portable(x, weights, scales, indices, *, route_weights=None):
     return _launch(x, weights, scales, indices, native=False, route_weights=route_weights)
+
+
+def _compact_scales_enabled(x, weights):
+    """Experimental gfx942 FNUZ layout; defaults and CUDA stay unchanged."""
+    import os
+    import torch
+
+    return bool(
+        torch.version.hip
+        and weights.dtype == torch.float8_e4m3fnuz
+        and os.environ.get("GLM53_GEMV_FNUZ_COMPACT_SCALES", "0") not in ("", "0")
+        and torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0] == "gfx942"
+    )
 
 
 def _launch(x, weights, scales, indices, *, native, route_weights=None, native_decode=False):
@@ -345,6 +363,7 @@ def _launch(x, weights, scales, indices, *, native, route_weights=None, native_d
             fnuz_native = (weights.dtype == torch.float8_e4m3fnuz and torch.version.hip
                            and os.environ.get("GLM53_GEMV_FNUZ_NATIVE", "0") not in ("", "0"))
             extra = [] if native else [weights.dtype == torch.float8_e4m3fnuz, bool(fnuz_native)]
+            portable_kwargs = {} if native else {"COMPACT_SCALES": _compact_scales_enabled(x, weights)}
             # Only measured inference cells use native FN-byte conversion.
             # Other stacks/geometries keep the original implementation.
             use_native_decode = (
@@ -358,12 +377,13 @@ def _launch(x, weights, scales, indices, *, native, route_weights=None, native_d
             )
             if use_native_decode:
                 kernel, extra = gemv_fn_native, []
+                portable_kwargs = {}
             skip_kwargs = ({"ROUTE_W": route_weights, "SKIP_ZERO": True}
                            if route_weights is not None else {})
             kernel[(t * k, triton.cdiv(o, 4))](
                 x, weights.view(torch.uint8), scales, indices, out,
                 o, i, k, x.ndim == 2, 4, triton.next_power_of_2(i), *extra,
-                **skip_kwargs,
+                **skip_kwargs, **portable_kwargs,
                 num_warps=4, enable_fp_fusion=False,
             )
     return out

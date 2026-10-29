@@ -30,11 +30,7 @@ def _kernel():
 
     @triton.jit
     def fgate(H, WB, DT, ALOG, OUT, LB, HAS_LB: tl.constexpr,
-              HD: tl.constexpr, BLOCK_O: tl.constexpr, QKV: tl.constexpr,
-              INDEPENDENT_ROWS: tl.constexpr = False):
-        if INDEPENDENT_ROWS:
-            H += tl.program_id(1) * HD
-            OUT += tl.program_id(1) * QKV
+              HD: tl.constexpr, BLOCK_O: tl.constexpr, QKV: tl.constexpr):
         offs = tl.program_id(0) * BLOCK_O + tl.arange(0, BLOCK_O)
         row = tl.program_id(1)
         h = tl.load(H + row * HD + tl.arange(0, HD)).to(tl.float32)
@@ -54,7 +50,8 @@ def _kernel():
     return fgate
 
 
-def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
+def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound, *,
+                independent_rows=False, m_cap=1):
     """Return BF16 [B, S, H, D] log-gates for x [B, S, I] (S == 1 decode,
     or the small-T speculative-verify block, 1 <= S <= 8).
 
@@ -95,10 +92,13 @@ def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
     with torch.cuda.device(x.device):
         B, S = x.shape[0], x.shape[1]
         rows = B * S
-        if rows == 1:
+        if independent_rows and (S != 1 or B > max(1, int(m_cap))):
+            raise OpNotEligible("independent forget-gate rows require decode within m_cap")
+        if rows == 1 or independent_rows:
             from vkernels.torch_ops.glm_gemv import dense_gemv
 
-            h = dense_gemv(x.view(1, hidden), fa_weight)
+            h = dense_gemv(x.reshape(rows, hidden), fa_weight,
+                           independent_rows=independent_rows, m_cap=rows)
         else:
             h = torch.nn.functional.linear(x.reshape(rows, hidden), fa_weight)
         out = torch.empty(rows, qkv_dim, dtype=torch.bfloat16, device=x.device)
@@ -107,7 +107,6 @@ def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
             h, fb_weight, dt_bias, a_log, out,
             1.0 if lower_bound is None else float(lower_bound),
             lower_bound is not None, head_dim, 64, qkv_dim,
-            INDEPENDENT_ROWS=bool(independent_rows and batch > 1),
             num_warps=4, enable_fp_fusion=False,
         )
     return out.view(B, S, heads, head_dim)
