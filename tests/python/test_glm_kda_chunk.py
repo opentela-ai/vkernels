@@ -280,3 +280,62 @@ def test_gpu_drift_probe(torch):
     print(f"\ndrift probe: max|Δout|={worst_out:.3e} max|Δstate|={worst_state:.3e}")
     assert worst_out < 1e-4, f"output drift {worst_out:.3e} breached the 1e-4 bar"
     assert worst_state < 1e-4, f"state drift {worst_state:.3e} breached the 1e-4 bar"
+
+
+@pytest.mark.parametrize("heads,tokens,allowed", [(16, 4, True), (16, 2048, True), (64, 4, False)])
+def test_hip_envelope_uses_head_axis(torch, monkeypatch, heads, tokens, allowed):
+    """Check the real adapter's admission before GPU code, with distinct H/S."""
+    from types import SimpleNamespace
+    from vkernels.torch_ops._dispatch import OpNotEligible
+    from vkernels.torch_ops.glm_kda_chunk import kda_chunk
+
+    monkeypatch.setattr(torch.version, "hip", "test")
+    monkeypatch.setenv("VK_GLM_KDA_CHUNK_TRITON_HIP", "1")
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    seen = []
+    def pipeline(q, k, v, g, beta, **kw):
+        seen.append(q.shape)
+        return v.transpose(1, 2).contiguous(), None
+    monkeypatch.setitem(sys.modules, "vkernels.torch_ops.vllm_kda", SimpleNamespace(kda_chunk_floe=pipeline))
+    q = torch.zeros(1, heads, tokens, 64)
+    beta = torch.zeros(1, heads, tokens)
+    if allowed:
+        out, _ = kda_chunk(q, q, q, q, beta)
+        assert out.shape == (1, tokens, heads, 64)
+        assert len(seen) == 1
+    else:
+        with pytest.raises(OpNotEligible, match="AMD"):
+            kda_chunk(q, q, q, q, beta)
+        assert not seen
+
+
+@pytest.mark.parametrize("override,arch,batch,heads,tokens,kdim,vdim,allowed", [
+    (None, "gfx942", 1, 16, 4, 128, 128, True),
+    (None, "gfx942:sramecc+:xnack-", 4, 16, 2048, 128, 128, True),
+    (None, "gfx942", 3, 16, 3, 128, 128, True),
+    (None, "gfx942", 1, 64, 4, 128, 128, False),
+    (None, "gfx942", 1, 8, 4, 128, 128, False),
+    (None, "gfx942", 1, 16, 1, 128, 128, False),
+    (None, "gfx942", 1, 16, 2049, 128, 128, False),
+    (None, "gfx942", 5, 16, 4, 128, 128, False),
+    (None, "gfx942", 1, 16, 4, 64, 128, False),
+    (None, "gfx942", 1, 16, 4, 128, 256, False),
+    (None, "gfx90a", 1, 16, 4, 128, 128, False),
+    (None, "gfx950", 1, 16, 4, 128, 128, False),
+    (None, "", 1, 16, 4, 128, 128, False),
+    ("0", "gfx942", 1, 16, 4, 128, 128, False),
+    ("", "gfx942", 1, 16, 4, 128, 128, False),
+    ("1", "gfx90a", 1, 8, 4, 64, 64, True),
+    ("TRUE", "gfx942", 1, 16, 4, 128, 128, True),
+    ("1", "gfx942", 1, 64, 4, 128, 128, False),
+])
+def test_hip_default_envelope_and_override(torch, monkeypatch, override, arch, batch, heads, tokens, kdim, vdim, allowed):
+    from types import SimpleNamespace
+    from vkernels.torch_ops.glm_kda_chunk import _allow_hip
+
+    if override is None:
+        monkeypatch.delenv("VK_GLM_KDA_CHUNK_TRITON_HIP", raising=False)
+    else:
+        monkeypatch.setenv("VK_GLM_KDA_CHUNK_TRITON_HIP", override)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: SimpleNamespace(gcnArchName=arch))
+    assert _allow_hip(heads, batch=batch, tokens=tokens, k_dim=kdim, v_dim=vdim, device="cuda:0") is allowed

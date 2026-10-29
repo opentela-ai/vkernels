@@ -71,6 +71,31 @@ from functools import lru_cache
 # (e.g. (2048,4096) m=8: 46.2 us vs 7.6; (38720,4096) m=8: 278 us vs 94).
 _CFG_M = {}
 
+# gfx942 small-batch pins, confirmed on MI300A with >512 MiB rotating
+# weights (Beverin jobs 696606/696609). Unlisted shapes keep BLAS in the
+# serving policy; notably, neither Apertus up projection won this sweep.
+# M=1 keeps its existing arithmetic and layout. M=3 masks the fourth row.
+_CFG_M_MI300A = {
+    (6144, 4096, 2): (4, 4096, 4),
+    (6144, 4096, 3): (4, 4096, 4),
+    (6144, 4096, 4): (4, 4096, 4),
+    (4096, 4096, 2): (8, 2048, 2),
+    (4096, 4096, 3): (4, 4096, 4),
+    (4096, 4096, 4): (4, 4096, 4),
+    (4096, 21504, 2): (8, 2048, 2),
+    (4096, 21504, 3): (8, 2048, 2),
+    (4096, 21504, 4): (8, 2048, 2),
+    (2560, 8192, 2): (4, 2048, 2),
+    (2560, 8192, 3): (4, 2048, 4),
+    (2560, 8192, 4): (4, 2048, 4),
+    (8192, 2048, 2): (4, 2048, 4),
+    (8192, 2048, 3): (4, 2048, 4),
+    (8192, 2048, 4): (4, 2048, 4),
+    (8192, 10752, 2): (4, 4096, 4),
+    (8192, 10752, 3): (8, 4096, 4),
+    (8192, 10752, 4): (8, 4096, 4),
+}
+
 _CFG = {
     (4096, 1536): (4, 2048, 4),
     (4096, 3072): (1, 4096, 4),
@@ -208,6 +233,32 @@ def _gemv_cfg(o, i, triton, torch_mod):
     return selected
 
 
+@lru_cache(maxsize=None)
+def _is_gfx942(device):
+    import torch
+
+    return bool(torch.version.hip and
+                getattr(torch.cuda.get_device_properties(device), "gcnArchName", "").split(":")[0] == "gfx942")
+
+
+def dense_gemv_small_batch(x, w):
+    """Use only measured gfx942 M=2..4 layouts; reject other contracts.
+
+    BF16 input/output and FP32 reduction match the single-row operator's
+    precision contract. Reduction order can differ from BLAS, so consumers
+    must distinguish this recipe when caching intermediate model state.
+    """
+    import torch
+
+    if x.ndim != 2 or w.ndim != 2 or (w.shape[0], w.shape[1], x.shape[0]) not in _CFG_M_MI300A:
+        raise OpNotEligible("no tuned small-batch GEMV for this shape")
+    if not x.is_cuda or not w.is_cuda or x.device != w.device or not _is_gfx942(x.device):
+        raise OpNotEligible("tuned small-batch GEMV requires gfx942")
+    if torch.is_grad_enabled() and (x.requires_grad or w.requires_grad):
+        raise OpNotEligible("small-batch GEMV is inference-only")
+    return dense_gemv(x, w, m_cap=4)
+
+
 def dense_gemv(x, w, m_cap=None, *, independent_rows=False):
     """Return BF16 [M, O] (or [O] for 1-D x) for x [M, I] and w [O, I].
 
@@ -253,7 +304,9 @@ def dense_gemv(x, w, m_cap=None, *, independent_rows=False):
                 num_warps=warps,
             )
         return y if x.ndim == 2 else y[0]
-    cfg = _CFG_M.get((o, i, m))
+    cfg = _CFG_M_MI300A.get((o, i, m)) if _is_gfx942(x.device) else None
+    if cfg is None:
+        cfg = _CFG_M.get((o, i, m))
     if cfg is not None:
         rows, block_i, warps = cfg
     else:

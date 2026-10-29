@@ -429,3 +429,66 @@ pipeline on MI300A -- HIP chunk 32 + reduced config sets for the 64 KB
 shared limit. Op parity job 693808 (5-19x vs eager at H16); probe
 tests/python/probe_kda_chunk_gfx942.py is the gate. Serving engagement
 (floe's verify-lane capture warmup) is the open item.
+
+### 2026-10-25: correct the gfx942 KDA gate's H/S axes
+
+The 693808 probe constructed `[B,S,H,D]` but passed it to the public
+`glm_kda_chunk.kda_chunk` adapter, whose contract is `[B,H,S,D]`. Its
+shape-labelled numbers therefore do not validate the claimed serving
+shapes. The adapter's HIP guard also read `key.shape[2]` (S) as heads;
+this admitted H64/S4 and rejected H16/S2048. It now uses the already
+validated `heads` axis. Three CPU admission regressions cover those
+cases without launching GPU code.
+
+Corrected MI300A gate **693874** passes all 14 cases: H16/D128 at B1/S4,
+B2/S2/3/4/8, B1/S64/2048, each with zero and nonzero initial state,
+including graph capture/replay and output/state parity at atol/rtol
+1e-4. H64/S4 and H64/S2048 correctly decline. Representative timings:
+H16/S4 pipeline eager launch 0.63–0.64 ms, graph replay 0.135–0.139 ms,
+torch reference 3.65–3.68 ms; S2048 pipeline 0.85–0.87 ms versus
+14.3–14.5 ms reference. The rewritten probe fails its process on a gate
+failure (the old script printed FAIL but exited 0).
+
+Floe-layer integration probe **693875** also passes: a real
+`Glm53LinearAttention` with H16/D128, batch 2, at S2/3/4/8/2048 takes
+the fused adapter, and S2/3/4/8 captures/replays without declines. The
+historical 693853 integration probe aborted because it sampled token
+IDs up to 999 from a tiny model with a 256-token vocabulary; it also
+used D32, outside this adapter's supported head dimensions.
+
+The graph wrapper already performs three eager warmups before capture.
+A missing additional prewarm is therefore unproven. Full-stack serve
+693876 adds temporary per-rank adapter traces to distinguish an absent
+opt-in, an eligibility decline, and successful capture. Its serving
+result is recorded in Floe's `docs/glm53-tp.md` when complete.
+
+Graph-vs-graph gate **693880** also passes all 14 cases. With nonzero
+state, B2/H16/S4 fused replay is **0.144 ms vs 1.890 ms** for the
+captured torch reference (~13x); B1/H16/S4 is 0.142 vs 1.582 ms. At
+S2048 it is 0.850 vs 12.858 ms. These compare captured implementations
+and supersede ratios based only on eager Python launch overhead.
+
+### 2026-10-25: state-only KDA prefix and convolution-history primitives
+
+`torch_ops/glm_kda_prefix_state.py` adds opt-in callables, with no serving
+dispatch changes: `kda_prefix_state` replays normalized K/V/log-gate/beta
+from an initial FP32 state up to each row's GPU prefix length;
+`kda_prefix_conv_state` gathers the accepted raw convolution tail from
+initial history and raw projections. Inputs are immutable and lengths
+can change during graph replay. The local operator suite passes 18 tests.
+
+MI300A gates 694376 (recurrence) and 694404 (recurrence + convolution
+history) pass at H16/S4/D128, B1 and B34 (flattened layers). B34 recurrence
+costs 0.025–0.036 ms for prefixes 1–4, versus ~0.54–0.55 ms for the full
+fused chunk; history restoration alone costs ~0.022–0.023 ms. State
+errors remain below 3.58e-7 against the independent chunk-WY oracle.
+These are operator measurements, not full-model repair measurements.
+
+Floe's real-layer qualification exposes an additional constraint:
+BF16 one-token decode convolution rounds differently from batched
+verification. Reusing the latter's inputs fails tight prefix-one state
+parity (2.61e-4 maximum error), despite both primitives passing their
+own mathematical gates. Other tested prefixes pass in both pool layouts,
+including next-call output checks. Do not infer full-model correctness;
+retain a one-token fallback and require serving shadows before wiring
+these primitives into folded-state repair.

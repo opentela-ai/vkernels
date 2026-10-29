@@ -302,3 +302,55 @@ def test_gqa_fused_kv_store_parity():
         assert th.equal(kcs[keep], kc[keep]) and th.equal(vcs[keep], vc[keep])
         assert th.equal(kc[written], kn[live]) and th.equal(vc[written], vn[live])
         assert th.equal(kcs[scratch], kc[scratch]) and th.equal(vcs[scratch], vc[scratch])
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("heads", [(32, 8), (16, 2)])
+@pytest.mark.parametrize("batch", [1, 2, 3, 4])
+@pytest.mark.parametrize("length", [129, 600])
+def test_short_split_graph_replay_updates_inputs_and_preserves_other_slots(torch, heads, batch, length):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vkernels.torch_ops.triton_attn import decode_attention_split, decode_attention_reference
+
+    torch.manual_seed(519)
+    nq, nkv = heads
+    capacity = (length + 255) // 256 * 256
+    pool = batch * capacity + 1
+    scratch = pool - 1
+    kc = torch.randn(pool, nkv, 128, device="cuda", dtype=torch.bfloat16)
+    vc = torch.randn_like(kc)
+    q = torch.randn(batch, nq, 128, device="cuda", dtype=torch.bfloat16)
+    kn = torch.randn(batch, nkv, 128, device="cuda", dtype=torch.bfloat16)
+    vn = torch.randn_like(kn)
+    table = torch.randperm(pool - 1, device="cuda").reshape(batch, capacity).to(torch.int32)
+    lengths = torch.tensor([length - row * 3 for row in range(batch)], device="cuda", dtype=torch.int32)
+    table[-1, int(lengths[-1]) - 1] = scratch
+
+    def forward():
+        return decode_attention_split(q, kc, vc, table, lengths, max_len_hint=capacity,
+            k_new=kn, v_new=vn, scratch_slot=scratch)
+
+    forward()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = forward()
+    for step in range(2):
+        q.copy_(torch.randn_like(q))
+        kn.copy_(torch.randn_like(kn))
+        vn.copy_(torch.randn_like(vn))
+        if step:
+            lengths.add_(1)
+        before_k, before_v = kc.clone(), vc.clone()
+        slots = table.gather(1, (lengths.long() - 1)[:, None])[:, 0].long()
+        expected_k, expected_v = before_k.clone(), before_v.clone()
+        expected_k[slots], expected_v[slots] = kn, vn
+        expected = decode_attention_reference(q.float(), expected_k.float(), expected_v.float(), table, lengths)
+        graph.replay()
+        torch.testing.assert_close(output.float(), expected, rtol=.01, atol=2e-4)
+        live = slots != scratch
+        keep = torch.ones(pool, device="cuda", dtype=torch.bool)
+        keep[slots[live]] = False
+        assert torch.equal(kc[keep], before_k[keep]) and torch.equal(vc[keep], before_v[keep])
+        assert torch.equal(kc[slots[live]], kn[live]) and torch.equal(vc[slots[live]], vn[live])

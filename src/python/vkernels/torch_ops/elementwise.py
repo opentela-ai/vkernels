@@ -897,7 +897,9 @@ def with_rounding(*, round_intermediates):
 
     bound = {name: partial(globals()[name], round_intermediates=round_intermediates)
              for name in ("rms_norm", "qk_norm", "qk_norm_rope", "rotary", "silu_mul")}
-    return SimpleNamespace(**bound, store_kv=store_kv)
+    from .xielu import xielu
+
+    return SimpleNamespace(**bound, store_kv=store_kv, xielu=xielu)
 
 
 def supports_model(model):
@@ -910,9 +912,10 @@ def supports_model(model):
             ("llama", "LlamaRMSNorm"),
             ("qwen2", "Qwen2RMSNorm"),
             ("qwen3", "Qwen3RMSNorm"),
+            ("apertus1p5", "Apertus1p5TextRMSNorm"),
         )
     }
-    if model.config.model_type not in ("llama", "qwen2", "qwen3"):
+    if model.config.model_type not in ("llama", "qwen2", "qwen3", "apertus1p5_text"):
         return False
     head_dim = getattr(model.config, "head_dim", None) or (
         model.config.hidden_size // model.config.num_attention_heads
@@ -924,6 +927,7 @@ def supports_model(model):
             ("transformers.models.llama.modeling_llama", "LlamaMLP"),
             ("transformers.models.qwen2.modeling_qwen2", "Qwen2MLP"),
             ("transformers.models.qwen3.modeling_qwen3", "Qwen3MLP"),
+            ("transformers.models.apertus1p5.modeling_apertus1p5", "Apertus1p5TextMLP"),
         }:
             return False
         if getattr(layer, "pre_feedforward_layernorm", None) is not None:
@@ -935,7 +939,13 @@ def supports_model(model):
         if getattr(attn, "rotary_dim", head_dim) != head_dim or head_dim % 2:
             return False
         activation = type(layer.mlp.act_fn)
-        if activation is not torch.nn.SiLU and (
+        # The ungated Apertus MLP executes its native activation separately;
+        # this capability gate enables only the same RMSNorm/RoPE/KV fusions.
+        native_xielu = model.config.model_type == "apertus1p5_text" and (activation.__module__, activation.__name__) == ("transformers.activations", "XIELUActivation")
+        if native_xielu and any(value.numel() != 1 or value.dtype != model.model.embed_tokens.weight.dtype or value.device != model.model.embed_tokens.weight.device
+                               for value in (layer.mlp.act_fn.alpha_p, layer.mlp.act_fn.alpha_n, layer.mlp.act_fn.beta, layer.mlp.act_fn.eps)):
+            return False
+        if not native_xielu and activation is not torch.nn.SiLU and (
             activation.__module__,
             activation.__name__,
         ) != ("transformers.activations", "SiLUActivation"):
