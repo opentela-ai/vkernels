@@ -45,10 +45,11 @@ lets every fla boundary check pass fully in-bounds — no masked-row
 garbage can leak through the state recurrence).
 
 Torch and Triton load lazily. Inference-only, no autograd backward.
-AMD (``torch.version.hip``) stays on the HIP WY path (floe knob
-``kda_chunk_hip``): this module raises :class:`OpNotEligible` there so the
-caller's fallback keeps today's behavior until the AMD twin
-(``vllm_kda_amd``) gets the same adapter.
+AMD gfx942 defaults to the qualified TP4 envelope: H16, K=V=128,
+B1–4, S2–2048, using chunk-32 tiles within its shared-memory limit.
+``VK_GLM_KDA_CHUNK_TRITON_HIP=0`` disables this path; ``=1`` retains
+the experimental envelope of up to 16 heads. Other AMD shapes decline
+by default. See the hardware and serving gates in the guard's docstring.
 """
 
 from ._dispatch import OpNotEligible
@@ -58,23 +59,28 @@ _HEAD_DIMS = (64, 128, 256)  # fwd_h splits K into 64-wide register blocks
 _CHUNK_SIZES = (16, 32, 64)  # solve_tril / kkt block structure supports these
 
 
-def _allow_hip(heads: int) -> bool:
-    """``VK_GLM_KDA_CHUNK_TRITON_HIP=1``: run the fused Triton chunk
-    pipeline on AMD gfx942, within the MI300A-validated envelope.
+def _allow_hip(heads: int, *, batch: int, tokens: int, k_dim: int, v_dim: int, device) -> bool:
+    """Default gfx942 TP4 envelope, plus the existing experimental override.
 
-    Validated (job 693808, chunk-32 tiles for the 64 KB shared limit):
-    per-call heads <= 16 -- the TP4 serving shape -- at rel <= 1.6e-6 vs
-    the eager fp32 reference, 5-19x faster (H16 S4 0.66 vs 3.7 ms; S2048
-    1.9 vs 35.3 ms). Solo heads (64) shows output rel 2e-4 with the state
-    still exact (7.9e-6) -- consistent with the GH200 lane-C precedent
-    (the EAGER oracle's own matmul precision degrading on this vendor) --
-    but outside the validated envelope, so those calls stay on the audited
-    eager reference."""
+    Validated (job 693874): H16, D128, B1/B2, S2/3/4/8/64/2048,
+    with zero/nonzero initial state and graph replay, at atol/rtol 1e-4
+    versus the fp32 oracle. H16 S4: 0.14 ms replay, 0.64 ms eager launch
+    of this pipeline, 3.7 ms torch reference. The original 693808 probe
+    swapped H/S, so its shape-labelled measurements are superseded.
+    Same-node serving 694328: 126.191 -> 88.740 ms/token, factual 4/4.
+    Default-admission gate 694482 also passes B3/S4 and B4/S2/3/4/8/64/2048,
+    zero/nonzero state and graph replay, with the override unset. Explicit
+    opt-out and H64 exclusion pass. H64 remains outside the envelope."""
     import os
 
-    if os.environ.get("VK_GLM_KDA_CHUNK_TRITON_HIP", "").strip() not in ("1", "true", "yes", "on"):
-        return False
-    return heads <= 16
+    override = os.environ.get("VK_GLM_KDA_CHUNK_TRITON_HIP")
+    if override is not None:
+        return override.strip().lower() in ("1", "true", "yes", "on") and heads <= 16
+    import torch
+
+    arch = str(getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")).split(":", 1)[0]
+    return (arch == "gfx942" and heads == 16 and 1 <= batch <= 4
+            and 2 <= tokens <= 2048 and k_dim == v_dim == 128)
 
 
 def kda_chunk(
@@ -139,12 +145,12 @@ def kda_chunk(
     devices = {t.device for t in (*tensors, beta, initial_state) if t is not None}
     if len(devices) != 1:
         raise OpNotEligible("inputs must live on one GPU")
-    if torch.version.hip is not None and not _allow_hip(int(key.shape[2]) if key.ndim == 4 else 1 << 30):
+    if torch.version.hip is not None and not _allow_hip(
+            heads, batch=bsz, tokens=seq_len, k_dim=k_dim, v_dim=v_dim, device=query.device):
         raise OpNotEligible(
-            "the fused Triton chunk pipeline is wired for NVIDIA; AMD uses the "
-            "kda_chunk_hip WY path (or set VK_GLM_KDA_CHUNK_TRITON_HIP=1 to "
-            "try the Triton pipeline on gfx942 -- parity-gated, floe's "
-            "dispatch falls back here on any issue)"
+            "AMD fused KDA defaults to gfx942 H16/K128/V128, B1-4, S2-2048; "
+            "this shape/device is outside that envelope or explicitly disabled. "
+            "VK_GLM_KDA_CHUNK_TRITON_HIP=1 retains the experimental H<=16 override"
         )
 
     # gfx942's 64 KB shared limit: BT=64 tiles (A is BT x BT fp32, k/w/u

@@ -129,3 +129,57 @@ def test_cpu_rejection_everywhere():
     x = torch.randn(1, 128, dtype=torch.bfloat16)
     with pytest.raises(OpNotEligible):
         dense_gemv(x, w)
+
+
+@pytest.mark.skipif(not _cuda(), reason="requires GPU")
+@pytest.mark.parametrize("batch", [2, 3, 4])
+@pytest.mark.parametrize("outputs,width", [(6144, 4096), (4096, 4096), (4096, 21504),
+                                           (2560, 8192), (8192, 2048), (8192, 10752)])
+def test_tuned_small_batch_matches_fp64_with_bf16_rounding(batch, outputs, width):
+    from vkernels.torch_ops.glm_gemv import _is_gfx942, dense_gemv_small_batch
+
+    if not _is_gfx942(torch.device("cuda", torch.cuda.current_device())):
+        pytest.skip("small-batch pins require gfx942")
+    gen = torch.Generator(device="cuda").manual_seed(outputs + width + batch)
+    weight = (torch.randn(outputs, width, device="cuda", generator=gen) * .02).bfloat16()
+    x = torch.randn(batch, width, device="cuda", generator=gen).bfloat16()
+    saved = x.clone(), weight.clone()
+    with torch.inference_mode():
+        expected = x.double() @ weight.double().T
+        actual = dense_gemv_small_batch(x, weight)
+    assert actual.shape == expected.shape and actual.dtype == torch.bfloat16
+    # A fixed absolute bound incorrectly rejects one BF16 ULP at larger
+    # magnitudes. Use an FP64 oracle, allowing BF16 rounding plus a small
+    # FP32-reduction allowance near cancellation. BLAS is not the oracle:
+    # at a midpoint its own reduction can round to the adjacent BF16 value.
+    torch.testing.assert_close(actual.double(), expected, rtol=torch.finfo(torch.bfloat16).eps, atol=2e-5)
+    assert torch.equal(x, saved[0]) and torch.equal(weight, saved[1])
+
+
+@pytest.mark.skipif(not _cuda(), reason="requires GPU")
+def test_tuned_small_batch_graph_reads_changed_inputs_and_preserves_three_rows():
+    from vkernels.torch_ops.glm_gemv import _is_gfx942, dense_gemv_small_batch
+
+    if not _is_gfx942(torch.device("cuda", torch.cuda.current_device())):
+        pytest.skip("small-batch pins require gfx942")
+    x = torch.randn(3, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn(6144, 4096, device="cuda") * .02).bfloat16()
+    with torch.inference_mode():
+        before = dense_gemv_small_batch(x, weight)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = dense_gemv_small_batch(x, weight)
+        x.mul_(-.5)
+        weight.mul_(.75)
+        graph.replay()
+        torch.testing.assert_close(replayed.float(), torch.nn.functional.linear(x, weight).float(), rtol=0, atol=.02)
+        assert replayed.shape == (3, 6144) and not torch.equal(before, replayed)
+
+
+def test_tuned_small_batch_rejects_cpu_and_unlisted_shapes():
+    from vkernels.torch_ops.glm_gemv import dense_gemv_small_batch
+
+    with pytest.raises(OpNotEligible, match="gfx942"):
+        dense_gemv_small_batch(torch.empty(3, 4096), torch.empty(6144, 4096))
+    with pytest.raises(OpNotEligible, match="no tuned"):
+        dense_gemv_small_batch(torch.empty(5, 8), torch.empty(16, 8))
