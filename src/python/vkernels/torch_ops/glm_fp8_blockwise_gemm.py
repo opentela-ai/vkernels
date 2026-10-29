@@ -166,7 +166,9 @@ def fp8_blockwise_gemm(a_fp8, a_scales, b_fp8, b_scales, out_dtype=None):
     out_dtype = out_dtype or torch.bfloat16
     out = torch.empty((m, n), device=a_fp8.device, dtype=out_dtype)
 
-    kernel = _cute_kernel() if a_fp8.is_cuda else None
+    hopper = (a_fp8.is_cuda and a_fp8.device.type == "cuda" and not torch.version.hip
+              and torch.cuda.get_device_capability(a_fp8.device) == (9, 0))
+    kernel = _cute_kernel() if hopper else None
     if kernel is not None:
         kernel(a_fp8, a_scales, b_fp8, b_scales, out)
         return out
@@ -445,7 +447,7 @@ def _triton_kernel():
             # row stride * row + col stride * col (a row/col stride swap
             # here reads scale[kb] of the WRONG row — row 0 still looks
             # correct, which is why small probes passed)
-            sa = tl.load(SA + rm * sam + kb * sakb, mask=rm < M, other=0.0)
+            sa = tl.load(SA + (rm // 128) * sam + kb * sakb, mask=rm < M, other=0.0)
             sb = tl.load(SB + (rn // 128) * sbn + kb * sbkb, mask=rn < N, other=0.0)
             blk = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
             acc += blk * (sa[:, None] * sb[None, :])
@@ -605,7 +607,7 @@ def _triton_native_kernel():
                 mask=rn[:, None] < N,
                 other=0.0,
             )
-            sa = tl.load(SA + rm * sam + kb * sakb, mask=rm < M, other=0.0)
+            sa = tl.load(SA + (rm // 128) * sam + kb * sakb, mask=rm < M, other=0.0)
             sb = tl.load(SB + (rn // 128) * sbn + kb * sbkb, mask=rn < N, other=0.0)
             blk = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
             acc += blk * (sa[:, None] * sb[None, :])
@@ -834,7 +836,7 @@ def _triton_decode_kernel():
                         mask=rmask[:, None],
                         other=0.0,
                     )
-                    sa = tl.load(SA + rm * sam + kb * sakb, mask=rmask, other=0.0)
+                    sa = tl.load(SA + (rm // 128) * sam + kb * sakb, mask=rmask, other=0.0)
                 b = tl.load(
                     W + rn[:, None] * K + rk[None, :],
                     mask=nmask[:, None],
@@ -953,6 +955,14 @@ def glm_decode_fp8_gemm(
             num_stages=stages,
         )
     return part.sum(0).to(out_dtype)
+
+
+
+
+
+
+
+
 
 
 @lru_cache(maxsize=1)

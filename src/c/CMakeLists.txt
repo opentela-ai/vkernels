@@ -5,6 +5,10 @@ add_library(vkernels STATIC)
 add_library(vkernels::vkernels ALIAS vkernels)
 
 target_compile_features(vkernels PUBLIC cxx_std_17)
+# Host oracles round multiply and add separately, matching the NumPy oracle.
+# AArch64 otherwise contracts the reduction into FMA under Release builds.
+target_compile_options(vkernels PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-ffp-contract=off>)
 target_include_directories(vkernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # The CPU reference sources are always compiled.

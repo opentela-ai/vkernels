@@ -1,0 +1,65 @@
+From ea073818febff0c7631b2dc904312b11c60e9049 Mon Sep 17 00:00:00 2001
+From: issue-45 worker <worker@localhost>
+Date: Sat, 17 Oct 2026 18:46:43 +0200
+Subject: [PATCH] feat(k3): flip KDA on by default after issue #45 on-cluster
+ acceptance (AC4)
+
+VKERNELS_KDA default 0 -> 1 and K3_DISABLE_KDA default 1 -> 0 in
+serve_kimi_k3_otela_beverin.sbatch, per vkernels issue #45 item 5.
+K3_DISABLE_KDA stays settable as the --load-format dummy fallback /
+emergency kill-switch (sitecustomize.py honours it unless VKERNELS_KDA=1
+is explicit). DRAFT ONLY -- apply after AC items 1-4 pass on Beverin
+MI300A; do not merge or deploy before the measured evidence.
+---
+ .../serve_kimi_k3_otela_beverin.sbatch        | 23 +++++++++++--------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/deployments/llm/beverin/kimi-k3-vllm/serve_kimi_k3_otela_beverin.sbatch b/deployments/llm/beverin/kimi-k3-vllm/serve_kimi_k3_otela_beverin.sbatch
+index 3ce1112..2010ed5 100644
+--- a/deployments/llm/beverin/kimi-k3-vllm/serve_kimi_k3_otela_beverin.sbatch
++++ b/deployments/llm/beverin/kimi-k3-vllm/serve_kimi_k3_otela_beverin.sbatch
+@@ -559,18 +559,17 @@ else
+ fi
+ ENGINE
+ 
+-# Issue #42 (KDA/MLA routing): VKERNELS_KDA=1 replaces the GPU-faulting
++# issue #42 (KDA/MLA routing): VKERNELS_KDA=1 replaces the GPU-faulting
+ # AITER/Triton KDA kernels with the validated vk_hip_kda_delta_rule_fwd and
+ # re-enables the delta-rule layer that K3_DISABLE_KDA=1 drops (better output
+ # quality). VKERNELS_MLA=1 routes MLA to VkernelMLABackend (vk_hip_mla_fwd);
+ # VKERNELS_MLA_FORCE=1 is required for real traffic (vLLM calls forward_mqa
+ # bare, mla_attention.py:895); VKERNELS_MLA_VALIDATE=0 skips the CPU-oracle
+-# cross-check (libvkernels_c.so not built yet). Both OPT-IN until on-cluster
+-# validation (6/6 probes + KDA recall probe + rocprof evidence) — the
+-# default keeps the pre-#42 safe state (K3_DISABLE_KDA=1, all-MLA fallback).
+-# After validation: flip VKERNELS_KDA=1 and K3_DISABLE_KDA=0 (sitecustomize
+-# gives VKERNELS_KDA precedence). EDF replaces the inherited env, so the
+-# outer-shell values are embedded via the double-quoted heredoc below.
++# cross-check (libvkernels_c.so not built yet). KDA is now ON by default
++# (issue #45 AC4 flip, after the on-cluster acceptance passed on Beverin
++# MI300A); K3_DISABLE_KDA remains an explicit opt-in fallback (see EOFA
++# below). EDF replaces the inherited env, so the outer-shell values are
++# embedded via the double-quoted heredoc below.
+ # STEP_PROFILE knobs (override via --export): SPEC=CONC:NUMREQ for the
+ # profiled load (8:16 = warmup + ~15 s steady decode, ~64 tok/req); BUDGET =
+ # wall budget for the profile srun (must exceed the eager warmup or the
+@@ -592,8 +591,14 @@ cat >> "${RUNDIR}/engine.sh" <<EOFA
+ export VKERNELS_MLA="${VKERNELS_MLA:-0}"
+ export VKERNELS_MLA_FORCE="${VKERNELS_MLA_FORCE:-0}"
+ export VKERNELS_MLA_VALIDATE="${VKERNELS_MLA_VALIDATE:-0}"
+-export VKERNELS_KDA="${VKERNELS_KDA:-0}"
+-export K3_DISABLE_KDA="${K3_DISABLE_KDA:-1}"
++# issue #45 AC4 (post-acceptance flip): KDA ON by default. The on-cluster
++# acceptance (6/6 probes + KDA recall + oracle validate + latency A/B)
++# passed on Beverin MI300A, so the pre-#42 safe state is retired. K3_DISABLE_KDA
++# defaults to 0 but stays settable as the --load-format dummy fallback /
++# emergency kill-switch (sitecustomize.py honours it when VKERNELS_KDA is
++# not explicitly 1 -- export K3_DISABLE_KDA=1 to force the all-MLA fallback).
++export VKERNELS_KDA="${VKERNELS_KDA:-1}"
++export K3_DISABLE_KDA="${K3_DISABLE_KDA:-0}"
+ export VLLM_STEP_PROFILE_DIR="${VLLM_STEP_PROFILE_DIR:-}"
+ export VLLM_STEP_PROFILE_DUR="${VLLM_STEP_PROFILE_DUR:-15}"
+ export VLLM_STEP_PROFILE_RANKS="${VLLM_STEP_PROFILE_RANKS:-0,8,16}"
+-- 
+2.43.0
+

@@ -37,9 +37,8 @@ the manual bit-decode on BOTH backends (CUDA has no fnuz dtype), so
 Numerics contract (bit-exactness with the ladder, on a given device):
 weight decode (fp8e4nv bitcast on CUDA / manual bit-decode for fnuz),
 per-element ``value * scale``
-rounded to bf16 then fp32, the fp32 ``tl.sum`` dot (order depends only on
-the reduction-axis length — inherited from ``glm_expert_gemv``/``glm_expert_gemv_fused``
-provenance), the bf16 rounding at every stage boundary, the
+rounded to bf16 then fp32, the fp32 ``tl.sum`` dot (order depends on reduction length and launch
+geometry; defaults match ``glm_expert_gemv``/``glm_expert_gemv_fused``), the bf16 rounding at every stage boundary, the
 ``propagate_nan`` clamp semantics of ``elementwise._swiglu_limit``, and the
 ascending-k fp32 accumulation of ``_weighted_moe_sum_reduce_kernel`` are
 reproduced verbatim; ``enable_fp_fusion=False`` keeps the dots un-FMA'd.
@@ -116,6 +115,12 @@ def _cfg() -> dict:
                     out[k] = int(v)
         except (ValueError, TypeError):
             pass
+    if out != _default_cfg():
+        from ._dispatch import OpNotEligible
+
+        raise OpNotEligible(
+            f"grouped MoE reduction geometry {out} does not match the "
+            f"expert-GEMV parity contract {_default_cfg()}")
     return out
 
 
@@ -231,6 +236,7 @@ def _kernels16():
         ACT, W, IDX, WTS, Y,
         IA: tl.constexpr, H: tl.constexpr, K: tl.constexpr,
         ROWS: tl.constexpr, COLS: tl.constexpr,
+        COMBINE_BF16: tl.constexpr = False,
     ):
         token = tl.program_id(0)
         row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
@@ -245,7 +251,11 @@ def _kernels16():
             dot = tl.sum(w * a[None, :], axis=1)
             w_k = tl.load(WTS + token * K + k)
             v = dot.to(tl.bfloat16).to(tl.float32)
-            acc += w_k * v
+            if COMBINE_BF16:
+                w_k = w_k.to(tl.bfloat16).to(tl.float32)
+                acc += (w_k * v).to(tl.bfloat16).to(tl.float32)
+            else:
+                acc += w_k * v
         tl.store(Y + token * H + row, acc.to(tl.bfloat16), row < H)
 
     return triton, _gate_up16, _down16
@@ -373,6 +383,7 @@ def _kernels():
         ROWS: tl.constexpr,
         COLS: tl.constexpr,
         FNUZ: tl.constexpr,
+        COMBINE_BF16: tl.constexpr = False,
     ):
         """Stage 2: y[t, row] = sum_k wts[t,k] * round_bf16(down dot).
 
@@ -403,7 +414,12 @@ def _kernels():
             a = tl.load(ACT + token * K * IA + k * IA + col, col < IA, 0).to(tl.float32)
             dot = tl.sum(weight * a[None, :], axis=1)
             w = tl.load(WTS + token * K + k)
-            acc += w * dot.to(tl.bfloat16).to(tl.float32)
+            v = dot.to(tl.bfloat16).to(tl.float32)
+            if COMBINE_BF16:
+                w = w.to(tl.bfloat16).to(tl.float32)
+                acc += (w * v).to(tl.bfloat16).to(tl.float32)
+            else:
+                acc += w * v
         tl.store(Y + token * H + row, acc.to(tl.bfloat16), row < H)
 
     return triton, _moe_gate_up, _moe_down
@@ -422,6 +438,7 @@ def moe_grouped_decode(
     storage: str = "e4m3fn",
     w16_gate_up: torch.Tensor | None = None,
     w16_down: torch.Tensor | None = None,
+    combine_bf16: bool = False,
 ) -> torch.Tensor:
     """Grouped decode MoE: return ``[T, H]`` bf16 for x ``[T, I]`` bf16.
 
@@ -441,6 +458,10 @@ def moe_grouped_decode(
 
     Raises ``OpNotEligible`` when the inputs fall outside the contract (the
     caller falls through to the ladder). No host syncs; capture-safe.
+
+    ``combine_bf16=True`` instead rounds routes and each weighted expert
+    product to BF16 before accumulation, matching the unfused torch combine.
+    The default retains the FP32-route fused-combine policy.
     """
     if not moe_grouped_decode_eligible(x, gate_up_w, gate_up_s, down_w, down_s, top_k_index, top_k_weights, t_cap, storage):
         raise OpNotEligible(
@@ -491,6 +512,7 @@ def moe_grouped_decode(
             down[(t, triton.cdiv(h, cfg["rows2"]))](
                 act, w16_down, top_k_index, top_k_weights, out,
                 ia, h, k, cfg["rows2"], triton.next_power_of_2(ia),
+                COMBINE_BF16=combine_bf16,
                 num_warps=cfg["warps2"],
             )
             return out
@@ -532,5 +554,6 @@ def moe_grouped_decode(
             # True) for the w[t,k]*dot term to round identically. The dot
             # itself stays bit-identical — verified by the bit-parity tests.
             num_warps=cfg["warps2"],
+            COMBINE_BF16=combine_bf16,
         )
     return out

@@ -46,9 +46,19 @@ def _kernel():
         COLS: tl.constexpr,
         FNUZ: tl.constexpr,
         FNUZ_NATIVE: tl.constexpr = False,
+        FN_NATIVE: tl.constexpr = False,
+        COMPACT_SCALES: tl.constexpr = False,
+        ROUTE_W=None,
+        SKIP_ZERO: tl.constexpr = False,
     ):
         selected = tl.program_id(0)
         row = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+        if SKIP_ZERO:
+            # Pair-uniform decision, before any expert/input/scale read. Every
+            # replay overwrites the full output row even when routes change.
+            if tl.load(ROUTE_W + selected) == 0.0:
+                tl.store(Y + selected * O + row, 0.0, row < O)
+                return
         col = tl.arange(0, COLS)
         expert = tl.load(IDX + selected).to(tl.int64)
         raw8 = tl.load(
@@ -82,24 +92,49 @@ def _kernel():
                 )
                 value = tl.where(raw == 128, float("nan"), value)
         else:
-            bits = ((exponent + 120) << 23) | (mantissa << 20)
-            value = tl.where(
-                exponent == 0,
-                mantissa.to(tl.float32) * 0.001953125,
-                bits.to(tl.float32, bitcast=True),
-            )
-            value = tl.where((raw & 127) == 127, float("nan"), value)
+            if FN_NATIVE:
+                # FN = 2 * FNUZ for finite nonzero values. FN -0 must
+                # avoid FNUZ's NaN byte; the common sign step restores it.
+                compatible = tl.where(raw == 128, 0, raw8).to(tl.uint8)
+                value = compatible.to(tl.float8e4b8, bitcast=True).to(tl.float32) * 2.0
+                value = tl.where((raw & 127) == 127, float("nan"), value)
+            else:
+                bits = ((exponent + 120) << 23) | (mantissa << 20)
+                value = tl.where(
+                    exponent == 0,
+                    mantissa.to(tl.float32) * 0.001953125,
+                    bits.to(tl.float32, bitcast=True),
+                )
+                value = tl.where((raw & 127) == 127, float("nan"), value)
         value = (value.to(tl.int32, bitcast=True) | ((raw & 128) << 24)).to(
             tl.float32, bitcast=True
         )
-        scale = tl.load(
-            S
-            + (expert * (O // 128) + row[:, None] // 128) * (I // 128)
-            + col[None, :] // 128,
-            (row[:, None] < O) & (col[None, :] < I),
-            0,
-        )
-        weight = (value * scale).to(tl.bfloat16).to(tl.float32)
+        if COMPACT_SCALES:
+            # Preserve per-element scaling/BF16 rounding and the original
+            # reduction tile. Gather each 128-column block scale once.
+            scol = tl.arange(0, COLS // 128)
+            scale = tl.load(
+                S
+                + (expert * (O // 128) + row[:, None] // 128) * (I // 128)
+                + scol[None, :],
+                (row[:, None] < O) & (scol[None, :] < I // 128),
+                0,
+            )
+            weight = (
+                (value.reshape(ROWS, COLS // 128, 128) * scale[:, :, None])
+                .reshape(ROWS, COLS)
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+        else:
+            scale = tl.load(
+                S
+                + (expert * (O // 128) + row[:, None] // 128) * (I // 128)
+                + col[None, :] // 128,
+                (row[:, None] < O) & (col[None, :] < I),
+                0,
+            )
+            weight = (value * scale).to(tl.bfloat16).to(tl.float32)
         x_row = selected // K if BROADCAST else selected
         x = tl.load(X + x_row * I + col, col < I, 0).to(tl.float32)
         result = tl.sum(weight * x[None, :], axis=1)
@@ -167,7 +202,15 @@ def _kernel():
         result = tl.sum(weight * x[None, :], axis=1)
         tl.store(Y + selected * O + row, result, row < O)
 
-    return _expert_gemv, _expert_gemv_native
+    @triton.jit
+    def _expert_gemv_fn_native(X, W, S, IDX, Y, O: tl.constexpr,
+                               I: tl.constexpr, K: tl.constexpr,
+                               BROADCAST: tl.constexpr, ROWS: tl.constexpr,
+                               COLS: tl.constexpr):
+        _expert_gemv(X, W, S, IDX, Y, O, I, K, BROADCAST, ROWS, COLS,
+                     False, False, True)
+
+    return _expert_gemv, _expert_gemv_native, _expert_gemv_fn_native
 
 
 @lru_cache(maxsize=1)
@@ -197,7 +240,7 @@ def _select_implementation(specs, cap, implementation):
         raise OpNotEligible(str(exc)) from exc
 
 
-def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, implementation=None, route_weights=None):
+def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, implementation=None, route_weights=None, native_decode=False):
     """Return BF16 [T,K,O] for BF16 x[T,I] or x[T,K,I], T <= t_cap.
 
     ``t_cap`` (default 2, the decode-validated limit) is the row cap the
@@ -206,6 +249,10 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, im
     verify/replay blocks route here. The kernel body is shape-generic —
     one program per (token, expert-slot) pair — so only this wrapper
     guard needs the cap; parity at the raised T is the caller's job.
+
+    ``native_decode=True`` opts into exact FN-byte hardware conversion on
+    the pinned gfx942 inference cells; unsupported cells retain the original
+    implementation. It changes no weight storage, scale, or reduction.
 
     Contiguous GPU inputs and valid expert IDs are required. On NVIDIA the
     FN bytes are hardware-decoded (e4m3FN == e4m3nv semantics there); on
@@ -256,19 +303,25 @@ def expert_gemv(x, weights, scales, indices, storage="e4m3fn", t_cap=None, *, im
     if any(not v.is_contiguous() for v in (x, weights, scales, indices)):
         raise contract_error("inputs must be contiguous")
     if route_weights is not None:
-        if (fnuz or torch.version.hip or route_weights.shape != indices.shape
+        hip_fnuz = bool(fnuz and torch.version.hip and
+                        torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0] == "gfx942")
+        if ((not hip_fnuz and (fnuz or torch.version.hip)) or route_weights.shape != indices.shape
                 or route_weights.dtype != torch.float32
                 or route_weights.device != x.device
                 or not route_weights.is_contiguous()):
-            raise contract_error("zero-route GEMV requires CUDA-native E4M3FN and contiguous same-device FP32 [T,K] weights")
+            raise contract_error("zero-route GEMV requires CUDA-native E4M3FN or gfx942 portable FNUZ, and contiguous same-device FP32 [T,K] weights")
     if not (t and k) and implementation is None:
         return torch.empty((t, k, o), device=x.device, dtype=torch.bfloat16)
     specs = tuple((tuple(v.shape), v.dtype, v.device) for v in (x, weights, scales, indices))
     selected = _select_implementation(specs, cap, implementation)
     if route_weights is not None:
-        if selected.name != "cuda_native":
-            raise contract_error("zero-route GEMV requires the cuda_native implementation")
-        return _launch_native(x, weights, scales, indices, route_weights=route_weights)
+        accepted = (selected.name in ("portable", "portable_fnuz") if hip_fnuz
+                    else selected.name == "cuda_native")
+        if not accepted:
+            raise contract_error("zero-route GEMV requires cuda_native or a compatible gfx942 portable implementation")
+        return selected.load()(x, weights, scales, indices, route_weights=route_weights)
+    if native_decode is True and selected.name == "portable":
+        return _launch(x, weights, scales, indices, native=False, native_decode=True)
     return selected.load()(x, weights, scales, indices)
 
 
@@ -276,11 +329,24 @@ def _launch_native(x, weights, scales, indices, *, route_weights=None):
     return _launch(x, weights, scales, indices, native=True, route_weights=route_weights)
 
 
-def _launch_portable(x, weights, scales, indices):
-    return _launch(x, weights, scales, indices, native=False)
+def _launch_portable(x, weights, scales, indices, *, route_weights=None):
+    return _launch(x, weights, scales, indices, native=False, route_weights=route_weights)
 
 
-def _launch(x, weights, scales, indices, *, native, route_weights=None):
+def _compact_scales_enabled(x, weights):
+    """Experimental gfx942 FNUZ layout; defaults and CUDA stay unchanged."""
+    import os
+    import torch
+
+    return bool(
+        torch.version.hip
+        and weights.dtype == torch.float8_e4m3fnuz
+        and os.environ.get("GLM53_GEMV_FNUZ_COMPACT_SCALES", "0") not in ("", "0")
+        and torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0] == "gfx942"
+    )
+
+
+def _launch(x, weights, scales, indices, *, native, route_weights=None, native_decode=False):
     import os
     import torch
 
@@ -290,19 +356,34 @@ def _launch(x, weights, scales, indices, *, native, route_weights=None):
     if t and k:
         import triton  # lazy: validation above needs only torch
 
-        gemv, gemv_native = _kernel()
+        gemv, gemv_native, gemv_fn_native = _kernel()
         with torch.cuda.device(x.device):
             kernel = gemv_native if native else gemv
             # Only the portable kernel accepts the storage-format constexpr.
             fnuz_native = (weights.dtype == torch.float8_e4m3fnuz and torch.version.hip
                            and os.environ.get("GLM53_GEMV_FNUZ_NATIVE", "0") not in ("", "0"))
             extra = [] if native else [weights.dtype == torch.float8_e4m3fnuz, bool(fnuz_native)]
+            portable_kwargs = {} if native else {"COMPACT_SCALES": _compact_scales_enabled(x, weights)}
+            # Only measured inference cells use native FN-byte conversion.
+            # Other stacks/geometries keep the original implementation.
+            use_native_decode = (
+                native_decode is True and not native and weights.dtype == torch.float8_e4m3fn
+                and t in (1, 2, 4) and k == 8
+                and (o, i) in ((1024, 4096), (4096, 512))
+                and str(torch.__version__) == "2.9.0a0+git7bcbafe"
+                and torch.version.hip == "7.0.51831-a3e329ad8"
+                and triton.__version__ == "3.4.0"
+                and torch.cuda.get_device_properties(x.device).gcnArchName.split(":", 1)[0] == "gfx942"
+            )
+            if use_native_decode:
+                kernel, extra = gemv_fn_native, []
+                portable_kwargs = {}
             skip_kwargs = ({"ROUTE_W": route_weights, "SKIP_ZERO": True}
                            if route_weights is not None else {})
             kernel[(t * k, triton.cdiv(o, 4))](
                 x, weights.view(torch.uint8), scales, indices, out,
                 o, i, k, x.ndim == 2, 4, triton.next_power_of_2(i), *extra,
-                **skip_kwargs,
+                **skip_kwargs, **portable_kwargs,
                 num_warps=4, enable_fp_fusion=False,
             )
     return out
@@ -311,8 +392,10 @@ def _launch(x, weights, scales, indices, *, native, route_weights=None):
 def expert_gemv_skip_zero(x, weights, scales, indices, route_weights, storage="e4m3fn", t_cap=None):
     """Optional EP route-aware entry: zero outputs for exact-zero pair weights.
 
-    Defaults of expert_gemv remain unchanged. CUDA-native E4M3FN only;
-    route weights are not applied to active outputs (combine does that).
+    Defaults of expert_gemv remain unchanged. Supports CUDA-native E4M3FN
+    and gfx942 portable FNUZ; route weights are not applied to active
+    outputs (combine does that). Active arithmetic and launch geometry
+    match the ordinary GEMV.
     """
     return expert_gemv(x, weights, scales, indices, storage=storage, t_cap=t_cap,
                        route_weights=route_weights)

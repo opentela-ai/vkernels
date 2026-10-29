@@ -1129,6 +1129,13 @@ __global__ void dsa_sparse_fwd_partial_db_kernel(
           sKey + (size_t)((buf * BQ + warp) * kti + tk) * W;
       const bool valid = (idx >= 0) && (idx < S_kv);
 
+      // All lanes of this wave own the same selected key. A masked key
+      // contributes neither a score nor a value. Keep split boundaries,
+      // staging order and every valid key's arithmetic unchanged.
+      if constexpr (SkipInvalid) {
+        if (!valid) continue;
+      }
+
       // --- lane-local partial score (main + tail), then warp-reduce ---
       float partial = 0.0f;
       if (valid) {
