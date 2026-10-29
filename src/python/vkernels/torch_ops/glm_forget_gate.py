@@ -30,7 +30,11 @@ def _kernel():
 
     @triton.jit
     def fgate(H, WB, DT, ALOG, OUT, LB, HAS_LB: tl.constexpr,
-              HD: tl.constexpr, BLOCK_O: tl.constexpr):
+              HD: tl.constexpr, BLOCK_O: tl.constexpr, QKV: tl.constexpr,
+              INDEPENDENT_ROWS: tl.constexpr = False):
+        if INDEPENDENT_ROWS:
+            H += tl.program_id(1) * HD
+            OUT += tl.program_id(1) * QKV
         offs = tl.program_id(0) * BLOCK_O + tl.arange(0, BLOCK_O)
         row = tl.program_id(1)
         h = tl.load(H + row * HD + tl.arange(0, HD)).to(tl.float32)
@@ -102,7 +106,8 @@ def forget_gate(x, fa_weight, fb_weight, dt_bias, a_log, lower_bound):
         kern[(qkv_dim // 64, rows)](
             h, fb_weight, dt_bias, a_log, out,
             1.0 if lower_bound is None else float(lower_bound),
-            lower_bound is not None, head_dim, 64,
+            lower_bound is not None, head_dim, 64, qkv_dim,
+            INDEPENDENT_ROWS=bool(independent_rows and batch > 1),
             num_warps=4, enable_fp_fusion=False,
         )
     return out.view(B, S, heads, head_dim)
