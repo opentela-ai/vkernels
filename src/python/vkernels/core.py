@@ -19,6 +19,8 @@ the behaviour is identical on a host build. Under CUDA, ``Device`` gains real
 
 from __future__ import annotations
 
+import warnings
+
 from vkernels import _backend
 
 _core = _backend.load_extension()
@@ -126,12 +128,21 @@ class Stream:
     def __del__(self):
         # Drain any pending tasks before the worker thread is torn down, so
         # destroying a busy stream cannot deadlock or drop work.
+        # A task failure nobody waited for is reported as a RuntimeWarning
+        # rather than silently discarded (exceptions cannot propagate out
+        # of __del__).
         impl = getattr(self, "_impl", None)
         if impl is not None:
             try:
-                self._impl.wait()
-            except Exception:
-                pass
+                impl.wait()
+            except Exception as exc:
+                label = getattr(self, "_name", "")
+                warnings.warn(
+                    f"vkernels.core.Stream {label!r} destroyed with an unobserved "
+                    f"task failure: {exc!r}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     def __repr__(self) -> str:
         label = f" {self._name!r}" if self._name else ""

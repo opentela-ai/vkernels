@@ -27,6 +27,9 @@
 #if VKERNELS_HAS_HIP
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include "vkernels/kernels/common/dispatch.hpp"
+#include "vkernels/kernels/common/launch.hpp"  // launch_on: launch + error check
+#include "vkernels/util/env.hpp"
 // Grid sync for the fused cooperative kernel. nvcc (the CUDA shim build)
 // takes CUDA's <cooperative_groups.h>; real HIP (ROCm 6.3, beverin) ships
 // the hipCG compat header <hip/hip_cooperative_groups.h> -- which also
@@ -199,8 +202,7 @@ void launch(const float* score,
             const int32_t* topk_indices_offset,
             const int32_t* row_starts,
             const int32_t* seq_lens) {
-  dsa_topk_transform_kernel<K>
-      <<<batch_size, kThreadsPerBlock, kDynamicSmemBytes, 0>>>(score,
+  common::launch_on(dsa_topk_transform_kernel<K>, batch_size, kThreadsPerBlock, kDynamicSmemBytes, nullptr, "dsa_topk_transform_kernel",score,
                                                                lengths,
                                                                dst_token_indices,
                                                                score_stride,
@@ -260,7 +262,7 @@ bool launch_scalar_logits(int q_variant, int batch_size, int num_heads, int head
     if (shmem > 48 * 1024)  // CUDA: over the 48 KB default -> opt in per launch
       hipFuncSetAttribute((const void*)dsa_topk_logits_kernel,
                           hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
-    dsa_topk_logits_kernel<<<grid, dim3(B), shmem, 0>>>(
+    common::launch_on(dsa_topk_logits_kernel, grid, dim3(B), shmem, nullptr, "dsa_topk_logits_kernel",
         reinterpret_cast<const uint8_t*>(q_fp8),
         reinterpret_cast<const uint8_t*>(kvcache_u8),
         reinterpret_cast<const float*>(weight),
@@ -276,7 +278,7 @@ bool launch_scalar_logits(int q_variant, int batch_size, int num_heads, int head
     if (shmem > 48 * 1024)
       hipFuncSetAttribute((const void*)dsa_topk_logits_kernel_fp8q,
                           hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
-    dsa_topk_logits_kernel_fp8q<<<grid, dim3(B), shmem, 0>>>(
+    common::launch_on(dsa_topk_logits_kernel_fp8q, grid, dim3(B), shmem, nullptr, "dsa_topk_logits_kernel_fp8q",
         reinterpret_cast<const uint8_t*>(q_fp8),
         reinterpret_cast<const uint8_t*>(kvcache_u8),
         reinterpret_cast<const float*>(weight),
@@ -439,43 +441,12 @@ void dsa_topk_transform(int32_t batch_size,
     return;
 
   const int32_t group_topk = token_topk / pool_size;
-#define VK_DSA_TOPK_LAUNCH(K)                                                                      \
-  launch<K>(score,                                                                                 \
-            lengths,                                                                               \
-            dst_token_indices,                                                                     \
-            batch_size,                                                                            \
-            score_stride,                                                                          \
-            pool_size,                                                                             \
-            out_cols,                                                                              \
-            page_table,                                                                            \
-            page_table_stride,                                                                     \
-            page_table_row_index,                                                                  \
-            topk_indices_offset,                                                                   \
-            row_starts,                                                                            \
-            seq_lens)
-  switch (group_topk) {
-  case 128:
-    VK_DSA_TOPK_LAUNCH(128);
-    break;
-  case 160:
-    VK_DSA_TOPK_LAUNCH(160);
-    break;
-  case 192:
-    VK_DSA_TOPK_LAUNCH(192);
-    break;
-  case 224:
-    VK_DSA_TOPK_LAUNCH(224);
-    break;
-  case 256:
-    VK_DSA_TOPK_LAUNCH(256);
-    break;
-  case 512:
-    VK_DSA_TOPK_LAUNCH(512);
-    break;
-  default:
-    break;
-  }
-#undef VK_DSA_TOPK_LAUNCH
+common::switch_over<128, 160, 192, 224, 256, 512>(group_topk, [&](auto k) {
+    launch<decltype(k)::value>(score, lengths, dst_token_indices, batch_size, score_stride,
+                               pool_size, out_cols, page_table, page_table_stride,
+                               page_table_row_index, topk_indices_offset, row_starts,
+                               seq_lens);
+  });
 }
 
 // ======================================================================
@@ -487,7 +458,7 @@ void dsa_topk_transform(int32_t batch_size,
 // entry IS the proven two-launch chain (the scalar logits launch the AUTO
 // dispatcher makes + the standalone transform kernel on the default
 // stream), so callers can wire it unconditionally and the env var decides;
-// per-call getenv, the VK_MHC_PRE_STRICT pattern (no static caching).
+// read per call (no static caching; the fused-path test flips it in-process).
 //
 // Fallback contract: any condition the fused path cannot honour (gate off,
 // invalid transform parameters, an unsupported group_topk, no scalar logits
@@ -520,8 +491,8 @@ void dsa_topk_logits_transform_fused(int batch_size, int num_heads, int head_dim
                                      const int32_t* topk_indices_offset,
                                      const int32_t* row_starts,
                                      const int32_t* t_seq_lens) {
-  const char* gate = std::getenv("VK_DSA_TOPK_FUSED");
-  const bool want_fused = gate != nullptr && std::strcmp(gate, "1") == 0;
+  // Re-read per call: test_dsa_topk_fused_gpu flips it in-process.
+  const bool want_fused = util::env_equals("VK_DSA_TOPK_FUSED", "1");
   if (q_variant != 0 && q_variant != 1 && q_variant != 2) {
     std::fprintf(stderr,
                  "vk_hip_dsa_topk_logits_transform_fused: bad q_variant=%d "
@@ -567,44 +538,23 @@ void dsa_topk_logits_transform_fused(int batch_size, int num_heads, int head_dim
                     num_heads * head_dim;
       const int shmem = shmem_logits > (int)kDynamicSmemBytes ? shmem_logits
                                                               : (int)kDynamicSmemBytes;
-#define VK_DSA_TOPK_COOP(K)                                                                        \
-  fused = variant == 1                                                                             \
-              ? launch_logits_transform_coop<K, false>(                                            \
-                    batch_size, num_heads, head_dim, block, max_table_len, max_seq_len,            \
-                    split_kv, q_fp8, kvcache_u8, weight, seq_lens, page_table, logits,             \
-                    t_lengths, dst_token_indices, score_stride, pool_size, out_cols,               \
-                    t_page_table, t_page_table_stride, page_table_row_index,                       \
-                    topk_indices_offset, row_starts, t_seq_lens, shmem)                            \
-              : launch_logits_transform_coop<K, true>(                                             \
-                    batch_size, num_heads, head_dim, block, max_table_len, max_seq_len,            \
-                    split_kv, q_fp8, kvcache_u8, weight, seq_lens, page_table, logits,             \
-                    t_lengths, dst_token_indices, score_stride, pool_size, out_cols,               \
-                    t_page_table, t_page_table_stride, page_table_row_index,                       \
-                    topk_indices_offset, row_starts, t_seq_lens, shmem)
-      switch (group_topk) {
-      case 128:
-        VK_DSA_TOPK_COOP(128);
-        break;
-      case 160:
-        VK_DSA_TOPK_COOP(160);
-        break;
-      case 192:
-        VK_DSA_TOPK_COOP(192);
-        break;
-      case 224:
-        VK_DSA_TOPK_COOP(224);
-        break;
-      case 256:
-        VK_DSA_TOPK_COOP(256);
-        break;
-      case 512:
-        VK_DSA_TOPK_COOP(512);
-        break;
-      default:
-        fused = false;
-        break;
-      }
-#undef VK_DSA_TOPK_COOP
+fused = false;
+      common::switch_over<128, 160, 192, 224, 256, 512>(group_topk, [&](auto k) {
+        constexpr int K = decltype(k)::value;
+        fused = variant == 1
+                    ? launch_logits_transform_coop<K, false>(
+                          batch_size, num_heads, head_dim, block, max_table_len, max_seq_len,
+                          split_kv, q_fp8, kvcache_u8, weight, seq_lens, page_table, logits,
+                          t_lengths, dst_token_indices, score_stride, pool_size, out_cols,
+                          t_page_table, t_page_table_stride, page_table_row_index,
+                          topk_indices_offset, row_starts, t_seq_lens, shmem)
+                    : launch_logits_transform_coop<K, true>(
+                          batch_size, num_heads, head_dim, block, max_table_len, max_seq_len,
+                          split_kv, q_fp8, kvcache_u8, weight, seq_lens, page_table, logits,
+                          t_lengths, dst_token_indices, score_stride, pool_size, out_cols,
+                          t_page_table, t_page_table_stride, page_table_row_index,
+                          topk_indices_offset, row_starts, t_seq_lens, shmem);
+      });
     } else {
       fused = false;
     }

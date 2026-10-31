@@ -139,4 +139,4 @@ def bucket_for_coverage(n: int) -> int:
     length at runtime and use the bucket for loop/buffer geometry only."""
     b = bucket_for(n)
     return b if b >= n else n
-    
+

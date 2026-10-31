@@ -66,8 +66,8 @@ vkl = "uv run vkl"
 rust-test = "cargo test --manifest-path src/rust/Cargo.toml"
 
 # ---- Code quality ----
-fmt = "clang-format --dry-run -i $(git ls-files '*.cpp' '*.hpp' '*.h' '*.cu' '*.cuh')"
-fmt-check = "clang-format --dry-run --Werror -i $(git ls-files '*.cpp' '*.hpp' '*.h' '*.cu' '*.cuh')"
+fmt = "clang-format --dry-run -i $(git ls-files '*.cpp' '*.hpp' '*.h' '*.cu' '*.cuh' '*.hip')"
+fmt-check = "clang-format --dry-run --Werror -i $(git ls-files '*.cpp' '*.hpp' '*.h' '*.cu' '*.cuh' '*.hip')"
 
 # ---- Coverage ----
 coverage = [

@@ -389,8 +389,8 @@ class VkernelBackendShimTest(unittest.TestCase):
 
             # distinct wrapper objects (a shared closure cell would still
             # install one function twice — catch that too)
-            w1 = getattr(stub, "convert_weight_to_mxfp4_moe_kernel_format")
-            w2 = getattr(stub, "convert_gpt_oss_weight_to_mxfp4_moe_kernel_format")
+            w1 = stub.convert_weight_to_mxfp4_moe_kernel_format
+            w2 = stub.convert_gpt_oss_weight_to_mxfp4_moe_kernel_format
             self.assertNotEqual(w1, w2)
 
             # non-AITER backend: each wrapper reaches ITS OWN original

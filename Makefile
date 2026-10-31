@@ -42,7 +42,7 @@ clean:
 fmt:
 	@if [ "$$CI" = "1" ]; then EXTRA=--Werror; fi; \
 	clang-format --dry-run $$EXTRA -i \
-	  $$(git ls-files '*.cpp' '*.hpp' '*.h' '*.cu' '*.cuh')
+	  $$(git ls-files '*.cpp' '*.hpp' '*.h' '*.cu' '*.cuh' '*.hip')
 
 tidy:
 	@command -v clang-tidy >/dev/null 2>&1 || { echo "clang-tidy not installed"; exit 1; }; \

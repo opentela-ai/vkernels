@@ -45,6 +45,9 @@
 #if VKERNELS_HAS_HIP
 #  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 #  include <hip/hip_runtime.h>
+#  include "vkernels/kernels/common/dispatch.hpp"
+#  include "vkernels/kernels/common/launch.hpp"  // launch_on: launch + error check
+#  include "vkernels/util/env.hpp"
 
 namespace vkernels::kernels::hip {
 
@@ -262,10 +265,7 @@ void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
   if (hc_mult3 > 32 || hc_hidden_size > kMaxHcHidden) return;
   // VK_MHC_PRE_STRICT=1 pins the bitwise-oracle strict chain for all calls
   // (issue #147 parity escape hatch). Resolved once, first call wins.
-  static const bool kStrictEnv = [] {
-    const char* e = std::getenv("VK_MHC_PRE_STRICT");
-    return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
-  }();
+  static const bool kStrictEnv = util::env_flag("VK_MHC_PRE_STRICT");
   if (kStrictEnv) {
     nslice = 1;
   } else if (nslice <= 0) {
@@ -274,8 +274,7 @@ void mhc_pre_gemm_sqrsum(int num_tokens, int hc_mult3, int hc_hidden_size,
   if (nslice == 1) {
     dim3 grid(num_tokens, hc_mult3);  // one block per (token, column) (#79)
     dim3 block(256);                  // coalesced fn-row walk + tree reduce
-    mhc_pre_gemm_sqrsum_kernel<<<grid, block, 0,
-                                 static_cast<hipStream_t>(stream)>>>(
+    common::launch_on(mhc_pre_gemm_sqrsum_kernel, grid, block, 0, static_cast<hipStream_t>(stream), "mhc_pre_gemm_sqrsum_kernel",
         reinterpret_cast<const uint16_t*>(x), reinterpret_cast<const float*>(fn),
         reinterpret_cast<float*>(out), reinterpret_cast<float*>(sqrsum),
         num_tokens, hc_mult3, hc_hidden_size);
@@ -395,23 +394,11 @@ void mhc_pre_gemm_sqrsum_blocked(int num_tokens, int hc_mult3,
   const float* fp = reinterpret_cast<const float*>(fn);
   float* op = reinterpret_cast<float*>(out);
   float* sp = reinterpret_cast<float*>(sqrsum);
-#define VK_MHC_BLOCKED_CASE(N)                                                \
-  do {                                                                        \
-    if (nslice == N)                                                          \
-      mhc_pre_gemm_sqrsum_blocked_kernel<N>                                   \
-          <<<grid, block, 0, s>>>(xp, fp, op, sp, num_tokens, hc_mult3,       \
-                                  hc_hidden_size);                            \
-  } while (0)
-  VK_MHC_BLOCKED_CASE(1);
-  VK_MHC_BLOCKED_CASE(2);
-  VK_MHC_BLOCKED_CASE(4);
-  VK_MHC_BLOCKED_CASE(8);
-  VK_MHC_BLOCKED_CASE(16);
-  VK_MHC_BLOCKED_CASE(32);
-  VK_MHC_BLOCKED_CASE(64);
-  VK_MHC_BLOCKED_CASE(128);
-  VK_MHC_BLOCKED_CASE(256);
-#undef VK_MHC_BLOCKED_CASE
+common::switch_over<1, 2, 4, 8, 16, 32, 64, 128, 256>(nslice, [&](auto n) {
+    common::launch_on(mhc_pre_gemm_sqrsum_blocked_kernel<decltype(n)::value>, grid, block, 0, s,
+                      "mhc_pre_gemm_sqrsum_blocked_kernel", xp, fp, op, sp, num_tokens, hc_mult3,
+                      hc_hidden_size);
+  });
 }
 
 void mhc_post(int num_tokens, int hc, int hidden,
@@ -421,7 +408,7 @@ void mhc_post(int num_tokens, int hc, int hidden,
   if (hc > 63) return;  // sCol[64] backstop
   dim3 grid(num_tokens, hc);
   dim3 block(256);
-  mhc_post_kernel<<<grid, block, 0, static_cast<hipStream_t>(stream)>>>(
+  common::launch_on(mhc_post_kernel, grid, block, 0, static_cast<hipStream_t>(stream), "mhc_post_kernel",
       reinterpret_cast<const float*>(a), reinterpret_cast<const uint16_t*>(b),
       reinterpret_cast<const float*>(c), reinterpret_cast<const uint16_t*>(d),
       reinterpret_cast<uint16_t*>(out), num_tokens, hc, hidden);

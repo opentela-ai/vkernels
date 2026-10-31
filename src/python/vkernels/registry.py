@@ -126,13 +126,13 @@ class KernelImplementation:
     # graph capture (borrowed from tokenspeed-kernel's registration hook).
     weight_preprocessor: str | None = None
 
-    @lru_cache(maxsize=256)
+    @lru_cache(maxsize=256)  # noqa: B019 - immutable registry entries, process lifetime
     def load(self) -> Callable:
         """Import the selected launcher; selection itself never calls this."""
         module, name = self.entrypoint.split(":")
         return getattr(import_module(module), name)
 
-    @lru_cache(maxsize=256)
+    @lru_cache(maxsize=256)  # noqa: B019 - immutable registry entries, process lifetime
     def load_weight_preprocessor(self) -> Callable | None:
         """Import the declared weight preprocessor, or ``None``.
 
@@ -202,7 +202,7 @@ class KernelRegistry:
                     "use a Priority band (optionally with a small intra-band offset)"
                 )
 
-    @lru_cache(maxsize=1024)
+    @lru_cache(maxsize=1024)  # noqa: B019 - immutable registry, process lifetime
     def explain(
         self, request: KernelRequest, *, override: str | None = None, allow_reference: bool = False
     ) -> SelectionExplanation:

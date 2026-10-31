@@ -370,7 +370,7 @@ def _isolated_plan(graph, sched, fams):
         if tv.storage_id in graph.fresh_storages:
             fresh.setdefault(tv.storage_id, (name, tv.numel))
     bufs, total = [], 0
-    for s, (name, numel) in fresh.items():
+    for s, (_name, numel) in fresh.items():
         bufs.append(type("B", (), {"storage_id": s, "offset": total, "numel": numel})())
         total += numel
     return type("P", (), {"buffers": bufs, "total_elements": total, "total_bytes": 4 * total})()

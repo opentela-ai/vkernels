@@ -46,6 +46,7 @@
 #if VKERNELS_HAS_HIP
 #  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 helpers
 #  include <hip/hip_runtime.h>
+#  include "vkernels/kernels/common/launch.hpp"  // launch_on: launch + error check
 
 namespace vkernels::kernels::hip {
 
@@ -470,7 +471,7 @@ void launch_assemble(int n_pools, int pool_size, int head_dim, int tail_size,
   dim3 grid(n_pools, 1, 1);
   dim3 block(64);
   const hipStream_t s = stream ? static_cast<hipStream_t>(stream) : nullptr;
-  dsa_kpool_assemble_kernel<<<grid, block, shmem, s>>>(
+  common::launch_on(dsa_kpool_assemble_kernel<Epi>, grid, block, shmem, s, "dsa_kpool_assemble_kernel",
       epi,
       reinterpret_cast<const uint16_t*>(chunk_k),
       reinterpret_cast<const uint16_t*>(chunk_score),
@@ -505,7 +506,7 @@ void launch_decode(int batch, int pool_size, int head_dim, int tail_size,
   dim3 grid(batch, 1, 1);
   dim3 block(64);
   const hipStream_t s = stream ? static_cast<hipStream_t>(stream) : nullptr;
-  dsa_kpool_decode_kernel<<<grid, block, shmem, s>>>(
+  common::launch_on(dsa_kpool_decode_kernel<Epi>, grid, block, shmem, s, "dsa_kpool_decode_kernel",
       epi,
       reinterpret_cast<const uint16_t*>(key),
       reinterpret_cast<const uint16_t*>(slot_score),

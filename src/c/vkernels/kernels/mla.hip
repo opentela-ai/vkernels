@@ -38,6 +38,8 @@
 
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
+#  include "vkernels/kernels/common/dispatch.hpp"
+#  include "vkernels/kernels/common/launch.hpp"  // launch_on: launch + error check
 #include "vkernels/kernels/execution_workspace.hpp"
 
 namespace vkernels::kernels::hip {
@@ -594,7 +596,7 @@ void launch(const float* q, const float* k_c, const float* k_pe,
   const int shmem = BQ * Dq * sizeof(float);
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, B);
-  mla_fwd_kernel<BQ><<<grid, block, shmem, st>>>(
+  common::launch_on(mla_fwd_kernel<BQ>, grid, block, shmem, st, "mla_fwd_kernel",
       q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start, lr, rhd,
       scale);
 }
@@ -636,10 +638,13 @@ bool launch_split(const float* q, const float* k_c, const float* k_pe,
   const dim3 gridC(S_q, H, B);
   // The combine kernel assumes 64 threads (its strided slices and the sLse
   // staging loop are hard-wired to 64); keep it at 64 regardless of BQ.
-  mla_fwd_split_combine_kernel<<<gridC, 64, split * sizeof(float), st>>>(
+  common::launch_on(mla_fwd_split_combine_kernel, gridC, 64, split * sizeof(float), st, "mla_fwd_split_combine_kernel",
       partial_out.ptr, partial_lse.ptr, out, S_q, split, lr);
   return true;
 }
+
+// (BQ, BH) tile key for the fused-head dispatch tables below; BH < 32.
+constexpr int mla_key(int bq, int bh) { return bq * 32 + bh; }
 
 // Fused-head prefill launch (issue #151). bq selects the query tile (rows
 // per block); the heads-per-block group follows as min(H, 16/BQ) rounded
@@ -660,55 +665,31 @@ void launch_fused(const float* q, const float* k_c, const float* k_pe,
     if (BHw < 1) BHw = 1;
     const dim3 block(BQ * BHw * 64);
     const dim3 grid((S_q + BQ - 1) / BQ, (H + BHw - 1) / BHw, B);
-#define VK_MLA_WIDE_CASE(BQ_, BH_)                                         \
-  case ((BQ_) * 32 + (BH_)):                                              \
-    mla_fwd_headfused_wide_kernel<BQ_, BH_, 8><<<grid, block, 0, st>>>(      \
-        q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start, rhd,   \
-        scale);                                                            \
-    return
-    switch (BQ * 32 + BHw) {
-      VK_MLA_WIDE_CASE(1, 1);
-      VK_MLA_WIDE_CASE(1, 2);
-      VK_MLA_WIDE_CASE(1, 4);
-      VK_MLA_WIDE_CASE(1, 8);
-      VK_MLA_WIDE_CASE(2, 1);
-      VK_MLA_WIDE_CASE(2, 2);
-      VK_MLA_WIDE_CASE(2, 4);
-      VK_MLA_WIDE_CASE(4, 1);
-      VK_MLA_WIDE_CASE(4, 2);
-      VK_MLA_WIDE_CASE(8, 1);
-      default: break;
-    }
-#undef VK_MLA_WIDE_CASE
+    const auto launch_wide = [&](auto key) {
+      constexpr int kKey = decltype(key)::value;
+      common::launch_on(mla_fwd_headfused_wide_kernel<kKey / 32, kKey % 32, 8>, grid, block, 0,
+                        st, "mla_fwd_headfused_wide_kernel", q, k_c, k_pe, v_c, out, B, H, S_q,
+                        S_kv, q_start, kv_start, rhd, scale);
+    };
+    if (common::switch_over<mla_key(1, 1), mla_key(1, 2), mla_key(1, 4), mla_key(1, 8),
+                            mla_key(2, 1), mla_key(2, 2), mla_key(2, 4), mla_key(4, 1),
+                            mla_key(4, 2), mla_key(8, 1)>(mla_key(BQ, BHw), launch_wide))
+      return;
   }
 
   const dim3 block(BQ * bh * 64);
   const dim3 grid((S_q + BQ - 1) / BQ, (H + bh - 1) / bh, B);
 
-#define VK_MLA_FUSED_CASE(BQ_, BH_)                                        \
-  case ((BQ_) * 32 + (BH_)):                                              \
-    mla_fwd_headfused_kernel<BQ_, BH_><<<grid, block, 0, st>>>(              \
-        q, k_c, k_pe, v_c, out, B, H, S_q, S_kv, q_start, kv_start, lr,    \
-        rhd, scale);                                                       \
-    return
-  switch (BQ * 32 + bh) {
-    VK_MLA_FUSED_CASE(1, 1);
-    VK_MLA_FUSED_CASE(1, 2);
-    VK_MLA_FUSED_CASE(1, 4);
-    VK_MLA_FUSED_CASE(1, 8);
-    VK_MLA_FUSED_CASE(1, 16);
-    VK_MLA_FUSED_CASE(2, 1);
-    VK_MLA_FUSED_CASE(2, 2);
-    VK_MLA_FUSED_CASE(2, 4);
-    VK_MLA_FUSED_CASE(2, 8);
-    VK_MLA_FUSED_CASE(4, 1);
-    VK_MLA_FUSED_CASE(4, 2);
-    VK_MLA_FUSED_CASE(4, 4);
-    VK_MLA_FUSED_CASE(8, 1);
-    VK_MLA_FUSED_CASE(8, 2);
-    default: break;
-  }
-#undef VK_MLA_FUSED_CASE
+  const auto launch_tile = [&](auto key) {
+    constexpr int kKey = decltype(key)::value;
+    common::launch_on(mla_fwd_headfused_kernel<kKey / 32, kKey % 32>, grid, block, 0, st,
+                      "mla_fwd_headfused_kernel", q, k_c, k_pe, v_c, out, B, H, S_q, S_kv,
+                      q_start, kv_start, lr, rhd, scale);
+  };
+  common::switch_over<mla_key(1, 1), mla_key(1, 2), mla_key(1, 4), mla_key(1, 8), mla_key(1, 16),
+                      mla_key(2, 1), mla_key(2, 2), mla_key(2, 4), mla_key(2, 8), mla_key(4, 1),
+                      mla_key(4, 2), mla_key(4, 4), mla_key(8, 1), mla_key(8, 2)>(
+      mla_key(BQ, bh), launch_tile);
 }
 }  // namespace
 

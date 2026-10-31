@@ -8,7 +8,7 @@
 namespace vkernels::kernels::cuda {
 namespace {
 template <bool Max>
-__global__ void reduce(const float* x, float* result, std::size_t n) {
+__global__ void reduce(const float* __restrict__ x, float* __restrict__ result, std::size_t n) {
   __shared__ float partial[256];
   float value = Max ? -CUDART_INF_F : 0.0f;
   for (std::size_t i = threadIdx.x; i < n; i += blockDim.x)

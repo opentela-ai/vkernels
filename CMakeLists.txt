@@ -22,6 +22,13 @@ option(VKERNELS_ENABLE_COVERAGE "Enable gcov line-coverage instrumentation" OFF)
 option(VKERNELS_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(VKERNELS_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
 option(VKERNELS_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+# Static analysis: run clang-tidy (.clang-tidy at the repo root) on the host
+# C++ sources of the library target while compiling. The coverage preset
+# (host CI) turns it on; without a clang-tidy on PATH (or
+# VKERNELS_CLANG_TIDY_EXE) the build proceeds with a warning, unless
+# VKERNELS_REQUIRE_CLANG_TIDY is set.
+option(VKERNELS_ENABLE_CLANG_TIDY "Run clang-tidy on host C++ library sources" OFF)
+option(VKERNELS_REQUIRE_CLANG_TIDY "Fail configure when clang-tidy is enabled but missing" OFF)
 
 # The build cache (docs/tuning-cache.md "Build cache"): route compiles
 # through ccache when available so rebuilds across presets / branches hit

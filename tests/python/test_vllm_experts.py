@@ -193,10 +193,10 @@ class GpuAlignDefaultTest(unittest.TestCase):
         import sys
 
         code = (
-            "import sys; sys.path.insert(0, {!r}); "
+            f"import sys; sys.path.insert(0, {str(_SRC)!r}); "
             "import vkernels.vllm_experts as ve; "
             "print(int(ve._GPU_ALIGN))"
-        ).format(str(_SRC))
+        )
         env = dict(os.environ, VKERNELS_GPU_ALIGN="0")
         out = subprocess.run(
             [sys.executable, "-c", code], env=env,

@@ -528,7 +528,7 @@ class HopperFP8BlockwiseGemmKernel:
 
                 mainloop_producer_state.reset_count()
 
-                for k_tile in range(k_tile_cnt):
+                for k_tile in range(k_tile_cnt):  # noqa: B007 - CuTe DSL pipeline loop
                     # Conditionally wait for AB buffer empty
                     mainloop_pipeline.producer_acquire(mainloop_producer_state)
                     # Slice to global/shared memref to current k_tile
@@ -754,7 +754,7 @@ class HopperFP8BlockwiseGemmKernel:
                 cute.nvgpu.warpgroup.wait_group(0)
 
                 # Release remaining pipeline stages from prologue
-                for k_tile in range(prologue_mma_cnt):
+                for k_tile in range(prologue_mma_cnt):  # noqa: B007 - CuTe DSL pipeline loop
                     mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
                     mainloop_consumer_release_state.advance()
 

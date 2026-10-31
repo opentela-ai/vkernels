@@ -91,4 +91,30 @@ line-length = 120
 # Pyflakes: duplicate definitions/registry keys, unused imports/variables,
 # empty f-strings — the mechanical scar class that union splices leave behind.
 # Structure and style stay human-reviewed; this is the automatable floor.
-select = ["F"]
+# E/W (pycodestyle), B (bugbear) and UP (pyupgrade) are enabled on top; the
+# rules below had hundreds of pre-existing hits (2026-10-31: 1031 findings in
+# total) and are ignored rather than mass-edited. Remove an entry together
+# with the change that fixes its findings.
+select = ["F", "E", "W", "B", "UP"]
+ignore = [
+    # style: 371 E501, 125 E741, 83 E702, 50 E701, 6 E731
+    "E501", "E701", "E702", "E731", "E741",
+    # annotation modernisation (autofixable; deferred to one mechanical change)
+    "UP006", "UP035", "UP037", "UP045",
+    # behaviour-relevant, need per-site review: zip(strict=) raises on length
+    # mismatch (81 sites); late-bound loop variables in closures (30 sites)
+    "B905", "B023",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Vendored donors keep their upstream style.
+"src/python/vkernels/torch_ops/tokenspeed_amd/**" = ["E", "W", "B", "UP"]
+"src/python/vkernels/torch_ops/_vendor_sgl_push/**" = ["E", "W", "B", "UP"]
+# Imports after optional-dependency probes / sys.path setup, by design.
+"src/python/vkernels/compiler/capture.py" = ["E402"]
+"src/python/vkernels/compiler/operator_ir.py" = ["E402"]
+"src/python/vkernels/compiler/reference_exec.py" = ["E402"]
+"src/python/vkernels/hip_dsa_mhc.py" = ["E402"]
+# Tests import after pytest.importorskip / sys.path setup by design, and some
+# contracts deliberately accept any exception type.
+"tests/python/**" = ["E402", "B017"]

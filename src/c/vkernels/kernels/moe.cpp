@@ -3,6 +3,7 @@
 // These are the golden reference paths against which HIP kernels are
 // validated. Always compiled, independent of GPU toolkit presence.
 #include "vkernels/kernels/moe.hpp"
+#include "vkernels/util/env.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -98,10 +99,8 @@ void fp4_to_bf16_dequant(Span<const uint8_t> packed, Span<uint16_t> out,
 // #14 — Platform async-copy gate (CPU reference)
 // ======================================================================
 bool use_async_copy_default() {
-  const char* env = std::getenv("K3_NO_ASYNC");
-  if (env) {
-    return env[0] != '1';  // "1" = force OFF
-  }
+  // Re-read per call (test_moe flips K3_NO_ASYNC in-process); "1" = force OFF.
+  if (const char* env = util::env_str("K3_NO_ASYNC")) return env[0] != '1';
   return true;  // host path always defaults to ON
 }
 

@@ -279,10 +279,10 @@ def tp_plan(hidden: int, ispp: int, tp: int, group_size: int = 32) -> dict:
     hidden_shard, ispp_shard = hidden // tp, ispp // tp
     if hidden_shard % 64 or ispp_shard % 64:
         raise ValueError("hidden/tp and ispp/tp must be multiples of 64 "
-                         "(BLOCK_K); got %d, %d" % (hidden_shard, ispp_shard))
+                         f"(BLOCK_K); got {hidden_shard}, {ispp_shard}")
     if hidden_shard % group_size or ispp_shard % group_size:
         raise ValueError("hidden/tp and ispp/tp must be multiples of "
-                         "group_size %d" % group_size)
+                         f"group_size {group_size}")
     return {
         "tp": tp,
         "hidden": hidden,

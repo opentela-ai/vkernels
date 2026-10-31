@@ -66,6 +66,38 @@ _INT = ctypes.c_int
 _FLOAT = ctypes.c_float
 
 
+_ULL = ctypes.c_ulonglong
+
+# C ABI prototypes (hip_capi.hpp), declared once per loaded library in
+# :func:`_load` instead of on every call. Symbols a given build lacks (the
+# pre-#69 / pre-#147 libraries) are skipped; callers probe with :func:`_sym`.
+_PROTOTYPES = {
+    "vk_hip_dsa_sparse_fwd_stream": (_INT, [_INT] * 9 + [_FLOAT, _INT] + [_VOIDP] * 6),
+    "vk_hip_dsa_sparse_fwd": (_INT, [_INT] * 9 + [_FLOAT, _INT] + [_VOIDP] * 5),
+    "vk_hip_dsa_sparse_fwd_split_stream": (_INT, [_INT] * 9 + [_FLOAT, _INT, _INT] + [_VOIDP] * 8),
+    "vk_hip_dsa_sparse_fwd_split": (_INT, [_INT] * 9 + [_FLOAT, _INT, _INT] + [_VOIDP] * 7),
+    "vk_hip_mhc_pre_gemm_sqrsum_blocked_stream": (_INT, [_INT] * 3 + [_VOIDP] * 4 + [_INT, _VOIDP]),
+    "vk_hip_mhc_pre_gemm_sqrsum_stream": (_INT, [_INT] * 3 + [_VOIDP] * 5),
+    "vk_hip_mhc_pre_gemm_sqrsum": (None, [_INT] * 3 + [_VOIDP] * 4),
+    "vk_hip_mhc_post_stream": (_INT, [_INT] * 3 + [_VOIDP] * 6),
+    "vk_hip_mhc_post": (None, [_INT] * 3 + [_VOIDP] * 5),
+    "vk_hip_kda_delta_rule_fwd": (None, [_VOIDP] * 6 + [_INT] * 5),
+    "vk_hip_kda_delta_rule_fwd_with_scratch_stream": (_INT, [_VOIDP] * 7 + [_INT] * 4 + [_VOIDP]),
+    "vk_hip_kda_delta_rule_fwd_with_scratch": (None, [_VOIDP] * 7 + [_INT] * 4),
+    "vk_hip_kda_chunked_scratch_floats": (_ULL, [_INT] * 4),
+    "vk_hip_kda_delta_rule_fwd_chunked_with_scratch_stream": (_INT, [_VOIDP] * 8 + [_INT] * 5 + [_VOIDP]),
+    "vk_hip_kda_delta_rule_fwd_chunked_with_scratch": (None, [_VOIDP] * 8 + [_INT] * 5),
+}
+
+
+def _declare_prototypes(lib) -> None:
+    for name, (restype, argtypes) in _PROTOTYPES.items():
+        fn = getattr(lib, name, None)
+        if fn is not None:
+            fn.restype = restype
+            fn.argtypes = argtypes
+
+
 def _load():
     """Load and cache ``libvkernels_hip.so``; returns None when absent."""
     global _LIB, _LIB_FAILED
@@ -76,10 +108,12 @@ def _load():
     try:
         from vkernels.vllm_experts import load_libvkernels_hip
 
-        _LIB = load_libvkernels_hip()
+        lib = load_libvkernels_hip()
     except (RuntimeError, OSError, ImportError):
         _LIB_FAILED = True
         return None
+    _declare_prototypes(lib)
+    _LIB = lib
     return _LIB
 
 
@@ -239,11 +273,6 @@ def dsa_sparse_fwd(
 
     fs = _sym(lib, "vk_hip_dsa_sparse_fwd_stream")
     if fs is not None:
-        fs.restype = _INT
-        fs.argtypes = [
-            _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT,
-            _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
-        ]
         with _device_guard(q):
             rc = fs(
                 int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
@@ -256,11 +285,6 @@ def dsa_sparse_fwd(
             raise RuntimeError(f"vk_hip_dsa_sparse_fwd failed with rc={rc}")
     else:
         fn = lib.vk_hip_dsa_sparse_fwd
-        fn.restype = _INT
-        fn.argtypes = [
-            _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT,
-            _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
-        ]
         with _device_guard(q):
             rc = fn(
                 int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
@@ -375,12 +399,6 @@ def dsa_sparse_fwd_split(
 
     fs = _sym(lib, "vk_hip_dsa_sparse_fwd_split_stream")
     if fs is not None:
-        fs.restype = _INT
-        fs.argtypes = [
-            _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT,
-            _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
-            _VOIDP, _VOIDP,
-        ]
         with _device_guard(q):
             rc = fs(
                 int(S_q), int(S_kv), int(H), int(dim), int(tail_dim), int(topk),
@@ -394,12 +412,6 @@ def dsa_sparse_fwd_split(
             )
     else:
         fn = lib.vk_hip_dsa_sparse_fwd_split
-        fn.restype = _INT
-        fn.argtypes = [
-            _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT, _FLOAT,
-            _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
-            _VOIDP,
-        ]
         with _device_guard(q):
             rc = fn(
                 int(S_q), int(S_kv), int(H), int(dim), int(tail_dim),
@@ -468,9 +480,6 @@ def mhc_pre_gemm_sqrsum(
     # was the strict chain -- so only route nslice=1 through it.
     fsb = _sym(lib, "vk_hip_mhc_pre_gemm_sqrsum_blocked_stream")
     if fsb is not None:
-        fsb.restype = _INT
-        fsb.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
-                        _INT, _VOIDP]
         with _device_guard(x):
             rc = fsb(int(n), int(hc_mult3), int(hc_hidden), _dptr(x),
                      _dptr(fn), _dptr(out), _dptr(sqrsum), nslice,
@@ -481,8 +490,6 @@ def mhc_pre_gemm_sqrsum(
         return out, sqrsum
     fs = _sym(lib, "vk_hip_mhc_pre_gemm_sqrsum_stream")
     if fs is not None and nslice == 1:
-        fs.restype = _INT
-        fs.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
         with _device_guard(x):
             rc = fs(int(n), int(hc_mult3), int(hc_hidden), _dptr(x),
                     _dptr(fn), _dptr(out), _dptr(sqrsum),
@@ -496,8 +503,6 @@ def mhc_pre_gemm_sqrsum(
             "vk_hip_mhc_pre_gemm_sqrsum_blocked_stream (issue #147); "
             "this library's non-suffixed entry serves the strict chain")
     f = lib.vk_hip_mhc_pre_gemm_sqrsum
-    f.restype = None
-    f.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
     with _device_guard(x):
         f(int(n), int(hc_mult3), int(hc_hidden), _dptr(x), _dptr(fn),
           _dptr(out), _dptr(sqrsum))
@@ -540,9 +545,6 @@ def mhc_post(
         _contig(out, "out", torch.bfloat16)
     fs = _sym(lib, "vk_hip_mhc_post_stream")
     if fs is not None:
-        fs.restype = _INT
-        fs.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
-                       _VOIDP, _VOIDP]
         with _device_guard(d):
             rc = fs(int(n), int(hc), int(hidden), _dptr(a), _dptr(b),
                     _dptr(c), _dptr(d), _dptr(out), _stream_ptr(stream))
@@ -550,8 +552,6 @@ def mhc_post(
             raise RuntimeError(f"vk_hip_mhc_post failed: rc={rc}")
     else:
         f = lib.vk_hip_mhc_post
-        f.restype = None
-        f.argtypes = [_INT, _INT, _INT, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP]
         f(int(n), int(hc), int(hidden), _dptr(a), _dptr(b), _dptr(c),
           _dptr(d), _dptr(out))
     return out
@@ -605,8 +605,6 @@ def kda_delta_rule_fwd(
     else:
         _contig(out, "out", torch.float32)
     f = lib.vk_hip_kda_delta_rule_fwd
-    f.restype = None
-    f.argtypes = [_VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _INT, _INT, _INT, _INT, _INT]
     f(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta), _dptr(out), B, H, S, D, int(chunk_size))
     return out
 
@@ -646,9 +644,6 @@ def kda_delta_rule_fwd_with_scratch(
         _contig(out, "out", torch.float32)
     fs = _sym(lib, "vk_hip_kda_delta_rule_fwd_with_scratch_stream")
     if fs is not None:
-        fs.restype = _INT
-        fs.argtypes = [_VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
-                       _INT, _INT, _INT, _INT, _VOIDP]
         with _device_guard(q):
             rc = fs(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta),
                     _dptr(state), _dptr(out), B, H, S, D,
@@ -661,9 +656,6 @@ def kda_delta_rule_fwd_with_scratch(
             raise RuntimeError("stream requires the #69 stream ABI "
                                "(rebuild libvkernels_hip)")
         f = lib.vk_hip_kda_delta_rule_fwd_with_scratch
-        f.restype = None
-        f.argtypes = [_VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP, _VOIDP,
-                      _INT, _INT, _INT, _INT]
         f(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta), _dptr(state),
           _dptr(out), B, H, S, D)
     return out, state
@@ -675,8 +667,6 @@ def kda_chunked_scratch_floats(B: int, H: int, S: int, D: int) -> int:
     if lib is None:
         raise RuntimeError("libvkernels_hip.so not found")
     f = lib.vk_hip_kda_chunked_scratch_floats
-    f.restype = ctypes.c_ulonglong
-    f.argtypes = [_INT, _INT, _INT, _INT]
     return int(f(B, H, S, D))
 
 
@@ -742,8 +732,6 @@ def kda_delta_rule_fwd_chunked(
         scratch = _contig(scratch, "scratch", torch.float32)
     fs = _sym(lib, "vk_hip_kda_delta_rule_fwd_chunked_with_scratch_stream")
     if fs is not None:
-        fs.restype = _INT
-        fs.argtypes = ([_VOIDP] * 8 + [_INT] * 5 + [_VOIDP])
         with _device_guard(q):
             rc = fs(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta),
                     _dptr(state), _dptr(out), _dptr(scratch), B, H, S, D,
@@ -756,8 +744,6 @@ def kda_delta_rule_fwd_chunked(
             raise RuntimeError("stream requires the #69 stream ABI "
                                "(rebuild libvkernels_hip)")
         f = lib.vk_hip_kda_delta_rule_fwd_chunked_with_scratch
-        f.restype = None
-        f.argtypes = ([_VOIDP] * 8 + [_INT] * 5)
         f(_dptr(q), _dptr(k), _dptr(v), _dptr(g), _dptr(beta), _dptr(state),
           _dptr(out), _dptr(scratch), B, H, S, D, int(chunk_size))
     return out, state

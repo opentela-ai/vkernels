@@ -28,6 +28,8 @@
 
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
+#  include "vkernels/kernels/common/launch.hpp"  // launch_on: launch + error check
+#  include "vkernels/util/env.hpp"
 #  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 
 namespace vkernels::kernels::hip {
@@ -1475,11 +1477,17 @@ void fused_moe_mxfp4(
   // launcher performs no device allocation of its own and launches one
   // fewer kernel per forward (issue #41, items 1 + 2).
   //
-  // Optional per-kernel timing (VK_MOE_KTIME=1) emits gateup/down
+  // Optional per-kernel timing (VK_MOE_KTIME=1; benchmark builds only) emits gateup/down
   // elapsed microseconds to stderr.  The hipEventSynchronize after each
   // launch serialises the two stages, so the bench's end-to-end timing is
   // only meaningful when this env var is unset.
-  const bool ktime = (std::getenv("VK_MOE_KTIME") != nullptr);
+  // Profiling hooks are compiled in only for VKERNELS_BUILD_BENCHMARKS builds
+  // (VKERNELS_PROFILING_HOOKS); production builds pay no per-call getenv.
+#if VKERNELS_PROFILING_HOOKS
+  const bool ktime = util::env_str("VK_MOE_KTIME") != nullptr;
+#else
+  constexpr bool ktime = false;
+#endif
   hipEvent_t ks = nullptr, ke = nullptr;
   if (ktime) { hipEventCreate(&ks); hipEventCreate(&ke); }
 #define VK_TBEGIN() do { if (ktime) hipEventRecord(ks, hipstream); } while (0)
@@ -1517,10 +1525,7 @@ void fused_moe_mxfp4(
     // dominates.  Measured on MI300A (see
     // docs/performance/moe-fused/gfx942.md): 2.61x at M=128, 1.77x at
     // M=512, 1.82x at M=1024, 1.68x at M=2048 over variant 0.
-    static const int pf_variant = [] {
-      const char* s = std::getenv("VK_MOE_PF_VARIANT");
-      return s ? std::atoi(s) : 5;
-    }();
+    static const int pf_variant = util::env_int("VK_MOE_PF_VARIANT", 5);
     {
       // Issue #150 variant 6: 128-row M-tiles with the v5 N geometry.  The
       // caller must have aligned expert_ids per 128-row block (EM % 128 ==
@@ -1530,8 +1535,7 @@ void fused_moe_mxfp4(
         {
           dim3 g(EM / kBM_pf128, ispp / kBN_pf_g16);
           VK_TBEGIN();
-          gateup_swiglu_kernel_prefill_pipe<kBM_pf128, kBN_pf_g16>
-              <<<g, kThreads_pf, 0, hipstream>>>(
+          common::launch_on(gateup_swiglu_kernel_prefill_pipe<kBM_pf128, kBN_pf_g16>, g, kThreads_pf, 0, hipstream, "gateup_swiglu_kernel_prefill_pipe",
               A, w13, w13_scale, b13, act_scratch,
               sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
               activation, beta, linear_beta, b13 != nullptr);
@@ -1540,8 +1544,7 @@ void fused_moe_mxfp4(
         {
           dim3 g(EM / kBM_pf128, hidden / kBN_pf_g32);
           VK_TBEGIN();
-          down_combine_kernel_prefill_pipe<kBM_pf128, kBN_pf_g32>
-              <<<g, kThreads_pf, 0, hipstream>>>(
+          common::launch_on(down_combine_kernel_prefill_pipe<kBM_pf128, kBN_pf_g32>, g, kThreads_pf, 0, hipstream, "down_combine_kernel_prefill_pipe",
               act_scratch, w2, w2_scale, b2, out, topk_w,
               sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
           VK_TEND("down");
@@ -1549,8 +1552,7 @@ void fused_moe_mxfp4(
       } else if (pf_variant == 2) {
         dim3 g(EM / kBM_pf, ispp / kBN_pf_g32);
         VK_TBEGIN();
-        gateup_swiglu_kernel_prefill_pipe<kBM_pf, kBN_pf_g32>
-            <<<g, kThreads_pf, 0, hipstream>>>(
+        common::launch_on(gateup_swiglu_kernel_prefill_pipe<kBM_pf, kBN_pf_g32>, g, kThreads_pf, 0, hipstream, "gateup_swiglu_kernel_prefill_pipe",
             A, w13, w13_scale, b13, act_scratch,
             sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
             activation, beta, linear_beta, b13 != nullptr);
@@ -1558,8 +1560,7 @@ void fused_moe_mxfp4(
       } else if (pf_variant == 4 || pf_variant == 5 || pf_variant == 6) {
         dim3 g(EM / kBM_pf, ispp / kBN_pf_g16);
         VK_TBEGIN();
-        gateup_swiglu_kernel_prefill_pipe<kBM_pf, kBN_pf_g16>
-            <<<g, kThreads_pf, 0, hipstream>>>(
+        common::launch_on(gateup_swiglu_kernel_prefill_pipe<kBM_pf, kBN_pf_g16>, g, kThreads_pf, 0, hipstream, "gateup_swiglu_kernel_prefill_pipe",
             A, w13, w13_scale, b13, act_scratch,
             sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
             activation, beta, linear_beta, b13 != nullptr);
@@ -1567,8 +1568,7 @@ void fused_moe_mxfp4(
       } else if (pf_variant == 3) {
         dim3 g(EM / kBM_pf, ispp / kBN_pf_g32);
         VK_TBEGIN();
-        gateup_swiglu_kernel_prefill_ws<kBN_pf_g32>
-            <<<g, 2 * kThreads_pf, 0, hipstream>>>(
+        common::launch_on(gateup_swiglu_kernel_prefill_ws<kBN_pf_g32>, g, 2 * kThreads_pf, 0, hipstream, "gateup_swiglu_kernel_prefill_ws",
             A, w13, w13_scale, b13, act_scratch,
             sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
             activation, beta, linear_beta, b13 != nullptr);
@@ -1578,14 +1578,12 @@ void fused_moe_mxfp4(
         dim3 g(EM / kBM_pf, ispp / kBN_pf);
         VK_TBEGIN();
         if (pf_variant == 1)
-          gateup_swiglu_kernel_prefill_pipe<kBM_pf, kBN_pf>
-              <<<g, kThreads_pf, 0, hipstream>>>(
+          common::launch_on(gateup_swiglu_kernel_prefill_pipe<kBM_pf, kBN_pf>, g, kThreads_pf, 0, hipstream, "gateup_swiglu_kernel_prefill_pipe",
               A, w13, w13_scale, b13, act_scratch,
               sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
               activation, beta, linear_beta, b13 != nullptr);
         else
-          gateup_swiglu_kernel_prefill<kBN_pf>
-              <<<g, kThreads_pf, 0, hipstream>>>(
+          common::launch_on(gateup_swiglu_kernel_prefill<kBN_pf>, g, kThreads_pf, 0, hipstream, "gateup_swiglu_kernel_prefill",
               A, w13, w13_scale, b13, act_scratch,
               sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
               activation, beta, linear_beta, b13 != nullptr);
@@ -1606,8 +1604,7 @@ void fused_moe_mxfp4(
         if (pf_variant == 5 || pf_variant == 6) {
           dim3 g(EM / kBM_pf, hidden / kBN_pf_g32);
           VK_TBEGIN();
-          down_combine_kernel_prefill_pipe<kBM_pf, kBN_pf_g32>
-              <<<g, kThreads_pf, 0, hipstream>>>(
+          common::launch_on(down_combine_kernel_prefill_pipe<kBM_pf, kBN_pf_g32>, g, kThreads_pf, 0, hipstream, "down_combine_kernel_prefill_pipe",
               act_scratch, w2, w2_scale, b2, out, topk_w,
               sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
           VK_TEND("down");
@@ -1615,12 +1612,11 @@ void fused_moe_mxfp4(
           dim3 g(EM / kBM_pf, hidden / kBN_pf);
           VK_TBEGIN();
           if (pf_variant >= 1 && pf_variant <= 4)
-            down_combine_kernel_prefill_pipe<kBM_pf, kBN_pf>
-                <<<g, kThreads_pf, 0, hipstream>>>(
+            common::launch_on(down_combine_kernel_prefill_pipe<kBM_pf, kBN_pf>, g, kThreads_pf, 0, hipstream, "down_combine_kernel_prefill_pipe",
                 act_scratch, w2, w2_scale, b2, out, topk_w,
                 sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
           else
-            down_combine_kernel_prefill<kBN_pf><<<g, kThreads_pf, 0, hipstream>>>(
+            common::launch_on(down_combine_kernel_prefill<kBN_pf>, g, kThreads_pf, 0, hipstream, "down_combine_kernel_prefill",
                 act_scratch, w2, w2_scale, b2, out, topk_w,
                 sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
           VK_TEND("down");
@@ -1634,12 +1630,12 @@ void fused_moe_mxfp4(
       dim3 g(EM / kBM, ispp / kBN, kWarps);
       VK_TBEGIN();
       if (kmajor)
-        gateup_swiglu_kernel<true><<<g, kWhreads, 0, hipstream>>>(
+        common::launch_on(gateup_swiglu_kernel<true>, g, kWhreads, 0, hipstream, "gateup_swiglu_kernel",
             A, w13, w13_scale, b13, act_scratch,
             sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
             activation, beta, linear_beta, b13 != nullptr);
       else
-        gateup_swiglu_kernel<false><<<g, kWhreads, 0, hipstream>>>(
+        common::launch_on(gateup_swiglu_kernel<false>, g, kWhreads, 0, hipstream, "gateup_swiglu_kernel",
             A, w13, w13_scale, b13, act_scratch,
             sorted_ids, expert_ids, hidden, ispp, M, top_k, swiglu_limit,
             activation, beta, linear_beta, b13 != nullptr);
@@ -1648,7 +1644,7 @@ void fused_moe_mxfp4(
     {
       dim3 g(EM / kBM, hidden / kBN, kWarps);
       VK_TBEGIN();
-      down_combine_kernel<<<g, kWhreads, 0, hipstream>>>(
+      common::launch_on(down_combine_kernel, g, kWhreads, 0, hipstream, "down_combine_kernel",
           act_scratch, w2, w2_scale, b2, out, topk_w,
           sorted_ids, expert_ids, ispp, hidden, M, top_k, b2 != nullptr);
       VK_TEND("down");
@@ -1915,7 +1911,7 @@ void moe_gateup_preact(
     int M, int hidden, int ispp, int top_k, int EM,
     int k_base, int hidden_k) {
   dim3 g(EM / kBM, ispp / kBN, kWarps);
-  gateup_preact_kernel<<<g, kWhreads>>>(
+  common::launch_on(gateup_preact_kernel, g, kWhreads, 0, nullptr, "gateup_preact_kernel",
       A, w13, w13_scale, gate_up, sorted_ids, expert_ids,
       hidden, k_base, hidden_k, ispp, M, top_k);
 }
@@ -1927,7 +1923,7 @@ void moe_act_epilogue(
     int activation, float beta, float linear_beta) {
   long total = (long)EM * ispp;
   int nb = (int)((total + 255) / 256);
-  act_epilogue_kernel<<<nb, 256>>>(
+  common::launch_on(act_epilogue_kernel, nb, 256, 0, nullptr, "act_epilogue_kernel",
       gate_up, b13, act, sorted_ids, expert_ids, M, top_k, EM, ispp,
       swiglu_limit, activation, beta, linear_beta, b13 != nullptr);
 }
@@ -1938,7 +1934,7 @@ void moe_down_preact(
     int M, int ispp, int hidden, int top_k, int EM,
     int k_base, int ispp_k) {
   dim3 g(EM / kBM, hidden / kBN, kWarps);
-  down_preact_kernel<<<g, kWhreads>>>(
+  common::launch_on(down_preact_kernel, g, kWhreads, 0, nullptr, "down_preact_kernel",
       act, w2, w2_scale, partial, sorted_ids, expert_ids,
       ispp, k_base, ispp_k, hidden, M, top_k);
 }
@@ -1949,7 +1945,7 @@ void moe_combine(
     int M, int hidden, int top_k, int EM) {
   long total = (long)EM * hidden;
   int nb = (int)((total + 255) / 256);
-  combine_kernel<<<nb, 256>>>(
+  common::launch_on(combine_kernel, nb, 256, 0, nullptr, "combine_kernel",
       partial, b2, topk_w_sorted, sorted_ids, expert_ids, out,
       M, hidden, top_k, EM, b2 != nullptr);
 }
@@ -2093,7 +2089,7 @@ void moe_align_block_size_hip(
   const int shared_ints = 2 * N + 3 * local_n;
   const size_t shared_bytes = (size_t)shared_ints * sizeof(int32_t);
   hipStream_t s = static_cast<hipStream_t>(stream);
-  moe_align_block_size_kernel<<<1, nthr, shared_bytes, s>>>(
+  common::launch_on(moe_align_block_size_kernel, 1, nthr, shared_bytes, s, "moe_align_block_size_kernel",
       topk_ids, expert_map, M, top_k, block_size, num_experts,
       N, max_EM, local_n, sorted_ids, expert_ids, out_em);
 }

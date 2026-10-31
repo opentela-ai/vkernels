@@ -16,8 +16,8 @@ constexpr int kTile = 16;
 // CPU oracle instantiates), so fused epilogues (epilogue::Relu<Linear>,
 // ...) become a template argument here instead of a kernel copy.
 template <typename Epilogue>
-__global__ void gemm_kernel(const float* A, const float* B, float* C, int M,
-                            int N, int K, Epilogue store) {
+__global__ void gemm_kernel(const float* __restrict__ A, const float* __restrict__ B,
+                            float* __restrict__ C, int M, int N, int K, Epilogue store) {
   int row = blockIdx.y * blockDim.y + threadIdx.y;
   int col = blockIdx.x * blockDim.x + threadIdx.x;
 

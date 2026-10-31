@@ -38,7 +38,7 @@ in-memory proposals never override these pins.
 """
 
 from ._dispatch import OpNotEligible
-from functools import lru_cache
+from functools import lru_cache, cache
 
 # (O, I) -> (ROWS, BLOCK_I, num_warps); graph-replayed autotune, GH200
 # (clariden job 3462837). Only shapes where the best beat the heuristic by
@@ -233,7 +233,7 @@ def _gemv_cfg(o, i, triton, torch_mod):
     return selected
 
 
-@lru_cache(maxsize=None)
+@cache
 def _is_gfx942(device):
     import torch
 

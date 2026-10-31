@@ -6,6 +6,8 @@
 
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
+#  include "vkernels/kernels/common/launch.hpp"  // launch_on: launch + error check
+#  include "vkernels/util/env.hpp"
 #  include <cstdlib>
 #  include <cstring>
 #  include "vkernels/util/error.hpp"
@@ -53,17 +55,15 @@ void fp4_to_bf16_dequant(const uint8_t* packed, uint16_t* out,
   VK_EXPECTS(n > 0, "n must be positive");
   constexpr int kBlock = 256;
   int blocks = static_cast<int>((n + kBlock - 1) / kBlock);
-  fp4_to_bf16_kernel<<<blocks, kBlock>>>(packed, out, n, scale);
-  hipError_t err = hipGetLastError();
-  VK_ENSURES(err == hipSuccess, "hip fp4_to_bf16 launch failed");
+  common::launch_on(fp4_to_bf16_kernel, blocks, kBlock, 0, nullptr, "fp4_to_bf16",packed, out, n, scale);
 }
 
 // ======================================================================
 // #14 — Platform async-copy gate (GFX942_ASYNC_OFF)
 // ======================================================================
 bool use_async_copy_default() {
-  const char* env = std::getenv("K3_NO_ASYNC");
-  if (env) return env[0] != '1';
+  // Re-read per call (test_moe flips K3_NO_ASYNC in-process); "1" = force OFF.
+  if (const char* env = util::env_str("K3_NO_ASYNC")) return env[0] != '1';
   int device_id = 0;
   hipError_t err = hipGetDevice(&device_id);
   if (err != hipSuccess) return false;

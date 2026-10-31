@@ -69,7 +69,7 @@ def glm_indexer_native_gather_finalize_into(pool_indices, selected, candidates, 
         if tensor.shape != shape or tensor.dtype != torch.bool:
             raise OpNotEligible('requires matching boolean candidate/visibility masks')
     tensors = (pool_indices, selected, candidates, visible, valid_keys, mask)
-    if not pool_indices.is_cuda or any((t.device != pool_indices.device or any((s < 0 for s in t.stride())) for t in tensors)):
+    if not pool_indices.is_cuda or any(t.device != pool_indices.device or any(s < 0 for s in t.stride()) for t in tensors):
         raise OpNotEligible('requires nonnegative strides on one HIP device')
     if str(torch.__version__) != '2.9.0a0+git7bcbafe' or torch.version.hip != '7.0.51831-a3e329ad8':
         raise OpNotEligible('unqualified Torch/HIP stack')

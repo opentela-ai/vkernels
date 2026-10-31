@@ -140,7 +140,7 @@ class StaticWorkerSchedule:
         from collections import deque
 
         indeg = {k: 0 for k in edges}
-        for k, outs in edges.items():
+        for _k, outs in edges.items():
             for o in outs:
                 indeg[o] += 1
         q = deque(k for k, d in indeg.items() if d == 0)

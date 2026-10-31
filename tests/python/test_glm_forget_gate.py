@@ -62,7 +62,6 @@ def test_small_t_verify_block_matches_eager(seq, batch, lower):
     torch.testing.assert_close(result, expected, rtol=0.008, atol=0.002)
     assert result.shape == (batch, seq, 16, 128)
     assert torch.isfinite(result).all()
-    single = inputs(1, "cuda", seq=1)
     # per-row equivalence: row (b, s) equals the S == 1 call on that row
     for b in range(batch):
         for s_i in range(seq):

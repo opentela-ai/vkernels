@@ -91,6 +91,28 @@ class StreamTest(unittest.TestCase):
         s.wait()  # repeated wait is fine
         self.assertEqual(s.submitted(), 1)
 
+    def test_unobserved_failure_warns_on_destruction(self):
+        # __del__ cannot raise; an unobserved task failure must not vanish.
+        s = Stream("lost")
+
+        def boom():
+            raise ValueError("task failed")
+
+        s.submit(boom)
+        with self.assertWarnsRegex(RuntimeWarning, "unobserved task failure"):
+            s.__del__()
+
+    def test_observed_failure_does_not_warn_on_destruction(self):
+        s = Stream()
+        s.submit(lambda: (_ for _ in ()).throw(ValueError("task failed")))
+        with self.assertRaises((ValueError, RuntimeError)):
+            s.wait()
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            s.__del__()
+
 
 if __name__ == "__main__":
     unittest.main()

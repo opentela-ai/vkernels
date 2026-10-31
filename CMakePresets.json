@@ -35,6 +35,7 @@
       "cacheVariables": {
         "VKERNELS_BUILD_CUDA": "OFF",
         "VKERNELS_ENABLE_COVERAGE": "ON",
+        "VKERNELS_ENABLE_CLANG_TIDY": "ON",
         "CMAKE_BUILD_TYPE": "Debug"
       }
     },

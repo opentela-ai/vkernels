@@ -93,21 +93,30 @@ void glm_fp8_fnuz_mfma_oracle_cpu(
 #if VKERNELS_HAS_HIP
 namespace vkernels::kernels::hip {
 
+// Every entry takes the launch stream as a trailing ``void* stream``
+// (a hipStream_t; nullptr = the null stream). The overloads without it are
+// the pre-stream signatures and launch on the null stream. Contract
+// violations (shape/split outside the contract below) throw
+// std::invalid_argument via VK_EXPECTS; launch failures throw
+// std::runtime_error. Internal partials scratch is stream-ordered
+// (Scratch<T>), so the call returns without a device synchronization.
+
 // Device counterpart of glm_fp8_block_gemv_cpu, split-K (see glm_moe.hip):
 // partial kernel grid (N/32, sk) + fixed-order reduce. sk in {1,2,4,8}
 // dividing K/128; the split pick is vkernels::kernels::gemv_pick_sk (host
 // arithmetic above, tuning-store aware).
-
-void glm_fp8_block_gemv(const uint16_t* x, const uint8_t* w,
-                        const float* scales, uint16_t* out,
+void glm_fp8_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales, uint16_t* out,
+                        int M, int N, int K, void* stream);
+void glm_fp8_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales, uint16_t* out,
                         int M, int N, int K);
 
 // Caller-owned fp32 partials scratch, M*N*sk floats (bench/autotune hook;
 // contents clobbered each call).
-void glm_fp8_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
-                                     const float* scales, uint16_t* out,
-                                     float* part, int M, int N, int K,
-                                     int sk);
+void glm_fp8_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w, const float* scales,
+                                     uint16_t* out, float* part, int M, int N, int K, int sk,
+                                     void* stream);
+void glm_fp8_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w, const float* scales,
+                                     uint16_t* out, float* part, int M, int N, int K, int sk);
 
 // FNUZ-storage decode GEMV (issue #148): w holds e4m3fnuz bytes (the #71
 // in-place conversion's payload-halved encoding) and scales are the
@@ -115,49 +124,45 @@ void glm_fp8_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
 // e4m3fn weight exactly. Decode is the hardware fnuz converter
 // (v_cvt_pk_f32_fp8) instead of the manual bit-assembly; same split-K
 // structure, sk heuristic and shape contract as glm_fp8_block_gemv.
-void glm_fp8_fnuz_block_gemv(
-    const uint16_t* x, const uint8_t* w, const float* scales, uint16_t* out, int M, int N, int K);
+void glm_fp8_fnuz_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales,
+                             uint16_t* out, int M, int N, int K, void* stream);
+void glm_fp8_fnuz_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales,
+                             uint16_t* out, int M, int N, int K);
 
-void glm_fp8_fnuz_block_gemv_with_scratch(const uint16_t* x,
-                                          const uint8_t* w,
-                                          const float* scales,
-                                          uint16_t* out,
-                                          float* part,
-                                          int M,
-                                          int N,
-                                          int K,
-                                          int sk);
+void glm_fp8_fnuz_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
+                                          const float* scales, uint16_t* out, float* part,
+                                          int M, int N, int K, int sk, void* stream);
+void glm_fp8_fnuz_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
+                                          const float* scales, uint16_t* out, float* part,
+                                          int M, int N, int K, int sk);
 
 // MFMA tensor-core decode GEMV (issue #148): same FNUZ storage contract
 // and fused activation quantize, but the fp8 dot runs on the CDNA3
 // tensor core (v_mfma_f32_16x16x32_fp8_fp8, wave64 fragments) instead of
 // per-code cvt+FMA — no fp8 decode arithmetic at all. Same shape
 // contract; requires N % 64 == 0 (implied by N % 128 == 0).
-void glm_fp8_fnuz_mfma_block_gemv(
-    const uint16_t* x, const uint8_t* w, const float* scales, uint16_t* out, int M, int N, int K);
+void glm_fp8_fnuz_mfma_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales,
+                                  uint16_t* out, int M, int N, int K, void* stream);
+void glm_fp8_fnuz_mfma_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales,
+                                  uint16_t* out, int M, int N, int K);
 
-void glm_fp8_fnuz_mfma_block_gemv_with_scratch(const uint16_t* x,
-                                               const uint8_t* w,
-                                               const float* scales,
-                                               uint16_t* out,
-                                               float* part,
-                                               int M,
-                                               int N,
-                                               int K,
-                                               int sk);
+void glm_fp8_fnuz_mfma_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
+                                               const float* scales, uint16_t* out,
+                                               float* part, int M, int N, int K, int sk,
+                                               void* stream);
+void glm_fp8_fnuz_mfma_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
+                                               const float* scales, uint16_t* out,
+                                               float* part, int M, int N, int K, int sk);
 
 // Debug hook (probe_mfma_fp8): also dumps block (0,0)'s quantized x
 // payload words and per-group activation scales. Callers may pass nullptr.
-void glm_fp8_fnuz_mfma_block_gemv_debug(const uint16_t* x,
-                                        const uint8_t* w,
-                                        const float* scales,
-                                        uint16_t* out,
-                                        float* part,
-                                        int M,
-                                        int N,
-                                        int K,
-                                        int sk,
-                                        uint32_t* dbg_sxa,
+void glm_fp8_fnuz_mfma_block_gemv_debug(const uint16_t* x, const uint8_t* w,
+                                        const float* scales, uint16_t* out, float* part,
+                                        int M, int N, int K, int sk, uint32_t* dbg_sxa,
+                                        float* dbg_s2a, void* stream);
+void glm_fp8_fnuz_mfma_block_gemv_debug(const uint16_t* x, const uint8_t* w,
+                                        const float* scales, uint16_t* out, float* part,
+                                        int M, int N, int K, int sk, uint32_t* dbg_sxa,
                                         float* dbg_s2a);
 
 }  // namespace vkernels::kernels::hip

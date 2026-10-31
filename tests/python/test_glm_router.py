@@ -164,7 +164,7 @@ def test_gpu_matches_torch_eager_selection(torch):
 
     torch.manual_seed(29)
     total_flips = 0
-    for trial in range(50):
+    for _trial in range(50):
         logits = torch.randn(64, 288, device="cuda")
         bias = torch.randn(288, device="cuda")
         idx, w = fused_router(logits, bias, 8, 2.5)

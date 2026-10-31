@@ -61,6 +61,9 @@
 
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
+#  include "vkernels/kernels/common/dispatch.hpp"
+#  include "vkernels/kernels/common/launch.hpp"  // launch_on: launch + error check
+#  include "vkernels/util/env.hpp"
 #include "vkernels/kernels/execution_workspace.hpp"
 #  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 
@@ -1162,28 +1165,22 @@ bool gemv_decode_dispatch(
   const dim3 grid((Ni + threads * TB - 1) / (threads * TB), 1, s);
   const int smem = Mi * kts_e * sizeof(uint16_t);
 
-#define VK_GEMV_M_CASE(MV)                                                    \
-  do {                                                                        \
-    if (fp8)                                                                  \
-      gemv_decode_fp8_splitk_kernel<MV, TB><<<grid, block, smem>>>(           \
-          A, (const uint8_t*)Bw, scales, partials.ptr, Ni, Ki, kts_e);          \
-    else                                                                      \
-      gemv_decode_bf16_splitk_kernel<MV, TB><<<grid, block, smem>>>(          \
-          A, (const uint16_t*)Bw, partials.ptr, Ni, Ki, kts_e);                 \
-  } while (0)
-  switch (Mi) {
-    case 1: VK_GEMV_M_CASE(1); break;
-    case 2: VK_GEMV_M_CASE(2); break;
-    case 4: VK_GEMV_M_CASE(4); break;
-    case 5: VK_GEMV_M_CASE(5); break;
-    case 8: VK_GEMV_M_CASE(8); break;
-    default: return false;
-  }
-#undef VK_GEMV_M_CASE
+const bool launched = common::switch_over<1, 2, 4, 5, 8>(Mi, [&](auto mv) {
+    constexpr int MV = decltype(mv)::value;
+    if (fp8)
+      common::launch_on(gemv_decode_fp8_splitk_kernel<MV, TB>, grid, block, smem, nullptr,
+                        "gemv_decode_fp8_splitk_kernel", A, (const uint8_t*)Bw, scales,
+                        partials.ptr, Ni, Ki, kts_e);
+    else
+      common::launch_on(gemv_decode_bf16_splitk_kernel<MV, TB>, grid, block, smem, nullptr,
+                        "gemv_decode_bf16_splitk_kernel", A, (const uint16_t*)Bw, partials.ptr,
+                        Ni, Ki, kts_e);
+  });
+  if (!launched) return false;
 
   const int cols = 256;
   dim3 gridC(Mi, (Ni + cols - 1) / cols);
-  gemm_bf16_splitk_combine_kernel<<<gridC, cols, 0, 0>>>(
+  common::launch_on(gemm_bf16_splitk_combine_kernel, gridC, cols, 0, nullptr, "gemm_bf16_splitk_combine_kernel",
       partials.ptr, C, C, Mi, Ni, s, alpha, beta);
   return true;
 }
@@ -1215,30 +1212,22 @@ bool gemv_decode_v2_dispatch(std::size_t M, std::size_t N, std::size_t K,
   const dim3 grid((Ni + threads * 8 - 1) / (threads * 8), 1, s);
   const int smem = AGMEM ? 0 : Mi * klp * (int)sizeof(uint16_t);
 
-#define VK_GEMV_V2_M_CASE(MV)                                          \
-  do {                                                                 \
-    if (fp8)                                                           \
-      gemv_decode_fp8_v2_kernel<MV, KK, AGMEM>                         \
-          <<<grid, block, smem>>>(A, (const uint8_t*)Bw, scales,       \
-                                  partials.ptr, Ni, Ki, kts_e);        \
-    else                                                               \
-      gemv_decode_bf16_v2_kernel<MV, KK, AGMEM>                        \
-          <<<grid, block, smem>>>(A, (const uint16_t*)Bw, partials.ptr,\
-                                  Ni, Ki, kts_e);                      \
-  } while (0)
-  switch (Mi) {
-    case 1: VK_GEMV_V2_M_CASE(1); break;
-    case 2: VK_GEMV_V2_M_CASE(2); break;
-    case 4: VK_GEMV_V2_M_CASE(4); break;
-    case 5: VK_GEMV_V2_M_CASE(5); break;
-    case 8: VK_GEMV_V2_M_CASE(8); break;
-    default: return false;
-  }
-#undef VK_GEMV_V2_M_CASE
+const bool launched = common::switch_over<1, 2, 4, 5, 8>(Mi, [&](auto mv) {
+    constexpr int MV = decltype(mv)::value;
+    if (fp8)
+      common::launch_on(gemv_decode_fp8_v2_kernel<MV, KK, AGMEM>, grid, block, smem, nullptr,
+                        "gemv_decode_fp8_v2_kernel", A, (const uint8_t*)Bw, scales,
+                        partials.ptr, Ni, Ki, kts_e);
+    else
+      common::launch_on(gemv_decode_bf16_v2_kernel<MV, KK, AGMEM>, grid, block, smem, nullptr,
+                        "gemv_decode_bf16_v2_kernel", A, (const uint16_t*)Bw, partials.ptr, Ni,
+                        Ki, kts_e);
+  });
+  if (!launched) return false;
 
   const int cols = 256;
   dim3 gridC(Mi, (Ni + cols - 1) / cols);
-  gemm_bf16_splitk_combine_kernel<<<gridC, cols, 0, 0>>>(
+  common::launch_on(gemm_bf16_splitk_combine_kernel, gridC, cols, 0, nullptr, "gemm_bf16_splitk_combine_kernel",
       partials.ptr, C, C, Mi, Ni, s, alpha, beta);
   return true;
 }
@@ -1431,16 +1420,16 @@ bool launch_splitk(const uint16_t* A, const uint16_t* B, uint16_t* C,
   dim3 block(kTh);
   dim3 gridS((M + BM - 1) / BM, (N + BN - 1) / BN, S);
   if (Wide) {
-    gemm_bf16_splitk_wide_kernel<BM, BN, Fused><<<gridS, block, 0, 0>>>(
+    common::launch_on(gemm_bf16_splitk_wide_kernel<BM, BN, Fused>, gridS, block, 0, nullptr, "gemm_bf16_splitk_wide_kernel",
         A, B, partials.ptr, C, C, M, N, K, kts, counters, S, alpha, beta);
   } else {
-    gemm_bf16_splitk_kernel<BM, BN><<<gridS, block, 0, 0>>>(
+    common::launch_on(gemm_bf16_splitk_kernel<BM, BN>, gridS, block, 0, nullptr, "gemm_bf16_splitk_kernel",
         A, B, partials.ptr, M, N, K, kts);
   }
   if (!Fused) {
     const int cols = 256;
     dim3 gridC(M, (N + cols - 1) / cols);
-    gemm_bf16_splitk_combine_kernel<<<gridC, cols, 0, 0>>>(
+    common::launch_on(gemm_bf16_splitk_combine_kernel, gridC, cols, 0, nullptr, "gemm_bf16_splitk_combine_kernel",
         partials.ptr, C, C, M, N, S, alpha, beta);
   }
   return true;
@@ -1452,7 +1441,7 @@ void launch(const uint16_t* A, const uint16_t* B, uint16_t* C,
   constexpr int kTh = (BM / 16) * 64;
   dim3 block(kTh);
   dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN);  // x = M-tiles, y = N-tiles (moe_fused)
-  gemm_bf16_kernel<BM, BN><<<grid, block, 0, 0>>>(
+  common::launch_on(gemm_bf16_kernel<BM, BN>, grid, block, 0, nullptr, "gemm_bf16_kernel",
       A, B, C, M, N, K, alpha, beta);
 }
 
@@ -1464,7 +1453,7 @@ void launch_reuse(const uint16_t* A, const uint16_t* B, uint16_t* C,
   dim3 block(kTh);
   // M grid shrinks by RM: each block covers RM consecutive M-tiles.
   dim3 grid((M + BM * RM - 1) / (BM * RM), (N + BN - 1) / BN);
-  gemm_bf16_kernel_reuse<BM, BN, RM><<<grid, block, 0, 0>>>(
+  common::launch_on(gemm_bf16_kernel_reuse<BM, BN, RM>, grid, block, 0, nullptr, "gemm_bf16_kernel_reuse",
       A, B, C, M, N, K, alpha, beta);
 }
 }  // namespace
@@ -1509,10 +1498,7 @@ void gemm_bf16_splitk_with_config(std::size_t M, std::size_t N, std::size_t K,
   // (per-tile arrival counters, bit-exact with the two-kernel sequence
   // below). Default 0 = the proven two-kernel path; the flag stays OFF
   // until the MI300A A/B (probe_issue156_batched-style, same job) lands.
-  static const int fused_mode = [] {
-    const char* e = std::getenv("VK_GEMM_SPLITK_FUSED");
-    return e ? std::atoi(e) : 0;
-  }();
+  static const int fused_mode = util::env_int("VK_GEMM_SPLITK_FUSED", 0);
   if (fused_mode != 0 && (Ni % 8 == 0) && (Ki % 8 == 0)) {
     gemm_bf16_splitk_fused_with_config(M, N, K, alpha, A, B, beta, C, bm, bn,
                                        s);
@@ -1727,21 +1713,21 @@ void gemm_fp8_block_splitk_with_config(
   dim3 block(kTh);
   dim3 gridS((Mi + bm - 1) / bm, (Ni + bn - 1) / bn, s);
   if (bm == 16 && bn == 16) {
-    gemm_fp8_block_splitk_kernel<16, 16><<<gridS, block, 0, 0>>>(
+    common::launch_on(gemm_fp8_block_splitk_kernel<16, 16>, gridS, block, 0, nullptr, "gemm_fp8_block_splitk_kernel",
         A, W8, scales, partials.ptr, Mi, Ni, Ki, kts);
   } else if (bm == 16 && bn == 64) {
-    gemm_fp8_block_splitk_kernel<16, 64><<<gridS, block, 0, 0>>>(
+    common::launch_on(gemm_fp8_block_splitk_kernel<16, 64>, gridS, block, 0, nullptr, "gemm_fp8_block_splitk_kernel",
         A, W8, scales, partials.ptr, Mi, Ni, Ki, kts);
   } else if (bm == 32 && bn == 64) {
-    gemm_fp8_block_splitk_kernel<32, 64><<<gridS, block, 0, 0>>>(
+    common::launch_on(gemm_fp8_block_splitk_kernel<32, 64>, gridS, block, 0, nullptr, "gemm_fp8_block_splitk_kernel",
         A, W8, scales, partials.ptr, Mi, Ni, Ki, kts);
   } else {
-    gemm_fp8_block_splitk_kernel<64, 64><<<gridS, block, 0, 0>>>(
+    common::launch_on(gemm_fp8_block_splitk_kernel<64, 64>, gridS, block, 0, nullptr, "gemm_fp8_block_splitk_kernel",
         A, W8, scales, partials.ptr, Mi, Ni, Ki, kts);
   }
   const int cols = 256;
   dim3 gridC(Mi, (Ni + cols - 1) / cols);
-  gemm_bf16_splitk_combine_kernel<<<gridC, cols, 0, 0>>>(
+  common::launch_on(gemm_bf16_splitk_combine_kernel, gridC, cols, 0, nullptr, "gemm_bf16_splitk_combine_kernel",
       partials.ptr, C, C, Mi, Ni, s, alpha, beta);
 }
 

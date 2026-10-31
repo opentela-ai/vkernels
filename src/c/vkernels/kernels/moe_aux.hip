@@ -25,12 +25,14 @@
 #include <cstdint>
 #include <cmath>
 #include <cstdlib>
-#include <mutex>
 
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
+#  include "vkernels/kernels/common/launch.hpp"  // launch_on: launch + error check
+#  include "vkernels/util/env.hpp"
 #  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 #  include "vkernels/util/error.hpp"
+#  include "vkernels/kernels/execution_workspace.hpp"  // Scratch<T>
 
 namespace vkernels::kernels::hip {
 
@@ -322,41 +324,12 @@ namespace vkernels::kernels::hip {
 namespace {
 int block_of(int n) { return n < 1024 ? (n > 0 ? n : 1) : 1024; }
 
-// #145 — internal device scratch for the inverse permutation inv[flat] = r
-// (size M*top_k int32). Grown on demand and reused across calls so the
-// per-layer combine path never pays hipMalloc. Guarded by a mutex; serving
-// is single-threaded per device so contention is nil next to a µs kernel.
-std::mutex g_inv_mu;
-int32_t* g_inv_buf = nullptr;
-size_t g_inv_cap = 0;  // elements
-
-int32_t* inv_scratch(size_t n_flat) {
-  std::lock_guard<std::mutex> lk(g_inv_mu);
-  if (n_flat > g_inv_cap) {
-    if (g_inv_buf) (void)hipFree(g_inv_buf);
-    hipError_t err = hipMalloc(&g_inv_buf, n_flat * sizeof(int32_t));
-    VK_ENSURES(err == hipSuccess, "moe_aux inv scratch hipMalloc failed");
-    g_inv_cap = n_flat;
-  }
-  return g_inv_buf;
-}
-
-// Gate-off fallback scratch for mxfp4_moe_sorted_quant (VK_MOE_AUX_FUSED_QUANT=0):
-// a cached [EM, hidden] bf16 buffer for the proven sort → quant composition.
-std::mutex g_sort_mu;
-uint16_t* g_sort_buf = nullptr;
-size_t g_sort_cap = 0;  // elements
-
-uint16_t* sorted_scratch(size_t n) {
-  std::lock_guard<std::mutex> lk(g_sort_mu);
-  if (n > g_sort_cap) {
-    if (g_sort_buf) (void)hipFree(g_sort_buf);
-    hipError_t err = hipMalloc(&g_sort_buf, n * sizeof(uint16_t));
-    VK_ENSURES(err == hipSuccess, "moe_aux sorted-quant scratch hipMalloc failed");
-    g_sort_cap = n;
-  }
-  return g_sort_buf;
-}
+// Internal device scratch (#145 inverse permutation; the gate-off sorted-quant
+// staging buffer) is a per-call Scratch<T>: allocated and released in stream
+// order on the launch stream (the null stream for these entries) from the
+// runtime's per-device pool. The former process-global grow-on-demand
+// buffers were shared across devices and freed/re-allocated under a host
+// mutex with no stream ordering against in-flight kernels.
 }  // namespace
 
 // #145 — build the inverse permutation inv[sorted_ids[r]] = r for real rows.
@@ -370,37 +343,29 @@ void mxfp4_moe_build_inv(const int32_t* sorted_ids, int32_t* inv,
       hipMemset(inv, 0xFF, (size_t)M * top_k * sizeof(int32_t));  // -1 fill
   VK_ENSURES(err == hipSuccess, "mxfp4_moe_build_inv memset failed");
   constexpr int kBlock = 256;
-  moe_build_inv_kernel<<<(EM + kBlock - 1) / kBlock, kBlock>>>(
+  common::launch_on(moe_build_inv_kernel, (EM + kBlock - 1) / kBlock, kBlock, 0, nullptr, "mxfp4_moe_build_inv",
       sorted_ids, inv, M, top_k, EM);
-  err = hipGetLastError();
-  VK_ENSURES(err == hipSuccess, "mxfp4_moe_build_inv launch failed");
 }
 
 void mxfp4_moe_quant(const uint16_t* A, uint8_t* packed, uint8_t* scales,
                      int M, int hidden, int group_size) {
   int n_groups = hidden / group_size;
   int gs = group_size < 256 ? group_size : 256;
-  mxfp4_moe_quant_kernel<<<dim3(M * n_groups), dim3(gs)>>>(
+  common::launch_on(mxfp4_moe_quant_kernel, dim3(M * n_groups), dim3(gs), 0, nullptr, "mxfp4_moe_quant",
       A, packed, scales, hidden, n_groups, group_size);
-  hipError_t err = hipGetLastError();
-  VK_ENSURES(err == hipSuccess, "mxfp4_moe_quant launch failed");
 }
 
 void mxfp4_moe_sort(const uint16_t* A, const int32_t* sorted_ids,
                     uint16_t* A_sorted, int M, int hidden, int top_k, int EM) {
-  moe_sort_kernel<<<dim3(EM), dim3(block_of(hidden))>>>(
+  common::launch_on(moe_sort_kernel, dim3(EM), dim3(block_of(hidden)), 0, nullptr, "mxfp4_moe_sort",
       A, sorted_ids, A_sorted, hidden, M, top_k, 2);
-  hipError_t err = hipGetLastError();
-  VK_ENSURES(err == hipSuccess, "mxfp4_moe_sort launch failed");
 }
 
 void mxfp4_moe_sort_scales(const uint8_t* scales, const int32_t* sorted_ids,
                            uint8_t* scales_sorted, int M, int n_groups,
                            int top_k, int EM) {
-  moe_sort_kernel<<<dim3(EM), dim3(block_of(n_groups))>>>(
+  common::launch_on(moe_sort_kernel, dim3(EM), dim3(block_of(n_groups)), 0, nullptr, "mxfp4_moe_sort_scales",
       scales, sorted_ids, scales_sorted, n_groups, M, top_k, 1);
-  hipError_t err = hipGetLastError();
-  VK_ENSURES(err == hipSuccess, "mxfp4_moe_sort_scales launch failed");
 }
 
 // Fusion — gather + quantize in one launch. Env kill-switch
@@ -413,23 +378,18 @@ void mxfp4_moe_sorted_quant(const uint16_t* A, const int32_t* sorted_ids,
                             int M, int hidden, int group_size, int top_k,
                             int EM) {
   if (M <= 0 || hidden <= 0 || EM <= 0) return;
-  static const int fused_mode = [] {
-    const char* e = std::getenv("VK_MOE_AUX_FUSED_QUANT");
-    return e ? std::atoi(e) : 1;
-  }();
+  static const int fused_mode = util::env_int("VK_MOE_AUX_FUSED_QUANT", 1);
   if (fused_mode == 0) {
-    uint16_t* scratch = sorted_scratch((size_t)EM * hidden);
-    mxfp4_moe_sort(A, sorted_ids, scratch, M, hidden, top_k, EM);
-    mxfp4_moe_quant(scratch, packed, scales, EM, hidden, group_size);
+    Scratch<uint16_t> scratch((size_t)EM * hidden, nullptr);
+    mxfp4_moe_sort(A, sorted_ids, scratch.ptr, M, hidden, top_k, EM);
+    mxfp4_moe_quant(scratch.ptr, packed, scales, EM, hidden, group_size);
     return;
   }
   int n_groups = hidden / group_size;
   int gs = group_size < 256 ? group_size : 256;
-  mxfp4_moe_sorted_quant_kernel<<<dim3(EM * n_groups), dim3(gs)>>>(
+  common::launch_on(mxfp4_moe_sorted_quant_kernel, dim3(EM * n_groups), dim3(gs), 0, nullptr, "mxfp4_moe_sorted_quant",
       A, sorted_ids, packed, scales, hidden, n_groups, group_size, top_k,
       M * top_k);
-  hipError_t err = hipGetLastError();
-  VK_ENSURES(err == hipSuccess, "mxfp4_moe_sorted_quant launch failed");
 }
 
 // #145 — token-major gather combine: each block owns one output token and
@@ -445,16 +405,15 @@ void mxfp4_moe_scatter_reduce(const float* partial, const float* topk_w,
                               int32_t* inv_prebuilt) {
   if (M <= 0 || width <= 0 || EM <= 0) return;
   int32_t* inv = inv_prebuilt;
+  Scratch<int32_t> inv_scratch(inv ? 0 : (size_t)M * top_k, nullptr);
   if (!inv) {
-    inv = inv_scratch((size_t)M * top_k);
+    inv = inv_scratch.ptr;
     mxfp4_moe_build_inv(sorted_ids, inv, M, top_k, EM);
   }
   constexpr int kBlock = 256;
   dim3 grid(M, (width + kBlock - 1) / kBlock);
-  moe_scatter_reduce_gather_kernel<<<grid, kBlock>>>(partial, topk_w, inv,
+  common::launch_on(moe_scatter_reduce_gather_kernel, grid, kBlock, 0, nullptr, "mxfp4_moe_scatter_reduce",partial, topk_w, inv,
                                                      out, width, top_k);
-  hipError_t err = hipGetLastError();
-  VK_ENSURES(err == hipSuccess, "mxfp4_moe_scatter_reduce launch failed");
 }
 
 void mxfp4_moe_scatter_reduce_q(const uint8_t* partial_q,
@@ -465,18 +424,17 @@ void mxfp4_moe_scatter_reduce_q(const uint8_t* partial_q,
                                 int group_size, int32_t* inv_prebuilt) {
   if (M <= 0 || width <= 0 || EM <= 0) return;
   int32_t* inv = inv_prebuilt;
+  Scratch<int32_t> inv_scratch(inv ? 0 : (size_t)M * top_k, nullptr);
   if (!inv) {
-    inv = inv_scratch((size_t)M * top_k);
+    inv = inv_scratch.ptr;
     mxfp4_moe_build_inv(sorted_ids, inv, M, top_k, EM);
   }
   int n_groups = width / group_size;
   constexpr int kBlock = 256;
   dim3 grid(M, (width + kBlock - 1) / kBlock);
-  moe_scatter_reduce_q_gather_kernel<<<grid, kBlock>>>(
+  common::launch_on(moe_scatter_reduce_q_gather_kernel, grid, kBlock, 0, nullptr, "mxfp4_moe_scatter_reduce_q",
       partial_q, partial_s, topk_w, inv, out, width, top_k, n_groups,
       group_size);
-  hipError_t err = hipGetLastError();
-  VK_ENSURES(err == hipSuccess, "mxfp4_moe_scatter_reduce_q launch failed");
 }
 
 }  // namespace vkernels::kernels::hip

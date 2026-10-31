@@ -419,6 +419,7 @@ void kda_k3_grams_blocked(const float* q, const float* k, const float* beta,
                           int B, int H, int nc, int S, int D, int blk,
                           void* stream = nullptr);
 
+#if VKERNELS_PROFILING_HOOKS  // benchmark-only; see kda.hip
 // Tuning aid (#70): best wall time (us) of each chunked launch —
 // out_us[0]=cumsum, [1]=grams, [2]=chunk-local (inverse+GEMMs),
 // [3]=state pass, [4..9]=local-internal phase deltas (clock64/1000),
@@ -430,6 +431,7 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
                              float* out, float* scratch,
                              int B, int H, int S, int D, int iters,
                              double* out_us);
+#endif
 
 void kda_pack_bitmatrix(const uint8_t* bits, uint8_t* packed,
                         std::size_t n_bits);

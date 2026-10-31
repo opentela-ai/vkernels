@@ -67,6 +67,9 @@
 #  include "vkernels/kernels/moe_device.hip"  // shared bf16<->f32 + fp4 helpers
 #  include "vkernels/kernels/dsa_topk_device.cuh"  // shared scalar dsa_topk_logits kernels
 #  include <hip/hip_runtime.h>
+#  include "vkernels/kernels/common/dispatch.hpp"
+#  include "vkernels/kernels/common/launch.hpp"  // launch_on: launch + error check
+#  include "vkernels/util/env.hpp"
 #include "vkernels/kernels/execution_workspace.hpp"
 
 namespace vkernels::kernels::hip {
@@ -358,8 +361,7 @@ void launch_impl(const void* q, const void* kv, const void* indices, void* out,
   const int shmem = BQ * W * sizeof(float);
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, 1);
-  dsa_sparse_fwd_kernel<BQ, MAIN_TILES, TAIL_TILES, V_TILES>
-      <<<grid, block, shmem, stream>>>(
+  common::launch_on(dsa_sparse_fwd_kernel<BQ, MAIN_TILES, TAIL_TILES, V_TILES>, grid, block, shmem, stream, "dsa_sparse_fwd_kernel",
           reinterpret_cast<const uint16_t*>(q),
           reinterpret_cast<const uint16_t*>(kv),
           reinterpret_cast<const int32_t*>(indices),
@@ -573,8 +575,7 @@ bool launch_stage_impl(const void* q, const void* kv, const void* indices,
                        (size_t)kti * (2u * BQ * ((size_t)W * 2u + 4u));
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, 1);
-  dsa_sparse_fwd_stage_kernel<BQ, MAIN_TILES, TAIL_TILES, V_TILES>
-      <<<grid, block, shmem, stream>>>(
+  common::launch_on(dsa_sparse_fwd_stage_kernel<BQ, MAIN_TILES, TAIL_TILES, V_TILES>, grid, block, shmem, stream, "dsa_sparse_fwd_stage_kernel",
           reinterpret_cast<const uint16_t*>(q),
           reinterpret_cast<const uint16_t*>(kv),
           reinterpret_cast<const int32_t*>(indices),
@@ -596,14 +597,8 @@ bool launch_stage(const void* q, const void* kv, const void* indices, void* out,
                   void* lse, int S_q, int S_kv, int H, int dim, int tail_dim,
                   int topk, int kv_group, float sm_scale, bool return_lse,
                   hipStream_t stream) {
-  static const int stage_mode = [] {
-    const char* e = std::getenv("VK_DSA_STAGE");
-    return e ? std::atoi(e) : 1;
-  }();
-  static const int kti_ovr = [] {
-    const char* e = std::getenv("VK_DSA_KTI");
-    return e ? std::atoi(e) : 0;
-  }();
+  static const int stage_mode = util::env_int("VK_DSA_STAGE", 1);
+  static const int kti_ovr = util::env_int("VK_DSA_KTI", 0);
   if (stage_mode == 0) return false;
   if (stage_mode == 1 && !(S_q > 8 && topk >= 64)) return false;
   const int W = dim + tail_dim;
@@ -637,10 +632,7 @@ bool launch_pf(const void* q, const void* kv, const void* indices, void* out,
                void* lse, int S_q, int S_kv, int H, int dim, int tail_dim,
                int topk, int kv_group, float sm_scale, bool return_lse,
                hipStream_t stream) {
-  static const int pf_mode = [] {
-    const char* e = std::getenv("VK_DSA_PF");
-    return e ? std::atoi(e) : 1;
-  }();
+  static const int pf_mode = util::env_int("VK_DSA_PF", 1);
   if (pf_mode == 0) return false;
   if (pf_mode == 1 && !(S_q > 8)) return false;
   const int W = dim + tail_dim;
@@ -648,7 +640,7 @@ bool launch_pf(const void* q, const void* kv, const void* indices, void* out,
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, 1);
   if (dim == 256 && tail_dim == 0) {
-    dsa_sparse_fwd_pf_kernel<BQ, 4, 4><<<grid, block, shmem, stream>>>(
+    common::launch_on(dsa_sparse_fwd_pf_kernel<BQ, 4, 4>, grid, block, shmem, stream, "dsa_sparse_fwd_pf_kernel",
         reinterpret_cast<const uint16_t*>(q),
         reinterpret_cast<const uint16_t*>(kv),
         reinterpret_cast<const int32_t*>(indices),
@@ -657,7 +649,7 @@ bool launch_pf(const void* q, const void* kv, const void* indices, void* out,
     return true;
   }
   if (dim == 576 && tail_dim == 64) {
-    dsa_sparse_fwd_pf_kernel<BQ, 10, 8><<<grid, block, shmem, stream>>>(
+    common::launch_on(dsa_sparse_fwd_pf_kernel<BQ, 10, 8>, grid, block, shmem, stream, "dsa_sparse_fwd_pf_kernel",
         reinterpret_cast<const uint16_t*>(q),
         reinterpret_cast<const uint16_t*>(kv),
         reinterpret_cast<const int32_t*>(indices),
@@ -820,10 +812,7 @@ void dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
   // >= CUs -> 1), so prefill / wide-H shapes are untouched. A scratch
   // allocation failure falls back to the plain ladder -- an OOM must never
   // break serving.
-  static const int auto_split_mode = [] {
-    const char* e = std::getenv("VK_DSA_DECODE_SPLIT");
-    return e ? std::atoi(e) : 1;
-  }();
+  static const int auto_split_mode = util::env_int("VK_DSA_DECODE_SPLIT", 1);
   if (auto_split_mode != 0 && S_q > 0 && H > 0 && topk > 0) {
     const int num_cu = [] {
       int dev = 0, n = 0;
@@ -990,7 +979,12 @@ __global__ void dsa_sparse_fwd_partial_kernel(
 #define VK_DSA_WARP_SYNC() __syncwarp()
 #endif
 
-template <int BQ, int Dim = 0, int Tail = -1>
+// SkipInvalid: masked keys are skipped instead of folded in with score
+// -inf. Both forms leave (row_max, row_sum, o) bit-identical (exp_old is
+// exactly 1 or the state is still zero); the default keeps the original
+// instruction stream. The parameter was referenced without being declared,
+// which broke every HIP build of this TU.
+template <int BQ, int Dim = 0, int Tail = -1, bool SkipInvalid = false>
 __global__ void dsa_sparse_fwd_partial_db_kernel(
     const uint16_t* __restrict__ q, const uint16_t* __restrict__ kv,
     const int32_t* __restrict__ indices, float* __restrict__ part_out,
@@ -1507,7 +1501,7 @@ void launch_partial(const void* q, const void* kv, const void* indices,
   const int shmem = BQ * W * sizeof(float);
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, split_kv);
-  dsa_sparse_fwd_partial_kernel<BQ><<<grid, block, shmem, stream>>>(
+  common::launch_on(dsa_sparse_fwd_partial_kernel<BQ>, grid, block, shmem, stream, "dsa_sparse_fwd_partial_kernel",
       reinterpret_cast<const uint16_t*>(q),
       reinterpret_cast<const uint16_t*>(kv),
       reinterpret_cast<const int32_t*>(indices),
@@ -1530,24 +1524,12 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
   // bypassing the occupancy gate below (correctness coverage for both
   // kernels at every shape); VK_DSA_KTI=<n> overrides the auto-sized
   // keys-per-tile (0 = auto). Read once per process.
-  static const int db_mode = [] {
-    const char* e = std::getenv("VK_DSA_DB");
-    return e ? std::atoi(e) : 1;
-  }();
-  static const int kti_ovr = [] {
-    const char* e = std::getenv("VK_DSA_KTI");
-    return e ? std::atoi(e) : 0;
-  }();
-  static const int dbpipe = [] {
-    const char* e = std::getenv("VK_DSA_DBPIPE");
-    return e ? std::atoi(e) : 1;
-  }();
+  static const int db_mode = util::env_int("VK_DSA_DB", 1);
+  static const int kti_ovr = util::env_int("VK_DSA_KTI", 0);
+  static const int dbpipe = util::env_int("VK_DSA_DBPIPE", 1);
   // Explicit opt-in for the absorbed GLM width. Graph replay still consumes
   // current indices; selected-key ordering and split boundaries stay fixed.
-  static const bool fixed_width = [] {
-    const char* e = std::getenv("VK_DSA_DB_WIDTH");
-    return e && e[0] == '1' && e[1] == '\0';
-  }();
+  static const bool fixed_width = util::env_equals("VK_DSA_DB_WIDTH", "1");
   if (db_mode == 0) return false;
   const int W = dim + tail_dim;
   const size_t shq = (size_t)BQ * (size_t)W * 4u;                // sQ
@@ -1592,8 +1574,7 @@ bool launch_partial_db(const void* q, const void* kv, const void* indices,
   dim3 grid((S_q + BQ - 1) / BQ, H, split_kv);
   const auto launch = [&](auto width) {
     constexpr int kDim = decltype(width)::value;
-    dsa_sparse_fwd_partial_db_kernel<BQ, kDim, kDim ? 0 : -1>
-        <<<grid, block, shmem, stream>>>(
+    common::launch_on(dsa_sparse_fwd_partial_db_kernel<BQ, kDim, kDim ? 0 : -1>, grid, block, shmem, stream, "dsa_sparse_fwd_partial_db_kernel",
       reinterpret_cast<const uint16_t*>(q),
       reinterpret_cast<const uint16_t*>(kv),
       reinterpret_cast<const int32_t*>(indices),
@@ -1633,18 +1614,9 @@ int launch_partial_vec(const void* q, const void* kv, const void* indices,
   // costs more than a launch); VK_DSA_VECG overrides the register batch
   // size G (1/2/4/8; default 1 = vectorization only, no batching -- the
   // A/B that isolates the two effects; G>1 measured slower).
-  static const int vec_mode = [] {
-    const char* e = std::getenv("VK_DSA_VEC");
-    return e ? std::atoi(e) : 1;
-  }();
-  static const int fuse_mode = [] {
-    const char* e = std::getenv("VK_DSA_FUSE");
-    return e ? std::atoi(e) : 0;
-  }();
-  static const int g_ovr = [] {
-    const char* e = std::getenv("VK_DSA_VECG");
-    return e ? std::atoi(e) : 1;
-  }();
+  static const int vec_mode = util::env_int("VK_DSA_VEC", 1);
+  static const int fuse_mode = util::env_int("VK_DSA_FUSE", 0);
+  static const int g_ovr = util::env_int("VK_DSA_VECG", 1);
   if (vec_mode == 0) return 0;
   if (tail_dim != 0 || dim <= 0 || dim % 4 != 0 || dim > 4 * 64) return 0;
   // No occupancy/TLP gate in auto mode: the UNFUSED vectorized kernel
@@ -1675,25 +1647,19 @@ int launch_partial_vec(const void* q, const void* kv, const void* indices,
   dim3 block(BQ * 64);
   dim3 grid((S_q + BQ - 1) / BQ, H, split_kv);
   const size_t shmem = (size_t)BQ * dim * sizeof(float);
-#define VK_LAUNCH_VEC(GG)                                                      \
-  do {                                                                         \
-    dsa_sparse_fwd_partial_vec_kernel<BQ, GG><<<grid, block, shmem, stream>>>(  \
-        reinterpret_cast<const uint16_t*>(q),                                  \
-        reinterpret_cast<const uint16_t*>(kv),                                 \
-        reinterpret_cast<const int32_t*>(indices),                             \
-        reinterpret_cast<float*>(part_out),                                    \
-        reinterpret_cast<float*>(part_lse),                                    \
-        reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),       \
-        counters, S_q, S_kv, H, dim, topk, sm_scale, split_kv,                 \
-        return_lse ? 1 : 0, fuse);                                             \
-  } while (0)
-  switch (g) {
-    case 1: VK_LAUNCH_VEC(1); break;
-    case 2: VK_LAUNCH_VEC(2); break;
-    case 8: VK_LAUNCH_VEC(8); break;
-    default: VK_LAUNCH_VEC(4); break;
-  }
-#undef VK_LAUNCH_VEC
+// g in {1, 2, 8}; anything else runs G = 4.
+  common::switch_over_or<4, 1, 2, 8>(g, [&](auto gg) {
+    common::launch_on(dsa_sparse_fwd_partial_vec_kernel<BQ, decltype(gg)::value>, grid, block,
+                      shmem, stream, "dsa_sparse_fwd_partial_vec_kernel",
+                      reinterpret_cast<const uint16_t*>(q),
+                      reinterpret_cast<const uint16_t*>(kv),
+                      reinterpret_cast<const int32_t*>(indices),
+                      reinterpret_cast<float*>(part_out),
+                      reinterpret_cast<float*>(part_lse),
+                      reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
+                      counters, S_q, S_kv, H, dim, topk, sm_scale, split_kv,
+                      return_lse ? 1 : 0, fuse);
+  });
   return fuse ? 2 : 1;
 }
 
@@ -1766,13 +1732,9 @@ void dsa_sparse_fwd_split_run(int S_q, int S_kv, int H, int dim, int tail_dim,
         tail_dim, topk, kv_group, sm_scale, split_kv, return_lse, out, lse,
         static_cast<hipStream_t>(stream));
   if (!need_combine) return;
-  static const bool tiled_combine = [] {
-    const char* e = std::getenv("VK_DSA_COMBINE_TILED");
-    return e && e[0] == '1' && e[1] == '\0';
-  }();
+  static const bool tiled_combine = util::env_equals("VK_DSA_COMBINE_TILED", "1");
   if (tiled_combine && dim == 512 && tail_dim == 0) {
-    dsa_sparse_fwd_combine_tiled_kernel<32>
-        <<<dim3(S_q, H, (dim - tail_dim + 31) / 32), 64, 0, static_cast<hipStream_t>(stream)>>>(
+    common::launch_on(dsa_sparse_fwd_combine_tiled_kernel<32>, dim3(S_q, H, (dim - tail_dim + 31) / 32), 64, 0, static_cast<hipStream_t>(stream), "dsa_sparse_fwd_combine_tiled_kernel",
             reinterpret_cast<const float*>(partial_out),
             reinterpret_cast<const float*>(partial_lse),
             reinterpret_cast<uint16_t*>(out),
@@ -1785,7 +1747,7 @@ void dsa_sparse_fwd_split_run(int S_q, int S_kv, int H, int dim, int tail_dim,
     return;
   }
   dim3 cgrid(S_q, H);
-  dsa_sparse_fwd_combine_kernel<<<cgrid, 64, 0, static_cast<hipStream_t>(stream)>>>(
+  common::launch_on(dsa_sparse_fwd_combine_kernel, cgrid, 64, 0, static_cast<hipStream_t>(stream), "dsa_sparse_fwd_combine_kernel",
       reinterpret_cast<const float*>(partial_out),
       reinterpret_cast<const float*>(partial_lse),
       reinterpret_cast<uint16_t*>(out), reinterpret_cast<float*>(lse),
@@ -2241,7 +2203,7 @@ void dsa_topk_logits_dispatch(int batch_size, int num_heads, int head_dim,
                                                       block)) {
     const int shmem = num_heads * (int)sizeof(float);  // sGate only
     dim3 blockdim((block / 16) * 64);
-    dsa_topk_logits_kernel_mfma_fp8<<<grid, blockdim, shmem, 0>>>(
+    common::launch_on(dsa_topk_logits_kernel_mfma_fp8, grid, blockdim, shmem, nullptr, "dsa_topk_logits_kernel_mfma_fp8",
         reinterpret_cast<const uint8_t*>(q_fp8),
         reinterpret_cast<const uint8_t*>(kvcache_u8),
         reinterpret_cast<const float*>(weight),
@@ -2261,7 +2223,7 @@ void dsa_topk_logits_dispatch(int batch_size, int num_heads, int head_dim,
     const int shmem = (head_dim * num_heads + block * kBK) * 2 +
                       (num_heads + block) * sizeof(float);
     dim3 blockdim((block / 16) * 64);
-    dsa_topk_logits_kernel_mfma<<<grid, blockdim, shmem, 0>>>(
+    common::launch_on(dsa_topk_logits_kernel_mfma, grid, blockdim, shmem, nullptr, "dsa_topk_logits_kernel_mfma",
         reinterpret_cast<const uint8_t*>(q_fp8),
         reinterpret_cast<const uint8_t*>(kvcache_u8),
         reinterpret_cast<const float*>(weight),
@@ -2280,7 +2242,7 @@ void dsa_topk_logits_dispatch(int batch_size, int num_heads, int head_dim,
     const int shmem = (num_heads * head_dim + num_heads +
                        block * head_dim + block) * sizeof(float);
     dim3 blockdim(block);
-    dsa_topk_logits_kernel<<<grid, blockdim, shmem, 0>>>(
+    common::launch_on(dsa_topk_logits_kernel, grid, blockdim, shmem, nullptr, "dsa_topk_logits_kernel",
         reinterpret_cast<const uint8_t*>(q_fp8),
         reinterpret_cast<const uint8_t*>(kvcache_u8),
         reinterpret_cast<const float*>(weight),
@@ -2300,7 +2262,7 @@ void dsa_topk_logits_dispatch(int batch_size, int num_heads, int head_dim,
     const int shmem = (num_heads + block * head_dim + block) * sizeof(float) +
                       num_heads * head_dim;
     dim3 blockdim(block);
-    dsa_topk_logits_kernel_fp8q<<<grid, blockdim, shmem, 0>>>(
+    common::launch_on(dsa_topk_logits_kernel_fp8q, grid, blockdim, shmem, nullptr, "dsa_topk_logits_kernel_fp8q",
         reinterpret_cast<const uint8_t*>(q_fp8),
         reinterpret_cast<const uint8_t*>(kvcache_u8),
         reinterpret_cast<const float*>(weight),

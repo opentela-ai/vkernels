@@ -215,7 +215,7 @@ def test_hazard_ordering_full_step():
     # exactly tile the pool — the soundness argument for a single launch
     # with no cross-layer barrier on those storages (phase order only
     # orders conv -> delta within a layer)
-    for pool_name, per_layer in (("conv_state", "conv_state_l"), ("ssm_state", "ssm_state_l")):
+    for pool_name, _per_layer in (("conv_state", "conv_state_l"), ("ssm_state", "ssm_state_l")):
         pool_sid = graph.tensor(pool_name).storage_id
         spans = []
         for op in graph.ops:

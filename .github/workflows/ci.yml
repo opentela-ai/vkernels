@@ -32,8 +32,15 @@ jobs:
       - name: Lint (ruff, pyflakes)
         run: uvx ruff check src/python tests/python
 
-      - name: Configure (coverage)
-        run: cmake --preset coverage
+      - name: Install clang-tidy (PyPI wheel)
+        run: |
+          uv tool install clang-tidy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # The coverage preset runs clang-tidy (.clang-tidy) on the host library
+      # sources during the build; REQUIRE makes a missing binary a failure.
+      - name: Configure (coverage + clang-tidy)
+        run: cmake --preset coverage -DVKERNELS_REQUIRE_CLANG_TIDY=ON
 
       - name: Build
         run: cmake --build --preset coverage -j$(nproc)
@@ -147,6 +154,28 @@ jobs:
           name: wheels-cuda
           path: dist/*.whl
           if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # HIP front-end check (no GPU, no ROCm runner): clang's HIP front end in
+  # -fsyntax-only mode over every library .hip TU, host + gfx942 device
+  # side. The `hip` job below is gated on a real runner and the nvcc
+  # HIP-on-CUDA build covers only a few .hip files, so without this nothing
+  # catches a HIP TU that no longer compiles.
+  # ------------------------------------------------------------------
+  hip-syntax:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang + HIP headers (Ubuntu universe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 libamdhip64-dev
+      - name: clang -x hip -fsyntax-only (gfx942)
+        env:
+          HIP_CLANG: clang++-18
+          HIP_PATH: /usr
+        run: meta/scripts/hip_syntax_check.sh
 
   rust:
     runs-on: ubuntu-24.04

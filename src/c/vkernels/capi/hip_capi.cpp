@@ -27,6 +27,10 @@
 extern "C" int hipGetLastError();
 
 #include "vkernels/capi/capi.hpp"  // VK_OK / VK_ERROR_* status codes
+// VK_CAPI_TRY / VK_CAPI_CATCH_RETURN_CODE: the int-returning entries translate
+// contract and launch-check exceptions (common::launch_on) into a status code
+// instead of letting them cross the C ABI.
+#include "vkernels/capi/capi_internal.hpp"
 #include <stdexcept>   // std::invalid_argument / std::exception (issue #57 catch)
 #include "vkernels/kernels/moe_fused.hpp"
 #include "vkernels/kernels/mla.hpp"
@@ -88,9 +92,11 @@ extern "C" int vk_hip_moe_align_block_size(
   const long Nl = (long)M * (long)top_k;
   if (Nl > 1024)  // single-block shared memory; caller falls back to CPU
     return VK_ERROR_UNSUPPORTED;
-  vkernels::kernels::hip::moe_align_block_size_hip(
-      topk_ids, expert_map, M, top_k, block_size, num_experts, local_n,
-      max_EM, sorted_ids, expert_ids, out_EM, stream);
+  VK_CAPI_TRY
+    vkernels::kernels::hip::moe_align_block_size_hip(
+        topk_ids, expert_map, M, top_k, block_size, num_experts, local_n,
+        max_EM, sorted_ids, expert_ids, out_EM, stream);
+  VK_CAPI_CATCH_RETURN_CODE()
   return VK_OK;
 }
 extern "C" void vk_hip_mla_fwd(
@@ -112,10 +118,12 @@ extern "C" int vk_hip_mla_fwd_stream(
     int kv_lora_rank, int qk_rope_head_dim, float scale,
     const float* q, const float* k_c, const float* k_pe,
     const float* v_c, float* out, void* stream) {
-  vkernels::kernels::hip::mla_fwd(
-      B, H, S_q, S_kv, q_start, kv_start,
-      kv_lora_rank, qk_rope_head_dim, scale,
-      q, k_c, k_pe, v_c, out, stream);
+  VK_CAPI_TRY
+    vkernels::kernels::hip::mla_fwd(
+        B, H, S_q, S_kv, q_start, kv_start,
+        kv_lora_rank, qk_rope_head_dim, scale,
+        q, k_c, k_pe, v_c, out, stream);
+  VK_CAPI_CATCH_RETURN_CODE()
   return (int)hipGetLastError();
 }
 
@@ -390,9 +398,11 @@ extern "C" int vk_hip_dsa_sparse_fwd_stream(
     int kv_group, int block_I, int inner_iter, float sm_scale,
     int return_lse, const void* q, const void* kv, const void* indices,
     void* out, void* lse, void* stream) {
-  vkernels::kernels::hip::dsa_sparse_fwd(
-      S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
-      sm_scale, return_lse != 0, q, kv, indices, out, lse, stream);
+  VK_CAPI_TRY
+    vkernels::kernels::hip::dsa_sparse_fwd(
+        S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+        sm_scale, return_lse != 0, q, kv, indices, out, lse, stream);
+  VK_CAPI_CATCH_RETURN_CODE()
   return (int)hipGetLastError();
 }
 
@@ -402,10 +412,12 @@ extern "C" int vk_hip_dsa_sparse_fwd_split_stream(
     int return_lse, int split_kv, const void* q, const void* kv,
     const void* indices, void* out, void* lse, void* partial_out,
     void* partial_lse, void* stream) {
-  vkernels::kernels::hip::dsa_sparse_fwd_split(
-      S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
-      sm_scale, return_lse != 0, split_kv, q, kv, indices, out, lse,
-      partial_out, partial_lse, stream);
+  VK_CAPI_TRY
+    vkernels::kernels::hip::dsa_sparse_fwd_split(
+        S_q, S_kv, H, dim, tail_dim, topk, kv_group, block_I, inner_iter,
+        sm_scale, return_lse != 0, split_kv, q, kv, indices, out, lse,
+        partial_out, partial_lse, stream);
+  VK_CAPI_CATCH_RETURN_CODE()
   return (int)hipGetLastError();
 }
 
@@ -414,9 +426,11 @@ extern "C" int vk_hip_mhc_pre_gemm_sqrsum_stream(int num_tokens, int hc_mult3,
                                                  const void* x, const void* fn,
                                                  void* out, void* sqrsum,
                                                  void* stream) {
-  vkernels::kernels::hip::mhc_pre_gemm_sqrsum(num_tokens, hc_mult3,
-                                              hc_hidden_size, x, fn, out,
-                                              sqrsum, stream);
+  VK_CAPI_TRY
+    vkernels::kernels::hip::mhc_pre_gemm_sqrsum(num_tokens, hc_mult3,
+                                                hc_hidden_size, x, fn, out,
+                                                sqrsum, stream);
+  VK_CAPI_CATCH_RETURN_CODE()
   return (int)hipGetLastError();
 }
 
@@ -425,9 +439,11 @@ extern "C" int vk_hip_mhc_pre_gemm_sqrsum_stream(int num_tokens, int hc_mult3,
 extern "C" int vk_hip_mhc_pre_gemm_sqrsum_blocked_stream(
     int num_tokens, int hc_mult3, int hc_hidden_size, const void* x,
     const void* fn, void* out, void* sqrsum, int nslice, void* stream) {
-  vkernels::kernels::hip::mhc_pre_gemm_sqrsum(num_tokens, hc_mult3,
-                                              hc_hidden_size, x, fn, out,
-                                              sqrsum, stream, nslice);
+  VK_CAPI_TRY
+    vkernels::kernels::hip::mhc_pre_gemm_sqrsum(num_tokens, hc_mult3,
+                                                hc_hidden_size, x, fn, out,
+                                                sqrsum, stream, nslice);
+  VK_CAPI_CATCH_RETURN_CODE()
   return (int)hipGetLastError();
 }
 
@@ -435,8 +451,10 @@ extern "C" int vk_hip_mhc_post_stream(int num_tokens, int hc, int hidden,
                                       const void* a, const void* b,
                                       const void* c, const void* d, void* out,
                                       void* stream) {
-  vkernels::kernels::hip::mhc_post(num_tokens, hc, hidden, a, b, c, d, out,
-                                   stream);
+  VK_CAPI_TRY
+    vkernels::kernels::hip::mhc_post(num_tokens, hc, hidden, a, b, c, d, out,
+                                     stream);
+  VK_CAPI_CATCH_RETURN_CODE()
   return (int)hipGetLastError();
 }
 
@@ -444,8 +462,10 @@ extern "C" int vk_hip_kda_delta_rule_fwd_with_scratch_stream(
     const float* q, const float* k, const float* v, const float* g,
     const float* beta, float* state, float* out, int B, int H, int S,
     int D, void* stream) {
-  vkernels::kernels::hip::kda_delta_rule_fwd_with_scratch(
-      q, k, v, g, beta, state, out, B, H, S, D, stream);
+  VK_CAPI_TRY
+    vkernels::kernels::hip::kda_delta_rule_fwd_with_scratch(
+        q, k, v, g, beta, state, out, B, H, S, D, stream);
+  VK_CAPI_CATCH_RETURN_CODE()
   return (int)hipGetLastError();
 }
 
@@ -453,9 +473,11 @@ extern "C" int vk_hip_kda_delta_rule_fwd_chunked_with_scratch_stream(
     const float* q, const float* k, const float* v, const float* g,
     const float* beta, float* state, float* out, float* scratch,
     int B, int H, int S, int D, int chunk_size, void* stream) {
-  vkernels::kernels::hip::kda_delta_rule_fwd_chunked_with_scratch(
-      q, k, v, g, beta, state, out, scratch, B, H, S, D, chunk_size,
-      stream);
+  VK_CAPI_TRY
+    vkernels::kernels::hip::kda_delta_rule_fwd_chunked_with_scratch(
+        q, k, v, g, beta, state, out, scratch, B, H, S, D, chunk_size,
+        stream);
+  VK_CAPI_CATCH_RETURN_CODE()
   return (int)hipGetLastError();
 }
 

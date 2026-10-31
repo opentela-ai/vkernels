@@ -894,7 +894,7 @@ if __name__ == "__main__":
         try:
             return tuple(int(x.strip()) for x in s.split(","))
         except ValueError:
-            raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.")
+            raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.") from None
 
     parser = argparse.ArgumentParser(description="example of multistage block matmul with CuTe on GPU")
     parser.add_argument("--mnkl", type=parse_comma_separated_ints, default=(112, 136, 40, 1))

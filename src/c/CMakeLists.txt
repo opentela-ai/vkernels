@@ -284,7 +284,10 @@ endif()
 
 # Propagate the CUDA and HIP availability flags to consumers and to the
 # library's own translation units.
+# Benchmark-only profiling hooks (kda_chunked_phase_times, VK_MOE_KTIME
+# stage timing) are compiled into the library only for benchmark builds.
 target_compile_definitions(vkernels PUBLIC
+  $<$<BOOL:${VKERNELS_BUILD_BENCHMARKS}>:VKERNELS_PROFILING_HOOKS=1>
   $<$<BOOL:${VKERNELS_HAS_CUDA}>:VKERNELS_HAS_CUDA=1>
   $<$<BOOL:${VKERNELS_HAS_NCCL}>:VKERNELS_HAS_NCCL=1>
   $<$<BOOL:${VKERNELS_HAS_HIP}>:VKERNELS_HAS_HIP=1>
@@ -299,6 +302,22 @@ set_target_properties(vkernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 vkernels_set_warnings(vkernels)
 vkernels_apply_sanitizers(vkernels)
+if(VKERNELS_ENABLE_CLANG_TIDY)
+  find_program(VKERNELS_CLANG_TIDY_EXE NAMES clang-tidy clang-tidy-18 clang-tidy-19)
+  if(VKERNELS_CLANG_TIDY_EXE)
+    # CXX sources only (host .cpp); .cu/.hip are other languages. Findings
+    # are reported, not fatal (.clang-tidy: WarningsAsErrors ''); -Wno-error
+    # keeps clang-only compiler warnings (the build itself is GCC -Werror)
+    # from failing the analysis.
+    set_target_properties(vkernels PROPERTIES
+      CXX_CLANG_TIDY "${VKERNELS_CLANG_TIDY_EXE};--quiet;--extra-arg=-Wno-error")
+    message(STATUS "vkernels: clang-tidy on host library sources (${VKERNELS_CLANG_TIDY_EXE})")
+  elseif(VKERNELS_REQUIRE_CLANG_TIDY)
+    message(FATAL_ERROR "vkernels: VKERNELS_REQUIRE_CLANG_TIDY set but clang-tidy not found")
+  else()
+    message(WARNING "vkernels: VKERNELS_ENABLE_CLANG_TIDY=ON but clang-tidy not found; skipping")
+  endif()
+endif()
 if(VKERNELS_ENABLE_COVERAGE)
   vkernels_apply_coverage(vkernels)
 endif()

@@ -20,11 +20,15 @@
 // The op stays memory-bound on the weight bytes at M=1 (AI ~ 2 FLOP/byte)
 // and nothing is ever materialized in BF16/FP32.
 #include <cstdint>
-#include <cstdio>
+#include <string>
 
 #include <hip/hip_runtime.h>
 
+#include "vkernels/kernels/common/dispatch.hpp"
+#include "vkernels/kernels/common/launch.hpp"
+#include "vkernels/kernels/execution_workspace.hpp"  // Scratch<T>
 #include "vkernels/kernels/glm_moe.hpp"
+#include "vkernels/util/error.hpp"
 
 #if VKERNELS_HAS_HIP
 
@@ -327,269 +331,152 @@ __global__ void glm_fp8_gemv_reduce_kernel(const float* __restrict__ part,
   out[idx] = f32_to_bf16(acc);
 }
 
+// Shape/split contract shared by the three decode GEMVs (glm_moe.hpp).
+void check_gemv_contract(const char* op, int M, int N, int K, int sk) {
+  VK_EXPECTS(M <= 2 && K <= kMaxK && K % 128 == 0 && N % 128 == 0 && sk >= 1 &&
+                 sk <= 8 && (K / 128) % sk == 0,
+             std::string(op) +
+                 ": requires M<=2, K<=4096, N%128==0, K%128==0, sk in {1,2,4,8} "
+                 "dividing K/128 (got M=" + std::to_string(M) + " N=" + std::to_string(N) +
+                 " K=" + std::to_string(K) + " sk=" + std::to_string(sk) + ")");
+}
+
+void launch_reduce(const float* part, uint16_t* out, int M, int N, int sk, hipStream_t st) {
+  const int mn = M * N;
+  common::launch_on(glm_fp8_gemv_reduce_kernel, (mn + kTh - 1) / kTh, kTh, 0, st,
+                    "glm_fp8_gemv_reduce_kernel", part, out, mn, sk);
+}
+
+// Fixed-size segment counts unroll (see glm_fp8_gemv_partial_kernel); any
+// other count runs the runtime-bound <0> instantiation.
+template <class F>
+void dispatch_segs(int segs, F&& f) {
+  common::switch_over_or<0, 2, 4, 8, 16, 32>(segs, f);
+}
+
+// One device-side partials buffer per call, stream-ordered (Scratch<T>).
+template <class Run>
+void with_partials(int M, int N, int K, hipStream_t st, Run&& run) {
+  const int sk = gemv_pick_sk(N, K);  // vkernels::kernels, store-aware
+  Scratch<float> part((size_t)M * N * sk, st);
+  run(part.ptr, sk);
+}
+
 }  // namespace
 
-void glm_fp8_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
-                                     const float* scales, uint16_t* out,
-                                     float* part, int M, int N, int K,
-                                     int sk) {
+void glm_fp8_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w, const float* scales,
+                                     uint16_t* out, float* part, int M, int N, int K, int sk,
+                                     void* stream) {
   if (M <= 0 || N <= 0 || K <= 0) return;
-  if (M > 2 || K > kMaxK || K % 128 != 0 || N % 128 != 0 || sk < 1 ||
-      sk > 8 || (K / 128) % sk != 0) {
-    std::fprintf(stderr,
-                 "glm_fp8_block_gemv: requires M<=2, K<=4096, N%%128==0, "
-                 "K%%128==0, sk in {1,2,4,8} dividing K/128 (got M=%d N=%d "
-                 "K=%d sk=%d)\n", M, N, K, sk);
-    return;
-  }
+  check_gemv_contract("glm_fp8_block_gemv", M, N, K, sk);
+  const auto st = static_cast<hipStream_t>(stream);
   const int segs = (K / 128) / sk;
   const dim3 grid((N + 31) / 32, sk);
-  switch (segs) {
-    case 2:  glm_fp8_gemv_partial_kernel<2><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-    case 4:  glm_fp8_gemv_partial_kernel<4><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-    case 8:  glm_fp8_gemv_partial_kernel<8><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-    case 16: glm_fp8_gemv_partial_kernel<16><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-    case 32: glm_fp8_gemv_partial_kernel<32><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-    default: glm_fp8_gemv_partial_kernel<0><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-  }
-  const int mn = M * N;
-  glm_fp8_gemv_reduce_kernel<<<(mn + kTh - 1) / kTh, kTh>>>(part, out, mn, sk);
+  dispatch_segs(segs, [&](auto c) {
+    common::launch_on(glm_fp8_gemv_partial_kernel<decltype(c)::value>, grid, kTh, 0, st,
+                      "glm_fp8_gemv_partial_kernel", x, w, scales, part, M, N, K, sk, segs);
+  });
+  launch_reduce(part, out, M, N, sk, st);
 }
 
-void glm_fp8_fnuz_block_gemv_with_scratch(const uint16_t* x,
-                                          const uint8_t* w,
-                                          const float* scales,
-                                          uint16_t* out,
-                                          float* part,
-                                          int M,
-                                          int N,
-                                          int K,
-                                          int sk) {
+void glm_fp8_fnuz_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
+                                          const float* scales, uint16_t* out, float* part,
+                                          int M, int N, int K, int sk, void* stream) {
   if (M <= 0 || N <= 0 || K <= 0) return;
-  if (M > 2 || K > kMaxK || K % 128 != 0 || N % 128 != 0 || sk < 1 || sk > 8 ||
-      (K / 128) % sk != 0) {
-    std::fprintf(stderr,
-                 "glm_fp8_fnuz_block_gemv: requires M<=2, K<=4096, N%%128==0, "
-                 "K%%128==0, sk in {1,2,4,8} dividing K/128 (got M=%d N=%d "
-                 "K=%d sk=%d)\n",
-                 M,
-                 N,
-                 K,
-                 sk);
-    return;
-  }
+  check_gemv_contract("glm_fp8_fnuz_block_gemv", M, N, K, sk);
+  const auto st = static_cast<hipStream_t>(stream);
   const int segs = (K / 128) / sk;
   const dim3 grid((N + 31) / 32, sk);
-  switch (segs) {
-  case 2:
-    glm_fp8_fnuz_gemv_partial_kernel<2><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs);
-    break;
-  case 4:
-    glm_fp8_fnuz_gemv_partial_kernel<4><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs);
-    break;
-  case 8:
-    glm_fp8_fnuz_gemv_partial_kernel<8><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs);
-    break;
-  case 16:
-    glm_fp8_fnuz_gemv_partial_kernel<16><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs);
-    break;
-  case 32:
-    glm_fp8_fnuz_gemv_partial_kernel<32><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs);
-    break;
-  default:
-    glm_fp8_fnuz_gemv_partial_kernel<0><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs);
-    break;
-  }
-  const int mn = M * N;
-  glm_fp8_gemv_reduce_kernel<<<(mn + kTh - 1) / kTh, kTh>>>(part, out, mn, sk);
+  dispatch_segs(segs, [&](auto c) {
+    common::launch_on(glm_fp8_fnuz_gemv_partial_kernel<decltype(c)::value>, grid, kTh, 0, st,
+                      "glm_fp8_fnuz_gemv_partial_kernel", x, w, scales, part, M, N, K, sk,
+                      segs);
+  });
+  launch_reduce(part, out, M, N, sk, st);
 }
 
-void glm_fp8_fnuz_block_gemv(
-    const uint16_t* x, const uint8_t* w, const float* scales, uint16_t* out, int M, int N, int K) {
+void glm_fp8_fnuz_mfma_block_gemv_debug(const uint16_t* x, const uint8_t* w,
+                                        const float* scales, uint16_t* out, float* part,
+                                        int M, int N, int K, int sk, uint32_t* dbg_sxa,
+                                        float* dbg_s2a, void* stream) {
   if (M <= 0 || N <= 0 || K <= 0) return;
-  const int sk = gemv_pick_sk(N, K);
-  float* part = nullptr;
-  hipMalloc(&part, (size_t)M * N * sk * sizeof(float));
-  glm_fp8_fnuz_block_gemv_with_scratch(x, w, scales, out, part, M, N, K, sk);
-  hipFree(part);
+  check_gemv_contract("glm_fp8_fnuz_mfma_block_gemv", M, N, K, sk);
+  const auto st = static_cast<hipStream_t>(stream);
+  const int segs = (K / 128) / sk;
+  const dim3 grid(N / 64, sk);  // 64 rows per 4-wave64-warp block
+  dispatch_segs(segs, [&](auto c) {
+    common::launch_on(glm_fp8_fnuz_mfma_gemv_kernel<decltype(c)::value>, grid, kTh, 0, st,
+                      "glm_fp8_fnuz_mfma_gemv_kernel", x, w, scales, part, M, N, K, sk, segs,
+                      dbg_sxa, dbg_s2a);
+  });
+  launch_reduce(part, out, M, N, sk, st);
 }
 
-void glm_fp8_fnuz_mfma_block_gemv_with_scratch(const uint16_t* x,
-                                               const uint8_t* w,
-                                               const float* scales,
-                                               uint16_t* out,
-                                               float* part,
-                                               int M,
-                                               int N,
-                                               int K,
-                                               int sk) {
-  glm_fp8_fnuz_mfma_block_gemv_debug(x, w, scales, out, part, M, N, K, sk, nullptr, nullptr);
+void glm_fp8_fnuz_mfma_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
+                                               const float* scales, uint16_t* out,
+                                               float* part, int M, int N, int K, int sk,
+                                               void* stream) {
+  glm_fp8_fnuz_mfma_block_gemv_debug(x, w, scales, out, part, M, N, K, sk, nullptr, nullptr,
+                                     stream);
 }
 
-void glm_fp8_fnuz_mfma_block_gemv_debug(const uint16_t* x,
-                                        const uint8_t* w,
-                                        const float* scales,
-                                        uint16_t* out,
-                                        float* part,
-                                        int M,
-                                        int N,
-                                        int K,
-                                        int sk,
-                                        uint32_t* dbg_sxa,
+void glm_fp8_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales,
+                        uint16_t* out, int M, int N, int K, void* stream) {
+  if (M <= 0 || N <= 0 || K <= 0) return;
+  with_partials(M, N, K, static_cast<hipStream_t>(stream), [&](float* part, int sk) {
+    glm_fp8_block_gemv_with_scratch(x, w, scales, out, part, M, N, K, sk, stream);
+  });
+}
+
+void glm_fp8_fnuz_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales,
+                             uint16_t* out, int M, int N, int K, void* stream) {
+  if (M <= 0 || N <= 0 || K <= 0) return;
+  with_partials(M, N, K, static_cast<hipStream_t>(stream), [&](float* part, int sk) {
+    glm_fp8_fnuz_block_gemv_with_scratch(x, w, scales, out, part, M, N, K, sk, stream);
+  });
+}
+
+void glm_fp8_fnuz_mfma_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales,
+                                  uint16_t* out, int M, int N, int K, void* stream) {
+  if (M <= 0 || N <= 0 || K <= 0) return;
+  with_partials(M, N, K, static_cast<hipStream_t>(stream), [&](float* part, int sk) {
+    glm_fp8_fnuz_mfma_block_gemv_with_scratch(x, w, scales, out, part, M, N, K, sk, stream);
+  });
+}
+
+// Legacy null-stream entry points (pre-stream signatures).
+void glm_fp8_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales,
+                        uint16_t* out, int M, int N, int K) {
+  glm_fp8_block_gemv(x, w, scales, out, M, N, K, nullptr);
+}
+void glm_fp8_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w, const float* scales,
+                                     uint16_t* out, float* part, int M, int N, int K, int sk) {
+  glm_fp8_block_gemv_with_scratch(x, w, scales, out, part, M, N, K, sk, nullptr);
+}
+void glm_fp8_fnuz_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales,
+                             uint16_t* out, int M, int N, int K) {
+  glm_fp8_fnuz_block_gemv(x, w, scales, out, M, N, K, nullptr);
+}
+void glm_fp8_fnuz_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
+                                          const float* scales, uint16_t* out, float* part,
+                                          int M, int N, int K, int sk) {
+  glm_fp8_fnuz_block_gemv_with_scratch(x, w, scales, out, part, M, N, K, sk, nullptr);
+}
+void glm_fp8_fnuz_mfma_block_gemv(const uint16_t* x, const uint8_t* w, const float* scales,
+                                  uint16_t* out, int M, int N, int K) {
+  glm_fp8_fnuz_mfma_block_gemv(x, w, scales, out, M, N, K, nullptr);
+}
+void glm_fp8_fnuz_mfma_block_gemv_with_scratch(const uint16_t* x, const uint8_t* w,
+                                               const float* scales, uint16_t* out,
+                                               float* part, int M, int N, int K, int sk) {
+  glm_fp8_fnuz_mfma_block_gemv_with_scratch(x, w, scales, out, part, M, N, K, sk, nullptr);
+}
+void glm_fp8_fnuz_mfma_block_gemv_debug(const uint16_t* x, const uint8_t* w,
+                                        const float* scales, uint16_t* out, float* part,
+                                        int M, int N, int K, int sk, uint32_t* dbg_sxa,
                                         float* dbg_s2a) {
-  if (M <= 0 || N <= 0 || K <= 0) return;
-  if (M > 2 || K > kMaxK || K % 128 != 0 || N % 128 != 0 || sk < 1 || sk > 8 ||
-      (K / 128) % sk != 0) {
-    std::fprintf(stderr,
-                 "glm_fp8_fnuz_mfma_block_gemv: requires M<=2, K<=4096, "
-                 "N%%128==0, K%%128==0, sk in {1,2,4,8} dividing K/128 "
-                 "(got M=%d N=%d K=%d sk=%d)\n",
-                 M,
-                 N,
-                 K,
-                 sk);
-    return;
-  }
-  const int segs = (K / 128) / sk;
-  const dim3 grid(N / 64, sk); // 64 rows per 4-wave64-warp block
-  switch (segs) {
-  case 2:
-    glm_fp8_fnuz_mfma_gemv_kernel<2>
-        <<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a);
-    break;
-  case 4:
-    glm_fp8_fnuz_mfma_gemv_kernel<4>
-        <<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a);
-    break;
-  case 8:
-    glm_fp8_fnuz_mfma_gemv_kernel<8>
-        <<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a);
-    break;
-  case 16:
-    glm_fp8_fnuz_mfma_gemv_kernel<16>
-        <<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a);
-    break;
-  case 32:
-    glm_fp8_fnuz_mfma_gemv_kernel<32>
-        <<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a);
-    break;
-  default:
-    glm_fp8_fnuz_mfma_gemv_kernel<0>
-        <<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a);
-    break;
-  }
-  const int mn = M * N;
-  glm_fp8_gemv_reduce_kernel<<<(mn + kTh - 1) / kTh, kTh>>>(part, out, mn, sk);
-}
-
-void glm_fp8_fnuz_mfma_block_gemv(
-    const uint16_t* x, const uint8_t* w, const float* scales, uint16_t* out, int M, int N, int K) {
-  if (M <= 0 || N <= 0 || K <= 0) return;
-  const int sk = gemv_pick_sk(N, K);
-  float* part = nullptr;
-  hipMalloc(&part, (size_t)M * N * sk * sizeof(float));
-  glm_fp8_fnuz_mfma_block_gemv_with_scratch(x, w, scales, out, part, M, N, K, sk);
-  hipFree(part);
-}
-
-void glm_fp8_fnuz_block_gemv_with_scratch(const uint16_t* x,
-                                          const uint8_t* w,
-                                          const float* scales, uint16_t* out,
-                                          float* part, int M, int N, int K,
-                                          int sk) {
-  if (M <= 0 || N <= 0 || K <= 0) return;
-  if (M > 2 || K > kMaxK || K % 128 != 0 || N % 128 != 0 || sk < 1 ||
-      sk > 8 || (K / 128) % sk != 0) {
-    std::fprintf(stderr,
-                 "glm_fp8_fnuz_block_gemv: requires M<=2, K<=4096, N%%128==0, "
-                 "K%%128==0, sk in {1,2,4,8} dividing K/128 (got M=%d N=%d "
-                 "K=%d sk=%d)\n", M, N, K, sk);
-    return;
-  }
-  const int segs = (K / 128) / sk;
-  const dim3 grid((N + 31) / 32, sk);
-  switch (segs) {
-    case 2:  glm_fp8_fnuz_gemv_partial_kernel<2><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-    case 4:  glm_fp8_fnuz_gemv_partial_kernel<4><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-    case 8:  glm_fp8_fnuz_gemv_partial_kernel<8><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-    case 16: glm_fp8_fnuz_gemv_partial_kernel<16><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-    case 32: glm_fp8_fnuz_gemv_partial_kernel<32><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-    default: glm_fp8_fnuz_gemv_partial_kernel<0><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs); break;
-  }
-  const int mn = M * N;
-  glm_fp8_gemv_reduce_kernel<<<(mn + kTh - 1) / kTh, kTh>>>(part, out, mn, sk);
-}
-
-void glm_fp8_fnuz_block_gemv(const uint16_t* x, const uint8_t* w,
-                             const float* scales, uint16_t* out,
-                             int M, int N, int K) {
-  if (M <= 0 || N <= 0 || K <= 0) return;
-  const int sk = gemv_pick_sk(N, K);
-  float* part = nullptr;
-  hipMalloc(&part, (size_t)M * N * sk * sizeof(float));
-  glm_fp8_fnuz_block_gemv_with_scratch(x, w, scales, out, part, M, N, K, sk);
-  hipFree(part);
-}
-
-void glm_fp8_fnuz_mfma_block_gemv_with_scratch(const uint16_t* x,
-                                               const uint8_t* w,
-                                               const float* scales,
-                                               uint16_t* out, float* part,
-                                               int M, int N, int K, int sk) {
-  glm_fp8_fnuz_mfma_block_gemv_debug(x, w, scales, out, part, M, N, K, sk,
-                                     nullptr, nullptr);
-}
-
-void glm_fp8_fnuz_mfma_block_gemv_debug(const uint16_t* x,
-                                        const uint8_t* w,
-                                        const float* scales,
-                                        uint16_t* out, float* part,
-                                        int M, int N, int K, int sk,
-                                        uint32_t* dbg_sxa, float* dbg_s2a) {
-  if (M <= 0 || N <= 0 || K <= 0) return;
-  if (M > 2 || K > kMaxK || K % 128 != 0 || N % 128 != 0 || sk < 1 ||
-      sk > 8 || (K / 128) % sk != 0) {
-    std::fprintf(stderr,
-                 "glm_fp8_fnuz_mfma_block_gemv: requires M<=2, K<=4096, "
-                 "N%%128==0, K%%128==0, sk in {1,2,4,8} dividing K/128 "
-                 "(got M=%d N=%d K=%d sk=%d)\n", M, N, K, sk);
-    return;
-  }
-  const int segs = (K / 128) / sk;
-  const dim3 grid(N / 64, sk);          // 64 rows per 4-wave64-warp block
-  switch (segs) {
-    case 2:  glm_fp8_fnuz_mfma_gemv_kernel<2><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a); break;
-    case 4:  glm_fp8_fnuz_mfma_gemv_kernel<4><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a); break;
-    case 8:  glm_fp8_fnuz_mfma_gemv_kernel<8><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a); break;
-    case 16: glm_fp8_fnuz_mfma_gemv_kernel<16><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a); break;
-    case 32: glm_fp8_fnuz_mfma_gemv_kernel<32><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a); break;
-    default: glm_fp8_fnuz_mfma_gemv_kernel<0><<<grid, kTh>>>(x, w, scales, part, M, N, K, sk, segs, dbg_sxa, dbg_s2a); break;
-  }
-  const int mn = M * N;
-  glm_fp8_gemv_reduce_kernel<<<(mn + kTh - 1) / kTh, kTh>>>(part, out, mn, sk);
-}
-
-void glm_fp8_fnuz_mfma_block_gemv(const uint16_t* x, const uint8_t* w,
-                                  const float* scales, uint16_t* out,
-                                  int M, int N, int K) {
-  if (M <= 0 || N <= 0 || K <= 0) return;
-  const int sk = gemv_pick_sk(N, K);
-  float* part = nullptr;
-  hipMalloc(&part, (size_t)M * N * sk * sizeof(float));
-  glm_fp8_fnuz_mfma_block_gemv_with_scratch(x, w, scales, out, part,
-                                            M, N, K, sk);
-  hipFree(part);
-}
-
-void glm_fp8_block_gemv(const uint16_t* x, const uint8_t* w,
-                        const float* scales, uint16_t* out,
-                        int M, int N, int K) {
-  if (M <= 0 || N <= 0 || K <= 0) return;
-  const int sk = gemv_pick_sk(N, K);  // vkernels::kernels, store-aware
-  float* part = nullptr;
-  hipMalloc(&part, (size_t)M * N * sk * sizeof(float));
-  glm_fp8_block_gemv_with_scratch(x, w, scales, out, part, M, N, K, sk);
-  hipFree(part);
+  glm_fp8_fnuz_mfma_block_gemv_debug(x, w, scales, out, part, M, N, K, sk, dbg_sxa, dbg_s2a,
+                                     nullptr);
 }
 
 }  // namespace vkernels::kernels::hip

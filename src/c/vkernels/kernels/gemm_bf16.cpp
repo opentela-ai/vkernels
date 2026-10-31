@@ -12,6 +12,7 @@
 // self-contained on a host-only build.
 #include "vkernels/kernels/gemm_bf16.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -56,13 +57,26 @@ void gemm_bf16_cpu(std::size_t M, std::size_t N, std::size_t K, float alpha,
   VK_EXPECTS(M == 0 || N == 0 || K == 0 || B != nullptr, "B must not be null");
   VK_EXPECTS(M == 0 || N == 0 || C != nullptr, "C must not be null");
 
+  // i-k-j order: B is streamed row by row (unit stride) into a row of fp32
+  // accumulators. Every C[i][j] still sums its K products in increasing k,
+  // one rounded multiply and one rounded add each (-ffp-contract=off), so
+  // the result is bit-identical to the i-j-k dot-product form. (Only the
+  // payload of a NaN result is unspecified: it depends on the operand order
+  // the compiler picks for the commutative add, in either loop order.)
+  std::vector<float> acc(N);
   for (std::size_t i = 0; i < M; ++i) {
+    std::fill(acc.begin(), acc.end(), 0.0f);
+    for (std::size_t k = 0; k < K; ++k) {
+      const float a = bf16_to_float_local(A[i * K + k]);
+      const uint16_t* brow = B + k * N;
+      for (std::size_t j = 0; j < N; ++j) {
+        const float p = a * bf16_to_float_local(brow[j]);
+        acc[j] = acc[j] + p;
+      }
+    }
     for (std::size_t j = 0; j < N; ++j) {
-      float acc = 0.0f;
-      for (std::size_t k = 0; k < K; ++k)
-        acc += bf16_to_float_local(A[i * K + k]) * bf16_to_float_local(B[k * N + j]);
       const float prev = (beta != 0.0f) ? bf16_to_float_local(C[i * N + j]) : 0.0f;
-      C[i * N + j] = float_to_bf16_local(alpha * acc + beta * prev);
+      C[i * N + j] = float_to_bf16_local(alpha * acc[j] + beta * prev);
     }
   }
 }

@@ -39,11 +39,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 #include "vkernels/kernels/kda.hpp"
 
 #if VKERNELS_HAS_HIP
 #  include <hip/hip_runtime.h>
+#  include "vkernels/kernels/common/launch.hpp"  // launch_on: launch + error check
+#  include "vkernels/util/env.hpp"
+#  include "vkernels/kernels/execution_workspace.hpp"  // Scratch<T>
+#  include "vkernels/util/error.hpp"
 
 namespace vkernels::kernels::hip {
 
@@ -125,12 +130,12 @@ void kda_layer_norm_gated(const float* x, const float* weight,
     const int block = 256;
     const int rows_per_block = block / 32;
     const int grid = (N + rows_per_block - 1) / rows_per_block;
-    kda_layer_norm_gated_kernel_row<<<grid, block, 0, 0>>>(
+    common::launch_on(kda_layer_norm_gated_kernel_row, grid, block, 0, nullptr, "kda_layer_norm_gated_kernel_row",
         x, weight, gate, out, N, D, eps);
   } else {
     const int block = 256;
     const int grid = (N + block - 1) / block;
-    kda_layer_norm_gated_kernel<<<grid, block, 0, 0>>>(
+    common::launch_on(kda_layer_norm_gated_kernel, grid, block, 0, nullptr, "kda_layer_norm_gated_kernel",
         x, weight, gate, out, N, D, eps);
   }
 }
@@ -174,9 +179,9 @@ __global__ void kda_gate_inter_kernel(const float* __restrict__ intra_log,
 void kda_gate_chunk_cumsum(const float* g, float* intra_log, float* inter_log,
                            int B, int H, int n_chunks, int chunk_size) {
   if (B == 0 || H == 0 || n_chunks == 0) return;
-  kda_gate_intra_kernel<<<dim3(n_chunks, H, B), 1, 0, 0>>>(
+  common::launch_on(kda_gate_intra_kernel, dim3(n_chunks, H, B), 1, 0, nullptr, "kda_gate_intra_kernel",
       g, intra_log, n_chunks, chunk_size);
-  kda_gate_inter_kernel<<<dim3(H, B), 1, 0, 0>>>(
+  common::launch_on(kda_gate_inter_kernel, dim3(H, B), 1, 0, nullptr, "kda_gate_inter_kernel",
       intra_log, inter_log, n_chunks, chunk_size);
 }
 
@@ -316,7 +321,7 @@ void launch(const float* q, const float* k, const float* v, const float* g,
   // sync-on-return behaviour.
   for (int cs = 0; cs < S; cs += kChunk) {
     const int len = (S - cs < kChunk) ? (S - cs) : kChunk;
-    kda_delta_rule_fwd_kernel<D, Db><<<grid, block, 0, stream>>>(
+    common::launch_on(kda_delta_rule_fwd_kernel<D, Db>, grid, block, 0, stream, "kda_delta_rule_fwd_kernel",
         q, k, v, g, beta, state, out, H, S, cs, len);
   }
   if (stream == nullptr) hipDeviceSynchronize();
@@ -348,17 +353,15 @@ void kda_delta_rule_fwd(const float* q, const float* k, const float* v,
   (void)chunk_size;  // the cooperative kernel streams tokens; chunking is a
                      // follow-on for parallelism (see file header).
   if (B == 0 || H == 0 || S == 0) return;
-  float* state = nullptr;
-  hipMalloc(&state, (size_t)B * H * D * D * sizeof(float));
-  hipMemsetAsync(state, 0, (size_t)B * H * D * D * sizeof(float), 0);
   // legacy entry: eager default-stream + sync (the stream variant is the
-  // graph-capture-safe one)
-  kda_delta_rule_fwd_with_scratch(q, k, v, g, beta, state, out, B, H, S, D,
+  // graph-capture-safe one). The state scratch is stream-ordered on the
+  // null stream: allocated, zeroed and released in order with the launches.
+  const size_t n_state = (size_t)B * H * D * D;
+  Scratch<float> state(n_state, nullptr);
+  VK_ENSURES(hipMemsetAsync(state.ptr, 0, n_state * sizeof(float), nullptr) == hipSuccess,
+             "kda_delta_rule_fwd: state zero-fill failed");
+  kda_delta_rule_fwd_with_scratch(q, k, v, g, beta, state.ptr, out, B, H, S, D,
                                   nullptr);
-  // kda_delta_rule_fwd_with_scratch syncs on return, so the scratch is no
-  // longer in use; hipFree (NOT synchronous in ROCm, unlike cudaFree) is
-  // then safe.
-  hipFree(state);
 }
 
 // ===========================================================================
@@ -384,7 +387,7 @@ void kda_pack_bitmatrix(const uint8_t* bits, uint8_t* packed,
   const std::size_t bytes = (n_bits + 7) / 8;
   const int block = 256;
   const int grid = (int)((bytes + block - 1) / block);
-  kda_pack_bitmatrix_kernel<<<grid, block, 0, 0>>>(bits, packed, n_bits);
+  common::launch_on(kda_pack_bitmatrix_kernel, grid, block, 0, nullptr, "kda_pack_bitmatrix_kernel",bits, packed, n_bits);
 }
 
 // ===========================================================================
@@ -1010,10 +1013,10 @@ void launch_chunked(const float* q, const float* k, const float* v,
   if (fused_cumsum) {
     // VK_KDA_CHUNKED_FUSED=1: cumsum folded into the gram prologue —
     // bit-identical L (same statements/order), one launch fewer.
-    kda_k3_gram_cumsum_kernel<D><<<gchunk, kThL, 0, stream>>>(
+    common::launch_on(kda_k3_gram_cumsum_kernel<D>, gchunk, kThL, 0, stream, "kda_k3_gram_cumsum_kernel",
         g, q, k, beta, L, M, N, nc, S);
   } else {
-    kda_k3_cumsum_kernel<<<gchunk, kTh, 0, stream>>>(g, L, nc, S, D);
+    common::launch_on(kda_k3_cumsum_kernel, gchunk, kTh, 0, stream, "kda_k3_cumsum_kernel",g, L, nc, S, D);
 #ifndef VKERNELS_KDA_CUDA_SHIM
     // VK_KDA_GRAM_MFMA=1 swaps launch (2a) to the block-anchored MFMA rung
     // (kda_k3_gram_mfma_kernel). DEFAULT OFF — the scalar per-pair gram
@@ -1021,23 +1024,23 @@ void launch_chunked(const float* q, const float* k, const float* v,
     // gate (the VK_KDA_CHUNKED_FUSED discipline). The M/N cell contract is
     // identical (M strict lower, N tril-inclusive, upper zeroed), so the
     // (2b) local kernel is unchanged.
-    const char* gram_mfma_env = std::getenv("VK_KDA_GRAM_MFMA");
-    if (gram_mfma_env != nullptr && gram_mfma_env[0] == '1') {
-      kda_k3_gram_mfma_kernel<D><<<gchunk, kGramTh, 0, stream>>>(
+    static const bool gram_mfma = util::env_equals("VK_KDA_GRAM_MFMA", "1");
+    if (gram_mfma) {
+      common::launch_on(kda_k3_gram_mfma_kernel<D>, gchunk, kGramTh, 0, stream, "kda_k3_gram_mfma_kernel",
           q, k, beta, L, M, N, nc, S);
     } else
 #endif
     {
-      kda_k3_gram_kernel<D><<<gchunk, kThL, 0, stream>>>(
+      common::launch_on(kda_k3_gram_kernel<D>, gchunk, kThL, 0, stream, "kda_k3_gram_kernel",
           q, k, beta, L, M, N, nc, S);
     }
   }
-  kda_k3_local_kernel<D><<<gchunk, kThL, 0, stream>>>(
+  common::launch_on(kda_k3_local_kernel<D>, gchunk, kThL, 0, stream, "kda_k3_local_kernel",
       q, k, v, beta, L, M, N, Kgw, Qgw, Kgb, dgG, U_v, W, T, Opar, nc, S,
       nullptr);
   constexpr int Rb = (D <= 32) ? D : 32;          // state rows per block
   const dim3 gstate(D / Rb, B * H);
-  kda_k3_state_kernel<D, Rb><<<gstate, kTh, 0, stream>>>(
+  common::launch_on(kda_k3_state_kernel<D, Rb>, gstate, kTh, 0, stream, "kda_k3_state_kernel",
       U_v, W, T, Opar, Kgb, dgG, state, out, nc, S);
   if (stream == nullptr) hipDeviceSynchronize();  // caller owns sync otherwise
 }
@@ -1048,32 +1051,23 @@ void kda_delta_rule_fwd_chunked_with_scratch(
     const float* beta, float* state, float* out, float* scratch,
     int B, int H, int S, int D, int chunk_size, void* stream) {
   if (B == 0 || H == 0 || S == 0) return;
-  if (chunk_size != kCs || S % kCs != 0 || D > 128) {
-    std::fprintf(stderr,
-                 "kda_delta_rule_fwd_chunked_with_scratch: requires "
-                 "chunk_size==64, S%%64==0, D<=128 (got cs=%d S=%d D=%d)\n",
-                 chunk_size, S, D);
-    return;
-  }
+  VK_EXPECTS(chunk_size == kCs && S % kCs == 0 && D <= 128,
+             "kda_delta_rule_fwd_chunked_with_scratch: requires chunk_size==64, "
+             "S%64==0, D<=128 (got cs=" + std::to_string(chunk_size) + " S=" +
+                 std::to_string(S) + " D=" + std::to_string(D) + ")");
   // VK_KDA_CHUNKED_FUSED=1 folds the per-key cumsum launch into the gram
   // kernel prologue (3 launches instead of 4, bit-identical L). DEFAULT is
   // the proven 4-launch chain; flip the default only after the gfx942 A/B
   // (NOTES-fusion-dsa-kda-launches.md).
-  bool fused = false;
-  if (const char* e = std::getenv("VK_KDA_CHUNKED_FUSED"))
-    fused = e[0] == '1';
+  // Re-read per call: test_kda_chunked_fused_gpu flips it in-process.
+  const bool fused = util::env_equals("VK_KDA_CHUNKED_FUSED", "1");
   const hipStream_t st = static_cast<hipStream_t>(stream);
 #ifdef VKERNELS_KDA_CUDA_SHIM
   // HIP-on-NVIDIA shim build: NVIDIA caps STATIC shared at 48 KB/block; the
   // D=128 gram kernels stage 64 KB (fine in gfx942's static budget). The
   // shim path therefore serves the D <= 64 templates only.
-  if (D > 64) {
-    std::fprintf(stderr,
-                 "kda_delta_rule_fwd_chunked_with_scratch: CUDA-shim build "
-                 "supports D <= 64 (got D=%d); use the HIP build for D=128\n",
-                 D);
-    return;
-  }
+  VK_EXPECTS(D <= 64, "kda_delta_rule_fwd_chunked_with_scratch: CUDA-shim build supports "
+                     "D <= 64 (got D=" + std::to_string(D) + "); use the HIP build for D=128");
   if (D <= 16)      launch_chunked<16>(q, k, v, g, beta, state, out, scratch, B, H, S, st, fused);
   else if (D <= 32) launch_chunked<32>(q, k, v, g, beta, state, out, scratch, B, H, S, st, fused);
   else              launch_chunked<64>(q, k, v, g, beta, state, out, scratch, B, H, S, st, fused);
@@ -1090,17 +1084,15 @@ void kda_delta_rule_fwd_chunked(const float* q, const float* k,
                                 const float* beta, float* out,
                                 int B, int H, int S, int D, int chunk_size) {
   if (B == 0 || H == 0 || S == 0) return;
-  float* state = nullptr;
-  hipMalloc(&state, (size_t)B * H * D * D * sizeof(float));
-  hipMemsetAsync(state, 0, (size_t)B * H * D * D * sizeof(float), 0);
-  float* scratch = nullptr;
-  const size_t sf = kda_chunked_scratch_floats(B, H, S, D);
-  hipMalloc(&scratch, sf * sizeof(float));
-  kda_delta_rule_fwd_chunked_with_scratch(q, k, v, g, beta, state, out,
-                                          scratch, B, H, S, D, chunk_size,
+  // Stream-ordered scratch on the null stream (see kda_delta_rule_fwd).
+  const size_t n_state = (size_t)B * H * D * D;
+  Scratch<float> state(n_state, nullptr);
+  VK_ENSURES(hipMemsetAsync(state.ptr, 0, n_state * sizeof(float), nullptr) == hipSuccess,
+             "kda_delta_rule_fwd_chunked: state zero-fill failed");
+  Scratch<float> scratch(kda_chunked_scratch_floats(B, H, S, D), nullptr);
+  kda_delta_rule_fwd_chunked_with_scratch(q, k, v, g, beta, state.ptr, out,
+                                          scratch.ptr, B, H, S, D, chunk_size,
                                           nullptr);
-  hipFree(state);
-  hipFree(scratch);
 }
 
 // #L8a standalone entry: the block-anchored MFMA grams (rung 1 of the
@@ -1128,21 +1120,25 @@ void kda_k3_grams_blocked(const float* q, const float* k, const float* beta,
     return;
   }
   if (D <= 16)
-    kda_k3_gram_mfma_kernel<16><<<dim3(B * H, nc), kGramTh, 0, st>>>(
+    common::launch_on(kda_k3_gram_mfma_kernel<16>, dim3(B * H, nc), kGramTh, 0, st, "kda_k3_gram_mfma_kernel",
         q, k, beta, L, M, N, nc, S);
   else if (D <= 32)
-    kda_k3_gram_mfma_kernel<32><<<dim3(B * H, nc), kGramTh, 0, st>>>(
+    common::launch_on(kda_k3_gram_mfma_kernel<32>, dim3(B * H, nc), kGramTh, 0, st, "kda_k3_gram_mfma_kernel",
         q, k, beta, L, M, N, nc, S);
   else if (D <= 64)
-    kda_k3_gram_mfma_kernel<64><<<dim3(B * H, nc), kGramTh, 0, st>>>(
+    common::launch_on(kda_k3_gram_mfma_kernel<64>, dim3(B * H, nc), kGramTh, 0, st, "kda_k3_gram_mfma_kernel",
         q, k, beta, L, M, N, nc, S);
   else
-    kda_k3_gram_mfma_kernel<128><<<dim3(B * H, nc), kGramTh, 0, st>>>(
+    common::launch_on(kda_k3_gram_mfma_kernel<128>, dim3(B * H, nc), kGramTh, 0, st, "kda_k3_gram_mfma_kernel",
         q, k, beta, L, M, N, nc, S);
   if (st == nullptr) hipDeviceSynchronize();
 #endif
 }
 
+// Benchmark-only (meta/benchmarks/bench_kda_chunked.hip): compiled into the
+// library only when VKERNELS_PROFILING_HOOKS is set (VKERNELS_BUILD_BENCHMARKS
+// builds). It device-synchronizes after every launch.
+#if VKERNELS_PROFILING_HOOKS
 // Tuning aid (#70): median wall time of each of the three chunked launches
 // (cumsum / chunk-local / state-pass), in microseconds, over `iters`
 // timed runs after one warmup of each. out_us[0..2] = K1, K2, K3.
@@ -1164,7 +1160,8 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
   const dim3 gchunk(B * H, nc);
   constexpr int Rb128 = 32;
   unsigned long long* dbg = nullptr;
-  hipMalloc(&dbg, 8 * sizeof(unsigned long long));
+  VK_ENSURES(hipMalloc(&dbg, 8 * sizeof(unsigned long long)) == hipSuccess,
+             "kda_chunked_phase_times: debug counter allocation failed");
   hipEvent_t e0, e1;
   hipEventCreate(&e0);
   hipEventCreate(&e1);
@@ -1184,27 +1181,27 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
     return best;
   };
   out_us[0] = time_launch([&] {
-    kda_k3_cumsum_kernel<<<gchunk, kTh>>>(g, L, nc, S, D);
+    common::launch_on(kda_k3_cumsum_kernel, gchunk, kTh, 0, nullptr, "kda_k3_cumsum_kernel",g, L, nc, S, D);
     hipDeviceSynchronize();
   });
   if (D <= 16)
     out_us[1] = time_launch([&] {
-      kda_k3_gram_kernel<16><<<gchunk, kThL>>>(q, k, beta, L, M, N, nc, S);
+      common::launch_on(kda_k3_gram_kernel<16>, gchunk, kThL, 0, nullptr, "kda_k3_gram_kernel",q, k, beta, L, M, N, nc, S);
       hipDeviceSynchronize();
     });
   else if (D <= 32)
     out_us[1] = time_launch([&] {
-      kda_k3_gram_kernel<32><<<gchunk, kThL>>>(q, k, beta, L, M, N, nc, S);
+      common::launch_on(kda_k3_gram_kernel<32>, gchunk, kThL, 0, nullptr, "kda_k3_gram_kernel",q, k, beta, L, M, N, nc, S);
       hipDeviceSynchronize();
     });
   else if (D <= 64)
     out_us[1] = time_launch([&] {
-      kda_k3_gram_kernel<64><<<gchunk, kThL>>>(q, k, beta, L, M, N, nc, S);
+      common::launch_on(kda_k3_gram_kernel<64>, gchunk, kThL, 0, nullptr, "kda_k3_gram_kernel",q, k, beta, L, M, N, nc, S);
       hipDeviceSynchronize();
     });
   else
     out_us[1] = time_launch([&] {
-      kda_k3_gram_kernel<128><<<gchunk, kThL>>>(q, k, beta, L, M, N, nc, S);
+      common::launch_on(kda_k3_gram_kernel<128>, gchunk, kThL, 0, nullptr, "kda_k3_gram_kernel",q, k, beta, L, M, N, nc, S);
       hipDeviceSynchronize();
     });
 #ifndef VKERNELS_KDA_CUDA_SHIM
@@ -1214,25 +1211,25 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
   // device test's job, not this timing aid's).
   if (D <= 16)
     out_us[10] = time_launch([&] {
-      kda_k3_gram_mfma_kernel<16><<<gchunk, kGramTh>>>(q, k, beta, L, M, N,
+      common::launch_on(kda_k3_gram_mfma_kernel<16>, gchunk, kGramTh, 0, nullptr, "kda_k3_gram_mfma_kernel",q, k, beta, L, M, N,
                                                       nc, S);
       hipDeviceSynchronize();
     });
   else if (D <= 32)
     out_us[10] = time_launch([&] {
-      kda_k3_gram_mfma_kernel<32><<<gchunk, kGramTh>>>(q, k, beta, L, M, N,
+      common::launch_on(kda_k3_gram_mfma_kernel<32>, gchunk, kGramTh, 0, nullptr, "kda_k3_gram_mfma_kernel",q, k, beta, L, M, N,
                                                       nc, S);
       hipDeviceSynchronize();
     });
   else if (D <= 64)
     out_us[10] = time_launch([&] {
-      kda_k3_gram_mfma_kernel<64><<<gchunk, kGramTh>>>(q, k, beta, L, M, N,
+      common::launch_on(kda_k3_gram_mfma_kernel<64>, gchunk, kGramTh, 0, nullptr, "kda_k3_gram_mfma_kernel",q, k, beta, L, M, N,
                                                       nc, S);
       hipDeviceSynchronize();
     });
   else
     out_us[10] = time_launch([&] {
-      kda_k3_gram_mfma_kernel<128><<<gchunk, kGramTh>>>(q, k, beta, L, M, N,
+      common::launch_on(kda_k3_gram_mfma_kernel<128>, gchunk, kGramTh, 0, nullptr, "kda_k3_gram_mfma_kernel",q, k, beta, L, M, N,
                                                        nc, S);
       hipDeviceSynchronize();
     });
@@ -1241,53 +1238,53 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
 #endif
   if (D <= 16) {
     out_us[2] = time_launch([&] {
-      kda_k3_local_kernel<16><<<gchunk, kThL>>>(q, k, v, beta, L, M, N,
+      common::launch_on(kda_k3_local_kernel<16>, gchunk, kThL, 0, nullptr, "kda_k3_local_kernel",q, k, v, beta, L, M, N,
                                               Kgw, Qgw, Kgb, dgG, U_v, W, T,
                                               Opar, nc, S, dbg);
       hipDeviceSynchronize();
     });
     for (int i = 0; i < 6; ++i) out_us[4 + i] = (double)dbg[i] / 1000.0;
     out_us[3] = time_launch([&] {
-      kda_k3_state_kernel<16, 16><<<dim3(D / 16, B * H), kTh>>>(
+      common::launch_on(kda_k3_state_kernel<16, 16>, dim3(D / 16, B * H), kTh, 0, nullptr, "kda_k3_state_kernel",
           U_v, W, T, Opar, Kgb, dgG, state, out, nc, S);
       hipDeviceSynchronize();
     });
   } else if (D <= 32) {
     out_us[2] = time_launch([&] {
-      kda_k3_local_kernel<32><<<gchunk, kThL>>>(q, k, v, beta, L, M, N,
+      common::launch_on(kda_k3_local_kernel<32>, gchunk, kThL, 0, nullptr, "kda_k3_local_kernel",q, k, v, beta, L, M, N,
                                               Kgw, Qgw, Kgb, dgG, U_v, W, T,
                                               Opar, nc, S, dbg);
       hipDeviceSynchronize();
     });
     for (int i = 0; i < 6; ++i) out_us[4 + i] = (double)dbg[i] / 1000.0;
     out_us[3] = time_launch([&] {
-      kda_k3_state_kernel<32, 32><<<dim3(D / 32, B * H), kTh>>>(
+      common::launch_on(kda_k3_state_kernel<32, 32>, dim3(D / 32, B * H), kTh, 0, nullptr, "kda_k3_state_kernel",
           U_v, W, T, Opar, Kgb, dgG, state, out, nc, S);
       hipDeviceSynchronize();
     });
   } else if (D <= 64) {
     out_us[2] = time_launch([&] {
-      kda_k3_local_kernel<64><<<gchunk, kThL>>>(q, k, v, beta, L, M, N,
+      common::launch_on(kda_k3_local_kernel<64>, gchunk, kThL, 0, nullptr, "kda_k3_local_kernel",q, k, v, beta, L, M, N,
                                               Kgw, Qgw, Kgb, dgG, U_v, W, T,
                                               Opar, nc, S, dbg);
       hipDeviceSynchronize();
     });
     for (int i = 0; i < 6; ++i) out_us[4 + i] = (double)dbg[i] / 1000.0;
     out_us[3] = time_launch([&] {
-      kda_k3_state_kernel<64, 32><<<dim3(D / 32, B * H), kTh>>>(
+      common::launch_on(kda_k3_state_kernel<64, 32>, dim3(D / 32, B * H), kTh, 0, nullptr, "kda_k3_state_kernel",
           U_v, W, T, Opar, Kgb, dgG, state, out, nc, S);
       hipDeviceSynchronize();
     });
   } else {
     out_us[2] = time_launch([&] {
-      kda_k3_local_kernel<128><<<gchunk, kThL>>>(q, k, v, beta, L, M, N,
+      common::launch_on(kda_k3_local_kernel<128>, gchunk, kThL, 0, nullptr, "kda_k3_local_kernel",q, k, v, beta, L, M, N,
                                                Kgw, Qgw, Kgb, dgG, U_v, W, T,
                                                Opar, nc, S, dbg);
       hipDeviceSynchronize();
     });
     for (int i = 0; i < 6; ++i) out_us[4 + i] = (double)dbg[i] / 1000.0;
     out_us[3] = time_launch([&] {
-      kda_k3_state_kernel<128, Rb128><<<dim3(D / Rb128, B * H), kTh>>>(
+      common::launch_on(kda_k3_state_kernel<128, Rb128>, dim3(D / Rb128, B * H), kTh, 0, nullptr, "kda_k3_state_kernel",
           U_v, W, T, Opar, Kgb, dgG, state, out, nc, S);
       hipDeviceSynchronize();
     });
@@ -1296,6 +1293,7 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
   hipEventDestroy(e1);
   hipFree(dbg);
 }
+#endif  // VKERNELS_PROFILING_HOOKS
 
 }  // namespace vkernels::kernels::hip
 
