@@ -1147,6 +1147,16 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
                              float* out, float* scratch,
                              int B, int H, int S, int D, int iters,
                              double* out_us) {
+#ifdef VKERNELS_KDA_CUDA_SHIM
+  // Same cap as kda_delta_rule_fwd_chunked_with_scratch: NVIDIA limits static
+  // shared memory to 48 KB per block and the D=128 gram/local kernels stage
+  // 64 KB, so the shim build never instantiates D=128.
+  constexpr int kProfMaxD = 64;
+  VK_EXPECTS(D <= 64, "kda_chunked_phase_times: CUDA-shim build supports D <= 64 (got D=" +
+                          std::to_string(D) + "); use the HIP build for D=128");
+#else
+  constexpr int kProfMaxD = 128;
+#endif
   const int nc = S / kCs;
   const size_t ncsd = (size_t)B * H * S * D;
   float* L    = scratch;
@@ -1201,7 +1211,7 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
     });
   else
     out_us[1] = time_launch([&] {
-      common::launch_on(kda_k3_gram_kernel<128>, gchunk, kThL, 0, nullptr, "kda_k3_gram_kernel",q, k, beta, L, M, N, nc, S);
+      common::launch_on(kda_k3_gram_kernel<kProfMaxD>, gchunk, kThL, 0, nullptr, "kda_k3_gram_kernel",q, k, beta, L, M, N, nc, S);
       hipDeviceSynchronize();
     });
 #ifndef VKERNELS_KDA_CUDA_SHIM
@@ -1277,7 +1287,7 @@ void kda_chunked_phase_times(const float* q, const float* k, const float* v,
     });
   } else {
     out_us[2] = time_launch([&] {
-      common::launch_on(kda_k3_local_kernel<128>, gchunk, kThL, 0, nullptr, "kda_k3_local_kernel",q, k, v, beta, L, M, N,
+      common::launch_on(kda_k3_local_kernel<kProfMaxD>, gchunk, kThL, 0, nullptr, "kda_k3_local_kernel",q, k, v, beta, L, M, N,
                                                Kgw, Qgw, Kgb, dgG, U_v, W, T,
                                                Opar, nc, S, dbg);
       hipDeviceSynchronize();
