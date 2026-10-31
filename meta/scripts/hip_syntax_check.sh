@@ -102,10 +102,14 @@ for f in "${files[@]}"; do
 done
 # Host-only TUs compiled solely in HIP builds (plain C++ against the HIP
 # headers): the HIP C ABI shim.
+# Adding -isystem /usr/include reorders it ahead of libstdc++'s directory and
+# breaks <cstdlib>'s #include_next, so skip it when HIP lives in /usr.
+hip_inc=()
+[ "$(cd "$hip_path/include" && pwd -P)" != /usr/include ] && hip_inc=(-isystem "$hip_path/include")
 if [ "$#" -eq 0 ]; then
   for f in src/c/vkernels/capi/hip_capi.cpp; do
     if "$clang" -x c++ -std=c++17 -fsyntax-only -D__HIP_PLATFORM_AMD__=1 \
-         -isystem "$hip_path/include" -DVKERNELS_HAS_HIP=1 -Isrc/c "$f"; then
+         "${hip_inc[@]}" -DVKERNELS_HAS_HIP=1 -Isrc/c "$f"; then
       echo "ok    $f"
     else
       echo "FAIL  $f"
