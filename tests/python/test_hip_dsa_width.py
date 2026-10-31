@@ -81,7 +81,8 @@ def test_public_width_dispatch_preserves_graph_results_and_selects_kernel(gpu, t
         combines = [e for e in events if e.get('cat') == 'kernel'
                     and 'dsa_sparse_fwd_combine_kernel' in e.get('name', '')]
         assert len(combines) == 5, 'Incomplete five-replay combine coverage'
-        expected = ('<1, 512, 0>', 'ILi1ELi512ELi0E') if enabled else ('<1, 0, -1>', 'ILi1ELi0ELin1E')
+        # Template args may carry a trailing SkipInvalid flag, so match the prefix.
+        expected = ('<1, 512, 0>', '<1, 512, 0,', 'ILi1ELi512ELi0E') if enabled else ('<1, 0, -1>', '<1, 0, -1,', 'ILi1ELi0ELin1E')
         assert all(any(part in name for part in expected) for name in names), names
         records.append(torch.load(folder / 'outputs.pt', map_location='cpu', weights_only=True))
     assert len(records[0]) == len(records[1]) == 12
