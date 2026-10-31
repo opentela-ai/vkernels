@@ -30,7 +30,9 @@ void expect_same(const std::vector<float>& got, const std::vector<float>& want, 
     if (std::isinf(want[i])) {
       EXPECT_TRUE(std::isinf(got[i]) && got[i] < 0);
     } else {
-      EXPECT_NEAR(got[i], want[i], tol);
+      // Relative tolerance: the device kernel may contract to FMA, so outputs
+      // near 1e3 differ from the oracle by about one float32 ulp (~6e-5).
+      EXPECT_NEAR(got[i], want[i], tol * std::fmax(1.0f, std::fabs(want[i])));
     }
   }
 }
